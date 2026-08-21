@@ -176,6 +176,17 @@
           "type": "null"
         }
       ]
+    },
+    "aws_sigv4": {
+      "description": "WOR-2648: sign this provider's requests with AWS Signature Version 4 instead of forwarding a static credential. Required by Bedrock and SageMaker, which do not accept a bearer token. Presence of this block is what selects the signer, so a provider entry either sets `api_key` or sets this, never both. `region` is required and is the credential scope; it is never inferred from `base_url`, matching the AWS SDKs, where an endpoint override leaves the signing region alone. When `base_url` is unset, `region` also fills the `{region}` placeholder in the provider catalog's default endpoint. See `sbproxy_ai::aws_sigv4`.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/AwsSigV4Config"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "definitions": {
@@ -923,6 +934,154 @@
           "type": "string",
           "enum": [
             "cpu"
+          ]
+        }
+      ]
+    },
+    "AwsSigV4Config": {
+      "description": "Sign this provider's requests with AWS Signature Version 4.\n\nPresence of this block is what selects the signer. Absent it, the provider's `api_key` is forwarded verbatim in the catalog's auth header, which is the pre-existing bearer-token behavior and never reaches this code at all. The two are mutually exclusive: a provider entry sets `api_key` or `aws_sigv4`, never both.",
+      "type": "object",
+      "required": [
+        "region"
+      ],
+      "properties": {
+        "region": {
+          "description": "AWS region used for the credential scope, for example `us-east-1`. Required, and independent of `base_url`: pointing `base_url` at a VPC endpoint or a private hostname does not change the region a signature is scoped to, exactly as an AWS SDK's `endpoint_url` override does not. When `base_url` is unset, this value also fills the `{region}` placeholder in the provider catalog's default endpoint.",
+          "type": "string"
+        },
+        "service": {
+          "description": "Signing service name in the credential scope. Defaults to `bedrock` for a `bedrock` provider and `sagemaker` for a `sagemaker` provider; set it explicitly for any other AWS service fronted through a provider entry.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "credentials": {
+          "description": "How to obtain the AWS credentials. Unset uses the standard AWS credential provider chain.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AwsCredentialsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "refresh_margin_secs": {
+          "description": "Seconds before expiry at which a short-lived credential is refreshed. Defaults to 900. A refresh that fails inside this window is retried on the next request and logged, and the cached credential keeps serving until 600 seconds remain, at which point a refresh failure fails the request.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "AwsCredentialsConfig": {
+      "description": "How one provider's AWS credentials are obtained.",
+      "type": "object",
+      "properties": {
+        "source": {
+          "description": "Which credential source backs this provider. Defaults to the standard AWS provider chain.",
+          "default": "default_chain",
+          "allOf": [
+            {
+              "$ref": "#/definitions/AwsCredentialSource"
+            }
+          ]
+        },
+        "access_key_id": {
+          "description": "AWS access key ID. Required by, and only read by, `static`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "secret_access_key": {
+          "description": "AWS secret access key. Required by, and only read by, `static`. Resolve it through `${VAR}`, `vault://`, or `awssm://` rather than writing it into the config file.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_token": {
+          "description": "Session token accompanying an already-issued short-lived key pair. Only read by `static`. A token supplied this way expires on AWS's schedule and SBproxy has no way to renew it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role_arn": {
+          "description": "Role ARN to assume. Required by, and only read by, `assume_role`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "external_id": {
+          "description": "External ID demanded by the role's trust policy. Only read by `assume_role`. Treated as a credential: it is never logged.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_name": {
+          "description": "Role session name recorded in CloudTrail. Only read by `assume_role`; defaults to `sbproxy`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_duration_secs": {
+          "description": "Requested role session length in seconds. Only read by `assume_role`; unset takes the role's own default (one hour on most roles).",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "profile": {
+          "description": "Named profile in the shared AWS config files. Read by `default_chain` and by the base identity `assume_role` starts from.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "AwsCredentialSource": {
+      "description": "Where a provider's AWS credentials come from.",
+      "oneOf": [
+        {
+          "description": "The standard AWS credential provider chain: environment variables, the shared config and credentials files, an OIDC web identity token (EKS IRSA), the ECS task role, and finally the EC2 instance profile. This is the default and the right answer for anything running inside AWS, because the chain refreshes short-lived credentials on its own.",
+          "type": "string",
+          "enum": [
+            "default_chain"
+          ]
+        },
+        {
+          "description": "A long-lived access key pair supplied by config. `session_token` may carry an already-issued short-lived credential, but SBproxy cannot renew one it was handed: use `assume_role` or `default_chain` for credentials that expire.",
+          "type": "string",
+          "enum": [
+            "static"
+          ]
+        },
+        {
+          "description": "STS `AssumeRole`, with the base identity coming from the default chain. The session is renewed before it expires, so a role session is the supported way to run on short-lived credentials.",
+          "type": "string",
+          "enum": [
+            "assume_role"
           ]
         }
       ]

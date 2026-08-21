@@ -9,6 +9,7 @@ pub mod ai_routing_policy;
 pub mod alerting;
 pub mod api_routes;
 pub mod attribution;
+pub mod aws_sigv4;
 pub mod budget;
 pub mod client;
 pub mod compression;
@@ -65,11 +66,15 @@ pub mod usage_parser;
 pub mod usage_sink;
 pub mod value_ledger;
 
+pub use aws_sigv4::{
+    AwsCredentialSource, AwsCredentialsConfig, AwsSigV4Config, AwsSigV4Error, AwsSigV4Signer,
+    ConfigSecret,
+};
 pub use budget::{
     cheapest_model, estimate_cost, BudgetConfig, BudgetLimit, BudgetScope, BudgetTracker,
     OnExceedAction, UsageRecord,
 };
-pub use client::AiClient;
+pub use client::{AiClient, OutboundSigner};
 pub use concurrency::ConcurrencyLimiter;
 pub use context_window::model_context_window;
 pub use degradation::{should_degrade, DegradationConfig};
