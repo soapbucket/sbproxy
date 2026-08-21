@@ -5284,7 +5284,7 @@ impl ProxyHttp for SbProxy {
                     }
                     Err(e) => {
                         let body_str = serde_json::json!({
-                            "error": "invalid request body for gRPC transcoding",
+                            "error": "gRPC transcoding refused the request",
                             "detail": e.to_string(),
                         })
                         .to_string();
