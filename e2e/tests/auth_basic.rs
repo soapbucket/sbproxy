@@ -2,10 +2,10 @@
 //!
 //! The `basic_auth` provider validates the standard
 //! `Authorization: Basic <b64(user:pass)>` header against the configured
-//! `users` list. The realm is surfaced to the client only as part of the
-//! 401 challenge; here we focus on the accept / reject decision and
-//! confirm the upstream is bypassed for unauthenticated traffic. Mirrors
-//! the contract from `examples/auth-basic/sb.yml`.
+//! `users` list. The realm is surfaced to the client as part of the 401
+//! challenge; the rest of the file covers the accept / reject decision
+//! and confirms the upstream is bypassed for unauthenticated traffic.
+//! Mirrors the contract from `examples/auth-basic/sb.yml`.
 
 use base64::Engine;
 use sbproxy_e2e::{MockUpstream, ProxyHarness};
@@ -111,6 +111,88 @@ fn unknown_user_returns_401() {
         )
         .expect("send");
     assert_eq!(resp.status, 401);
+}
+
+#[test]
+fn missing_credential_challenges_with_the_configured_realm() {
+    // RFC 9110 section 11.6.1: the 401 has to name the scheme and realm
+    // or the client has nothing to retry with and a browser never
+    // prompts. `realm: "sbproxy demo"` in the config above is the value
+    // that must appear here.
+    let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
+    let harness = ProxyHarness::start_with_yaml(&config_yaml(&upstream.base_url())).expect("start");
+
+    let resp = harness.get("/get", "basic.localhost").expect("send");
+    assert_eq!(resp.status, 401);
+    assert_eq!(
+        resp.headers.get("www-authenticate").map(String::as_str),
+        Some(r#"Basic realm="sbproxy demo""#),
+        "the configured realm must reach the wire; headers were {:?}",
+        resp.headers
+    );
+}
+
+#[test]
+fn wrong_password_also_challenges() {
+    // A rejected credential is the case where the client most needs the
+    // scheme and realm back, so the challenge cannot be limited to the
+    // no-credential branch.
+    let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
+    let harness = ProxyHarness::start_with_yaml(&config_yaml(&upstream.base_url())).expect("start");
+
+    let resp = harness
+        .get_with_headers(
+            "/get",
+            "basic.localhost",
+            &[("authorization", &basic_auth("admin", "not-the-password"))],
+        )
+        .expect("send");
+    assert_eq!(resp.status, 401);
+    assert_eq!(
+        resp.headers.get("www-authenticate").map(String::as_str),
+        Some(r#"Basic realm="sbproxy demo""#)
+    );
+}
+
+#[test]
+fn an_authored_401_page_keeps_the_challenge_header() {
+    // The challenge and the body are independent choices. Routing the
+    // header-carrying denial through the body chooser is what makes an
+    // origin able to author its own 401 page without losing
+    // `WWW-Authenticate`.
+    let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
+    let config = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "basic.localhost":
+    action:
+      type: proxy
+      url: "{}"
+    error_pages:
+      - status: 401
+        content_type: text/html
+        body: "<h1>sign in</h1>"
+    authentication:
+      type: basic_auth
+      realm: "sbproxy demo"
+      users:
+        - username: admin
+          password: s3cret
+"#,
+        upstream.base_url()
+    );
+    let harness = ProxyHarness::start_with_yaml(&config).expect("start");
+
+    let resp = harness.get("/get", "basic.localhost").expect("send");
+    assert_eq!(resp.status, 401);
+    assert_eq!(
+        resp.headers.get("www-authenticate").map(String::as_str),
+        Some(r#"Basic realm="sbproxy demo""#),
+        "an authored error page must not cost the origin its challenge"
+    );
+    assert_eq!(resp.text().expect("utf8 body"), "<h1>sign in</h1>");
 }
 
 #[test]

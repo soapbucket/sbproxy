@@ -2,9 +2,10 @@
 # Custom error pages.
 #
 # error_pages substitutes the body and content type when the proxy itself
-# generates an error response: auth failures (401, 403), policy denials,
-# the default 404 for unknown origins, etc. It does NOT intercept
-# upstream-returned status codes.
+# generates an error response: auth failures (401, 403) and policy denials
+# on this origin. It does NOT intercept upstream-returned status codes,
+# and it does not reach the 404 for a Host matching no origin, which is
+# answered before any origin's config is resolved.
 #
 # This example has a single origin protected by API key authentication.
 # Any request without the `X-Api-Key` header gets a 401 from the proxy,

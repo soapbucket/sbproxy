@@ -3394,6 +3394,7 @@ pub(super) async fn request_filter(
                         origin.error_pages.as_deref(),
                         origin.problem_details.as_ref(),
                         &path,
+                        &[],
                     )
                     .await?;
                     return Ok(true);
@@ -3582,6 +3583,7 @@ pub(super) async fn request_filter(
                         origin.error_pages.as_deref(),
                         origin.problem_details.as_ref(),
                         &path,
+                        &[],
                     )
                     .await?;
                     return Ok(true);
@@ -3621,7 +3623,24 @@ pub(super) async fn request_filter(
                             .get("host")
                             .and_then(|v| v.to_str().ok()),
                     );
-                    send_error_with_extra_headers(session, status, msg, &augmented).await?;
+                    // WOR-2525: route through the same body chooser the
+                    // bare `Deny` arm uses. A denial that carries a
+                    // challenge is still a denial, so an origin that
+                    // authored an `error_pages` 401 or turned on
+                    // `problem_details` must get that body here too;
+                    // `send_error_with_extra_headers` would have
+                    // silently replaced both with `{"error": ...}`.
+                    let path = session.req_header().uri.path().to_string();
+                    send_error_with_pages(
+                        session,
+                        status,
+                        msg,
+                        origin.error_pages.as_deref(),
+                        origin.problem_details.as_ref(),
+                        &path,
+                        &augmented,
+                    )
+                    .await?;
                     return Ok(true);
                 }
                 AuthResult::DigestChallenge(challenge) => {
@@ -4287,7 +4306,42 @@ pub(super) async fn request_filter(
                 // under the refusal it was set for.
                 send_response(session, status, &content_type, body.as_bytes()).await?;
             } else {
-                send_error(session, status, &msg).await?;
+                // WOR-2529: every denial the arms above did not claim
+                // gets the origin's own error shape. `send_error` wrote
+                // `{"error": msg}` as `application/json` no matter what
+                // the origin configured, so `error_pages` and
+                // `problem_details` covered authentication denials and
+                // upstream failures but not a single policy denial, and
+                // `include_detail: false` did not suppress anything on
+                // this path (the WAF appends its rule id to `msg`).
+                //
+                // The special-case arms deliberately stay ahead of this
+                // one: each carries a spec-pinned body and headers, so
+                // the precedence is the one `error_pages` already had,
+                // an authored or spec body wins and the renderer takes
+                // the rest.
+                //
+                // What this still cannot see, because it is only the
+                // policy chain's fall-through: refusals emitted before
+                // the chain runs (bot_detection's 403 above, the 405
+                // for a disallowed method, the well-known and callback
+                // endpoints), the unmatched-Host 404 (no origin is
+                // resolved yet, so there is no config to read), and the
+                // AI-surface denials in `ai_dispatch` / `action_dispatch`,
+                // each of which calls `send_error` directly. Widening
+                // those is a separate change; `docs/configuration.md`
+                // states the same boundary for operators.
+                let path = session.req_header().uri.path().to_string();
+                send_error_with_pages(
+                    session,
+                    status,
+                    &msg,
+                    origin.error_pages.as_deref(),
+                    origin.problem_details.as_ref(),
+                    &path,
+                    &[],
+                )
+                .await?;
             }
             return Ok(true);
         }

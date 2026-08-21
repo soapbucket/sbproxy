@@ -144,6 +144,40 @@ fn ct_str_eq(a: &str, b: &str) -> bool {
     constant_time_eq(a.as_bytes(), b.as_bytes())
 }
 
+/// Escape an operator-supplied value for an RFC 9110 section 5.6.4
+/// `quoted-string` inside a `WWW-Authenticate` challenge.
+///
+/// A realm is config text, so it can carry the two characters that end a
+/// quoted-string early: a `"` closes the string and lets the remainder
+/// parse as further auth-params, and a trailing `\` escapes the closing
+/// quote and swallows the parameters after it. Both get a quoted-pair.
+///
+/// Control characters are dropped rather than emitted. They have no
+/// quoted-pair representation in a `quoted-string` at all, and a CR or
+/// LF would make the header builder reject the whole header, which on
+/// the Basic path means the 401 loses its challenge entirely. Dropping
+/// them keeps a well-formed challenge on the wire.
+///
+/// The escaping round-trips: a conforming client decodes the
+/// quoted-pairs back to the configured realm, which is what Digest
+/// needs since the realm is an input to the HA1 hash. That round trip
+/// does *not* hold for a realm containing control characters, which is
+/// unrepresentable in this header either way.
+fn quote_auth_param(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '"' | '\\' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 // --- Auth Enum ---
 
 /// Auth provider - enum dispatch for built-in types.
@@ -488,7 +522,12 @@ impl ApiKeyAuth {
 pub struct BasicAuthProvider {
     /// Accepted username/password pairs.
     pub users: Vec<BasicAuthUser>,
-    /// Optional realm shown in the `WWW-Authenticate` challenge.
+    /// Realm sent in the `WWW-Authenticate` challenge on a 401.
+    ///
+    /// Optional in config only. RFC 9110 section 11.6.1 makes the
+    /// parameter mandatory on the wire, so an origin that sets none is
+    /// challenged as `Basic realm="restricted"` rather than left
+    /// without a challenge.
     #[serde(default)]
     pub realm: Option<String>,
 }
@@ -512,11 +551,33 @@ pub struct BasicAuthUser {
     pub attrs: CredentialAttrs,
 }
 
+/// Realm advertised when the operator configured none.
+///
+/// RFC 9110 section 11.6.1 makes `realm` mandatory on a Basic challenge,
+/// so there is no "omit it" option: a challenge without one is not a
+/// valid Basic challenge and a browser may not prompt. `restricted` is
+/// the conventional placeholder and carries no information about the
+/// origin, which is the right default for a value that goes out on an
+/// unauthenticated 401.
+const DEFAULT_BASIC_REALM: &str = "restricted";
+
 impl BasicAuthProvider {
     /// Build a BasicAuthProvider from a generic JSON config value.
     /// Unknown keys are refused (WOR-2181).
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
         provider_config_from_value(value)
+    }
+
+    /// Build the `WWW-Authenticate` value for a denied request.
+    ///
+    /// Emitting this is not cosmetic. RFC 9110 section 11.6.1 requires a
+    /// 401 to carry `WWW-Authenticate`; without it a browser never
+    /// prompts for credentials and a conforming client has no way to
+    /// learn which scheme to retry with, so the origin looks broken
+    /// rather than protected.
+    pub fn challenge(&self) -> String {
+        let realm = self.realm.as_deref().unwrap_or(DEFAULT_BASIC_REALM);
+        format!("Basic realm=\"{}\"", quote_auth_param(realm))
     }
 
     /// Check if the request has valid basic auth credentials.
@@ -1379,11 +1440,17 @@ impl DigestAuth {
     /// The `algorithm` parameter is how RFC 7616 §3.3 negotiates the
     /// hash: a client that understands SHA-256 echoes it back on the
     /// response, and one that does not fails rather than downgrading.
+    ///
+    /// The realm is escaped for its `quoted-string`; it is operator
+    /// config, so a `"` in it would otherwise end the parameter early
+    /// and the rest of the realm would parse as more auth-params. The
+    /// nonce goes through the same escape for uniformity even though
+    /// `generate_nonce` only ever produces hex.
     pub fn challenge(&self, nonce: &str) -> String {
         format!(
             "Digest realm=\"{}\", nonce=\"{}\", qop=\"auth\", algorithm={}",
-            self.realm,
-            nonce,
+            quote_auth_param(&self.realm),
+            quote_auth_param(nonce),
             self.algorithm.token()
         )
     }
@@ -1929,6 +1996,70 @@ mod tests {
         });
         let auth = BasicAuthProvider::from_config(json).unwrap();
         assert!(auth.realm.is_none());
+    }
+
+    /// The configured realm reaches the challenge value verbatim. This
+    /// is the value the 401 carries, so getting the realm text right
+    /// here is what makes a browser's prompt name the right service.
+    #[test]
+    fn basic_auth_challenge_carries_the_configured_realm() {
+        let auth = BasicAuthProvider::from_config(serde_json::json!({
+            "users": [{"username": "u", "password": "p"}],
+            "realm": "Admin Panel"
+        }))
+        .unwrap();
+        assert_eq!(auth.challenge(), r#"Basic realm="Admin Panel""#);
+    }
+
+    /// RFC 9110 section 11.6.1 makes `realm` mandatory on a Basic
+    /// challenge, so an origin that configured none still gets one.
+    #[test]
+    fn basic_auth_challenge_falls_back_to_a_default_realm() {
+        let auth = BasicAuthProvider::from_config(serde_json::json!({
+            "users": [{"username": "u", "password": "p"}]
+        }))
+        .unwrap();
+        assert_eq!(auth.challenge(), r#"Basic realm="restricted""#);
+    }
+
+    /// A realm carrying a quote must not be able to close the
+    /// quoted-string and append auth-params of its own. Unescaped, the
+    /// realm below would put a bare `error="x"` parameter on the
+    /// challenge that the operator never configured.
+    #[test]
+    fn basic_auth_challenge_escapes_a_realm_that_would_break_the_header() {
+        let auth = BasicAuthProvider::from_config(serde_json::json!({
+            "users": [{"username": "u", "password": "p"}],
+            "realm": r#"a", error="x"#
+        }))
+        .unwrap();
+        assert_eq!(auth.challenge(), r#"Basic realm="a\", error=\"x""#);
+    }
+
+    /// A realm with a CR or LF has no quoted-string encoding, and
+    /// leaving it raw makes the header builder reject the whole header,
+    /// which drops the challenge. Strip instead, so the 401 still
+    /// challenges.
+    #[test]
+    fn basic_auth_challenge_strips_control_characters_from_the_realm() {
+        let auth = BasicAuthProvider::from_config(serde_json::json!({
+            "users": [{"username": "u", "password": "p"}],
+            "realm": "Admin\r\nX-Injected: yes"
+        }))
+        .unwrap();
+        assert_eq!(auth.challenge(), r#"Basic realm="AdminX-Injected: yes""#);
+    }
+
+    /// The Digest realm is operator config on the same footing, and its
+    /// challenge had no escaping at all before this.
+    #[test]
+    fn digest_challenge_escapes_a_realm_that_would_break_the_header() {
+        let auth = DigestAuth::new(r#"leg"acy"#, vec![]);
+        let challenge = auth.challenge("abc123");
+        assert!(
+            challenge.starts_with(r#"Digest realm="leg\"acy", nonce="abc123""#),
+            "realm quote must be escaped: {challenge}"
+        );
     }
 
     #[test]

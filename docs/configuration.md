@@ -2430,7 +2430,29 @@ origins:
 |-------|------|---------|-------------|
 | `type` | string | required | Must be `basic_auth` |
 | `users` | list | required | Username/password pairs |
-| `realm` | string | | Optional realm shown in the `WWW-Authenticate` challenge |
+| `realm` | string | `restricted` | Realm sent in the `WWW-Authenticate` challenge on a 401 |
+
+A denied request gets the challenge, which is what makes a browser
+prompt and tells a scripted client which scheme to retry with:
+
+```bash
+$ curl -i -H 'Host: admin.example.com' http://localhost:8080/
+HTTP/1.1 401 Unauthorized
+content-type: application/json
+content-length: 24
+www-authenticate: Basic realm="Admin Panel"
+
+{"error":"unauthorized"}
+```
+
+Both the missing-credential and the wrong-password cases challenge.
+`realm` is optional in config only; RFC 9110 section 11.6.1 requires the
+parameter on the wire, so an origin that sets none is challenged as
+`Basic realm="restricted"`. A quote or backslash in the realm is escaped
+into the quoted string rather than being allowed to end it.
+
+An `error_pages` entry or `problem_details` on the origin replaces the
+body above and leaves the challenge header in place.
 
 ### bearer
 
@@ -4981,9 +5003,11 @@ origins:
 
 ## Error pages
 
-Error pages let you replace upstream error responses with operator-defined bodies. Each entry declares the status codes it covers, the `Content-Type` it produces, and the response body. When more than one entry matches the status code, the proxy performs `Accept` header content negotiation across the candidates and picks the highest-quality match. With no concrete preference it prefers `application/json`, then `text/html`, then the first candidate.
+Error pages let you replace the error responses the proxy itself generates with operator-defined bodies. A status the upstream returned is relayed as the upstream wrote it and never runs through this table. Each entry declares the status codes it covers, the `Content-Type` it produces, and the response body. When more than one entry matches the status code, the proxy performs `Accept` header content negotiation across the candidates and picks the highest-quality match. With no concrete preference it prefers `application/json`, then `text/html`, then the first candidate.
 
 The block is a list at the origin level. Each entry's `status` field accepts a single integer or a list of integers. When `template` is true, the body is rendered with `{{ status_code }}` and `{{ request.path }}` substituted at request time.
+
+`error_pages` and `problem_details` share one emitter, so they cover the same set of errors and an authored page always wins over the renderer. [What the renderer covers](#what-the-renderer-covers) below is the list for both.
 
 ```yaml
 origins:
@@ -5016,10 +5040,10 @@ origins:
 ## Problem details (RFC 9457)
 
 The `problem_details` block opts the origin into RFC 9457
-`application/problem+json` responses for authentication-denial errors
-that are not matched by an `error_pages` entry. The two blocks compose:
-per-status custom pages still win when authored; `problem_details`
-catches every other authentication denial with a structured body.
+`application/problem+json` responses for proxy-generated errors that are
+not matched by an `error_pages` entry. The two blocks compose: per-status
+custom pages still win when authored; `problem_details` catches the rest
+with a structured body.
 
 ```yaml
 origins:
@@ -5035,8 +5059,8 @@ origins:
       include_detail: true
 ```
 
-An authentication denial on this origin with a status other than 401
-(no `error_pages` entry matches it) renders as:
+A denial on this origin with a status other than 401 (no `error_pages`
+entry matches it) renders as:
 
 ```json
 {
@@ -5050,27 +5074,27 @@ An authentication denial on this origin with a status other than 401
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | bool | false | When true, render unmatched authentication-denial errors as `application/problem+json`. |
+| `enabled` | bool | false | When true, render unmatched proxy-generated errors as `application/problem+json`. |
 | `type_base_uri` | string | | Base URI for the `type` field; the status code is appended (e.g. `https://api.example.com/errors/503`). When unset the renderer emits the RFC 9457 default `about:blank`. |
 | `include_detail` | bool | true | When false, the `detail` field is suppressed (operators can avoid leaking internal error text). |
-
-The renderer fires from the same code path that `error_pages`
-participates in for authentication denials (a bad API key, a failed
-JWT check, forward_auth rejecting a request, and so on). It does not
-currently apply to policy denials (`ip_filter`, `waf`, rate limiting,
-etc.) or to a default 404 for an unmatched route; those keep their own
-response shapes. Upstream-returned status codes are not rewritten
-either; the renderer only handles errors the proxy itself generates.
 
 See [`examples/problem-details/`](https://github.com/soapbucket/sbproxy/tree/main/examples/problem-details).
 
 Spec: <https://www.rfc-editor.org/rfc/rfc9457.html>.
 
-The renderer covers both error sources:
+### What the renderer covers
 
-- **Proxy-generated errors** (authentication denials, policy denials,
-  the default 404 for unknown origins) when no matching `error_pages`
-  entry exists.
+`problem_details` sits behind `error_pages` on the same emitter, so
+anything below that no authored page matches renders as problem+json:
+
+- **Authentication denials**: a bad API key, a failed JWT check,
+  `forward_auth` rejecting a request, a Basic or plugin denial that also
+  carries a `WWW-Authenticate` challenge. The challenge header survives
+  the rendered body.
+- **Policy denials** from the origin's `policies:` chain that do not
+  author their own response: `ip_filter`, `waf`, `dlp`, `csrf`, `rego`,
+  `expression`, `object_authz`, `request_limit`, `http_framing`,
+  `exposed_credentials`, `semantic_constraint`, and `agent_budget`.
 - **Upstream failures** (connect refused, connect timeout, TLS
   handshake errors, mid-stream connection loss) routed through
   Pingora's `fail_to_proxy` path. The `detail` field carries the
@@ -5078,6 +5102,48 @@ The renderer covers both error sources:
   `connection_timeout`, `tls_protocol_error`, `connection_terminated`,
   `http_request_error`) so downstream tooling can break down by
   failure mode without scraping the body.
+
+### What it does not cover
+
+These keep their own response shapes, and turning `problem_details` on
+does not change them:
+
+- **Denials whose body is pinned by a protocol**: rate limiting and DDoS
+  (429 with the `RateLimit-*` set), the AI-crawl family (402 payment
+  challenge, 403 content-signal refusal, 406 rail negotiation, 503
+  ledger unavailable), settlement responses, agent-to-agent chain
+  refusals, and any policy that authored its own body and media type.
+  The wire format is part of those specs, so a generic envelope would
+  break the client that reads them.
+- **Policies that write their own body on every refusal**:
+  `concurrent_limit`, `content_digest`, and `prompt_injection_v2`. Each
+  carries an operator-settable body (`error_body` /
+  `error_content_type`, `block_body` / `block_content_type`) and emits
+  it, or its own JSON default, straight to the client. The knob the
+  operator already has for those three is the body itself, so the
+  renderer stays out of the way rather than overwriting it.
+- **The default 404 for an unmatched `Host`**. No origin resolved, so
+  there is no `problem_details` block to read.
+- **Refusals that run before the policy chain**: `bot_detection`'s 403,
+  the 405 for a method the origin does not allow, and the built-in
+  well-known and callback endpoints. Those answer from their own
+  emitters, ahead of the point where the origin's error configuration is
+  consulted.
+- **The `digest` challenge 401** and the 429 a `cap` credential gets for
+  exhausting its own budget. Both write their headers and body in one
+  piece from their own emitters.
+- **AI gateway surface errors** (`/v1/chat/completions` and the rest of
+  the AI dispatch path). Those answer from their own emitters: some in
+  the provider's `{"error": {...}}` envelope so an SDK's error handling
+  still works, the rest as a flat `{"error": "..."}`. Neither reads the
+  origin's `error_pages` or `problem_details`.
+- **Upstream-returned status codes**. A 500 the backend produced is
+  relayed as the backend wrote it; the renderer only shapes errors the
+  proxy itself generates.
+
+`include_detail: false` suppresses `detail` on everything the renderer
+does cover, which includes the WAF message that names the matched rule
+id.
 
 ---
 
