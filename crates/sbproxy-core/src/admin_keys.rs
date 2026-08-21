@@ -73,10 +73,13 @@ thread_local! {
 /// Route entry point. Returns `Some(response)` for paths this module owns and
 /// `None` so the caller can fall through to the rest of the admin dispatcher.
 pub fn dispatch(method: &str, path: &str, body: Option<&str>) -> Option<Resp> {
-    // Cleared on the way in as well as drained on the way out: another
-    // admin surface on this thread (`admin_cache`'s evict routes) also
-    // invalidates, and a leftover flag would attach its failure to the
-    // next unrelated key mutation.
+    // Cleared on the way in as well as drained on the way out. The drain
+    // below is a `take`, so today nothing can be left behind; the clear is
+    // here because the admin listener reuses threads across requests, so
+    // the cost of that invariant being wrong once is a propagation failure
+    // reported against a later, unrelated key mutation on the same thread.
+    // `admin_cache`'s evict routes invalidate too, but they answer 502
+    // directly and never write this slot.
     PROPAGATION_FAILURE.with(|slot| *slot.borrow_mut() = None);
     let resp = route(method, path, body)?;
     Some(with_propagation_warning(resp))
@@ -2321,15 +2324,21 @@ fn invalidate(plane: &KeyPlane, id: &str) {
         // answers a different question: the log for the operator reading
         // this replica, the counter for the alert, and the slot for the
         // response body so the caller who asked for the revoke is told.
+        //
+        // The chain rather than `%error`: displaying an `anyhow::Error`
+        // renders only its outermost context, which is the generic "reach
+        // the shared cache tier to invalidate an id" and names no cause.
+        // The tier's own error already carries a redacted DSN.
+        let detail = format!("{error:#}");
         tracing::warn!(
             key_id = %id,
-            %error,
+            error = %detail,
             "keystore cache-tier invalidation did not propagate; peer replicas will \
              serve the previous record until their cache TTL lapses"
         );
         sbproxy_observe::metrics::record_key_cache_invalidation_failure("key");
         PROPAGATION_FAILURE.with(|slot| {
-            *slot.borrow_mut() = Some(format!("{error:#}"));
+            *slot.borrow_mut() = Some(detail);
         });
     }
     // A credential's resolved secret is cached separately from its record, so

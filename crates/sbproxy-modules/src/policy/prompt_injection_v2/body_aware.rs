@@ -399,7 +399,7 @@ fn body_aware_counter() -> &'static prometheus::IntCounterVec {
     BODY_AWARE_COUNTER.get_or_init(|| {
         let opts = prometheus::Opts::new(
             "sbproxy_prompt_injection_v2_results_total",
-            "Body-aware prompt-injection detector results, labelled by action, label, and detector.",
+            "Body-aware prompt-injection detector results, labeled by action, label, and detector.",
         );
         let counter = prometheus::IntCounterVec::new(opts, &["action", "label", "detector"])
             .expect("counter shape is constant");

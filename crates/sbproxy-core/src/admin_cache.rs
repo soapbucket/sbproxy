@@ -196,9 +196,16 @@ fn evict_response(
     match outcome {
         Ok(()) => (200, "application/json", body.to_string()),
         Err(error) => {
+            // The whole chain, not `%error`. Displaying an `anyhow::Error`
+            // renders only its outermost context, which here is the generic
+            // "reach the shared cache tier to invalidate an id" and says
+            // nothing about why: connection refused, auth rejected, or a
+            // failed `del`. The DSN inside it is already redacted by the
+            // link's own error.
+            let detail = format!("{error:#}");
             tracing::warn!(
                 %scope,
-                %error,
+                error = %detail,
                 "admin cache eviction did not reach the shared keystore cache tier"
             );
             sbproxy_observe::metrics::record_key_cache_invalidation_failure(scope);
@@ -206,7 +213,7 @@ fn evict_response(
                 502,
                 "application/json",
                 json!({
-                    "error": format!("eviction did not reach the shared cache tier: {error:#}"),
+                    "error": format!("eviction did not reach the shared cache tier: {detail}"),
                     "local_cache_cleared": true,
                 })
                 .to_string(),

@@ -67,7 +67,7 @@ pub struct CircuitBreaker {
     probes_in_flight: AtomicU32,
     /// Wall-clock ms of the most recent probe admission, or 0 when the
     /// current recovery cycle has admitted none. Drives the stale-slot
-    /// forgiveness in [`CircuitBreaker::try_admit_probe`].
+    /// forgiveness in `try_admit_probe`.
     last_probe_time: AtomicU64,
 }
 
@@ -123,17 +123,26 @@ impl CircuitBreaker {
     ///
     /// - Closed: always allows.
     /// - Open: rejects unless the open duration has elapsed (triggers HalfOpen transition).
-    /// - HalfOpen: allows only while fewer than [`HALF_OPEN_MAX_PROBES`]
-    ///   probes are in flight, and takes a probe slot when it does.
+    /// - HalfOpen: allows only while no probe is in flight, and takes the
+    ///   probe slot when it does. One at a time, always: the count is an
+    ///   internal constant rather than a knob, since no caller has asked
+    ///   for a second concurrent probe.
     ///
     /// This is not a pure read. In HalfOpen an `allow_request` that returns
     /// `true` has claimed a probe slot, released when the caller reports the
     /// outcome through [`record_success`](Self::record_success) or
-    /// [`record_failure`](Self::record_failure). A caller that asks the
+    /// [`record_failure`](Self::record_failure). A caller that reaches
+    /// neither, because the request it admitted said nothing about the
+    /// upstream's health, owes the slot back through
+    /// [`release_probe`](Self::release_probe). A caller that asks the
     /// question speculatively (both load-balancer consumers evaluate it as a
     /// per-candidate eligibility predicate) can therefore take a slot for a
-    /// request it never dispatches; see [`Self::try_admit_probe`] for the
-    /// forgiveness that keeps that from wedging the breaker.
+    /// request it never dispatches; a slot nobody returns is written off
+    /// after one more open duration, so that cannot wedge the breaker.
+    // `HALF_OPEN_MAX_PROBES` and `try_admit_probe` are named in plain
+    // backticks above and here rather than as intra-doc links: they are
+    // private, this item is public, and rustdoc's private_intra_doc_links
+    // lint is an error under the workspace's `-D warnings` docs lane.
     pub fn allow_request(&self) -> bool {
         match self.state() {
             CircuitState::Closed => true,
@@ -232,17 +241,20 @@ impl CircuitBreaker {
     ///    once per `open_duration`, which is exactly what the state exists
     ///    to prevent.
     /// 2. The forgiveness above it covers slots that are never returned. A
-    ///    slot is released only on `record_success` / `record_failure`, and
-    ///    a caller can skip both: the ledger client returns early on a hard
-    ///    (non-retryable) error, and the load balancer and AI router both
-    ///    call `allow_request` as a per-candidate eligibility predicate, so
-    ///    a candidate that is evaluated and then not selected takes a slot
-    ///    and reports nothing. Without forgiveness the first such request
-    ///    would pin the breaker in HalfOpen-rejects for the life of the
-    ///    process. Once a full `open_duration` has passed with no state
-    ///    change, the outstanding slots are written off and one probe goes
-    ///    through, so the worst case degrades to one probe per recovery
-    ///    cycle rather than a permanent wedge.
+    ///    slot is released on `record_success` / `record_failure`, or by
+    ///    hand through [`Self::release_probe`], and a caller can reach
+    ///    none of the three: the load balancer and the AI router both call
+    ///    `allow_request` as a per-candidate eligibility predicate, so a
+    ///    candidate that is evaluated and then not selected takes a slot
+    ///    and reports nothing, with no later call that knows to give it
+    ///    back. Without forgiveness the first such request would pin the
+    ///    breaker in HalfOpen-rejects for the life of the process. Once a
+    ///    full `open_duration` has passed with no state change, the
+    ///    outstanding slots are written off and one probe goes through, so
+    ///    the worst case degrades to one probe per recovery cycle rather
+    ///    than a permanent wedge. Forgiveness is the backstop, not the
+    ///    plan: a caller that knows it produced no verdict should say so
+    ///    with `release_probe` rather than wait out an open duration.
     ///
     /// The CAS on `last_probe_time` makes exactly one caller the forgiver.
     /// What this does *not* guarantee is an exact cap at the forgiveness
@@ -284,8 +296,26 @@ impl CircuitBreaker {
         }
     }
 
-    /// Return a probe slot after the caller reported its outcome.
-    fn release_probe(&self) {
+    /// Hand back a probe slot the caller took and cannot report on.
+    ///
+    /// [`record_success`](Self::record_success) and
+    /// [`record_failure`](Self::record_failure) already release the slot,
+    /// so this is for the third case: an admitted request that produced no
+    /// verdict about the upstream's health at all. The AI-crawl ledger
+    /// client is the one in tree. Its redeem returns early on a hard,
+    /// non-retryable error (`ledger.token_already_spent`,
+    /// `ledger.signature_invalid`), which a perfectly healthy ledger
+    /// answers with; deliberately, that does not flap the breaker. Without
+    /// this the slot would only come back through the stale-slot
+    /// forgiveness inside the admission path, so one refused token would
+    /// leave every other redeem answered with a synthetic
+    /// `ledger.unavailable` for a whole open duration, which the crawl
+    /// policy turns into a fail-closed 503.
+    ///
+    /// Saturating, so an extra call on a breaker with nothing outstanding
+    /// is a no-op rather than an underflow that would hand out an
+    /// unbounded number of probes.
+    pub fn release_probe(&self) {
         let _ =
             self.probes_in_flight
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |in_flight| {
@@ -509,6 +539,39 @@ mod tests {
         assert!(
             cb.allow_request(),
             "an abandoned probe slot must not wedge the breaker"
+        );
+    }
+
+    #[test]
+    fn a_probe_that_learned_nothing_can_hand_its_slot_straight_back() {
+        // The AI-crawl ledger client's case: the probe was dispatched, the
+        // ledger answered, and the answer was a hard business refusal that
+        // says nothing about whether the endpoint is healthy. It reports
+        // neither success nor failure, so without an explicit return the
+        // slot would sit out a whole open duration and every other redeem
+        // in that window would be refused as if the ledger were down.
+        let cb = CircuitBreaker::new(2, 1, Duration::from_secs(30));
+        open_then_cool_down(&cb, 2);
+
+        assert!(cb.allow_request());
+        assert!(!cb.allow_request(), "the slot is out");
+        cb.release_probe();
+        assert!(
+            cb.allow_request(),
+            "a returned slot must admit the next probe now, not after \
+             another open duration"
+        );
+
+        // Still exactly one at a time, and an over-release cannot mint
+        // extra probes out of a saturating decrement.
+        assert!(!cb.allow_request());
+        cb.release_probe();
+        cb.release_probe();
+        cb.release_probe();
+        assert!(cb.allow_request());
+        assert!(
+            !cb.allow_request(),
+            "three releases of one slot must not widen the budget"
         );
     }
 

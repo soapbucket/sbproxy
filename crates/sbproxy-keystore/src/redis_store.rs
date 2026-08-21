@@ -370,6 +370,13 @@ impl CacheTier for RedisCacheTier {
     /// out leaves every peer's L1 holding it. Neither is a cache miss the
     /// store can cover for, which is why this is the one part of the tier
     /// that does not swallow its errors.
+    ///
+    /// What `Ok` does not prove: Redis `PUBLISH` reports how many
+    /// subscribers received the message and succeeds at zero, so `Ok` means
+    /// the announcement went out, not that any peer was listening. A
+    /// replica whose subscription was down is covered by the subscriber
+    /// clearing its whole local cache on every resubscription, not by this
+    /// return value.
     async fn invalidate(&self, id: &str) -> Result<()> {
         // `conn()` already names the redacted DSN in its own error.
         let mut c = self

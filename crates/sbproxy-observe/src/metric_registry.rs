@@ -3344,12 +3344,24 @@ pub const METRICS: &[MetricCapability] = &[
     MetricCapability {
         name: "sbproxy_prompt_injection_v2_results_total",
         kind: MetricKind::Counter,
-        writer: Writer::Recorder("record_metric"),
+        // `body_aware_counter`, not the `record_metric` that increments it.
+        // Writer matching is textual and unqualified, and `record_metric`
+        // is a name a closure parameter in `sbproxy-core`'s
+        // `compression_value.rs` also carries, so it counts as a call site
+        // for a function that has nothing to do with this family. That is
+        // a live-writer guard that stays green after the real writer loses
+        // its last caller. `body_aware_counter` is unique in the
+        // workspace, is called only from `record_metric`, and builds this
+        // exact vec.
+        writer: Writer::Recorder("body_aware_counter"),
         support: SupportLevel::Stable,
         compat: CompatTier::Alpha,
         // Registered into the ProxyMetrics registry rather than the global
-        // one: `body_aware_counter()` builds the vec by hand and hands it to
-        // `metrics().registry`.
+        // one: the writer above builds the vec by hand and hands it to
+        // `metrics().registry`. Written without the trailing parenthesis on
+        // purpose. Recorder call sites are counted textually over raw
+        // source, comments included, so `name(` written here would count as
+        // a call and keep the live-writer check green on its own.
         registry: Registry::Proxy,
         labels: &["action", "label", "detector"],
         description: "Body-aware prompt-injection detector results, by action taken, detection label, and detector name.",

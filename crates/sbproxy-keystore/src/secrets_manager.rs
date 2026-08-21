@@ -63,7 +63,7 @@ pub struct SecretsManagerKeyStore {
     /// This covers one process. It does not cover a second sbproxy replica
     /// pointed at the same vault prefix, an operator editing the secret by
     /// hand, or any other external writer. Against those, the read-back
-    /// retry governed by [`RMW_ATTEMPTS`] is the whole defense, and it
+    /// retry governed by `RMW_ATTEMPTS` is the whole defense, and it
     /// narrows the race rather than closing it. Closing it needs a
     /// conditional write, which is exactly the primitive
     /// `put_key_if_revision` reports as [`KeyPolicyCasResult::Unsupported`]
