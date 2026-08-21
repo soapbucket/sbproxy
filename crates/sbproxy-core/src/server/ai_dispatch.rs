@@ -6037,8 +6037,15 @@ pub(super) async fn handle_ai_proxy(
                     bytes::Bytes::from(translated)
                 }
                 Err(e) => {
+                    // WOR-2595: the typed record goes out here rather
+                    // than from the terminal logging hook, because the
+                    // reason code does not survive to `logging` and both
+                    // refusal arms `return Ok(())` immediately, which is
+                    // what makes one call here exactly one record.
+                    record_ai_admission_refusal(ctx, surface_label, e.reason());
                     warn!(
                         error = %e,
+                        reason = e.reason(),
                         "AI proxy: failed to parse Anthropic Messages inbound body"
                     );
                     send_error(session, e.status(), e.message()).await?;
@@ -6097,8 +6104,20 @@ pub(super) async fn handle_ai_proxy(
                                 }
                             }
                             Some(Err((status, message))) => {
+                                // The bridge returns prose rather than a
+                                // `ChatError`, so the code is chosen here.
+                                // Its two shapes (an unknown reference,
+                                // and a malformed or unrenderable object)
+                                // split on the status the bridge picked.
+                                let reason = if status == 404 {
+                                    "prompt_reference_not_found"
+                                } else {
+                                    "prompt_object_unrenderable"
+                                };
+                                record_ai_admission_refusal(ctx, surface_label, reason);
                                 warn!(
                                     error = %message,
+                                    reason,
                                     "AI proxy: Responses prompt bridge refused request"
                                 );
                                 send_error(session, status, &message).await?;
@@ -6120,8 +6139,10 @@ pub(super) async fn handle_ai_proxy(
                     bytes::Bytes::from(translated)
                 }
                 Err(e) => {
+                    record_ai_admission_refusal(ctx, surface_label, e.reason());
                     warn!(
                         error = %e,
+                        reason = e.reason(),
                         "AI proxy: failed to parse OpenAI Responses inbound body"
                     );
                     send_error(session, e.status(), e.message()).await?;
@@ -11752,6 +11773,81 @@ fn record_ai_failure_decision(
         &ctx.tenant_id,
         &reason,
         DecisionDetails::ai_failure(provider, kind),
+    );
+}
+
+/// Record `ai.admission` on the decision family, the AI admission
+/// counter, and, when enabled, the audit feed (WOR-2595).
+///
+/// The funnel behind every pre-provider refusal the inbound
+/// native-format shim can take: the Anthropic Messages translate, the
+/// Responses stored-prompt bridge, and the Responses translate. Before
+/// it, an MCP-governance-bypass attempt (`tools: [{"type": "mcp", ...}]`
+/// on `/v1/responses`) produced one free-text warn and a bare 400, which
+/// is metrically and forensically indistinguishable from a typo'd JSON
+/// body.
+///
+/// **What this cannot see.** Only those three arms. A request refused
+/// later by the model allow/block gate, a virtual-key policy, a
+/// guardrail, a budget, a rate limiter, or a CEL/Rego policy is that
+/// plane's decision and publishes under that plane's own event; none of
+/// them route through here. Refusals on the canonical
+/// `/v1/chat/completions` path have no inbound shim at all, so they
+/// cannot reach this funnel either. `docs/events.md` states the same
+/// boundary for operators.
+///
+/// `reason` is a `&'static str` from [`sbproxy_ai::format::ChatError::reason`]
+/// and never the error's message: several of the coded refusals
+/// interpolate caller bytes into the message (a serde parse error, an
+/// unrecognized role name), and both the metric label and
+/// `DecisionDetails` ship unscrubbed. The message reaches the client and
+/// the audit record's scrubbed `reason` prose, and nowhere else.
+fn record_ai_admission_refusal(ctx: &RequestContext, surface: &str, reason: &'static str) {
+    use sbproxy_observe::decision::{
+        DecisionDetails, DecisionEngine, DecisionEvent, DecisionOutcome,
+    };
+
+    sbproxy_ai::ai_metrics::record_admission_decision(surface, reason, "deny");
+
+    let origin_id = ctx
+        .origin_idx
+        .and_then(|idx| ctx.pipeline.config.origins.get(idx))
+        .map(|origin| origin.origin_id.to_string());
+    let origin_for_family = origin_id.as_deref().unwrap_or("__unmatched__");
+    sbproxy_observe::decision::record_decision(
+        DecisionEvent::AiAdmission,
+        DecisionEngine::BuiltIn,
+        DecisionOutcome::Deny,
+        origin_for_family,
+        &ctx.tenant_id,
+    );
+
+    let Some(origin_id) = origin_id else {
+        return;
+    };
+    if !crate::server::proxy_http::audit_publishes(
+        &ctx.pipeline,
+        DecisionEvent::AiAdmission,
+        Some(&ctx.tenant_id),
+        Some(&origin_id),
+    ) {
+        return;
+    }
+    // Prose built from the two bounded codes only, for the same reason
+    // the detail fields are: this string is scrubbed on the way into the
+    // record, but scrubbing is a redaction pass over operator-configured
+    // patterns, not a guarantee about an arbitrary parse error.
+    let audit_reason = format!("{surface} surface refused the request before dispatch: {reason}");
+    crate::policy_bus::emit_decision_audit_detailed(
+        DecisionEvent::AiAdmission,
+        DecisionEngine::BuiltIn,
+        DecisionOutcome::Deny,
+        &ctx.request_id,
+        &origin_id,
+        &origin_id,
+        &ctx.tenant_id,
+        &audit_reason,
+        DecisionDetails::ai_admission(surface, reason),
     );
 }
 
@@ -22958,6 +23054,301 @@ mod ai_error_classification_tests {
             ),
             "timeout"
         );
+    }
+
+    /// One `sbproxy_ai_admission_decisions_total` series, or 0 when
+    /// nothing has created it yet.
+    ///
+    /// `prometheus::gather()` reads a process-global registry and the
+    /// sibling tests in this module can run in the same process, so
+    /// callers assert a strict increase rather than an exact value.
+    fn admission_decisions_count(surface: &str, reason: &str) -> f64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "sbproxy_ai_admission_decisions_total")
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        let labelled = |name: &str, want: &str| {
+                            metric
+                                .get_label()
+                                .iter()
+                                .any(|label| label.name() == name && label.value() == want)
+                        };
+                        labelled("surface", surface)
+                            && labelled("reason", reason)
+                            && labelled("outcome", "deny")
+                    })
+                    .map(|metric| metric.get_counter().value())
+                    .sum()
+            })
+            .unwrap_or_default()
+    }
+
+    /// WOR-2595: red first, at the dispatch seam rather than at the
+    /// funnel.
+    ///
+    /// Before this wiring the whole handling of a Responses-shim refusal
+    /// was `warn!` plus `send_error`: no `record_decision`, no audit
+    /// record, and no counter. An MCP-governance-bypass attempt was
+    /// therefore indistinguishable in metrics from a typo'd JSON body,
+    /// both landing on `record_ai_gateway_decision("rejected",
+    /// "client_error")`. This drives a real `POST /v1/responses` through
+    /// `handle_ai_proxy` so it fails if the shim's refusal arm stops
+    /// calling the funnel, not merely if the funnel itself breaks. On
+    /// main the counter family does not exist and the first assertion
+    /// reads 0 against 0.
+    #[tokio::test]
+    async fn responses_mcp_tool_refusal_counts_an_ai_admission_deny() {
+        let config = openai_proxy_config("http://127.0.0.1:9");
+        let request = serde_json::json!({
+            "model": "requested-model",
+            "input": "fixture prompt",
+            "tools": [{
+                "type": "mcp",
+                "server_url": "https://evil.invalid/?token=SECRETTOKEN",
+                "server_label": "internal"
+            }]
+        });
+        let (mut session, client) = downstream_bytes_session(
+            "/v1/responses",
+            "application/json",
+            serde_json::to_vec(&request).expect("request JSON"),
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let before = admission_decisions_count("responses", "tools_mcp_unsupported");
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the MCP tool refusal is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 400"), "{response:?}");
+        assert!(
+            admission_decisions_count("responses", "tools_mcp_unsupported") >= before + 1.0,
+            "the refusal must tick sbproxy_ai_admission_decisions_total\
+             {{surface=\"responses\",reason=\"tools_mcp_unsupported\",outcome=\"deny\"}}"
+        );
+        // The refusal message names the governed alternative and nothing
+        // the caller sent; the URL can carry a credential.
+        let rendered = String::from_utf8_lossy(&response);
+        assert!(
+            !rendered.contains("SECRETTOKEN") && !rendered.contains("server_url"),
+            "the refusal must not echo the caller's MCP server URL: {rendered}"
+        );
+        assert_eq!(
+            context.admin_ai_attempts, 0,
+            "a refused request never reaches a provider"
+        );
+    }
+
+    /// The audit half of the pair above: with `ai.admission` enabled the
+    /// same refusal publishes exactly one typed record, and the record
+    /// carries the bounded surface and reason codes rather than the
+    /// refusal prose.
+    #[tokio::test]
+    async fn responses_mcp_tool_refusal_publishes_ai_admission_when_enabled() {
+        let compiled = sbproxy_config::compile_config(
+            r#"
+proxy:
+  tenants:
+    - id: acme
+  observability:
+    log:
+      decision_audit:
+        enabled: false
+        events:
+          ai.admission: true
+origins:
+  "ai.test":
+    tenant_id: acme
+    action:
+      type: static
+      body: ok
+"#,
+        )
+        .expect("ai.admission fixture config");
+        let pipeline = std::sync::Arc::new(
+            crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+                .expect("ai.admission fixture pipeline"),
+        );
+
+        let config = openai_proxy_config("http://127.0.0.1:9");
+        let request = serde_json::json!({
+            "model": "requested-model",
+            "input": "fixture prompt",
+            "tools": [{
+                "type": "mcp",
+                "server_url": "https://evil.invalid/?token=SECRETTOKEN"
+            }]
+        });
+        let (mut session, client) = downstream_bytes_session(
+            "/v1/responses",
+            "application/json",
+            serde_json::to_vec(&request).expect("request JSON"),
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        context.pipeline = std::sync::Arc::clone(&pipeline);
+        context.origin_idx = Some(0);
+        context.tenant_id = "acme".into();
+        context.request_id = "req-ai-admission".into();
+
+        let (bus, mut rx) = crate::policy_bus::channel(16);
+        crate::policy_bus::init_global_bus(bus);
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            pipeline.as_ref(),
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("the MCP tool refusal is handled");
+        drop(session);
+        let _ = live_downstream_body(client).await;
+
+        let mut ours = Vec::new();
+        while let Ok(record) = rx.try_recv() {
+            if let crate::policy_bus::AuditRecord::Decision(audit) = record {
+                if audit.request_id == "req-ai-admission" {
+                    ours.push(audit);
+                }
+            }
+        }
+        assert_eq!(
+            ours.len(),
+            1,
+            "the refusal returns immediately, so it publishes exactly one record"
+        );
+        let audit = &ours[0];
+        assert_eq!(
+            audit.event,
+            sbproxy_observe::decision::DecisionEvent::AiAdmission
+        );
+        assert_eq!(
+            audit.outcome,
+            sbproxy_observe::decision::DecisionOutcome::Deny
+        );
+        assert_eq!(audit.origin, "ai.test");
+        assert_eq!(audit.tenant, "acme");
+        assert_eq!(audit.details.surface.as_deref(), Some("responses"));
+        assert_eq!(
+            audit.details.verdict.as_deref(),
+            Some("tools_mcp_unsupported")
+        );
+        let rendered = audit.to_ocsf().to_string();
+        assert!(
+            !rendered.contains("SECRETTOKEN") && !rendered.contains("server_url"),
+            "details ship unscrubbed, so the record must carry codes only: {rendered}"
+        );
+    }
+
+    /// The negative case: a request the shim admits with a lossiness
+    /// note must publish no `ai.admission` record at all.
+    ///
+    /// An unsupported non-`mcp` tool block is dropped and counted on
+    /// `sbproxy_ai_translation_dropped_total`, not refused. A guard that
+    /// counted this as an admission denial would report a refusal rate
+    /// that no client ever saw a 400 for.
+    #[tokio::test]
+    async fn an_admitted_lossy_responses_request_publishes_no_ai_admission() {
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture(
+            serde_json::to_vec(&serde_json::json!({
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }]
+            }))
+            .expect("upstream JSON"),
+            "application/json",
+        )
+        .await;
+        let compiled = sbproxy_config::compile_config(
+            r#"
+proxy:
+  observability:
+    log:
+      decision_audit:
+        enabled: true
+origins:
+  "ai.test":
+    action:
+      type: static
+      body: ok
+"#,
+        )
+        .expect("ai.admission negative fixture config");
+        let pipeline = std::sync::Arc::new(
+            crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+                .expect("ai.admission negative fixture pipeline"),
+        );
+
+        let config = openai_proxy_config(&upstream_url);
+        let request = serde_json::json!({
+            "model": "requested-model",
+            "input": "fixture prompt",
+            "tools": [{"type": "web_search_preview"}]
+        });
+        let (mut session, client) = downstream_bytes_session(
+            "/v1/responses",
+            "application/json",
+            serde_json::to_vec(&request).expect("request JSON"),
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        context.pipeline = std::sync::Arc::clone(&pipeline);
+        context.origin_idx = Some(0);
+        context.request_id = "req-ai-admission-lossy".into();
+
+        let (bus, mut rx) = crate::policy_bus::channel(16);
+        crate::policy_bus::init_global_bus(bus);
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            pipeline.as_ref(),
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("the lossy request is admitted");
+        drop(session);
+        let _ = live_downstream_body(client).await;
+
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            1,
+            "the request was admitted, so it reached the provider"
+        );
+        while let Ok(record) = rx.try_recv() {
+            if let crate::policy_bus::AuditRecord::Decision(audit) = record {
+                assert!(
+                    !(audit.request_id == "req-ai-admission-lossy"
+                        && audit.event
+                            == sbproxy_observe::decision::DecisionEvent::AiAdmission),
+                    "a dropped-with-a-note field is lossiness, not an admission denial"
+                );
+            }
+        }
     }
 
     /// WOR-2486: red first. Before this wiring, `ai.failure` was on

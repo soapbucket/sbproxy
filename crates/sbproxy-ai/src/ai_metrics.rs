@@ -584,6 +584,52 @@ pub(crate) fn translation_dropped_value(surface: &str, field: &str) -> u64 {
         .get() as u64
 }
 
+// --- Pre-provider admission refusals (WOR-2595) ---
+
+/// Registered without `.unwrap()` for the same reason as
+/// `AI_PRICE_CEILING` below: the production unwrap/expect ratchet in
+/// `scripts/check-unwrap-ratchet.sh` is at its baseline and one metric
+/// family is not worth a panic path.
+static AI_ADMISSION_DECISIONS: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_admission_decisions_total",
+            "Pre-provider AI gateway admission decisions by inbound surface and reason (WOR-2595)"
+        ),
+        &["surface", "reason", "outcome"]
+    )
+    .ok()
+});
+
+/// Record a pre-provider AI admission decision (WOR-2595).
+///
+/// `surface` is the inbound surface label from `AiSurface::label`
+/// (`messages`, `responses`), so the series joins
+/// `sbproxy_ai_surface_requests_total` on the same values. `reason` is
+/// the refusal's bounded code from `ChatError::reason`
+/// (`tools_mcp_unsupported`, `store_unsupported`, `malformed_json`, ...),
+/// the prompt-bridge codes the dispatcher names
+/// (`prompt_reference_not_found`, `prompt_object_unrenderable`), or
+/// `malformed_request` where a refusal site has not been coded.
+/// `outcome` is `deny` today and is carried anyway so an admit-side
+/// counterpart can share the family rather than mint a second one.
+///
+/// Every label value is a `&'static str` at the call site; the
+/// cardinality limiter is a backstop, not the contract. Never pass a
+/// `ChatError::message`: several of the coded refusals interpolate
+/// caller bytes into it.
+pub fn record_admission_decision(surface: &str, reason: &str, outcome: &str) {
+    let Some(counter) = &*AI_ADMISSION_DECISIONS else {
+        return;
+    };
+    let metric = "sbproxy_ai_admission_decisions_total";
+    let surface = sbproxy_observe::metrics::sanitize_label_budget(metric, "surface", surface);
+    let reason = sbproxy_observe::metrics::sanitize_label_budget(metric, "reason", reason);
+    counter
+        .with_label_values(&[surface.as_str(), reason.as_str(), outcome])
+        .inc();
+}
+
 // --- Per-request price ceiling (WOR-2559) ---
 
 /// Registered without `.unwrap()` (mirroring

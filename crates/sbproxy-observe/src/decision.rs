@@ -115,6 +115,17 @@ pub enum DecisionEvent {
     AiClose,
     /// An upstream AI call failed.
     AiFailure,
+    /// The AI gateway refused a request before any provider saw it.
+    ///
+    /// Distinct from [`Self::AiFailure`], which is an upstream fact.
+    /// This one is the proxy's own decision, taken at the inbound
+    /// native-format shim: an MCP tool block that would have asked the
+    /// provider to contact an MCP server behind the gateway's back, a
+    /// stateful-join reference the gateway cannot honor, an unresolved
+    /// stored-prompt object, a body that is not JSON. Without it the
+    /// only trace of a governance-bypass attempt was a bare 400, which
+    /// is metrically indistinguishable from a typo.
+    AiAdmission,
     /// A transform rewrote a response.
     Transform,
     /// An action served a response.
@@ -199,6 +210,7 @@ impl DecisionEvent {
             Self::AiStreamEvent => "ai.stream.event",
             Self::AiClose => "ai.close",
             Self::AiFailure => "ai.failure",
+            Self::AiAdmission => "ai.admission",
             Self::Transform => "transform",
             Self::Action => "action",
             Self::LogCustomField => "log.custom_field",
@@ -224,6 +236,7 @@ impl DecisionEvent {
         Self::AiStreamEvent,
         Self::AiClose,
         Self::AiFailure,
+        Self::AiAdmission,
         Self::Transform,
         Self::Action,
         Self::LogCustomField,
@@ -300,6 +313,15 @@ impl DecisionEvent {
             // ai.failure: `record_ai_provider_response_failure` in
             // ai_dispatch.rs, the one funnel every provider-response
             // failure classification already ran through (WOR-2486).
+            // ai.admission: `record_ai_admission_refusal` in
+            // ai_dispatch.rs, the funnel behind all three pre-provider
+            // refusal arms of the inbound native-format shim (the
+            // Anthropic Messages translate, the Responses prompt-object
+            // bridge, and the Responses translate). Narrower than "every
+            // pre-provider refusal": a request refused by the model
+            // gate, a guardrail, a budget, or a policy is recorded by
+            // that plane's own event and never reaches this one. See
+            // `docs/events.md`.
             // ai.close: `AiRequestExtensions::close()` in
             // ai_extensions.rs, called once per stream regardless of
             // whether any bundle hook subscribed to `ai.close` itself
@@ -321,6 +343,7 @@ impl DecisionEvent {
             | Self::AiGuardrailInput
             | Self::AiGuardrailOutput
             | Self::AiFailure
+            | Self::AiAdmission
             | Self::AiClose
             | Self::McpTool => EventCoverage::Emitted,
             // Published as `policy` records already; see the doc above.
@@ -1001,6 +1024,15 @@ pub struct DecisionDetails {
     /// self-contained when an analyst is looking at a single decision.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision_latency_ms: Option<u32>,
+    /// Which inbound AI surface the decision was taken on.
+    ///
+    /// The same closed vocabulary
+    /// `sbproxy_ai_surface_requests_total` is labelled by (`messages`,
+    /// `responses`, `chat`, ...), so a rule can join a refusal record to
+    /// the surface's own request rate. Proxy-authored: it comes from the
+    /// matched route, never from the body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub surface: Option<String>,
 }
 
 impl DecisionDetails {
@@ -1183,6 +1215,24 @@ impl DecisionDetails {
         }
     }
 
+    /// Detail for a pre-provider AI gateway refusal.
+    ///
+    /// `surface` is the inbound AI surface (`messages`, `responses`),
+    /// and `verdict` is the refusal's bounded reason code
+    /// (`tools_mcp_unsupported`, `store_unsupported`, `malformed_json`,
+    /// ...). Both are `&'static str` at every call site on purpose:
+    /// details ship unredacted, and the refusal messages these records
+    /// accompany interpolate caller bytes (a JSON parse error, an
+    /// unrecognized role name), so the message never becomes a field
+    /// here.
+    pub fn ai_admission(surface: &str, reason: &str) -> Self {
+        Self {
+            surface: (!surface.is_empty()).then(|| surface.to_owned()),
+            verdict: (!reason.is_empty()).then(|| reason.to_owned()),
+            ..Self::default()
+        }
+    }
+
     /// Whether every field is absent, so the OCSF render can leave the
     /// object out rather than emit an empty one.
     ///
@@ -1221,6 +1271,7 @@ impl DecisionDetails {
             policy_surface,
             verdict,
             decision_latency_ms,
+            surface,
         } = self;
         requested_model.is_none()
             && selected_model.is_none()
@@ -1243,6 +1294,7 @@ impl DecisionDetails {
             && policy_surface.is_none()
             && verdict.is_none()
             && decision_latency_ms.is_none()
+            && surface.is_none()
     }
 
     /// Whether the decision moved the request off what it asked for, or
@@ -1726,6 +1778,7 @@ mod tests {
                 "ai.tool_call",
                 "ai.close",
                 "ai.failure",
+                "ai.admission",
                 "mcp.tool"
             ],
             "the wired set changed; update has_emitter and the docs that state coverage"

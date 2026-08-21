@@ -77,11 +77,12 @@ Config: `proxy.observability.log.decision_audit.events.route.decide: true`
 [observability.md](observability.md#one-family-for-every-decision-event),
 [decision-records.md](decision-records.md).
 
-Named limit: eight of the eighteen possible decision events publish under
+Named limit: eleven of the nineteen possible decision events publish under
 their own label today (`auth`, `cache.admit`, `cache.key`, `route.decide`,
-`ai.guardrail.input`, `ai.guardrail.output`, `ai.tool_call`, `mcp.tool`),
-plus `policy` under the newer record format. The other nine are not one
-undifferentiated leftover; the code names four deliberate states for them.
+`ai.guardrail.input`, `ai.guardrail.output`, `ai.tool_call`, `ai.close`,
+`ai.failure`, `ai.admission`, `mcp.tool`), plus `policy` under the newer
+record format. The other seven are not one undifferentiated leftover; the
+code names four deliberate states for them.
 `waf` and `rate_limit` are superseded by policy: both already run in the
 policy chain and publish as a `policy` record naming which one fired, so a
 second emitter would double-record one decision rather than add coverage.
@@ -90,9 +91,8 @@ durable settlement store, and this feed drops records under load, which is
 the wrong trade for a receipt. `ai.stream.event` never publishes: it fires
 once per streamed chunk, so config load refuses `ai.stream.event: true`
 outright rather than accept an ingest bill (`ai.close` carries the
-stream's summary once instead). The remaining five, `ai.close`,
-`ai.failure`, `transform`, `action`, `log.custom_field`, are genuinely
-unwired, no emitter yet. An `events:` key naming a label this proxy does
+stream's summary once instead). The remaining three, `transform`,
+`action`, and `log.custom_field`, are genuinely unwired, no emitter yet. An `events:` key naming a label this proxy does
 not recognize fails config load; a known but unwired label loads and
 warns at boot instead, because refusing every label a later release might
 wire would block pre-configuring it today. Proof:
