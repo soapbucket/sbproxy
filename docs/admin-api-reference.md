@@ -296,7 +296,7 @@ missing key/credential id is `404`.
 
 ```json
 {
-  "key_id": "key_9f2c...",
+  "key_id": "a1b2c3d4e5f60789",
   "policy_revision": 3,
   "policy_digest": "sha256:...",
   "name": "checkout-service",
@@ -353,7 +353,7 @@ default to the server-read value; `PATCH` requires it explicitly). A
 mismatch returns `409`:
 
 ```json
-{"error": "key policy revision conflict", "key_id": "key_9f2c...", "expected_revision": 2, "current_revision": 3}
+{"error": "key policy revision conflict", "key_id": "a1b2c3d4e5f60789", "expected_revision": 2, "current_revision": 3}
 ```
 
 A `revoked` key is terminal: any further mutation returns
@@ -368,8 +368,18 @@ Mints a fresh secret, keeps the prior hash valid for `grace_secs`
 (both authenticate during the window), and returns:
 
 ```json
-{"token": "sbp_key_9f2c..._<new secret>", "grace_expires_at": "2026-07-01T01:00:00Z", "key": {"...": "..."}}
+{"token": "sbp_a1b2c3d4e5f60789_<new secret>", "grace_expires_at": "2026-07-01T01:00:00Z", "key": {"...": "..."}}
 ```
+
+The key id has to be one the gateway minted: sixteen lowercase hex
+characters, which is what `POST /admin/keys` produces. A key seeded from
+config under `key_management.seed.keys[]` can carry any id its author
+wrote, and a rotated token built from a non-conforming id is not a token
+the inbound resolver can parse. Rotating one returns
+`409 {"error": "key id is not in the minted format ..."}` and changes
+nothing, so the credential in the field keeps working. To replace a
+seeded key, create a new one with `POST /admin/keys`, move callers over,
+then revoke the seeded id.
 
 ### `POST /admin/keys/{id}/budget-override`
 

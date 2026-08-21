@@ -9,7 +9,7 @@ use super::*;
 use sbproxy_config::types::FailureMode;
 
 /// Whether the inbound request asks for a WebSocket upgrade.
-fn is_websocket_upgrade_request(request: &pingora_http::RequestHeader) -> bool {
+pub(super) fn is_websocket_upgrade_request(request: &pingora_http::RequestHeader) -> bool {
     request
         .headers
         .get(http::header::UPGRADE)
@@ -556,13 +556,17 @@ pub(super) async fn handle_action(
             // (`content_shape_transform`, `markdown_projection`,
             // `canonical_url`, `rsl_urn`, `citation_required`). The walk
             // itself is shared with the mock arm (WOR-2496).
-            let mut body_bytes = apply_origin_transforms_to_generated_body(
+            let transform_outcome = apply_origin_transforms_to_generated_body(
                 pipeline,
                 origin_idx,
                 ctx,
                 Bytes::copy_from_slice(s.body.as_bytes()),
                 &ct,
             );
+            if transform_outcome.terminal_failure {
+                return serve_generated_transform_failure(session, ctx, transform_outcome).await;
+            }
+            let mut body_bytes = transform_outcome.body;
 
             // Wave 4 day-5 Items 3 + 4: shape-driven body rewrite +
             // Content-Type override.
@@ -952,13 +956,17 @@ pub(super) async fn handle_action(
             // WOR-2496: the origin's transform chain applies to the
             // mock body the same way it does to a static body or an
             // upstream response.
-            let body = apply_origin_transforms_to_generated_body(
+            let transform_outcome = apply_origin_transforms_to_generated_body(
                 pipeline,
                 origin_idx,
                 ctx,
                 Bytes::from(serde_json::to_vec(&m.body).unwrap_or_default()),
                 "application/json",
             );
+            if transform_outcome.terminal_failure {
+                return serve_generated_transform_failure(session, ctx, transform_outcome).await;
+            }
+            let body = transform_outcome.body;
             // WOR-2599: without a declared length Pingora frames the body
             // close-delimited, so the only end-of-body signal is the
             // connection dying and a client cannot tell a finished body
@@ -1417,6 +1425,48 @@ pub(super) async fn handle_action(
             }
         }
     }
+}
+
+/// Serve the `failure_posture: closed` refusal for a locally generated
+/// response whose transform chain faulted.
+///
+/// A `static` or `mock` action answers in the request phase, so there is
+/// no committed upstream header to work around: the status line is still
+/// ours to write and the refusal is an ordinary `500` carrying the
+/// substituted body, not the generated one. `x-sbproxy-transform-error`
+/// names the transform, matching the attribution the proxied path
+/// stamps.
+async fn serve_generated_transform_failure(
+    session: &mut Session,
+    ctx: &mut RequestContext,
+    outcome: crate::server::GeneratedBodyTransformOutcome,
+) -> Result<bool> {
+    ctx.response_status = Some(500);
+    ctx.response_status_override = Some(500);
+    let attribution = ctx.transform_error_attribution.clone();
+    let mut header = pingora_http::ResponseHeader::build(500, Some(3)).map_err(|e| {
+        Error::because(
+            ErrorType::InternalError,
+            "failed to build transform-failure header",
+            e,
+        )
+    })?;
+    header
+        .insert_header("content-type", "application/json")
+        .map_err(|e| Error::because(ErrorType::InternalError, "failed to set content-type", e))?;
+    header
+        .insert_header("content-length", outcome.body.len().to_string())
+        .map_err(|e| Error::because(ErrorType::InternalError, "failed to set content-length", e))?;
+    if let Some(name) = attribution {
+        let _ = header.insert_header("x-sbproxy-transform-error", name);
+    }
+    session
+        .write_response_header(Box::new(header), false)
+        .await?;
+    session
+        .write_response_body(Some(outcome.body), true)
+        .await?;
+    Ok(true)
 }
 
 struct PluginActionTransformOutcome {

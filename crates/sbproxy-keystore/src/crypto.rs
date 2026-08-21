@@ -559,9 +559,11 @@ mod tests {
     #[test]
     fn legacy_parse_cannot_resolve_a_seeded_key_id_containing_a_dash() {
         // `parse_token` splits on the FIRST dash, so a config-seeded key_id
-        // with a dash in it can never round-trip. Latent today because the
-        // shipped examples use `ci0001` / `seed0001`; pinned so it stays that
-        // way rather than becoming a silent auth failure later.
+        // with a dash in it can never round-trip. The shipped examples now
+        // seed a conforming id, so nothing in the tree depends on the loose
+        // shape; pinned so a dashed id stays a refusal rather than becoming a
+        // silent auth failure later. `rotate_key` refuses a non-conforming id
+        // outright, for the same reason on the minting side.
         let (key_id, secret) = parse_token("sk-team-alpha-secretvalue").unwrap();
         assert_eq!(key_id, "team", "splits on the first dash, not the last");
         assert_eq!(secret, "alpha-secretvalue");

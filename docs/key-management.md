@@ -1417,6 +1417,14 @@ survive a reload instead.
 For a self-contained config, declare keys and credentials inline. A seed key
 takes either a `secret` (hashed at boot) or a precomputed `secret_hash`.
 
+Give a seeded key an id in the shape the gateway mints, sixteen lowercase hex
+characters. Nothing validates the field, and a seeded key with any id
+authenticates fine as `sk-<key_id>-<secret>`, but the minted token shape is
+`sbp_<16 hex>_<64 hex>` and a rotated token has to parse back on the inbound
+path. `POST /admin/keys/{id}/rotate` refuses a non-conforming id with a `409`
+rather than hand you a token that authenticates nowhere. Avoid a dash in the
+id for the same family of reasons: the legacy parser splits on the first one.
+
 The `key_management:` block nests under `proxy:`; a top-level `key_management:`
 key is silently dropped with a warning and the feature stays off.
 
@@ -1429,7 +1437,7 @@ proxy:
       master_key: env:SBPROXY_KEY_MASTER
     seed:
       keys:
-        - key_id: ci0001
+        - key_id: a1b2c3d4e5f60789
           secret: rotate-me-in-production
           name: ci-runner
           max_requests_per_minute: 60

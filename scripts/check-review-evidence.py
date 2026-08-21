@@ -36,10 +36,13 @@ An `## Adversarial review` heading, and beneath it:
   2. A `Findings:` line carrying a count for each of Blocker, Major, and
      Minor, or the literal `Findings: none`.
   3. One list item per declared finding, leading with its severity and
-     carrying a disposition sentence that starts `Fixed`, `Accepted`, or
-     `Filed`. The item count per severity must equal the declared count
-     in both directions, so an undercounted summary fails the same way
-     an undocumented finding does.
+     carrying a disposition: a clause that says what happened to that
+     finding. `Fixed.`, `Landed in #1177.`, `Not fixed here, the remedy
+     is separate scope.`, `Partly addressed.`, `Deferred to release
+     prep.`, `Not replicated.` The full shape is under OUTCOMES below.
+     The item count per severity must equal the declared count in both
+     directions, so an undercounted summary fails the same way an
+     undocumented finding does.
   4. A `Verification:` line when the counts are not all zero, because
      CLAUDE.md requires a verification round on the fixes whenever the
      first round finds anything. Without this the rule would be one more
@@ -102,6 +105,7 @@ import io
 import json
 import re
 import sys
+import textwrap
 import unicodedata
 from pathlib import Path
 
@@ -117,10 +121,68 @@ DOC_POINTER = (
 # findings list.
 SEVERITIES = ("Blocker", "Major", "Minor")
 
-# The dispositions a finding may end in. Small on purpose: a closed
-# vocabulary is what makes the line machine-checkable, and the failure
-# message prints the whole set, so nobody has to guess.
-DISPOSITIONS = ("Fixed", "Accepted", "Filed")
+# What a disposition is, and why it is not a list of three verbs.
+#
+# The rule this enforces is not "findings get fixed". The fix-do-not-file
+# rule in CLAUDE.md does that, and a human decides it. What is checkable
+# here is narrower and still worth having: **every declared finding has a
+# stated outcome rather than being listed and abandoned.** So the test is
+# "does this sentence say what happened to this finding", not "does it
+# use an approved verb".
+#
+# The first version of this check accepted `Fixed`, `Accepted`, and
+# `Filed` and nothing else. Its first real pull request, #1181, wrote
+# `Landed in #1177, same seam`, `Not fixed here. Pre-existing, the remedy
+# is a separate change`, `Partly addressed. Unit coverage added, e2e
+# still absent`, `Not replicated. Neither commit carries the trailer`,
+# and `Deferred by convention`. Every one of those states an outcome, and
+# several say more than `Accepted.` does. The gate refused all five, and
+# the author satisfied it by prefixing `**Accepted.**` to each sentence
+# he had already written. That is the gate making the pull request body
+# worse, which is the one thing it exists to prevent.
+#
+# So the vocabulary stays closed, because the alternative does not work:
+# "any past participle opening a clause" would take `Observed in the
+# logs`, `Introduced by #1148`, and `Caused by the same bug`, which are
+# descriptions of the finding and not outcomes for it. What was wrong was
+# not closedness. It was that three bare words have nowhere to put
+# polarity or degree, and the honest negative and partial forms are where
+# most real dispositions live.
+#
+# The shape is therefore `[qualifier] outcome`, opening a clause:
+#
+#   - OUTCOMES stand alone.  `Fixed.`  `Landed in #1177.`  `Deferred.`
+#   - A qualifier moves the capital to itself and the outcome follows in
+#     any case.  `Not fixed here.`  `Partly addressed.`  `Already fixed.`
+#   - NEGATED_OUTCOMES are outcomes only in the negative. `Not
+#     replicated` says the finding does not apply here. Bare
+#     `Replicated` says the opposite: the finding is real and nothing has
+#     happened to it, which is exactly the abandonment this checks for.
+OUTCOMES = (
+    "Fixed",  # repaired in this branch
+    "Addressed",  # repaired, where "fixed" would overstate it
+    "Resolved",
+    "Mitigated",  # bounded rather than removed
+    "Reverted",
+    "Landed",  # repaired by another change already in the tree
+    "Superseded",  # the finding no longer describes the code
+    "Accepted",  # the risk is taken knowingly
+    "Declined",  # considered and refused, with a reason
+    "Waived",
+    "Deferred",  # left for a named later moment
+    "Filed",  # tracked elsewhere, with a reference
+    "Withdrawn",  # the reviewer took it back
+)
+
+# Only a disposition when negated. See the note above.
+NEGATED_OUTCOMES = ("replicated", "reproduced", "applicable", "reachable")
+
+# Polarity. Unlocks NEGATED_OUTCOMES as well as OUTCOMES.
+NEGATIVE_QUALIFIERS = ("Not",)
+
+# Degree. `Partly addressed` is a real outcome and a more useful one than
+# `Fixed` would be, since it says which half is missing.
+DEGREE_QUALIFIERS = ("Partly", "Partially", "Already")
 
 # Values that look like an answer and are not one. Compared against the
 # whole field value, lowercased and stripped of trailing periods, so a
@@ -208,25 +270,90 @@ COUNT = re.compile(r"(\d+)\s*[*_`]{0,3}\s*(blocker|major|minor)s?\b", re.IGNOREC
 # a second finding.
 ITEM_SEVERITY = re.compile(r"^[*_`]{0,3}\s*(blocker|major|minor)\b", re.IGNORECASE)
 
-# A disposition has to be capitalized and start a clause, so that an
-# ordinary finding description ("the endpoint accepted a forged token")
-# cannot pass for one. Deliberately not IGNORECASE.
+# A disposition has to open a clause and carry the capital there, so that
+# an ordinary finding description ("the endpoint accepted a forged
+# token", "the timeout is not fixed by the retry change") cannot pass for
+# one. Deliberately not IGNORECASE at the head of the clause; the word
+# *after* a qualifier is case-free, because `Not fixed` and `Not Fixed`
+# say the same thing.
 #
 # The clause boundaries are wider than sentence-enders because people
 # write `boom, Fixed in this branch`, `boom; Fixed`, `boom: Fixed`,
 # `boom [Fixed]`, and a bare line break where a period would go. Refusing
 # those is how a gate teaches people to route around it. The trailing
 # `(?![\w-])` is what keeps `Fixed-size columns are the cause` from
-# reading as a disposition.
+# reading as a disposition, on the qualified branch as much as the bare
+# one.
 #
-# Residual and accepted: `Accepted values are only a and b` at a clause
-# start still counts. Separating that from a real disposition needs to
-# understand English, and the cost of guessing wrong is refusing an
-# honest author.
+# ` - ` used to be a clause boundary too, and is not, because the shape
+# this repository documents separates a finding's *fields* with it:
+# `- Major - \`rate_limit.rs:88\` - Declined requests still increment the
+# success counter`. That put the first word of the claim at a clause
+# start, so a claim opening on an outcome word disposed of its own
+# finding. It carried no fixture and no rationale when it was written,
+# and dropping it changes the verdict on none of the last 250 pull
+# request bodies in this repository.
+#
+# Residual and accepted, because the remaining doors cannot be closed
+# without understanding English: `Accepted values are only a and b`,
+# `Filed under the wrong crate`, and `Not applicable to the cache` all
+# still count at a clause start, and a claim written `- Blocker: Declined
+# requests ...` reaches one through the colon. The cost of guessing wrong
+# here is refusing an honest author, which is the failure this file was
+# widened to stop, so the guess is not made.
+_CLAUSE_START = r"(?:^|[.!?]\)?\s+|[,;:]\s+|\n\s*|[(\[]\s*)[*_`]{0,3}"
+_EMPHASIS = r"[*_`]{0,3}"
+_QUALIFIED = "|".join(NEGATIVE_QUALIFIERS + DEGREE_QUALIFIERS)
+
 DISPOSITION_SENTENCE = re.compile(
-    r"(?:^|[.!?]\)?\s+|[,;:]\s+|\n\s*|\s-\s+|[(\[]\s*)[*_`]{0,3}("
-    + "|".join(DISPOSITIONS)
+    _CLAUSE_START
+    + "(?:"
+    + f"(?:{'|'.join(OUTCOMES)})"
+    + f"|(?:{_QUALIFIED})\\s+{_EMPHASIS}(?i:{'|'.join(OUTCOMES)})"
+    + f"|(?:{'|'.join(NEGATIVE_QUALIFIERS)})\\s+{_EMPHASIS}"
+    + f"(?i:{'|'.join(NEGATED_OUTCOMES)})"
     + r")(?![\w-])"
+)
+
+def _para(text: str, indent: str = "  ") -> str:
+    return textwrap.fill(
+        text, width=72, initial_indent=indent, subsequent_indent=indent
+    )
+
+
+_ALL_QUALIFIERS = NEGATIVE_QUALIFIERS + DEGREE_QUALIFIERS
+
+# Printed whenever a finding has no disposition, and built from the
+# tuples above rather than retyped, so the help cannot drift from what
+# the pattern accepts. A gate whose documented examples disagree with its
+# behavior is a trap.
+DISPOSITION_HELP = "\n".join(
+    (
+        _para(
+            "End each finding with a sentence that says what happened to it."
+            " Open a clause with one of:"
+        ),
+        "",
+        _para(", ".join(OUTCOMES), indent="    "),
+        "",
+        _para(
+            "or put "
+            + ", ".join(_ALL_QUALIFIERS[:-1])
+            + f", or {_ALL_QUALIFIERS[-1]} in front of one:"
+            " `Not fixed here, the remedy is separate scope.`,"
+            " `Partly addressed, the e2e is still absent.`,"
+            " `Already fixed in #1177.`. `Not` also opens "
+            + ", ".join(f"`Not {w}`" for w in NEGATED_OUTCOMES[:-1])
+            + f", and `Not {NEGATED_OUTCOMES[-1]}`, which state an outcome"
+            " only in the negative."
+        ),
+        "",
+        _para(
+            "The capital and the clause break are load bearing: they are what"
+            ' keeps an ordinary description ("the endpoint accepted a forged'
+            ' token") from passing for a disposition.'
+        ),
+    )
 )
 
 
@@ -447,13 +574,40 @@ def collect_table_findings(
     A row counts only when one whole cell is exactly a severity, so a
     header row, a separator, and a prose cell that happens to say "major"
     are all left alone.
+
+    When the table names a `Disposition` column, only that column is read
+    for one. Scanning every cell was tolerable while the vocabulary was
+    three words, and it is not now: a finding cell opening `Deferred
+    loading of the bundle is never tested` would dispose its own row
+    while the Disposition column still read `still looking at it`. The
+    header is re-read per table, since a body with a table of findings
+    and a table of something else has two.
     """
     out: list[tuple[int, str, str, bool]] = []
+    previous: list[str] | None = None
+    disposition_column: int | None = None
     for lineno, line in lines:
         m = TABLE_ROW.match(line)
-        if not m or TABLE_SEPARATOR.match(line):
+        if not m:
             continue
         cells = [clean_value(c) for c in m.group(1).split("|")]
+        if TABLE_SEPARATOR.match(line):
+            # The row above a separator is the header, and every table has
+            # one, so recomputing here is what keeps a second table from
+            # inheriting the first's column. Resetting on the blank line
+            # between two tables would do the same thing and would not be
+            # reachable by any input this could get wrong, so it is not
+            # here: unfalsifiable code is code nothing is holding.
+            disposition_column = next(
+                (
+                    i
+                    for i, c in enumerate(previous or [])
+                    if c.lower().rstrip(".") == "disposition"
+                ),
+                None,
+            )
+            continue
+        previous = cells
         index = next(
             (i for i, c in enumerate(cells) if c.lower().rstrip(".") in
              {s.lower() for s in SEVERITIES}),
@@ -462,7 +616,15 @@ def collect_table_findings(
         if index is None:
             continue
         rest = [c for i, c in enumerate(cells) if i != index]
-        disposed = any(DISPOSITION_SENTENCE.search(c) for c in rest)
+        if (
+            disposition_column is not None
+            and disposition_column != index
+            and disposition_column < len(cells)
+        ):
+            read_for_disposition = [cells[disposition_column]]
+        else:
+            read_for_disposition = rest
+        disposed = any(DISPOSITION_SENTENCE.search(c) for c in read_for_disposition)
         out.append((lineno, cells[index].capitalize(), " | ".join(rest), disposed))
     return out
 
@@ -628,14 +790,7 @@ def check_body(body: object) -> list[str]:
         flat = " ".join(item.split())
         problems.append(f"line {lineno}: finding has no disposition: {flat[:96]}")
     if undisposed:
-        problems.append(
-            "  End each finding with a sentence starting "
-            + ", ".join(DISPOSITIONS[:-1])
-            + f", or {DISPOSITIONS[-1]}."
-            "\n  It has to start the sentence and keep its capital, so that an"
-            "\n  ordinary description (\"the endpoint accepted a forged token\")"
-            "\n  cannot pass for a disposition."
-        )
+        problems.append(DISPOSITION_HELP)
 
     if declared is not None:
         for severity in SEVERITIES:
@@ -695,7 +850,7 @@ def report(problems: list[str]) -> int:
         # Indent every line, not just the first: a diagnostic whose
         # continuation lines drift left is harder to read than one line.
         for line in problem.split("\n"):
-            print(f"  {line}", file=sys.stderr)
+            print(f"  {line}" if line.strip() else "", file=sys.stderr)
     print("", file=sys.stderr)
     print(
         "A body that satisfies this gate looks like:\n"
@@ -703,13 +858,16 @@ def report(problems: list[str]) -> int:
         "    ## Adversarial review\n"
         "\n"
         "    Reviewer: feature-dev:code-reviewer against .github/code-review-rubric.md\n"
-        "    Findings: 1 Blocker, 0 Major, 1 Minor\n"
+        "    Findings: 1 Blocker, 1 Major, 1 Minor\n"
         "    Verification: second round by the same reviewer, no new findings\n"
         "\n"
         "    - Blocker - `crates/sbproxy-core/src/router.rs:214` - a 5xx retries\n"
         "      against the same dead peer forever. Fixed in this branch.\n"
-        "    - Minor - `crates/sbproxy-core/src/router.rs:88` - doc comment names\n"
-        "      a field that moved. Fixed in this branch.\n"
+        "    - Major - `crates/sbproxy-core/src/router.rs:301` - the retry budget\n"
+        "      is held by convention, not by the type. Not fixed here: the type\n"
+        "      change is separate scope.\n"
+        "    - Minor - `crates/sbproxy-core/src/router.rs:88` - the teardown log\n"
+        "      names a field that moved. Landed in #1177, same seam.\n"
         "\n"
         "or, when the review turned up nothing:\n"
         "\n"
@@ -763,8 +921,18 @@ GOOD_EXPLICIT_ZEROES = """\
 """
 
 
-def _self_test() -> int:
-    """Fixtures for the parser. Reads no network and writes no files."""
+def _fixture_suite() -> list[str]:
+    """Fixtures for the parser. Reads no network and writes nothing.
+
+    Returns the list of fixtures that did not behave as declared, so the
+    mutation battery below can run this against a deliberately broken
+    copy of the module and require the list to be non-empty.
+
+    The only files it opens are the two the repository uses to document
+    the shape, `.github/code-review-rubric.md` and
+    `.github/PULL_REQUEST_TEMPLATE.md`, and only when it is running
+    inside a checkout.
+    """
 
     failures: list[str] = []
 
@@ -860,6 +1028,50 @@ def _self_test() -> int:
         "four-backtick fence quoting a three-backtick block",
         "## Testing\n\n````markdown\n```\nsample\n```\n````\n\n" + GOOD_NONE,
     )
+
+    # --- Every accepted disposition form has a fixture ---
+    # Generated from the tuples rather than typed out, so a word added to
+    # the vocabulary cannot ship without a fixture behind it.
+    def one_finding(disposition: str) -> str:
+        return (
+            "## Adversarial review\n\nReviewer: an agent with shell access\n"
+            "Findings: 1 Blocker, 0 Major, 0 Minor\nVerification: second round\n\n"
+            f"- Blocker - `a.rs:1` - the pool never drains. {disposition}\n"
+        )
+
+    for outcome in OUTCOMES:
+        expect_ok(f"bare outcome {outcome!r}", one_finding(f"{outcome} in this branch."))
+        for qualifier in NEGATIVE_QUALIFIERS + DEGREE_QUALIFIERS:
+            expect_ok(
+                f"{qualifier!r} plus {outcome!r}",
+                one_finding(f"{qualifier} {outcome.lower()} in this branch."),
+            )
+    for outcome in NEGATED_OUTCOMES:
+        for qualifier in NEGATIVE_QUALIFIERS:
+            expect_ok(
+                f"{qualifier!r} plus {outcome!r}",
+                one_finding(f"{qualifier} {outcome} on this branch."),
+            )
+
+    # --- The five forms PR #1181 wrote, verbatim ---
+    # The first pull request this check ever ran against. It refused all
+    # five, and the author satisfied it by prefixing `**Accepted.**` to
+    # each, which is the gate degrading the body it exists to protect.
+    for label, disposition in (
+        ("landed elsewhere", "Landed in #1177 (WOR-2551), same seam"),
+        ("not fixed here", "Not fixed here. Pre-existing, remedy is a separate change"),
+        ("partly addressed", "Partly addressed. Unit coverage added, e2e still absent"),
+        ("not replicated", "Not replicated. Neither commit carries the trailer"),
+        ("deferred by convention", "Deferred by convention"),
+    ):
+        expect_ok(f"#1181 wrote this: {label}", one_finding(disposition))
+        expect_ok(
+            f"#1181 wrote this, in a table: {label}",
+            "## Adversarial review\n\nReviewer: an agent with shell access\n"
+            "Findings: 0 Blocker, 1 Major, 0 Minor\nVerification: second round\n\n"
+            "| ID | Sev | Finding | Disposition |\n|---|---|---|---|\n"
+            f"| M1 | Major | the teardown seam | **{disposition}** |\n",
+        )
 
     # --- Refused shapes ---
     expect_fail("empty body", "", "empty")
@@ -965,6 +1177,156 @@ def _self_test() -> int:
         "Findings: 1 Blocker, 0 Major, 0 Minor\nVerification: second round\n\n"
         "- Blocker - `a.rs:1` - the endpoint accepted a forged token and served it.\n",
         "no disposition",
+    )
+
+    # --- The widened vocabulary still refuses description ---
+    # Each of these is what a loosening of one branch of
+    # DISPOSITION_SENTENCE would let through. The mutation battery below
+    # names the loosening each one kills.
+    for label, tail in (
+        # Confirming a finding is real is the opposite of disposing of
+        # it, so the negated-only outcomes have to stay negated.
+        ("bare Replicated", "the pool never drains. Replicated on main at f7329b05."),
+        ("bare Reproduced", "the pool never drains. Reproduced on a clean checkout."),
+        # A degree qualifier does not turn one into an outcome either.
+        ("Partly reproduced", "the pool never drains. Partly reproduced on a second host."),
+        # A qualifier on its own says nothing about the finding.
+        ("bare Not", "the pool never drains. Not every worker checks the flag."),
+        ("bare Partly", "the pool never drains. Partly because the buffer is shared."),
+        # The capital has to be on the word that opens the clause, both
+        # for a bare outcome and for a qualifier carrying one.
+        ("lowercase not fixed", "the timeout is not fixed by the retry change."),
+        ("lowercase not fixed opening a clause",
+         "the timeout is unbounded; not fixed by the retry change either."),
+        ("lowercase fixed opening a clause",
+         "the retry loop is unbounded; fixed timeouts are not the cause."),
+        # A disposition word mid-clause is a description, not a verdict.
+        ("Fixed as a CHANGELOG heading",
+         "the CHANGELOG entry under Fixed names the wrong crate."),
+        # The hyphen guard covers the qualified branch too.
+        ("Not Accepted-Encoding",
+         "the doc spells the header `accept-encoding`. Not Accepted-Encoding."),
+    ):
+        expect_fail(
+            f"{label} is not a disposition",
+            "## Adversarial review\n\nReviewer: an agent with shell access\n"
+            "Findings: 1 Blocker, 0 Major, 0 Minor\nVerification: second round\n\n"
+            f"- Blocker - `a.rs:1` - {tail}\n",
+            "no disposition",
+        )
+    expect_fail(
+        "a finding cell cannot dispose its own row when there is a Disposition column",
+        "## Adversarial review\n\nReviewer: an agent with shell access\n"
+        "Findings: 0 Blocker, 1 Major, 0 Minor\nVerification: second round\n\n"
+        "| # | Severity | Finding | Disposition |\n|---|---|---|---|\n"
+        "| M1 | Major | Deferred loading of the bundle is never tested"
+        " | still looking at it |\n",
+        "no disposition",
+    )
+    expect_ok(
+        "a table with no Disposition column still reads every cell",
+        "## Adversarial review\n\nReviewer: an agent with shell access\n"
+        "Findings: 0 Blocker, 1 Major, 0 Minor\nVerification: second round\n\n"
+        "| Severity | What was found, and what happened to it |\n|---|---|\n"
+        "| Major | the pool never drains. Fixed in this branch. |\n",
+    )
+    expect_ok(
+        "a second table's Disposition column is read from its own header",
+        "## Adversarial review\n\nReviewer: an agent with shell access\n"
+        "Findings: 0 Blocker, 1 Major, 1 Minor\nVerification: second round\n\n"
+        "| # | Severity | Finding | Disposition |\n|---|---|---|---|\n"
+        "| M1 | Major | the pool never drains | **Fixed.** in this branch |\n\n"
+        "| Severity | What was found, and what happened to it | Notes | Owner |\n"
+        "|---|---|---|---|\n"
+        "| Minor | the log names a moved field. Fixed in this branch."
+        " | none | rick |\n",
+    )
+    # A finding's own claim opens right after the ` - ` that separates it
+    # from the path, so a claim that starts on an outcome word used to
+    # dispose of its own finding. Found by the reviewer of this change.
+    for label, item in (
+        ("Declined requests",
+         "- Major - `rate_limit.rs:88` - Declined requests still increment the\n"
+         "  success counter, which hides the refusal from dashboards."),
+        ("Superseded cache entries",
+         "- Major - `cache.rs:12` - Superseded cache entries are not evicted, so a\n"
+         "  concurrent reader still gets stale data until the old TTL expires."),
+        ("Resolved hostnames",
+         "- Major - `dns.rs:9` - Resolved hostnames are cached without honoring the\n"
+         "  TTL, so a failover stays invisible for an hour."),
+    ):
+        expect_fail(
+            f"a claim opening on {label!r} does not dispose its own finding",
+            "## Adversarial review\n\nReviewer: an agent with shell access\n"
+            "Findings: 0 Blocker, 1 Major, 0 Minor\nVerification: second round\n\n"
+            + item
+            + "\n",
+            "no disposition",
+        )
+    # A lowercase qualifier in front of a negated-only outcome. The
+    # capital has to be on the word that opens the clause on that branch
+    # too, and nothing was holding that before.
+    expect_fail(
+        "a lowercase qualifier before a negated-only outcome is not a disposition",
+        "## Adversarial review\n\nReviewer: an agent with shell access\n"
+        "Findings: 0 Blocker, 1 Major, 0 Minor\nVerification: second round\n\n"
+        "- Major - `health.rs:1` - the check endpoint is unbound; not reachable from\n"
+        "  the sidecar's network namespace, so every request 503s.\n",
+        "no disposition",
+    )
+    expect_fail(
+        "a lowercase qualifier before a negated-only outcome, in a table",
+        "## Adversarial review\n\nReviewer: an agent with shell access\n"
+        "Findings: 0 Blocker, 1 Major, 0 Minor\nVerification: second round\n\n"
+        "| # | Severity | Finding | Disposition |\n|---|---|---|---|\n"
+        "| M1 | Major | the endpoint is unbound | not applicable until the sidecar"
+        " lands |\n",
+        "no disposition",
+    )
+    expect_fail(
+        "a table cell reading Replicated does not dispose the row",
+        "## Adversarial review\n\nReviewer: an agent with shell access\n"
+        "Findings: 0 Blocker, 1 Major, 0 Minor\nVerification: second round\n\n"
+        "| # | Severity | Finding | Disposition |\n|---|---|---|---|\n"
+        "| M1 | Major | the pool never drains | Replicated on main at f7329b05 |\n",
+        "no disposition",
+    )
+
+    # --- Item boundaries: one finding's disposition is not another's ---
+    expect_fail(
+        "a later finding's disposition does not cover an earlier one",
+        "## Adversarial review\n\nReviewer: an agent with shell access\n"
+        "Findings: 2 Blocker, 0 Major, 0 Minor\nVerification: second round\n\n"
+        "- Blocker - `a.rs:1` - the pool never drains.\n"
+        "- Blocker - `a.rs:2` - the retry loop is unbounded. Fixed in this branch.\n",
+        "no disposition",
+    )
+    expect_fail(
+        "a flush-left paragraph after an item does not dispose it",
+        "## Adversarial review\n\nReviewer: an agent with shell access\n"
+        "Findings: 1 Blocker, 0 Major, 0 Minor\nVerification: second round\n\n"
+        "- Blocker - `a.rs:1` - the pool never drains.\n\n"
+        "Fixed in a later branch, once the pool owner is settled.\n",
+        "no disposition",
+    )
+    expect_fail(
+        "a severity named in an item's prose is not a second finding",
+        "## Adversarial review\n\nReviewer: an agent with shell access\n"
+        "Findings: 1 Blocker, 0 Major, 1 Minor\nVerification: second round\n\n"
+        "- Blocker - `a.rs:1` - the pool never drains, which is also what makes the\n"
+        "  Minor below reachable. Fixed in this branch.\n",
+        "declares 1 Minor but the block lists 0",
+    )
+    expect_ok(
+        "a severity named in a note is not a finding",
+        GOOD_NONE + "\n- Scope: the Blocker and Major rules were both run"
+        " against the diff.\n",
+    )
+    expect_fail(
+        "a severity counted twice",
+        "## Adversarial review\n\nReviewer: an agent\n"
+        "Findings: 1 Blocker, 2 Blocker, 0 Major, 0 Minor\n",
+        "more than once",
     )
     expect_fail(
         "findings without a verification round",
@@ -1100,6 +1462,48 @@ def _self_test() -> int:
         "2 `Verification:` lines",
     )
 
+    # --- What the repository documents is what this accepts ---
+    # The rubric tells a reviewer what shape to produce and this file
+    # decides whether that shape passes. Those two drifting apart is how
+    # an author ends up rewriting honest prose to satisfy a gate, which
+    # is what widened this vocabulary in the first place. The template's
+    # stub is the other half: it lives inside an HTML comment, so it has
+    # to fail, or every untouched template would satisfy the check.
+    root = Path(__file__).resolve().parent.parent
+    if (root / ".github").is_dir():
+        rubric = root / ".github" / "code-review-rubric.md"
+        template = root / ".github" / "PULL_REQUEST_TEMPLATE.md"
+        try:
+            rubric_text = rubric.read_text(encoding="utf-8")
+            template_text = template.read_text(encoding="utf-8")
+        except OSError as exc:
+            failures.append(f"cannot read the documented shapes: {exc}")
+        else:
+            examples = [
+                block
+                for block in re.findall(
+                    r"^```markdown\n(.*?)^```$", rubric_text, re.S | re.M
+                )
+                if "Adversarial review" in block
+            ]
+            if len(examples) != 1:
+                failures.append(
+                    f"expected one worked example in {rubric.name},"
+                    f" found {len(examples)}"
+                )
+            for example in examples:
+                problems = check_body(example)
+                if problems:
+                    failures.append(
+                        f"the worked example in {rubric.name} does not pass:"
+                        f" {problems}"
+                    )
+            if not check_body(template_text):
+                failures.append(
+                    f"{template.name} satisfies the check on its own, so every"
+                    " pull request that leaves the stub untouched would pass"
+                )
+
     # --- Line numbers in diagnostics point at the offending line ---
     body = "line one\n\n## Adversarial review\n\nReviewer: TBD\nFindings: none\n"
     if not any("line 5" in p for p in check_body(body)):
@@ -1170,12 +1574,312 @@ def _self_test() -> int:
         if (exempt is not None) != expected:
             failures.append(f"bot exemption for {login} was {exempt!r}, expected exempt={expected}")
 
+    return failures
+
+
+# ---------------------------------------------------------------------------
+# Mutation battery
+# ---------------------------------------------------------------------------
+#
+# A fixture proves the checker accepts what it should. It does not prove
+# the checker would notice if a refusal stopped working: a fixture whose
+# needle happens to match for the wrong reason passes forever. Round 2 of
+# the review on the first version of this file found exactly that, a
+# fixture named for the HTML-comment stripper that stayed green with the
+# stripper replaced by a no-op.
+#
+# So each refusal this file relies on is paired with a loosening of the
+# source that would break it. Every mutation has to make `_fixture_suite`
+# report something. A mutation that nothing catches is a refusal nothing
+# is holding, which is the same as not having it.
+#
+# Each entry is `(name, anchor, replacement)`. The anchor has to appear in
+# the source exactly once, so a refactor that moves the code it names
+# fails the battery loudly instead of quietly testing nothing.
+# Only the source above this line is mutated, so anything defined below
+# it gets no mutation coverage by construction. `main` and
+# `body_from_event_payload` live down there and are covered by the
+# invocation fixtures instead. Anything new that decides whether a body
+# passes belongs above the marker, or its refusals are held by nothing
+# and `--self-test` will keep printing a count that does not include it.
+_BATTERY_MARKER = "MUTATIONS: tuple[tuple[str, str, str], ...] = ("
+
+MUTATIONS: tuple[tuple[str, str, str], ...] = (
+    (
+        "html comments render as prose",
+        'def strip_html_comments(text: str) -> str:\n    """Blank out',
+        'def strip_html_comments(text: str) -> str:\n    return text\n    """Blank out',
+    ),
+    (
+        "an unclosed html block stops at its own line",
+        '            # An HTML block with no closer runs to the end of the document.\n'
+        "            out.append(text[pos:idx])\n"
+        '            out.append("\\n" * text.count("\\n", idx))\n'
+        '            return "".join(out)',
+        "            out.append(text[pos:])\n"
+        '            return "".join(out)',
+    ),
+    (
+        "an inline comment is paired only within its own line",
+        '        close = text.find("-->", idx + 4)',
+        '        _eol = text.find("\\n", idx)\n'
+        '        close = text.find(\n'
+        '            "-->", idx + 4,\n'
+        "            len(text) if opens_block or _eol == -1 else _eol,\n"
+        "        )",
+    ),
+    (
+        "fenced blocks read as prose",
+        'def live_lines(text: str) -> list[tuple[int, str]]:\n    """Return',
+        "def live_lines(text: str) -> list[tuple[int, str]]:\n"
+        '    return list(enumerate(text.split("\\n"), start=1))\n    """Return',
+    ),
+    (
+        "a short closing fence closes a longer block",
+        "if run[0] == fence_char and len(run) >= fence_len and not info:",
+        "if run[0] == fence_char and not info:",
+    ),
+    (
+        "a tilde fence is not a fence",
+        'FENCE = re.compile(r"^ {0,3}((`{3,})|(~{3,}))\\s*(.*)$")',
+        'FENCE = re.compile(r"^ {0,3}((`{3,})|(`{3,}))\\s*(.*)$")',
+    ),
+    (
+        "a tab is one column of indentation",
+        "line.expandtabs(4)",
+        "line.expandtabs(1)",
+    ),
+    (
+        "four spaces of indentation still makes a heading",
+        'HEADING = re.compile(r"^ {0,3}(#{1,6})\\s+(.*?)\\s*$")',
+        'HEADING = re.compile(r"^ *(#{1,6})\\s+(.*?)\\s*$")',
+    ),
+    (
+        "any whitespace counts as heading indentation",
+        'HEADING = re.compile(r"^ {0,3}(#{1,6})\\s+(.*?)\\s*$")',
+        'HEADING = re.compile(r"^\\s{0,3}(#{1,6})\\s+(.*?)\\s*$")',
+    ),
+    (
+        "a section never ends, so a second block folds into the first",
+        "if start is not None and here <= level:",
+        "if start is not None and here <= 0:",
+    ),
+    (
+        "every subheading is skipped, not just Checked and sound",
+        'skipping = title.startswith("checked")',
+        "skipping = True",
+    ),
+    (
+        "a field may appear twice",
+        "if len(hits) > 1:",
+        "if len(hits) > 2:",
+    ),
+    (
+        "invisible formatting characters survive cleaning",
+        'value = "".join(c for c in value if unicodedata.category(c) != "Cf")',
+        'value = "".join(c for c in value)',
+    ),
+    (
+        "a placeholder is an answer",
+        "def placeholder_problem(lineno: int, raw: str, key: str) -> list[str]:\n"
+        "    value = clean_value(raw)",
+        "def placeholder_problem(lineno: int, raw: str, key: str) -> list[str]:\n"
+        "    return []\n    value = clean_value(raw)",
+    ),
+    (
+        "`none` is not a placeholder",
+        '    "none",\n',
+        "",
+    ),
+    (
+        "a missing severity count is not reported",
+        "missing = [s for s in SEVERITIES if not counts[s]]",
+        "missing = []",
+    ),
+    (
+        "a severity counted twice is not reported",
+        "repeated = [s for s in SEVERITIES if len(counts[s]) > 1]",
+        "repeated = []",
+    ),
+    (
+        "an undercounted summary passes",
+        "if want == got:\n                continue",
+        "if want <= got:\n                continue",
+    ),
+    (
+        "an overcounted summary passes",
+        "if want == got:\n                continue",
+        "if want >= got:\n                continue",
+    ),
+    (
+        "the verification round is optional",
+        "elif not dup and declared is not None and sum(declared.values()) > 0:",
+        "elif not dup and declared is not None and sum(declared.values()) > 1000:",
+    ),
+    (
+        "a Disposition column is not honored, so any cell can dispose a row",
+        "            disposition_column is not None\n"
+        "            and disposition_column != index",
+        "            False\n            and disposition_column != index",
+    ),
+    (
+        "the Disposition column is found once and reused by every later table",
+        "        if TABLE_SEPARATOR.match(line):",
+        "        if TABLE_SEPARATOR.match(line) and disposition_column is None:",
+    ),
+    (
+        "tables are not read for findings",
+        "def collect_table_findings(\n    lines: list[tuple[int, str]],\n"
+        ') -> list[tuple[int, str, str, bool]]:\n    """',
+        "def collect_table_findings(\n    lines: list[tuple[int, str]],\n"
+        ') -> list[tuple[int, str, str, bool]]:\n    return []\n    """',
+    ),
+    (
+        "a list item never ends, so a later disposition covers an earlier finding",
+        "if is_break or (pending_blank and indent_columns(line) < 2):",
+        "if False:",
+    ),
+    (
+        # `.match` anchors at position 0 whether or not the pattern says
+        # `^`, so the loosening that actually bites is a leading `.*?`.
+        "a severity anywhere in an item starts a finding",
+        'ITEM_SEVERITY = re.compile(r"^[*_`]{0,3}\\s*(blocker|major|minor)\\b"',
+        'ITEM_SEVERITY = re.compile(r".*?[*_`]{0,3}\\s*(blocker|major|minor)\\b"',
+    ),
+    (
+        "a lowercase disposition word counts",
+        '    + r")(?![\\w-])"\n)',
+        '    + r")(?![\\w-])",\n    re.IGNORECASE,\n)',
+    ),
+    (
+        "a hyphenated word counts as a disposition",
+        '    + r")(?![\\w-])"\n)',
+        '    + r")"\n)',
+    ),
+    (
+        "a disposition word need not open a clause",
+        '_CLAUSE_START = r"(?:^|[.!?]\\)?\\s+|[,;:]\\s+|\\n\\s*|[(\\[]\\s*)[*_`]{0,3}"',
+        '_CLAUSE_START = r"[*_`]{0,3}"',
+    ),
+    (
+        "the dash between a finding's fields opens a clause again",
+        '_CLAUSE_START = r"(?:^|[.!?]\\)?\\s+|[,;:]\\s+|\\n\\s*|[(\\[]\\s*)[*_`]{0,3}"',
+        '_CLAUSE_START = r"(?:^|[.!?]\\)?\\s+|[,;:]\\s+|\\n\\s*|\\s-\\s+|[(\\[]\\s*)[*_`]{0,3}"',
+    ),
+    (
+        # DEGREE_QUALIFIERS and NEGATIVE_QUALIFIERS reach the pattern
+        # through two different names, so the capital guard has to be
+        # mutated on both branches or one of them is untested.
+        "a qualifier need not carry the capital before a negated-only outcome",
+        "+ f\"|(?:{'|'.join(NEGATIVE_QUALIFIERS)})\\\\s+{_EMPHASIS}\"",
+        "+ f\"|(?i:{'|'.join(NEGATIVE_QUALIFIERS)})\\\\s+{_EMPHASIS}\"",
+    ),
+    (
+        "a negated-only outcome counts on its own",
+        "f\"(?:{'|'.join(OUTCOMES)})\"",
+        "f\"(?:{'|'.join(OUTCOMES + tuple(w.capitalize()"
+        ' for w in NEGATED_OUTCOMES))})"',
+    ),
+    (
+        "a degree qualifier unlocks a negated-only outcome",
+        "+ f\"|(?:{'|'.join(NEGATIVE_QUALIFIERS)})\\\\s+{_EMPHASIS}\"",
+        '+ f"|(?:{_QUALIFIED})\\\\s+{_EMPHASIS}"',
+    ),
+    (
+        "a qualifier counts on its own",
+        "+ f\"|(?:{_QUALIFIED})\\\\s+{_EMPHASIS}(?i:{'|'.join(OUTCOMES)})\"",
+        "+ f\"|(?:{_QUALIFIED})(?:\\\\s+{_EMPHASIS}(?i:{'|'.join(OUTCOMES)}))?\"",
+    ),
+    (
+        "a qualifier need not carry the capital",
+        '_QUALIFIED = "|".join(NEGATIVE_QUALIFIERS + DEGREE_QUALIFIERS)',
+        '_QUALIFIED = "|".join(\n'
+        '    w.lower() + "|" + w for w in NEGATIVE_QUALIFIERS + DEGREE_QUALIFIERS\n)',
+    ),
+)
+
+
+def _mutation_suite(source: str) -> tuple[list[str], list[str]]:
+    """Every mutation in MUTATIONS has to make `_fixture_suite` complain.
+
+    Returns `(failures, raised)`. A mutant that raises partway through the
+    fixtures is caught, since `--self-test` goes red either way, but it is
+    caught by a crash rather than by a fixture disagreeing and the run
+    stops before the fixtures after it. `_self_test` names those, so a
+    green run cannot be read as "every mutation met a fixture that
+    disagreed" when it was not.
+    """
+    failures: list[str] = []
+    raised: list[str] = []
+    # Only the source above this table is mutated. Every anchor is quoted
+    # inside the table itself, so searching the whole file would find each
+    # of them twice and the count guard would fire on all of them.
+    head, marker, tail = source.partition(_BATTERY_MARKER)
+    if not marker:
+        return ["the mutation battery cannot find itself in the source"], raised
+    for name, anchor, replacement in MUTATIONS:
+        if head.count(anchor) != 1:
+            failures.append(
+                f"mutation {name!r}: its anchor appears {head.count(anchor)} times"
+                " above the battery, expected exactly 1. The code it names moved;"
+                " re-aim the mutation rather than deleting it."
+            )
+            continue
+        mutant = head.replace(anchor, replacement) + marker + tail
+        namespace: dict[str, object] = {
+            "__name__": "check_review_evidence_mutant",
+            "__file__": __file__,
+        }
+        try:
+            exec(compile(mutant, "<mutant>", "exec"), namespace)
+        except Exception as exc:  # noqa: BLE001 - a broken mutant is a broken battery
+            failures.append(f"mutation {name!r}: the mutant does not load: {exc!r}")
+            continue
+        suite = namespace.get("_fixture_suite")
+        if not callable(suite):
+            failures.append(f"mutation {name!r}: the mutant has no _fixture_suite")
+            continue
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                caught: object = suite()
+        except Exception as exc:  # noqa: BLE001
+            # Caught, but by a crash. Named in the summary, because a
+            # crash stops the remaining fixtures and so proves less than
+            # a fixture that disagreed.
+            raised.append(f"{name} ({type(exc).__name__})")
+            continue
+        if not caught:
+            failures.append(
+                f"mutation {name!r} is not caught: the fixtures all pass with it"
+                " applied, so nothing is holding that refusal."
+            )
+    return failures, raised
+
+
+def _self_test() -> int:
+    """Fixtures, then the mutation battery over the same fixtures."""
+    failures = _fixture_suite()
+    try:
+        source = Path(__file__).read_text(encoding="utf-8")
+    except OSError as exc:
+        failures.append(f"cannot read own source for the mutation battery: {exc}")
+    else:
+        mutation_failures, raised = _mutation_suite(source)
+        failures += mutation_failures
+
     if failures:
         sys.stderr.write("FAIL\n")
         for failure in failures:
             sys.stderr.write(f"  - {failure}\n")
         return 1
-    sys.stdout.write("OK\n")
+    note = ""
+    if raised:
+        note = (
+            f"; {len(raised)} caught by the mutant raising rather than by a"
+            f" fixture disagreeing: {', '.join(raised)}"
+        )
+    sys.stdout.write(f"OK ({len(MUTATIONS)} mutations, all caught{note})\n")
     return 0
 
 

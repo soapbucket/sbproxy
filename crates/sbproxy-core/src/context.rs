@@ -737,15 +737,21 @@ pub struct RequestContext {
     /// flag is read.
     pub content_digest_verified: bool,
 
-    /// WOR-805 F1.6.1: a successful `bot_auth` verdict carried a
-    /// `Signature-Input` that covered `content-digest`. The auth
-    /// phase verified the signature header but the body was not
-    /// available yet, so the body-vs-`Content-Digest`-header check
-    /// is deferred to `request_body_filter`. The body filter sets
-    /// `validate_request_body` alongside this flag so the buffer
-    /// path runs; on `end_of_stream` it runs
-    /// `verify_content_digest(header_value, body)` and rejects with
-    /// 401 if the body does not match the signed digest.
+    /// WOR-805 F1.6.1: a successful signature-based auth verdict
+    /// carried a `Signature-Input` that covered `content-digest`. The
+    /// auth phase verified the signature header but the body was not
+    /// available yet, so the body-vs-`Content-Digest`-header check is
+    /// deferred to `request_body_filter`.
+    /// `request_phase::arm_deferred_body_digest_binding` sets
+    /// `validate_request_body` alongside this flag so the buffer path
+    /// runs; on `end_of_stream` it runs
+    /// `verify_content_digest(header_value, body)` and rejects with 401
+    /// if the body does not match the signed digest.
+    ///
+    /// Named for `bot_auth`, which armed it first, but `hmac_auth`
+    /// shares the flag and the same deferred contract. Every provider
+    /// that arms it is listed in
+    /// `request_phase::DEFERRED_BODY_DIGEST_PROVIDERS`.
     pub bot_auth_digest_check_required: bool,
 
     // --- WOR-808 PR5 / PR6: RSL <link rel="license"> body injection ---

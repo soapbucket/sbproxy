@@ -296,7 +296,69 @@ the next version cut.
   metrics section of
   [docs/key-management.md](docs/key-management.md#operational-metrics).
 
+- **A signed extension bundle can ship a `runtime: rego` transform, not
+  just a policy.** A `kind: transform` hook on a Rego bundle attaches
+  under `transforms[]` by its `type` name and evaluates once per
+  buffered response body. Its input is `input.body.body_base64` (the
+  complete body, base64), `input.body.content_type`,
+  `input.body.origin`, and `input.config`; the pinned rule must return
+  a base64 string, which becomes the replacement body, bounded by
+  `sandbox.max_output_bytes`. An undefined rule is the transform
+  declining and the body passes through untouched. The module compiles
+  once per hook at candidate load and its query is proved evaluable
+  there, so a bad rule reference refuses the bundle instead of failing
+  every request. Bounded by `sandbox.budget_ms` plus the buffer and
+  output caps; `memory_mb` and `stack_kb` do not apply to Rego and are
+  now refused on a Rego manifest rather than accepted and ignored. See
+  the Rego transform section of
+  [docs/extension-bundles.md](docs/extension-bundles.md).
+
 ### Changed, and worth checking before you upgrade
+
+- **`POST /admin/keys/{id}/rotate` returns the current `sbp_` token
+  shape, and refuses a key id it cannot mint one for.** Every shipped
+  release before this returned the legacy `sk-<id>-<secret>` shape from
+  this endpoint while `POST /admin/keys` had already moved to
+  `sbp_<id>_<secret>`. Any operator script matching `^sk-`, or splitting
+  a rotated token on `-` to recover the key id, needs updating.
+
+  The refusal is the part to check before you upgrade. A minted key id
+  is sixteen lowercase hex characters, and the strict parser on the
+  inbound path asserts exactly that. A key seeded from config under
+  `key_management.seed.keys[]` can carry any id its author wrote, and
+  rotating one produced a token nothing could parse: the endpoint
+  answered `200` with a credential that authenticated on no code path,
+  and when the grace window closed the working token died with it.
+  Rotating a non-conforming id now answers
+  `409 {"error": "key id is not in the minted format ..."}` and changes
+  nothing. If you rotated a seeded key on a build carrying the earlier
+  behavior, the token you were handed is not usable; create a
+  replacement key with `POST /admin/keys`, move callers over, and revoke
+  the seeded id.
+
+- **Every upgraded WebSocket tunnel is now scanned, and every one that
+  is not a `websocket` action's is held to a 10 MB message ceiling.**
+  The frame scanner was armed inside a match on `Action::WebSocket`, so
+  `/v1/realtime` (which runs under an `ai_proxy` origin and hands off to
+  transparent forwarding) and any `type: proxy` or `type: load_balancer`
+  origin fronting a WebSocket backend opened a completely unscanned
+  tunnel. Those now get the scanner, with the same documented 10 MB
+  default a `websocket` action gets when it configures nothing. A `101`
+  for a non-WebSocket upgrade is still left alone.
+
+  Check this one before you upgrade if you front a WebSocket backend
+  through any action other than `websocket` and your peers send messages
+  larger than 10 MB. Those tunnels were unbounded on every prior release
+  and are not any more: the first oversized message drops both TCP
+  connections mid-message, with no close frame and no HTTP status,
+  because nothing HTTP may be written into a stream the client is
+  already reading as frames. `sbproxy_websocket_teardowns_total{reason="message_too_large"}`
+  and a `websocket_message_too_large` audit record are how it shows up.
+  There is no config key to raise the ceiling for those origins yet;
+  `max_message_size` is a `websocket`-action field, so today the escape
+  hatch is to front the backend with a `websocket` action, which also
+  gets you the subprotocol allowlist. Widening the key to the other
+  action types is tracked separately.
 
 - **`transport: stdio` MCP servers now run as one supervised
   persistent child per configured server, not one process per
@@ -330,6 +392,38 @@ the next version cut.
   [docs/ai-gateway.md](docs/ai-gateway.md).
 
 ### Fixed
+
+- **A `failure_posture: closed` transform now fails a `static` or
+  `mock` response closed instead of serving it untransformed.** The
+  transform chain has reached generated bodies since the response-phase
+  work landed, but a fault there logged a warning and continued with
+  the untransformed buffer, whatever the transform's declared posture.
+  A redaction transform on a `type: static` origin therefore shipped
+  the exact string it existed to strip whenever it faulted (a budget
+  overrun, a non-string result, a body over the buffer cap). A `closed`
+  transform's fault now answers `500` with
+  `x-sbproxy-transform-error: <transform>` and never writes the
+  generated body, matching the proxied and plugin-action paths.
+  `failure_posture: open`, which is what a `transforms:` entry defaults
+  to, keeps warning and continuing.
+
+- **A WebSocket control frame can no longer disable
+  `max_message_size`.** Control frames do not count toward a message
+  total, so their declared payload length was skipped rather than
+  checked. A fourteen-byte masked pong header declaring `u64::MAX` was
+  enough: the scanner spent the declared count skipping payload bytes,
+  never parsed another frame header, and the cap stopped applying in
+  that direction for the life of the connection, with nothing logged
+  and no teardown. RFC 6455 section 5.5 is now enforced on the frames
+  it governs: a control frame over 125 payload bytes, or one arriving
+  without `FIN`, closes the tunnel.
+
+- **`print()` inside a Rego bundle hook is bounded and redacted.** A
+  transform hook's input is the complete buffered response body, so
+  `print(input.body.body_base64)` copied every response into the log at
+  `info`, uncapped and unredacted. Messages now pass through the secret
+  redactor, are truncated at 512 bytes, and at most eight events are
+  emitted per evaluation with one summary line for the remainder.
 
 - **A large request body no longer costs the client the response
   sbproxy already wrote.** Any response the proxy generates itself goes
@@ -442,6 +536,68 @@ the next version cut.
   `502`. Routes with `request_modifiers` still validate at the
   post-modifier seam, since the modified request is the one the
   contract holds.
+
+### Security
+
+- **`hmac_auth` now binds a signature to the body it covers.** A
+  signature covering `content-digest` was checked against the empty body
+  the authentication phase can offer, not against the bytes the client
+  sent. The check was inverted rather than weak: a client sending the
+  true digest of its body was refused, while one declaring the empty-body
+  digest `sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:` was
+  admitted and could then send any body at all. Because covering
+  `content-digest` could not work, deployments signed `("@method"
+  "@target-uri")` and nothing else, so a request captured off the wire
+  replayed with an attacker-chosen body until its `created` timestamp
+  left the `clock_skew_seconds` window. An attacker could not forge a
+  signature, change the method or the route, or extend the window; they
+  substituted the body of a request someone else signed.
+
+  Verification now defers the digest half to the request body filter and
+  completes it against the complete pre-transform body, the same
+  two-step contract `bot_auth` uses, answering `401` on a mismatch.
+  Covering `content-digest` works, so `required_components` can require
+  it and mean it. Two consequences worth knowing before you upgrade: a
+  body-covering signature now caps the request at the 8 MiB request-body
+  buffer and a larger body answers `413`, and the `401` body for a
+  mismatch changed from `bot_auth: content-digest body mismatch` to
+  `signature: content-digest body mismatch`, since either provider can
+  raise it. See the `hmac_auth` section of
+  [docs/configuration.md](docs/configuration.md).
+
+- **`ldap_auth` bounds what it dials.** Authentication runs before an
+  origin's `policies:`, so no `rate_limit` or `ddos` policy could cap the
+  directory bind: anyone able to send an `Authorization: Basic` header
+  drove one bind per request, which made the gateway a 1:1 amplifier
+  pointed at the directory and offered account lockout for any guessable
+  username. Three bounds now run before the dial, none of which caches a
+  success: a 30 second refused-credential cache keyed on a salted
+  SHA-256 of the exact username and password, a per-username failed-bind
+  budget of 5 per 60 seconds that then throttles to one bind per 12
+  seconds, and a cap of 32 binds in flight. The budget throttles rather
+  than blocks on purpose, so nobody can spend a username's budget with
+  wrong guesses and lock its owner out; a throttled request answers
+  `503`, not `401`, because the directory was never consulted. An
+  attacker cycling *distinct* usernames is still bounded only by what
+  runs in front of the origin.
+
+- **Refused LDAP binds and refused JWE algorithms are visible in release
+  builds.** Both logged at `debug`, which the release profile's
+  `release_max_level_info` compiles out, so the shipped binary recorded
+  nothing for a refused credential while the documentation promised the
+  log named the offending algorithm. Raised to `info`. A failed
+  `content-digest` body binding now logs at `warn` at all three refusal
+  sites; it previously logged at `debug` in one and nowhere in the other
+  two. No credential is logged at any of them.
+
+### Fixed, plan-time validation
+
+- **`ldap_auth` and its `ldap` alias validate clean.** Both were missing
+  from the OSS auth catalogue, so `sbproxy validate` reported that the
+  type "is not in the OSS catalog (will fail at runtime)" on every LDAP
+  config, including this repository's own `examples/auth-ldap/sb.yml`,
+  which was false. The same omission stopped both names being reserved
+  against a bundle hook claiming them.
 
 ## [1.13.0] - 2026-08-18
 

@@ -2705,16 +2705,18 @@ pub fn record_security_headers_csp_emitted(mode: &str, tenant: &str) {
 /// Record one WebSocket upgrade refusal or tunnel teardown initiated
 /// by the gateway (WOR-2552).
 ///
-/// `reason` is a closed three-value set: `message_too_large` (a frame
-/// scan crossed the `websocket` action's `max_message_size` cap),
+/// `reason` is a closed four-value set: `message_too_large` (a frame
+/// scan crossed the tunnel's `max_message_size` cap),
+/// `control_frame_violation` (a control frame declared more than RFC
+/// 6455's 125 payload bytes, or arrived fragmented),
 /// `subprotocol_violation` (the upstream's 101 selected a subprotocol
 /// outside the negotiated set, refused before the tunnel opened), and
 /// `upstream_error` (a post-upgrade failure tore the tunnel down:
 /// an upstream reset, timeout, or read error; WOR-2551's no-write
 /// teardown). `direction` is
-/// `client_to_upstream` or `upstream_to_client` for the size cap, and
-/// `none` for the two reasons that have no per-direction scan. Both
-/// are proxy-authored constants; `tenant` and `origin` are
+/// `client_to_upstream` or `upstream_to_client` for the two frame-scan
+/// reasons, and `none` for the two that have no per-direction scan.
+/// Both are proxy-authored constants; `tenant` and `origin` are
 /// operator-scoped and pass through the cardinality limiter.
 ///
 /// Registration failure yields no counter rather than a panic, the same

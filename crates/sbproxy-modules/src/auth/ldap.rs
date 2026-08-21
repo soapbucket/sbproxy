@@ -39,16 +39,66 @@
 //!   refusal, never an allow. This provider adds a network round-trip
 //!   to the request hot path (unlike every other built-in auth type
 //!   except `forward_auth`); the deliberate decision recorded on
-//!   WOR-2519 is to accept that latency rather than cache bind
-//!   results, because a bind-result cache is a password-equivalence
+//!   WOR-2519 is to accept that latency rather than cache *successful*
+//!   bind results, because a success cache is a password-equivalence
 //!   cache: it would extend a credential's validity past a
 //!   directory-side revocation or password change.
+//!
+//! # Bounding the outbound bind
+//!
+//! Authentication runs before an origin's `policies:` are evaluated, so
+//! an origin's `rate_limit` or `ddos` policy cannot cap what this
+//! provider dials. Left unbounded that makes the gateway a 1:1
+//! amplifier pointed at the customer's directory, reachable by anyone
+//! who can send an `Authorization: Basic` header, and it hands an
+//! attacker directory-side account lockout for any guessable username.
+//!
+//! Three bounds run before the dial, none of which caches a success:
+//!
+//! * **Refused-credential cache.** A credential the directory has
+//!   already refused is refused locally for
+//!   `REFUSED_CREDENTIAL_TTL` without a second dial. Only ever
+//!   turns an allow into nothing: the entry is keyed on a salted
+//!   SHA-256 of the username and password, so it can match nothing but
+//!   the exact pair the directory rejected, and it expires quickly.
+//! * **Per-username failed-bind budget.** After
+//!   `MAX_FAILED_BINDS_PER_USERNAME` directory-attributed failures
+//!   inside `FAILED_BIND_WINDOW`, that username reaches the directory
+//!   at most once per `OVER_BUDGET_DIAL_SPACING` instead of on every
+//!   request, which drops a guessing run from as fast as the attacker
+//!   can send to the budget's rate. A successful bind clears it.
+//!
+//!   It throttles rather than blocks, and the difference is the whole
+//!   design. Blocking would let anyone who knows a username spend its
+//!   budget with a handful of wrong guesses and have every later
+//!   request refused, including the owner's with the correct password.
+//!   That is the same deny-service-by-exhaustion this module rejects a
+//!   global budget for, aimed at one victim. Past the budget the
+//!   directory still gets asked, just less often, so a correct password
+//!   costs its owner a delay and never a lockout.
+//! * **Outbound concurrency cap.** At most
+//!   `MAX_IN_FLIGHT_BINDS` binds are in flight at once, so a burst
+//!   cannot hold open an unbounded number of directory connections for
+//!   `timeout_secs` each. Over the cap the request is refused as
+//!   `DirectoryUnavailable`, which fails closed.
+//!
+//! What is still unbounded: an attacker who cycles *distinct*
+//! usernames pays one dial per new name, because a per-username budget
+//! by construction cannot see across names. Bounding that needs either
+//! a global failed-bind budget, which lets an attacker deny service to
+//! honest users by exhausting it, or evaluating cheap policies before
+//! authentication so an origin's own `rate_limit` applies. The second
+//! is the real fix and is a phase-ordering change, not a change to
+//! this file.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde::Deserialize;
-use tracing::{debug, warn};
+use tracing::{info, warn};
 
 /// Default seconds allowed for the connect + bind exchange.
 pub const DEFAULT_LDAP_TIMEOUT_SECS: u64 = 5;
@@ -57,6 +107,59 @@ pub const DEFAULT_LDAP_TIMEOUT_SECS: u64 = 5;
 /// composing the bind DN. `cn` mirrors Apache APISIX's `ldap-auth`
 /// default for the same knob.
 pub const DEFAULT_UID_ATTRIBUTE: &str = "cn";
+
+/// How long a credential the directory refused is refused locally.
+///
+/// Short on purpose. The entry can only ever refuse the exact
+/// username-and-password pair the directory already rejected, but it is
+/// still proxy-side state standing in for a directory answer, so it
+/// expires before an operator who fixes an account has to wonder why.
+pub const REFUSED_CREDENTIAL_TTL: Duration = Duration::from_secs(30);
+
+/// Window over which per-username failed binds are counted.
+pub const FAILED_BIND_WINDOW: Duration = Duration::from_secs(60);
+
+/// Directory-attributed failures one username may spend inside
+/// [`FAILED_BIND_WINDOW`] before the proxy stops dialing for it.
+///
+/// Sits below the lockout thresholds directories ship (Active
+/// Directory's account lockout policy is commonly 5 to 10), so the
+/// proxy stops forwarding failures before the directory starts
+/// counting them toward a lockout. A human retrying a typo three or
+/// four times stays inside it, and the budget clears on the next
+/// success.
+pub const MAX_FAILED_BINDS_PER_USERNAME: u32 = 5;
+
+/// Minimum spacing between dials for a username whose budget is spent.
+///
+/// A spent budget throttles, it does not block. Blocking was the first
+/// shape of this and it was wrong: an attacker who knows a username can
+/// spend its budget with five cheap wrong guesses, and every later
+/// request, including the owner's with the correct password, is refused
+/// without the directory ever being asked. That is the same
+/// deny-service-by-exhaustion this module rejects a global budget for,
+/// scoped to one victim instead of everyone, and it is worse than the
+/// amplification it was meant to stop.
+///
+/// So past the budget a username still reaches the directory, at most
+/// once per this interval. The sustained failure rate stays at the
+/// budget's rate, and a correct password costs its owner one interval
+/// of delay rather than a lockout.
+pub const OVER_BUDGET_DIAL_SPACING: Duration =
+    Duration::from_secs(FAILED_BIND_WINDOW.as_secs() / MAX_FAILED_BINDS_PER_USERNAME as u64);
+
+/// Directory binds this provider will have in flight at once.
+///
+/// Bounds how many directory connections a burst can hold open for
+/// `timeout_secs` each. Generous for a gateway in front of one
+/// directory; the point is that the number exists, not that it is
+/// tight.
+pub const MAX_IN_FLIGHT_BINDS: usize = 32;
+
+/// Entries the refused-credential cache and the per-username budget
+/// each hold before evicting. Bounds the memory an attacker cycling
+/// usernames can cause the provider to hold.
+const BIND_GUARD_CAPACITY: usize = 4096;
 
 /// Outcome of one directory-bind authentication attempt.
 ///
@@ -89,6 +192,244 @@ pub enum LdapBindOutcome {
     DirectoryUnavailable,
 }
 
+/// Why a request never reached the directory.
+///
+/// Separated from [`LdapBindOutcome`] because the two answer different
+/// questions: this one is about whether the proxy was willing to spend
+/// a bind, and only then does the directory get to rule on the
+/// credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindRefusal {
+    /// This exact credential was refused by the directory recently.
+    AlreadyRefused,
+    /// The username has spent its failed-bind budget and dialed too
+    /// recently. A delay, not a verdict: the next dial past
+    /// [`OVER_BUDGET_DIAL_SPACING`] goes through whatever the credential
+    /// is, so this can never hold a correct password out indefinitely.
+    UsernameThrottled,
+    /// Too many binds already in flight against the directory.
+    TooManyInFlight,
+}
+
+/// Held for the duration of one outbound bind; releases the slot on
+/// drop, including on an early return or a panic.
+struct InFlightPermit<'a> {
+    in_flight: &'a AtomicUsize,
+}
+
+impl Drop for InFlightPermit<'_> {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Per-username failed-bind budget for one [`FAILED_BIND_WINDOW`].
+#[derive(Debug, Clone, Copy)]
+struct FailureBudget {
+    spent: u32,
+    window_started: Instant,
+    /// When this username last reached the directory. Only consulted
+    /// once the budget is spent, to space the dials that follow.
+    last_dial_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct BindGuardState {
+    /// Salted credential digest -> when the directory refused it.
+    refused: HashMap<[u8; 32], Instant>,
+    /// Username -> failures spent in the current window.
+    failures: HashMap<String, FailureBudget>,
+}
+
+/// The bounds that stand between an inbound request and an outbound
+/// directory bind. See "Bounding the outbound bind" in the module docs.
+///
+/// Shared behind an `Arc` so cloning the provider (the config compiler
+/// does) shares one budget rather than handing an attacker a fresh one.
+struct BindGuard {
+    in_flight: AtomicUsize,
+    state: Mutex<BindGuardState>,
+    /// Per-process random salt. Keeps the cache keys from being
+    /// precomputable from a username and a password guess, so the map
+    /// cannot be probed as a credential oracle by anything that gets a
+    /// look at proxy memory or a heap dump.
+    salt: [u8; 32],
+}
+
+impl std::fmt::Debug for BindGuard {
+    /// Counts only. The state map keys are usernames and salted
+    /// credential digests, and the salt is what makes those digests
+    /// unguessable, so none of the three belongs in a debug dump of the
+    /// provider (which `Auth`'s own `Debug` will happily print).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (refused, budgeted) = match self.state.lock() {
+            Ok(state) => (state.refused.len(), state.failures.len()),
+            Err(poisoned) => {
+                let state = poisoned.into_inner();
+                (state.refused.len(), state.failures.len())
+            }
+        };
+        f.debug_struct("BindGuard")
+            .field("in_flight", &self.in_flight.load(Ordering::Acquire))
+            .field("refused_credentials", &refused)
+            .field("budgeted_usernames", &budgeted)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BindGuard {
+    fn new() -> Self {
+        use rand::RngCore as _;
+        let mut salt = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut salt);
+        Self {
+            in_flight: AtomicUsize::new(0),
+            state: Mutex::new(BindGuardState::default()),
+            salt,
+        }
+    }
+
+    /// Salted digest of one credential. The password is hashed and
+    /// never stored; nothing reverses this back to either field.
+    fn digest(&self, username: &str, password: &str) -> [u8; 32] {
+        use sha2::{Digest as _, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(self.salt);
+        hasher.update(username.as_bytes());
+        // Length-prefix-free inputs would let ("ab", "c") and ("a",
+        // "bc") collide; the separator cannot appear in either field
+        // because both come out of a UTF-8 Basic credential split on
+        // `:`, and a NUL is not a legal username character.
+        hasher.update([0u8]);
+        hasher.update(password.as_bytes());
+        hasher.finalize().into()
+    }
+
+    /// Decide whether this credential earns a directory bind.
+    ///
+    /// Returns the in-flight permit on success, so the slot cannot be
+    /// taken without also being released.
+    fn admit(
+        &self,
+        username: &str,
+        digest: &[u8; 32],
+        now: Instant,
+    ) -> Result<InFlightPermit<'_>, BindRefusal> {
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(refused_at) = state.refused.get(digest) {
+                if now.duration_since(*refused_at) < REFUSED_CREDENTIAL_TTL {
+                    return Err(BindRefusal::AlreadyRefused);
+                }
+                state.refused.remove(digest);
+            }
+            // Sequential borrows rather than one `get_mut` arm doing
+            // both, because the expiry branch needs its own mutable
+            // borrow of the same map.
+            let window_expired = state
+                .failures
+                .get(username)
+                .is_some_and(|b| now.duration_since(b.window_started) >= FAILED_BIND_WINDOW);
+            if window_expired {
+                state.failures.remove(username);
+            }
+            if let Some(budget) = state.failures.get_mut(username) {
+                if budget.spent >= MAX_FAILED_BINDS_PER_USERNAME {
+                    if now.duration_since(budget.last_dial_at) < OVER_BUDGET_DIAL_SPACING {
+                        return Err(BindRefusal::UsernameThrottled);
+                    }
+                    // Letting this one through is the whole point: the
+                    // credential might be the right one, and only the
+                    // directory can say. Start the next interval here so
+                    // the rate holds whatever the answer turns out to be.
+                    budget.last_dial_at = now;
+                }
+            }
+        }
+
+        self.in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < MAX_IN_FLIGHT_BINDS).then_some(current + 1)
+            })
+            .map(|_| InFlightPermit {
+                in_flight: &self.in_flight,
+            })
+            .map_err(|_| BindRefusal::TooManyInFlight)
+    }
+
+    /// Record a refusal the directory itself returned.
+    ///
+    /// Only directory-attributed refusals land here. A local refusal
+    /// (empty password) and a directory-side failure (timeout, dial
+    /// error) both cost nothing to produce, so counting them would let
+    /// an attacker spend an honest user's budget without spending a
+    /// bind of their own.
+    fn record_directory_refusal(&self, username: &str, digest: [u8; 32], now: Instant) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        evict_expired(&mut state, now);
+        if state.refused.len() < BIND_GUARD_CAPACITY {
+            state.refused.insert(digest, now);
+        }
+        match state.failures.get_mut(username) {
+            Some(budget) if now.duration_since(budget.window_started) < FAILED_BIND_WINDOW => {
+                budget.spent = budget.spent.saturating_add(1);
+                budget.last_dial_at = now;
+            }
+            Some(budget) => {
+                *budget = FailureBudget {
+                    spent: 1,
+                    window_started: now,
+                    last_dial_at: now,
+                };
+            }
+            None => {
+                if state.failures.len() >= BIND_GUARD_CAPACITY {
+                    evict_oldest_budget(&mut state);
+                }
+                state.failures.insert(
+                    username.to_owned(),
+                    FailureBudget {
+                        spent: 1,
+                        window_started: now,
+                        last_dial_at: now,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Clear a username's budget after the directory accepted it.
+    fn record_success(&self, username: &str) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.failures.remove(username);
+    }
+}
+
+fn evict_expired(state: &mut BindGuardState, now: Instant) {
+    state
+        .refused
+        .retain(|_, at| now.duration_since(*at) < REFUSED_CREDENTIAL_TTL);
+    state
+        .failures
+        .retain(|_, budget| now.duration_since(budget.window_started) < FAILED_BIND_WINDOW);
+}
+
+/// Make room by dropping the least recently started window.
+///
+/// An attacker who floods distinct usernames can push an honest user's
+/// budget out this way, but every junk username they add costs them a
+/// real bind, and the alternative is an unbounded map.
+fn evict_oldest_budget(state: &mut BindGuardState) {
+    let oldest = state
+        .failures
+        .iter()
+        .min_by_key(|(_, budget)| budget.window_started)
+        .map(|(username, _)| username.clone());
+    if let Some(username) = oldest {
+        state.failures.remove(&username);
+    }
+}
+
 /// LDAP directory-bind authentication provider (`type: ldap_auth`).
 ///
 /// See the module docs for the bind model and the security posture.
@@ -116,6 +457,11 @@ pub struct LdapAuthProvider {
     /// Deadline in seconds for the whole connect + bind exchange.
     /// Defaults to [`DEFAULT_LDAP_TIMEOUT_SECS`].
     pub timeout_secs: u64,
+    /// Bounds on what this provider will dial. Private and shared
+    /// across clones: an attacker must not be able to reset a budget,
+    /// and no caller outside this module should be able to construct a
+    /// provider without one.
+    bind_guard: Arc<BindGuard>,
 }
 
 /// Serde shape for [`LdapAuthProvider::from_config`]. Kept separate so
@@ -203,6 +549,7 @@ impl LdapAuthProvider {
             tls_verify: raw.tls_verify,
             allow_insecure: raw.allow_insecure,
             timeout_secs: raw.timeout_secs.unwrap_or(DEFAULT_LDAP_TIMEOUT_SECS),
+            bind_guard: Arc::new(BindGuard::new()),
         })
     }
 
@@ -228,8 +575,17 @@ impl LdapAuthProvider {
     /// endpoint under a config-scoped deadline; the URL is validated
     /// at config load, not per request.
     ///
+    /// Not every call reaches the directory. Authentication runs
+    /// before an origin's `policies:`, so nothing downstream can cap
+    /// what this dials; the bounds in "Bounding the outbound bind"
+    /// (module docs) run first and can refuse before any dial. A
+    /// refusal that never touched the directory is reported as
+    /// `InvalidCredentials` when it is about the credential and as
+    /// `DirectoryUnavailable` when it is about capacity, so the caller
+    /// keeps failing closed either way.
+    ///
     /// Never logs the password. The bind DN (which contains only the
-    /// username and operator config) is logged at debug on refusals.
+    /// username and operator config) is logged on refusals.
     pub async fn authenticate(&self, headers: &http::HeaderMap) -> LdapBindOutcome {
         let Some((username, password)) = basic_credentials(headers) else {
             return LdapBindOutcome::NoCredentials;
@@ -243,16 +599,62 @@ impl LdapAuthProvider {
             // directories commonly answer it with success. Refuse
             // locally so that success can never be mistaken for a
             // verified credential.
-            debug!(
+            // `info`, not `debug`: the release profile pins tracing to
+            // `release_max_level_info`, so a `debug!` here compiles out
+            // and the shipped binary logs nothing at all for a refused
+            // bind. The username is an identifier; the password is not
+            // touched.
+            info!(
                 username = %username,
                 "ldap_auth: refusing empty password (would be an unauthenticated bind)"
             );
             return LdapBindOutcome::InvalidCredentials;
         }
 
+        // Everything above refuses without dialing anyway. From here
+        // on a call costs the directory a connection and a bind, so the
+        // bounds get their say first.
+        let now = Instant::now();
+        let digest = self.bind_guard.digest(&username, &password);
+        let permit = match self.bind_guard.admit(&username, &digest, now) {
+            Ok(permit) => permit,
+            Err(BindRefusal::AlreadyRefused) => {
+                info!(
+                    username = %username,
+                    "ldap_auth: credential already refused by the directory; refusing without a new bind"
+                );
+                return LdapBindOutcome::InvalidCredentials;
+            }
+            Err(BindRefusal::UsernameThrottled) => {
+                // `DirectoryUnavailable`, not `InvalidCredentials`. The
+                // proxy has not consulted the directory and has no idea
+                // whether this credential is good; saying "wrong
+                // password" to the owner of a correct one would be a
+                // lie the caller then renders as a 401. A 503 says what
+                // actually happened, and is retryable.
+                info!(
+                    username = %username,
+                    spacing_secs = OVER_BUDGET_DIAL_SPACING.as_secs(),
+                    budget = MAX_FAILED_BINDS_PER_USERNAME,
+                    "ldap_auth: username over its failed-bind budget; deferring the next bind"
+                );
+                return LdapBindOutcome::DirectoryUnavailable;
+            }
+            Err(BindRefusal::TooManyInFlight) => {
+                warn!(
+                    url = %self.url,
+                    cap = MAX_IN_FLIGHT_BINDS,
+                    "ldap_auth: outbound bind concurrency cap reached; refusing"
+                );
+                return LdapBindOutcome::DirectoryUnavailable;
+            }
+        };
+
         let bind_dn = self.bind_dn(&username);
         let deadline = Duration::from_secs(self.timeout_secs.max(1));
-        match tokio::time::timeout(deadline, self.simple_bind(&bind_dn, &password)).await {
+        let result = tokio::time::timeout(deadline, self.simple_bind(&bind_dn, &password)).await;
+        drop(permit);
+        match result {
             Err(_elapsed) => {
                 warn!(url = %self.url, "ldap_auth: directory bind timed out; refusing");
                 LdapBindOutcome::DirectoryUnavailable
@@ -267,14 +669,25 @@ impl LdapAuthProvider {
                 LdapBindOutcome::DirectoryUnavailable
             }
             Ok(Ok(rc)) => match rc {
-                0 => LdapBindOutcome::Allowed { username },
+                0 => {
+                    self.bind_guard.record_success(&username);
+                    LdapBindOutcome::Allowed { username }
+                }
                 // RFC 4511 appendix A result codes attributable to the
                 // presented credential: invalidCredentials(49),
                 // noSuchObject(32) for an unknown user's DN, and
                 // invalidDNSyntax(34) for a username the DN cannot be
                 // composed from.
                 49 | 32 | 34 => {
-                    debug!(bind_dn = %bind_dn, result_code = rc, "ldap_auth: bind refused");
+                    // The directory itself ruled on this credential, so
+                    // it is the only refusal that spends the username's
+                    // budget and seeds the refused-credential cache.
+                    self.bind_guard
+                        .record_directory_refusal(&username, digest, Instant::now());
+                    // `info` for the same reason as the empty-password
+                    // refusal above: `debug!` does not survive the release
+                    // build. The DN names the identity, never the secret.
+                    info!(bind_dn = %bind_dn, result_code = rc, "ldap_auth: bind refused");
                     LdapBindOutcome::InvalidCredentials
                 }
                 // Anything else (unwillingToPerform, busy, unavailable,
@@ -536,6 +949,81 @@ mod tests {
         .unwrap()
     }
 
+    /// Like `ScriptedDirectory` but serves every connection it is
+    /// offered and counts the bind requests it receives, which is the
+    /// number these tests are actually about: how many times an
+    /// inbound HTTP request reaches the customer's directory.
+    struct CountingDirectory {
+        port: u16,
+        binds: Arc<AtomicUsize>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl CountingDirectory {
+        async fn start(expected_dn: &str, expected_password: &str) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let expected_dn = expected_dn.to_string();
+            let expected_password = expected_password.to_string();
+            let binds = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&binds);
+            let handle = tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let counter = Arc::clone(&counter);
+                    let expected_dn = expected_dn.clone();
+                    let expected_password = expected_password.clone();
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = vec![0u8; 4096];
+                        loop {
+                            let Ok(n) = stream.read(&mut buf).await else {
+                                return;
+                            };
+                            if n == 0 {
+                                return;
+                            }
+                            let Some((msgid, dn, password)) = parse_simple_bind(&buf[..n]) else {
+                                // An unbind notice, not a bind. Not counted.
+                                return;
+                            };
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            let rc = if dn == expected_dn && password == expected_password {
+                                0u8
+                            } else {
+                                49u8
+                            };
+                            let response = [
+                                0x30, 0x0c, 0x02, 0x01, msgid, 0x61, 0x07, 0x0a, 0x01, rc, 0x04,
+                                0x00, 0x04, 0x00,
+                            ];
+                            if stream.write_all(&response).await.is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+            Self {
+                port,
+                binds,
+                handle,
+            }
+        }
+
+        fn binds(&self) -> usize {
+            self.binds.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for CountingDirectory {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
     fn basic_header(username: &str, password: &str) -> http::HeaderMap {
         let mut headers = http::HeaderMap::new();
         let encoded =
@@ -628,6 +1116,300 @@ mod tests {
             LdapBindOutcome::Allowed {
                 username: "alice,cn=admin".to_string()
             }
+        );
+    }
+
+    // --- Bounding the outbound bind ---
+    //
+    // Authentication runs before an origin's `policies:`, so no
+    // `rate_limit` or `ddos` policy an operator writes can cap what
+    // this provider dials. These pin the bounds that stand in for it.
+    // The assertion is always on binds the *directory* saw, because
+    // that is the resource being amplified.
+
+    #[tokio::test]
+    async fn repeated_identical_bad_credentials_cost_one_bind() {
+        let dir = CountingDirectory::start("cn=alice,ou=users,dc=example,dc=org", "right").await;
+        let provider = provider_for_port(dir.port);
+
+        for _ in 0..6 {
+            assert_eq!(
+                provider.authenticate(&basic_header("alice", "wrong")).await,
+                LdapBindOutcome::InvalidCredentials,
+                "a refused credential stays refused"
+            );
+        }
+
+        assert_eq!(
+            dir.binds(),
+            1,
+            "six requests with one already-refused credential must cost the directory \
+             one bind, not six"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_username_under_password_guessing_is_throttled_at_the_directory() {
+        let dir = CountingDirectory::start("cn=alice,ou=users,dc=example,dc=org", "right").await;
+        let provider = provider_for_port(dir.port);
+
+        // A distinct password each time, so the refused-credential
+        // cache never hits and only the per-username budget can bound
+        // this. This is the shape that drives directory-side account
+        // lockout for a username the attacker does not own.
+        let budget = usize::try_from(MAX_FAILED_BINDS_PER_USERNAME).unwrap();
+        let attempts = budget * 4;
+        let mut refused_by_directory = 0usize;
+        let mut throttled = 0usize;
+        for attempt in 0..attempts {
+            match provider
+                .authenticate(&basic_header("alice", &format!("guess-{attempt}")))
+                .await
+            {
+                LdapBindOutcome::InvalidCredentials => refused_by_directory += 1,
+                // Not a verdict on the credential: the proxy declined to
+                // spend a bind on it yet. Never `InvalidCredentials`,
+                // because the directory was not asked.
+                LdapBindOutcome::DirectoryUnavailable => throttled += 1,
+                other => panic!("a wrong password must never be admitted, got {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            dir.binds(),
+            budget,
+            "{attempts} guesses inside one spacing interval must cost the directory only \
+             the {budget}-bind budget"
+        );
+        assert_eq!(
+            refused_by_directory, budget,
+            "only the guesses that actually reached the directory carry its verdict"
+        );
+        assert_eq!(
+            throttled,
+            attempts - budget,
+            "the rest wait for a slot rather than being called bad credentials"
+        );
+    }
+
+    /// The budget must not become a way to lock an honest user out.
+    #[tokio::test]
+    async fn a_successful_bind_clears_the_username_budget() {
+        let dir = CountingDirectory::start("cn=alice,ou=users,dc=example,dc=org", "right").await;
+        let provider = provider_for_port(dir.port);
+
+        for attempt in 0..2 {
+            assert_eq!(
+                provider
+                    .authenticate(&basic_header("alice", &format!("typo-{attempt}")))
+                    .await,
+                LdapBindOutcome::InvalidCredentials
+            );
+        }
+        assert_eq!(
+            provider.authenticate(&basic_header("alice", "right")).await,
+            LdapBindOutcome::Allowed {
+                username: "alice".to_string()
+            },
+            "the real password still works after a couple of typos"
+        );
+
+        // Budget cleared: alice gets her full allowance again rather
+        // than the two failures she already spent.
+        let further = usize::try_from(MAX_FAILED_BINDS_PER_USERNAME).unwrap();
+        for attempt in 0..further {
+            assert_eq!(
+                provider
+                    .authenticate(&basic_header("alice", &format!("later-{attempt}")))
+                    .await,
+                LdapBindOutcome::InvalidCredentials
+            );
+        }
+        assert_eq!(
+            dir.binds(),
+            2 + 1 + further,
+            "the success must reset the budget rather than leaving it spent"
+        );
+    }
+
+    /// The concurrency cap refuses rather than queueing, so a burst
+    /// cannot hold open an unbounded number of directory connections
+    /// for `timeout_secs` each.
+    #[test]
+    fn the_in_flight_cap_refuses_once_it_is_full() {
+        let guard = BindGuard::new();
+        let now = Instant::now();
+        let digest = guard.digest("alice", "pw");
+
+        let permits: Vec<_> = (0..MAX_IN_FLIGHT_BINDS)
+            .map(|_| {
+                guard
+                    .admit("alice", &digest, now)
+                    .expect("cap admits up to MAX_IN_FLIGHT_BINDS")
+            })
+            .collect();
+        assert!(
+            matches!(
+                guard.admit("alice", &digest, now),
+                Err(BindRefusal::TooManyInFlight)
+            ),
+            "a bind past the cap of {MAX_IN_FLIGHT_BINDS} must be refused, not queued"
+        );
+
+        drop(permits);
+        assert!(
+            guard.admit("alice", &digest, now).is_ok(),
+            "slots must come back when the binds finish"
+        );
+    }
+
+    /// The refused-credential entry is keyed on the exact pair, so a
+    /// password change is not shadowed by a stale refusal.
+    #[test]
+    fn a_refusal_only_matches_the_credential_the_directory_refused() {
+        let guard = BindGuard::new();
+        let now = Instant::now();
+        let refused = guard.digest("alice", "old");
+        guard.record_directory_refusal("alice", refused, now);
+
+        assert!(
+            matches!(
+                guard.admit("alice", &refused, now),
+                Err(BindRefusal::AlreadyRefused)
+            ),
+            "the exact credential the directory refused must not dial again"
+        );
+        assert!(
+            guard
+                .admit("alice", &guard.digest("alice", "new"), now)
+                .is_ok(),
+            "a different password is a different credential"
+        );
+        assert!(
+            guard.admit("bob", &guard.digest("bob", "old"), now).is_ok(),
+            "another user's identical password is a different credential"
+        );
+    }
+
+    /// A spent budget must never answer a correct password with a
+    /// refusal the directory never issued.
+    ///
+    /// The first shape of this budget blocked outright, which handed
+    /// anyone who knew a username a repeatable lockout of its owner: five
+    /// cheap wrong guesses, and every later request was refused without
+    /// the directory being asked, the owner's correct password included.
+    #[tokio::test]
+    async fn a_spent_budget_does_not_call_a_correct_password_wrong() {
+        let dir = CountingDirectory::start("cn=alice,ou=users,dc=example,dc=org", "right").await;
+        let provider = provider_for_port(dir.port);
+
+        // An attacker who knows only the username spends alice's budget.
+        for attempt in 0..MAX_FAILED_BINDS_PER_USERNAME {
+            assert_eq!(
+                provider
+                    .authenticate(&basic_header("alice", &format!("guess-{attempt}")))
+                    .await,
+                LdapBindOutcome::InvalidCredentials
+            );
+        }
+
+        // Alice now presents the correct password. The proxy has not
+        // asked the directory about it, so it must not claim it is wrong.
+        let outcome = provider.authenticate(&basic_header("alice", "right")).await;
+        assert_ne!(
+            outcome,
+            LdapBindOutcome::InvalidCredentials,
+            "a throttled request must not be reported as a bad credential; \
+             the directory was never consulted about it"
+        );
+        assert_eq!(
+            outcome,
+            LdapBindOutcome::DirectoryUnavailable,
+            "the honest answer is that the directory could not be consulted yet"
+        );
+    }
+
+    /// The throttle has to let go, or it is just a slower lockout.
+    #[test]
+    fn a_spent_budget_dials_again_once_the_spacing_elapses() {
+        let guard = BindGuard::new();
+        let start = Instant::now();
+
+        for attempt in 0..MAX_FAILED_BINDS_PER_USERNAME {
+            let digest = guard.digest("alice", &format!("guess-{attempt}"));
+            guard
+                .admit("alice", &digest, start)
+                .expect("every guess inside the budget reaches the directory");
+            guard.record_directory_refusal("alice", digest, start);
+        }
+
+        // Immediately after: throttled, not refused outright.
+        let correct = guard.digest("alice", "right");
+        assert!(
+            matches!(
+                guard.admit("alice", &correct, start),
+                Err(BindRefusal::UsernameThrottled)
+            ),
+            "the request past the budget waits for a slot"
+        );
+
+        // One spacing interval later the same credential goes through,
+        // which is what keeps this a delay rather than a lockout.
+        let later = start + OVER_BUDGET_DIAL_SPACING;
+        assert!(
+            guard.admit("alice", &correct, later).is_ok(),
+            "a spent budget must not hold a credential out past {}s",
+            OVER_BUDGET_DIAL_SPACING.as_secs()
+        );
+    }
+
+    /// A `{:?}` of the provider must not dump who has been failing.
+    #[test]
+    fn debug_never_prints_usernames_the_salt_or_a_credential_digest() {
+        let provider = LdapAuthProvider::from_config(base_config()).unwrap();
+        provider.bind_guard.record_directory_refusal(
+            "alice",
+            provider.bind_guard.digest("alice", "s3cret"),
+            Instant::now(),
+        );
+
+        let rendered = format!("{provider:?}");
+        assert!(
+            !rendered.contains("alice"),
+            "a username under a failed-bind budget must not reach a debug dump: {rendered}"
+        );
+        assert!(
+            !rendered.contains("s3cret") && !rendered.contains("salt"),
+            "neither the credential nor the digest salt belongs in a debug dump: {rendered}"
+        );
+        assert!(
+            rendered.contains("budgeted_usernames: 1"),
+            "the counts are what a debug dump is for: {rendered}"
+        );
+    }
+
+    /// A refusal the directory never issued must not spend a budget.
+    /// Otherwise an attacker sending empty passwords, which never dial,
+    /// could refuse an honest user for free.
+    #[tokio::test]
+    async fn local_refusals_do_not_spend_the_budget() {
+        let dir = CountingDirectory::start("cn=alice,ou=users,dc=example,dc=org", "right").await;
+        let provider = provider_for_port(dir.port);
+
+        for _ in 0..(MAX_FAILED_BINDS_PER_USERNAME * 4) {
+            assert_eq!(
+                provider.authenticate(&basic_header("alice", "")).await,
+                LdapBindOutcome::InvalidCredentials
+            );
+        }
+        assert_eq!(dir.binds(), 0, "an empty password never dials");
+
+        assert_eq!(
+            provider.authenticate(&basic_header("alice", "right")).await,
+            LdapBindOutcome::Allowed {
+                username: "alice".to_string()
+            },
+            "alice's budget must be untouched by refusals the directory never saw"
         );
     }
 }

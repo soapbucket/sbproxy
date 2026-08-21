@@ -10,6 +10,7 @@ use super::*;
 use crate::context::{LoadBalancerActionKey, LoadBalancerAttemptToken};
 use anyhow::Context as _;
 use sbproxy_config::types::FailureMode;
+use sbproxy_modules::action::websocket::FrameViolation;
 
 fn active_action<'a>(pipeline: &'a CompiledPipeline, ctx: &RequestContext) -> Option<&'a Action> {
     let origin_idx = ctx.origin_idx?;
@@ -22,6 +23,37 @@ fn active_action<'a>(pipeline: &'a CompiledPipeline, ctx: &RequestContext) -> Op
     } else {
         pipeline.actions.get(origin_idx)
     }
+}
+
+/// The frame-scanner guard to arm for a `101 Switching Protocols`
+/// exchange, or `None` when this upgrade is not a WebSocket one.
+///
+/// Two decisions in one place, because they were wrong together.
+///
+/// The cap: an action that configures `max_message_size` supplies it,
+/// and every other action gets the same documented 10 MB ceiling a
+/// `websocket` action gets when it says nothing. Retrospective review of
+/// PR #1148 found the guard armed only under `Action::WebSocket`, so
+/// `/v1/realtime` (which runs under `Action::AiProxy` and returns
+/// `Ok(false)` for transparent forwarding) and any `type: proxy` origin
+/// fronting a WebSocket backend opened an unscanned tunnel: both body
+/// filters read `ctx.websocket_tunnel` and did nothing.
+///
+/// The gate: the downstream request must have asked for a WebSocket
+/// upgrade. A `101` for some other protocol does not carry RFC 6455
+/// frames, and scanning those bytes as frames would misparse them.
+fn websocket_tunnel_guard_for_upgrade(
+    request: &pingora_http::RequestHeader,
+    action: Option<&Action>,
+) -> Option<sbproxy_modules::action::websocket::WebSocketTunnelGuard> {
+    if !super::action_dispatch::is_websocket_upgrade_request(request) {
+        return None;
+    }
+    let max_message_size = match action {
+        Some(Action::WebSocket(ws)) => ws.max_message_size,
+        _ => sbproxy_modules::action::websocket::DEFAULT_MAX_MESSAGE_SIZE,
+    };
+    Some(sbproxy_modules::action::websocket::WebSocketTunnelGuard::new(max_message_size))
 }
 
 pub(super) fn request_modifiers_for_route(
@@ -90,6 +122,16 @@ impl WebSocketDirection {
 pub(super) enum WebSocketViolation {
     /// A message crossed the action's `max_message_size` cap.
     MessageTooLarge,
+    /// A control frame broke RFC 6455 section 5.5: over 125 payload
+    /// bytes, or fragmented.
+    ///
+    /// Separate from `MessageTooLarge` because it is a different rule
+    /// with a different attacker story. A control frame's declared
+    /// length is skipped rather than accumulated, so an unchecked one
+    /// both reaches the upstream and desynchronizes the scanner for the
+    /// life of the tunnel; an operator alerting on this wants to see it
+    /// as protocol abuse, not as a client sending too much data.
+    ControlFrame,
     /// The upstream's `101` named a subprotocol outside the set the
     /// client offered and this origin allows.
     Subprotocol,
@@ -100,6 +142,7 @@ impl WebSocketViolation {
     fn teardown_reason(self) -> &'static str {
         match self {
             Self::MessageTooLarge => "message_too_large",
+            Self::ControlFrame => "control_frame_violation",
             Self::Subprotocol => "subprotocol_violation",
         }
     }
@@ -110,6 +153,7 @@ impl WebSocketViolation {
     fn audit_event_type(self) -> &'static str {
         match self {
             Self::MessageTooLarge => "websocket_message_too_large",
+            Self::ControlFrame => "websocket_control_frame_violation",
             Self::Subprotocol => "websocket_subprotocol_violation",
         }
     }
@@ -124,7 +168,7 @@ impl WebSocketViolation {
     /// carried.
     fn status_code(self) -> u16 {
         match self {
-            Self::MessageTooLarge => 0,
+            Self::MessageTooLarge | Self::ControlFrame => 0,
             Self::Subprotocol => 502,
         }
     }
@@ -249,31 +293,55 @@ pub(super) fn scan_websocket_tunnel_chunk(
         WebSocketDirection::UpstreamToClient => guard.scan_upstream_bytes(chunk),
     };
     if let Err(violation) = scan {
-        if !already_violated {
-            warn!(
-                hostname = %ctx.hostname,
-                observed = violation.observed,
-                limit = violation.limit,
-                direction = direction.as_label(),
-                "websocket message exceeds max_message_size; closing the tunnel"
-            );
-            record_websocket_violation(
-                ctx,
+        // Every `reason` below is proxy-authored: a fixed sentence, the
+        // direction label, and byte counts or an opcode read off a frame
+        // header. No frame content reaches it, which is what lets the
+        // string travel to a third-party sink intact. The
+        // `message_too_large` wording is byte-identical to what WOR-2552
+        // shipped, because a SIEM rule may already match on it.
+        let (kind, reason) = match violation {
+            FrameViolation::MessageTooLarge { observed, limit } => (
                 WebSocketViolation::MessageTooLarge,
-                direction.as_label(),
-                method,
                 format!(
                     "websocket message exceeds max_message_size: direction={}, observed={}, limit={}",
                     direction.as_label(),
-                    violation.observed,
-                    violation.limit
+                    observed,
+                    limit
                 ),
+            ),
+            FrameViolation::OversizedControlFrame { declared } => (
+                WebSocketViolation::ControlFrame,
+                format!(
+                    "websocket control frame exceeds the RFC 6455 payload limit: direction={}, declared={}, limit={}",
+                    direction.as_label(),
+                    declared,
+                    sbproxy_modules::action::websocket::MAX_CONTROL_FRAME_PAYLOAD
+                ),
+            ),
+            FrameViolation::FragmentedControlFrame { opcode } => (
+                WebSocketViolation::ControlFrame,
+                format!(
+                    "websocket control frame arrived fragmented, which RFC 6455 forbids: \
+                     direction={}, opcode=0x{:X}",
+                    direction.as_label(),
+                    opcode
+                ),
+            ),
+        };
+        if !already_violated {
+            warn!(
+                hostname = %ctx.hostname,
+                violation = violation.label(),
+                detail = %violation,
+                direction = direction.as_label(),
+                "websocket frame violates an enforced limit; closing the tunnel"
             );
+            record_websocket_violation(ctx, kind, direction.as_label(), method, reason);
         }
         *body = None;
         return Err(pingora_error::Error::explain(
-            pingora_error::ErrorType::Custom("websocket_message_too_large"),
-            "websocket message exceeds max_message_size",
+            pingora_error::ErrorType::Custom(violation.label()),
+            violation.to_string(),
         ));
     }
     Ok(())
@@ -336,35 +404,40 @@ pub(super) fn enforce_upstream_subprotocol_selection(
 /// Whether this request is riding an upgraded tunnel, and whether the
 /// gateway's own frame scanner already tore it down (WOR-2551).
 ///
-/// `Some(true)` means the `websocket` action's `max_message_size` guard
-/// tripped, which already logged, counted, and audited at the scan site.
-/// `Some(false)` means a tunnel is open and nothing has reported why it
-/// is ending yet. `None` means the client is still speaking HTTP.
+/// `Some(true)` means the frame scanner tore the tunnel down, either on
+/// `max_message_size` or on RFC 6455's control-frame rules, and the scan
+/// site already logged, counted, and audited it. `Some(false)` means a
+/// tunnel is open and nothing has reported why it is ending yet. `None`
+/// means the client is still speaking HTTP.
 ///
-/// Two surfaces reach 101 and then speak raw frames, and both belong
-/// here:
+/// The guard answers for every surface now.
+/// [`websocket_tunnel_guard_for_upgrade`] arms
+/// [`RequestContext::websocket_tunnel`] on any `101` whose downstream
+/// request asked for a WebSocket upgrade, so `Action::WebSocket`, AI
+/// realtime (`type: ai_proxy` reaching `/v1/realtime`), a `type: proxy`
+/// or `type: load_balancer` origin fronting a WebSocket backend, and a
+/// forward rule onto any of them all arrive here with a guard. Its
+/// presence is the proxy's own record that the upgrade settled.
 ///
-/// - `Action::WebSocket`, which arms
-///   [`RequestContext::websocket_tunnel`] in `response_filter` right
-///   after the upstream's 101 passes subprotocol enforcement. The guard
-///   exists because that action scans frames; its presence is the
-///   proxy's own record that the upgrade settled.
-/// - AI realtime (`type: ai_proxy` reaching `/v1/realtime`), dispatched
-///   through `action_dispatch::handle_action` into
-///   `ctx.ai_realtime_dispatch`. It never arms a frame-scanner guard,
-///   because scanning is a `websocket`-action duty, so it needs the
-///   second half of the test: `ctx.response_status` carries the
-///   upstream's status from `response_filter`, and a 101 there is the
-///   same proof of an open tunnel the guard gives the other surface.
-///   Without this arm a realtime provider reset wrote `bad gateway`
-///   into the client's audio frame stream, which is the exact defect
-///   WOR-2551 fixed on the `websocket` action and left standing here.
+/// The realtime arm below is, as a result, unreachable today, and it is
+/// kept deliberately rather than deleted. Realtime dispatch is gated on
+/// `is_websocket_upgrade_request` (`action_dispatch.rs`), the same
+/// predicate the arming uses, and the arming runs earlier in
+/// `response_filter` than `ctx.response_status` is set, so a realtime
+/// `101` always has a guard by the time anything asks. What the arm
+/// costs is two lines; what it buys is that a future realtime surface
+/// negotiated without an `Upgrade` header (an h2 extended `CONNECT`, a
+/// provider that tunnels over a plain `200`) still reports its open
+/// tunnel here instead of writing `bad gateway` into a client's audio
+/// frame stream. That was the exact defect WOR-2551 fixed on the
+/// `websocket` action, and it is cheaper to keep the belt than to
+/// rediscover it.
 ///
-/// The realtime arm is deliberately keyed on the status rather than on
-/// `ai_realtime_dispatch` alone: the dispatch context is populated
-/// before the provider answers, so a realtime request the provider
-/// refused with a 401 is still an ordinary HTTP exchange and still owes
-/// its client a readable error body.
+/// It is keyed on the status rather than on `ai_realtime_dispatch`
+/// alone for the same reason it always was: the dispatch context is
+/// populated before the provider answers, so a realtime request the
+/// provider refused with a 401 is still an ordinary HTTP exchange and
+/// still owes its client a readable error body.
 fn upgraded_tunnel_torn_down(ctx: &RequestContext) -> Option<bool> {
     if let Some(guard) = ctx.websocket_tunnel.as_ref() {
         return Some(guard.violated());
@@ -3447,14 +3520,18 @@ impl ProxyHttp for SbProxy {
                 &inbound_body,
                 ctx,
             ) {
+                warn!(
+                    provider = %ctx.principal.source.as_str(),
+                    "content-digest body binding failed on the GraphQL inbound body; refusing"
+                );
                 let body = serde_json::json!({
-                    "error": "bot_auth: content-digest body mismatch",
+                    "error": "signature: content-digest body mismatch",
                 })
                 .to_string();
                 ctx.validator_failed = Some((401, body, "application/json".to_string()));
                 return Err(pingora_error::Error::explain(
                     pingora_error::ErrorType::HTTPStatus(401),
-                    "bot_auth: content-digest body binding failed",
+                    "signature: content-digest body binding failed",
                 ));
             }
 
@@ -3615,14 +3692,33 @@ impl ProxyHttp for SbProxy {
 
         // --- WOR-2490: websocket upgrade acceptance ---
         //
-        // The upstream answered `101 Switching Protocols` for a
-        // `websocket` action. Two enforcement duties before the tunnel
-        // opens: hold the upstream's subprotocol selection to what the
-        // client offered and this origin allows, and arm the
-        // `max_message_size` frame scanner for both directions.
+        // The upstream answered `101 Switching Protocols`. Two
+        // enforcement duties before the tunnel opens: hold the
+        // upstream's subprotocol selection to what the client offered
+        // and this origin allows (a `websocket` action's job, since it
+        // is the only action that configures an allowlist), and arm the
+        // frame scanner for both directions.
+        //
+        // The scanner arms for every WebSocket upgrade, not only for
+        // `Action::WebSocket`. Retrospective review of PR #1148 found
+        // the guard keyed on the action: `/v1/realtime` runs under
+        // `Action::AiProxy`, which gates the upgrade and then returns
+        // `Ok(false)` for transparent forwarding, so `active_action`
+        // never matched and both body-filter scans were no-ops on the
+        // highest-value tunnel in the product. A `type: proxy` or
+        // `type: load_balancer` origin fronting a WebSocket backend had
+        // the same gap. An action that carries no `max_message_size`
+        // gets the same documented 10 MB ceiling a `websocket` action
+        // gets when it says nothing.
+        //
+        // The `Upgrade: websocket` test is load bearing: a `101` for
+        // some other protocol (`h2c`, or any other upgrade an origin
+        // proxies) does not carry RFC 6455 frames, and running a frame
+        // scanner over those bytes would misparse them.
         if upstream_response.status.as_u16() == 101 {
             let pipeline = ctx.pipeline.clone();
-            if let Some(Action::WebSocket(ws)) = active_action(&pipeline, ctx) {
+            let action = active_action(&pipeline, ctx);
+            if let Some(Action::WebSocket(ws)) = action {
                 if !ws.subprotocols.is_empty() {
                     use sbproxy_modules::action::websocket::parse_subprotocol_header_values;
                     let selected = parse_subprotocol_header_values(
@@ -3651,12 +3747,8 @@ impl ProxyHttp for SbProxy {
                         )?;
                     }
                 }
-                ctx.websocket_tunnel = Some(
-                    sbproxy_modules::action::websocket::WebSocketTunnelGuard::new(
-                        ws.max_message_size,
-                    ),
-                );
             }
+            ctx.websocket_tunnel = websocket_tunnel_guard_for_upgrade(session.req_header(), action);
         }
 
         // --- WOR-808: RSL `Link: rel="license"` discovery header ---
@@ -5417,15 +5509,24 @@ impl ProxyHttp for SbProxy {
                     &session.req_header().headers,
                     &collected,
                 ) {
-                    debug!("bot_auth content-digest body binding check failed; rejecting request");
+                    // `warn!`, not `debug!`: this is the forgery this
+                    // binding exists to catch, and `release_max_level_info`
+                    // compiles `debug!` out, so at debug the shipped binary
+                    // records a refused body-bound signature as nothing at
+                    // all. Carries no digest values and no body length, which
+                    // would hand a prober a size oracle.
+                    warn!(
+                        provider = %ctx.principal.source.as_str(),
+                        "content-digest body binding failed; refusing request"
+                    );
                     let body_str = serde_json::json!({
-                        "error": "bot_auth: content-digest body mismatch",
+                        "error": "signature: content-digest body mismatch",
                     })
                     .to_string();
                     ctx.validator_failed = Some((401, body_str, "application/json".into()));
                     return Err(pingora_error::Error::explain(
                         pingora_error::ErrorType::HTTPStatus(401),
-                        "bot_auth: content-digest body binding failed",
+                        "signature: content-digest body binding failed",
                     ));
                 }
                 let pipeline = ctx.pipeline.clone();
@@ -8084,6 +8185,102 @@ mod tests {
     use super::*;
     use pingora_error::ErrorSource;
 
+    /// A downstream `GET` asking for a WebSocket upgrade.
+    fn upgrade_request() -> pingora_http::RequestHeader {
+        let mut request =
+            pingora_http::RequestHeader::build("GET", b"/v1/realtime", None).expect("request");
+        request
+            .insert_header("upgrade", "websocket")
+            .expect("upgrade header");
+        request
+            .insert_header("connection", "Upgrade")
+            .expect("connection header");
+        request
+    }
+
+    /// The compiled action for the single origin in `yaml`.
+    fn first_action(yaml: &str) -> Action {
+        let config = sbproxy_config::compile_config(yaml).expect("fixture config");
+        let mut pipeline =
+            crate::pipeline::CompiledPipeline::from_config(config).expect("fixture pipeline");
+        pipeline.actions.remove(0)
+    }
+
+    /// One masked text frame declaring `payload_len` bytes of payload.
+    fn text_frame_header(payload_len: u64) -> Vec<u8> {
+        let mut bytes = vec![0x81u8, 0x80 | 127];
+        bytes.extend_from_slice(&payload_len.to_be_bytes());
+        bytes.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        bytes
+    }
+
+    #[test]
+    fn a_non_websocket_action_upgrade_still_arms_the_frame_scanner() {
+        // Retrospective review of PR #1148: the guard was armed only
+        // inside `if let Some(Action::WebSocket(ws))`. `/v1/realtime`
+        // runs under `Action::AiProxy` and a `type: proxy` origin can
+        // carry an upgrade too, so both opened a tunnel with
+        // `ctx.websocket_tunnel == None` and both body-filter scans
+        // no-opped for its entire life.
+        let action = first_action(
+            r#"
+origins:
+  "realtime.example":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#,
+        );
+        let mut guard = websocket_tunnel_guard_for_upgrade(&upgrade_request(), Some(&action))
+            .expect("an upgraded tunnel under a non-websocket action must be scanned");
+
+        // The documented 10 MB default applies, the same ceiling a
+        // `websocket` action gets when it says nothing. A fresh guard
+        // per probe: the first header's declared payload never arrives,
+        // so a second header fed to the same scanner would be consumed
+        // as that payload rather than parsed.
+        guard
+            .scan_client_bytes(&text_frame_header(10 * 1024 * 1024))
+            .expect("a message at the default ceiling passes");
+        let mut guard = websocket_tunnel_guard_for_upgrade(&upgrade_request(), Some(&action))
+            .expect("an upgraded tunnel under a non-websocket action must be scanned");
+        guard
+            .scan_client_bytes(&text_frame_header(10 * 1024 * 1024 + 1))
+            .expect_err("a message over the default ceiling is refused");
+    }
+
+    #[test]
+    fn a_websocket_action_upgrade_keeps_its_configured_cap() {
+        let action = first_action(
+            r#"
+origins:
+  "ws.example":
+    action:
+      type: websocket
+      url: ws://test.sbproxy.dev
+      max_message_size: 1024
+"#,
+        );
+        let mut guard = websocket_tunnel_guard_for_upgrade(&upgrade_request(), Some(&action))
+            .expect("a websocket action's tunnel is scanned");
+        guard
+            .scan_client_bytes(&text_frame_header(1024))
+            .expect("a message at the configured cap passes");
+        let mut guard = websocket_tunnel_guard_for_upgrade(&upgrade_request(), Some(&action))
+            .expect("a websocket action's tunnel is scanned");
+        guard
+            .scan_client_bytes(&text_frame_header(1025))
+            .expect_err("a message over the configured cap is refused");
+    }
+
+    #[test]
+    fn a_101_that_is_not_a_websocket_upgrade_is_left_alone() {
+        // Some other protocol upgrade does not carry RFC 6455 frames,
+        // and scanning those bytes as frames would misparse them.
+        let request = pingora_http::RequestHeader::build("GET", b"/", None).expect("request");
+        assert!(websocket_tunnel_guard_for_upgrade(&request, None).is_none());
+    }
+
     #[test]
     fn closed_transform_failure_aborts_a_committed_response() {
         let mut ctx = RequestContext::default();
@@ -10290,6 +10487,55 @@ origins:
             ),
             policy_before + 2,
             "the shared policy counter sees the refusal the way it sees every other one"
+        );
+    }
+
+    /// The fourteen bytes from the retrospective review of PR #1148,
+    /// through the same funnel: a masked pong header declaring
+    /// `u64::MAX`. Before the control-frame check this scan returned
+    /// `Ok(())`, the guard stayed untripped, and every later byte in
+    /// that direction was consumed as the declared payload, so no
+    /// record, no counter, and no cap for the life of the tunnel.
+    #[test]
+    fn a_control_frame_violation_audits_and_counts_under_its_own_reason() {
+        const ORIGIN: &str = "ws-control.example.com";
+        const WEDGING_PONG_HEADER: &[u8] = &[
+            0x8A, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x11, 0x22, 0x33, 0x44,
+        ];
+        let before =
+            websocket_teardown_count("control_frame_violation", "client_to_upstream", ORIGIN);
+
+        let records = capture_security_audit(|| {
+            let mut ctx = websocket_ctx(ORIGIN, 1_048_576);
+            let mut body = Some(Bytes::from_static(WEDGING_PONG_HEADER));
+            assert!(scan_websocket_tunnel_chunk(
+                &mut ctx,
+                &mut body,
+                WebSocketDirection::ClientToUpstream,
+                Some("GET"),
+            )
+            .is_err());
+            assert!(body.is_none(), "the refused chunk is dropped");
+        });
+
+        assert_eq!(records.len(), 1, "{records:?}");
+        let record = &records[0];
+        assert_eq!(record["event_type"], "websocket_control_frame_violation");
+        assert_eq!(record["hostname"], ORIGIN);
+        assert_eq!(
+            record["status_code"], 0,
+            "a torn-down tunnel receives no HTTP status"
+        );
+        assert_eq!(
+            record["reason"].as_str().expect("reason is a string"),
+            "websocket control frame exceeds the RFC 6455 payload limit: \
+             direction=client_to_upstream, declared=18446744073709551615, limit=125",
+            "the reason is proxy-authored: a fixed sentence plus header-derived numbers"
+        );
+        assert_eq!(
+            websocket_teardown_count("control_frame_violation", "client_to_upstream", ORIGIN),
+            before + 1,
+            "an operator alerting on protocol abuse gets its own reason label"
         );
     }
 

@@ -357,7 +357,7 @@ Verification: <how the fixes were re-checked>
 - Blocker - `path/to/file.rs:LINE` - one-line claim. Failure scenario:
   concrete inputs or state, and what goes wrong. Fixed in this branch.
 - Major - `path/to/other.rs:LINE` - one-line claim. Failure scenario:
-  what goes wrong. Accepted; why it was not fixed.
+  what goes wrong. Not fixed here, and why.
 
 ### Checked and sound
 - Category: what was verified, in one line.
@@ -366,12 +366,27 @@ Verification: <how the fixes were re-checked>
 One entry per finding, and one for every finding the `Findings:` counts
 declare. A list item leading with its severity is the short form; past
 about five findings, a table with a Severity column and a Disposition
-column reads better and the checker counts it the same way. Group them
+column reads better and the checker counts it the same way, reading that
+column for the disposition rather than the whole row. Group them
 under subheadings if that helps; `### Checked and sound` is exempt from
-the count. End each with a sentence
-starting `Fixed`, `Accepted`, or `Filed`: the capital and the sentence
-break are what separate a disposition from a description that happens to
-use the word, as in "the endpoint accepted a forged token".
+the count.
+
+End each with a clause saying what happened to that finding. `Fixed`,
+`Addressed`, `Resolved`, `Mitigated`, `Reverted`, `Landed`,
+`Superseded`, `Accepted`, `Declined`, `Waived`, `Deferred`, `Filed`, and
+`Withdrawn` all count, as does any of them under `Not`, `Partly`,
+`Partially`, or `Already`, and so do `Not replicated`, `Not reproduced`,
+`Not applicable`, and `Not reachable`. Write the one that is true rather
+than the one that is shortest: "Not fixed here, the remedy is a separate
+change" tells the next reader more than "Accepted." does.
+
+The capital and the clause break are what separate a disposition from a
+description that happens to use the word, as in "the endpoint accepted a
+forged token". So front the qualifier, `Already fixed by #1177.` rather
+than `This was already fixed by #1177.`, and end the claim with a
+period, comma, semicolon, or colon before the disposition starts. The
+` - ` between a finding's severity, path, and claim is a field separator
+and does not open a clause.
 
 `Findings: none` is the form for a review that turned nothing up, and it
 needs no `Verification:` line. Everything else does, because a round

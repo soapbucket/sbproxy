@@ -305,7 +305,10 @@ place.
 
 Run the fixtures with `python3 scripts/check-review-evidence.py
 --self-test` (`scripts/check.sh` does too), and check a draft body with
-`--body-file FILE` or `--stdin` before opening the PR.
+`--body-file FILE` or `--stdin` before opening the PR. The self-test
+carries a mutation battery as well: every refusal the check relies on is
+paired with a loosening of the parser that has to break a fixture, so a
+refusal cannot quietly stop working behind fixtures that still pass.
 
 The pull request template already carries an `## Adversarial review`
 heading at the end, after "Notes for reviewers". Fill that one in.
@@ -320,17 +323,45 @@ Under the heading:
    Minor, or the literal `Findings: none`. Those three are the whole
    severity set; the rubric has no Critical.
 3. One entry per declared finding, either a list item leading with its
-   severity or a table row with a whole cell that is the severity. The
-   entry count per severity has to match the declared count in both
-   directions, so an undercounted summary fails the same way an
+   severity or a table row with a whole cell that is the severity. In a
+   table that names a `Disposition` column, that column is the one read
+   for the disposition; a table without one has every cell in the row
+   read. The entry count per severity has to match the declared count in
+   both directions, so an undercounted summary fails the same way an
    undocumented finding does.
 4. A `Verification:` line whenever the counts are not all zero, since a
    round that finds anything gets a second round on the fixes.
 
-Each finding ends with a sentence starting `Fixed`, `Accepted`, or
-`Filed`. The capital and the sentence break are load bearing: they are
-what separates a disposition from a description that happens to use the
-word, as in "the endpoint accepted a forged token".
+Each finding ends with a clause saying what happened to it. What the
+check is after is that no finding was listed and then abandoned, so the
+vocabulary is the outcomes people actually write:
+
+- `Fixed`, `Addressed`, `Resolved`, `Mitigated`, `Reverted`, `Landed`,
+  `Superseded`, `Accepted`, `Declined`, `Waived`, `Deferred`, `Filed`,
+  `Withdrawn`.
+- Any of those under `Not`, `Partly`, `Partially`, or `Already`: `Not
+  fixed here, the remedy is separate scope.` `Partly addressed, the e2e
+  is still absent.` `Already fixed in #1177.`
+- `Not replicated`, `Not reproduced`, `Not applicable`, `Not reachable`.
+  Those four are outcomes only in the negative. On their own they say
+  the finding is real and nothing has happened to it, which is the
+  abandonment the check exists to catch.
+
+Write the honest one rather than the shortest one. "Not fixed here,
+because it is pre-existing and the remedy is a separate change" tells
+the next reader more than "Accepted." does.
+
+Two shapes to know, both of them consequences of the capital and the
+clause break being what separates a disposition from a description that
+happens to use the word, as in "the endpoint accepted a forged token":
+
+- Front the qualifier. `Already fixed by #1177.` counts; `This was
+  already fixed by #1177.` does not, because the qualifier has to open
+  the clause and carry the capital.
+- End the claim before the disposition starts, with a period, comma,
+  semicolon, or colon. The ` - ` that separates a finding's severity,
+  path, and claim is a field separator here and does not open a clause,
+  so `boom - Fixed here` is refused and `boom. Fixed here` is not.
 
 Findings may be grouped under subheadings, which is what a review with
 more than a handful of them wants; a `### Checked and sound` subsection
@@ -354,8 +385,8 @@ Verification: second round by the same reviewer against the fixed tree
 - Blocker - `crates/sbproxy-core/src/router.rs:214` - an upstream 5xx
   retries against the same dead peer forever. Fixed in this branch.
 - Major - `crates/sbproxy-core/src/router.rs:301` - the retry budget is
-  held by convention rather than by the type. Accepted; the type change
-  is separate scope.
+  held by convention rather than by the type. Not fixed here, the type
+  change is separate scope.
 ```
 
 Without:

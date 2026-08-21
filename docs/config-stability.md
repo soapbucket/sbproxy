@@ -1,6 +1,6 @@
 # Config stability tiers
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-20*
 
 This page defines the stability tiers and applies them to representative or
 high-impact configuration leaves. It also lists the current reviewed
@@ -128,6 +128,8 @@ surface that does the job. Boot and reload both refuse the document.
 | `transforms[].allowed_hosts` (`type: wasm`) | Never enforced, and unenforceable: WASM modules have no network surface at all here, so the allowlist described a boundary nothing checked. | Keep the reaching on the proxy side. Gate the origin with an `expression` policy, or route the callout through an origin the proxy controls. The key returns as an enforced one if a host callout ever lands. |
 | `transforms[].on_request` (`type: cel`) | Compiled at config load and never evaluated. Transforms run on the response body, so there is no request phase for it to run in. | An `expression` policy to gate the request, a rate-limit or WAF `key:` expression to key on it, or a forward rule to route on it. |
 | `transforms[].on_response`, and its `expression` alias (`type: cel`) | Replaced the entire response body with whatever scalar the expression evaluated to. No partial edit, no structure-aware change, no streaming. CEL is for deciding; producing a payload is a different job, and no config in the tree ever authored the key. | A `javascript`, `lua_json`, or WASM transform, each of which parses the body, edits part of it, and re-emits. The same transform's `headers:` rules still set response headers from CEL. |
+| `sandbox.memory_mb` (bundle manifest, `runtime: rego`) | Reached nothing. A Rego hook evaluates on the Regorus interpreter inside the proxy's own process, so there is no guest heap to bound, and the interpreter's allocator guards compile to `Ok(())` unless a Cargo feature this workspace does not enable is on. The number an operator wrote bounded nothing at all while reading as a sandbox control. | `sandbox.budget_ms` bounds evaluation time, and `sandbox.max_buffer_bytes` plus `sandbox.max_output_bytes` bound the body in and the replacement out. The key is still honored on `runtime: wasm`, `proxy_wasm`, and `javascript`, which do have a guest to bound. |
+| `sandbox.stack_kb` (bundle manifest, `runtime: rego`) | Same: no guest stack exists to bound, and 0.11 exposes no stack-depth knob the key could have been mapped to. | The same three keys as `memory_mb` above, and the key keeps working on the three runtimes that have a guest stack. |
 
 #### Schema keys refused at config compile
 
