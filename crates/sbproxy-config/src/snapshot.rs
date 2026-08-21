@@ -275,7 +275,12 @@ pub struct CompiledConfig {
     /// Extension bundle discovery configuration preserved for the pipeline
     /// candidate loader. This crate does not resolve paths or fetch sources.
     pub extension_bundles: crate::extensions::ExtensionBundlesConfig,
-    /// All compiled origins, in the order they were registered.
+    /// All compiled origins, sorted by their config key.
+    ///
+    /// The order is part of the compiled output rather than an accident
+    /// of how the file was read: `compile_config` sorts the origin keys
+    /// before it assigns positions. Callers may rely on it, and one
+    /// does, the `servers` array of an emitted OpenAPI document.
     pub origins: Vec<CompiledOrigin>,
     /// Maps hostname to index into `origins`.
     pub host_map: HashMap<CompactString, usize>,

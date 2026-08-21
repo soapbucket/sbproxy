@@ -47,11 +47,13 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, field
 import difflib
+import json
 import os
 from pathlib import Path
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -77,13 +79,24 @@ MANIFEST: dict[str, dict] = {
     },
     "examples/usage-bridge-queue/README.md": {
         # The same worker as docs/payment-settlement.md's usage_bridge
-        # section, reached by its own dedicated walkthrough. Both of this
-        # page's captures are `sqlite3` reads against the queue that
-        # section's config also drives, so they get the same stack,
-        # match list, and settle wait rather than a second definition of
-        # the same shape: a row written `queued` needs the recovery
-        # worker's next sweep, 1000 ms in this example's config, before
-        # it reads `terminal`.
+        # section, reached by its own dedicated walkthrough. It drives
+        # its own traffic: the page's first capture bills a call and the
+        # two `sqlite3` reads below it read what that produced.
+        #
+        # That driver marker is load bearing rather than tidy. The two
+        # reads used to be the only markers here, on the assumption that
+        # docs/payment-settlement.md's section had already filled the
+        # queue. It had, and then this page's own stack start wiped it:
+        # `start_usage_bridge_stack` rmtree's /tmp/sbproxy-usage-bridge
+        # before every boot, so both reads ran against an empty database
+        # and this page could not go green in a full run no matter what
+        # it claimed. A page's captures have to stand up on their own,
+        # because the harness gives every document a fresh stack.
+        #
+        # Same stack, match list and settle wait as the settlement page
+        # rather than a second definition of the same shape: a row
+        # written `queued` needs the recovery worker's next sweep,
+        # 1000 ms in this example's config, before it reads `terminal`.
         "sections": [
             {
                 "match": ["usage-bridge", "usage_bridge"],
@@ -158,46 +171,116 @@ MANIFEST: dict[str, dict] = {
             {"stack": "settlement", "fresh_each": True},
         ],
     },
+    "docs/audit-log.md": {
+        # The admin half of the page, against `examples/audit-log/`.
+        # Shared rather than fresh per block because the second capture
+        # asserts the admin-action ring is still empty after the first
+        # one reloaded, which is the page's actual claim: a reload does
+        # not write to that ring. A fresh proxy per block would show an
+        # empty ring for a reason the page is not making.
+        "sections": [{"stack": "audit_log", "fresh_each": False}],
+    },
+    "docs/admin-api-reference.md": {
+        # Two sections, because this page is a route reference with a
+        # walkthrough embedded in it.
+        "sections": [
+            # The "Worked example" blocks are the same five attributed
+            # calls `examples/admin-reporting/README.md` drives, read
+            # back through this page's routes, so they want that
+            # walkthrough's stack rather than a second copy of it. They
+            # are ordered among themselves: the export counters in the
+            # last one exist because the two exports above it ran.
+            {
+                "match": ["api/requests", "admin_request_export"],
+                "stack": "admin_reporting",
+                "fresh_each": False,
+            },
+            # `/api/health` answers with a compile-time constant, so
+            # this does not prove the body is current; the page says as
+            # much two lines below the marker. What it holds is the
+            # route: that the admin server binds, that basic auth on
+            # these credentials is accepted, and that this path still
+            # answers 200 with this shape rather than having moved or
+            # grown a field. Any config with an admin block serves it,
+            # so it rides the cheaper stack.
+            {"stack": "audit_log", "fresh_each": False},
+        ],
+    },
+    "examples/admin-reporting/README.md": {
+        # One walkthrough, one stack, and every block after the first is
+        # downstream of the one above it: the report reads the five
+        # calls the stack drove, and the export counters and audit
+        # records read the two exports. `fresh_each` would reset the
+        # in-memory report ring between blocks and publish zeroes.
+        #
+        # The export marker writes its CSV to /tmp rather than to the
+        # `acme-requests.csv` the page shows. Commands run with the repo
+        # root as their working directory, so the documented spelling
+        # would drop an untracked file into the tree on every check, and
+        # a lane that dirties the tree it is checking fails the gate
+        # that reads it. `head -3` prints the same three lines either
+        # way, which is what the block holds.
+        "sections": [{"stack": "admin_reporting", "fresh_each": False}],
+    },
 }
 
-# Pages that show command output and are deliberately NOT in the manifest
-# above.
+# Pages that carry command output and are deliberately NOT above.
 #
-# Written down because the alternative is worse than silence: an
-# unreplayed page looks exactly like a page nobody has got to yet, so the
-# next person sweeping for gaps re-derives the same reasoning and, if
-# they are unlucky, lands the flaky gate the note exists to prevent.
+# This list is here because the alternative is worse than useless. An
+# unreplayed page looks identical to a page nobody got to yet, so the
+# next person to sweep for gaps re-derives the same reasoning and, if
+# they are unlucky, lands the flaky gate one of these notes exists to
+# prevent. Two of these were decided in pull-request bodies, which are
+# invisible from the code.
 #
 # `examples/health-and-budget-gauges/README.md`
-#     Timing-dependent by design, and the timing is the subject. The
-#     walkthrough says "scrape right after startup, before the dead
-#     target's third consecutive probe failure", then scrapes again
-#     after it, to show one gauge crossing from 0 to 2. The harness has
-#     no way to hold that window open: it would have to land a capture
-#     inside a roughly four-second startup race, on a loaded CI runner,
-#     to read the first block's value. Forcing it in buys a flaky gate,
-#     which is worth less than no gate because a lane people rerun until
-#     it passes stops being read at all. The page's blocks also
-#     interleave `$` prompts with their output, so there is no
-#     output-only block to put after a marker.
+#     Timing-dependent by design. Its walkthrough says "scrape right
+#     after startup, before the dead target's third consecutive probe
+#     failure", and the harness has no way to hold that window open.
+#     A manifest entry buys a flaky gate rather than an honest one.
+#     There is no ticket for this and that is deliberate: the only
+#     remedies are to teach the harness to freeze a probe clock, or to
+#     rewrite the walkthrough so it stops demonstrating the thing it
+#     exists to demonstrate. A ticket saying "add this to the manifest"
+#     reads as a to-do and gets actioned into the flake. If you are here
+#     because you noticed the page is unreplayed: that is on purpose.
 #
-#     The remedies are real but neither is a manifest entry: teach the
-#     harness to freeze a probe clock, or rewrite the walkthrough so it
-#     stops demonstrating the transition it exists to demonstrate. If
-#     you are here because you noticed the page is unreplayed, that is
-#     on purpose; the same note is in the page itself.
+# `docs/audit-log.md`, the two stdout blocks
+#     The `sbproxy::admin::audit` line and the `config_audit` envelope
+#     are real output, but they arrive on the proxy's stdout, which this
+#     script redirects into a log file and never hands to a capture
+#     command. There is no command that produces them, so there is
+#     nothing to put after a marker. Covering them needs an admin route
+#     that reads them back, which is a feature rather than a manifest
+#     entry.
+#
+# `docs/admin-api-reference.md`, its per-route response bodies
+#     The worked examples on this page are captured; its per-route JSON
+#     blocks are not, and should not be. They are response *shapes*
+#     carrying deliberate placeholders (`abc123...`, `08ad73be-...`,
+#     `key_9f2c...`), and several describe states you cannot produce on
+#     demand, such as a reload whose `degraded` array names a subsystem
+#     that failed. A shape is not a capture, and replaying one would
+#     mean inventing a scenario to match it.
+#
+# `docs/admin-api-reference.md`, the routing-decisions worked example
+#     The one worked example on the page that is left out. Its setup is
+#     a config inline in the page rather than a directory under
+#     `examples/`, and it needs a second provider on 18591 plus a
+#     deliberately closed port to force the fallback it demonstrates.
+#     A stack here would be standing up a fixture that exists nowhere
+#     else in the repo; the example wants shipping first.
 #
 # `docs/admin-ui.md`
-#     Nothing on the page is command output. It is prose plus
+#     Nothing to replay on this branch. The page is prose plus
 #     screenshots (see `scripts/capture-admin-screenshots.mjs`) and
-#     copy-paste blocks: a build recipe, a URL template, a config
-#     fragment, and a three-terminal mesh launch. Its one real captured
-#     response is keyed by a request id minted at run time by the drive
-#     call above it, and reaching it needs `capture_content` on the
-#     origin AND `allow_content_capture` on the key, so replaying it
-#     means shell-substituting an id out of a previous call rather than
-#     running the command the page prints. Covering this page is a
-#     screenshot problem, not a manifest entry.
+#     three copy-paste blocks: a build recipe, a URL template, and a
+#     three-terminal mesh launch. None of the three shows output.
+
+#
+# The two whole-page exemptions above are machine-checked below, so a
+# marker landing on one of them is refused rather than quietly ignored.
+# The block-level notes stay prose: they name blocks, not pages.
 EXEMPT_DOCS: dict[str, str] = {
     "docs/admin-ui.md": (
         "nothing on the page is command output: prose, screenshots, and "
@@ -224,7 +307,7 @@ class Capture:
 @dataclass
 class Result:
     capture: Capture
-    status: str  # "ok" | "drift" | "empty" | "missing" | "skipped"
+    status: str  # "ok" | "drift" | "empty" | "missing" | "blocked" | "skipped"
     detail: str = ""
     actual: str = ""
 
@@ -244,6 +327,14 @@ class Stack:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+                # Reaped rather than left behind: `kill` only delivers
+                # the signal, and a child still holding its listening
+                # socket is a child the next stack's port preflight
+                # will find and report as somebody else's.
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
         self.procs.clear()
 
 
@@ -284,6 +375,15 @@ NORMALIZERS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\b1[0-9]{9}\b"), "<EPOCH_S>"),
     (re.compile(r"lnbcrt[0-9a-z]{20,}"), "lnbcrt<INVOICE>"),
     (re.compile(r"127\.0\.0\.1:\d{4,5}"), "127.0.0.1:<PORT>"),
+    # Service time in milliseconds, as a float, in both export formats.
+    # It is the one field on the reporting pages that is a measurement
+    # rather than a value the config or the request determined, so it
+    # moves every run and is the only thing normalized away there.
+    (re.compile(r'"latency_ms":\s*\d+\.\d+'), '"latency_ms": <LATENCY>'),
+    # The same field in the CSV export, where it has no name. Anchored
+    # on the column that follows it rather than on a bare float, so it
+    # cannot swallow the cost, token or retry columns.
+    (re.compile(r"(?<=,)\d+\.\d+(?=,127\.0\.0\.1:)"), "<LATENCY>"),
     (re.compile(r"^content-length: \d+$", re.MULTILINE), "content-length: <LEN>"),
     # The recovery worker's admin status counters advance on its own
     # wall-clock tick interval, independent of what a walkthrough's steps
@@ -388,6 +488,61 @@ def _block_after(lines: list[str], start: int) -> tuple[str | None, tuple[int, i
 # --- Stacks ------------------------------------------------------------
 
 
+def _busy_ports(ports: tuple[int, ...], timeout: int = 15) -> list[int]:
+    """Which of these loopback ports still have a listener.
+
+    Waits up to `timeout` for them to clear before answering, because
+    the caller has usually just torn down the previous stack and a
+    listener takes a moment to go.
+
+    This exists because the failure it prevents is invisible. Every
+    stack here binds 8080 and most also bind 9090. Start one while
+    something else holds those ports and nothing reports an error: the
+    proxy child dies on the bind, `_wait_for_http` gets its 200 from
+    whatever is already listening, and every capture in the document
+    then replays against a foreign proxy. That surfaced as a
+    `config_revision` drift on `docs/audit-log.md` whose "actual" value
+    belonged to a different example's config entirely, and it could just
+    as easily have gone green against output that happened to match.
+    A named skip is worth more than either.
+    """
+    deadline = time.time() + timeout
+    while True:
+        busy = []
+        for port in ports:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.settimeout(1)
+                if probe.connect_ex(("127.0.0.1", port)) == 0:
+                    busy.append(port)
+        if not busy or time.time() >= deadline:
+            return busy
+        time.sleep(1)
+
+
+def _wait_for_port(port: int, procs: list[subprocess.Popen], timeout: int = 60) -> bool:
+    """Wait for a listener on a loopback port without sending a request.
+
+    `_wait_for_http` probes the data plane, and the proxy logs what the
+    data plane serves. For most stacks that costs nothing, but a page
+    that publishes a request count is a page the readiness probe can
+    change: `examples/admin-reporting/` publishes `requests: 5`, and a
+    GET to `127.0.0.1:8080/metrics` lands in the same report ring as an
+    unattributed sixth row under the `__default__` tenant. A TCP connect
+    answers the same question and leaves no trace.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for proc in procs:
+            if proc.poll() is not None:
+                return False
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.settimeout(2)
+            if probe.connect_ex(("127.0.0.1", port)) == 0:
+                return True
+        time.sleep(1)
+    return False
+
+
 def _wait_for_http(url: str, procs: list[subprocess.Popen], timeout: int = 60) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -428,7 +583,11 @@ def start_settlement_stack(binary: Path, logs: Path) -> Stack | None:
             stderr=subprocess.STDOUT,
         )
     )
-    if not _wait_for_http("http://127.0.0.1:8080/metrics", stack.procs):
+    # This page's captures call the admin listener on 9090, which
+    # binds after the proxy service; readiness on 8080 alone can hand
+    # the first capture a connection refused. 9090 up implies 8080 is
+    # serving.
+    if not _wait_for_port(9090, stack.procs):
         stack.stop()
         return None
     return stack
@@ -503,7 +662,9 @@ def start_temp_budget_override_stack(binary: Path, logs: Path) -> Stack | None:
             },
         )
     )
-    if not _wait_for_http("http://127.0.0.1:8080/metrics", stack.procs):
+    # Same readiness rule as the settlement stack: the captures here
+    # drive 9090, which binds last, so wait on it directly.
+    if not _wait_for_port(9090, stack.procs):
         stack.stop()
         return None
     return stack
@@ -545,12 +706,168 @@ def start_transform_json_schema_stack(binary: Path, logs: Path) -> Stack | None:
     return stack
 
 
+def start_audit_log_stack(binary: Path, logs: Path) -> Stack | None:
+    """Just the proxy: these captures only ever call the admin server.
+
+    `examples/audit-log/sb.yml` points its one origin at
+    `test.sbproxy.dev`, which nothing here dials. Every command on the
+    two pages this stack serves is an admin call on 9090, so the proxy
+    alone is the whole stack and no fixture is needed.
+    """
+    stack = Stack()
+    proxy_log = (logs / "audit-log-proxy.log").open("w")
+    stack.procs.append(
+        subprocess.Popen(
+            [str(binary), "serve", "-f", "examples/audit-log/sb.yml"],
+            cwd=ROOT,
+            stdout=proxy_log,
+            stderr=subprocess.STDOUT,
+        )
+    )
+    # Both pages this stack serves only ever call the admin listener on
+    # 9090, and the admin listener binds after the proxy service is up,
+    # so readiness on 8080 can declare a stack whose admin port still
+    # refuses connections. Wait on 9090 itself, the way the
+    # admin-reporting stack does.
+    if not _wait_for_port(9090, stack.procs):
+        stack.stop()
+        return None
+    return stack
+
+
+def _fixture_from_readme(readme: Path, opener: str, terminator: str) -> str:
+    """Lift a heredoc fixture out of the page that documents it.
+
+    `examples/admin-reporting/` ships no `fixture.py`, and that is on
+    purpose: its `sb.yml` header used to carry a second copy of this
+    fixture, the copy drifted, and a reader who ran that one got totals
+    matching none of the published numbers. The README's heredoc is the
+    only copy, so the stack runs that rather than a duplicate this file
+    would then have to keep in step.
+    """
+    lines = readme.read_text().split("\n")
+    for index, line in enumerate(lines):
+        if line.strip() != opener:
+            continue
+        body = []
+        for rest in lines[index + 1 :]:
+            if rest.strip() == terminator:
+                return "\n".join(body)
+            body.append(rest)
+        break
+    raise RuntimeError(f"no {opener!r} fixture found in {readme}")
+
+
+def start_admin_reporting_stack(binary: Path, logs: Path) -> Stack | None:
+    """The reporting fixture, the proxy, and the five attributed calls.
+
+    The driving calls belong to the stack rather than to a capture
+    because they answer with nothing: the page's `drive()` sends output
+    to `/dev/null`, and a marker over an empty block is a finding by
+    this script's own rules. Everything the page then publishes, the
+    report, both exports, the export counters and the audit records, is
+    a read of what those five calls produced, so the stack has to have
+    made them before the first capture runs.
+
+    A fresh proxy per run matters here for the same reason: the report
+    ring is in-memory and holds whatever has passed through it, so a
+    second run against a live proxy would report ten calls and match
+    none of the published figures.
+    """
+    stack = Stack()
+    fixture_source = _fixture_from_readme(
+        ROOT / "examples/admin-reporting/README.md", "python3 - <<'PY' &", "PY"
+    )
+    fixture_path = Path("/tmp/sbproxy-admin-reporting-fixture.py")
+    fixture_path.write_text(fixture_source)
+    fixture_log = (logs / "admin-reporting-fixture.log").open("w")
+    stack.procs.append(
+        subprocess.Popen(
+            [sys.executable, str(fixture_path)],
+            cwd=ROOT,
+            stdout=fixture_log,
+            stderr=subprocess.STDOUT,
+        )
+    )
+    time.sleep(3)
+    proxy_log = (logs / "admin-reporting-proxy.log").open("w")
+    stack.procs.append(
+        subprocess.Popen(
+            [str(binary), "serve", "-f", "examples/admin-reporting/sb.yml"],
+            cwd=ROOT,
+            stdout=proxy_log,
+            stderr=subprocess.STDOUT,
+        )
+    )
+    # The admin listener binds after the proxy service starts, so a
+    # listener on 9090 means 8080 is serving. See `_wait_for_port` for
+    # why this stack cannot use the HTTP probe the others do.
+    if not _wait_for_port(9090, stack.procs):
+        stack.stop()
+        return None
+
+    # The five calls from the page's "Drive attributed traffic" block,
+    # in the order it lists them. Order is not cosmetic: the CSV export
+    # is newest-first and the page publishes its first two rows.
+    drives = [
+        ("acme.ai.local", "vk-acme-platform", "dev@acme.test", "gpt-4o-mini", "summarize"),
+        ("acme.ai.local", "vk-acme-platform", "dev@acme.test", "gpt-4o-mini", "summarize"),
+        ("acme.ai.local", "vk-acme-platform", "ops@acme.test", "gpt-4o", "incident-triage"),
+        ("acme.ai.local", "vk-acme-research", "sci@acme.test", "gpt-4o-mini", "literature-scan"),
+        (
+            "globex.ai.local",
+            "vk-globex-platform",
+            "dev@globex.test",
+            "gpt-4o-mini",
+            "summarize",
+        ),
+    ]
+    for host, key, user, model, feature in drives:
+        result = subprocess.run(
+            [
+                "curl", "-s", "-o", "/dev/null",
+                "http://127.0.0.1:8080/v1/chat/completions",
+                "-H", f"Host: {host}",
+                "-H", f"Authorization: Bearer {key}",
+                "-H", f"X-Sb-User-Id: {user}",
+                "-H", f"X-Sb-Property-Feature: {feature}",
+                "-H", "Content-Type: application/json",
+                "-d",
+                json.dumps({"model": model, "messages": [{"role": "user", "content": "Hi"}]}),
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            stack.stop()
+            return None
+    return stack
+
+
 STACK_STARTERS = {
     "settlement": start_settlement_stack,
     "usage_bridge": start_usage_bridge_stack,
     "temp_budget_override": start_temp_budget_override_stack,
     "api_deprecation": start_api_deprecation_stack,
     "transform_json_schema": start_transform_json_schema_stack,
+    "audit_log": start_audit_log_stack,
+    "admin_reporting": start_admin_reporting_stack,
+}
+
+# What each stack binds, checked before it starts. See `_busy_ports`
+# for why a busy port has to be caught here rather than left to the
+# readiness probe. Keep an entry per starter: a stack missing from this
+# map binds nothing as far as the guard is concerned, which is the one
+# way back to the silent-foreign-proxy failure.
+STACK_PORTS: dict[str, tuple[int, ...]] = {
+    "settlement": (8080, 9090, 18080),
+    "usage_bridge": (8080, 9090, 18080),
+    "temp_budget_override": (8080, 9090, 18080),
+    "api_deprecation": (8080,),
+    "transform_json_schema": (8080,),
+    "audit_log": (8080, 9090),
+    "admin_reporting": (8080, 9090, 18086),
 }
 
 
@@ -677,12 +994,24 @@ def check_document(
                 if stack is not None:
                     stack.stop()
                     stack = None
+                current_stack_name = wanted
+                busy = _busy_ports(STACK_PORTS.get(wanted, ()))
+                if busy:
+                    ports = ", ".join(str(port) for port in busy)
+                    results.append(
+                        Result(
+                            capture,
+                            "blocked",
+                            f"{wanted} stack needs port(s) {ports}, which are "
+                            "still in use; nothing was replayed against them",
+                        )
+                    )
+                    continue
                 starter = STACK_STARTERS[wanted]
                 stack = starter(binary, logs)
-                current_stack_name = wanted
                 if stack is None:
                     results.append(
-                        Result(capture, "skipped", f"{wanted} stack did not come up")
+                        Result(capture, "blocked", f"{wanted} stack did not come up")
                     )
                     continue
 
@@ -763,6 +1092,20 @@ def main() -> int:
             }
         )
 
+    # A page in the MANIFEST whose CAPTURE markers were stripped (a doc
+    # regen that drops HTML comments, say) falls out of the glob above
+    # and out of coverage without a word, while the MANIFEST still
+    # reads as covering it. Refuse that state by name.
+    stripped = [rel for rel in MANIFEST if not _has_marker(ROOT / rel)]
+    if stripped:
+        for rel in stripped:
+            print(
+                f"capture check: {rel} is in MANIFEST but carries no "
+                "CAPTURE marker; its coverage silently lapsed",
+                file=sys.stderr,
+            )
+        return 2
+
     exempt_errors = check_exemptions()
     for error in exempt_errors:
         print(f"capture exemption: {error}", file=sys.stderr)
@@ -789,6 +1132,16 @@ def main() -> int:
     if binary is not None and not binary.exists():
         print(f"capture check: binary not found at {binary}", file=sys.stderr)
         return 2
+    if binary is None and not args.stackless_only:
+        print(
+            "capture check: a full replay was requested (no --stackless-only), "
+            "but no proxy binary exists at target/release/sbproxy and "
+            "SBPROXY_CAPTURE_BIN is unset. Every stack capture would be "
+            "silently skipped and the run would read as coverage. Build the "
+            "binary or point SBPROXY_CAPTURE_BIN at one.",
+            file=sys.stderr,
+        )
+        return 2
 
     logs = Path("/tmp/sbproxy-capture-logs")
     logs.mkdir(parents=True, exist_ok=True)
@@ -804,7 +1157,17 @@ def main() -> int:
     for result in all_results:
         counts[result.status] = counts.get(result.status, 0) + 1
 
-    failures = [r for r in all_results if r.status in ("drift", "empty", "missing")]
+    # `blocked` is in this set on purpose. It means a stack this run was
+    # asked to replay could not be started, so those captures were not
+    # checked, and a run that verified nothing must not exit 0 and read
+    # as coverage. `skipped` stays out of it: that is the deliberately
+    # partial run, `--stackless-only`, which the local gate asks for by
+    # name. A full run with no binary cannot get this far: it is
+    # refused up front, before any capture is replayed, for the same
+    # reason `blocked` fails.
+    failures = [
+        r for r in all_results if r.status in ("drift", "empty", "missing", "blocked")
+    ]
     for result in failures:
         rel = display_path(result.capture.path)
         print(f"\n{rel}:{result.capture.line}: {result.detail}")

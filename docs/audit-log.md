@@ -905,9 +905,32 @@ curl -sS -X POST -u admin:demo-change-me http://127.0.0.1:9090/admin/reload
 
 The call itself answers with the new revision:
 
+<!-- CAPTURE: curl -sS -X POST -u admin:demo-change-me http://127.0.0.1:9090/admin/reload -->
+
 ```json
 {"config_revision":"8f10eba811d1","loaded_at":"2026-08-01T15:02:21.996698+00:00","fully_applied":true,"degraded":[]}
 ```
+
+`8f10eba811d1` is reproducible: this config produces that revision on
+any machine, on every boot, which is why the block above is checked
+against a real run character for character rather than having the
+revision treated as noise. Earlier versions did move it across restarts
+when a config declared more than one origin, so treat a revision change
+recorded by one of those as unreliable.
+
+Be precise about what the value identifies, because it is narrower than
+the name suggests. `config_revision` is a hash of the routable surface:
+the set of hostnames the proxy serves. It moves when an origin is added,
+removed or renamed. It does **not** move when the behavior behind an
+unchanged hostname changes, so a reload that swaps an auth provider,
+edits a policy, or rewrites a forward rule reports the revision it
+started with. Two nodes agreeing on a revision are serving the same set
+of origins, which is not the same claim as serving the same file.
+
+For "has the loaded config drifted from what is on disk", use
+`GET /admin/drift`, which compares a hash of the bytes. `config_revision`
+is for correlation: it tells you which routable generation a row was
+written under, and it is stable enough to group by.
 
 Two lines land on the proxy's stdout. First the admin-action line, on the
 `sbproxy::admin::audit` target, which records who called what:
@@ -937,6 +960,8 @@ empty:
 ```bash
 curl -sS -u admin:demo-change-me 'http://127.0.0.1:9090/api/audit/recent?limit=50'
 ```
+
+<!-- CAPTURE: curl -sS -u admin:demo-change-me 'http://127.0.0.1:9090/api/audit/recent?limit=50' -->
 
 ```json
 []

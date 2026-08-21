@@ -145,12 +145,16 @@ pub enum Evidence {
     /// The config revision that supplied the weight. Backs
     /// [`UnitSource::RouteWeight`].
     RouteWeight {
-        /// Short hex tag of the configuration that was live when the weight
-        /// was read, as `sbproxy-core` computes it over the serialised
-        /// document. This is the field that answers "you priced my call
-        /// under a config I never agreed to": it names a specific document,
-        /// so a buyer holding the signed config bundle can look the weight
-        /// up and get the same number rather than being asked to trust one.
+        /// Short hex tag of the routable origin set that was live when the
+        /// weight was read, as `sbproxy-core` computes it over the sorted
+        /// hostname set. It scopes the receipt to a serving generation, so
+        /// receipts from two different origin sets cannot be conflated. It
+        /// is deliberately not a hash of the document's contents: a weight
+        /// edit behind an unchanged hostname set does not move it, so it
+        /// does not by itself answer "you priced my call under a rate I
+        /// never agreed to". The number that answers that is the unit's
+        /// `count`, the applied weight, checked against the signed config
+        /// bundle the buyer holds.
         ///
         /// A tag rather than a counter. There is no monotonic generation
         /// number anywhere in this proxy, and inventing one would produce an
