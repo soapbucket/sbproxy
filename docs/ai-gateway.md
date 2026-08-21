@@ -2261,7 +2261,7 @@ What the gateway does not do is hold server-side response state, and it refuses 
 - `store: true` is refused with a 400, because the response id would never be retrievable from the gateway. `store: false`, or omitting the field, works: the stateless translation persists nothing, which is exactly what it asks for.
 - An `mcp` tool block is refused with a 400. It asks the model provider to contact an MCP server directly, bypassing the gateway's MCP governance (RBAC, sessions, audit, egress inventory). Front the server with a `type: mcp` action and point the client at that origin instead.
 - Every other non-`function` tool block (`file_search`, `web_search_preview`, `code_interpreter`, `image_generation`, and any unrecognized type) is dropped, never forwarded upstream, counted on `sbproxy_ai_translation_dropped_total`, and named in the request's one aggregated `AI proxy: request fields dropped in translation` warn. That warn lists at most eight distinct field labels; past eight, a drop is still counted but no longer named, so the log line cannot grow with the request body.
-- A `prompt` object (`{"id": ..., "version": ..., "variables": ...}`) is served from the gateway's own prompt store: `id` names a stored prompt on the origin, `version` picks a stored version label, and omitting `version` resolves the pinned default. The rendered template is prepended to `instructions` before translation, so it reaches every configured provider, not only OpenAI. An `id` or `version` the store does not hold is a 404 with one generic unknown-reference message, so a caller probing versions cannot tell a missing version from a missing prompt; the precise miss is logged server-side at debug level. A malformed object is a 400, and neither falls through to the raw input. A string-valued `prompt` is not the object form; it is dropped and logged with a warning, unchanged. See "Stored prompts and offline optimization" below.
+- A `prompt` object (`{"id": ..., "version": ..., "variables": ...}`) is served from the gateway's own prompt store: `id` names a stored prompt on the origin, `version` picks a stored version label, and omitting `version` resolves the pinned default. The rendered template is prepended to `instructions` before translation, so it reaches every configured provider, not only OpenAI. An `id` or `version` the store does not hold is a 404 with one generic unknown-reference message, so a caller probing versions cannot tell a missing version from a missing prompt; the precise miss is logged server-side at debug level. A malformed object is a 400, and neither falls through to the raw input. A string-valued `prompt` is the `name@version` reference form and resolves against the same store, with no caller variables. See "Stored prompts and offline optimization" below.
 
 The refusals are deliberate. A request that references state the gateway does not hold would otherwise succeed while quietly missing context, and that failure is harder to notice than a 400 that names the field and the fix.
 
@@ -2542,6 +2542,79 @@ run metadata. Runtime versions are added, replaced, and pinned through the
 authenticated Admin API. Use a new version label when you need immutable
 history.
 
+### Which surfaces resolve a reference
+
+`prompt` is a gateway field, not a field of any provider's wire format, so what
+happens to it depends on which inbound surface the request arrived on:
+
+| Inbound surface | `"prompt": "name@version"` (string) | `"prompt": {"id": ...}` (object) |
+|---|---|---|
+| `POST /v1/chat/completions` | Resolved, prepended as a system turn, key stripped. A name a configured store does not hold is a 400. On an origin with no prompt store at all the key passes through untouched, because `prompt` is also a legacy completions field a provider may accept. | Not the reference form. Passed through as-is. |
+| `POST /v1/messages` | Resolved, prepended as a system turn, key stripped before translation. A name a configured store does not hold is a 400; an origin with no prompt store at all answers 404 rather than forwarding the key. | Not the reference form. Dropped in translation and counted on `sbproxy_ai_translation_dropped_total`. |
+| `POST /v1/responses` | As `/v1/messages`. | Resolved against the same store and prepended to `instructions`. An unknown reference is a 404, a malformed object a 400. |
+
+The last column of the middle row is the difference worth knowing. On the two
+native surfaces `prompt` cannot be anything but a gateway reference, so a
+request naming one an origin cannot resolve is a caller error rather than a
+field the provider might want; forwarding it would ship a gateway-only key
+upstream while running the request without the template it named. On the
+canonical chat path the same case stays a pass-through, so an origin with no
+`prompts:` block behaves exactly as it did before the store existed.
+
+A refusal on either native surface publishes an `ai.admission` decision record
+when `observability.log.decision_audit.events.ai.admission` is on, carrying
+`surface` and a `verdict` of `prompt_reference_not_found` or
+`prompt_render_failed`. See [events.md](events.md).
+
+```yaml
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          provider_type: openai
+          api_key: "${OPENAI_API_KEY}"
+          models: [gpt-4o]
+      prompts:
+        templates:
+          greeting:
+            default_version: "1"
+            versions:
+              "1":
+                template: "You are a bot for {{ variables.product }}."
+                variables:
+                  product: "Acme"
+```
+
+```bash
+curl -s http://127.0.0.1:8080/v1/messages \
+  -H 'Host: ai.example.com' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4o","max_tokens":64,
+       "prompt":"greeting@1",
+       "messages":[{"role":"user","content":"hi"}]}'
+```
+
+The upstream receives the rendered template as the leading system turn, and no
+`prompt` key:
+
+```json
+{
+  "model": "gpt-4o",
+  "max_tokens": 64,
+  "messages": [
+    {"role": "system", "content": "You are a bot for Acme."},
+    {"role": "user", "content": "hi"}
+  ]
+}
+```
+
+Before this, the same request reached the provider with no system turn at all:
+the Anthropic translator has no representation for `prompt`, so it noted the
+drop on `sbproxy_ai_translation_dropped_total{surface="messages",field="anthropic.prompt"}`
+and carried on without the template.
+
 On `/v1/responses` the same store serves the OpenAI Responses `prompt`
 object. `id` maps onto the stored prompt name, `version` onto a stored
 version label, and omitting `version` resolves the pinned default:
@@ -2651,8 +2724,9 @@ touch. A version pinning `variables: {role: "customer"}` whose template says
 `variables.role` says. Put a constraint that has to hold regardless of the
 caller in the template text, not in `variables:`. The `"prompt": "name@version"`
 string form carries no variables at all, so the same stored version is
-caller-writable on `/v1/responses` and operator-only on
-`/v1/chat/completions`; there is no per-version variable lock today.
+caller-writable through the object form on `/v1/responses` and operator-only
+everywhere the string form is used, including `/v1/chat/completions` and
+`/v1/messages`; there is no per-version variable lock today.
 
 A malformed prompt object (a non-string `id`, an unknown key, a typed
 content-part variable) is a 400. The string form above is unchanged.

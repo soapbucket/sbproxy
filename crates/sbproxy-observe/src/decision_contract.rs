@@ -185,12 +185,13 @@ pub const FIELD_CONTRACTS: &[FieldContract] = &[
                (`tools_mcp_unsupported`, `previous_response_id_unsupported`, \
                `conversation_unsupported`, `store_unsupported`, `prompt_object_unresolved`, \
                `malformed_json`, `body_not_object`, `role_missing`, `role_unsupported`, \
-               `prompt_reference_not_found`, `prompt_object_unrenderable`, and \
-               `malformed_request` for a refusal whose site has not been coded yet). The \
-               refusal message is deliberately not a field: it interpolates caller bytes on \
-               several of those codes, and details ship unredacted. Coverage is the three \
-               inbound native-shim refusal arms only; a request refused later by a model \
-               gate, guardrail, budget, or policy records under that plane's own event.",
+               `prompt_reference_not_found`, `prompt_object_unrenderable`, \
+               `prompt_render_failed`, and `malformed_request` for a refusal whose site has \
+               not been coded yet). The refusal message is deliberately not a field: it \
+               interpolates caller bytes on several of those codes, and details ship \
+               unredacted. Coverage is the three inbound native-shim refusal arms plus the \
+               two stored-prompt resolver arms; a request refused later by a model gate, \
+               guardrail, budget, or policy records under that plane's own event.",
     },
     FieldContract {
         event: DecisionEvent::AiClose,

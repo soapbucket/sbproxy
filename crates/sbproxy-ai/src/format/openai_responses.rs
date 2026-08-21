@@ -169,9 +169,12 @@ impl ChatFormat for OpenAiResponsesFormat {
         // stripped, unknown references 404ed there). One that reaches
         // this translator was never resolved, so the request would run
         // without the template it names; refuse rather than drop. A
-        // string (or other non-object) `prompt` is not the bridge's
-        // object form and keeps the pre-bridge note-and-drop behavior
-        // (counted at the translate seam per WOR-2535).
+        // STRING `prompt` is the `name@version` reference form; the
+        // dispatcher lifts it off the body before this translator runs
+        // (WOR-2597), so a string reaching here came from a caller of
+        // this format outside that dispatch path. Any other type keeps
+        // the note-and-drop behavior, counted at the translate seam per
+        // WOR-2535.
         match obj.get("prompt") {
             None | Some(Value::Null) => {}
             Some(Value::Object(_)) => {

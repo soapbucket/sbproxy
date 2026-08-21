@@ -314,13 +314,14 @@ impl DecisionEvent {
             // ai_dispatch.rs, the one funnel every provider-response
             // failure classification already ran through (WOR-2486).
             // ai.admission: `record_ai_admission_refusal` in
-            // ai_dispatch.rs, the funnel behind all three pre-provider
-            // refusal arms of the inbound native-format shim (the
-            // Anthropic Messages translate, the Responses prompt-object
-            // bridge, and the Responses translate). Narrower than "every
-            // pre-provider refusal": a request refused by the model
-            // gate, a guardrail, a budget, or a policy is recorded by
-            // that plane's own event and never reaches this one. See
+            // ai_dispatch.rs, the funnel behind the three refusal arms
+            // of the inbound native-format shim (the Anthropic Messages
+            // translate, the Responses prompt-object bridge, and the
+            // Responses translate) and the two of the shared
+            // stored-prompt resolver. Narrower than "every pre-provider
+            // refusal": a request refused by the model gate, a
+            // guardrail, a budget, or a policy is recorded by that
+            // plane's own event and never reaches this one. See
             // `docs/events.md`.
             // ai.close: `AiRequestExtensions::close()` in
             // ai_extensions.rs, called once per stream regardless of

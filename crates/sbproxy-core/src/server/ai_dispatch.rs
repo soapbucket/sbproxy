@@ -6024,16 +6024,27 @@ pub(super) async fn handle_ai_proxy(
     // inbound format id is stamped on the request context so the
     // relay path can wrap the response body back into the format the
     // client expects.
+    //
+    // WOR-2597: `"prompt": "name@version"` is this gateway's
+    // stored-prompt reference and belongs to no native wire format, so
+    // both translators drop it and the shared resolver further down,
+    // which reads the already-translated canonical body, never saw one
+    // on `/v1/messages` or `/v1/responses`. The reference is lifted off
+    // the inbound body here and put back on the canonical body after
+    // the parse, which is the only place the resolver looks.
+    let mut lifted_prompt_reference: Option<String> = None;
     let body_bytes = match surface {
         sbproxy_ai::handler::AiSurface::Messages => {
+            let (inbound_bytes, reference) = lift_gateway_prompt_reference(&body_bytes);
             match sbproxy_ai::format::anthropic_messages::translate_anthropic_request_to_openai(
-                body_bytes.as_ref(),
+                inbound_bytes.as_ref(),
                 hostname,
                 translation_tenant,
             ) {
                 Ok(translated) => {
                     ctx.ai_inbound_format = Some("anthropic".into());
                     path = "/v1/chat/completions".into();
+                    lifted_prompt_reference = reference;
                     bytes::Bytes::from(translated)
                 }
                 Err(e) => {
@@ -6062,9 +6073,10 @@ pub(super) async fn handle_ai_proxy(
             // to any configured provider. An unknown id or version
             // fails closed with a 404 naming the reference, and a
             // malformed object is a 400; neither falls through to the
-            // raw input. A string `prompt` is not the object form and
-            // keeps its pre-bridge behavior (the translator notes and
-            // drops it). The byte scan keeps the extra JSON parse off
+            // raw input. A string `prompt` is not the object form; it
+            // is the `name@version` reference form, lifted just below
+            // by `lift_gateway_prompt_reference` (WOR-2597). The byte
+            // scan keeps the extra JSON parse off
             // bodies that cannot carry the field; a false positive
             // only costs the parse, and the translator's own
             // unresolved-object refusal backstops anything the scan
@@ -6128,6 +6140,12 @@ pub(super) async fn handle_ai_proxy(
                     }
                 }
             }
+            // The string form of the same reference. The object bridge
+            // above already stripped `prompt` on a hit, so this only
+            // fires for `"prompt": "name@version"`, which the translator
+            // would otherwise note as `responses.prompt` and drop. A
+            // non-string, non-object `prompt` keeps that note.
+            let (inbound_bytes, reference) = lift_gateway_prompt_reference(&inbound_bytes);
             match sbproxy_ai::format::openai_responses::translate_responses_request_to_openai(
                 inbound_bytes.as_ref(),
                 hostname,
@@ -6136,6 +6154,7 @@ pub(super) async fn handle_ai_proxy(
                 Ok(translated) => {
                     ctx.ai_inbound_format = Some("responses".into());
                     path = "/v1/chat/completions".into();
+                    lifted_prompt_reference = reference;
                     bytes::Bytes::from(translated)
                 }
                 Err(e) => {
@@ -6932,6 +6951,20 @@ pub(super) async fn handle_ai_proxy(
             return Ok(());
         }
     };
+    // WOR-2597: put the lifted stored-prompt reference back on the
+    // canonical body, which is where the shared WOR-800 resolver below
+    // reads it. It cannot escape to a provider from here: the resolver
+    // strips the key on a hit, refuses on a miss, and the native
+    // byte-forward bypass is already unavailable to a body that carried
+    // one, because `prompt` is absent from
+    // `native_request_is_losslessly_governable`'s allowlist.
+    if let Some(reference) = &lifted_prompt_reference {
+        let reference = reference.clone();
+        if let Some(object) = body.as_object_mut() {
+            object.insert("prompt".to_string(), serde_json::Value::String(reference));
+        }
+    }
+
     // Native bypass may only reuse the original client bytes while every
     // content-bearing field still matches this post-parse baseline. Keep the
     // snapshot only for the one native surface that can currently bypass.
@@ -7038,14 +7071,21 @@ pub(super) async fn handle_ai_proxy(
     // library API at sbproxy_ai::prompts) shadows config so an
     // operator can mint or pin a prompt at runtime without a full
     // config reload. A miss on both layers leaves the prompt field
-    // untouched (the request proceeds with no synthesized system
-    // message, same as today's "no `prompt` field" path).
+    // untouched on the canonical chat path (the request proceeds with
+    // no synthesized system message, same as today's "no `prompt`
+    // field" path). WOR-2597: a miss on a reference lifted off a
+    // NATIVE inbound body is a 404 instead, because `prompt` is not a
+    // field of those wire formats and forwarding it would ship a
+    // gateway-only key upstream. See the `None` arms below.
     //
     // The Responses-surface OBJECT form (`"prompt": {"id", ...}`) is
     // bridged earlier, before the inbound shim translated the body to
     // this canonical shape (WOR-2514); by this point a bridged request
     // carries its rendered template in `instructions` and no `prompt`
-    // field at all.
+    // field at all. The STRING form on either native surface is lifted
+    // by `lift_gateway_prompt_reference` at that same shim and put back
+    // on this body after the parse, which is how it reaches this block
+    // at all (WOR-2597).
     if let Some(reference) = body
         .get("prompt")
         .and_then(|v| v.as_str())
@@ -7061,24 +7101,50 @@ pub(super) async fn handle_ai_proxy(
                     .as_ref()
                     .map(|store| store.render(&reference, &request_ctx))
             });
-        if let Some(outcome) = result {
-            match outcome {
-                Ok(rendered) => {
-                    prepend_system_message(&mut body, &rendered.text);
-                    ctx.ai_prompt_name = Some(rendered.name);
-                    ctx.ai_prompt_version = Some(rendered.version);
-                    // Drop the gateway-only `prompt` field so it is not
-                    // forwarded to the provider.
-                    if let Some(obj) = body.as_object_mut() {
-                        obj.remove("prompt");
-                    }
-                }
-                Err(e) => {
-                    warn!(reference = %reference, error = %e, "AI proxy: prompt render failed");
-                    send_error(session, 400, &format!("prompt error: {e}")).await?;
-                    return Ok(());
+        match result {
+            Some(Ok(rendered)) => {
+                prepend_system_message(&mut body, &rendered.text);
+                ctx.ai_prompt_name = Some(rendered.name);
+                ctx.ai_prompt_version = Some(rendered.version);
+                // Drop the gateway-only `prompt` field so it is not
+                // forwarded to the provider.
+                if let Some(obj) = body.as_object_mut() {
+                    obj.remove("prompt");
                 }
             }
+            Some(Err(e)) => {
+                record_ai_admission_refusal(ctx, surface_label, "prompt_render_failed");
+                warn!(reference = %reference, error = %e, "AI proxy: prompt render failed");
+                send_error(session, 400, &format!("prompt error: {e}")).await?;
+                return Ok(());
+            }
+            // A miss on both layers. On the canonical chat path this
+            // stays a pass-through: `prompt` is a legacy completions
+            // field there, an origin may have no `prompts:` block at
+            // all, and a provider that understands the field has every
+            // right to receive it. WOR-2597: on a native inbound
+            // surface it cannot be either of those things. `prompt` is
+            // not a field of the Anthropic Messages or OpenAI Responses
+            // wire format, so a caller who sent one meant this
+            // gateway's store, and forwarding the key to the provider
+            // would ship a gateway-only field upstream while running
+            // the request without the template it named. Refuse, and
+            // strip the key on the way out so no later path can
+            // forward it.
+            None if lifted_prompt_reference.is_some() => {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.remove("prompt");
+                }
+                record_ai_admission_refusal(ctx, surface_label, "prompt_reference_not_found");
+                warn!(
+                    reference = %reference,
+                    surface = surface_label,
+                    "AI proxy: stored prompt reference not found on a native inbound surface"
+                );
+                send_error(session, 404, "prompt error: unknown prompt reference").await?;
+                return Ok(());
+            }
+            None => {}
         }
     }
 
@@ -11779,22 +11845,25 @@ fn record_ai_failure_decision(
 /// Record `ai.admission` on the decision family, the AI admission
 /// counter, and, when enabled, the audit feed (WOR-2595).
 ///
-/// The funnel behind every pre-provider refusal the inbound
-/// native-format shim can take: the Anthropic Messages translate, the
-/// Responses stored-prompt bridge, and the Responses translate. Before
-/// it, an MCP-governance-bypass attempt (`tools: [{"type": "mcp", ...}]`
-/// on `/v1/responses`) produced one free-text warn and a bare 400, which
-/// is metrically and forensically indistinguishable from a typo'd JSON
-/// body.
+/// The funnel behind the five refusals the AI dispatch path can take
+/// before any provider is chosen: the three arms of the inbound
+/// native-format shim (the Anthropic Messages translate, the Responses
+/// stored-prompt bridge, and the Responses translate) and the two
+/// refusal arms of the shared stored-prompt resolver (a render failure,
+/// and a reference lifted off a native body that no prompt layer holds).
+/// Before it, an MCP-governance-bypass attempt (`tools: [{"type":
+/// "mcp", ...}]` on `/v1/responses`) produced one free-text warn and a
+/// bare 400, which is metrically and forensically indistinguishable
+/// from a typo'd JSON body.
 ///
-/// **What this cannot see.** Only those three arms. A request refused
-/// later by the model allow/block gate, a virtual-key policy, a
-/// guardrail, a budget, a rate limiter, or a CEL/Rego policy is that
-/// plane's decision and publishes under that plane's own event; none of
-/// them route through here. Refusals on the canonical
-/// `/v1/chat/completions` path have no inbound shim at all, so they
-/// cannot reach this funnel either. `docs/events.md` states the same
-/// boundary for operators.
+/// **What this cannot see.** Only those five. A request refused later
+/// by the model allow/block gate, a virtual-key policy, a guardrail, a
+/// budget, a rate limiter, or a CEL/Rego policy is that plane's
+/// decision and publishes under that plane's own event; none of them
+/// route through here. On the canonical `/v1/chat/completions` path
+/// there is no inbound shim, so the only refusal that reaches this
+/// funnel from there is a stored-prompt render failure.
+/// `docs/events.md` states the same boundary for operators.
 ///
 /// `reason` is a `&'static str` from [`sbproxy_ai::format::ChatError::reason`]
 /// and never the error's message: several of the coded refusals
@@ -15914,6 +15983,55 @@ fn prepend_responses_instructions(body: &mut serde_json::Value, text: &str) {
         "instructions".to_string(),
         serde_json::Value::String(merged),
     );
+}
+
+/// Lift a gateway-only string `prompt` reference out of a native
+/// inbound body, returning the body without it and the reference.
+///
+/// `"prompt": "name@version"` is this gateway's stored-prompt reference,
+/// not a field of the Anthropic Messages or OpenAI Responses wire
+/// formats. Both native translators therefore drop it: the Anthropic
+/// catch-all notes `anthropic.prompt`, the Responses translator notes
+/// `responses.prompt`, and the shared resolver downstream reads the
+/// ALREADY-TRANSLATED canonical body, where the field no longer exists.
+/// A `prompts:` origin plus a `/v1/messages` request naming a stored
+/// prompt therefore ran without the template it asked for, which is
+/// silent context loss.
+///
+/// Lifting the reference before translation and re-inserting it into
+/// the translated body puts it where the resolver looks, without
+/// teaching the hub about a field no provider accepts. `HubRequest`
+/// gains nothing, `REPRESENTED_TOP_LEVEL_KEYS` gains nothing, and the
+/// native-bypass allowlist gains nothing, so the lossless-bypass path
+/// stays disabled for a body carrying this key.
+///
+/// Only a string is lifted. An object-valued `prompt` is the Responses
+/// stored-prompt OBJECT form, bridged separately and refused by the
+/// translator if it was not; any other type keeps its note-and-drop
+/// behavior. A body that is not a JSON object, or whose reserialization
+/// fails, is returned untouched with `None`, so a failure here can only
+/// leave the pre-existing behavior rather than invent a new one.
+fn lift_gateway_prompt_reference(bytes: &bytes::Bytes) -> (bytes::Bytes, Option<String>) {
+    // Same byte scan the Responses object bridge uses: it keeps the
+    // extra JSON parse off bodies that cannot carry the field, and a
+    // false positive costs only the parse.
+    if !bytes.as_ref().windows(8).any(|w| w == b"\"prompt\"") {
+        return (bytes.clone(), None);
+    }
+    let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(bytes.as_ref()) else {
+        return (bytes.clone(), None);
+    };
+    let Some(object) = parsed.as_object_mut() else {
+        return (bytes.clone(), None);
+    };
+    let Some(reference) = object.get("prompt").and_then(|v| v.as_str()).map(str::to_owned) else {
+        return (bytes.clone(), None);
+    };
+    object.remove("prompt");
+    match serde_json::to_vec(&parsed) {
+        Ok(rewritten) => (bytes::Bytes::from(rewritten), Some(reference)),
+        Err(_) => (bytes.clone(), None),
+    }
 }
 
 /// WOR-2514: bridge an object-valued Responses `prompt` onto the
