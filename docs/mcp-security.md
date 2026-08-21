@@ -1,6 +1,6 @@
 # MCP security
 
-*Last modified: 2026-08-17*
+*Last modified: 2026-08-21*
 
 For a row-by-row scorecard against the OWASP MCP Top 10, coverage stated
 plainly as full, partial, or out of gateway scope, see

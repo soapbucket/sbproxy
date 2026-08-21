@@ -1,6 +1,6 @@
 # MCP security coverage
 
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-21*
 
 What the gateway enforces against the OWASP MCP Top 10 (MCP01:2025 through
 MCP10:2025, currently in beta; the next revision is expected around October

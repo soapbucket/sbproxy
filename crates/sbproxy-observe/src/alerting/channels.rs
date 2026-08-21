@@ -612,10 +612,10 @@ fn version() -> &'static str {
 /// This used to be a second copy of the same host-plus-random-tag
 /// derivation, which meant the alert surfaces and the evidence records
 /// carried two independently random identifiers for one process.
-/// Everything in this crate now reads the one in
-/// [`crate::instance`]. `sbproxy_core::identity::instance_id` remains
-/// separate and mints its own tag, so the callback surfaces it stamps
-/// still disagree with these.
+/// Everything now reads the one in [`crate::instance`], including
+/// `sbproxy_core::identity::instance_id`, which the callback envelope
+/// and its own `x-sbproxy-instance` header stamp. One process, one
+/// identifier, on every surface a receiver could join on.
 fn instance_id() -> &'static str {
     crate::instance::instance_id()
 }

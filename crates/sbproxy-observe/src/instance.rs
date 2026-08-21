@@ -5,10 +5,15 @@
 //!
 //! Anything the proxy emits that a receiver has to attribute to one
 //! emitter carries this: the alert webhook envelope and its
-//! `X-Sbproxy-Instance` header, and the per-tenant evidence sequence on
-//! `mcp_governance_decision`. A counter, a sequence, or a deduplication
-//! key says nothing to a SIEM ingesting two replicas until it knows
-//! which process produced it.
+//! `X-Sbproxy-Instance` header, the callback envelope and its
+//! `x-sbproxy-instance` header (through
+//! `sbproxy_core::identity::instance_id`, which delegates here), and
+//! the per-tenant evidence sequence on `mcp_governance_decision`. A
+//! counter, a sequence, or a deduplication key says nothing to a SIEM
+//! ingesting two replicas until it knows which process produced it,
+//! and it says the wrong thing if two surfaces of one process answer
+//! that question differently, which is why this is the only
+//! derivation of the identifier in the workspace.
 //!
 //! Format: `<host>-<8 hex chars>`, for example `sbproxy-7c4d8b9a`. The
 //! host part comes from `HOSTNAME` (the pod name under Kubernetes) or
@@ -16,6 +21,15 @@
 //! that share a host name, and it is drawn fresh on every start, so a
 //! restart is deliberately a new identity: that is what lets a receiver
 //! tell a counter that restarted from a counter that rolled back.
+//!
+//! What the tag is not: a uniqueness proof. It is 32 bits, so the
+//! separation between two processes rests mostly on the host part, and
+//! the host part collapses to the literal `sbproxy` when neither
+//! `HOSTNAME` nor the `hostname` command answers. Under Kubernetes and
+//! Docker the environment sets `HOSTNAME` per container, so that
+//! fallback is the unusual case rather than the normal one; a
+//! deployment that hits it should set `HOSTNAME` rather than rely on
+//! the tag alone.
 
 use std::sync::OnceLock;
 

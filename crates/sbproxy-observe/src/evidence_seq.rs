@@ -30,9 +30,9 @@
 //! this: **within one `sbproxy.evidence.instance`, one tenant's
 //! sequence is gapless and strictly increasing.** Group by
 //! `(sbproxy.evidence.instance, sbproxy.tenant.id)` and a hole is a
-//! real hole. The instance identifier is fresh on every process start
-//! by construction, which is what makes a restart look like a new
-//! sequence rather than like a rollback of the old one.
+//! real hole. The instance identifier is drawn fresh on every process
+//! start, which is what makes a restart look like a new sequence
+//! rather than like a rollback of the old one.
 //!
 //! What that costs a receiver: it cannot tell a replica that was
 //! shut down deliberately from one that was killed mid-stream, because

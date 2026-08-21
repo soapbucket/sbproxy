@@ -377,7 +377,8 @@ impl FileSink {
     }
 }
 
-/// Minimum spacing between file-sink I/O warnings for one path.
+/// Minimum spacing between file-sink I/O warnings of one kind for
+/// one path.
 ///
 /// Every failure below persists until an operator fixes the volume,
 /// the mount, or the permission, and `write_line` runs once per
@@ -387,28 +388,40 @@ impl FileSink {
 const FILE_SINK_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Warn about a file-sink I/O failure at most once per
-/// [`FILE_SINK_WARN_INTERVAL`] per path.
+/// [`FILE_SINK_WARN_INTERVAL`] per failure kind per path.
 ///
 /// Keyed by path rather than by a single process-wide latch so one
-/// broken sink cannot mask a second one. The key space is the set of
-/// configured sink paths, which comes from operator config and never
-/// from anything a caller controls, so the map is bounded by the
-/// config file.
+/// broken sink cannot mask a second one, and by `message` inside that
+/// so one failure kind cannot mask a different one on the same sink:
+/// a rotation failure, which keeps the record, would otherwise
+/// swallow the append failure a second later, which does not. Both
+/// halves of the key are closed. Paths come from operator config and
+/// `message` is one of the four `&'static str` literals below, so the
+/// map is bounded by the config file times four and nothing a caller
+/// sends can grow it.
 fn warn_file_sink_io(path: &std::path::Path, error: &dyn std::fmt::Display, message: &'static str) {
-    static LAST_WARN: OnceLock<
-        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::time::Instant>>,
-    > = OnceLock::new();
+    // Failure message -> sink path -> when that pair last warned.
+    // Nested rather than keyed on a `(PathBuf, &'static str)` tuple so
+    // the lookup borrows the path: on a persistent failure this runs
+    // once per emitted record, and the throttled call should not
+    // allocate to find out it has nothing to say.
+    type WarnLog = std::collections::HashMap<
+        &'static str,
+        std::collections::HashMap<std::path::PathBuf, std::time::Instant>,
+    >;
+    static LAST_WARN: OnceLock<std::sync::Mutex<WarnLog>> = OnceLock::new();
     let map = LAST_WARN.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let now = std::time::Instant::now();
     {
         let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
-        let warned_recently = guard
+        let per_path = guard.entry(message).or_default();
+        let warned_recently = per_path
             .get(path)
             .is_some_and(|prev| now.duration_since(*prev) < FILE_SINK_WARN_INTERVAL);
         if warned_recently {
             return;
         }
-        guard.insert(path.to_path_buf(), now);
+        per_path.insert(path.to_path_buf(), now);
     }
     // Emit outside the guard: a `tracing` call runs subscriber code of
     // unbounded cost, and one of those subscribers can be a file sink
@@ -448,6 +461,14 @@ impl SinkOutput for FileSink {
                     &e,
                     "file sink: could not create parent directory; log line dropped",
                 );
+                // Return rather than fall through to the open, which
+                // cannot succeed: `create_dir_all` returns Ok on a
+                // directory that already exists, so an error here means
+                // the parent is absent or is not a directory, and the
+                // append-mode open below fails for the same reason.
+                // Falling through would count `open_failed` as well and
+                // charge one lost record to the counter twice.
+                return;
             }
         }
         // Rotate before the append when the active file has reached
@@ -733,6 +754,18 @@ mod tests {
         reset_sink_dispatcher_for_test();
     }
 
+    /// Serializes the tests that assert a before/after delta on
+    /// `sbproxy_telemetry_dropped_total{kind="file_sink"}`.
+    ///
+    /// The family is process-wide. Two of these tests move
+    /// `reason="open_failed"` (one by ticking it, one by asserting it
+    /// stays put), so under a thread-per-test runner they race and the
+    /// delta assertions read each other's increments. Holding this for
+    /// the whole before/act/after window makes the deltas mean what
+    /// they say under `cargo test` as well as under nextest's
+    /// process-per-test isolation.
+    static FILE_SINK_DROP_COUNTERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// One `sbproxy_telemetry_dropped_total{kind="file_sink",reason=...}`
     /// series off the default registry. An absent series reads as
     /// zero, which is what the first drop of a reason looks like.
@@ -774,6 +807,9 @@ mod tests {
 
     #[test]
     fn file_sink_counts_a_failed_append_rather_than_discarding_it() {
+        let _serial = FILE_SINK_DROP_COUNTERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // The seam is `append_line`, the one call `write_line` makes
         // once the file is open. With the append result discarded
         // (`let _ = writeln!(...)`) this counter never moves, which is
@@ -797,6 +833,9 @@ mod tests {
 
     #[test]
     fn file_sink_counts_an_open_failure_through_write_line() {
+        let _serial = FILE_SINK_DROP_COUNTERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // End to end through the real `write_line`: the sink path is
         // an existing directory, so `create_dir_all` and `metadata`
         // both succeed and only the append-mode open fails. That arm
@@ -813,6 +852,37 @@ mod tests {
             before + 1,
             "a failed open must tick sbproxy_telemetry_dropped_total\
              {{kind=\"file_sink\",reason=\"open_failed\"}}"
+        );
+    }
+
+    #[test]
+    fn a_mkdir_failure_charges_one_lost_record_once() {
+        let _serial = FILE_SINK_DROP_COUNTERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // One record, one increment. `create_dir_all` only fails when
+        // the parent is absent or is not a directory, and the
+        // append-mode open fails for that same reason, so counting both
+        // arms would bill a single lost line to
+        // sbproxy_telemetry_dropped_total twice and hand an operator a
+        // loss rate that is double the real one.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let blocker = dir.path().join("a-regular-file");
+        std::fs::write(&blocker, b"not a directory").expect("write the blocking file");
+        let path = blocker.join("sink.log");
+
+        let mkdir_before = file_sink_dropped_total("mkdir_failed");
+        let open_before = file_sink_dropped_total("open_failed");
+        FileSink::new(&path).write_line("an audit record");
+        assert_eq!(
+            file_sink_dropped_total("mkdir_failed"),
+            mkdir_before + 1,
+            "the lost record must be counted once, under mkdir_failed"
+        );
+        assert_eq!(
+            file_sink_dropped_total("open_failed"),
+            open_before,
+            "the doomed open must not be attempted, let alone counted a second time"
         );
     }
 

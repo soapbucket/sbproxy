@@ -353,6 +353,29 @@ impl CardinalityLimiter {
     /// too. The tenant dimension is on
     /// `sbproxy_label_cardinality_overflow_per_tenant_total{metric, label, tenant_id}`
     /// instead.
+    ///
+    /// What replaces the retired per-demotion line, and how far each
+    /// replacement reaches. A proxy-wide saturation stays scrapeable
+    /// for as long as it lasts on
+    /// `sbproxy_label_cardinality_unique_values{label}` against
+    /// `sbproxy_label_cardinality_budget{label}`, which
+    /// `metrics::refresh_cardinality_gauges` recomputes at scrape from
+    /// the `seen` map itself, so it covers every caller of the
+    /// proxy-wide path whether or not that caller went through a
+    /// budget wrapper. The per-demotion *rate* is a different
+    /// question, and only the overflow counters answer it:
+    /// `sbproxy_label_cardinality_overflow_total{metric, label}` for
+    /// callers routed through `metrics::sanitize_label_budget`, the
+    /// per-tenant counter above for
+    /// `metrics::sanitize_label_budget_tenant`, and nothing at all for
+    /// the plain `metrics::sanitize_label`, which is most of the call
+    /// sites in `metrics.rs`. So the line below names the gauges
+    /// rather than a counter: pointing an operator at a counter that
+    /// is flat by construction for their label is worse than pointing
+    /// them at nothing. The tenant-scoped sets are outside
+    /// [`Self::tracked_labels`], so the gauges do not cover them
+    /// either and the per-tenant counter is their only ongoing
+    /// signal.
     fn note_saturated(&self, label_name: &str) {
         {
             // Poison recovery rather than a panic, unlike the sets
@@ -370,9 +393,10 @@ impl CardinalityLimiter {
         }
         tracing::warn!(
             label = label_name,
-            "{SATURATION_MESSAGE}; logged once per label, \
-             sbproxy_label_cardinality_unique_values and \
-             sbproxy_label_cardinality_overflow_total carry the rate"
+            "{SATURATION_MESSAGE}; logged once per label. \
+             sbproxy_label_cardinality_unique_values against \
+             sbproxy_label_cardinality_budget shows the saturation for \
+             as long as it lasts"
         );
     }
 
