@@ -200,6 +200,18 @@ fn next_config_version() -> u64 {
     CONFIG_VERSION_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+/// The current pipeline generation.
+///
+/// Moves once per swap, whatever changed inside the pipeline. Anything
+/// caching a value derived from the compiled config should key on this
+/// rather than on `config_revision`: the revision is an origin-set
+/// identity hash, so it deliberately does not move when a policy, an
+/// auth block, a forward rule or a port does, and a cache keyed on it
+/// serves the pre-reload answer for the life of the process.
+pub(crate) fn pipeline_generation() -> u64 {
+    CONFIG_VERSION_COUNTER.load(Ordering::Relaxed)
+}
+
 /// Load a read guard to the current pipeline.
 ///
 /// The returned guard holds an `Arc<CompiledPipeline>` that is valid

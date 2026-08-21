@@ -39,6 +39,8 @@ There is no `docker-compose.yml`, and the reason is the build rather than the st
 bash examples/usage-bridge-queue/bin/bill-one-call.sh
 ```
 
+<!-- CAPTURE: bash examples/usage-bridge-queue/bin/bill-one-call.sh -->
+
 ```
 minted a governed key naming customer=cus_demo_usage_bridge
 chat completion               status=200

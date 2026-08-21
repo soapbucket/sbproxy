@@ -489,6 +489,43 @@ the next version cut.
   counted by
   `sbproxy_security_headers_csp_emitted_total{mode,tenant}`.
 
+- **`config_revision` is a function of the config again, not of the
+  process that read it.** On any config with more than one origin the
+  revision changed across restarts with nothing else changing: the
+  compiler assigned each origin its index by walking a `HashMap`, and
+  the revision hash consumed those indices, so a two-origin file
+  reported two revisions across three boots and an N-origin file had up
+  to N! of them. `config_revision` rides the request log, the access
+  log, the CSV export, webhook envelopes and `policy_version`'s prefix,
+  where it is read as the config generation that served a request, so a
+  value that moved on its own made that unanswerable across a restart
+  and fired a revision-change signal on every reboot. Origin indices are
+  now assigned in sorted key order, which also makes the compiled origin
+  list itself deterministic, and the hash pairs each hostname with its
+  rank in that order rather than with a stored position. Two upgrade
+  notes: a single-origin config hashes to exactly the value it did
+  before, and a multi-origin config settles on one of the values it was
+  already alternating between, so anything keyed on a revision sees at
+  most one final change and none after that. The `servers` array in an
+  emitted OpenAPI document is now ordered by hostname for the same
+  reason; it was previously in whatever order that config's origins
+  landed in.
+
+- **`GET /api/openapi.json` and `.yaml` refresh on every reload.** The
+  admin OpenAPI render is cached, and the cache was keyed on
+  `config_revision`, which identifies the set of origins served and
+  deliberately holds still when the behavior behind an unchanged
+  hostname changes. So a reload that added an auth block, edited a
+  forward rule or set a deprecation left the cache in place and the
+  admin routes served the pre-reload document for the life of the
+  process. It is keyed on the pipeline generation now, which moves on
+  every swap. The per-host `/.well-known/openapi.json` route was never
+  affected; it rebuilds per request. Three docs that described
+  `config_revision` as a content hash of the configuration have been
+  corrected to say what it identifies, most importantly
+  [docs/metering.md](docs/metering.md), which told buyers to verify a
+  signed receipt's pricing against it.
+
 - **Prompts admin page "Add version" now sends the field the backend
   expects.** The form built a `content` key while
   `POST /admin/prompts/<host>/<name>/versions` deserializes into a
