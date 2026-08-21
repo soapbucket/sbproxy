@@ -13,8 +13,22 @@
 #   - auth_header     : HTTP header carrying the API key
 #   - auth_prefix     : prefix prepended to the key (e.g. "Bearer ")
 #   - format          : wire format - openai|anthropic|google|bedrock|custom
-#   - supports_streaming
-#   - supports_embeddings
+#   - supports_streaming / supports_embeddings / supports_chat
+#       Coarse catalog hints about the vendor's own API. They are NOT a
+#       statement about which surfaces this gateway will serve, and
+#       nothing in the request path reads them. The gateway's answer
+#       lives in one place, `sbproxy_ai::api_routes`
+#       (`provider_supports_surface` and the modality-aware variant),
+#       which is also what `GET /v1/models` publishes as each model's
+#       `capabilities` array, so a listing cannot advertise a surface the
+#       gateway would refuse with 501 (WOR-2647).
+#       Editing a hint here therefore changes no behavior, and the two
+#       have drifted: `bedrock` says it embeds (Titan does, through the
+#       native InvokeModel shape, which is not the `/v1/embeddings` shape
+#       the gateway forwards) while `vertex` says it does not (its
+#       OpenAI-compatible endpoint does, and the gateway forwards it).
+#       Do not wire these back into a decision without reconciling the
+#       data first.
 #   - data_posture    : declared data-handling posture, per the vendor's
 #       published data-processing terms (a catalog claim, not an audit):
 #         retains_data : prompt data sent to a stock account is retained

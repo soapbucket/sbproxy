@@ -37,7 +37,10 @@ use serde::{Deserialize, Serialize};
 /// Embedded gzipped catalog. The build copies the file at
 /// `data/ai_providers.yml.gz` into the binary so a fresh checkout
 /// does not need to know about the file path. Regenerate via
-/// `gzip -k -9 data/ai_providers.yml`.
+/// `gzip -n -9 -c data/ai_providers.yml > data/ai_providers.yml.gz`.
+/// `-n` drops the source filename and mtime from the gzip header, so
+/// the same YAML always compresses to the same bytes and a rebuild does
+/// not show up as a diff.
 const EMBEDDED_PROVIDERS_GZ: &[u8] = include_bytes!("../../data/ai_providers.yml.gz");
 
 /// Known provider metadata.
@@ -61,13 +64,32 @@ pub struct ProviderInfo {
     /// Wire format family this provider's API speaks.
     pub format: ProviderFormat,
     /// Whether the provider supports Server-Sent Events streaming.
+    ///
+    /// A catalog hint about the vendor's API, not a gateway decision;
+    /// see the note on [`Self::supports_chat`].
     pub supports_streaming: bool,
     /// Whether the provider exposes an embeddings endpoint.
+    ///
+    /// A catalog hint about the vendor's API, not a gateway decision;
+    /// see the note on [`Self::supports_chat`].
     pub supports_embeddings: bool,
     /// Whether the provider exposes a chat-completions endpoint.
     /// Defaults to `true`; set to `false` for embeddings-only or
-    /// reranker-only providers (e.g. Voyage, Jina) so chat configs
-    /// fail closed at validation time instead of 404ing at runtime.
+    /// reranker-only providers (e.g. Voyage, Jina).
+    ///
+    /// This and its two neighbours are coarse catalog claims about the
+    /// vendor's own API. None of them decides anything: whether this
+    /// gateway serves a surface for a provider, and what `GET /v1/models`
+    /// publishes as a model's `capabilities`, both come from
+    /// [`crate::api_routes::provider_supports_surface`] and
+    /// [`crate::api_routes::surface_capability_names`] instead.
+    ///
+    /// They used to feed the model listing while the matrix answered the
+    /// request, which let the two disagree on 43 of the 72 shipped
+    /// entries in both directions: a bedrock listing advertised the
+    /// `embeddings` surface the request path answers with 501, and a
+    /// vertex listing hid one it serves (WOR-2647). Reconcile the data
+    /// before wiring either back into a decision.
     #[serde(default = "default_true")]
     pub supports_chat: bool,
     /// Declared data-handling posture of the vendor's API, per its

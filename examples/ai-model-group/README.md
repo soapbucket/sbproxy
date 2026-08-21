@@ -1,6 +1,6 @@
 # AI gateway: model group (one public name, several deployments)
 
-*Last modified: 2026-06-24*
+*Last modified: 2026-08-21*
 
 ![AI gateway: model group (one public name, several deployments)](../../docs/assets/ai-model-group.gif)
 
@@ -33,9 +33,14 @@ The gateway serves read-only metadata endpoints from this config, no upstream ca
 ```bash
 # Deployments grouped by public model name.
 curl -s -H 'Host: ai.local' http://127.0.0.1:8080/model_group/info | jq
-# => {"data":[{"model_group":"gpt-4o-mini","num_deployments":2,"providers":["openai-deployment-a","openai-deployment-b"]}]}
+# => {"data":[{"model_group":"gpt-4o-mini","num_deployments":2,
+#              "providers":["openai-deployment-a","openai-deployment-b"],
+#              "capabilities":["audio_speech","audio_transcription","chat_completions",
+#                              "embeddings","image_edits","image_generation",
+#                              "image_variations","messages","moderations","realtime",
+#                              "reranking","responses","streaming"]}]}
 
-# Flat list of every deployment.
+# Flat list of every deployment, each with the same capabilities array.
 curl -s -H 'Host: ai.local' http://127.0.0.1:8080/model/info | jq
 
 # Health (also /health/readiness and /health/liveliness).

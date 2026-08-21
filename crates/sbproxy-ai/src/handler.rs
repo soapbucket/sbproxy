@@ -1740,6 +1740,41 @@ impl AiSurface {
         }
     }
 
+    /// Every classified surface, in declaration order.
+    ///
+    /// The capability matrix in [`crate::api_routes`] and the model
+    /// listing both need to iterate the whole surface set: the matrix
+    /// tests to prove the documented contract holds for every cell, and
+    /// [`crate::api_routes::surface_capability_names`] to publish the
+    /// surfaces a provider will actually be given. This array is the
+    /// production copy both use, so the set a `/v1/models` listing
+    /// advertises and the set the dispatch path enforces cannot come
+    /// apart (WOR-2647).
+    ///
+    /// The length is written out so adding a variant is a compile error
+    /// here rather than a quietly shorter sweep.
+    pub const ALL: [AiSurface; 19] = [
+        AiSurface::ChatCompletions,
+        AiSurface::Models,
+        AiSurface::Embeddings,
+        AiSurface::Assistants,
+        AiSurface::Threads,
+        AiSurface::Batches,
+        AiSurface::FineTuning,
+        AiSurface::Files,
+        AiSurface::Realtime,
+        AiSurface::ImageGeneration,
+        AiSurface::ImageEdits,
+        AiSurface::ImageVariations,
+        AiSurface::AudioTranscription,
+        AiSurface::AudioSpeech,
+        AiSurface::Moderations,
+        AiSurface::Reranking,
+        AiSurface::Messages,
+        AiSurface::Responses,
+        AiSurface::Unknown,
+    ];
+
     /// Whether this surface legitimately carries a `multipart/form-data`
     /// request body. The OpenAI-compatible API takes multipart on image
     /// edits, image variations, audio transcription/translation, and file

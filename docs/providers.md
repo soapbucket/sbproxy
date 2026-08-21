@@ -1,5 +1,5 @@
 # Supported providers
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 SBproxy ships native adapters for 72 LLM providers behind one OpenAI-compatible API. The 72 breaks down as: 66 entries that speak the OpenAI wire format and pass through unchanged, 3 with in-tree request and response translators (Anthropic, Gemini, Bedrock), and 3 `Custom`-format entries (SageMaker, Oracle, Watsonx) that pass through in their native shape with no translation. You bring your own key per provider, and the `model` field passes straight through to the upstream, so the gateway reaches 200+ models (and whatever a provider ships next) without enumerating them.
 
@@ -98,7 +98,7 @@ The `cloudflare`, `vertex`, `runpod`, `azure_foundry`, and `snowflake` defaults 
 
 [^vertex-oauth]: Vertex AI requires a short-lived OAuth2 access token rather than a static API key. Generate one with `gcloud auth print-access-token` (or your service account flow) and rotate it before expiry. SBproxy forwards the configured `api_key` verbatim as the bearer token.
 
-[^embed-only]: Voyage and Jina expose embeddings (and rerank) endpoints only. Their catalog entries set `supports_chat: false` so chat-completion configs against these providers will fail closed at validation time once the runtime check is wired.
+[^embed-only]: Voyage and Jina expose embeddings (and rerank) endpoints only. Their catalog entries record that as `supports_chat: false`, which is a note about the vendor rather than a gate: nothing in the gateway reads it, so a chat-completions request against one of them is forwarded and 404s at the upstream. Keep chat traffic away from them by leaving chat models out of their `models` list, or with `allowed_models`.
 
 `format` is the wire protocol the upstream expects. OpenAI-compatible upstreams pass through unchanged. Anthropic, Google Gemini, and AWS Bedrock are translated bidirectionally for chat-completions requests: clients send OpenAI-shaped bodies, SBproxy rewrites the body and path on the way out, and SBproxy rewrites the response back to OpenAI shape. For streaming, the relay parses native Anthropic, Gemini, and Bedrock stream frames into the internal hub stream and re-emits OpenAI Chat, Anthropic Messages, or OpenAI Responses shape based on the inbound route. Gemini embeddings at `/v1/embeddings` translate to and from Gemini embedding calls. Oracle OCI, Watsonx, SageMaker, and other `Custom` formats remain native pass-through, so clients must send the provider's native body shape or route through OpenRouter/custom translation.
 
@@ -248,12 +248,20 @@ providers:
     auth_header: Authorization     # header carrying the key (required)
     auth_prefix: "Bearer "         # prefix prepended to the key ("" for raw keys, defaults to "")
     format: openai                 # wire format: openai | anthropic | google | bedrock | custom (required)
-    supports_streaming: true
-    supports_embeddings: false
-    supports_chat: true            # set false for embeddings/rerank-only providers
+    supports_streaming: true       # catalog note only, see below
+    supports_embeddings: false     # catalog note only, see below
+    supports_chat: true            # catalog note only, see below
 ```
 
 A malformed override file is rejected and the gateway falls back to the embedded catalog rather than booting with no providers.
+
+The three `supports_*` keys are notes about the vendor's own API. Nothing in
+the request path reads them, so changing one changes nothing about what the
+gateway serves. That is decided by `format` plus the per-provider surface matrix
+documented under [Supported endpoints](ai-gateway.md#supported-endpoints), and
+the same matrix is what `GET /v1/models` publishes as each model's
+`capabilities` array. A custom entry with `format: openai` gets the full OpenAI
+surface row whatever its `supports_embeddings` value says.
 
 ### 3. Add it to the in-tree registry
 

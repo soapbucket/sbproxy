@@ -84,6 +84,13 @@ pub fn provider_supports_realtime(provider: &crate::ProviderConfig) -> bool {
 /// normalisation would mislead callers. The gateway instead lists only the
 /// public logical names it is configured to serve and adds bounded aggregate
 /// availability for managed deployments without exposing topology.
+///
+/// That listing's per-model `capabilities` array is this matrix, read
+/// through [`surface_capability_names`], so it stays the same answer the
+/// dispatch path gives. Nothing else may derive it: the provider
+/// catalog's `supports_chat` / `supports_embeddings` booleans used to,
+/// and disagreed with this table on 43 of the 72 shipped entries in both
+/// directions (WOR-2647).
 pub fn provider_supports_surface(provider_type: &str, surface: &crate::handler::AiSurface) -> bool {
     // Per-provider narrowings: the wire-format default would admit
     // more surfaces than the upstream actually exposes. Listed
@@ -204,6 +211,126 @@ pub fn provider_supports_surface_for_modality(
         Some(Modality::Image) => matches!(surface, AiSurface::ImageGeneration),
         Some(Modality::Chat) | None => false,
     }
+}
+
+/// The modality of a locally served (`serve:`) provider, or `None` for
+/// a provider that proxies an upstream (WOR-1908).
+///
+/// A served provider is not in the provider catalog, so the type-keyed
+/// matrix falls to the unknown-provider default and would blanket-501 a
+/// non-chat surface even while the box is serving an embedder. This is
+/// the modality [`provider_supports_surface_for_modality`] widens on.
+///
+/// A served provider hosts one or more models; this reports the first
+/// served model whose modality is not chat, so its surface becomes
+/// legal. An explicit `modality:` on the serve entry wins, because it is
+/// the only way to declare one for a raw `hf:` reference that has no
+/// catalog entry; otherwise the certified built-in catalog entry's
+/// modality answers. An operator's custom catalog is not consulted here,
+/// so a model only they know keeps the chat-only default.
+pub fn served_provider_modality(
+    provider: &crate::ProviderConfig,
+) -> Option<sbproxy_model_host::Modality> {
+    let serve = provider.serve.as_ref()?;
+    let catalog = builtin_model_catalog();
+    serve
+        .models
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .modality
+                .or_else(|| catalog.get(&entry.model).map(|model| model.modality))
+        })
+        .find(|modality| !modality.uses_kv_cache())
+}
+
+/// The certified built-in catalog, parsed once. Resolving a served
+/// model's modality must not re-parse the embedded YAML per call.
+fn builtin_model_catalog() -> &'static sbproxy_model_host::Catalog {
+    static BUILTIN: std::sync::OnceLock<sbproxy_model_host::Catalog> = std::sync::OnceLock::new();
+    BUILTIN.get_or_init(sbproxy_model_host::Catalog::builtin)
+}
+
+/// Whether a surface is a claim about a model or about the account
+/// behind it.
+///
+/// The capability array hangs off a model entry, so it may only name
+/// surfaces a caller reaches by naming that model. `models` lists the
+/// account's models, and `files`, `batches`, `assistants`, `threads`,
+/// and `fine_tuning` manage account-scoped resources; publishing those
+/// per model would invite a caller to read them as per-model facts,
+/// which is the same false-advertising failure this function exists to
+/// prevent. `Unknown` is not a surface at all.
+///
+/// Exhaustive on purpose: a new [`crate::handler::AiSurface`] variant is
+/// a compile error here rather than a quiet omission from every
+/// listing.
+fn surface_is_a_model_capability(surface: &crate::handler::AiSurface) -> bool {
+    use crate::handler::AiSurface;
+    match surface {
+        AiSurface::ChatCompletions
+        | AiSurface::Embeddings
+        | AiSurface::Messages
+        | AiSurface::Responses
+        | AiSurface::Reranking
+        | AiSurface::ImageGeneration
+        | AiSurface::ImageEdits
+        | AiSurface::ImageVariations
+        | AiSurface::AudioTranscription
+        | AiSurface::AudioSpeech
+        | AiSurface::Moderations
+        | AiSurface::Realtime => true,
+        AiSurface::Models
+        | AiSurface::Assistants
+        | AiSurface::Threads
+        | AiSurface::Batches
+        | AiSurface::FineTuning
+        | AiSurface::Files
+        | AiSurface::Unknown => false,
+    }
+}
+
+/// The capability names a model listing may publish for `provider`
+/// (WOR-2647).
+///
+/// One source of truth for "what will this gateway serve for this
+/// model". Every surface in [`crate::handler::AiSurface::ALL`] that is a
+/// per-model claim is run through
+/// [`provider_supports_surface_for_modality`], the same matrix the
+/// dispatch path consults before it answers 501, and labeled with
+/// [`crate::handler::AiSurface::label`]. Deriving a listing any other
+/// way is how the two drift: the provider catalog's
+/// `supports_chat` / `supports_embeddings` booleans disagreed with this
+/// matrix on 43 of the 72 shipped entries, in both directions, so a
+/// caller could read `embeddings` off a bedrock model listing and get a
+/// 501 from the request that listing invited.
+///
+/// `streaming` is part of the vocabulary but is not an `AiSurface`. The
+/// gateway relays a streaming chat completion on every wire format it
+/// handles, and no capability check anywhere refuses a `stream: true`
+/// request, so `streaming` rides with `chat_completions` instead of
+/// coming from a catalog claim about the upstream.
+///
+/// Names come back sorted and deduplicated, so two listing surfaces
+/// rendering the same provider produce byte-identical arrays.
+///
+/// Takes the whole config entry and resolves the served modality itself
+/// via [`served_provider_modality`], so a caller cannot forget it and
+/// quietly under-report a locally served embedder.
+pub fn surface_capability_names(provider: &crate::ProviderConfig) -> Vec<&'static str> {
+    let served_modality = served_provider_modality(provider);
+    let mut names = std::collections::BTreeSet::new();
+    for surface in &crate::handler::AiSurface::ALL {
+        if surface_is_a_model_capability(surface)
+            && provider_supports_surface_for_modality(provider, surface, served_modality)
+        {
+            names.insert(surface.label());
+        }
+    }
+    if names.contains("chat_completions") {
+        names.insert("streaming");
+    }
+    names.into_iter().collect()
 }
 
 /// WOR-824 item 3: per-wire-format capability matrix.
@@ -403,27 +530,6 @@ mod tests {
             }
         }
 
-        const ALL_SURFACES: [AiSurface; 19] = [
-            ChatCompletions,
-            Models,
-            Embeddings,
-            Assistants,
-            Threads,
-            Batches,
-            FineTuning,
-            Files,
-            Realtime,
-            ImageGeneration,
-            ImageEdits,
-            ImageVariations,
-            AudioTranscription,
-            AudioSpeech,
-            Moderations,
-            Reranking,
-            Messages,
-            Responses,
-            Unknown,
-        ];
         let providers = [
             "openai",
             "anthropic",
@@ -435,7 +541,7 @@ mod tests {
         ];
 
         for provider in providers {
-            for surface in &ALL_SURFACES {
+            for surface in &AiSurface::ALL {
                 assert_eq!(
                     provider_supports_surface(provider, surface),
                     expected(provider, surface),
@@ -488,27 +594,6 @@ mod tests {
             }
         }
 
-        const ALL_SURFACES: [AiSurface; 19] = [
-            ChatCompletions,
-            Models,
-            Embeddings,
-            Assistants,
-            Threads,
-            Batches,
-            FineTuning,
-            Files,
-            Realtime,
-            ImageGeneration,
-            ImageEdits,
-            ImageVariations,
-            AudioTranscription,
-            AudioSpeech,
-            Moderations,
-            Reranking,
-            Messages,
-            Responses,
-            Unknown,
-        ];
         const ALL_FORMATS: [ProviderFormat; 5] = [
             ProviderFormat::OpenAi,
             ProviderFormat::Anthropic,
@@ -518,7 +603,7 @@ mod tests {
         ];
 
         for format in ALL_FORMATS {
-            for surface in &ALL_SURFACES {
+            for surface in &AiSurface::ALL {
                 assert_eq!(
                     provider_format_supports_surface(format, surface),
                     expected(format, surface),
@@ -854,5 +939,153 @@ mod tests {
                 "cohere should not advertise support for {surface:?}"
             );
         }
+    }
+
+    // --- WOR-2647: the listing and the enforcer are one answer ---
+
+    fn typed_provider(provider_type: &str) -> crate::ProviderConfig {
+        provider(serde_json::json!({
+            "name": "entry",
+            "provider_type": provider_type,
+            "api_key": "test",
+            "models": ["m"]
+        }))
+    }
+
+    /// Every capability name a listing publishes is a surface the
+    /// dispatch path will serve, and every model-scoped surface it will
+    /// serve is published, for every entry in the shipped catalog.
+    ///
+    /// Sweeping the catalog rather than a handful of names is the point:
+    /// the booleans this replaced disagreed with the matrix on 43 of the
+    /// 72 entries, and the two that got noticed (bedrock advertising an
+    /// embeddings surface it 501s, vertex hiding one it serves) were the
+    /// two somebody happened to read.
+    #[test]
+    fn capability_names_are_the_matrix_answer_for_every_catalog_provider() {
+        use crate::handler::AiSurface;
+
+        let catalog = crate::providers::list_providers();
+        assert!(catalog.len() > 40, "catalog sweep is not empty");
+        for provider_type in catalog {
+            let entry = typed_provider(&provider_type);
+            let names = surface_capability_names(&entry);
+            for surface in &AiSurface::ALL {
+                if !surface_is_a_model_capability(surface) {
+                    continue;
+                }
+                assert_eq!(
+                    names.contains(&surface.label()),
+                    provider_supports_surface(&provider_type, surface),
+                    "{provider_type} / {surface:?}: listing and enforcer disagree"
+                );
+            }
+        }
+    }
+
+    /// The two entries the ticket named, pinned by name so a regression
+    /// reads as itself rather than as a sweep index.
+    #[test]
+    fn bedrock_hides_embeddings_and_vertex_publishes_them() {
+        use crate::handler::AiSurface;
+
+        assert!(!provider_supports_surface(
+            "bedrock",
+            &AiSurface::Embeddings
+        ));
+        assert!(!surface_capability_names(&typed_provider("bedrock")).contains(&"embeddings"));
+
+        assert!(provider_supports_surface("vertex", &AiSurface::Embeddings));
+        assert!(surface_capability_names(&typed_provider("vertex")).contains(&"embeddings"));
+    }
+
+    /// An account-scoped surface is not a per-model capability, and
+    /// neither is an unclassified path. Publishing `files` or `unknown`
+    /// on a model entry would invite exactly the misreading this whole
+    /// change exists to stop.
+    #[test]
+    fn capability_names_exclude_account_scoped_surfaces_and_unknown() {
+        // openai is the widest row in the matrix: if a name is ever
+        // going to leak, it leaks here.
+        let names = surface_capability_names(&typed_provider("openai"));
+        for excluded in [
+            "models",
+            "assistants",
+            "threads",
+            "batches",
+            "fine_tuning",
+            "files",
+            "unknown",
+        ] {
+            assert!(
+                !names.contains(&excluded),
+                "{excluded} is not a per-model capability: {names:?}"
+            );
+        }
+        assert_eq!(
+            names,
+            vec![
+                "audio_speech",
+                "audio_transcription",
+                "chat_completions",
+                "embeddings",
+                "image_edits",
+                "image_generation",
+                "image_variations",
+                "messages",
+                "moderations",
+                "realtime",
+                "reranking",
+                "responses",
+                "streaming",
+            ]
+        );
+    }
+
+    /// `streaming` is not an `AiSurface`; it rides with chat, which the
+    /// gateway serves for every wire format. An anthropic entry gets it
+    /// without getting any of the openai-only surfaces.
+    #[test]
+    fn streaming_rides_with_chat_and_names_come_back_sorted() {
+        let names = surface_capability_names(&typed_provider("anthropic"));
+        assert_eq!(
+            names,
+            vec!["chat_completions", "messages", "responses", "streaming"]
+        );
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "wire order must be stable across sites");
+    }
+
+    /// WOR-1908 through the listing: a locally served embedder is not in
+    /// the provider catalog, so the type-keyed matrix alone would hide
+    /// the one surface it exists to answer.
+    #[test]
+    fn a_served_embedder_publishes_the_embeddings_surface() {
+        let embedder = provider(serde_json::json!({
+            "name": "local-embedder",
+            "models": ["e5"],
+            "serve": {
+                "models": [{
+                    "model": "hf:intfloat/e5-large-v2",
+                    "name": "e5",
+                    "modality": "embedding"
+                }]
+            }
+        }));
+        assert_eq!(
+            served_provider_modality(&embedder),
+            Some(sbproxy_model_host::Modality::Embedding)
+        );
+        assert!(surface_capability_names(&embedder).contains(&"embeddings"));
+
+        // A provider that proxies an upstream has no served modality,
+        // and an unknown type keeps the restrictive default.
+        let proxied = provider(serde_json::json!({"name": "mystery", "api_key": "k"}));
+        assert_eq!(served_provider_modality(&proxied), None);
+        assert_eq!(
+            surface_capability_names(&proxied),
+            vec!["chat_completions", "messages", "responses", "streaming"]
+        );
     }
 }

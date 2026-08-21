@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -414,4 +414,120 @@ fn route_headers_and_managed_errors_are_stable_and_allowlisted() {
     assert_eq!(error["error"]["request_id"], "req_123");
     assert_eq!(error["error"]["retryable"], true);
     assert_eq!(error["error"]["sbproxy_reason"], "no_ready_replica");
+}
+
+/// Read the first listed model's capability array as a set of names.
+fn listed_capabilities(response: &serde_json::Value) -> BTreeSet<String> {
+    response["data"][0]["capabilities"]
+        .as_array()
+        .expect("capabilities array")
+        .iter()
+        .map(|name| name.as_str().expect("capability name").to_string())
+        .collect()
+}
+
+/// One provider entry serving one model, keyed on `provider_type`.
+fn single_provider_config(provider_type: &str) -> sbproxy_ai::handler::AiHandlerConfig {
+    serde_json::from_value(serde_json::json!({
+        "providers": [
+            {
+                "name": "entry",
+                "provider_type": provider_type,
+                "api_key": "test",
+                "models": ["m"]
+            }
+        ]
+    }))
+    .expect("AI config")
+}
+
+/// WOR-2647: the listing advertises exactly what the enforcer serves.
+///
+/// `GET /v1/models` publishes a per-model `capabilities` array, and the
+/// request path answers a surface it does not handle with 501. The two
+/// used to read different tables: the array came from the provider
+/// catalog's `supports_chat` / `supports_embeddings` booleans in
+/// `crates/sbproxy-ai/data/ai_providers.yml`, and the refusal came from
+/// `provider_supports_surface`. They disagreed on 43 of the 72 shipped
+/// catalog entries, in both directions. `bedrock` declares
+/// `supports_embeddings: true`, so a bedrock-only origin advertised
+/// `embeddings` on its own listing and then answered `POST
+/// /v1/embeddings` with 501; `vertex` declares `false` while the
+/// enforcer serves the surface, so a caller was told not to try
+/// something that works.
+///
+/// This sweeps the whole catalog rather than the two entries that were
+/// noticed, because a per-entry assertion is narrower than the
+/// enforcer it is meant to track.
+#[test]
+fn model_listing_advertises_only_surfaces_the_enforcer_serves() {
+    use sbproxy_ai::api_routes::provider_supports_surface;
+    use sbproxy_ai::handler::AiSurface;
+
+    let mut checked = 0usize;
+    for provider_type in sbproxy_ai::providers::list_providers() {
+        let config = single_provider_config(&provider_type);
+        let listing = logical_model_listing(&config, &[], &[], &[], &BTreeMap::new());
+        let advertised = listed_capabilities(&listing);
+
+        for (surface, label) in [
+            (AiSurface::ChatCompletions, "chat_completions"),
+            (AiSurface::Embeddings, "embeddings"),
+            (AiSurface::Reranking, "reranking"),
+            (AiSurface::AudioSpeech, "audio_speech"),
+        ] {
+            let enforced = provider_supports_surface(&provider_type, &surface);
+            let listed = advertised.contains(label);
+            assert_eq!(
+                listed, enforced,
+                "{provider_type}: listing advertises {label}={listed}, \
+                 enforcer answers {enforced}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked >= 200, "the catalog sweep ran: {checked} checks");
+}
+
+/// The bedrock case named in the ticket, pinned on its own so a
+/// regression names the provider rather than a sweep index.
+#[test]
+fn bedrock_listing_does_not_advertise_the_embeddings_it_refuses() {
+    use sbproxy_ai::api_routes::provider_supports_surface;
+    use sbproxy_ai::handler::AiSurface;
+
+    assert!(
+        !provider_supports_surface("bedrock", &AiSurface::Embeddings),
+        "the enforcer answers 501 for bedrock embeddings"
+    );
+    let listing = logical_model_listing(
+        &single_provider_config("bedrock"),
+        &[],
+        &[],
+        &[],
+        &BTreeMap::new(),
+    );
+    let advertised = listed_capabilities(&listing);
+    assert!(
+        !advertised.contains("embeddings"),
+        "bedrock advertised embeddings it will 501: {advertised:?}"
+    );
+    assert!(advertised.contains("chat_completions"));
+}
+
+/// The other direction: vertex serves embeddings and must say so.
+#[test]
+fn vertex_listing_advertises_the_embeddings_it_serves() {
+    use sbproxy_ai::api_routes::provider_supports_surface;
+    use sbproxy_ai::handler::AiSurface;
+
+    assert!(provider_supports_surface("vertex", &AiSurface::Embeddings));
+    let listing = logical_model_listing(
+        &single_provider_config("vertex"),
+        &[],
+        &[],
+        &[],
+        &BTreeMap::new(),
+    );
+    assert!(listed_capabilities(&listing).contains("embeddings"));
 }

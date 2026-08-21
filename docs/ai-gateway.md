@@ -79,6 +79,19 @@ omits worker identity, engine ports, and private endpoints. It does not call an
 ordinary provider's native model-list endpoint or reproduce provider-specific
 model metadata.
 
+Each entry's `capabilities` array comes from the same per-provider surface
+matrix that decides whether a request is served or answered with 501, so a
+client can read the listing and act on it: anything named there is a surface
+this gateway will forward for that model. Whether the upstream then answers 200
+is the upstream's business. A capability appears when at least one eligible
+provider serving that model handles the surface, which is the rule the 501 gate
+uses. The names are the surface labels from
+[Supported endpoints](#supported-endpoints), narrowed to the ones a caller
+reaches by naming a model, plus `streaming`. Account-scoped surfaces (`models`,
+`files`, `batches`, `assistants`, `threads`, `fine_tuning`) belong to the
+provider rather than to any one model, so they are left out. `GET /model/info`
+and `GET /model_group/info` carry the same array from the same matrix.
+
 Successful completions add `x-sbproxy-logical-model` and an allowlisted
 `x-sbproxy-route-class` of `local`, `peer`, or `external`. Managed availability
 and cold-start failures that expose a public reason use an OpenAI-style
@@ -2183,6 +2196,8 @@ Marking an alias `deprecated` keeps it serving while making its use visible. Eve
 Every inbound request to an `action: ai_proxy` origin is classified into an `AiSurface` by `classify_surface(method, path)` in `crates/sbproxy-ai/src/handler.rs`. The classifier accepts canonical OpenAI paths with optional `/v1` or `/api/v1` prefix and any trailing slash. The surface label appears on the per-surface metrics, on the request tracing span, and on every per-surface decision (rate limit, guardrail extractor, 501 gate).
 
 Provider capability is the source of truth for which surfaces a configured provider can serve. The matrix lives in `crates/sbproxy-ai/src/api_routes.rs::provider_supports_surface` and keys on the provider type: the entry's `provider_type`, falling back to `name` when no type is set. A custom-named entry such as `name: team-openai` with `provider_type: openai` therefore keeps the full OpenAI surface set; the display name never narrows or widens capability. When no configured provider supports the requested surface, the proxy returns **501 Not Implemented** before any upstream call. The universal surfaces are chat completions, Anthropic Messages, OpenAI Responses, and models. Unknown surfaces fall through to the existing dispatch and 404 at the upstream.
+
+The same matrix is what the model listings publish. `GET /v1/models`, `GET /model/info`, and `GET /model_group/info` derive each entry's `capabilities` array from it, so the listing and the 501 gate cannot give different answers. The provider catalog's `supports_streaming`, `supports_embeddings`, and `supports_chat` keys in `crates/sbproxy-ai/data/ai_providers.yml` are notes about the vendor's API and are read by nothing.
 
 | Surface label | Method(s) | Path(s) | Providers (today) |
 |---|---|---|---|
