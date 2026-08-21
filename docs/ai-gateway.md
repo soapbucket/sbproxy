@@ -1739,7 +1739,7 @@ flowchart TD
 
 When every candidate is over the ceiling the request fails closed with 402. The gateway will not quietly route to something more expensive than the caller was willing to pay. The refusal names the ceiling and carries each excluded candidate's estimated cost and the price layer that produced it, so the caller sees what the request would have cost:
 
-```bash
+```console
 $ curl -s http://127.0.0.1:8080/v1/chat/completions \
     -H 'Host: ai.local' \
     -H 'Content-Type: application/json' \
