@@ -603,9 +603,11 @@ static AI_ADMISSION_DECISIONS: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
 
 /// Record a pre-provider AI admission decision (WOR-2595).
 ///
-/// `surface` is the inbound surface label from `AiSurface::label`
-/// (`messages`, `responses`), so the series joins
-/// `sbproxy_ai_surface_requests_total` on the same values. `reason` is
+/// `surface` is the inbound surface label from `AiSurface::label`, so
+/// the series joins `sbproxy_ai_surface_requests_total` on the same
+/// values: `messages` or `responses` for a refusal at the native-format
+/// shim, and any JSON surface, `chat_completions` included, for one at
+/// the shared stored-prompt resolver. `reason` is
 /// the refusal's bounded code from `ChatError::reason`
 /// (`tools_mcp_unsupported`, `store_unsupported`, `malformed_json`, ...),
 /// the prompt-bridge codes the dispatcher names
@@ -625,8 +627,13 @@ pub fn record_admission_decision(surface: &str, reason: &str, outcome: &str) {
     let metric = "sbproxy_ai_admission_decisions_total";
     let surface = sbproxy_observe::metrics::sanitize_label_budget(metric, "surface", surface);
     let reason = sbproxy_observe::metrics::sanitize_label_budget(metric, "reason", reason);
+    // `outcome` is a literal at the only call site, but it goes through
+    // the limiter like its two neighbors: an exemption held by "the
+    // caller passes a constant" is exactly the invariant a second caller
+    // breaks silently.
+    let outcome = sbproxy_observe::metrics::sanitize_label_budget(metric, "outcome", outcome);
     counter
-        .with_label_values(&[surface.as_str(), reason.as_str(), outcome])
+        .with_label_values(&[surface.as_str(), reason.as_str(), outcome.as_str()])
         .inc();
 }
 

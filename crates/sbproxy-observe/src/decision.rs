@@ -1220,8 +1220,12 @@ impl DecisionDetails {
 
     /// Detail for a pre-provider AI gateway refusal.
     ///
-    /// `surface` is the inbound AI surface (`messages`, `responses`),
-    /// and `verdict` is the refusal's bounded reason code
+    /// `surface` is the inbound AI surface the request arrived on:
+    /// `messages` or `responses` for a refusal at the native-format
+    /// shim, and whatever surface the request came in on for a refusal
+    /// at the shared stored-prompt resolver, which the canonical
+    /// `chat_completions` path reaches too. `verdict` is the refusal's
+    /// bounded reason code
     /// (`tools_mcp_unsupported`, `store_unsupported`, `malformed_json`,
     /// ...). Both are `&'static str` at every call site on purpose:
     /// details ship unredacted, and the refusal messages these records

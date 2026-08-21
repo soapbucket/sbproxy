@@ -66,7 +66,11 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/v1/chat/completio
 
 The provider is never contacted. Before this, the same request reached it with an empty `model`.
 
-One surface keeps the old behavior, and it is called out rather than left to be discovered: a multipart request (audio transcription, image edits, image variations) that carries no `model` form field is still forwarded without one, and its model gates still do not run. The multipart rewrite can replace a `model` part and cannot add one.
+Two carve-outs, called out rather than left to be discovered.
+
+The fallback applies on the three chat-shaped surfaces only: `POST /v1/chat/completions`, `POST /v1/messages`, and `POST /v1/responses`. `default_model` names a chat model, and the other JSON surfaces on the same origin have their own model vocabularies. `POST /v1/moderations` and `POST /v1/images/generations` in particular treat `model` as optional and default it upstream, so writing a chat model into one of those bodies would turn a request the provider accepts into a 400. Those surfaces still forward no `model`, and their model gates still do not run.
+
+The second is multipart: an audio transcription, image edit, or image variation request that carries no `model` form field is still forwarded without one, for the same reason. The multipart rewrite can replace a `model` part and cannot add one.
 
 Two more per-provider fields bound dispatch. `timeout_ms` caps one attempt's wall clock, measured from connect through the end of the response body, so it cuts a streaming completion off mid-stream if the stream outlives it; pick it with your slowest legitimate stream in mind, not your median. `max_retries` re-dispatches on retryable failures, each attempt with a fresh timeout window, so the worst case a client waits on one provider is `(timeout_ms + backoff) x (max_retries + 1)` before routing moves on.
 

@@ -18,7 +18,7 @@
 #   - crates/sbproxy-modules/src/action/routing/ ships two built-in
 #     RoutingStrategy implementations: first-healthy and lora-aware.
 #   - crates/sbproxy-observe/src/decision.rs defines 8 decision engines
-#     (built_in, plugin, cel, lua, js, rego, wasm, proxy_wasm) and 18
+#     (built_in, plugin, cel, lua, js, rego, wasm, proxy_wasm) and 19
 #     decision events, so any documented cardinality product that
 #     multiplies by the engine count uses 8, not 7.
 #   - crates/sbproxy-security/ exposes crypto, hostfilter, ip, pii, ssrf,
@@ -98,6 +98,8 @@ GENERATED_CORPUS="llms-full.txt"
 # cannot disagree about what is exempt.
 CORPUS_LAG=(
   "90+ AI provider :: MIGRATION.md carried this from the initial commit and WOR-2627 fixed it there; the corpus still embeds the pre-fix page"
+  "18 x 8 x 7 :: docs/observability.md's cardinality product moved to 19 events when WOR-2595 added ai.admission; the corpus still embeds the pre-fix page"
+  "1008 before tenancy :: the same product's total, fixed in docs/observability.md by WOR-2595 and not yet regenerated into the corpus"
 )
 corpus_lag_reason() {
   local entry
@@ -137,9 +139,13 @@ STALE_STRINGS=(
   # multiplies by it. `rego` landed with the multi-engine routing policy
   # and both went stale, which understated the label ceiling operators
   # size their Prometheus against. `DecisionEngine::ALL` has 8 variants
-  # and `DecisionEvent::ALL` has 18, so the product is 18 x 8 x 7 = 1008.
+  # and `DecisionEvent::ALL` has 19, so the product is 19 x 8 x 7 = 1064.
+  # WOR-2595 added `ai.admission` and moved the event count off 18, which
+  # is why the product that was correct until then is now on this list.
   "18 x 7 x 7"
   "882 before tenancy"
+  "18 x 8 x 7"
+  "1008 before tenancy"
   "\`js\`, \`wasm\`, \`proxy_wasm\`"
 )
 

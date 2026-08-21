@@ -143,7 +143,7 @@ origins:
             - claude-haiku-4-5
 ```
 
-`default_model` names the model shown in this provider's `/v1/models` listing and the model a request routes to when it omits `model`, on hosted and locally served providers alike. On the hosted path the fallback is origin-wide rather than per-provider, because provider selection has not happened yet when the model is read: it applies only when every enabled provider that names a default names the same one. See [ai-gateway.md](ai-gateway.md#defaulting-the-model) for the rule and its one exception in full.
+`default_model` names the model shown in this provider's `/v1/models` listing and the model a request routes to when it omits `model`, on hosted and locally served providers alike. On the hosted path the fallback is origin-wide rather than per-provider, because provider selection has not happened yet when the model is read: it applies only when every enabled provider that names a default names the same one, and only on the chat-shaped surfaces (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`). See [ai-gateway.md](ai-gateway.md#defaulting-the-model) for the rule and its carve-outs in full.
 
 Useful per-provider knobs:
 

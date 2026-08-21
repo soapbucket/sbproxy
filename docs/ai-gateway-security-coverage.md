@@ -92,7 +92,8 @@ the wrong trade for a receipt. `ai.stream.event` never publishes: it fires
 once per streamed chunk, so config load refuses `ai.stream.event: true`
 outright rather than accept an ingest bill (`ai.close` carries the
 stream's summary once instead). The remaining three, `transform`,
-`action`, and `log.custom_field`, are genuinely unwired, no emitter yet. An `events:` key naming a label this proxy does
+`action`, and `log.custom_field`, are genuinely unwired, no emitter yet.
+An `events:` key naming a label this proxy does
 not recognize fails config load; a known but unwired label loads and
 warns at boot instead, because refusing every label a later release might
 wire would block pre-configuring it today. Proof:

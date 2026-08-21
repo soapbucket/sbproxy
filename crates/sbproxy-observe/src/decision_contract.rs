@@ -178,10 +178,12 @@ pub const FIELD_CONTRACTS: &[FieldContract] = &[
     FieldContract {
         event: DecisionEvent::AiAdmission,
         fields: &["surface", "verdict"],
-        note: "The pre-provider refusal record. `surface` is the inbound AI surface \
-               (`messages`, `responses`), the same vocabulary \
+        note: "The pre-provider refusal record. `surface` is the inbound AI surface the \
+               request arrived on, the same vocabulary \
                `sbproxy_ai_surface_requests_total` uses, so a refusal rate is a join rather \
-               than a guess. `verdict` is the refusal's bounded reason code \
+               than a guess: `messages` or `responses` for a refusal at the native-format \
+               shim, and any JSON surface, `chat_completions` included, for one at the \
+               shared stored-prompt resolver. `verdict` is the refusal's bounded reason code \
                (`tools_mcp_unsupported`, `previous_response_id_unsupported`, \
                `conversation_unsupported`, `store_unsupported`, `prompt_object_unresolved`, \
                `malformed_json`, `body_not_object`, `role_missing`, `role_unsupported`, \
