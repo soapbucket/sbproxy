@@ -84,7 +84,14 @@ impl NoncePolicy {
 }
 
 /// Configuration for the Web Bot Auth provider.
+///
+/// WOR-2181: unknown keys are refused, so a misspelled
+/// `nonce_polciy:` fails the config instead of leaving the replay
+/// policy at its default. `type:` is stripped by
+/// `crate::auth::provider_config_from_value` before this parses, so
+/// both `bot_auth` and the `web_bot_auth` alias keep routing here.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BotAuthConfig {
     /// Directory of known agents. Each entry's `key_id` must be
     /// unique. May be empty when `directory` is set: the dynamic
@@ -205,9 +212,10 @@ impl std::fmt::Debug for BotAuthProvider {
 }
 
 impl BotAuthProvider {
-    /// Build the provider from JSON config.
+    /// Build the provider from JSON config. Unknown keys are refused
+    /// (WOR-2181).
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
-        let cfg: BotAuthConfig = serde_json::from_value(value)?;
+        let cfg: BotAuthConfig = crate::auth::provider_config_from_value(value)?;
         // A provider must have either inline agents or a directory.
         // An empty config with neither is a misconfiguration.
         if cfg.agents.is_empty() && cfg.directory.is_none() {

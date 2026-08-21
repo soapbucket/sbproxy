@@ -1,6 +1,6 @@
 # Config stability tiers
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 This page defines the stability tiers and applies them to representative or
 high-impact configuration leaves. It also lists the current reviewed
@@ -112,6 +112,52 @@ the registry uses, so an operator reads one boot log rather than two. No
 module field does this today: `origins.*.action.sticky`, the one field that
 did, was removed in favor of the `ring_hash` load-balancer algorithm and is
 now refused at config compile with an error naming the replacement.
+
+#### Unknown keys inside an `authentication` block
+
+**Upgrade-affecting.** A configuration that carried a key the proxy did not
+recognize inside an `authentication:` block used to compile, boot, and serve.
+It now fails to compile, at `serve`, `validate`, and hot reload alike, with an
+error naming the key and the ones the provider accepts:
+
+```
+unknown field `require_dp0p`, expected `tokens` or `require_dpop`
+```
+
+What that changed. `authentication:` is an opaque value on the typed
+envelope, so neither of the two schema-level unknown-key passes reaches
+inside it, and each provider deserialized permissively: serde dropped a key
+it did not know and the setting that key was meant to be took its default.
+Every optional switch on an auth provider defaults to the permissive value,
+so a single mistyped character produced a config that read as though a
+control were on and ran with it off. `require_dp0p: true` on a `bearer` block
+served with DPoP proof-of-possession disabled; `require_mtls_bnd: true` on
+`jwt` served with RFC 8705 certificate binding disabled. The same shape
+applied to `tls_verify` on `ldap_auth`, `require_agent_binding` on `cap`,
+`nonce_policy` on `bot_auth`, and `clock_skew_seconds` on `hmac_auth`.
+
+The refusal rides the existing config-compile error path, so a rejected hot
+reload leaves the last-good configuration serving; only a boot on a rejected
+file stops the proxy.
+
+What to do on upgrade: run `sbproxy validate <path>` before rolling. Any key
+it names is one the proxy was already ignoring, so correcting the spelling
+gives you the control the file claimed, and deleting the line gives you the
+behavior you were actually running. Neither is a silent change.
+
+Two surfaces stay permissive on purpose. `noop` has no configuration to
+check. And the per-credential entries under `api_keys:`, `tokens:`, `users:`,
+and `hmac_auth`'s `keys:` fold free-form attribution metadata (`project`,
+`team`, `tags`, `metadata`) into the same mapping as the secret, so an
+unknown key there cannot be told apart from an intended one.
+
+The same change made `proxy.extensions.agent_detect` refuse unknown keys, and
+made a malformed block that sets `enabled: true` a hard compile error rather
+than a warning that left the scorer off. An absent `agent_detect` block is
+unchanged: detection stays off and nothing is logged. A malformed block that
+does not set `enabled: true` also keeps warning and disabling, since disabled
+is what it asked for. This matches `proxy.extensions.tls_fingerprint`, which
+already behaves this way.
 
 #### Module keys refused at config compile
 

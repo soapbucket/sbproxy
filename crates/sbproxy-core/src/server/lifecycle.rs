@@ -973,8 +973,25 @@ fn install_detection_singletons(compiled: &sbproxy_config::CompiledConfig) {
     // did load rather than blocking serving, matching the TLS-catalogue
     // block above.
     {
-        let agent_detect_cfg =
-            crate::pipeline::AgentDetectConfig::from_extensions(&compiled.server.extensions);
+        // WOR-2181 made `from_extensions` fallible, and the pipeline
+        // compile has already run it with `?` on this same block, so a
+        // config that reaches here cannot produce the error arm. The
+        // `tls_fingerprint` block above takes the same position on its
+        // own call. Degrade rather than panic on the impossible case,
+        // and warn so it is not swallowed if it ever happens.
+        let agent_detect_cfg = match crate::pipeline::AgentDetectConfig::from_extensions(
+            &compiled.server.extensions,
+        ) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "proxy.extensions.agent_detect unreadable after compile; \
+                     no agent-detect scorer installed",
+                );
+                crate::pipeline::AgentDetectConfig::default()
+            }
+        };
         if agent_detect_cfg.enabled {
             let rule_scorer: Option<std::sync::Arc<dyn sbproxy_agent_detect::AgentScorer>> =
                 match agent_detect_cfg.rule_pack_path.as_deref() {
