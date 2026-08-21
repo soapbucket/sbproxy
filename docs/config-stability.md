@@ -456,6 +456,34 @@ a server-streaming method that fails partway: the status line is already
 committed downstream when the trailers arrive, so that response stays 200 with
 the error in the body.
 
+### The translated gRPC paths now ask the upstream for `identity` framing
+
+**Who this reaches.** Any origin with `action: {type: grpc}` and either
+`transcode` or `grpc_web: true`. Plain gRPC passthrough is unaffected.
+
+**What changes.** Both translated paths read the length-prefixed message
+frames, and neither can read a compressed one. They now send
+`grpc-accept-encoding: identity` on the request to the upstream, replacing
+anything the client sent, so a compliant server stops compressing. Two
+consequences follow. A compressed response frame that arrives anyway is
+refused by the transcoder with a JSON error naming compression, where before
+its bytes were handed to the protobuf decoder as if they were a message. And
+the gRPC-Web bridge no longer strips a non-`identity` `grpc-encoding` response
+header, since the frames under it are forwarded byte for byte.
+
+**What an operator sees when it bites.** An upstream configured to compress
+responses stops doing so on these origins, which shows up as larger response
+bodies between the proxy and that upstream. An upstream that compresses
+unconditionally, ignoring the negotiation, surfaces as a JSON body of
+`{"error": "gRPC response transcoding failed", "detail": "...compressed..."}`
+instead of the previous protobuf decode error. That body arrives with the
+upstream's own status, normally 200, because the frame's compression flag is
+only readable once the status line has gone downstream.
+
+**What to do before upgrading.** If you rely on gRPC message compression
+between the proxy and a gRPC upstream, keep that origin on plain passthrough
+rather than `transcode` or `grpc_web`.
+
 ---
 
 ## Selected field stability reference

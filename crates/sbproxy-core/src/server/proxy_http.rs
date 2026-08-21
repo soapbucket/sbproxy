@@ -3058,6 +3058,15 @@ impl ProxyHttp for SbProxy {
             let _ = upstream_request.insert_header("content-type".to_string(), "application/grpc");
             let _ = upstream_request.insert_header("te".to_string(), "trailers");
             upstream_request.remove_header("content-length");
+            // The proxy is the gRPC client on this hop and it decodes the
+            // response frame itself to produce JSON, so it has to say
+            // which message encodings it can read. It can read exactly
+            // one. Sending nothing leaves the upstream to guess, and a
+            // guess of `gzip` yields a frame the transcoder cannot decode
+            // at all; the inbound REST request's own `accept-encoding` is
+            // about the HTTP body downstream, not about gRPC message
+            // framing, so it must not leak into this decision either.
+            let _ = upstream_request.insert_header("grpc-accept-encoding".to_string(), "identity");
         }
 
         // WOR-819: gRPC-Web request -> native gRPC. The path and method
@@ -3073,6 +3082,14 @@ impl ProxyHttp for SbProxy {
             // X-Grpc-Web is a CORS preflight marker the upstream gRPC
             // server does not expect.
             upstream_request.remove_header("x-grpc-web");
+            // The bridge forwards response message frames byte for byte
+            // to a browser, and no gRPC-Web client implementation reads
+            // message-level compression, so a compressed frame is
+            // undeliverable however the proxy handles it. Overriding
+            // whatever the browser sent is the point: the negotiation
+            // that matters is between this proxy and the upstream, and
+            // this proxy will not re-frame a payload it cannot read.
+            let _ = upstream_request.insert_header("grpc-accept-encoding".to_string(), "identity");
         }
 
         // Prepend the proxy action's URL path to the upstream request path.
@@ -4028,6 +4045,13 @@ impl ProxyHttp for SbProxy {
         if ctx.transcode_active {
             let _ = upstream_response.insert_header("content-type".to_string(), "application/json");
             upstream_response.remove_header("content-length");
+            // Unconditional here, unlike the gRPC-Web block below: no
+            // gRPC frame reaches the client on this path at all, only the
+            // JSON the transcoder builds from it, so a header describing
+            // gRPC message framing would describe nothing the client
+            // holds. Whether the frame was actually compressed is decided
+            // per message by its flag byte, which `transcode_response`
+            // reads and refuses.
             upstream_response.remove_header("grpc-encoding");
             if let Some(status) = upstream_response
                 .headers
@@ -4100,7 +4124,30 @@ impl ProxyHttp for SbProxy {
             let resp_ct = sbproxy_transport::grpc::GrpcWebBridge::response_content_type(&req_ct);
             let _ = upstream_response.insert_header("content-type".to_string(), resp_ct);
             upstream_response.remove_header("content-length");
-            upstream_response.remove_header("grpc-encoding");
+            // `grpc-encoding` describes the framing of message bytes this
+            // bridge forwards byte for byte, so it may only be dropped
+            // when it describes nothing. The request advertised
+            // `grpc-accept-encoding: identity`, so a compliant upstream
+            // sends no header or `identity` and this strips it exactly as
+            // before. An upstream that ignored the negotiation keeps its
+            // header, and the browser client rejects a body it cannot
+            // read instead of parsing compressed bytes as protobuf. A
+            // header claiming compression over frames whose flag byte is
+            // clear is the harmless direction of the same mismatch: the
+            // client reads the flag per message, as the spec requires.
+            // A header present but unreadable as text keeps the same
+            // treatment as one naming an algorithm: it is not proof of
+            // identity, so it is not dropped.
+            let drop_grpc_encoding = match upstream_response.headers.get("grpc-encoding") {
+                None => true,
+                Some(value) => value
+                    .to_str()
+                    .map(|v| v.trim().eq_ignore_ascii_case("identity"))
+                    .unwrap_or(false),
+            };
+            if drop_grpc_encoding {
+                upstream_response.remove_header("grpc-encoding");
+            }
             if let Some(status) = upstream_response
                 .headers
                 .get("grpc-status")

@@ -32,6 +32,10 @@ pub mod echo_pb {
 use echo_pb::echo_server::{Echo, EchoServer};
 use echo_pb::{EchoRequest, EchoResponse};
 
+/// Request message that makes the stub Echo upstream report the
+/// `grpc-accept-encoding` it was called with rather than echo.
+const ACCEPT_ENCODING_PROBE: &str = "__report_grpc_accept_encoding";
+
 #[derive(Default)]
 struct EchoSvc;
 
@@ -45,7 +49,24 @@ impl Echo for EchoSvc {
         &self,
         request: tonic::Request<EchoRequest>,
     ) -> Result<tonic::Response<EchoResponse>, tonic::Status> {
+        // A caller asking for this exact message gets the request's
+        // `grpc-accept-encoding` back instead of an echo. It is the only
+        // way a test on the REST side of the transcoder can see a header
+        // the proxy adds on the gRPC side, and that header is what stops
+        // the upstream from compressing a frame the transcoder cannot
+        // read. Any other message echoes as usual.
+        let accept_encoding = request
+            .metadata()
+            .get("grpc-accept-encoding")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("<absent>")
+            .to_string();
         let msg = request.into_inner().message;
+        if msg == ACCEPT_ENCODING_PROBE {
+            return Ok(tonic::Response::new(EchoResponse {
+                message: accept_encoding,
+            }));
+        }
         Ok(tonic::Response::new(EchoResponse { message: msg }))
     }
 
@@ -230,6 +251,37 @@ fn unmapped_path_is_not_transcoded() {
         resp.status >= 400,
         "an unmapped path must not transcode; got {}",
         resp.status
+    );
+}
+
+#[test]
+fn the_transcoded_request_advertises_identity_message_encoding() {
+    // The proxy decodes the response frame itself to build JSON, and it
+    // can decode exactly one message encoding. A gRPC server compresses
+    // only what its caller says it can read, so the caller has to say so;
+    // sending nothing leaves a server free to gzip a frame the transcoder
+    // then refuses. This asserts the header on the wire the upstream
+    // actually received, not the intent at the call site.
+    let upstream = spawn_echo_grpc_server();
+    let harness = ProxyHarness::start_with_yaml(&transcode_config(&upstream)).expect("start");
+
+    let resp = harness
+        .post_json(
+            "/echo",
+            "transcode.localhost",
+            &json!({ "message": ACCEPT_ENCODING_PROBE }),
+            &[],
+        )
+        .expect("post");
+
+    assert_eq!(resp.status, 200, "the probe call itself must succeed");
+    let v: serde_json::Value = serde_json::from_slice(&resp.body)
+        .unwrap_or_else(|e| panic!("response is JSON: {e}; body={:?}", resp.body));
+    assert_eq!(
+        v["message"], "identity",
+        "the synthesized gRPC request must advertise identity message encoding; \
+         upstream saw {}",
+        v["message"]
     );
 }
 
