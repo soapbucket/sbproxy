@@ -223,7 +223,7 @@ A route attached to Gateways from several implementations keeps everyone's statu
 
 Each reconcile writes the rendered document to a temporary file in the same directory, flushes it to disk, renames it over `sb.yml`, and syncs the directory. The rename is the atomic step. A data plane reading the file during a publish sees either the previous complete document or the new one, and a controller pod killed mid-publish leaves the previous document byte for byte intact rather than a truncated one the proxy cannot boot on.
 
-Two limits are worth knowing. The guarantee is the filesystem's: a rename is atomic within one filesystem, which is why the temporary is written beside `sb.yml` rather than in `/tmp`, and on an NFS-backed `PersistentVolume` both the rename and the `fsync` are the server's promise rather than the kernel's. And a mode you set on the published file is carried across each publish, so `chmod 640 sb.yml` on the shared volume survives the next reconcile.
+Two limits are worth knowing. The guarantee is the filesystem's: a rename is atomic within one filesystem, which is why the temporary is written beside `sb.yml` rather than in `/tmp`, and on an NFS-backed `PersistentVolume` both the rename and the `fsync` are the server's promise rather than the kernel's. A mount that refuses the directory `fsync` outright, as some network and FUSE-backed volumes do, gets a logged warning naming the path and a publish still reported as successful: the rename has already taken effect by then, so the document is live and only its survival of a power cut is in question. And a mode you set on the published file is carried across each publish, so `chmod 640 sb.yml` on the shared volume survives the next reconcile.
 
 ### One process, one HTTP port
 
