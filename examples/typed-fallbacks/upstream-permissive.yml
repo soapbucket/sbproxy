@@ -1,0 +1,32 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Credential-free fixture for examples/typed-fallbacks/: an upstream that
+# answers every chat completion, standing in for the larger-window and
+# more-permissive providers the gateway reroutes to.
+#
+# Run:
+#   make run CONFIG=examples/typed-fallbacks/upstream-permissive.yml
+
+proxy:
+  http_bind_port: 8092
+
+origins:
+  "127.0.0.1":
+    action:
+      type: mock
+      status: 200
+      content_type: application/json
+      body:
+        id: chatcmpl-typed-fallbacks-demo
+        object: chat.completion
+        created: 0
+        model: mock-upstream
+        choices:
+          - index: 0
+            message:
+              role: assistant
+              content: "Hello from the answering fixture."
+            finish_reason: stop
+        usage:
+          prompt_tokens: 8
+          completion_tokens: 7
+          total_tokens: 15

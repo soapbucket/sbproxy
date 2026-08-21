@@ -122,9 +122,8 @@ surface that does the job. Boot and reload both refuse the document.
 
 | Key | Why it is refused | What to use instead |
 |---|---|---|
-| `origins.*.action.context_overflow` (`ai_proxy`) | Never a field on the AI handler and never read by anything. The decision layer behind it (error, fall back to a larger model, truncate) had no caller in the life of the tree, and the AI gateway guide described the block as ignored, which left operators free to write it. | A `window_fit` lever under `compression.levers`, or the `resilience.llm_aware.context_compress` shorthand. No configuration reroutes an oversized prompt to a larger-window model; order the larger model first, or alias to it. |
+| `origins.*.action.context_overflow` (`ai_proxy`) | Never a field on the AI handler and never read by anything. The decision layer behind it (error, fall back to a larger model, truncate) had no caller in the life of the tree, and the AI gateway guide described the block as ignored, which left operators free to write it. | A `window_fit` lever under `compression.levers`, or the `resilience.llm_aware.context_compress` shorthand, to fit the prompt in place. To reroute it to a larger-window model instead, name that provider in `context_window_fallbacks:` on the action. |
 | `origins.*.action.sticky` (`load_balancer`) | No affinity cookie was ever issued. | `algorithm: ring_hash` keyed on `cookie`, `header`, `ip`, or `uri`. |
-| `origins.*.action.targets[].zone` (`load_balancer`) | Target selection is not locality aware and never read the label, so zoned targets still received traffic from every zone. The key's name promises the zone-aware routing that Envoy and Nginx operators expect, and a promise-shaped label is a foot-gun rather than a convenience. | Remove the key; zone-aware routing is not implemented. To tell replicas apart, use `targets[].metadata`, which promises nothing about selection. |
 | `transforms[].allowed_hosts` (`type: wasm`) | Never enforced, and unenforceable: WASM modules have no network surface at all here, so the allowlist described a boundary nothing checked. | Keep the reaching on the proxy side. Gate the origin with an `expression` policy, or route the callout through an origin the proxy controls. The key returns as an enforced one if a host callout ever lands. |
 | `transforms[].on_request` (`type: cel`) | Compiled at config load and never evaluated. Transforms run on the response body, so there is no request phase for it to run in. | An `expression` policy to gate the request, a rate-limit or WAF `key:` expression to key on it, or a forward rule to route on it. |
 | `transforms[].on_response`, and its `expression` alias (`type: cel`) | Replaced the entire response body with whatever scalar the expression evaluated to. No partial edit, no structure-aware change, no streaming. CEL is for deciding; producing a payload is a different job, and no config in the tree ever authored the key. | A `javascript`, `lua_json`, or WASM transform, each of which parses the body, edits part of it, and re-emits. The same transform's `headers:` rules still set response headers from CEL. |
@@ -136,12 +135,14 @@ surface that does the job. Boot and reload both refuse the document.
 These parsed, warned once at boot, and then governed nothing. A warning
 can be the proportionate response to a key that does less than its name
 promises while still doing something, but the promise has to be small.
-`origins.*.action.targets[].zone` sat in that category for a while (it
-rendered a column in the admin target-health view) and moved to the
-refused table above once it was clear the column was not what operators
-were writing the key for: `zone` reads as locality routing, and a
-multi-region config that trusts it round-robins globally with nothing
-but a boot warning to say so.
+`origins.*.action.targets[].zone` is the surface that walked every
+state this page names: it started as a warned-about display label
+(rendering a column in the admin target-health view), moved to the
+refused table once it was clear the column was not what operators were
+writing the key for, and left that table when zone-aware selection
+shipped and the label started steering traffic. A key leaves the
+refused table in exactly one direction: by gaining the enforcement its
+name promises in the same change that re-admits it.
 
 Refusal is for two other shapes. The first is a key with nothing behind
 it at all, where a config that sets it keeps claiming a property the

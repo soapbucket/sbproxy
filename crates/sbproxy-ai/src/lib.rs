@@ -58,6 +58,7 @@ pub mod session;
 pub mod token_estimate;
 pub mod tracing_spans;
 pub mod translators;
+pub mod typed_fallbacks;
 pub mod types;
 pub mod usage_ledger;
 pub mod usage_parser;

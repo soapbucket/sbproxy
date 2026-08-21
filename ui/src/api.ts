@@ -1471,6 +1471,9 @@ export interface TargetHealth {
   breaker?: string;
   breaker_state?: string;
   latency_ms?: number;
+  /** WOR-2328: the target's authored zone label. Selection prefers
+   *  targets matching the pipeline's `proxy_zone`. */
+  zone?: string | null;
   [k: string]: unknown;
 }
 
@@ -2023,8 +2026,18 @@ export interface RequestLog {
   failover_engaged?: boolean;
   failover_from?: string;
   failover_to?: string;
+  // WOR-2556: which typed trigger drove an AI reroute, when one did.
+  // Closed vocabulary: "context_window" | "content_policy" | "generic".
+  failover_trigger?: string;
   load_balancer_strategy?: string;
   load_balancer_target?: string;
+  /** WOR-2328 zone-locality verdict for the selected target:
+   *  "local" (stayed in the proxy's own zone) or "spilled" (no
+   *  same-zone target was healthy). Absent when the stage did not
+   *  engage. */
+  zone_locality?: "local" | "spilled" | string;
+  /** Why the strategy picked that target, when it decides per request. */
+  routing_detail?: string;
   provider?: string;
   model?: string;
   tokens_in?: number;

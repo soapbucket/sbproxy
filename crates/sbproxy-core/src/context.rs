@@ -424,6 +424,12 @@ pub struct RequestContext {
     pub admin_failover_from: Option<String>,
     /// Latest provider selected after a handoff.
     pub admin_failover_to: Option<String>,
+    /// Which typed trigger drove the latest AI reroute, when one did
+    /// (WOR-2556). Closed vocabulary: `context_window` (prompt exceeds
+    /// the primary model's window), `content_policy` (a refusal was
+    /// rerouted), or `generic` (status/transport failover). `None` when
+    /// no reroute happened.
+    pub admin_failover_trigger: Option<String>,
     /// Most recently attempted AI provider, used to detect handoffs.
     pub admin_last_ai_provider: Option<String>,
     /// Closed generic load-balancer or AI router strategy name.
@@ -451,6 +457,21 @@ pub struct RequestContext {
     /// keep every value small and already-redacted: this map reaches
     /// the admin API unfiltered.
     pub ai_route_detail: serde_json::Map<String, serde_json::Value>,
+    /// Zone-locality verdict of the load balancer selection
+    /// (WOR-2328): `"local"` when selection narrowed to the proxy's
+    /// own zone, `"spilled"` when no same-zone target was healthy and
+    /// selection widened across zones, `None` when the locality stage
+    /// did not engage.
+    pub admin_zone_locality: Option<&'static str>,
+    /// Why the strategy chose that target, when the strategy has a
+    /// per-request reason worth showing (WOR-2564). `semantic_route`
+    /// fills it with the matched deployment, the winning exemplar's
+    /// ordinal, and the cosine score, so the admin routing-decisions row
+    /// shows which declared specialty fired rather than only the
+    /// provider it landed on. Bounded and operator-derived: a provider
+    /// name, a small integer, and a score. Never exemplar text, never a
+    /// client-supplied string.
+    pub admin_routing_detail: Option<String>,
 
     // --- Concurrent limit guards ---
     /// Permits issued by `ConcurrentLimitPolicy` for this request. The
@@ -1755,11 +1776,14 @@ impl RequestContext {
             admin_failover_from: None,
             admin_failover_to: None,
             admin_last_ai_provider: None,
+            admin_failover_trigger: None,
             admin_load_balancer_strategy: None,
             admin_load_balancer_target: None,
             ai_route_candidates: Vec::new(),
             ai_route_attempted: Vec::new(),
             ai_route_detail: serde_json::Map::new(),
+            admin_zone_locality: None,
+            admin_routing_detail: None,
             concurrent_limit_guards: Vec::new(),
             concurrent_limit_denial_body: None,
             agent_budget_guards: Vec::new(),
