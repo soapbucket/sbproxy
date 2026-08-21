@@ -1,6 +1,6 @@
 # Config stability tiers
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 This page defines the stability tiers and applies them to representative or
 high-impact configuration leaves. It also lists the current reviewed
@@ -113,6 +113,52 @@ module field does this today: `origins.*.action.sticky`, the one field that
 did, was removed in favor of the `ring_hash` load-balancer algorithm and is
 now refused at config compile with an error naming the replacement.
 
+#### Unknown keys inside an `authentication` block
+
+**Upgrade-affecting.** A configuration that carried a key the proxy did not
+recognize inside an `authentication:` block used to compile, boot, and serve.
+It now fails to compile, at `serve`, `validate`, and hot reload alike, with an
+error naming the key and the ones the provider accepts:
+
+```
+unknown field `require_dp0p`, expected `tokens` or `require_dpop`
+```
+
+What that changed. `authentication:` is an opaque value on the typed
+envelope, so neither of the two schema-level unknown-key passes reaches
+inside it, and each provider deserialized permissively: serde dropped a key
+it did not know and the setting that key was meant to be took its default.
+Every optional switch on an auth provider defaults to the permissive value,
+so a single mistyped character produced a config that read as though a
+control were on and ran with it off. `require_dp0p: true` on a `bearer` block
+served with DPoP proof-of-possession disabled; `require_mtls_bnd: true` on
+`jwt` served with RFC 8705 certificate binding disabled. The same shape
+applied to `tls_verify` on `ldap_auth`, `require_agent_binding` on `cap`,
+`nonce_policy` on `bot_auth`, and `clock_skew_seconds` on `hmac_auth`.
+
+The refusal rides the existing config-compile error path, so a rejected hot
+reload leaves the last-good configuration serving; only a boot on a rejected
+file stops the proxy.
+
+What to do on upgrade: run `sbproxy validate <path>` before rolling. Any key
+it names is one the proxy was already ignoring, so correcting the spelling
+gives you the control the file claimed, and deleting the line gives you the
+behavior you were actually running. Neither is a silent change.
+
+Two surfaces stay permissive on purpose. `noop` has no configuration to
+check. And the per-credential entries under `api_keys:`, `tokens:`, `users:`,
+and `hmac_auth`'s `keys:` fold free-form attribution metadata (`project`,
+`team`, `tags`, `metadata`) into the same mapping as the secret, so an
+unknown key there cannot be told apart from an intended one.
+
+The same change made `proxy.extensions.agent_detect` refuse unknown keys, and
+made a malformed block that sets `enabled: true` a hard compile error rather
+than a warning that left the scorer off. An absent `agent_detect` block is
+unchanged: detection stays off and nothing is logged. A malformed block that
+does not set `enabled: true` also keeps warning and disabling, since disabled
+is what it asked for. This matches `proxy.extensions.tls_fingerprint`, which
+already behaves this way.
+
 #### Module keys refused at config compile
 
 A module key that names behavior the runtime does not have is refused rather
@@ -122,9 +168,8 @@ surface that does the job. Boot and reload both refuse the document.
 
 | Key | Why it is refused | What to use instead |
 |---|---|---|
-| `origins.*.action.context_overflow` (`ai_proxy`) | Never a field on the AI handler and never read by anything. The decision layer behind it (error, fall back to a larger model, truncate) had no caller in the life of the tree, and the AI gateway guide described the block as ignored, which left operators free to write it. | A `window_fit` lever under `compression.levers`, or the `resilience.llm_aware.context_compress` shorthand. No configuration reroutes an oversized prompt to a larger-window model; order the larger model first, or alias to it. |
+| `origins.*.action.context_overflow` (`ai_proxy`) | Never a field on the AI handler and never read by anything. The decision layer behind it (error, fall back to a larger model, truncate) had no caller in the life of the tree, and the AI gateway guide described the block as ignored, which left operators free to write it. | A `window_fit` lever under `compression.levers`, or the `resilience.llm_aware.context_compress` shorthand, to fit the prompt in place. To reroute it to a larger-window model instead, name that provider in `context_window_fallbacks:` on the action. |
 | `origins.*.action.sticky` (`load_balancer`) | No affinity cookie was ever issued. | `algorithm: ring_hash` keyed on `cookie`, `header`, `ip`, or `uri`. |
-| `origins.*.action.targets[].zone` (`load_balancer`) | Target selection is not locality aware and never read the label, so zoned targets still received traffic from every zone. The key's name promises the zone-aware routing that Envoy and Nginx operators expect, and a promise-shaped label is a foot-gun rather than a convenience. | Remove the key; zone-aware routing is not implemented. To tell replicas apart, use `targets[].metadata`, which promises nothing about selection. |
 | `transforms[].allowed_hosts` (`type: wasm`) | Never enforced, and unenforceable: WASM modules have no network surface at all here, so the allowlist described a boundary nothing checked. | Keep the reaching on the proxy side. Gate the origin with an `expression` policy, or route the callout through an origin the proxy controls. The key returns as an enforced one if a host callout ever lands. |
 | `transforms[].on_request` (`type: cel`) | Compiled at config load and never evaluated. Transforms run on the response body, so there is no request phase for it to run in. | An `expression` policy to gate the request, a rate-limit or WAF `key:` expression to key on it, or a forward rule to route on it. |
 | `transforms[].on_response`, and its `expression` alias (`type: cel`) | Replaced the entire response body with whatever scalar the expression evaluated to. No partial edit, no structure-aware change, no streaming. CEL is for deciding; producing a payload is a different job, and no config in the tree ever authored the key. | A `javascript`, `lua_json`, or WASM transform, each of which parses the body, edits part of it, and re-emits. The same transform's `headers:` rules still set response headers from CEL. |
@@ -136,12 +181,14 @@ surface that does the job. Boot and reload both refuse the document.
 These parsed, warned once at boot, and then governed nothing. A warning
 can be the proportionate response to a key that does less than its name
 promises while still doing something, but the promise has to be small.
-`origins.*.action.targets[].zone` sat in that category for a while (it
-rendered a column in the admin target-health view) and moved to the
-refused table above once it was clear the column was not what operators
-were writing the key for: `zone` reads as locality routing, and a
-multi-region config that trusts it round-robins globally with nothing
-but a boot warning to say so.
+`origins.*.action.targets[].zone` is the surface that walked every
+state this page names: it started as a warned-about display label
+(rendering a column in the admin target-health view), moved to the
+refused table once it was clear the column was not what operators were
+writing the key for, and left that table when zone-aware selection
+shipped and the label started steering traffic. A key leaves the
+refused table in exactly one direction: by gaining the enforcement its
+name promises in the same change that re-admits it.
 
 Refusal is for two other shapes. The first is a key with nothing behind
 it at all, where a config that sets it keeps claiming a property the
@@ -208,6 +255,53 @@ see that case, because the key is read.
 | `audit.sink: tracing` | It never selected anything. Emission to the `config_audit`, `security_audit`, and `key_audit` targets has always been unconditional, so `tracing` and `memory` described the same proxy. | `memory` for the same behavior under an honest name, or `chain` with a `path` and a `sign_with` for a hash-chained, signed trail that survives a restart. |
 | `audit.path`, `audit.sign_with` under any sink but `chain` | Nothing would write to the file or sign anything. A path nothing writes to is the more dangerous of the two shapes, because it looks configured. | Set `sink: chain`, or remove the key. |
 
+#### Rego base data that collides with a rule (upgrade-affecting)
+
+`policies[].data` and `ai_routing_policy.data` are unchanged as keys and stay
+`stable`. What narrowed is the set of documents they accept, and a config that
+compiled before this change can refuse after it.
+
+Rego resolves a base-data value over a rule's computed value at the same path,
+per rule rather than per query. The load-time check used to compare the data
+document against the queried rule's path only, so a document that landed on a
+helper rule several references away from the query compiled clean and then made
+that helper a constant: the query still evaluated, the decision still looked
+computed, and a `deny` rule that stopped running failed open with nothing in
+the logs to say so. The check now compares against every rule head the module
+defines. Four shapes refuse where three of them did not before:
+
+| Base data | Rule the module defines | Previously |
+|---|---|---|
+| `data.<pkg>.<helper>` | a rule at that path that is not the query's | compiled, helper silently dead |
+| `data.<pkg>.<rule>` set to JSON `null` | a rule at that path | compiled, rule silently dead |
+| `data.<pkg>` set to a scalar | a rule beneath that path | refused at load with an opaque `previous value is not an object` from the interpreter, or compiled with the rule dead if the query never reached it |
+| `data.<pkg>.<table>` holding any key | a partial rule computing its own keys at that path (`table[k] := ...`) | compiled and behaved correctly whenever the base keys and the computed keys were disjoint |
+
+The fourth row is the one where a config that was working refuses, and it is
+the only one. Rego indexes a partial rule by the key it computes, so a base
+table of `{"POST": "no"}` beside a rule that only ever produces `GET` merged
+and both entries were readable. Load time sees the fixed part of the path and
+no further, so it cannot separate that document from `{"GET": "no"}` beside the
+same rule, which kills the rule's only output and says nothing. The check keeps
+the wide side, because that second document is the silent failure this whole
+change exists to catch, and it fails open. An empty object at the same path
+still loads, since no key there can beat a computed one.
+
+The refusal names the data path, the rule it landed on, and the reference chain
+from the query to that rule:
+
+```
+policy `rego`: base data defines `data.sbproxy.trusted`, and the module defines a rule at
+that path, so Rego resolves the base document there and the rule never evaluates. The query
+`data.sbproxy.allow` reaches it: data.sbproxy.allow -> data.sbproxy.trusted. Move the base
+data under a key no rule in the module produces.
+```
+
+The fix is to move the table off the rule's path. A sibling key inside the
+package (`data.sbproxy.roles` next to an `allow` rule) still loads, and a
+top-level key (`data.allowed_methods`) always did. See
+[`scripting.md`](scripting.md#base-data-the-table-the-rule-reads).
+
 ### Current config-only compatibility fields
 
 | Field or subtree | What happens today |
@@ -230,6 +324,67 @@ is consulted again, and the grace period covers a re-resolution failure
 with the last-known-good value. Both are `stable` in the key registry; see
 [configuration.md](configuration.md#secret-rotation) for the current
 behavior.
+
+---
+
+## Upgrade-affecting behavior changes
+
+A field whose meaning did not change can still change what your proxy does,
+when a code path that was supposed to read it starts reading it. Nothing here
+is a schema change: the same file compiles before and after. What changes is
+which traffic the value you already wrote now refuses.
+
+### `egress.usage_sinks` now gates the `events:` webhook sink
+
+**Who this reaches.** Any config that has both `egress.usage_sinks` set to
+`mode: deny_by_default` and an `events:` block with `sink: webhook`. A config
+with no `egress:` section, or one whose `usage_sinks` is absent or left at the
+default `allow_by_default`, is unaffected: that sink stays `ungated` and
+delivers exactly as before.
+
+**What changes.** `usage_sinks` has always compiled its allowlist under two
+purposes, `usage_sink` and `webhook`, and the events sink has always
+authorized under `webhook`. The `webhook` half was never installed into the
+process registry, so the events sink read an empty slot and dialed with no
+allowlist whatever the block said. It is installed now, so the block applies:
+your collector's host has to be on `egress.usage_sinks.hosts`, on a scheme and
+port that list permits (`ports` defaults to `[80, 443]`, so a collector on
+`:8088` needs an explicit `ports:`), and resolving onto a private address needs
+`allow_private: true`.
+
+**What an operator sees when it bites.** The SIEM feed stops and every surface
+says why: a `warn` on the `events` target carrying the closed reason
+(`unlisted_host`, `disallowed_port`, `private_address`, and the rest of
+[the egress vocabulary](admin-api-reference.md#get-apiegress)), one
+`sbproxy_events_dropped_total{sink="webhook",reason="egress_denied"}` per event
+in each dropped batch, one
+`sbproxy_egress_refused_total{purpose="webhook",reason=...}`, and a `denied`
+row for the collector in `GET /api/egress`. Nothing is dropped silently, and
+no surface carries the URL.
+
+**What to do before upgrading.** Read `GET /api/egress` on the running proxy,
+find the `webhook` row for your collector, and add that host (and its port, if
+it is not 80 or 443) to `egress.usage_sinks.hosts`.
+
+### `egress.token_exchange` now gates the MCP run-as-user token exchange
+
+**Who this reaches.** Any config with `egress.token_exchange` set to
+`mode: deny_by_default` and an MCP server whose `upstream_auth` uses the
+token-exchange mode with `run_as_user_auth`.
+
+**What changes.** That exchange passed no authorizer at all, so it ran ungated
+regardless of this sub-block. It now reads the same slot the non-MCP
+outbound-credential resolver does, and a per-server `egress:` block does not
+substitute for it: a per-server block gates that server's upstream connects and
+OpenAPI tool calls, never its token endpoint.
+
+**What an operator sees when it bites.** The tool call fails with
+`token exchange egress denied`, plus
+`sbproxy_egress_refused_total{purpose="token_exchange",reason=...}` and a
+`denied` row in `GET /api/egress` naming the token endpoint's host.
+
+**What to do before upgrading.** Add every MCP token endpoint host to
+`egress.token_exchange.hosts` alongside the non-MCP ones already there.
 
 ---
 

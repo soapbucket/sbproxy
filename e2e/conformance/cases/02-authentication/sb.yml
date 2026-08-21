@@ -38,4 +38,10 @@ origins:
     authentication:
       type: jwt
       secret: jW7tN3mK9pR4xL2vX5qJ8bN4mW
-      algorithm: HS256
+      # The field is the plural `algorithms`, a list. This case carried
+      # the singular `algorithm: HS256` for as long as the file has
+      # existed and it was dropped on the floor every run; the config
+      # happened to work because HS256 is in the default set a `secret`
+      # implies. WOR-2181 refuses unknown keys on an auth block, so the
+      # typo is now a config error rather than a silent drop.
+      algorithms: [HS256]

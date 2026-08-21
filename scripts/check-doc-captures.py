@@ -64,7 +64,58 @@ import urllib.request
 ROOT = Path(__file__).resolve().parent.parent
 
 MARKER = re.compile(r"^[ \t]*<!--[ \t]*CAPTURE:[ \t]*(?P<command>.+?)[ \t]*-->[ \t]*$")
-FENCE = re.compile(r"^(?P<fence>`{3,})(?P<lang>[a-z]*)[ \t]*$")
+
+# An opening code fence, near enough to CommonMark for a docs tree.
+#
+# CommonMark allows three or more backticks followed by an *info string*
+# that may hold anything except a backtick, so `rust,no_run`, `text
+# title="sb.yml"` and `console` are all openers. The old pattern here
+# was `` `{3,}[a-z]*[ \t]*$ ``, which accepted only a bare lowercase
+# language. That is not a narrower parse, it is a desynchronizing one:
+# the opener is skipped, the block's own closing fence is then read as
+# an opener, and every fence below it in the document is paired off by
+# one. `docs/audit-log.md` shipped exactly that (a ```rust,no_run block
+# at line 1019 cost the file one of its 31 blocks and inverted code and
+# prose for the rest of the page) while every lane stayed green.
+#
+# Leading whitespace is accepted without CommonMark's three-space limit,
+# because fences nested in list items here are indented four and five
+# (`docs/admin-api-guide.md:122`). Refusing those would trade one silent
+# desync for another.
+FENCE = re.compile(r"^[ \t]*(?P<fence>`{3,})(?P<info>[^`]*)$")
+
+# A closing fence: backticks and nothing else. The run must be at least
+# as long as the opener's, which is what lets a four-backtick block hold
+# three-backtick lines in its body.
+FENCE_CLOSE = re.compile(r"^[ \t]*(?P<fence>`{3,})[ \t]*$")
+
+# Anything that starts a run of three or more backticks. A line matching
+# this but not `FENCE` is a fence the parser cannot read, and is
+# reported rather than walked past: see `_fences`.
+FENCE_LOOKALIKE = re.compile(r"^[ \t]*`{3,}")
+
+# An ATX heading. `uncaptured_output_blocks` uses it as the one thing
+# that separates a command from a block below it.
+HEADING = re.compile(r"^ {0,3}#{1,6}(?:[ \t]|$)")
+
+
+def _fence_lang(info: str) -> str:
+    """The language out of a fence's info string.
+
+    CommonMark's info string is the language followed by arbitrary
+    attributes. Everything this script decides is keyed on the language,
+    so `rust,no_run` is `rust` and `text title="sb.yml"` is `text`.
+    """
+    stripped = info.strip()
+    if not stripped:
+        return ""
+    return re.split(r"[,\s]", stripped, maxsplit=1)[0].lower()
+
+
+def _closes(line: str, fence: str) -> bool:
+    """Whether `line` closes a block opened with `fence`."""
+    closing = FENCE_CLOSE.match(line)
+    return closing is not None and len(closing.group("fence")) >= len(fence)
 
 # Manifest of how to stand up what a document's commands talk to.
 #
@@ -80,8 +131,10 @@ MANIFEST: dict[str, dict] = {
     "examples/usage-bridge-queue/README.md": {
         # The same worker as docs/payment-settlement.md's usage_bridge
         # section, reached by its own dedicated walkthrough. It drives
-        # its own traffic: the page's first capture bills a call and the
-        # two `sqlite3` reads below it read what that produced.
+        # its own traffic: the page's first capture bills a call, the
+        # two `sqlite3` reads below it read the row that produced, and
+        # the `/metrics` scrape at the end reads the counter the same
+        # call incremented (WOR-2643).
         #
         # That driver marker is load bearing rather than tidy. The two
         # reads used to be the only markers here, on the assumption that
@@ -263,14 +316,6 @@ MANIFEST: dict[str, dict] = {
 #     that failed. A shape is not a capture, and replaying one would
 #     mean inventing a scenario to match it.
 #
-# `docs/admin-api-reference.md`, the routing-decisions worked example
-#     The one worked example on the page that is left out. Its setup is
-#     a config inline in the page rather than a directory under
-#     `examples/`, and it needs a second provider on 18591 plus a
-#     deliberately closed port to force the fallback it demonstrates.
-#     A stack here would be standing up a fixture that exists nowhere
-#     else in the repo; the example wants shipping first.
-#
 # `docs/admin-ui.md`
 #     Nothing to replay on this branch. The page is prose plus
 #     screenshots (see `scripts/capture-admin-screenshots.mjs`) and
@@ -280,7 +325,23 @@ MANIFEST: dict[str, dict] = {
 #
 # The two whole-page exemptions above are machine-checked below, so a
 # marker landing on one of them is refused rather than quietly ignored.
-# The block-level notes stay prose: they name blocks, not pages.
+#
+# The block-level notes used to stay prose, on the reasoning that they
+# name blocks and not pages. That reasoning is what WOR-2643 walked
+# through: `examples/usage-bridge-queue/README.md` showed a `/metrics`
+# scrape and its three-line output with no marker on it, and the block
+# was neither replayed nor named here, which are the same thing to
+# every lane that reads this file. Blocks that show output now go in
+# `UNCAPTURED_BLOCKS` below and are held to the same standard as the
+# page-level list: a reason, and exactly one match.
+#
+# What stays prose is the two notes above with no command to replay at
+# all - the audit stdout lines, which no command produces, and the
+# per-route response shapes, which are not output of anything. The
+# routing-decisions note that used to sit here as a third one is gone:
+# it has a command, so it lives in `UNCAPTURED_BLOCKS` and is audited.
+# Two records of one decision is how the machine-read half and the
+# prose half drift apart, which is the rot this whole map removes.
 EXEMPT_DOCS: dict[str, str] = {
     "docs/admin-ui.md": (
         "nothing on the page is command output: prose, screenshots, and "
@@ -290,6 +351,84 @@ EXEMPT_DOCS: dict[str, str] = {
         "timing-dependent: the walkthrough scrapes inside the window before a "
         "probe's third consecutive failure, which no replay can hold open"
     ),
+}
+
+# Fenced languages a block uses when it holds the output of the command
+# above it. `bash` blocks are commands; `yaml`, `rust`, `toml` and the
+# rest are source. A block in one of these, sitting under a `bash`
+# block, is this repo's shape for "here is what that printed".
+#
+# `http` and `xml` are here because the tree shows raw responses in them
+# eleven times (`docs/auth-oidc.md:110`,
+# `examples/rail-x402-base-sepolia/README.md:91`). None of those pages
+# is covered today, so they are latent rather than live, which is the
+# reason to add them now rather than after one lands on a manifest page.
+OUTPUT_FENCE_LANGS = frozenset({"", "text", "json", "http", "xml"})
+
+# Command blocks on a MANIFEST page that show their output and are
+# deliberately not replayed. Keyed on a substring of the command, so a
+# rewritten block loses its entry and gets policed again.
+#
+# Every one of these is a page in the manifest, which is the point: the
+# manifest says the page is covered, and a reader has no way to tell
+# which blocks on it are. Recording the exceptions by command is what
+# makes "this page is captured" mean something, and what makes adding an
+# uncaptured block to a captured page a decision somebody has to write
+# down rather than an omission nothing sees.
+#
+# A needle is a substring, so it must match exactly one block. Matching
+# none means the block was captured or rewritten and the note is
+# excusing nothing. Matching two means one excuse now covers a block
+# nobody wrote it for: `chain?limit=5` would silently absorb a second,
+# newer `chain?limit=5&channel=security` block and the page would report
+# clean. Both are errors below. Widen the needle until it is unique
+# rather than letting it spread, because a substring that can quietly
+# over-match is the denylist this map replaced wearing a new hat.
+UNCAPTURED_BLOCKS: dict[str, dict[str, str]] = {
+    "docs/payment-settlement.md": {
+        "/admin/payments/status": (
+            "an operator's own deployment, not this page's fixture: it "
+            "authenticates with ${SB_ADMIN_PASSWORD}, which nothing on the "
+            "page sets, and the body shows two configured rails and six "
+            "figures of worker ticks that a fixture started seconds ago "
+            "cannot produce"
+        ),
+        "/admin/payments/reconcile": (
+            "same deployment and same unset ${SB_ADMIN_PASSWORD} as the "
+            "status block above it; the response claims a lightning_cln "
+            "attempt that only a stranded real payment produces"
+        ),
+    },
+    "docs/audit-log.md": {
+        "chain?limit=5": (
+            "runs against the hand-written /tmp/sbproxy-audit-demo/sb.yml the "
+            "page prints inline, which has four chains and its own keystore; "
+            "the audit_log stack boots examples/audit-log/sb.yml instead"
+        ),
+        "chain?channel=admin&limit=2": (
+            "same inline /tmp/sbproxy-audit-demo walkthrough, and it pages "
+            "through records the three calls above it wrote"
+        ),
+        "sed -i ''": (
+            "tampers with a chained record on disk to show the walk stopping. "
+            "Destructive by design, and the BSD spelling of sed -i is not "
+            "portable to the Linux lanes"
+        ),
+        ": > /tmp/sbproxy-audit-demo": (
+            "truncates the security chain to show what a deleted trail looks "
+            "like. Destructive by design, against the same inline fixture"
+        ),
+    },
+    "docs/admin-api-reference.md": {
+        "api/routing-decisions": (
+            "the one worked example on the page left out. Its setup is a "
+            "config inline in the page rather than a directory under "
+            "examples/, and it needs a second provider on 18591 plus a "
+            "deliberately closed port to force the fallback it demonstrates: "
+            "a fixture that exists nowhere else in the repo, so the example "
+            "wants shipping before the stack does"
+        ),
+    },
 }
 
 
@@ -480,9 +619,130 @@ def _block_after(lines: list[str], start: int) -> tuple[str | None, tuple[int, i
     fence = opening.group("fence")
     body_start = cursor + 1
     for end in range(body_start, len(lines)):
-        if lines[end].startswith(fence) and not lines[end][len(fence):].strip():
+        if _closes(lines[end], fence):
             return "\n".join(lines[body_start:end]), (body_start, end)
     return None, None
+
+
+def _fences(lines: list[str]) -> tuple[list[tuple[int, int, str]], list[tuple[int, str]]]:
+    """Every fenced block in a document, and every fence it could not read.
+
+    Returns `(blocks, problems)`. Blocks are `(open, close, language)`
+    with indices into `lines`. Problems are `(1-based line, why)`.
+
+    The second half of that tuple is the point. This walker can lose
+    sync with the document in exactly two ways, and both used to be
+    silent:
+
+    1. A line that opens a fence but does not match `FENCE` - an info
+       string with a backtick in it. The walker steps over the opener,
+       reads the block's closing fence as an opener, and pairs off every
+       fence below it by one, reporting prose as code and code as prose.
+    2. A fence that is never closed. Stopping at that point is right (a
+       stray triple-backtick in prose should not swallow the rest of the
+       file) but it means every block below it disappears.
+
+    Both now come back as problems, so a caller that acts on the blocks
+    can refuse instead of trusting a half-read document. Nothing else
+    can desync it: a fence line inside a block body is either the closer
+    or too short to be one, which is the same call CommonMark makes.
+    """
+    blocks: list[tuple[int, int, str]] = []
+    problems: list[tuple[int, str]] = []
+    cursor = 0
+    while cursor < len(lines):
+        line = lines[cursor]
+        opening = FENCE.match(line)
+        if not opening:
+            if FENCE_LOOKALIKE.match(line):
+                problems.append(
+                    (
+                        cursor + 1,
+                        f"opens a code fence this parser cannot read: {line.strip()!r}. "
+                        "An info string may not contain a backtick; every block below "
+                        "this line would be paired off by one",
+                    )
+                )
+            cursor += 1
+            continue
+        fence = opening.group("fence")
+        for end in range(cursor + 1, len(lines)):
+            if _closes(lines[end], fence):
+                blocks.append((cursor, end, _fence_lang(opening.group("info"))))
+                cursor = end + 1
+                break
+        else:
+            problems.append(
+                (
+                    cursor + 1,
+                    f"opens a code fence that is never closed: {line.strip()!r}. "
+                    "Every block below this line is invisible to this check",
+                )
+            )
+            cursor = len(lines)
+    return blocks, problems
+
+
+def fence_problems(path: Path) -> list[tuple[int, str]]:
+    """Fences in a document that `_fences` cannot account for.
+
+    Split out so the coverage gate can refuse an unreadable page rather
+    than report on the wrong half of it.
+    """
+    return _fences(path.read_text().split("\n"))[1]
+
+
+def uncaptured_output_blocks(path: Path) -> list[tuple[int, str]]:
+    """Commands whose output the page shows and no marker replays.
+
+    The shape this looks for is the one every captured block on every
+    page here already has: a `bash` block, then the output it printed.
+    A marker between the two means the harness re-runs the command and
+    diffs it. No marker means the block is a transcript somebody typed
+    once, and nothing in this repo can tell whether it is still true.
+
+    Setup and teardown are outside the rule by construction rather than
+    by exemption: `cargo build`, `mkdir`, `kill %1` show no output, so
+    no output block follows them and there is nothing to hold to the
+    code. This looks only at commands the page makes a claim about.
+
+    What it can see, exactly: a `bash` block whose next fenced block is
+    in `OUTPUT_FENCE_LANGS`, with no heading between the two. Prose
+    between them is inside the rule, because "That returns:" followed by
+    the body is this repo's most common shape for showing output, and
+    exempting it made the check narrower than the sentence above claims.
+    A heading is out, because a heading starts a new subject and the
+    block under it belongs to that subject, not to the command above.
+
+    What it cannot see: output shown under a heading, output the page
+    describes in prose without fencing it, and output fenced in a
+    language not in `OUTPUT_FENCE_LANGS` (`yaml`, `rust`, `toml` and the
+    rest are source, and treating them as output would police every
+    config sample in the tree).
+
+    Returns `(line number of the command fence, the command text)`.
+    """
+    lines = path.read_text().split("\n")
+    blocks, _ = _fences(lines)
+    findings: list[tuple[int, str]] = []
+    for index, (start, end, lang) in enumerate(blocks):
+        if lang != "bash" or index + 1 >= len(blocks):
+            continue
+        next_start, _, next_lang = blocks[index + 1]
+        if next_lang not in OUTPUT_FENCE_LANGS:
+            continue
+        between = [line for line in lines[end + 1:next_start] if line.strip()]
+        if any(MARKER.match(line) for line in between):
+            continue
+        # A heading between the two means the second block is not this
+        # command's output; it is the first thing the next section
+        # shows. Prose is not that signal: five of the 32 command and
+        # output pairs on the covered pages have a sentence between
+        # them, and all five are genuine output of the command above.
+        if any(HEADING.match(line) for line in between):
+            continue
+        findings.append((start + 1, "\n".join(lines[start + 1:end])))
+    return findings
 
 
 # --- Stacks ------------------------------------------------------------
@@ -900,6 +1160,83 @@ def check_exemptions() -> list[str]:
     return errors
 
 
+def check_block_coverage() -> list[str]:
+    """Refuse a shown output that neither a marker nor a note accounts for.
+
+    Coverage here has always been per marker, which makes it per block
+    that somebody remembered. A page in the MANIFEST reads as covered,
+    and until now that could mean any fraction of it: WOR-2643's
+    `/metrics` scrape sat three lines under a captured `sqlite3` read on
+    a manifest page, showed a counter value, and was replayed by
+    nothing. Every lane was green and the page was two thirds checked.
+
+    So the unit of the decision moves from the page to the block. A
+    command that shows its output on a manifest page is either replayed
+    or named in `UNCAPTURED_BLOCKS` with a reason, and both halves are
+    audited: a note that matches no block is reported the same way a
+    missing marker is, so the exceptions cannot outlive the blocks they
+    were written for, and a note that matches two is reported as well,
+    so one excuse cannot spread to a block nobody wrote it for.
+
+    The scope of "shows its output" is `uncaptured_output_blocks`, whose
+    docstring says exactly what that sees and does not. Before reading
+    any of it this refuses a page whose fences it cannot parse, because
+    a half-read page reports clean for the wrong reason.
+    """
+    errors: list[str] = []
+    for rel in sorted(UNCAPTURED_BLOCKS):
+        if rel not in MANIFEST:
+            errors.append(
+                f"{rel} has UNCAPTURED_BLOCKS entries but is not in MANIFEST; "
+                "an unlisted page is not covered, so the notes describe nothing"
+            )
+    for rel in sorted(MANIFEST):
+        path = ROOT / rel
+        if not path.exists():
+            continue
+        unreadable = fence_problems(path)
+        for line, why in unreadable:
+            errors.append(f"{rel}:{line}: {why}")
+        if unreadable:
+            # Every block index below the bad fence is suspect, so the
+            # findings from this page would be about the wrong lines.
+            continue
+        recorded = UNCAPTURED_BLOCKS.get(rel, {})
+        matches: dict[str, list[int]] = {needle: [] for needle in recorded}
+        for line, command in uncaptured_output_blocks(path):
+            hits = [needle for needle in recorded if needle in command]
+            if hits:
+                for needle in hits:
+                    matches[needle].append(line)
+                continue
+            first = command.strip().split("\n")[0]
+            errors.append(
+                f"{rel}:{line}: shows the output of `{first}` and no CAPTURE "
+                "marker replays it. Add a marker, or record the block in "
+                "UNCAPTURED_BLOCKS with the reason it cannot be replayed"
+            )
+        for needle, reason in sorted(recorded.items()):
+            if not reason.strip():
+                errors.append(f"{rel}: UNCAPTURED_BLOCKS entry '{needle}' gives no reason")
+            hit_lines = matches[needle]
+            if not hit_lines:
+                errors.append(
+                    f"{rel}: UNCAPTURED_BLOCKS entry '{needle}' matches no "
+                    "uncaptured block; the block was captured or rewritten, so "
+                    "drop the entry rather than leave it excusing nothing"
+                )
+            elif len(hit_lines) > 1:
+                where = ", ".join(str(line) for line in hit_lines)
+                errors.append(
+                    f"{rel}: UNCAPTURED_BLOCKS entry '{needle}' matches "
+                    f"{len(hit_lines)} uncaptured blocks (lines {where}); the "
+                    "reason was written for one of them. Narrow the needle and "
+                    "give each block its own entry, or the next block to contain "
+                    "this substring inherits an excuse nobody wrote for it"
+                )
+    return errors
+
+
 def section_for(capture: Capture, doc_config: dict) -> dict:
     """The manifest section governing one capture.
 
@@ -1110,6 +1447,16 @@ def main() -> int:
     for error in exempt_errors:
         print(f"capture exemption: {error}", file=sys.stderr)
 
+    coverage_errors = check_block_coverage()
+    for error in coverage_errors:
+        print(f"capture coverage: {error}", file=sys.stderr)
+
+    # Both are static: they read the documents and the two maps, and
+    # need no binary and no stack. So they run in every mode, including
+    # `--list` and the `--stackless-only` lane CI uses, which is the
+    # lane a missing marker has to be caught in.
+    static_errors = exempt_errors + coverage_errors
+
     if args.list:
         total = 0
         for path in docs:
@@ -1120,7 +1467,10 @@ def main() -> int:
         print(f"\n{total} capture(s) in {len(docs)} document(s)")
         for rel, reason in sorted(EXEMPT_DOCS.items()):
             print(f"exempt: {rel}: {reason}")
-        return 1 if exempt_errors else 0
+        for rel, blocks in sorted(UNCAPTURED_BLOCKS.items()):
+            for needle, reason in sorted(blocks.items()):
+                print(f"uncaptured block: {rel}: `{needle}`: {reason}")
+        return 1 if static_errors else 0
 
     raw_binary = args.binary or os.environ.get("SBPROXY_CAPTURE_BIN")
     binary: Path | None
@@ -1188,8 +1538,8 @@ def main() -> int:
         )
 
     if args.update:
-        return 1 if exempt_errors else 0
-    return 1 if (failures or exempt_errors) else 0
+        return 1 if static_errors else 0
+    return 1 if (failures or static_errors) else 0
 
 
 if __name__ == "__main__":

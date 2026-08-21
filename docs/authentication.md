@@ -1,6 +1,6 @@
 # Authentication
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 Every origin decides who may call it with an `authentication` block, a sibling of `action` in `sb.yml` (`auth` is an accepted alias). SBproxy ships twelve built-in providers, from a static API key to a full OpenID Connect login. This page is the chooser: which provider fits which caller, how to accept more than one on the same origin, and what the rest of the gateway does with the identity a provider establishes. The field-by-field reference for all twelve lives in [configuration.md](configuration.md#authentication).
 
@@ -136,6 +136,23 @@ sequenceDiagram
 - **Trust tiers.** Verifier outcomes feed the four-value trust tier: a verified `bot_auth` signature or CAP token earns `strong`, a failed one drops the request to `suspicious`, and policies read the result as `request.trust_tier`. See [trust-tiers.md](trust-tiers.md).
 - **mTLS at the listener.** `proxy.mtls` verifies client certificates in the TLS handshake, before any provider here runs, and passes the verified cert metadata upstream as `X-Client-Cert-*` headers. See [mTLS client authentication](configuration.md#mtls-client-authentication) and [mtls-client-auth](../examples/mtls-client-auth/).
 - **DPoP binding.** `bearer` and `jwt` take `require_dpop` to demand an RFC 9449 proof on every request, and `jwt` additionally takes `require_mtls_bound` for RFC 8705 certificate-bound tokens. See [sender-constrained Bearer](configuration.md#sender-constrained-bearer-rfc-9449). For the proofs SBproxy itself mints on upstream calls, see [outbound-dpop.md](outbound-dpop.md).
+
+## A misspelled key is a config error, not a missing control
+
+Every one of the eleven configurable providers refuses a key it does not recognize, at `serve`, `validate`, and hot reload alike. The error names the key you wrote and lists the ones the provider takes:
+
+```
+unknown field `require_dp0p`, expected `tokens` or `require_dpop`
+```
+
+The reason this is worth its own section: the keys most worth misspelling are the ones that turn a control on. `require_dpop`, `require_mtls_bound`, `require_agent_binding`, `tls_verify`, `nonce_policy`, `clock_skew_seconds`. Each of them defaults to the permissive value, so until this landed a typo in one of them produced a config that compiled, booted, and served with that control off while the file said it was on. `require_dp0p: true` on a bearer block, with a zero for the `o`, ran with DPoP proof-of-possession disabled and nothing anywhere said so.
+
+Two surfaces stay permissive, deliberately:
+
+- `noop` has no configuration, so there is nothing to check and a stray key on a `noop` block is still accepted.
+- Individual credential entries inside `api_keys:`, `tokens:`, `users:`, and `hmac_auth`'s `keys:` accept unknown keys, because each entry folds the free-form attribution metadata (`project`, `team`, `tags`, and anything under `metadata`) into the same mapping as the secret. An unknown key there is indistinguishable from an intended one.
+
+If you are upgrading and a config that used to boot now refuses, the key it names is one the proxy was already ignoring. Fix the spelling or delete the line; either way the running behavior is what you had before. See [config-stability.md](config-stability.md#unknown-keys-inside-an-authentication-block).
 
 ## Honest notes
 

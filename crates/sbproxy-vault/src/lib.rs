@@ -6,7 +6,6 @@
 
 pub mod aws;
 pub mod azure;
-pub mod convergent;
 pub mod file;
 pub mod gcp;
 pub mod hashicorp;
@@ -26,7 +25,6 @@ pub use aws::{AwsAuth, AwsSecretsManagerBackend, AwsSecretsManagerConfig, DEFAUL
 pub use azure::{
     AzureKeyVaultAuth, AzureKeyVaultBackend, AzureKeyVaultConfig, DEFAULT_AZURE_CACHE_TTL,
 };
-pub use convergent::ConvergentFingerprinter;
 pub use file::{FileFormat, FileVaultBackend, FileVaultConfig};
 pub use gcp::{
     GcpSecretManagerAuth, GcpSecretManagerBackend, GcpSecretManagerConfig, DEFAULT_GCP_CACHE_TTL,

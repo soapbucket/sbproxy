@@ -1,5 +1,5 @@
 # prompt_injection_v2
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 ![Two requests carrying injection-style instructions: one tagged, one blocked](assets/prompt-injection-v2.gif)
 
@@ -277,6 +277,15 @@ is handled by `failure_posture`, in the shared vocabulary from
   as waived, and a sidecar that never answered produced no verdict to
   shadow-record.
 
+A sidecar that sheds load is in the same bucket. The sidecar bounds the
+bytes, batch size, concurrency, and duration of every inference it runs,
+and a request past any of those bounds comes back as
+`RESOURCE_EXHAUSTED` or `DEADLINE_EXCEEDED` rather than a verdict. The
+detector cannot tell that apart from an outage and does not try to: both
+take the `failure_posture` path. See
+[classifier-sidecar.md](classifier-sidecar.md#3-request-limits-and-load-shedding)
+for the limits and their defaults.
+
 The older boolean `fail_closed` still parses and still means what it
 always meant: `true` resolves to `closed` and `false` (the default)
 resolves to `open`, so an existing config keeps its exact behavior.
@@ -400,6 +409,13 @@ lifecycle:
   survives 30 s resets the backoff schedule on the next crash).
 * On graceful shutdown sends SIGTERM, waits up to
   `shutdown_grace` (default 5 s), then SIGKILL.
+* Appends `--inference-max-request-bytes`,
+  `--inference-max-items`, `--inference-max-concurrent`,
+  `--inference-max-queued`, and `--inference-timeout-ms` for
+  whichever of those `SupervisorConfig` fields is set. Left
+  `None`, each falls to the sidecar's own default, and the two
+  concurrency ones derive from the host. See
+  [classifier-sidecar.md](classifier-sidecar.md#setting-the-limits-on-a-supervised-sidecar).
 
 The pattern pairs naturally with `connect_uds_lazy`: the
 supervisor passes the UDS path to the child; the proxy holds a

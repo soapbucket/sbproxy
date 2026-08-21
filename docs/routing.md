@@ -1,5 +1,5 @@
 # Routing and traffic management
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 How SBproxy decides which upstream serves a request: hostname matching, forward rules, load balancing, protocol-specific actions, failover, and the extension point for custom selection logic. This page is the hub; [configuration.md](configuration.md) is the field-by-field source of truth for every block below.
 
@@ -77,7 +77,7 @@ Runnable: [`examples/forward-rules/`](../examples/forward-rules/), [`examples/bo
 | `ip_hash` / `uri_hash` / `header_hash` / `cookie_hash` | Sticky by client IP, path, a named header, or a named cookie. |
 | `ring_hash` | Ketama-style consistent hashing; removing one of N targets remaps roughly 1/N of keys instead of reshuffling most of them. |
 
-The `sticky:` block from older configs was removed (it never issued an affinity cookie); use `ring_hash` keyed on a cookie your application already sets instead. Zone-aware routing is not implemented: `targets[].zone` never influenced selection and is refused at config compile rather than accepted as an inert label.
+The `sticky:` block from older configs was removed (it never issued an affinity cookie); use `ring_hash` keyed on a cookie your application already sets instead.
 
 **Health, failure, and resilience signals** apply per target and compose:
 
@@ -86,6 +86,48 @@ The `sticky:` block from older configs was removed (it never issued an affinity 
 - **Outlier detection**: ejects a target whose error *rate* crosses `threshold` over a sliding `window_secs`, complementary to the breaker's consecutive-failure trigger. See [Outlier detection](configuration.md#outlier-detection); runnable at [`examples/outlier-detection/`](../examples/outlier-detection/).
 
 When every target is filtered by these signals, the load balancer falls back to the unfiltered list rather than returning 502 to the client.
+
+**Zone-aware routing:** when the proxy knows which zone it is in and targets carry `zone` labels, selection prefers same-zone targets and spills across zones only when no same-zone target is healthy. The proxy's own zone comes from `proxy.zone` in the config; when that is unset, the `SB_ZONE` environment variable fills in, which is the knob a Kubernetes deployment populates from the node's `topology.kubernetes.io/zone` label. Config wins over the environment, so a stray variable can never re-zone a proxy whose config already says where it is.
+
+```yaml
+proxy:
+  zone: us-east-1a
+
+origins:
+  "api.example.com":
+    action:
+      type: load_balancer
+      algorithm: round_robin
+      targets:
+        - url: https://replica-east.internal:8443
+          zone: us-east-1a
+        - url: https://replica-west.internal:8443
+          zone: us-west-2a
+```
+
+Locality is a narrowing stage, not a ninth algorithm. It runs after the health signals above and before the priority filter, so it only ever sees targets that are already eligible, and it composes with every algorithm, registered strategy, and deployment mode rather than replacing them:
+
+```mermaid
+flowchart TD
+    POOL["Pool after deployment-mode\nand backup filtering"] --> HEALTH["Health narrowing:\nactive probes, outlier ejection,\ncircuit breakers"]
+    HEALTH -->|"every target filtered:\nlast-resort full pool,\nlocality stands down"| PRIO
+    HEALTH --> GATE{"proxy.zone or SB_ZONE bound,\npool carries zone labels,\npool at least locality.min_pool_size?"}
+    GATE -->|no| PRIO["Priority filter\n(X-Priority header)"]
+    GATE -->|yes| SAME{"Any healthy target\nin the proxy's own zone?"}
+    SAME -->|"yes: narrow to same-zone\n(zone_locality = local)"| PRIO
+    SAME -->|"no: spill across zones\n(zone_locality = spilled)"| PRIO
+    PRIO --> SEL["Registered strategy,\nor the configured algorithm"]
+    SEL --> T["Selected target"]
+```
+
+The behavior to rely on, in order of what breaks first:
+
+- **Same-zone preference is absolute while the local zone is healthy.** Every request from a proxy in `us-east-1a` lands on a `us-east-1a` target, matching the pre-call region filtering LiteLLM documents and the `prefer_local` half of Envoy's zone-aware routing.
+- **Failover is per-request, not per-config.** The moment the last same-zone target goes unhealthy, requests spill to the other zones; the moment one recovers, traffic snaps back. There is no mode switch to flip and no blackholing when the local zone is down.
+- **A proxy with no zone identity selects exactly as before.** Zone labels without `proxy.zone` or `SB_ZONE` steer nothing (the proxy logs a warning at boot naming the missing knob), and an unlabeled pool ignores the proxy's zone. Single-zone configs are unaffected.
+- **`locality.min_pool_size`** (default 2) deactivates the stage when the pool is smaller, the same guard as Envoy's `min_cluster_size`. The pool is counted before health filtering, as Envoy counts cluster hosts, so a health flap can never toggle the stage on and off. Raise it on large fleets where pinning a small local zone would concentrate too much traffic; the default only excludes single-target pools so that a two-target, two-zone config routes locally out of the box.
+
+Every selection reports its verdict four ways. `sbproxy_lb_zone_locality_total{origin, verdict}` counts each shaped selection, so `rate(sbproxy_lb_zone_locality_total{verdict="spilled"}[5m]) > 0` is the alert expression for a spill in progress. The structured access log carries `zone_locality` per line and the admin request log carries the same field per row, both `local` or `spilled` and both absent when the stage did not engage, so an alert on the series joins to the exact requests that spilled. And `GET /api/health/targets` shows each target's zone beside the proxy's own, so an operator can see at a glance whether locality is active. Reach for the counter first: the admin ring is off by default and the matching `debug!` line is compiled out of a release build. See [access-log.md](access-log.md), [admin-api-reference.md](admin-api-reference.md), and [metrics-stability.md](metrics-stability.md). Runnable, with a forced local-zone-down drill: [`examples/multi-zone/`](../examples/multi-zone/).
 
 **Deployment patterns:** blue-green (`deployment_mode: { mode: blue_green, active: green }`, targets tagged `group: blue`/`green`) and canary (`deployment_mode: { mode: canary, weight: 10 }`, a `group: canary` subset). See [Blue-green deployments](configuration.md#blue-green-deployments) and [Canary deployments](configuration.md#canary-deployments); runnable at [`examples/load-balancer/`](../examples/load-balancer/) and [`examples/load-balancer-deployment/`](../examples/load-balancer-deployment/).
 
@@ -116,6 +158,10 @@ Field tables for each: [configuration.md#websocket](configuration.md#websocket),
 **gRPC-Web translation is unary and server-streaming only.** `grpc_web: true` buffers the whole gRPC-Web request before forwarding it, so a client-streaming or bidirectional call over gRPC-Web has no path through. Browser gRPC-Web clients cannot do client-streaming anyway, so this matches what the wire format offers.
 
 **`transcode` routes are unary only.** A REST route binds to one gRPC method and one request message. A streaming method behind a transcode route returns only its first response frame.
+
+**A path binding beats a query parameter of the same name.** A transcode route fills the request message from three places, in this order: the JSON body, then the path template's captures, then the query string. A query parameter naming a field a capture already bound is dropped, and so is one naming a parent or a child of that field, so `GET /v1/echo/allowed?message=forbidden` sends `allowed` upstream. The route matched on the path and the header-phase policies read the path, so a query parameter allowed to overwrite the resource name would hand the upstream a value nothing earlier in the request had looked at. Captured path segments are percent-decoded except for the RFC 3986 reserved characters, so `%2F` inside a single-segment capture stays encoded instead of becoming a separator the template never allowed. A request carrying more than 256 query parameters, or a dotted parameter name more than 32 levels deep, is refused.
+
+**What a query parameter does depends on the kind of field it names.** Every parameter a binding does not shadow overlays the body, with three possible outcomes. It is **read** for a `string`, for the ten integer types and the two floating-point ones, for a `bool` spelled `1`, `t`, `T`, `TRUE`, `true`, `True`, `0`, `f`, `F`, `FALSE`, `false`, or `False`, and for an enum given either a declared value name or a number. It is **refused** with a 400 when the field can hold a value and the spelling will not read into it: `?count=abc` on an `int32`, `?dry_run=yes` on a `bool`, `?status=NOPE` on an enum. A dotted key routed through a scalar, such as `?message.deeper=x` where `message` is a `string`, is refused too, since no message anywhere could have that field. It is **ignored** when there is nothing to read: a name matching no field in the request message, a `message` or `bytes` field, and an empty value such as `?count=` or a bare `?count` against anything but a `string`. The refusal is the only one of the three that changed, because it is the only one that used to reach the upstream with the field silently at its default. Two limits worth knowing: a repeated field takes the value as a single element and repeating the key overwrites rather than appends, and neither `bytes` nor a nested message can be filled from the query at all, both of which differ from grpc-gateway.
 
 **A body-reading policy turns off streaming for the whole origin.** `content_digest`, `request_validator`, `openapi_validation`, `body_threat_protection`, and body-aware `prompt_injection_v2` all need the complete request body, so the proxy holds every request chunk until the client half-closes. A unary call half-closes immediately and is unaffected. A streaming call does not: it waits for a response that cannot arrive until it stops sending, and the call stalls until the client's deadline expires. Nothing refuses this composition at config load today, and the symptom reads like an upstream fault. Attach body-reading policies to the HTTP origins that need them, not to a `grpc` origin that carries streaming methods.
 
@@ -148,6 +194,7 @@ Everything above that reacts to failure (health checks, circuit breaker, outlier
 | [`load-balancer`](../examples/load-balancer/) | Basic algorithm selection |
 | [`load-balancer-deployment`](../examples/load-balancer-deployment/) | Blue-green and canary |
 | [`active-health-checks`](../examples/active-health-checks/) | Active probes |
+| [`multi-zone`](../examples/multi-zone/) | Zone-aware routing with cross-zone spillover |
 | [`circuit-breaker`](../examples/circuit-breaker/) | Consecutive-failure isolation |
 | [`outlier-detection`](../examples/outlier-detection/) | Error-rate ejection |
 | [`service-discovery`](../examples/service-discovery/) | DNS re-resolution and IP rotation |

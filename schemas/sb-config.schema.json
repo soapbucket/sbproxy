@@ -93,7 +93,8 @@
         "tls_cert_file": null,
         "tls_key_file": null,
         "trusted_proxies": [],
-        "web_bot_auth": null
+        "web_bot_auth": null,
+        "zone": null
       },
       "allOf": [
         {
@@ -474,6 +475,14 @@
         },
         "bind_address": {
           "description": "Address the public listeners bind. Defaults to `0.0.0.0`, every interface.\n\nApplies to both [`Self::http_bind_port`] and [`Self::https_bind_port`], deliberately. Two fields would let an operator lock down HTTP, leave HTTPS on every interface, and believe the box was closed; one field cannot be half-applied.\n\nA server deployment wants the default, which is why it is the default. Set `127.0.0.1` when the proxy serves only processes on the same machine, or a specific interface address to pick one NIC. `sbproxy run` and `sbproxy service install` generate `127.0.0.1` (WOR-2199): they configure one machine for itself, and the address they print has to be the address they bound.\n\nThis is not a substitute for authentication. It limits who can reach the listener, not what they may do once they reach it.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "zone": {
+          "description": "The availability zone this proxy considers itself in, e.g. `\"us-east-1a\"` (WOR-2328).\n\nLoad balancer targets whose `targets[].zone` label matches are preferred by target selection, with per-request spillover across zones when no same-zone target is healthy. When unset, the `SB_ZONE` environment variable fills in at pipeline compile time (see [`Self::resolve_zone`]), which is how a Kubernetes deployment feeds in the node's `topology.kubernetes.io/zone` label. Config wins over the environment so a deployment that states its zone here can never be re-zoned by a stray variable. With neither set, target selection ignores zone labels entirely and warns at boot when labels are authored anyway.",
           "default": null,
           "type": [
             "string",
@@ -11137,7 +11146,7 @@
           ]
         },
         "token_exchange": {
-          "description": "Arms `EgressPurpose::TokenExchange` for the non-MCP outbound credential resolver's OAuth token-endpoint calls. The MCP token exchange path (`sbproxy_extension::mcp::auth`) has its own `egress:` block and is unaffected by this section.",
+          "description": "Arms `EgressPurpose::TokenExchange`: every OAuth token-endpoint call this proxy makes, the non-MCP outbound credential resolver's and the MCP run-as-user token exchange's (`sbproxy_extension::mcp::auth`) alike. A per-server `egress:` block gates that server's upstream connects and OpenAPI tool calls and does not reach this purpose, so this sub-block is the only way to arm a token endpoint.",
           "default": null,
           "anyOf": [
             {

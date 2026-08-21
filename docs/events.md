@@ -1,6 +1,6 @@
 # SBproxy events
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 SBproxy hands a SIEM three different things, and this page is the map of how they fit together: typed proxy events (the `events:` block, a closed set of eighteen), decision-audit records (`observability.log.decision_audit`, eighteen pipeline decisions normalized to OCSF), and four audit channels that write to their own tracing targets (`security_audit`, `config_audit`, `key_audit`, and the admin action ring). Two of those four, `security_audit` and `config_audit`, can additionally be hash-chained and Ed25519-signed for tamper evidence.
 
@@ -190,7 +190,23 @@ Headers: `X-Sbproxy-Event: proxy_events`, `X-Sbproxy-Event-Count`, `X-Sbproxy-Ti
 
 Any 2xx is success. Anything else drops the batch and counts it.
 
+### Where the batch is allowed to go
+
+The batch carries an HMAC signature over its own body, so where that body ends up is a security question rather than a routing one. Four rules decide it, and all four are enforced on every batch rather than once at boot.
+
 The URL goes through the SSRF guard at boot and again before every batch, so a collector hostname that starts resolving to a private address stops being posted to rather than becoming an internal probe.
+
+**The dial is pinned to the addresses that check resolved.** The guard resolves the hostname and the connection goes to that answer, not to a second lookup the HTTP client runs for itself. A DNS answer that changes between the check and the connect cannot steer the batch anywhere, because the connect was never going to ask again.
+
+**Redirects are not followed; they are re-authorized.** A `3xx` `Location` is put back through the same allowlist, private-address, and DNS-pinning checks the original URL passed, and only then dialed, on that hop's own pinned addresses. At most ten hops, after which the chain is refused as `too_many_redirects`, and all of them inside the one five-second budget the first request started on: a collector that stalls on every hop cannot hold the delivery thread for ten times the timeout.
+
+**A cross-origin redirect is refused outright.** Any hop that changes scheme, host, or port leaves the collector you configured. Because the batch body is the thing the signature covers, there is no version of that hop that is safe: forwarding the body hands your signed events to a host you never named, and stripping it would send an empty POST your collector cannot use. So the hop is refused and the batch is dropped. A collector that legitimately lives behind a redirect needs its real URL in `events.url`.
+
+**The collector's reply is read under a 64 KiB ceiling.** Nothing here reads the reply body, only its status, but a reply past the ceiling is refused rather than buffered.
+
+If you have armed the `egress:` block's `usage_sinks` allowlist (see [configuration.md](configuration.md#egress-allowlists)), it now gates this sink too, and your collector's host has to be on it. Until that block is set to `mode: deny_by_default`, the events collector shows up in `GET /api/egress` as `ungated`: recorded, reached, and never denied.
+
+What a refusal looks like: a `warn` on the `events` target naming the closed reason, one `sbproxy_events_dropped_total{sink="webhook",reason="egress_denied"}` per event in the dropped batch, one `sbproxy_egress_refused_total{purpose="webhook",reason=...}`, a `denied` row for the destination in `GET /api/egress`, and an `egress_refused` typed event if your `events:` block selects that type. The reason is one of a closed set (`redirect_to_unlisted_host`, `unlisted_host`, `private_address`, `dns_pin_mismatch`, `too_many_redirects`, and the rest of [the egress vocabulary](admin-api-reference.md#get-apiegress)); no surface ever carries the URL.
 
 ### Authenticating the webhook
 
@@ -230,7 +246,7 @@ There is no single schema file to point at; the convention is consistent rather 
 Two vocabularies get reused deliberately rather than invented per feature:
 
 - **The OCSF envelope**, for decision-audit. Every record is API Activity (6003) with the Security Control profile: `class_uid`, `metadata.correlation_uid` (the request id), `cloud.org.name` (tenant), `api.service.name` (the origin id, never the request `Host`), `disposition_id` / `is_alert`, and per-event structured detail under `unmapped`, OCSF's sanctioned home for attributes the class does not define. [observability.md](observability.md) and [decision-records.md](decision-records.md) have the full field-by-field reference.
-- **The OTel GenAI and error vocabulary**, for the AI request/response spans this page's events correlate with. `gen_ai.*` attributes follow the OTel GenAI semantic conventions, and a failed span sets `otel.status_code = ERROR` with `error.type` drawn from a closed set: `guardrail_blocked`, `rate_limited`, `content_filter`, `budget_exceeded`, `upstream_5xx`, `timeout`, `provider_error`. `ai.failure`'s decision-audit `verdict` field (`rate_limited`, `content_filter`, `upstream_5xx`, `provider_error`) is drawn from the same closed vocabulary on purpose, so a rule written against the span's `error.type` and a rule written against the decision-audit record agree about what a failure was.
+- **The OTel GenAI and error vocabulary**, for the AI request/response spans this page's events correlate with. `gen_ai.*` attributes follow the OTel GenAI semantic conventions, and a failed span sets `otel.status_code = ERROR` with `error.type` drawn from a closed set: `guardrail_blocked`, `rate_limited`, `content_filter`, `budget_exceeded`, `invalid_request`, `upstream_5xx`, `timeout`, `provider_error`. `ai.failure`'s decision-audit `verdict` field (`rate_limited`, `content_filter`, `upstream_5xx`, `provider_error`) is drawn from the same closed vocabulary on purpose, so a rule written against the span's `error.type` and a rule written against the decision-audit record agree about what a failure was.
 
 Standard resource attributes (`service.name`, `service.version`, `host.name`, `k8s.pod.name`, and the rest) and the `sbproxy.*` namespace (`sbproxy.request_id`, `sbproxy.tenant_id`, `sbproxy.route`) are documented in full in [observability.md](observability.md#traces).
 
@@ -306,8 +322,9 @@ Every other way an event fails to arrive lands on the same counter, so an empty 
 | `serialize_error` | The event would not encode as JSON. |
 | `write_error` | The file write or flush failed. |
 | `http_error` | The endpoint answered a non-2xx status. |
-| `delivery_failed` | The request never got an answer: connection refused, DNS failure, or the five-second timeout. |
+| `delivery_failed` | The request never got an answer: connection refused, DNS failure, the five-second timeout on the whole delivery including any redirect hops, or a reply past the 64 KiB ceiling. |
 | `ssrf_rejected` | The URL resolved to an address the SSRF guard refuses. |
+| `egress_denied` | The collector, or a host it redirected to, is not one this proxy may reach. See [Where the batch is allowed to go](#where-the-batch-is-allowed-to-go); the specific reason is on the `warn` line and on `sbproxy_egress_refused_total`. |
 
 A steady `queue_full` rate against a healthy collector usually means `types:` is too broad. `request_completed` fires once per request; `policy_denied` fires once per denial; `provider_selected`, `budget_exceeded`, and `guardrail_triggered` fire only on the verdict transitions described above, so a high rate on any of those three is itself worth looking at before you widen the queue.
 

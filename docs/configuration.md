@@ -337,9 +337,9 @@ egress:
 | Sub-block | Purpose(s) armed | Gates |
 |---|---|---|
 | `ai_providers` | `ai_provider` | Every upstream AI provider dispatch the AI gateway client makes. |
-| `usage_sinks` | `usage_sink`, `webhook` | Langfuse, Datadog, and object-store usage-sink deliveries (`usage_sink`), plus webhook usage-sink deliveries (`webhook`, a separate purpose the same sub-block arms with one allowlist). |
+| `usage_sinks` | `usage_sink`, `webhook` | Langfuse, Datadog, and object-store usage-sink deliveries (`usage_sink`), plus webhook usage-sink deliveries and the `events:` webhook sink (`webhook`, a separate purpose the same sub-block arms with one allowlist). |
 | `model_artifacts` | `model_artifact` | The model-host artifact fetcher's HTTP downloads. |
-| `token_exchange` | `token_exchange` | The non-MCP outbound-credential resolver's OAuth token-endpoint calls. The MCP token-exchange path has its own per-server `egress:` block (see [mcp-security.md](mcp-security.md)) and is unaffected by this section. |
+| `token_exchange` | `token_exchange` | Every OAuth token-endpoint call this proxy makes: the non-MCP outbound-credential resolver's, and the MCP run-as-user token exchange's. A per-server `egress:` block gates that server's upstream connects and OpenAPI tool calls; it does not reach this purpose, so this sub-block is the only way to arm a token endpoint. |
 | `telemetry` | `telemetry` | The OTLP trace, metric, and log exporter endpoints. Authorized once at boot, where each exporter is constructed; a denied endpoint refuses boot with a fatal error naming it. A config reload re-verifies the still-running trace and metric exporters against the new allowlist and refuses the reload, naming the endpoint, if either is now denied; the log exporter is rebuilt on every reload and re-authorizes itself then. |
 
 Each sub-block accepts `mode` (`deny_by_default` or `allow_by_default`,
@@ -410,6 +410,7 @@ proxy:
 | `config_history` | object | unset | Durable local ring of every applied config revision, kept for inspection and future rollback. Disabled by default. See [config_history](#config_history). |
 | `response_cache_store` | object | unset | Picks the backing store for the shared response cache and optionally encrypts entries at rest. See [Choosing the backing store](#choosing-the-backing-store). When unset, the store is Redis if `l2_cache_settings` is configured and an in-process map otherwise. |
 | `messenger_settings` | object | | Not supported. Setting it fails config load. See [messenger_settings](#messenger_settings). |
+| `zone` | string | unset | The availability zone this proxy considers itself in, e.g. `us-east-1a`. Load balancer targets labeled with a matching `targets[].zone` are preferred; see [Zone-aware routing](routing.md#distributing-traffic-the-load-balancer-action). When unset, the `SB_ZONE` environment variable fills in (config wins). Unset both and selection ignores zone labels entirely. |
 | `trusted_proxies` | array of CIDR strings | `[]` | Source ranges whose inbound `X-Forwarded-For` / `X-Real-IP` / `Forwarded` headers are honored. Connections from outside the list have those headers stripped on ingress so they cannot spoof identity. IPv6 CIDRs work. See [Trusted proxies and forwarding headers](#trusted-proxies-and-forwarding-headers). |
 | `correlation_id` | object | enabled, `X-Request-Id`, echo on | Correlation-ID propagation policy. See [Correlation ID](#correlation-id). |
 | `mtls` | object | unset | mTLS client-certificate verification on the HTTPS listener. See [mTLS client authentication](#mtls-client-authentication). |
@@ -1446,6 +1447,7 @@ origins:
 | `lb_method` | string | unset | Compatibility marker for plugin routing. `plugin` requires `strategy`; `algorithm` remains the fallback. |
 | `deployment_mode` | object | `{mode: normal}` | Deployment mode. See below. |
 | `outlier_detection` | object | unset | Passive ejection policy. See [Outlier detection](#outlier-detection). |
+| `locality` | object | `{min_pool_size: 2}` | Zone-locality tuning. `min_pool_size` deactivates the same-zone preference when the deployment-filtered pool is smaller than this. The pool is counted before health filtering, as Envoy counts cluster hosts for `min_cluster_size`, so a health flap can never toggle the stage on and off. The stage itself needs no block, only `proxy.zone` (or `SB_ZONE`) plus `targets[].zone` labels. See [Zone-aware routing](routing.md#distributing-traffic-the-load-balancer-action). |
 
 Algorithms:
 
@@ -1478,7 +1480,7 @@ origins:
 
 The `sticky:` block was removed. It parsed (`cookie_name`, `ttl`) and did nothing: no affinity cookie was ever issued. A config that still sets it fails to compile with an error naming the replacement. For cookie-based session affinity, use `ring_hash` keyed on the cookie your application already issues, as above.
 
-The `targets[].zone` label was removed the same way. Target selection is not locality aware and never read the label, so zoned targets still received traffic from every zone; a config that sets it fails to compile. Zone-aware routing is not implemented. To tell replicas apart, use `metadata:`, which promises nothing about selection.
+The `targets[].zone` label routes. When the proxy knows its own zone (`proxy.zone`, or `SB_ZONE` when that is unset), selection prefers same-zone targets and spills across zones only when no same-zone target is healthy; a proxy with no zone identity ignores the labels and warns at boot. The label went through a removal on the way here: it originally parsed as display-only decoration, was refused at config compile once that became clear, and was re-introduced together with the enforcement. See [Zone-aware routing](routing.md#distributing-traffic-the-load-balancer-action) for the semantics and [`examples/multi-zone/`](../examples/multi-zone/) for a runnable drill.
 
 When `strategy` is set, deployment, backup, priority, health, circuit-breaker, and outlier filters run first. The registered strategy receives only eligible targets. Returning no selection falls through to `algorithm`.
 
@@ -1495,6 +1497,7 @@ Target fields:
 | `backup` | bool | false | Reserved for fallback. Excluded from normal selection. |
 | `group` | string | | Deployment group label (`blue`, `green`, `canary`). |
 | `priority` | int | 5 | Routing priority (1 = highest, 10 = lowest). Read from `X-Priority` header when not set here. |
+| `zone` | string | unset | Availability zone label, e.g. `us-east-1a`. When the proxy's own zone (`proxy.zone` or `SB_ZONE`) matches, this target is preferred; when no same-zone target is healthy, requests spill across zones. Ignored, with a boot warning, when the proxy has no zone identity. |
 | `metadata` | object | `{}` | Strategy-specific JSON signals such as `loaded_adapters` or `gpu_utilization`. Limited to 64 entries per target and 64 bytes per key. |
 | `health_check` | object | | Active health-check probe config. See [Active health checks](#active-health-checks). |
 | `host_override` | string | unset | Override the upstream `Host` for this target. Default is the target URL's hostname. |
@@ -1604,23 +1607,26 @@ origins:
 |-------|------|---------|-------------|
 | `providers` | list | required | Configured upstream AI providers. |
 | `routing` | string \| object | `round_robin` | Routing strategy. Either a flat string or `{strategy: ..., ...}`. |
+| `context_window_fallbacks` | list | empty (trigger off) | Provider names to reroute to when a prompt overflows the model's context window. Names must match `providers[].name`. See [Typed fallback triggers](ai-llm-aware-resilience.md#typed-fallback-triggers). |
+| `content_policy_fallbacks` | list | empty (trigger off) | Provider names to reroute to when a provider refuses on content-policy grounds. Names must match `providers[].name`. See [Typed fallback triggers](ai-llm-aware-resilience.md#typed-fallback-triggers). |
+| `max_price_per_request` | number | unset (gate off) | Hard per-request price ceiling in USD. Each routing candidate on a token-priced chat surface (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`) is priced before selection; candidates over the ceiling are dropped, and a fully excluded set refuses with `402`. Must be positive when set; a value at or below zero is refused at config load. The `x-sbproxy-max-price` request header tightens the ceiling for one request but can never raise it, and sending that header to a surface the estimate does not model returns `400`. See [Per-request price ceiling](ai-gateway.md#per-request-price-ceiling). |
 | `allowed_models` | list | empty (allow all) | Allow-list of model names. |
 | `blocked_models` | list | | Block-list of model names. Takes precedence over allow-list. |
 | `data_posture` | object | unset | Data-handling posture requirement: `require_zdr` (default `false`) and `allow_data_collection` (default `true`). A hard provider-eligibility filter applied before any routing strategy runs, composed with the per-request `x-sbproxy-require-zdr` / `x-sbproxy-disallow-data-collection` headers (most restrictive wins). A request left with no eligible provider fails closed naming the constraint and the excluded providers; a block that excludes every configured provider is refused at config load. See [ai-gateway.md](ai-gateway.md#provider-data-posture). |
-| `max_body_size` | int | | Maximum request body size in bytes. |
+| `max_body_size` | int | `67108864` (64 MiB) | Maximum request body size in bytes the gateway accepts, checked while the body arrives rather than once it is buffered. An oversize declared `Content-Length` is refused before the first read, and a chunked upload that declares nothing is refused on the chunk that crosses the cap. Either way the answer is `413` and no provider is contacted, so nothing reaches the response cache or the idempotency store. The same number bounds the buffered upstream response. Unset means 64 MiB rather than unlimited, `0` reads as unset, and values above 1 GiB are clamped to 1 GiB. |
 | `guardrails` | object | | Input/output guardrails pipeline. |
 | `budget` | object | | Budget enforcement configuration. |
 | `model_rate_limits` | map | | Per-model rate limit overrides keyed by model name. |
 | `per_surface_rate_limits` | map | | Per-surface rate limit overrides keyed by AI surface label (`chat_completions`, `assistants`, `image_generation`, ...). |
 | `max_concurrent` | map | | Maximum concurrent in-flight requests per provider. |
-| `resilience` | object | | Per-provider circuit breaker, outlier detection, and active health probes. Also hosts the LLM-aware knobs (`retry_policy`, `llm_aware`, `content_policy_fallback`); see [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md). |
+| `resilience` | object | | Per-provider circuit breaker, outlier detection, and active health probes. Also hosts the LLM-aware knobs (`retry_policy`, `cooldown_policy`, `llm_aware`, `content_policy_fallback`); see [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md). |
 | `compression` | object | unset | Ordered AI context-compression policy. See [AI context compression](#ai-context-compression) and [ai-context-compression.md](ai-context-compression.md). |
 | `reasoning` | string or object | `off` | Route policy for concise reasoning. Use `concise`, `off`, or `{budget: N}` with `N` greater than zero. |
 | `shadow` | object | | Side-by-side eval: mirror each request to a second provider and log metrics. |
 | `ai_policy` | object | | One sandboxed CEL expression over the AI decision pipeline (`expression`, `on_error`). See [ai-policy-cel.md](ai-policy-cel.md). |
 | `usage_sinks` | list | `[]` | Destinations for completed-call usage records. The `ledger` sink (`path`, optional `signing_seed_hex`) writes a hash-chained, signable record. See [ai-usage-ledger.md](ai-usage-ledger.md). |
 
-Routing strategies: `round_robin`, `weighted`, `fallback_chain`, `random`, `lowest_latency`, `least_connections`, `cost_optimized`, `least_token_usage`, `prefix_affinity`, `peak_ewma`, `sticky`, `race`, `cascade`, `cost_quality`, `outcome_aware`. See [ai-gateway.md](ai-gateway.md#routing-strategies) for each; `outcome_aware` has its own page in [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md). `token_rate` is refused at config load: it scores headroom against a per-provider token limit that no field declares, which makes it `least_token_usage` under another name. See [ai-gateway.md#token_rate-refused](ai-gateway.md#token_rate-refused).
+Routing strategies: `round_robin`, `weighted`, `fallback_chain`, `random`, `lowest_latency`, `least_connections`, `cost_optimized`, `least_token_usage`, `prefix_affinity`, `peak_ewma`, `sticky`, `race`, `headroom`, `reset_aware`, `cascade`, `cost_quality`, `outcome_aware`, `semantic_route`. See [ai-gateway.md](ai-gateway.md#routing-strategies) for each; `outcome_aware` has its own page in [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md). `cascade`, `cost_quality`, and `semantic_route` carry required settings, so each needs the object form; `semantic_route` written as a flat string is refused with an error naming the `routes:` and embedding-source keys it needs, and its exemplars are capped at config load: 64 routes, 64 exemplars per route, and 256 exemplar texts across every route combined, since each one is an embedding call on the request that builds the index. `token_rate` is refused at config load: it scores headroom against a per-provider token limit that no field declares, which makes it `least_token_usage` under another name. See [ai-gateway.md#token_rate-refused](ai-gateway.md#token_rate-refused).
 
 Peak EWMA accepts the object form:
 
@@ -2121,9 +2127,9 @@ resilience:
     healthy_threshold: 2
 ```
 
-When `resilience` is set, retries fan across providers up to `min(providers.len(), 5)` attempts; ejected providers are skipped on the second and later attempts.
+`resilience` on its own does not add an attempt. A second attempt needs a routing plan that has somewhere to go: `routing.strategy: fallback_chain`, `resilience.content_policy_fallback: true`, or a typed fallback list. With one of those, the dispatch loop visits each configured provider at most once, so the attempt ceiling is the provider count and no separate key raises it. Circuit-broken, ejected, and cooling-down providers are skipped on the second and later attempts.
 
-The block also accepts the LLM-aware keys: `retry_policy` (per-failure-class retry counts, e.g. `rate_limit: 3`), `llm_aware.context_compress` plus `llm_aware.completion_reserve_tokens` (fit an over-long prompt to the model's window before dispatch), and `content_policy_fallback` (route a content-policy refusal to the next provider in priority order). Semantics and the failure-cause table are in [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md).
+The block also accepts the LLM-aware keys: `retry_policy` (per-failure-class retry counts, e.g. `rate_limit: 3`), `cooldown_policy` (per-failure-class provider cooldown seconds), `llm_aware.context_compress` plus `llm_aware.completion_reserve_tokens` (fit an over-long prompt to the model's window before dispatch), and `content_policy_fallback` (route a content-policy refusal to the next provider in priority order). The typed reroute lists, `context_window_fallbacks` and `content_policy_fallbacks`, are siblings of `routing:` on the action rather than resilience keys. Semantics and the failure-cause table are in [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md).
 
 #### Shadow (`shadow`)
 
@@ -2318,6 +2324,34 @@ The `authentication` block is a sibling of `action`, not nested inside it. It co
 
 Anything else falls through to the inventory-based auth plugin registry, so a linked third-party crate can register additional types (`oauth`, `oauth_introspection`, `oauth_client_credentials`, `ext_authz`, `biscuit`, `saml`, ...) without patching the proxy. Plugins register on the typed `AuthPluginRegistration` channel and surface through the standard `authentication.type` config field.
 
+### Unknown keys are refused
+
+Every one of the eleven configurable built-in providers refuses a key it
+does not recognize, at `serve`, `validate`, and hot reload. The error names
+the key you wrote and lists the ones the provider accepts:
+
+```
+unknown field `require_dp0p`, expected `tokens` or `require_dpop`
+```
+
+This closes a fail-open. Until it landed, an unrecognized key was dropped
+silently and the setting it was meant to be took its default, so
+`require_dp0p: true` on a bearer block served every request with DPoP
+proof-of-possession off while the config read as though it were on. The
+same held for `require_mtls_bound` on `jwt`, and for every other optional
+switch on every other provider.
+
+Two things stay open on purpose. `noop` has no configuration to check, so a
+stray key on a `noop` block is still accepted. And the per-credential
+entries inside `api_keys:`, `tokens:`, `users:`, and `hmac_auth`'s `keys:`
+stay permissive, because each one flattens the free-form attribution
+metadata (`project`, `team`, `tags`, ...) into the same mapping and there is
+no way to tell an unknown key from an intended one there.
+
+Upgrading: a config that carried a stray key inside an `authentication`
+block used to boot and now fails to compile. See
+[config-stability.md](config-stability.md#unknown-keys-inside-an-authentication-block).
+
 ### Accepting more than one provider
 
 `authentication` also takes a list of two or more provider blocks. Providers run in declared order and the first one that accepts the request wins. This is the shape of a credential migration (keep accepting legacy API keys while callers move to JWTs on the same origin) and of mixed-client origins (services present tokens, crawlers present signatures).
@@ -2437,6 +2471,10 @@ origins:
 | `tokens` | list | required | Accepted bearer tokens (each entry is either the raw secret or `{secret, dpop_jkt, ...}`) |
 | `require_dpop` | bool | `false` | When `true`, every accepted token MUST come with a valid RFC 9449 DPoP proof whose `jkt` matches the token entry's `dpop_jkt` metadata. Tokens without `dpop_jkt` metadata fail closed. |
 
+Any other key on a `bearer` block is rejected at config load. Misspelling
+`require_dpop` used to leave DPoP off silently; see
+[Unknown keys are refused](#unknown-keys-are-refused).
+
 #### Sender-constrained Bearer (RFC 9449)
 
 DPoP binds an opaque bearer token to a proof-of-possession key
@@ -2495,6 +2533,10 @@ origins:
 | `jwe.decryption_key` | string | | PEM private key for decrypting JWE (RFC 7516) encrypted tokens before the usual signature checks. See "Encrypted tokens" below. |
 
 The list must contain at least one entry; an empty list rejects all tokens. Bearer tokens must be supplied via `Authorization: Bearer <jwt>`.
+
+Any other key on a `jwt` block is rejected at config load. Misspelling
+`require_dpop` or `require_mtls_bound` used to leave that binding off
+silently; see [Unknown keys are refused](#unknown-keys-are-refused).
 
 #### Sender-constrained JWT (RFC 9449 + RFC 8705)
 
@@ -3398,7 +3440,7 @@ policies:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `max_body_size` | int | unset | Maximum request body size in bytes. |
+| `max_body_size` | int | unset | Maximum request body size in bytes. Checked against a declared `Content-Length` in the request phase and against the running total as chunks arrive, so a chunked upload that declares nothing is caught too. It also bounds what a linked Rust action plugin buffers before it runs: that action answers from the request phase and returns, so it never reaches the streaming check and applies this cap itself. Left unset it still buffers no more than 64 MiB, and a value above 1 GiB is clamped there. A proxied request has no body cap without this field. `type: ai_proxy` has the same problem and its own key, [`max_body_size` on the action](#ai_proxy), which is the one it reads. |
 | `max_header_count` | int | unset | Maximum number of request headers. Alias: `max_headers_count`. |
 | `max_header_size` | int or string | unset | Maximum size of a single header value. Strings like `"4KB"` or `"1MB"` are accepted. |
 | `max_url_length` | int | unset | Maximum URL length in characters. |

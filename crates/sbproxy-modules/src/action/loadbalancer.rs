@@ -5,8 +5,11 @@
 //! ketama-style ring hash (consistent hashing).
 //! Backup targets are excluded from normal selection and reserved for fallback.
 //!
-//! Also supports blue-green and canary deployment modes, and priority-based
-//! routing via the `X-Priority` request header.
+//! Also supports blue-green and canary deployment modes, priority-based
+//! routing via the `X-Priority` request header, and zone-aware locality
+//! (WOR-2328): when the proxy knows its own zone, selection prefers
+//! same-zone targets and spills across zones only when no same-zone
+//! target is healthy.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -82,6 +85,19 @@ pub struct LoadBalancerAction {
     /// Consistent-hash ring, built once at config compile time.
     /// `Some` exactly when `algorithm` is [`Algorithm::RingHash`].
     ring: Option<HashRing>,
+    /// The zone this proxy considers itself in, bound once by the
+    /// pipeline after compilation (`proxy.zone`, falling back to the
+    /// `SB_ZONE` environment variable). Unset means the zone-locality
+    /// stage never engages, so a proxy with no zone identity selects
+    /// exactly as it did before WOR-2328.
+    local_zone: std::sync::OnceLock<String>,
+    /// `true` when at least one configured target carries a `zone`
+    /// label. Precomputed so the per-request locality stage does not
+    /// rescan an unlabeled pool.
+    zoned_targets: bool,
+    /// Minimum eligible-target count for the locality stage; see
+    /// [`LocalityConfig::min_pool_size`].
+    locality_min_pool_size: usize,
     state: LoadBalancerState,
 }
 
@@ -98,6 +114,35 @@ pub struct TargetSelection {
     pub target_index: usize,
     /// Registered strategy name or built-in algorithm name.
     pub selection_method: String,
+    /// How the zone-locality stage shaped this selection. `None` when
+    /// the stage did not engage (no proxy zone, no zoned targets, pool
+    /// below `locality.min_pool_size`, or every target already
+    /// filtered out by health signals).
+    pub zone_locality: Option<ZoneLocality>,
+}
+
+/// Per-selection verdict of the zone-locality stage (WOR-2328).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZoneLocality {
+    /// Selection was narrowed to targets in the proxy's own zone.
+    Local,
+    /// No same-zone target was healthy, so selection spilled across
+    /// every eligible target regardless of zone.
+    Spilled,
+}
+
+impl ZoneLocality {
+    /// Stable lowercase label for logs, the admin request ring, the
+    /// access log's `zone_locality` field, and the `verdict` label on
+    /// `sbproxy_lb_zone_locality_total`. All four carry the same two
+    /// strings, so an operator can join a spilled log line to the
+    /// series that alerted.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ZoneLocality::Local => "local",
+            ZoneLocality::Spilled => "spilled",
+        }
+    }
 }
 
 impl std::fmt::Debug for LoadBalancerAction {
@@ -113,6 +158,9 @@ impl std::fmt::Debug for LoadBalancerAction {
             )
             .field("retry", &self.retry.is_some())
             .field("strategy", &self.strategy_name)
+            .field("local_zone", &self.local_zone.get())
+            .field("zoned_targets", &self.zoned_targets)
+            .field("locality_min_pool_size", &self.locality_min_pool_size)
             .field("state", &self.state)
             .finish()
     }
@@ -228,6 +276,37 @@ pub struct OutlierDetectionConfig {
     pub ejection_duration_secs: Option<u64>,
 }
 
+/// Zone-locality tuning accepted under the `locality:` key on a
+/// load_balancer action (WOR-2328).
+///
+/// The zone-locality stage itself needs no block to run: it engages
+/// whenever the proxy knows its own zone (`proxy.zone`, or `SB_ZONE`
+/// when that is unset) and at least one target carries a `zone` label.
+/// This block only tunes it.
+#[derive(Debug, Deserialize)]
+pub struct LocalityConfig {
+    /// Minimum pool size required before the zone-locality stage
+    /// narrows selection, counted over the deployment-filtered pool
+    /// before health filtering (as Envoy counts cluster hosts) so a
+    /// health flap cannot toggle the stage. Below it, selection
+    /// spreads across every eligible target as if no zone were set.
+    ///
+    /// Envoy's zone-aware routing carries the same deactivation guard
+    /// as `min_cluster_size` (default 6 there) so a small local zone
+    /// cannot absorb a large fleet's traffic. The default here is 2,
+    /// not 6, because this stage is a hard per-proxy preference rather
+    /// than Envoy's fleet-wide percentage balancing, and a deactivating
+    /// default would make the common two-target, two-zone config
+    /// silently non-local, which is the exact trap WOR-2328 exists to
+    /// remove. Values below 2 disable the guard entirely.
+    #[serde(default = "default_locality_min_pool_size")]
+    pub min_pool_size: usize,
+}
+
+fn default_locality_min_pool_size() -> usize {
+    2
+}
+
 /// A single upstream target.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Target {
@@ -246,15 +325,22 @@ pub struct Target {
     /// Read from `X-Priority` header when not set here; defaults to 5.
     #[serde(default = "default_priority")]
     pub priority: u8,
-    // WOR-2246 pinned `zone` here as a display label and not a routing
-    // input; WOR-2498 removed it. Operators coming from Envoy/Nginx
-    // zone-aware balancing read `zone:` as locality routing, which
-    // `select_target_for_request` never implemented, and a label whose
-    // name promises routing is a foot-gun rather than a convenience.
-    // Unknown keys under `action:` are not rejected, so
-    // `from_config_for_origin` refuses an authored `zone:` explicitly,
-    // the same way it refuses `sticky:`. Tell replicas apart with
-    // `metadata:` entries, which promise nothing about selection.
+    /// Availability zone or region label, e.g. `"us-east-1a"`.
+    ///
+    /// A routing input since WOR-2328: when the proxy knows its own
+    /// zone (`proxy.zone`, or the `SB_ZONE` environment variable as a
+    /// fallback), selection prefers targets whose `zone` matches it and
+    /// widens to every eligible target only when no same-zone target is
+    /// healthy. A proxy with no zone identity ignores the label, so a
+    /// config that sets it without `proxy.zone` behaves exactly as an
+    /// unzoned one (and says so in a boot warning).
+    ///
+    /// History: WOR-2246 pinned `zone` as a display label, WOR-2498
+    /// removed it and refused an authored `zone:` at config compile
+    /// because a label whose name promises routing must route, and
+    /// WOR-2328 re-introduced it with the enforcement attached.
+    #[serde(default)]
+    pub zone: Option<String>,
     /// Active health-check configuration for this target. When set,
     /// the proxy probes the target on a background timer and ejects it
     /// from selection on consecutive probe failures. See
@@ -410,6 +496,10 @@ struct LoadBalancerConfig {
     /// Sliding-window failure-rate ejection.
     #[serde(default)]
     outlier_detection: Option<OutlierDetectionConfig>,
+    /// Zone-locality tuning. The stage runs without the block; see
+    /// [`LocalityConfig`].
+    #[serde(default)]
+    locality: Option<LocalityConfig>,
     /// Per-target circuit breakers.
     #[serde(default)]
     circuit_breaker: Option<CircuitBreakerConfig>,
@@ -508,26 +598,13 @@ impl LoadBalancerAction {
              modulus algorithms also remain available."
         );
 
-        // WOR-2498: `targets[].zone` parsed as a display label and
-        // steered nothing, which read as zone-aware routing to anyone
-        // arriving from a balancer that has it. Refused for the same
-        // reason `sticky:` is: unknown keys under `action:` are not
-        // rejected, so deleting the field alone would demote the
-        // documented limitation to silence.
-        let zone_authored = value
-            .get("targets")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|targets| targets.iter().any(|target| target.get("zone").is_some()));
-        anyhow::ensure!(
-            !zone_authored,
-            "load_balancer `targets[].zone` was removed: target selection is not locality \
-             aware and never consulted the label, so zoned targets still received traffic \
-             from every zone. Remove the key; to tell replicas apart, use `metadata:`. The \
-             selection algorithms that ship are `round_robin`, `weighted_random`, \
-             `least_connections`, `ip_hash`, `uri_hash`, `header_hash`, `cookie_hash`, and \
-             `ring_hash`; see docs/routing.md."
-        );
-
+        // `targets[].zone` was refused here between WOR-2498 and
+        // WOR-2328: it parsed as a display label and steered nothing,
+        // and a key whose name promises locality routing must not sit
+        // inert. The refusal is gone because the promise is now kept:
+        // `select_target_for_request` runs a zone-locality stage that
+        // prefers same-zone targets and spills across zones when the
+        // local zone has no healthy target.
         let config: LoadBalancerConfig = serde_json::from_value(value)?;
         anyhow::ensure!(
             !config.targets.is_empty(),
@@ -626,6 +703,12 @@ impl LoadBalancerAction {
         let ring = matches!(config.algorithm, Algorithm::RingHash { .. })
             .then(|| HashRing::build(&config.targets));
 
+        let zoned_targets = config.targets.iter().any(|target| target.zone.is_some());
+        let locality_min_pool_size = config
+            .locality
+            .map(|locality| locality.min_pool_size)
+            .unwrap_or_else(default_locality_min_pool_size);
+
         Ok(Self {
             targets: config.targets,
             algorithm: config.algorithm,
@@ -636,6 +719,9 @@ impl LoadBalancerAction {
             strategy_name,
             strategy,
             ring,
+            local_zone: std::sync::OnceLock::new(),
+            zoned_targets,
+            locality_min_pool_size,
             state: LoadBalancerState {
                 round_robin_counter: AtomicU64::new(0),
                 connections: (0..num_targets).map(|_| AtomicU32::new(0)).collect(),
@@ -669,6 +755,42 @@ impl LoadBalancerAction {
             .get(target_index)
             .map(ArcSwap::load_full)
     }
+
+    /// Bind the zone this proxy considers itself in (WOR-2328).
+    ///
+    /// Called once per compiled pipeline, after action compilation,
+    /// with the value `proxy.zone` resolves to (config first, then the
+    /// `SB_ZONE` environment variable). Empty and whitespace-only
+    /// values are ignored, and only the first non-empty bind sticks;
+    /// a config reload builds a new action and binds it fresh.
+    pub fn bind_local_zone(&self, zone: &str) {
+        let zone = zone.trim();
+        if zone.is_empty() {
+            return;
+        }
+        let _ = self.local_zone.set(zone.to_string());
+    }
+
+    /// The zone this proxy considers itself in, when one is bound.
+    pub fn local_zone(&self) -> Option<&str> {
+        self.local_zone.get().map(String::as_str)
+    }
+
+    /// `true` when at least one configured target carries a `zone` label.
+    pub fn has_zoned_targets(&self) -> bool {
+        self.zoned_targets
+    }
+
+    // There was a `pub fn locality_min_pool_size()` accessor here.
+    // Nothing outside this file's tests ever called it: production
+    // reads `self.locality_min_pool_size` directly at the one call
+    // site in `select_target_for_request`. The pub-item ratchet is
+    // blind to a same-file test consumer, so it shipped as public API
+    // surface promising a capability no caller had. The two tests read
+    // the field, which they can do from a child module.
+    //
+    // `has_zoned_targets()` and `local_zone()` above stay: both have
+    // production callers in `sbproxy-core`'s boot path.
 
     /// Returns `true` when the breaker for the target at `idx` would
     /// allow a new request right now (Closed or HalfOpen). Returns
@@ -846,10 +968,10 @@ impl LoadBalancerAction {
 
     /// Select a target through the configured strategy, then the algorithm.
     ///
-    /// Deployment, backup, priority, health, breaker, and outlier filters
-    /// run before the strategy projection. A strategy can therefore choose
-    /// only from the same final eligible slice used by the fallback
-    /// algorithm.
+    /// Deployment, backup, health, breaker, outlier, zone-locality, and
+    /// priority filters run before the strategy projection, in that
+    /// order. A strategy can therefore choose only from the same final
+    /// eligible slice used by the fallback algorithm.
     pub fn select_target_for_request(
         &self,
         mut request: RoutingRequest,
@@ -958,6 +1080,14 @@ impl LoadBalancerAction {
             }
         };
 
+        // The zone-locality guard below counts the deployment-filtered
+        // pool before health filtering, matching Envoy's
+        // `min_cluster_size` (cluster hosts, not the healthy subset).
+        // Counting after would deactivate locality exactly when a
+        // health flap shrinks the pool, which is when the spill
+        // verdict matters most.
+        let deployment_pool_size = active_targets.len();
+
         // Filter out targets the outlier detector has ejected. Fall
         // back to the unfiltered list when every active target is
         // ejected (better to send traffic to a flaky upstream than to
@@ -976,6 +1106,23 @@ impl LoadBalancerAction {
         };
 
         anyhow::ensure!(!active_targets.is_empty(), "no active targets available");
+
+        // --- Zone-locality filter (WOR-2328) ---
+        // Fourth narrowing stage: prefer targets in the proxy's own
+        // zone, spill across zones when none is left. Running after
+        // the health filters makes "healthy same-zone" literal and
+        // cross-zone failover per-request rather than a mode switch,
+        // and it stands down entirely in the all-ejected last-resort
+        // case above, the same reason Envoy disables zone-aware
+        // routing in panic mode.
+        let (active_targets, zone_locality) = locality_filter(
+            self.local_zone(),
+            self.zoned_targets,
+            self.locality_min_pool_size,
+            deployment_pool_size,
+            has_strictly_eligible_targets,
+            active_targets,
+        );
 
         // --- Priority-based pre-filtering ---
         // If an X-Priority header is present, sort targets by their priority field
@@ -1065,6 +1212,7 @@ impl LoadBalancerAction {
             tls,
             target_index: idx,
             selection_method,
+            zone_locality,
         })
     }
 
@@ -1285,16 +1433,71 @@ async fn run_health_probe_loop(
     }
 }
 
-// WOR-2246: `LocalityConfig` and `locality_filter` lived here and were
-// reached only by their own tests. No config key ever deserialized a
-// `LocalityConfig` (there is no `local_zone` leaf in the schema), and
-// `select_target_for_request` never called the filter, so the pair
-// existed solely to make `targets[].zone` look like a routing input.
-// Deleted rather than wired: zone-aware routing is a feature nobody has
-// asked for, and leaving a plausible-looking helper in the module is how
-// the docs came to promise locality routing in the first place. The
-// `zone` label itself followed under WOR-2498: it is refused at config
-// compile in `from_config_for_origin` rather than accepted as inert.
+// History of the locality names in this module: WOR-2246 deleted an
+// earlier `LocalityConfig` + `locality_filter` pair that was reached
+// only by its own tests and made `targets[].zone` look like a routing
+// input, and WOR-2498 then refused the label itself at config compile
+// rather than letting it sit inert. WOR-2328 brought both names back
+// wired for real: `LocalityConfig` deserializes from the `locality:`
+// key and `locality_filter` (below) runs on every
+// `select_target_for_request` call between the health filters and the
+// priority filter.
+
+/// Narrow `candidates` to the proxy's own zone (WOR-2328).
+///
+/// Returns the (possibly narrowed) candidate set plus the verdict the
+/// selection reports outward. The stage stands down, returning the
+/// set untouched and no verdict, when any precondition is missing:
+/// no bound proxy zone, an unlabeled pool, a deployment-filtered pool
+/// smaller than `locality.min_pool_size` (Envoy's `min_cluster_size`
+/// guard; `pool_size` is counted before health filtering, as Envoy
+/// counts cluster hosts, so a health flap cannot toggle the stage), or
+/// the all-ejected last-resort case where the health stage already
+/// fell back to the full pool (`strictly_eligible == false`, Envoy's
+/// panic mode). With the preconditions met it keeps the same-zone
+/// candidates when at least one exists ([`ZoneLocality::Local`]) and
+/// otherwise spills across every candidate ([`ZoneLocality::Spilled`]),
+/// which is what makes cross-zone failover per-request instead of a
+/// special case. An unlabeled target in a labeled pool is a different
+/// locality, matching Envoy's endpoint-locality model: only an exact
+/// zone match is local.
+///
+/// A free function rather than a method so the build-time
+/// config-reader guard sees the `Target::zone` read (the guard proves
+/// a key through field access and cannot see into inherent impls; see
+/// `sbproxy-capability`'s `config_scan`). It does not cover
+/// `locality.min_pool_size`: that arrives here as a plain `usize`
+/// parameter, so `pool_size < min_pool_size` is an identifier
+/// comparison the scanner never sees as a field read. The key is
+/// covered by the `stable("origins.*.action.locality.min_pool_size",
+/// ...)` override in `sbproxy-config`'s `key_registry`, which is
+/// load-bearing and must not be deleted on the strength of this
+/// signature.
+fn locality_filter<'t>(
+    local_zone: Option<&str>,
+    pool_is_zoned: bool,
+    min_pool_size: usize,
+    pool_size: usize,
+    strictly_eligible: bool,
+    candidates: Vec<(usize, &'t Target)>,
+) -> (Vec<(usize, &'t Target)>, Option<ZoneLocality>) {
+    let Some(local_zone) = local_zone else {
+        return (candidates, None);
+    };
+    if !pool_is_zoned || !strictly_eligible || pool_size < min_pool_size {
+        return (candidates, None);
+    }
+    let same_zone: Vec<(usize, &'t Target)> = candidates
+        .iter()
+        .filter(|(_, target)| target.zone.as_deref() == Some(local_zone))
+        .cloned()
+        .collect();
+    if same_zone.is_empty() {
+        (candidates, Some(ZoneLocality::Spilled))
+    } else {
+        (same_zone, Some(ZoneLocality::Local))
+    }
+}
 
 // --- Consistent-hash ring (ring_hash) ---
 
@@ -1857,48 +2060,299 @@ mod tests {
         assert_eq!(lb.targets.len(), 1);
     }
 
-    // --- targets[].zone is removed and refused (WOR-2328 / WOR-2498) ---
+    // --- Zone-locality stage (WOR-2328) ---
     //
-    // WOR-2246 pinned `zone` as a display label; WOR-2498 removed it.
-    // Operators coming from zone-aware balancers read the key as
-    // locality routing, which the selection path never implemented, so
-    // the field now fails config compilation the same way `sticky:`
-    // does rather than sitting inert behind a boot warning.
+    // WOR-2246 pinned `zone` as a display label, and WOR-2498 refused
+    // an authored `zone:` at config compile because the label steered
+    // nothing. WOR-2328 re-introduced the field together with the
+    // enforcement: selection prefers same-zone targets and spills
+    // across zones when no same-zone target is healthy. These tests
+    // pin the enforcement; `zone_on_a_target_compiles_and_routes`
+    // replaces the old refusal test
+    // (`zone_on_a_target_is_refused_at_config_compile`) with the
+    // positive claim.
+
+    /// Select through the request projection so the assertion can see
+    /// the per-selection `zone_locality` verdict.
+    fn select_from(lb: &LoadBalancerAction, client_ip: &str) -> TargetSelection {
+        let mut request = RoutingRequest::new("GET", "/", "lb.test");
+        request.client_ip = Some(client_ip.to_string());
+        lb.select_target_for_request(request)
+            .expect("an eligible pool always selects")
+    }
+
+    fn zoned_two_target_lb() -> LoadBalancerAction {
+        make_lb(serde_json::json!({
+            "targets": [
+                {"url": "http://a:8080", "zone": "zone-a"},
+                {"url": "http://b:8080", "zone": "zone-b"}
+            ],
+            "algorithm": "round_robin"
+        }))
+    }
 
     #[test]
-    fn zone_on_a_target_is_refused_at_config_compile() {
-        let error = LoadBalancerAction::from_config(serde_json::json!({
+    fn zone_on_a_target_compiles_and_routes() {
+        // The exact shape WOR-2498 refused at config compile. The
+        // refusal is gone because the label routes now.
+        let lb = make_lb(serde_json::json!({
             "targets": [
                 {"url": "http://a:8080", "zone": "us-east-1a"},
                 {"url": "http://b:8080"}
             ]
-        }))
-        .expect_err("an authored targets[].zone must fail config compilation, not sit inert");
+        }));
+        assert_eq!(lb.targets[0].zone.as_deref(), Some("us-east-1a"));
+        assert!(lb.has_zoned_targets());
 
-        let message = error.to_string();
-        assert!(
-            message.contains("zone"),
-            "the error must name the removed key: '{message}'"
-        );
-        assert!(
-            message.contains("not locality aware"),
-            "the error must say selection never consulted the label: '{message}'"
-        );
-        assert!(
-            message.contains("routing.md"),
-            "the error must point at the algorithms that do ship: '{message}'"
+        lb.bind_local_zone("us-east-1a");
+        for _ in 0..4 {
+            let selection = select_from(&lb, "203.0.113.7");
+            assert_eq!(
+                selection.target_index, 0,
+                "a zoned pool with a bound proxy zone must keep traffic local"
+            );
+            assert_eq!(selection.zone_locality, Some(ZoneLocality::Local));
+        }
+    }
+
+    #[test]
+    fn target_zone_field_defaults_to_none() {
+        let lb = make_lb(serde_json::json!({
+            "targets": [{"url": "http://a:8080"}]
+        }));
+        assert!(lb.targets[0].zone.is_none());
+        assert!(!lb.has_zoned_targets());
+    }
+
+    #[test]
+    fn zone_prefers_local_targets_over_round_robin() {
+        let lb = zoned_two_target_lb();
+        lb.bind_local_zone("zone-a");
+
+        let visited: std::collections::BTreeSet<usize> = (0..6)
+            .map(|_| select_from(&lb, "203.0.113.7").target_index)
+            .collect();
+        assert_eq!(
+            visited,
+            std::collections::BTreeSet::from([0]),
+            "same-zone preference must keep round-robin inside zone-a"
         );
     }
 
     #[test]
-    fn omitting_zone_compiles_cleanly() {
+    fn zone_spills_when_no_local_target_is_healthy_and_returns_with_health() {
+        let lb = zoned_two_target_lb();
+        lb.bind_local_zone("zone-a");
+
+        // Local zone down: the request spills across zones instead of
+        // blackholing, and says so.
+        lb.set_target_health(0, false);
+        for _ in 0..4 {
+            let selection = select_from(&lb, "203.0.113.7");
+            assert_eq!(
+                selection.target_index, 1,
+                "with zone-a unhealthy every request must spill to zone-b"
+            );
+            assert_eq!(selection.zone_locality, Some(ZoneLocality::Spilled));
+        }
+
+        // Failover is per-request, not per-config: health returning
+        // moves the very next selection back inside the local zone.
+        lb.set_target_health(0, true);
+        let selection = select_from(&lb, "203.0.113.7");
+        assert_eq!(selection.target_index, 0);
+        assert_eq!(selection.zone_locality, Some(ZoneLocality::Local));
+    }
+
+    #[test]
+    fn zone_spills_when_the_local_zone_has_no_targets() {
+        let lb = zoned_two_target_lb();
+        lb.bind_local_zone("zone-c");
+
+        let mut visited = std::collections::BTreeSet::new();
+        for _ in 0..6 {
+            let selection = select_from(&lb, "203.0.113.7");
+            assert_eq!(selection.zone_locality, Some(ZoneLocality::Spilled));
+            visited.insert(selection.target_index);
+        }
+        assert_eq!(
+            visited,
+            std::collections::BTreeSet::from([0, 1]),
+            "a proxy zoned away from every target must still spread traffic"
+        );
+    }
+
+    #[test]
+    fn unbound_proxy_zone_leaves_selection_unchanged() {
+        // Zone labels with no proxy zone identity: exactly the
+        // pre-WOR-2328 shape. Both targets take traffic and no
+        // locality verdict is reported.
+        let lb = zoned_two_target_lb();
+
+        let mut visited = std::collections::BTreeSet::new();
+        for _ in 0..6 {
+            let selection = select_from(&lb, "203.0.113.7");
+            assert_eq!(selection.zone_locality, None);
+            visited.insert(selection.target_index);
+        }
+        assert_eq!(visited, std::collections::BTreeSet::from([0, 1]));
+    }
+
+    #[test]
+    fn unlabeled_pool_ignores_the_proxy_zone() {
+        // A single-zone config (no target labels) behaves exactly as
+        // today even when the proxy itself is zoned.
         let lb = make_lb(serde_json::json!({
             "targets": [
                 {"url": "http://a:8080"},
                 {"url": "http://b:8080"}
-            ]
+            ],
+            "algorithm": "round_robin"
         }));
-        assert_eq!(lb.targets.len(), 2);
+        lb.bind_local_zone("zone-a");
+
+        let mut visited = std::collections::BTreeSet::new();
+        for _ in 0..6 {
+            let selection = select_from(&lb, "203.0.113.7");
+            assert_eq!(selection.zone_locality, None);
+            visited.insert(selection.target_index);
+        }
+        assert_eq!(visited, std::collections::BTreeSet::from([0, 1]));
+    }
+
+    #[test]
+    fn unlabeled_target_is_not_local() {
+        // An unlabeled target in a labeled pool is a different
+        // locality, matching Envoy's endpoint-locality model: only an
+        // exact zone match is local.
+        let lb = make_lb(serde_json::json!({
+            "targets": [
+                {"url": "http://a:8080", "zone": "zone-a"},
+                {"url": "http://b:8080"}
+            ],
+            "algorithm": "round_robin"
+        }));
+        lb.bind_local_zone("zone-a");
+
+        for _ in 0..4 {
+            let selection = select_from(&lb, "203.0.113.7");
+            assert_eq!(selection.target_index, 0);
+            assert_eq!(selection.zone_locality, Some(ZoneLocality::Local));
+        }
+    }
+
+    #[test]
+    fn locality_deactivates_below_min_pool_size() {
+        // Envoy's `min_cluster_size` shape: below the configured pool
+        // size the stage stands down entirely and traffic spreads.
+        let lb = make_lb(serde_json::json!({
+            "targets": [
+                {"url": "http://a:8080", "zone": "zone-a"},
+                {"url": "http://b:8080", "zone": "zone-b"}
+            ],
+            "algorithm": "round_robin",
+            "locality": {"min_pool_size": 3}
+        }));
+        assert_eq!(lb.locality_min_pool_size, 3);
+        lb.bind_local_zone("zone-a");
+
+        let mut visited = std::collections::BTreeSet::new();
+        for _ in 0..6 {
+            let selection = select_from(&lb, "203.0.113.7");
+            assert_eq!(selection.zone_locality, None);
+            visited.insert(selection.target_index);
+        }
+        assert_eq!(visited, std::collections::BTreeSet::from([0, 1]));
+    }
+
+    #[test]
+    fn min_pool_size_defaults_to_two() {
+        let lb = zoned_two_target_lb();
+        assert_eq!(lb.locality_min_pool_size, 2);
+    }
+
+    #[test]
+    fn locality_stands_down_when_every_target_is_filtered() {
+        // Panic-mode composition: when health filtering removes every
+        // target, the ejection stage already falls back to the whole
+        // pool rather than 502ing, and the locality stage must not
+        // re-narrow that last-resort set (Envoy disables zone-aware
+        // routing in panic mode for the same reason).
+        let lb = zoned_two_target_lb();
+        lb.bind_local_zone("zone-a");
+        lb.set_target_health(0, false);
+        lb.set_target_health(1, false);
+
+        let mut visited = std::collections::BTreeSet::new();
+        for _ in 0..6 {
+            let selection = select_from(&lb, "203.0.113.7");
+            assert_eq!(selection.zone_locality, None);
+            visited.insert(selection.target_index);
+        }
+        assert_eq!(
+            visited,
+            std::collections::BTreeSet::from([0, 1]),
+            "an all-unhealthy pool must still spread rather than pin to the local zone"
+        );
+    }
+
+    #[test]
+    fn locality_narrows_before_the_priority_filter() {
+        // Stage order is ejection, locality, priority: a cross-zone
+        // target with a better priority must not beat a healthy local
+        // one.
+        let lb = make_lb(serde_json::json!({
+            "targets": [
+                {"url": "http://a:8080", "zone": "zone-a", "priority": 5},
+                {"url": "http://b:8080", "zone": "zone-b", "priority": 1}
+            ],
+            "algorithm": "round_robin"
+        }));
+        lb.bind_local_zone("zone-a");
+
+        for _ in 0..4 {
+            let selection = select_from(&lb, "203.0.113.7");
+            assert_eq!(selection.target_index, 0);
+            assert_eq!(selection.zone_locality, Some(ZoneLocality::Local));
+        }
+    }
+
+    #[test]
+    fn locality_composes_with_ring_hash() {
+        // The ring is built over every configured target; locality
+        // narrows the eligibility bitmap, so the walk skips cross-zone
+        // targets without rebuilding the ring.
+        let lb = make_lb(serde_json::json!({
+            "targets": [
+                {"url": "http://a:8080", "zone": "zone-a"},
+                {"url": "http://b:8080", "zone": "zone-a"},
+                {"url": "http://c:8080", "zone": "zone-b"}
+            ],
+            "algorithm": {"ring_hash": {"key": "ip"}},
+            "locality": {"min_pool_size": 2}
+        }));
+        lb.bind_local_zone("zone-a");
+
+        let mut visited = std::collections::BTreeSet::new();
+        for octet in 1..=32u8 {
+            let selection = select_from(&lb, &format!("203.0.113.{octet}"));
+            assert_eq!(selection.zone_locality, Some(ZoneLocality::Local));
+            visited.insert(selection.target_index);
+        }
+        assert_eq!(
+            visited,
+            std::collections::BTreeSet::from([0, 1]),
+            "ring keys must stay inside zone-a while both local targets are healthy"
+        );
+    }
+
+    #[test]
+    fn binding_an_empty_zone_is_ignored() {
+        let lb = zoned_two_target_lb();
+        lb.bind_local_zone("   ");
+        assert_eq!(lb.local_zone(), None);
+        lb.bind_local_zone(" zone-a ");
+        assert_eq!(lb.local_zone(), Some("zone-a"));
     }
 
     #[test]
@@ -2930,13 +3384,14 @@ mod tests {
         );
     }
 
-    // WOR-2246: four locality_filter tests stood here. They were the
-    // only callers the helper ever had, which is how a routing input
-    // nothing routed on kept looking covered. The helper is gone, and a
-    // `zone_does_not_steer_target_selection` test pinned the label as
-    // inert until WOR-2498 removed the field; the refusal tests above
-    // (`zone_on_a_target_is_refused_at_config_compile`) pin the removal
-    // now.
+    // WOR-2246: four tests of an unwired `locality_filter` helper
+    // stood here, the only callers it ever had, which is how a routing
+    // input nothing routed on kept looking covered. WOR-2498 then
+    // removed and refused the `zone` field, and WOR-2328 rebuilt the
+    // filter as a live selection stage. Its tests live in the
+    // zone-locality block above and drive it through
+    // `select_target_for_request`, never by calling the helper
+    // directly, so coverage tracks the wiring rather than the helper.
 
     // --- ring_hash tests ---
 

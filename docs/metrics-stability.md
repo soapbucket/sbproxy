@@ -75,8 +75,9 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `mesh_replication_read_repairs_total` | Counter | `stable` | `beta` | none | Stale replicas repaired in line by quorum reads. |
 | `mesh_replication_writes_total` | Counter | `stable` | `beta` | `outcome` | Replicated substrate writes, by coordinator outcome (acked or quorum_failed). |
 | `mesh_tombstone_gc_total` | Counter | `stable` | `beta` | `outcome` | Ack-aware tombstone garbage collection decisions (collected or deferred). |
+| `mesh_transport_inbound_rejected_total` | Counter | `stable` | `beta` | `reason` | Inbound cache RPC connections refused or torn down by an admission or deadline bound, by reason (connection_limit, handshake_timeout, handshake_failed, idle_timeout, frame_timeout, write_timeout). Any sustained connection_limit rate means peers are being turned away; the peer address is in the log line, never in a label. |
 | `mesh_transport_rpc_duration_seconds` | Histogram | `stable` | `beta` | `op` | Successful cross-node cache RPC duration, by operation. Healthy same-zone means sit well under 5ms; a mean near 40ms is the delayed-ACK/Nagle transport stall signature and warrants an alert. |
-| `mesh_transport_rpc_errors_total` | Counter | `stable` | `beta` | `kind` | Cross-node cache RPC failures, by transport phase. |
+| `mesh_transport_rpc_errors_total` | Counter | `stable` | `beta` | `kind` | Cross-node cache RPC failures, by transport phase. The five timeout_ kinds (timeout_lock, timeout_connect, timeout_tls, timeout_write, timeout_read) are the deadline half of the same set: a peer that answered with nothing rather than with a refusal. |
 | `sbproxy_a2a_chain_depth` | Histogram | `stable` | `beta` | `route`, `spec` | Distribution of A2A chain depth observed at the proxy. |
 | `sbproxy_a2a_denied_total` | Counter | `stable` | `beta` | `route`, `reason` | A2A hops denied by the a2a policy, labeled by route and reason. |
 | `sbproxy_a2a_hops_total` | Counter | `stable` | `beta` | `route`, `spec`, `decision` | A2A hops observed by the proxy, labeled by route, spec, and policy decision. |
@@ -132,8 +133,10 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_ai_multipart_inspection_skipped_total` | Counter | `stable` | `beta` | `check`, `surface` | Request-body inspection skipped because the AI request body was multipart, by inspection kind and classified surface. |
 | `sbproxy_ai_native_bypass_total` | Counter | `stable` | `beta` | `inbound_format`, `provider_format` | AI requests that bypassed the hub format round-trip when client format matched provider format. |
 | `sbproxy_ai_output_throughput_tokens_per_second` | Histogram | `stable` | `beta` | `provider`, `model` | AI streaming output throughput (completion tokens / generation duration). |
+| `sbproxy_ai_price_ceiling_total` | Counter | `stable` | `alpha` | `outcome` | Per-request price-ceiling guard outcomes: `candidate_excluded` (a routing candidate priced over the ceiling and dropped), `refused` (every candidate over it, so the request answered 402), `invalid_header` (an unusable `x-sbproxy-max-price`), and `unsupported_surface` (a header ceiling on a surface the estimate cannot price). |
 | `sbproxy_ai_price_source_total` | Counter | `stable` | `alpha` | `source` | Cost estimates by the price-table layer that produced the price. |
 | `sbproxy_ai_provider_attempts_total` | Counter | `stable` | `beta` | `provider`, `outcome` | AI provider attempts during failover/selection, by provider and outcome. |
+| `sbproxy_ai_provider_cooldowns_total` | Counter | `stable` | `beta` | `provider`, `cause` | Providers parked out of rotation by `resilience.cooldown_policy`, by the classified failure that parked them. The circuit breaker's counterpart for the cooldown axis; without it a rotated credential parks the whole pool on a log line nobody can alert on. |
 | `sbproxy_ai_provider_errors_total` | Counter | `stable` | `stable` | `provider`, `error_kind` | Per-provider AI error events. |
 | `sbproxy_ai_rag_context_bytes` | Histogram | `stable` | `beta` | none | Bytes of rendered RAG context injected into the request body. |
 | `sbproxy_ai_rag_latency_seconds` | Histogram | `stable` | `beta` | `stage`, `provider` | RAG retrieval latency in seconds, by stage (embedding, search, total) and provider. |
@@ -150,6 +153,8 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_ai_requests_attributed_total` | Counter | `stable` | `beta` | `origin`, `provider`, `model`, `surface`, `tenant_id`, `api_key_id`, `outcome` | AI requests partitioned by attribution + outcome. |
 | `sbproxy_ai_reversible_redaction_miss_total` | Counter | `stable` | `beta` | `rule` | Reversible PII placeholders that appeared in the upstream response but did not match a request-side capture entry. |
 | `sbproxy_ai_semantic_cache_similarity` | Histogram | `stable` | `beta` | `provider` | Cosine similarity of semantic-cache hits. |
+| `sbproxy_ai_semantic_route_decisions_total` | Counter | `stable` | `beta` | `outcome` | Semantic-route selections by decision outcome. |
+| `sbproxy_ai_semantic_route_similarity` | Histogram | `stable` | `beta` | `provider` | Best exemplar cosine similarity of scored semantic-route requests. |
 | `sbproxy_ai_shadow_dropped_total` | Counter | `stable` | `beta` | `reason` | Configured shadow requests skipped or dropped before dispatch, by closed reason. |
 | `sbproxy_ai_shadow_inflight` | Gauge | `stable` | `beta` | none | Currently in-flight shadow request tasks supervised by the AI client. |
 | `sbproxy_ai_shadow_timeout_total` | Counter | `stable` | `beta` | none | Shadow tasks canceled after their wall-clock supervisor timeout. |
@@ -232,6 +237,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_label_cardinality_overflow_per_tenant_total` | Counter | `stable` | `beta` | `metric`, `label`, `tenant_id` | Per-tenant overflow demotions (`sbproxy_label_cardinality_overflow_total` with the tenant_id label). |
 | `sbproxy_label_cardinality_overflow_total` | Counter | `stable` | `beta` | `metric`, `label` | Number of label values demoted to __other__ because the per-label budget was exhausted. |
 | `sbproxy_label_cardinality_unique_values` | Gauge | `stable` | `beta` | `label` | Unique values a label name has accepted so far. Divided by sbproxy_label_cardinality_budget it gives how close the label is to collapsing new values into __other__, which is a warning the overflow counter can only give after the fact. |
+| `sbproxy_lb_zone_locality_total` | Counter | `stable` | `beta` | `origin`, `verdict` | Load-balancer selections the zone-locality stage shaped, by verdict: local (narrowed to the proxy's own zone) or spilled (no same-zone target was healthy, so selection widened across zones). rate(...{verdict="spilled"}[5m]) > 0 is a cross-zone spill in progress, which the debug log and the admin ring cannot report on a release binary with the admin server off. |
 | `sbproxy_ledger_redeem_duration_seconds` | Histogram | `stable` | `beta` | `host`, `outcome` | Wall-clock latency of a single ledger token redemption. |
 | `sbproxy_managed_replica_attempts_total` | Counter | `stable` | `beta` | `provider`, `deployment`, `route_class`, `outcome` | Managed model replica attempts by provider, deployment, route class, and bounded outcome. |
 | `sbproxy_managed_replica_failovers_total` | Counter | `stable` | `beta` | `provider`, `deployment`, `reason` | Safe pre-output managed replica handovers by provider, deployment, and bounded reason. |

@@ -67,6 +67,28 @@ pub struct AiHandlerConfig {
     /// [`crate::data_posture`].
     #[serde(default)]
     pub data_posture: Option<crate::data_posture::DataPostureRequirement>,
+    /// Typed fallback list for the context-window trigger (WOR-2556):
+    /// provider names to reroute to when a prompt's pre-flight token
+    /// estimate (or a provider's own rejection) overflows the model's
+    /// context window. Ordered; each name must match a
+    /// `providers[].name` (config load refuses unknown names). Empty
+    /// (the default) disables the trigger, and the generic chain
+    /// handles every failure as before. This is the
+    /// `context_window_fallbacks` half of the LiteLLM
+    /// `fallbacks` / `context_window_fallbacks` /
+    /// `content_policy_fallbacks` split; the generic half is
+    /// `routing.strategy: fallback_chain`.
+    #[serde(default)]
+    pub context_window_fallbacks: Vec<String>,
+    /// Typed fallback list for the content-policy trigger (WOR-2556):
+    /// provider names to reroute to when a provider refuses a request
+    /// on content-policy / safety grounds. Ordered; each name must
+    /// match a `providers[].name`. Empty (the default) disables the
+    /// trigger; the legacy `resilience.content_policy_fallback`
+    /// boolean (route to the next provider in order) keeps working
+    /// unchanged when this list is not set.
+    #[serde(default)]
+    pub content_policy_fallbacks: Vec<String>,
     /// Optional allow-list of model names; empty means allow all.
     #[serde(default)]
     pub allowed_models: Vec<ModelId>,
@@ -84,6 +106,22 @@ pub struct AiHandlerConfig {
     #[serde(default)]
     pub model_aliases: Vec<crate::model_alias::ModelAlias>,
     /// Maximum request body size in bytes accepted by the gateway.
+    ///
+    /// Checked while the body arrives rather than once it is all in
+    /// memory. A declared `Content-Length` over the cap is refused
+    /// before the first read; a chunked upload that declares nothing is
+    /// refused on the chunk that crosses the line. Both answer `413`
+    /// from the request phase, so no provider is contacted and nothing
+    /// reaches the response cache or the idempotency store.
+    ///
+    /// The same number bounds the buffered upstream response the relay
+    /// holds in memory, and the multipart body a governed model
+    /// rewrite produces.
+    ///
+    /// Unset means 64 MiB, not unlimited. An AI request body has to be
+    /// held whole before it can be parsed, routed, and scanned, so a
+    /// deployment that configured no cap still has one; `0` reads as
+    /// unset, and anything above 1 GiB is clamped to 1 GiB.
     #[serde(default)]
     pub max_body_size: Option<usize>,
     /// Optional input/output guardrails pipeline.
@@ -229,6 +267,22 @@ pub struct AiHandlerConfig {
     /// runtime. `None` uses only `model_prices` + the built-in catalog.
     #[serde(default)]
     pub rate_card: Option<String>,
+    /// WOR-2559: origin-level hard price ceiling in USD per request (the
+    /// OpenRouter `provider.max_price` analog). Before provider
+    /// selection, each routing candidate on a token-priced chat surface
+    /// (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`) is
+    /// estimated through the same price resolution cost tracking bills with
+    /// (`model_prices`, rate card, built-in catalog, then the pessimistic
+    /// $5/$5 fallback); candidates whose estimate exceeds the ceiling are
+    /// excluded, and a fully excluded set refuses with 402 naming the
+    /// ceiling and each candidate's resolved price. On a `cascade`
+    /// origin the tier list is filtered the same way, priced on the model
+    /// each tier names, because the cascade routes over its tiers rather
+    /// than over the provider order. The `x-sbproxy-max-price` request
+    /// header can tighten this per request but never raise it. Must be
+    /// positive when set; `None` (the default) disables the gate.
+    #[serde(default)]
+    pub max_price_per_request: Option<f64>,
     /// WOR-1880: optional fair-share quota pool across providers.
     /// When set, each provider attempt reserves against the pool before
     /// dispatch; a deny advances to the next candidate when alternatives
@@ -544,6 +598,13 @@ impl AiHandlerConfig {
                         );
                         router = router.with_outlier_detection(config);
                     }
+                    if let Some(cooldown) = resilience.cooldown_policy.as_ref() {
+                        tracing::info!(
+                            providers = self.providers.len(),
+                            "ai per-error-class cooldowns armed"
+                        );
+                        router = router.with_classified_cooldowns(cooldown.clone());
+                    }
                 }
                 std::sync::Arc::new(router)
             })
@@ -695,6 +756,15 @@ pub struct AiResilienceConfig {
     /// malformed request is not. `None` keeps the status-code retry set.
     #[serde(default)]
     pub retry_policy: Option<crate::failure_cause::RetryPolicy>,
+    /// WOR-2556: per-error-class cooldown durations, the provider-level
+    /// counterpart to `retry_policy`'s request-level counts. When set,
+    /// a classified failure of a mapped class removes that provider
+    /// from candidate rotation for the configured number of seconds
+    /// (advisory, like the breaker: an all-cooling pool is revived
+    /// rather than turned into an outage). `None` keeps current
+    /// behavior exactly.
+    #[serde(default)]
+    pub cooldown_policy: Option<crate::failure_cause::CooldownPolicy>,
     /// WOR-1545: LLM-aware failover actions on top of the per-error retry
     /// policy. `None` leaves the request path unchanged.
     #[serde(default)]
@@ -991,6 +1061,19 @@ where
         return Ok(RoutingStrategy::PrefixAffinity(config));
     }
 
+    // WOR-2564: semantic routing carries routes / min_similarity /
+    // fallback / an embedding-source block alongside the discriminator.
+    // Validation runs here so a strategy with nothing to embed with or
+    // nothing to route to refuses the config at load.
+    if strategy_name == "semantic_route" {
+        let mut fields = obj.clone();
+        fields.remove("strategy");
+        let config: crate::routing::semantic_route::SemanticRouteConfig =
+            serde_json::from_value(serde_json::Value::Object(fields)).map_err(Error::custom)?;
+        config.validate().map_err(Error::custom)?;
+        return Ok(RoutingStrategy::SemanticRoute(Box::new(config)));
+    }
+
     // WOR-797: cost/quality routing carries cheap_provider /
     // frontier_provider / cost_threshold alongside the discriminator.
     // `learned` is accepted as an alias.
@@ -1087,11 +1170,71 @@ impl AiHandlerConfig {
              oversized prompt to the model's window is what the compression pipeline does: \
              add a `window_fit` lever under `compression.levers`, or set \
              `resilience.llm_aware.context_compress: true` for the one-lever shorthand. \
-             There is no configuration today that reroutes an oversized prompt to a \
-             larger-window model; list the larger model first, or alias to it, if that is \
-             the behavior you want."
+             To reroute an oversized prompt to a larger-window model instead, list that \
+             provider in `context_window_fallbacks:` on this action."
         );
+        // WOR-2556: the `routing:` object form ignores keys the selected
+        // strategy does not read, so a typed fallback list authored there
+        // would be silently swallowed, which is the failure mode the
+        // `context_overflow:` refusal above exists to prevent. Refuse and
+        // point at the level the keys live on.
+        //
+        // `resilience:` is checked on the same footing, and is the
+        // likelier of the two misplacements: `content_policy_fallback`
+        // (singular, a boolean) is a real key that already lives there,
+        // so the plural list is one character and one nesting level from
+        // a spelling operators are already using. `AiResilienceConfig`
+        // sets no `deny_unknown_fields`, so without this the key is
+        // dropped in silence, `sbproxy validate` exits 0, and every
+        // content-policy refusal reaches the caller with nothing in the
+        // logs to say the configured reroute never ran.
+        for parent in ["routing", "resilience"] {
+            let Some(object) = value.get(parent).and_then(|v| v.as_object()) else {
+                continue;
+            };
+            for key in ["context_window_fallbacks", "content_policy_fallbacks"] {
+                anyhow::ensure!(
+                    !object.contains_key(key),
+                    "ai `{parent}.{key}` is not read there and would be silently ignored: \
+                     `{key}:` is a sibling of `{parent}:` on the ai_proxy action, not a key \
+                     inside it"
+                );
+            }
+        }
         let mut config: Self = serde_json::from_value(value)?;
+        // WOR-2556: a typed fallback list is an aimed allowlist. A name
+        // matching no provider would leave the trigger configured and
+        // the reroute unreachable, so it fails the load instead.
+        for (key, names) in [
+            ("context_window_fallbacks", &config.context_window_fallbacks),
+            ("content_policy_fallbacks", &config.content_policy_fallbacks),
+        ] {
+            for name in names {
+                anyhow::ensure!(
+                    config
+                        .providers
+                        .iter()
+                        .any(|provider| provider.name.as_str() == name.as_str()),
+                    "ai `{key}` names provider `{name}`, which does not match any \
+                     `providers[].name` on this action"
+                );
+            }
+        }
+        // WOR-2559: a ceiling of zero or below cannot admit any request
+        // whose estimate is a real cost, so it would blackhole the origin
+        // at 402 for every chat request, which is what a typed `-0.05` or
+        // a stray `0` looks like. The header form already refuses a
+        // non-positive value; refusing here too means the operator learns
+        // at load rather than from a support ticket.
+        if let Some(ceiling) = config.max_price_per_request {
+            if !ceiling.is_finite() || ceiling <= 0.0 {
+                anyhow::bail!(
+                    "ai max_price_per_request must be a positive USD amount, got {ceiling}. \
+                     A ceiling at or below zero refuses every request, since no priced \
+                     candidate estimates below it. Remove the key to disable the ceiling."
+                );
+            }
+        }
         if let Some(rag) = config.rag.as_ref() {
             rag.validate()
                 .map_err(|error| anyhow::anyhow!("ai rag: {error}"))?;
@@ -1233,6 +1376,39 @@ impl AiHandlerConfig {
                         "ai routing cascade tier {index} names provider {:?}, \
                          which is not configured",
                         tier.provider_id
+                    );
+                }
+            }
+        }
+        // WOR-2564: the same literal, checkable discipline for semantic
+        // routing. A route pinned to a deployment nobody configured, a
+        // fallback nothing can serve, or an embedding provider outside
+        // `providers` would each surface as a silent per-request fallback
+        // at runtime; each is a config-compile refusal instead.
+        if let RoutingStrategy::SemanticRoute(semantic) = &config.routing {
+            for (index, rule) in semantic.routes.iter().enumerate() {
+                if !provider_names.contains(rule.deployment.as_str()) {
+                    anyhow::bail!(
+                        "ai semantic_route route {index} names deployment {:?}, \
+                         which is not a configured provider",
+                        rule.deployment
+                    );
+                }
+            }
+            if let Some(fallback) = semantic.fallback.as_deref() {
+                if !provider_names.contains(fallback) {
+                    anyhow::bail!(
+                        "ai semantic_route fallback names provider {fallback:?}, \
+                         which is not configured"
+                    );
+                }
+            }
+            if let Some(embedding) = semantic.embedding.as_ref() {
+                if !provider_names.contains(embedding.provider.as_str()) {
+                    anyhow::bail!(
+                        "ai semantic_route embedding provider {:?} is not configured; \
+                         `source: provider` must name one of this origin's providers",
+                        embedding.provider
                     );
                 }
             }
@@ -1995,12 +2171,368 @@ mod tests {
     }
 
     #[test]
+    fn typed_fallback_lists_naming_an_unknown_provider_are_refused() {
+        // WOR-2556: a typed fallback list is an allowlist of provider
+        // names. A name matching nothing would leave the trigger
+        // configured and the reroute silently unreachable, which is the
+        // exact rot mode the original WOR-1524 mechanism died of.
+        let error = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "small", "api_key": "k"}],
+            "context_window_fallbacks": ["big"],
+        }))
+        .expect_err("a fallback list naming no configured provider must fail the config");
+        let message = error.to_string();
+        assert!(
+            message.contains("context_window_fallbacks") && message.contains("big"),
+            "the error has to name the key and the unknown provider: {message}"
+        );
+
+        let error = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "strict", "api_key": "k"}],
+            "content_policy_fallbacks": ["permissive"],
+        }))
+        .expect_err("a fallback list naming no configured provider must fail the config");
+        let message = error.to_string();
+        assert!(
+            message.contains("content_policy_fallbacks") && message.contains("permissive"),
+            "the error has to name the key and the unknown provider: {message}"
+        );
+    }
+
+    #[test]
+    fn typed_fallback_keys_nested_under_routing_are_refused() {
+        // WOR-2556: the `routing:` object form ignores keys a strategy
+        // does not read, so a typed fallback list nested there would be
+        // silently swallowed. Refuse it and point at the right level.
+        let error = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "small", "api_key": "k"},
+                {"name": "big", "api_key": "k"},
+            ],
+            "routing": {"strategy": "fallback_chain", "context_window_fallbacks": ["big"]},
+        }))
+        .expect_err("a typed fallback list nested under routing: must fail the config");
+        let message = error.to_string();
+        assert!(
+            message.contains("context_window_fallbacks"),
+            "the error has to name the misplaced key: {message}"
+        );
+    }
+
+    #[test]
+    fn typed_fallback_keys_nested_under_resilience_are_refused() {
+        // WOR-2556 review: `resilience.content_policy_fallback`
+        // (singular) is a real key, so the plural list next to it is the
+        // likelier misplacement of the two. `AiResilienceConfig` has no
+        // `deny_unknown_fields`, so nothing else in the load path sees it.
+        for key in ["context_window_fallbacks", "content_policy_fallbacks"] {
+            let mut resilience = serde_json::Map::new();
+            resilience.insert(
+                "content_policy_fallback".to_string(),
+                serde_json::Value::Bool(true),
+            );
+            resilience.insert(key.to_string(), serde_json::json!(["permissive"]));
+            let error = AiHandlerConfig::from_config(serde_json::json!({
+                "providers": [
+                    {"name": "small", "api_key": "k"},
+                    {"name": "permissive", "api_key": "k"},
+                ],
+                "resilience": resilience,
+            }))
+            .expect_err("a typed fallback list nested under resilience: must fail the config");
+            let message = error.to_string();
+            assert!(
+                message.contains(key) && message.contains("resilience"),
+                "the error has to name the misplaced key and its parent: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_fallback_lists_parse_when_names_match_providers() {
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "small", "api_key": "k"},
+                {"name": "big", "api_key": "k"},
+                {"name": "permissive", "api_key": "k"},
+            ],
+            "routing": {"strategy": "fallback_chain"},
+            "context_window_fallbacks": ["big"],
+            "content_policy_fallbacks": ["permissive"],
+        }))
+        .expect("typed fallback lists naming configured providers parse");
+        assert_eq!(config.context_window_fallbacks, vec!["big".to_string()]);
+        assert_eq!(
+            config.content_policy_fallbacks,
+            vec!["permissive".to_string()]
+        );
+    }
+
+    #[test]
+    fn cooldown_policy_removes_a_provider_after_a_mapped_failure_class() {
+        let config = resilience_config(serde_json::json!({
+            "cooldown_policy": {"rate_limit": 60},
+        }));
+        let router = config.router();
+        assert_eq!(
+            router.eligible_indices(&config.providers),
+            vec![0, 1],
+            "no failures yet: everyone eligible"
+        );
+        router.note_classified_failure(0, "openai", crate::failure_cause::FailureCause::RateLimit);
+        assert_eq!(
+            router.eligible_indices(&config.providers),
+            vec![1],
+            "a rate-limited provider is held out for the configured cooldown"
+        );
+        // A class the policy does not map must not cool anything down.
+        router.note_classified_failure(
+            1,
+            "anthropic",
+            crate::failure_cause::FailureCause::ServerError,
+        );
+        assert_eq!(
+            router.eligible_indices(&config.providers),
+            vec![1],
+            "an unmapped class never triggers a cooldown"
+        );
+    }
+
+    #[test]
+    fn a_cooldown_records_the_parked_provider_and_cause_on_its_counter() {
+        // WOR-2556 review: parking a provider is the moment traffic
+        // stops reaching it, and a `warn!` line was the only record. A
+        // rotating log line cannot be graphed and nothing can alert on
+        // it, so the seam that parks the provider writes the counter
+        // too. Asserted through `config.router()` rather than against
+        // the recorder directly: a covered recorder is not a wired one.
+        //
+        // The provider name is unique to this test on purpose. The
+        // prometheus registry is process-global and other tests in this
+        // binary park providers of their own.
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "cooldown-counter-probe", "api_key": "k"},
+                {"name": "anthropic", "api_key": "k"},
+            ],
+            "resilience": {"cooldown_policy": {"auth": 300}},
+        }))
+        .expect("config compiles");
+        let router = config.router();
+        router.note_classified_failure(
+            0,
+            "cooldown-counter-probe",
+            crate::failure_cause::FailureCause::Auth,
+        );
+
+        let families = prometheus::gather();
+        let family = families
+            .iter()
+            .find(|family| family.name() == "sbproxy_ai_provider_cooldowns_total")
+            .expect("the cooldown seam has to register its counter");
+        let has_label = |metric: &prometheus::proto::Metric, name: &str, value: &str| {
+            metric
+                .get_label()
+                .iter()
+                .any(|label| label.name() == name && label.value() == value)
+        };
+        assert!(
+            family.get_metric().iter().any(|metric| {
+                has_label(metric, "provider", "cooldown-counter-probe")
+                    && has_label(metric, "cause", "auth")
+                    && metric.get_counter().value() >= 1.0
+            }),
+            "the parked provider and the class that parked it both have to be on the series"
+        );
+    }
+
+    #[test]
+    fn without_a_cooldown_policy_classified_failures_change_nothing() {
+        let config = resilience_config(serde_json::json!({}));
+        let router = config.router();
+        router.note_classified_failure(0, "openai", crate::failure_cause::FailureCause::RateLimit);
+        assert_eq!(
+            router.eligible_indices(&config.providers),
+            vec![0, 1],
+            "defaults preserve current behavior exactly"
+        );
+    }
+
+    #[test]
     fn least_token_usage_is_still_accepted() {
         AiHandlerConfig::from_config(serde_json::json!({
             "providers": [{"name": "openai", "api_key": "k"}],
             "routing": "least_token_usage",
         }))
         .expect("the strategy token_rate degenerates into stays available");
+    }
+
+    /// One valid `semantic_route` block, shared by the registration and
+    /// refusal tests so each refusal test mutates exactly one thing.
+    fn semantic_route_config(routing: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "providers": [
+                {"name": "code-pool", "api_key": "k"},
+                {"name": "chat-pool", "api_key": "k"},
+                {"name": "embedder", "api_key": "k"}
+            ],
+            "routing": routing,
+        })
+    }
+
+    #[test]
+    fn semantic_route_registers_as_a_named_strategy() {
+        let config = AiHandlerConfig::from_config(semantic_route_config(serde_json::json!({
+            "strategy": "semantic_route",
+            "min_similarity": 0.7,
+            "fallback": "chat-pool",
+            "routes": [
+                {"deployment": "code-pool", "exemplars": ["Write a Rust function that parses JSON"]},
+                {"deployment": "chat-pool", "exemplars": ["Chat about everyday topics"]}
+            ],
+            "embedding": {"provider": "embedder", "model": "text-embedding-3-small"}
+        })))
+        .expect("semantic_route with routes and an embedding source compiles");
+        assert_eq!(config.router().strategy_name(), "semantic_route");
+    }
+
+    #[test]
+    fn semantic_route_without_an_embedding_source_is_refused_at_config_compile() {
+        let error = AiHandlerConfig::from_config(semantic_route_config(serde_json::json!({
+            "strategy": "semantic_route",
+            "routes": [
+                {"deployment": "code-pool", "exemplars": ["Write a Rust function that parses JSON"]}
+            ]
+        })))
+        .expect_err("no embedding source must fail config compile, not surprise at runtime");
+        let message = error.to_string();
+        assert!(
+            message.contains("semantic_route") && message.contains("embedding"),
+            "the error has to name the strategy and the missing embedding block: {message}"
+        );
+    }
+
+    #[test]
+    fn semantic_route_naming_an_unknown_deployment_is_refused() {
+        let error = AiHandlerConfig::from_config(semantic_route_config(serde_json::json!({
+            "strategy": "semantic_route",
+            "routes": [
+                {"deployment": "no-such-pool", "exemplars": ["Write a Rust function"]}
+            ],
+            "embedding": {"provider": "embedder", "model": "text-embedding-3-small"}
+        })))
+        .expect_err("a route naming an unconfigured provider must be refused like a cascade tier");
+        let message = error.to_string();
+        assert!(
+            message.contains("no-such-pool"),
+            "the error has to name the offending deployment: {message}"
+        );
+    }
+
+    #[test]
+    fn semantic_route_naming_an_unknown_fallback_is_refused() {
+        let error = AiHandlerConfig::from_config(semantic_route_config(serde_json::json!({
+            "strategy": "semantic_route",
+            "fallback": "no-such-pool",
+            "routes": [
+                {"deployment": "code-pool", "exemplars": ["Write a Rust function"]}
+            ],
+            "embedding": {"provider": "embedder", "model": "text-embedding-3-small"}
+        })))
+        .expect_err("a fallback naming an unconfigured provider must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("no-such-pool"),
+            "the error has to name the offending fallback: {message}"
+        );
+    }
+
+    #[test]
+    fn semantic_route_embedding_provider_must_be_configured() {
+        let error = AiHandlerConfig::from_config(semantic_route_config(serde_json::json!({
+            "strategy": "semantic_route",
+            "routes": [
+                {"deployment": "code-pool", "exemplars": ["Write a Rust function"]}
+            ],
+            "embedding": {"provider": "no-such-embedder", "model": "text-embedding-3-small"}
+        })))
+        .expect_err("an embedding provider outside `providers` must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("no-such-embedder"),
+            "the error has to name the offending embedding provider: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exemplars_embed_once_across_the_router_lookups_a_request_makes() {
+        // WOR-2564's cost claim lives at this seam, not inside `decide`.
+        // The dispatcher reaches the strategy through
+        // `AiHandlerConfig::router()` on every request, so if that handed
+        // back a freshly cloned config the exemplar cache would be cold
+        // every time and the "config-time cost, not a per-request one"
+        // promise would be false while `decide`'s own cache test stayed
+        // green. Two lookups, two decisions, one exemplar build.
+        let config = AiHandlerConfig::from_config(semantic_route_config(serde_json::json!({
+            "strategy": "semantic_route",
+            "min_similarity": 0.5,
+            "routes": [
+                {"deployment": "code-pool", "exemplars": ["one", "two"]},
+                {"deployment": "chat-pool", "exemplars": ["three"]}
+            ],
+            "embedding": {"provider": "embedder", "model": "text-embedding-3-small"}
+        })))
+        .expect("semantic_route compiles");
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let embed = |_text: String| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            async { Ok(vec![1.0_f32, 0.0]) }
+        };
+
+        let first_lookup = config.router();
+        let semantic = first_lookup
+            .semantic_route_config()
+            .expect("the compiled strategy is semantic_route");
+        crate::routing::semantic_route::decide(semantic, "a request", &embed).await;
+        // Three exemplars plus this request's own prompt.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 4);
+        drop(first_lookup);
+
+        let second_lookup = config.router();
+        let semantic = second_lookup
+            .semantic_route_config()
+            .expect("the compiled strategy is semantic_route");
+        crate::routing::semantic_route::decide(semantic, "another request", &embed).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            5,
+            "a second request must cost one prompt embed, not a whole exemplar rebuild"
+        );
+    }
+
+    #[test]
+    fn the_shipped_semantic_routing_example_compiles_at_this_layer() {
+        // compile_config leaves the ai_proxy action opaque, so the
+        // sbproxy-config example sweep cannot prove the routing block.
+        // This layer owns it; parse the published example directly.
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let example = manifest
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crates/sbproxy-ai sits two levels under the workspace root")
+            .join("examples/semantic-routing/sb.yml");
+        let text = std::fs::read_to_string(&example)
+            .unwrap_or_else(|error| panic!("read {}: {error}", example.display()));
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&text).expect("example parses");
+        let action = parsed
+            .get("origins")
+            .and_then(|origins| origins.get("ai.local"))
+            .and_then(|origin| origin.get("action"))
+            .expect("example declares the ai.local action");
+        let action_json = serde_json::to_value(action).expect("action converts to JSON");
+        let config = AiHandlerConfig::from_config(action_json)
+            .expect("the published semantic-routing example must compile");
+        assert_eq!(config.router().strategy_name(), "semantic_route");
     }
 
     #[test]
@@ -2057,6 +2589,8 @@ mod tests {
             providers: Vec::new(),
             routing: RoutingStrategy::RoundRobin,
             data_posture: None,
+            context_window_fallbacks: Vec::new(),
+            content_policy_fallbacks: Vec::new(),
             allowed_models: Vec::new(),
             blocked_models: Vec::new(),
             max_body_size: None,
@@ -2085,6 +2619,7 @@ mod tests {
             ai_routing_policy: None,
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
+            max_price_per_request: None,
             quota_pool: None,
             rag: None,
             guardrails_pipeline: OnceLock::new(),
@@ -2105,6 +2640,8 @@ mod tests {
             providers: Vec::new(),
             routing: RoutingStrategy::RoundRobin,
             data_posture: None,
+            context_window_fallbacks: Vec::new(),
+            content_policy_fallbacks: Vec::new(),
             allowed_models: Vec::new(),
             blocked_models: vec!["gpt-4".into()],
             max_body_size: None,
@@ -2133,6 +2670,7 @@ mod tests {
             ai_routing_policy: None,
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
+            max_price_per_request: None,
             quota_pool: None,
             rag: None,
             guardrails_pipeline: OnceLock::new(),
@@ -2153,6 +2691,8 @@ mod tests {
             providers: Vec::new(),
             routing: RoutingStrategy::RoundRobin,
             data_posture: None,
+            context_window_fallbacks: Vec::new(),
+            content_policy_fallbacks: Vec::new(),
             allowed_models: vec!["gpt-4".into(), "gpt-3.5-turbo".into()],
             blocked_models: Vec::new(),
             max_body_size: None,
@@ -2181,6 +2721,7 @@ mod tests {
             ai_routing_policy: None,
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
+            max_price_per_request: None,
             quota_pool: None,
             rag: None,
             guardrails_pipeline: OnceLock::new(),
@@ -2202,6 +2743,8 @@ mod tests {
             providers: Vec::new(),
             routing: RoutingStrategy::RoundRobin,
             data_posture: None,
+            context_window_fallbacks: Vec::new(),
+            content_policy_fallbacks: Vec::new(),
             allowed_models: vec!["gpt-4".into()],
             blocked_models: vec!["gpt-4".into()],
             max_body_size: None,
@@ -2230,6 +2773,7 @@ mod tests {
             ai_routing_policy: None,
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
+            max_price_per_request: None,
             quota_pool: None,
             rag: None,
             guardrails_pipeline: OnceLock::new(),
@@ -2392,6 +2936,34 @@ mod tests {
             error.contains("reasoning budget must be greater than zero"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn from_config_rejects_a_price_ceiling_at_or_below_zero() {
+        // A ceiling of zero or below admits nothing, so it turns the
+        // origin into a 402 for every chat request. The header form
+        // already refuses a non-positive value; a typo in the config must
+        // not be the quieter of the two.
+        for bad in [0.0, -0.05] {
+            let json = serde_json::json!({
+                "providers": [{"name": "openai", "api_key": "sk-test"}],
+                "max_price_per_request": bad,
+            });
+            let error = AiHandlerConfig::from_config(json)
+                .expect_err("a non-positive ceiling must refuse the config")
+                .to_string();
+            assert!(error.contains("max_price_per_request"), "{error}");
+        }
+    }
+
+    #[test]
+    fn from_config_accepts_a_positive_price_ceiling() {
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "max_price_per_request": 0.05,
+        }))
+        .expect("a positive ceiling is a valid config");
+        assert_eq!(config.max_price_per_request, Some(0.05));
     }
 
     #[test]

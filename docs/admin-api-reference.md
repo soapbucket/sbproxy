@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
@@ -523,8 +523,10 @@ Response body: an array of `RequestLogEntry`:
     "failover_engaged": true,
     "failover_from": "openai",
     "failover_to": "anthropic",
+    "failover_trigger": "context_window",
     "load_balancer_strategy": "lowest_latency",
     "load_balancer_target": "anthropic",
+    "routing_detail": "matched anthropic exemplar 1 at 0.831 (floor 0.750)",
     "provider": "anthropic",
     "model": "claude-sonnet-4",
     "tokens_in": 315,
@@ -552,7 +554,10 @@ Response body: an array of `RequestLogEntry`:
 | `retry_count` | int | Additional upstream attempts after the first. Zero means no retry. |
 | `failover_engaged` | bool | Whether fallback or AI provider failover ran. |
 | `failover_from`, `failover_to` | string | First failed and final selected provider or target, when known. |
+| `failover_trigger` | string | Which trigger drove an AI reroute. Closed set: `context_window` (the prompt outgrew the model's window), `content_policy` (the provider refused on safety grounds), and `generic` (an ordinary availability or transport failover). Absent when no reroute happened. The counter spells the generic case differently; see [ai-gateway.md](ai-gateway.md#typed-fallback-triggers). |
 | `load_balancer_strategy`, `load_balancer_target` | string | Bounded routing strategy and selected target. |
+| `zone_locality` | string | Zone-locality verdict for the selected target: `local` (narrowed to the proxy's own zone) or `spilled` (no same-zone target was healthy, selection widened across zones). Absent when the stage did not engage. |
+| `routing_detail` | string | Why a per-request strategy picked that target. Bounded and operator-derived, never exemplar text or caller input. `semantic_route` writes the matched deployment with the winning exemplar's ordinal (or `centroid`) and the cosine score against the floor, for example `matched fast-pool exemplar 1 at 0.831 (floor 0.750)`, or the near-miss that sent the request to the fallback: `below floor: closest fast-pool at 0.612 (floor 0.750)`, `no user message to embed`, `embedder unavailable; routed to the default`, or `matched fast-pool at 0.831 but it is not eligible for this request` when the winner was filtered out before selection. Absent for strategies that do not decide per request. |
 | `provider`, `model` | string | AI provider and model when the AI gateway handled the request. |
 | `tokens_in`, `tokens_out` | int | Parsed prompt and completion tokens. |
 | `cost_usd_micros` | int | Estimated AI cost in millionths of a US dollar. |
@@ -1175,10 +1180,12 @@ diagnose why a load balancer is short on candidates.
 ```json
 {
   "config_revision": "abc123...",
+  "proxy_zone": "us-east-1a",
   "origins": [
     {
       "hostname": "api.example.com",
       "origin_id": "api",
+      "local_zone": "us-east-1a",
       "targets": [
         {
           "index": 0,
@@ -1189,7 +1196,8 @@ diagnose why a load balancer is short on candidates.
           "circuit_breaker_state": "closed",
           "weight": 10,
           "backup": false,
-          "group": null
+          "group": null,
+          "zone": "us-east-1a"
         }
       ]
     }
@@ -1211,11 +1219,16 @@ diagnose why a load balancer is short on candidates.
 | `origins[].targets[].weight` | int | Authored weight. |
 | `origins[].targets[].backup` | bool | True when this is a backup target. |
 | `origins[].targets[].group` | string \| null | Authored group tag, if any. |
+| `origins[].targets[].zone` | string \| null | Authored zone label, if any. A live routing input: same-zone targets are preferred while the pipeline's `proxy_zone` is set. |
+| `proxy_zone` | string \| null | The zone this proxy resolved for itself (`proxy.zone`, else `SB_ZONE`). Null means the zone-locality stage never engages. |
+| `origins[].local_zone` | string \| null | The zone bound to this origin's load balancer; matches `proxy_zone` on the live pipeline. |
 
-A `zone` field used to appear here, echoing the load balancer's
-`targets[].zone` label. That config key is refused at config compile
-now (target selection was never locality aware), so the response no
-longer carries it.
+The `zone` field disappeared from this response for a stretch: the
+label was display-only decoration, then refused at config compile,
+and it returned when zone-aware selection shipped and made it a
+routing input. Read it together with `proxy_zone`: a labeled target
+list under a null `proxy_zone` is exactly the shape the boot warning
+about an unzoned proxy points at.
 
 Origins whose action is not `load_balancer` (e.g. `proxy`,
 `ai_proxy`, `static`, `redirect`) are omitted from `origins`.
@@ -1461,10 +1474,14 @@ configured:
 Rules report `inactive`, `ok`, or `firing`, their thresholds, latest reading,
 sample count, and evaluation timestamp. Provider error-rate evaluation stays
 inactive until at least 10 provider attempts contribute to the interval.
-Channels report only their type, stable index, sanitized scheme and host, or
-whether a PagerDuty routing key is configured. URLs, paths, credentials,
-headers, and routing keys are never returned. Delivery health is `untested`,
-`healthy`, or `failing`, with a bounded error summary and latest-attempt time.
+Channels report only their type, stable index, sanitized origin (scheme,
+host, and port), or whether a PagerDuty routing key is configured. Paths,
+query strings, credentials, headers, and routing keys are never returned;
+a Slack or Teams webhook keeps its whole secret in the path, so the origin
+is as much of the URL as this surface will show. The port is part of the
+origin, so two receivers on one host are distinguishable here. Delivery
+health is `untested`, `healthy`, or `failing`, with a bounded error summary
+and latest-attempt time.
 
 History retains at most 200 fired, resolved, and channel-test events for the
 life of the process. It is not durable. `authority: "file"` and
@@ -1694,17 +1711,46 @@ The top-level `egress:` section (see
 [Egress allowlists](configuration.md#egress-allowlists)) arms six of
 the purposes above through five sub-blocks: `ai_providers` (AI
 providers), `usage_sinks` (usage sinks and webhooks, one allowlist for
-both), `model_artifacts`, `token_exchange` (the non-MCP token-exchange
-resolver only), and `telemetry`. Until a sub-block sets
+both, including the `events:` webhook sink), `model_artifacts`,
+`token_exchange` (both the non-MCP outbound-credential resolver and the
+MCP run-as-user token exchange), and `telemetry`. Until a sub-block sets
 `mode: deny_by_default`, its purpose stays `ungated`: reached, but
 nothing was ever denied because nothing was armed.
 
-Four more purposes arm outside that section, per-tool or per-action:
-MCP upstream connects, OpenAPI-backed MCP tools, and the MCP
-token-exchange path each take a per-server `egress:` block (see [mcp-security.md](mcp-security.md));
-the dual-LLM quarantine judge takes a per-action `egress:` block.
+Three more purposes arm outside that section, per-tool or per-action:
+MCP upstream connects and OpenAPI-backed MCP tools take a per-server
+`egress:` block (see [mcp-security.md](mcp-security.md)), and the
+dual-LLM quarantine judge takes a per-action `egress:` block. A
+per-server `egress:` block does not reach the token-exchange purpose;
+that one is armed by `egress.token_exchange` and nothing else.
 Extension bundle hooks are armed automatically from the bundle's own
 outbound grant and never appear as `ungated`.
+
+No purpose lets its HTTP client follow a redirect on its own. Each `3xx`
+`Location` is re-authorized from scratch, against the same purpose, with
+fresh DNS pins; a chain longer than ten hops is refused with
+`too_many_redirects`.
+
+Two purposes go further and dial only the addresses that authorization
+resolved, on the first request and on every hop after it: the
+`token_exchange` calls the MCP run-as-user exchange makes, and the
+`webhook` deliveries the `events:` sink makes. Those are the two whose
+request body is itself a credential. The others, `ai_provider`,
+`usage_sink`, and `model_artifact`, re-authorize each hop against the
+allowlist and then let the client resolve the host again at dial time,
+so the allowlist and the hop bound apply and the DNS pin does not yet.
+
+Every hop shows up in this inventory under its own host, so a redirect
+chain is visible here as the several destinations it actually is rather
+than as the one URL an operator configured.
+
+On the two pinned purposes, a hop that changes scheme, host, or port
+drops `Authorization`, `Proxy-Authorization`, `Cookie`, and any
+signature header before it is replayed. A request carrying a body does
+not make that hop at all: it is refused with
+`redirect_to_unlisted_host`, because a body that is itself the
+credential (an OAuth subject token in a form field, an HMAC-signed event
+batch) cannot be stripped and still be the request the caller asked for.
 
 One purpose cannot be armed by any config today: engine-artifact
 downloads pass no authorizer, so they stay `ungated` regardless of

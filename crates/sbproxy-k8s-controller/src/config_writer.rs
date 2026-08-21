@@ -36,6 +36,7 @@
 //! `docs/gateway-api.md` lists what is not translated.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::Path;
 
 use serde::Serialize;
@@ -324,11 +325,86 @@ pub fn render(
     }
 }
 
-/// Write a rendered document to `path`.
+/// Write a rendered document to `path`, whole or not at all.
+///
+/// The data plane reads this file from a shared volume and re-reads it
+/// on every change, so a partially written document is not a transient
+/// state it rides out: `std::fs::write` truncates first, and a
+/// controller killed between the truncate and the write leaves an empty
+/// or half-written `sb.yml` on disk permanently. The proxy that restarts
+/// after that cannot boot on it.
+///
+/// So the document goes to a temporary file in the same directory, is
+/// flushed to the platter, and is moved into place with a rename.
+///
+/// # What is guaranteed, and what is not
+///
+/// `rename(2)` within one directory is atomic, so a reader either opens
+/// the previous complete document or the new complete one. Never a
+/// prefix of either. `sync_all` on the temporary before the rename is
+/// what makes the new contents durable rather than the rename merely
+/// pointing at unwritten pages, and the `fsync` of the directory
+/// afterwards is what makes the rename itself survive power loss. On
+/// crash-consistency terms: after this returns `Ok`, the new document is
+/// on stable storage; if it returns `Err`, the previous file is
+/// untouched and no temporary is left behind.
+///
+/// Two caveats worth stating rather than implying. The temporary is
+/// created in `path`'s own directory because a rename is atomic only
+/// within a filesystem, and `/tmp` frequently is not the same one. And
+/// on a network filesystem, an NFS-backed `PersistentVolume` among them,
+/// rename atomicity and `fsync` durability are the server's promise, not
+/// the kernel's; this is as good as the volume underneath it.
+///
+/// The temporary carries the pid and a nanosecond stamp because the
+/// deployment shares one volume between replicas. Two containers can
+/// both be pid 1, so the pid alone does not separate them.
 pub fn write_config(config: &GeneratedConfig, path: &Path) -> anyhow::Result<()> {
     let yaml = config.to_yaml()?;
-    std::fs::write(path, yaml)?;
-    Ok(())
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("sb.yml");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let temporary = parent.join(format!(".{file_name}.{}.{nanos}.tmp", std::process::id()));
+
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&temporary)?;
+        // A rename swaps the inode, so the mode an operator set on the
+        // published file would otherwise be reset to the umask default
+        // on every reconcile. Carry it across; a first publish keeps the
+        // default it has always had.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(existing) = std::fs::metadata(path) {
+                let mode = existing.permissions().mode() & 0o777;
+                file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+            }
+        }
+        file.write_all(yaml.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        // Durability of the directory entry itself. Windows has no
+        // handle to a directory to sync, and no controller image ships
+        // for it.
+        #[cfg(unix)]
+        {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+
+    if result.is_err() {
+        // Best effort: the publish already failed, and a leftover
+        // dotfile in the mount is the smaller problem.
+        let _ = std::fs::remove_file(&temporary);
+    }
+    Ok(result?)
 }
 
 // --- Listener planning ------------------------------------------------
@@ -2366,6 +2442,109 @@ origins:
         write_config(&rendered.config, &path).expect("write succeeds");
         let body = std::fs::read_to_string(&path).expect("read back");
         assert!(body.contains("http_bind_port: 8080"));
+    }
+
+    /// The durability half of the publish. A crash between the truncate
+    /// and the write cannot be staged in-process, but every failure of
+    /// the publish takes the same branch, and the guarantee is the same
+    /// one: the document already on disk is still whole afterwards.
+    ///
+    /// Dropping the directory's write bit is what stages it. Note that
+    /// it does not stop the old `std::fs::write` at all: truncating an
+    /// existing file needs write permission on the file, not on its
+    /// directory, so the pre-fix writer succeeds here and rewrites the
+    /// document. It is creating the temporary that needs the directory.
+    #[cfg(unix)]
+    #[test]
+    fn write_config_leaves_the_previous_document_intact_when_publication_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("sb.yml");
+        let published = render_default(&[simple_gateway()], &[], &[]);
+        write_config(&published.config, &path).expect("the first publish succeeds");
+        let last_good = std::fs::read_to_string(&path).expect("read back");
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500))
+            .expect("drop the directory write bit");
+
+        // Root ignores the write bit, so on a privileged runner this
+        // injection cannot fire and the assertions below would be
+        // vacuous. Restore and leave rather than pretend. Every lane
+        // that gates this workspace runs unprivileged.
+        let probe = dir.path().join(".privilege-probe");
+        if std::fs::File::create(&probe).is_ok() {
+            let _ = std::fs::remove_file(&probe);
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("restore the directory");
+            return;
+        }
+
+        let replacement = render_default(&[], &[], &[]);
+        let error = write_config(&replacement.config, &path);
+
+        // Restore before asserting so the temp dir can still clean up
+        // when an assertion below fails.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("restore the directory");
+
+        let error = error.expect_err("a publish that cannot write its temporary fails");
+        assert!(!format!("{error}").is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the previous document is still readable"),
+            last_good,
+            "a failed publish left something other than the last good document"
+        );
+    }
+
+    /// A rename that fails leaves its temporary behind, and this file is
+    /// written on every reconcile. One dotfile per failure fills the
+    /// volume the data plane reads from.
+    #[test]
+    fn write_config_leaves_no_temporary_behind() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("sb.yml");
+        let rendered = render_default(&[simple_gateway()], &[], &[]);
+        write_config(&rendered.config, &path).expect("write succeeds");
+        write_config(&rendered.config, &path).expect("republish succeeds");
+
+        let mut entries: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read the directory")
+            .map(|entry| {
+                entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        entries.sort();
+        assert_eq!(entries, vec!["sb.yml".to_string()]);
+    }
+
+    /// The publish swaps the inode, so without carrying the mode across
+    /// a reconcile would silently reopen a file an operator had locked
+    /// down.
+    #[cfg(unix)]
+    #[test]
+    fn republishing_keeps_the_mode_the_published_file_already_had() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("sb.yml");
+        let rendered = render_default(&[simple_gateway()], &[], &[]);
+        write_config(&rendered.config, &path).expect("the first publish succeeds");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
+            .expect("tighten the published file");
+
+        write_config(&rendered.config, &path).expect("the republish succeeds");
+
+        let mode = std::fs::metadata(&path)
+            .expect("published file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o640, "the republish reset the operator's mode");
     }
 
     #[test]

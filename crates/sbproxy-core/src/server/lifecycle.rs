@@ -973,8 +973,25 @@ fn install_detection_singletons(compiled: &sbproxy_config::CompiledConfig) {
     // did load rather than blocking serving, matching the TLS-catalogue
     // block above.
     {
-        let agent_detect_cfg =
-            crate::pipeline::AgentDetectConfig::from_extensions(&compiled.server.extensions);
+        // WOR-2181 made `from_extensions` fallible, and the pipeline
+        // compile has already run it with `?` on this same block, so a
+        // config that reaches here cannot produce the error arm. The
+        // `tls_fingerprint` block above takes the same position on its
+        // own call. Degrade rather than panic on the impossible case,
+        // and warn so it is not swallowed if it ever happens.
+        let agent_detect_cfg = match crate::pipeline::AgentDetectConfig::from_extensions(
+            &compiled.server.extensions,
+        ) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "proxy.extensions.agent_detect unreadable after compile; \
+                     no agent-detect scorer installed",
+                );
+                crate::pipeline::AgentDetectConfig::default()
+            }
+        };
         if agent_detect_cfg.enabled {
             let rule_scorer: Option<std::sync::Arc<dyn sbproxy_agent_detect::AgentScorer>> =
                 match agent_detect_cfg.rule_pack_path.as_deref() {
@@ -4842,11 +4859,25 @@ fn install_usage_rollups_from_config(compiled: &sbproxy_config::CompiledConfig) 
 /// that gap the moment a future change touched one call site and not the
 /// other; call this one function from both instead.
 ///
-/// Three of the five purposes this section names live behind their own,
-/// separate lazy reader: the usage-sink builder, the model-artifact
-/// fetcher, and the outbound-credential resolver each read their own
-/// purpose out of the registry well after this function returns (the
-/// model-artifact fetcher's own staleness window against a
+/// Four sub-blocks, five purposes: `usage_sinks:` compiles one
+/// allowlist under both `UsageSink` and `Webhook`, because the sinks
+/// underneath it authorize under two different, pre-existing purposes.
+/// The registry is an exact-key map, so both keys have to be written or
+/// the reader that asks for the missing one gets `None` and dials
+/// ungated. That is not hypothetical: this function named only
+/// `UsageSink`, and the `events:` webhook sink, which reads `Webhook`,
+/// therefore ran with no allowlist under every config anyone could
+/// write while three docs said it was gated (WOR-2612). Which keys a
+/// sub-block owns is now read off the compiled authorizer itself, with
+/// [`sbproxy_security::egress::EgressAuthorizer::purposes`], rather
+/// than spelled out here a second time where it can disagree with what
+/// `compile_egress_gates` actually built.
+///
+/// Four of the five purposes live behind their own, separate lazy
+/// reader: the usage-sink builder, the `events:` webhook sink, the
+/// model-artifact fetcher, and the outbound-credential resolver each
+/// read their own purpose out of the registry well after this function
+/// returns (the model-artifact fetcher's own staleness window against a
 /// registry-only reload is documented on
 /// [`sbproxy_model_host::HttpArtifactTransport::with_configured_egress`]).
 /// `AiProvider` is the one purpose armed synchronously, right here,
@@ -4869,21 +4900,39 @@ fn install_usage_rollups_from_config(compiled: &sbproxy_config::CompiledConfig) 
 /// unaffected either way: it is rebuilt on every reload and
 /// re-authorizes itself at construction time.
 fn arm_egress_gates_from_config(compiled: &sbproxy_config::CompiledConfig) {
-    use sbproxy_security::egress::{install_configured_gate, EgressPurpose};
-    install_configured_gate(
-        EgressPurpose::AiProvider,
+    use sbproxy_security::egress::{install_configured_gate, EgressAuthorizer, EgressPurpose};
+
+    /// File one compiled sub-block under every purpose it answers for.
+    ///
+    /// `armed` names what an *absent* sub-block clears. There is no
+    /// authorizer to ask in that case, so it stays a literal here, and
+    /// it has to be a superset of what the sub-block installs: a reload
+    /// that drops the block would otherwise leave a stale allowlist
+    /// armed under the key it forgot.
+    fn arm(armed: &[EgressPurpose], compiled: Option<EgressAuthorizer>) {
+        let keys: Vec<EgressPurpose> = match &compiled {
+            Some(authorizer) => authorizer.purposes(),
+            None => armed.to_vec(),
+        };
+        for purpose in keys {
+            install_configured_gate(purpose, compiled.clone());
+        }
+    }
+
+    arm(
+        &[EgressPurpose::AiProvider],
         compiled.egress.ai_providers.clone(),
     );
-    install_configured_gate(
-        EgressPurpose::UsageSink,
+    arm(
+        &[EgressPurpose::UsageSink, EgressPurpose::Webhook],
         compiled.egress.usage_sinks.clone(),
     );
-    install_configured_gate(
-        EgressPurpose::ModelArtifact,
+    arm(
+        &[EgressPurpose::ModelArtifact],
         compiled.egress.model_artifacts.clone(),
     );
-    install_configured_gate(
-        EgressPurpose::TokenExchange,
+    arm(
+        &[EgressPurpose::TokenExchange],
         compiled.egress.token_exchange.clone(),
     );
     // Rebuild the AI client immediately, in the same call, so `AiProvider`
@@ -7144,6 +7193,89 @@ egress:
             None,
         );
         reload_ai_client();
+    }
+
+    #[test]
+    fn every_purpose_the_compiled_egress_section_arms_is_reachable_in_the_registry() {
+        // WOR-2612 regression, and the guard against the next one of its
+        // shape. A sub-block can compile an allowlist for more than one
+        // purpose: `usage_sinks:` builds one under both `UsageSink` and
+        // `Webhook`. The registry is an exact-key map with no fallback,
+        // so a purpose the compiler armed and the installer skipped
+        // answers `None` for every config, forever, and the consumer
+        // reading that key dials with no allowlist while the operator's
+        // `deny_by_default` block says otherwise. That is what shipped:
+        // `Webhook` was compiled and never installed, and the `events:`
+        // webhook sink is the reader that got `None`.
+        //
+        // The expectation is read off the compiled authorizers rather
+        // than typed out, deliberately. A literal list here would be a
+        // third copy of the same fact and could go stale the same way
+        // the installer's copy did; asking the value what it answers for
+        // cannot. Both directions are checked, because a sub-block that
+        // arms two purposes and clears one is the same bug with the
+        // reload in front of it.
+        let yaml = r#"
+proxy: {}
+egress:
+  ai_providers:
+    mode: deny_by_default
+    hosts: ["api.openai.com"]
+  usage_sinks:
+    mode: deny_by_default
+    hosts: ["collector.internal"]
+  model_artifacts:
+    mode: deny_by_default
+    hosts: ["artifacts.internal"]
+  token_exchange:
+    mode: deny_by_default
+    hosts: ["idp.internal"]
+"#;
+        let compiled = sbproxy_config::compile_config(yaml).expect("config compiles");
+        let armed: Vec<sbproxy_security::egress::EgressPurpose> = [
+            compiled.egress.ai_providers.as_ref(),
+            compiled.egress.usage_sinks.as_ref(),
+            compiled.egress.model_artifacts.as_ref(),
+            compiled.egress.token_exchange.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .flat_map(|authorizer| authorizer.purposes())
+        .collect();
+        assert!(
+            armed.contains(&sbproxy_security::egress::EgressPurpose::Webhook),
+            "the fixture must exercise a sub-block that arms two purposes; \
+             `usage_sinks:` compiling `Webhook` is the case this test is about"
+        );
+
+        arm_egress_gates_from_config(&compiled);
+
+        for purpose in &armed {
+            assert!(
+                sbproxy_security::egress::configured_gate(*purpose).is_some(),
+                "`{}` has a compiled allowlist but no registry slot, so every \
+                 `configured_gate({})` read runs ungated",
+                purpose.as_label(),
+                purpose.as_label()
+            );
+        }
+
+        // A reload that drops the whole `egress:` section has to give
+        // every one of those purposes back to the legacy ungated
+        // contract, not leave the last config's allowlist pinned.
+        let dropped = sbproxy_config::compile_config("proxy: {}\n").expect("bare config compiles");
+        arm_egress_gates_from_config(&dropped);
+        for purpose in &armed {
+            assert!(
+                sbproxy_security::egress::configured_gate(*purpose).is_none(),
+                "`{}` stayed armed after a reload dropped the `egress:` section",
+                purpose.as_label()
+            );
+        }
+
+        // `arm_egress_gates_from_config` rebuilds the AI client itself,
+        // and the bare config above already restored the ungated one, so
+        // there is nothing left for this test to undo.
     }
 
     // WOR-2481: the reload-time seam for the boot-only OTLP trace and

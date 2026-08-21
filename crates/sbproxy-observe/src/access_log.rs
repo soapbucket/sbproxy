@@ -470,6 +470,22 @@ pub struct AccessLogEntry {
     /// never contacted an upstream.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_host: Option<String>,
+    /// How the zone-locality stage shaped the load-balancer selection
+    /// for this request (WOR-2328): `local` when selection was
+    /// narrowed to the proxy's own zone, `spilled` when no same-zone
+    /// target was healthy and selection widened across zones.
+    ///
+    /// Absent, rather than empty, when the stage did not engage: no
+    /// proxy zone, an unlabeled pool, a pool below
+    /// `locality.min_pool_size`, or a request that never reached a
+    /// load balancer at all. An empty string on those lines would read
+    /// as a verdict, and the whole point of the field is that a value
+    /// here means locality decided something.
+    ///
+    /// Pairs with `upstream_host` above: that says which target was
+    /// picked, this says whether picking it crossed a zone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zone_locality: Option<String>,
 
     // --- G6.4 captured headers ---
     /// Request headers captured under the
@@ -712,6 +728,7 @@ impl Default for AccessLogEntry {
             license_token_id: None,
             cap_token_id: None,
             upstream_host: None,
+            zone_locality: None,
             request_headers: BTreeMap::new(),
             response_headers: BTreeMap::new(),
         }
@@ -1033,6 +1050,7 @@ mod tests {
             license_token_id: None,
             cap_token_id: None,
             upstream_host: None,
+            zone_locality: None,
             request_headers: BTreeMap::new(),
             response_headers: BTreeMap::new(),
         }

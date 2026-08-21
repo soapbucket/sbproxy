@@ -81,6 +81,8 @@ Two counters describe the bridge, both labelled by tenant, because a billing num
 curl -s http://127.0.0.1:8080/metrics | grep sbproxy_usage_bridge
 ```
 
+<!-- CAPTURE: curl -s http://127.0.0.1:8080/metrics | grep sbproxy_usage_bridge -->
+
 ```
 # HELP sbproxy_usage_bridge_enqueued_total Billable units the request path queued for a usage reporter, by tenant, reporter, resource type, and whether the row was new
 # TYPE sbproxy_usage_bridge_enqueued_total counter

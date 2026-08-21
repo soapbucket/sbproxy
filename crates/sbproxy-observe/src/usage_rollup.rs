@@ -119,7 +119,14 @@ impl RollupOutcome {
             | "auth_denied"
             | "gateway_auth_denied"
             | "policy_block"
-            | "data_posture_block" => Self::Blocked,
+            | "data_posture_block"
+            // WOR-2559: a per-request price-ceiling refusal is the
+            // gateway declining to dispatch on cost, not an upstream
+            // failure. Before it had its own outcome label it arrived
+            // here as `budget_exceeded` and partitioned as Blocked;
+            // dropping it into Error would have made the ceiling look
+            // like a fault in the spend rollups.
+            | "price_ceiling_block" => Self::Blocked,
             _ => Self::Error,
         }
     }
@@ -1354,6 +1361,10 @@ mod tests {
             // to route, not an upstream error, so it partitions with
             // the other intentional blocks in spend reporting.
             "data_posture_block",
+            // WOR-2559: same reasoning for the price ceiling. It used
+            // to reach here as `budget_exceeded`, so leaving it out
+            // would move real traffic from Blocked to Error.
+            "price_ceiling_block",
         ] {
             assert_eq!(
                 RollupOutcome::from_outcome_label(blocked),

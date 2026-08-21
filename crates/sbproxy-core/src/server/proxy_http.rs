@@ -1013,6 +1013,18 @@ fn begin_load_balancer_attempt(
     });
     ctx.admin_load_balancer_strategy = Some(selection.selection_method.clone());
     ctx.admin_load_balancer_target = Some(format!("{}:{}", selection.host, selection.port));
+    // WOR-2328: per-attempt zone-locality verdict, so a retry that
+    // spills after a local first attempt reports the spill.
+    ctx.admin_zone_locality = selection
+        .zone_locality
+        .map(sbproxy_modules::action::ZoneLocality::as_str);
+    // The verdict is settled here, so this is where it gets a series.
+    // The admin ring above is off by default and the `debug!` further
+    // down is compiled out of a release build, so without this counter
+    // a total local-zone outage leaves no trace an alert can read.
+    if let Some(verdict) = ctx.admin_zone_locality {
+        sbproxy_observe::metrics::record_zone_locality(ctx.hostname.as_str(), verdict);
+    }
 }
 
 fn capture_load_balancer_upstream_response(
@@ -2366,6 +2378,7 @@ impl ProxyHttp for SbProxy {
                     tls = %selection.tls,
                     target_idx = %selection.target_index,
                     selection_method = %selection.selection_method,
+                    zone_locality = ctx.admin_zone_locality.unwrap_or("off"),
                     "load balancer routing request to upstream"
                 );
 
@@ -5284,7 +5297,7 @@ impl ProxyHttp for SbProxy {
                     }
                     Err(e) => {
                         let body_str = serde_json::json!({
-                            "error": "invalid request body for gRPC transcoding",
+                            "error": "gRPC transcoding refused the request",
                             "detail": e.to_string(),
                         })
                         .to_string();
@@ -7842,8 +7855,11 @@ impl ProxyHttp for SbProxy {
                 failover_engaged: ctx.admin_failover_engaged(),
                 failover_from: ctx.admin_failover_from.clone(),
                 failover_to: ctx.admin_failover_to.clone(),
+                failover_trigger: ctx.admin_failover_trigger.clone(),
                 load_balancer_strategy: ctx.admin_load_balancer_strategy.clone(),
                 load_balancer_target: ctx.admin_load_balancer_target.clone(),
+                zone_locality: ctx.admin_zone_locality.map(str::to_string),
+                routing_detail: ctx.admin_routing_detail.clone(),
                 provider: ctx.ai_provider.clone(),
                 model: ctx.ai_model.clone(),
                 tokens_in: ctx.ai_tokens_in,
@@ -9263,6 +9279,7 @@ origins:
             tls: true,
             target_index,
             selection_method: selection_method.to_string(),
+            zone_locality: None,
         }
     }
 
@@ -9626,6 +9643,77 @@ origins:
             Some("target-0.example.com:443")
         );
         finish_load_balancer_attempt(&mut ctx, LoadBalancerAttemptOutcome::Neutral);
+    }
+
+    /// One selection through the real seam, so the counter is proven
+    /// wired rather than merely present.
+    fn select_with_locality(origin: &str, verdict: Option<sbproxy_modules::action::ZoneLocality>) {
+        let pipeline = lifecycle_pipeline();
+        let mut ctx = RequestContext {
+            pipeline: std::sync::Arc::clone(&pipeline),
+            hostname: origin.into(),
+            ..RequestContext::default()
+        };
+        let mut selection = target_selection(0, "round_robin");
+        selection.zone_locality = verdict;
+
+        begin_load_balancer_attempt(&mut ctx, LoadBalancerActionKey::new(0, None), &selection);
+        finish_load_balancer_attempt(&mut ctx, LoadBalancerAttemptOutcome::Neutral);
+    }
+
+    /// WOR-2328: a cross-zone spill has to reach a series an operator
+    /// can alert on. It previously reached only `ctx.admin_zone_locality`
+    /// (the in-memory admin ring, which `admin.enabled` defaults off)
+    /// and a `debug!` line that `release_max_level_info` compiles out,
+    /// so on a release binary a total local-zone outage was visible
+    /// first on the cross-AZ egress bill.
+    #[test]
+    fn a_cross_zone_spill_lands_on_the_locality_counter() {
+        let origin = "spill.locality.test";
+        let series = [("origin", origin), ("verdict", "spilled")];
+        let before = counter_value("sbproxy_lb_zone_locality_total", &series);
+
+        select_with_locality(origin, Some(sbproxy_modules::action::ZoneLocality::Spilled));
+
+        assert_eq!(
+            counter_value("sbproxy_lb_zone_locality_total", &series),
+            before + 1,
+            "rate(sbproxy_lb_zone_locality_total{{verdict=\"spilled\"}}[5m]) is the alert; \
+             nothing incremented the series it reads"
+        );
+    }
+
+    /// The other half of the same seam: a same-zone selection lands on
+    /// the `local` verdict, and a selection the stage stood down on
+    /// records nothing at all, so the two series count exactly the
+    /// selections locality decided rather than all traffic.
+    #[test]
+    fn a_local_selection_and_a_stood_down_stage_are_told_apart() {
+        let origin = "local.locality.test";
+        let local = [("origin", origin), ("verdict", "local")];
+        let before_local = counter_value("sbproxy_lb_zone_locality_total", &local);
+
+        select_with_locality(origin, Some(sbproxy_modules::action::ZoneLocality::Local));
+        assert_eq!(
+            counter_value("sbproxy_lb_zone_locality_total", &local),
+            before_local + 1
+        );
+
+        // No verdict: the stage never engaged, so neither series moves.
+        select_with_locality(origin, None);
+        assert_eq!(
+            counter_value("sbproxy_lb_zone_locality_total", &local),
+            before_local + 1,
+            "a selection the locality stage stood down on must not be counted as a local one"
+        );
+        assert_eq!(
+            counter_value(
+                "sbproxy_lb_zone_locality_total",
+                &[("origin", origin), ("verdict", "spilled")]
+            ),
+            0,
+            "a stood-down stage must not read as a spill"
+        );
     }
 
     #[test]

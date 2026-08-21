@@ -19,6 +19,12 @@ failover. A plain 4xx client error (a malformed request, an auth failure) is
 returned unchanged, and a refusal embedded in a 200 response is a valid
 completion and is not intercepted.
 
+`content_policy_fallback: true` is the next-in-order form: it sends the
+refusal to whichever provider priority order put next. To name the
+providers a refusal should go to instead, use the `content_policy_fallbacks:`
+list shown in [`examples/typed-fallbacks/`](../typed-fallbacks/). When both
+are set, the list wins.
+
 ## Run
 
 ```bash

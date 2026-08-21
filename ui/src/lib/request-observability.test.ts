@@ -196,6 +196,30 @@ describe("gatewayBadges", () => {
       { kind: "legacy", label: "gateway data unavailable", tone: "neutral" },
     ]);
   });
+
+  it("names the typed trigger on a reroute and stays quiet for generic", () => {
+    // WOR-2556: a typed reroute says why, an availability failover
+    // keeps the plain route label.
+    const typed = gatewayBadges(
+      row({
+        failover_engaged: true,
+        failover_from: "small",
+        failover_to: "big-window",
+        failover_trigger: "context_window",
+      }),
+    ).find((badge) => badge.kind === "failover");
+    expect(typed?.label).toBe("context window: small → big-window");
+
+    const generic = gatewayBadges(
+      row({
+        failover_engaged: true,
+        failover_from: "primary",
+        failover_to: "backup",
+        failover_trigger: "generic",
+      }),
+    ).find((badge) => badge.kind === "failover");
+    expect(generic?.label).toBe("primary → backup");
+  });
 });
 
 describe("Logs presentation state", () => {

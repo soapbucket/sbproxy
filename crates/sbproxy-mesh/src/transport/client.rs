@@ -15,20 +15,36 @@
 //! Connection failures take the current connection down and return the error
 //! to the caller; the next call transparently reconnects on demand. There is
 //! no background reconnect task in the MVP - reconnection is lazy.
+//!
+//! # Deadlines (WOR-2637)
+//!
+//! Every await in the request engine below is bounded twice: by its own
+//! phase cap, and by one overall deadline for the whole call that is fixed
+//! before the per-peer lock is even taken. The second bound is the load
+//! bearing one. Five phase timeouts that each restart the clock add up to
+//! five times the number an operator thinks they configured, and a request
+//! path that waits that long is indistinguishable from one that hangs. See
+//! the `PeerTimeouts` constants in this module for the numbers and the
+//! reasoning behind each.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
+use tokio::time::error::Elapsed;
+use tokio::time::Instant as Deadline;
 
 use crate::crypto::Cipher;
 use crate::metrics::{
     MESH_TRANSPORT_RPC_DURATION, MESH_TRANSPORT_RPC_ERRORS, TRANSPORT_RPC_KIND_CONNECT,
     TRANSPORT_RPC_KIND_DECODE, TRANSPORT_RPC_KIND_DECRYPT, TRANSPORT_RPC_KIND_ENCODE,
-    TRANSPORT_RPC_KIND_IO, TRANSPORT_RPC_KIND_REMOTE, TRANSPORT_RPC_KIND_TLS,
+    TRANSPORT_RPC_KIND_IO, TRANSPORT_RPC_KIND_REMOTE, TRANSPORT_RPC_KIND_TIMEOUT_CONNECT,
+    TRANSPORT_RPC_KIND_TIMEOUT_LOCK, TRANSPORT_RPC_KIND_TIMEOUT_READ,
+    TRANSPORT_RPC_KIND_TIMEOUT_TLS, TRANSPORT_RPC_KIND_TIMEOUT_WRITE, TRANSPORT_RPC_KIND_TLS,
 };
 use crate::state::register::VersionedLwwMergeOutcome;
 
@@ -125,6 +141,169 @@ fn cache_op_label(op: &CacheOp) -> &'static str {
     }
 }
 
+// --- Outbound deadlines ---
+
+/// How long a caller waits for the per-peer RPC lock before giving up.
+///
+/// The transport is one connection per peer with one request in flight, so
+/// callers queue behind each other by design. Five seconds is far past the
+/// sub-millisecond round trip a healthy peer answers in, which means a wait
+/// this long is never contention, it is a peer that has stopped answering
+/// while holding the lane. Failing the queued callers fast is what keeps a
+/// single wedged peer from wedging every task that wants it.
+const RPC_LOCK_WAIT: Duration = Duration::from_secs(5);
+
+/// Deadline on the TCP connect.
+///
+/// Three seconds is roughly ten times the worst plausible cross-region
+/// round trip and a small fraction of the kernel's SYN retry schedule,
+/// which on Linux gives up after about two minutes. Without this the OS
+/// timer is the timer, and two minutes on a cache read is a hang.
+const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Deadline on the peer mTLS handshake, after the TCP connect.
+///
+/// Two round trips plus certificate chain verification. Five seconds is
+/// generous for a cross-region handshake on a loaded node and still bounded.
+const RPC_TLS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Deadline on writing one request frame.
+///
+/// A request is small for every operation except a `Put` or `ReplicaApply`
+/// of a large value, which the frame cap allows up to 16 MiB of. Ten seconds
+/// clears that at roughly 13 Mbps, which no mesh link is below. This is also
+/// the bound that catches a peer that accepts a connection and then stops
+/// reading: the send buffer fills and the write parks.
+const RPC_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Deadline on reading one response frame for a point operation.
+///
+/// `Get`, `Put`, `Delete`, `MergeVersioned`, `ReplicaApply`, and
+/// `ReplicaFetch` all answer out of the peer's in-memory shard, so a healthy
+/// reply is sub-millisecond. Ten seconds is four orders of magnitude of
+/// headroom and still short enough that a request path waiting on one is not
+/// simply hung.
+const RPC_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Deadline on reading one response frame for a scanning operation.
+///
+/// `PurgePrefix`, `SyncDigest`, and `SnapshotPrefix` walk the peer's shard
+/// rather than looking one key up, so seconds are a normal answer on a large
+/// one and the point-operation deadline would shed real work. Sixty seconds
+/// is sized for the scan, not for the request path; nothing on a request
+/// path issues these.
+const RPC_SCAN_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Overall deadline for one point-operation RPC, lock wait included.
+///
+/// A per-phase timeout is not a bound on the call. Lock, connect, TLS,
+/// write, and read each restarting their own clock is how a "10 second
+/// timeout" becomes a thirty-something second stall. This is the number that
+/// actually holds, and every phase is clamped to whichever of the two
+/// expires first.
+const RPC_TOTAL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Overall deadline for one scanning RPC, lock wait included.
+const RPC_SCAN_TOTAL_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// How long a cached connection may sit unused before the next request opens
+/// a fresh one instead.
+///
+/// This exists to keep the server's idle reaper from ever being felt. The
+/// serving side reclaims an admission slot from a connection that starts no
+/// frame for five minutes; if the client only found out by writing into a
+/// socket the peer had already closed, every quiet period would cost one
+/// failed RPC. Recycling at a fifth of that window moves the reconnect to
+/// this side, where it is a fresh connect on a call that then succeeds,
+/// and costs one extra handshake per idle peer per minute.
+const CLIENT_IDLE_REUSE_MAX: Duration = Duration::from_secs(60);
+
+/// Network deadlines for one [`PeerClient`].
+///
+/// Not operator-configurable; the reasoning for each default lives at its
+/// constant. Tests construct narrow values through
+/// [`PeerClient::with_timeouts`] so a deadline is observable in
+/// milliseconds instead of seconds.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PeerTimeouts {
+    /// Cap on waiting for the per-peer RPC lock. See [`RPC_LOCK_WAIT`].
+    pub(crate) lock_wait: Duration,
+    /// Cap on the TCP connect. See [`RPC_CONNECT_TIMEOUT`].
+    pub(crate) connect: Duration,
+    /// Cap on the peer mTLS handshake. See [`RPC_TLS_TIMEOUT`].
+    pub(crate) tls: Duration,
+    /// Cap on writing the request frame. See [`RPC_WRITE_TIMEOUT`].
+    pub(crate) write: Duration,
+    /// Cap on reading a point operation's response. See [`RPC_READ_TIMEOUT`].
+    pub(crate) read: Duration,
+    /// Cap on reading a scanning operation's response. See
+    /// [`RPC_SCAN_READ_TIMEOUT`].
+    pub(crate) scan_read: Duration,
+    /// Overall cap on a point operation. See [`RPC_TOTAL_TIMEOUT`].
+    pub(crate) total: Duration,
+    /// Overall cap on a scanning operation. See [`RPC_SCAN_TOTAL_TIMEOUT`].
+    pub(crate) scan_total: Duration,
+    /// Idle window past which a cached connection is replaced rather than
+    /// reused. See [`CLIENT_IDLE_REUSE_MAX`].
+    pub(crate) idle_reuse_max: Duration,
+}
+
+impl Default for PeerTimeouts {
+    fn default() -> Self {
+        Self {
+            lock_wait: RPC_LOCK_WAIT,
+            connect: RPC_CONNECT_TIMEOUT,
+            tls: RPC_TLS_TIMEOUT,
+            write: RPC_WRITE_TIMEOUT,
+            read: RPC_READ_TIMEOUT,
+            scan_read: RPC_SCAN_READ_TIMEOUT,
+            total: RPC_TOTAL_TIMEOUT,
+            scan_total: RPC_SCAN_TOTAL_TIMEOUT,
+            idle_reuse_max: CLIENT_IDLE_REUSE_MAX,
+        }
+    }
+}
+
+impl PeerTimeouts {
+    /// Overall deadline and response cap for `op`.
+    ///
+    /// Two classes, because one number cannot serve both. A point operation
+    /// is a hash lookup on the peer and belongs to a request path; a scan
+    /// walks the peer's shard and legitimately takes seconds. Sizing both by
+    /// the scan would leave a request path waiting a minute on a dead peer,
+    /// and sizing both by the point op would fail every large purge.
+    fn budget_for(&self, op: &CacheOp) -> (Duration, Duration) {
+        match op {
+            CacheOp::PurgePrefix { .. }
+            | CacheOp::SyncDigest { .. }
+            | CacheOp::SnapshotPrefix { .. } => (self.scan_total, self.scan_read),
+            CacheOp::Get { .. }
+            | CacheOp::Put { .. }
+            | CacheOp::Delete { .. }
+            | CacheOp::MergeVersioned { .. }
+            | CacheOp::ReplicaApply { .. }
+            | CacheOp::ReplicaFetch { .. } => (self.total, self.read),
+        }
+    }
+}
+
+/// Await `future` under both its own phase cap and the request's overall
+/// deadline, whichever comes first.
+///
+/// Neither clock restarts inside the call, and the overall deadline is a
+/// fixed point in time rather than a duration, so the phases cannot add up
+/// past it however many of them run.
+async fn under_deadline<F>(
+    deadline: Deadline,
+    cap: Duration,
+    future: F,
+) -> Result<F::Output, Elapsed>
+where
+    F: Future,
+{
+    tokio::time::timeout_at(deadline.min(Deadline::now() + cap), future).await
+}
+
 // --- PeerClient ---
 
 /// Per-peer RPC client. Holds exactly one TCP connection; reconnects lazily
@@ -144,6 +323,8 @@ pub struct PeerClient {
     /// counter. The `Mutex` also serialises send/recv so the MVP is always
     /// at most one request in flight per peer.
     inner: Arc<Mutex<InnerClient>>,
+    /// Network deadlines for every phase of an outbound RPC.
+    timeouts: PeerTimeouts,
 }
 
 /// Internal state guarded by `PeerClient::inner`.
@@ -153,6 +334,10 @@ struct InnerClient {
     stream: Option<MeshConn>,
     /// Monotonic per-connection request id. Reset on reconnect.
     next_id: u64,
+    /// When the current connection last completed a round trip. `None`
+    /// before the first one. Drives the idle recycle that keeps this side
+    /// ahead of the peer's idle reaper.
+    last_used: Option<Instant>,
 }
 
 impl PeerClient {
@@ -181,6 +366,21 @@ impl PeerClient {
     /// a mutually-authenticated TLS session after the TCP connect, so an
     /// untrusted peer (or a man-in-the-middle) cannot serve mesh RPCs.
     pub fn with_security(addr: String, cipher: Option<Cipher>, tls: Option<MeshTlsClient>) -> Self {
+        Self::with_timeouts(addr, cipher, tls, PeerTimeouts::default())
+    }
+
+    /// [`Self::with_security`] with explicit network deadlines.
+    ///
+    /// In-crate only. The deadlines are not config keys on purpose: each
+    /// default carries its reasoning at its constant, and a deadline an
+    /// operator can raise to "none" is not a deadline. Tests use this to
+    /// watch a bound fire in milliseconds.
+    pub(crate) fn with_timeouts(
+        addr: String,
+        cipher: Option<Cipher>,
+        tls: Option<MeshTlsClient>,
+        timeouts: PeerTimeouts,
+    ) -> Self {
         Self {
             addr,
             cipher,
@@ -188,7 +388,9 @@ impl PeerClient {
             inner: Arc::new(Mutex::new(InnerClient {
                 stream: None,
                 next_id: 1,
+                last_used: None,
             })),
+            timeouts,
         }
     }
 
@@ -440,35 +642,103 @@ impl PeerClient {
     /// paired response, and returns the result.
     ///
     /// Any transport error clears `inner.stream` so the next call starts by
-    /// reconnecting.
+    /// reconnecting, and so does any deadline: a connection that missed a
+    /// deadline has an unread response or half a request still on it, and
+    /// reusing it would pair the next caller's request with this caller's
+    /// answer.
     async fn send_request(&self, op: CacheOp) -> anyhow::Result<CacheResult> {
         let started = Instant::now();
         let op_label = cache_op_label(&op);
-        let mut guard = self.inner.lock().await;
+        // Fixed before the lock, so the whole call is bounded rather than
+        // each of its phases separately.
+        let (total, read_cap) = self.timeouts.budget_for(&op);
+        let deadline = Deadline::now() + total;
+
+        let Ok(mut guard) =
+            under_deadline(deadline, self.timeouts.lock_wait, self.inner.lock()).await
+        else {
+            MESH_TRANSPORT_RPC_ERRORS
+                .with_label_values(&[TRANSPORT_RPC_KIND_TIMEOUT_LOCK])
+                .inc();
+            return Err(anyhow::anyhow!(
+                "peer {} is busy: no RPC slot within {:?}",
+                self.addr,
+                self.timeouts.lock_wait
+            ));
+        };
+
+        // --- Recycle a connection the peer is about to reap ---
+        //
+        // The serving side reclaims an admission slot from a connection that
+        // starts no frame for its idle window. Finding that out by writing
+        // into a socket the peer already closed would cost one failed RPC
+        // per quiet period, so the reconnect happens here instead, on a call
+        // that then succeeds.
+        if guard
+            .last_used
+            .is_some_and(|last| last.elapsed() >= self.timeouts.idle_reuse_max)
+        {
+            guard.stream = None;
+            guard.last_used = None;
+        }
 
         // --- Ensure we're connected ---
         if guard.stream.is_none() {
-            let tcp = TcpStream::connect(&self.addr).await.map_err(|e| {
-                MESH_TRANSPORT_RPC_ERRORS
-                    .with_label_values(&[TRANSPORT_RPC_KIND_CONNECT])
-                    .inc();
-                anyhow::anyhow!("connect to {} failed: {}", self.addr, e)
-            })?;
+            let tcp = match under_deadline(
+                deadline,
+                self.timeouts.connect,
+                TcpStream::connect(&self.addr),
+            )
+            .await
+            {
+                Err(_elapsed) => {
+                    MESH_TRANSPORT_RPC_ERRORS
+                        .with_label_values(&[TRANSPORT_RPC_KIND_TIMEOUT_CONNECT])
+                        .inc();
+                    return Err(anyhow::anyhow!(
+                        "connect to {} timed out after {:?}",
+                        self.addr,
+                        self.timeouts.connect
+                    ));
+                }
+                Ok(Err(e)) => {
+                    MESH_TRANSPORT_RPC_ERRORS
+                        .with_label_values(&[TRANSPORT_RPC_KIND_CONNECT])
+                        .inc();
+                    return Err(anyhow::anyhow!("connect to {} failed: {}", self.addr, e));
+                }
+                Ok(Ok(tcp)) => tcp,
+            };
             // Small perf win on the wire side: coalescing is almost never
             // beneficial for a request/response RPC.
             let _ = tcp.set_nodelay(true);
             let conn = match &self.tls {
-                Some(t) => MeshConn::Tls(Box::new(
-                    t.connector
-                        .connect(t.server_name.clone(), tcp)
-                        .await
-                        .map_err(|e| {
+                Some(t) => {
+                    let handshake = t.connector.connect(t.server_name.clone(), tcp);
+                    match under_deadline(deadline, self.timeouts.tls, handshake).await {
+                        Err(_elapsed) => {
+                            MESH_TRANSPORT_RPC_ERRORS
+                                .with_label_values(&[TRANSPORT_RPC_KIND_TIMEOUT_TLS])
+                                .inc();
+                            return Err(anyhow::anyhow!(
+                                "TLS handshake to {} timed out after {:?}",
+                                self.addr,
+                                self.timeouts.tls
+                            ));
+                        }
+                        Ok(Err(e)) => {
                             MESH_TRANSPORT_RPC_ERRORS
                                 .with_label_values(&[TRANSPORT_RPC_KIND_TLS])
                                 .inc();
-                            anyhow::anyhow!("TLS handshake to {} failed: {}", self.addr, e)
-                        })?,
-                )),
+                            return Err(anyhow::anyhow!(
+                                "TLS handshake to {} failed: {}",
+                                self.addr,
+                                e
+                            ));
+                        }
+                        Ok(Ok(tls_stream)) => MeshConn::Tls(Box::new(tls_stream)),
+                    }
+                }
                 None => MeshConn::Plain(tcp),
             };
             guard.stream = Some(conn);
@@ -496,25 +766,50 @@ impl PeerClient {
         // The split borrows on `guard.stream` are confined to the inner
         // block so they end before we touch `guard.stream = None`. Any I/O
         // error tears the connection down so the next call reconnects.
-        let io_result: anyhow::Result<Vec<u8>> = {
+        //
+        // Each arm carries the metric `kind` it should be counted under, so
+        // there is one place that increments and the closed set cannot grow
+        // a value in a branch nobody reviewed.
+        let io_result: Result<Vec<u8>, (&'static str, anyhow::Error)> = {
             // `MeshConn` is `AsyncRead + AsyncWrite`; write then read run
             // sequentially on the same connection, so no split is needed.
             let conn = guard.stream.as_mut().expect("connected above");
-            match write_frame(conn, &on_wire).await {
-                Ok(()) => match read_frame(conn).await {
-                    Ok(b) => Ok(b),
-                    Err(e) => Err(anyhow::anyhow!("read from {} failed: {}", self.addr, e)),
+            match under_deadline(deadline, self.timeouts.write, write_frame(conn, &on_wire)).await {
+                Err(_elapsed) => Err((
+                    TRANSPORT_RPC_KIND_TIMEOUT_WRITE,
+                    anyhow::anyhow!(
+                        "write to {} timed out after {:?}",
+                        self.addr,
+                        self.timeouts.write
+                    ),
+                )),
+                Ok(Err(e)) => Err((
+                    TRANSPORT_RPC_KIND_IO,
+                    anyhow::anyhow!("write to {} failed: {}", self.addr, e),
+                )),
+                Ok(Ok(())) => match under_deadline(deadline, read_cap, read_frame(conn)).await {
+                    Err(_elapsed) => Err((
+                        TRANSPORT_RPC_KIND_TIMEOUT_READ,
+                        anyhow::anyhow!(
+                            "no response from {} within {:?}",
+                            self.addr,
+                            read_cap.min(total)
+                        ),
+                    )),
+                    Ok(Err(e)) => Err((
+                        TRANSPORT_RPC_KIND_IO,
+                        anyhow::anyhow!("read from {} failed: {}", self.addr, e),
+                    )),
+                    Ok(Ok(b)) => Ok(b),
                 },
-                Err(e) => Err(anyhow::anyhow!("write to {} failed: {}", self.addr, e)),
             }
         };
         let resp_bytes = match io_result {
             Ok(b) => b,
-            Err(e) => {
-                MESH_TRANSPORT_RPC_ERRORS
-                    .with_label_values(&[TRANSPORT_RPC_KIND_IO])
-                    .inc();
+            Err((kind, e)) => {
+                MESH_TRANSPORT_RPC_ERRORS.with_label_values(&[kind]).inc();
                 guard.stream = None;
+                guard.last_used = None;
                 return Err(e);
             }
         };
@@ -530,6 +825,7 @@ impl PeerClient {
                         .with_label_values(&[TRANSPORT_RPC_KIND_DECRYPT])
                         .inc();
                     guard.stream = None;
+                    guard.last_used = None;
                     return Err(anyhow::anyhow!(
                         "response from {} failed AEAD decrypt",
                         self.addr
@@ -550,12 +846,15 @@ impl PeerClient {
             // map. In the serial MVP a mismatch is a bug; tear the
             // connection down so state resyncs on the next call.
             guard.stream = None;
+            guard.last_used = None;
             return Err(anyhow::anyhow!(
                 "request/response id mismatch: sent {}, got {}",
                 request_id,
                 resp.request_id
             ));
         }
+        // A completed round trip is what the idle recycle measures from.
+        guard.last_used = Some(Instant::now());
         MESH_TRANSPORT_RPC_DURATION
             .with_label_values(&[op_label])
             .observe(started.elapsed().as_secs_f64());
@@ -1114,5 +1413,247 @@ mod tests {
         assert_eq!(got, Some(Bytes::from_static(b"pv")));
 
         server.shutdown();
+    }
+
+    // --- Outbound deadlines (WOR-2637) ---
+
+    /// A peer that completes the TCP handshake, holds the socket, and never
+    /// writes a byte. This is the shape the two existing "unreachable peer"
+    /// tests do *not* cover: they point at `127.0.0.1:1`, which refuses, and
+    /// a refusal returns on its own. Nothing here ever returns on its own.
+    async fn silent_peer() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr").to_string();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                // Held, not dropped: dropping would send a FIN and let the
+                // client off the hook.
+                held.push(stream);
+            }
+        });
+        (addr, task)
+    }
+
+    /// A peer that answers every framed request with `Value(None)` and
+    /// counts the connections it accepted.
+    async fn counting_peer() -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::AtomicUsize;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr").to_string();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        let task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    while let Ok(payload) = read_frame(&mut stream).await {
+                        let Ok(request) = crate::transport::wire::decode::<Request>(&payload)
+                        else {
+                            break;
+                        };
+                        let response = Response {
+                            request_id: request.request_id,
+                            result: CacheResult::Value(None),
+                        };
+                        let Ok(bytes) = crate::transport::wire::encode(&response) else {
+                            break;
+                        };
+                        if write_frame(&mut stream, &bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, accepted, task)
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_accepts_and_never_answers_loses_to_the_read_deadline() {
+        let (addr, peer) = silent_peer().await;
+        let client = PeerClient::with_timeouts(
+            addr,
+            None,
+            None,
+            PeerTimeouts {
+                read: Duration::from_millis(200),
+                total: Duration::from_millis(500),
+                ..PeerTimeouts::default()
+            },
+        );
+
+        // The outer timeout is the assertion. Without a read deadline this
+        // call never returns and the harness limit is what ends the test.
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(10), client.get("k".to_string())).await;
+        let error = outcome
+            .expect("the RPC must return on its own, not on the harness limit")
+            .expect_err("a peer that never answers is not a successful get");
+        assert!(
+            error.to_string().contains("no response from"),
+            "expected a read-deadline error, got: {error}"
+        );
+
+        peer.abort();
+    }
+
+    #[tokio::test]
+    async fn one_wedged_peer_does_not_wedge_every_caller() {
+        // The transport is one connection per peer, so callers queue on the
+        // lock. Bounding only the network leaves the hundredth caller
+        // waiting a hundred read deadlines; the lock deadline is what keeps
+        // the lane from being the wedge.
+        let (addr, peer) = silent_peer().await;
+        let client = Arc::new(PeerClient::with_timeouts(
+            addr,
+            None,
+            None,
+            PeerTimeouts {
+                lock_wait: Duration::from_millis(100),
+                read: Duration::from_millis(200),
+                total: Duration::from_millis(500),
+                ..PeerTimeouts::default()
+            },
+        ));
+
+        let started = Instant::now();
+        let mut callers = Vec::new();
+        for index in 0..100u32 {
+            let client = Arc::clone(&client);
+            callers.push(tokio::spawn(async move {
+                client.get(format!("k-{index}")).await
+            }));
+        }
+        let mut failures = 0usize;
+        let joined = tokio::time::timeout(Duration::from_secs(20), async {
+            for caller in callers {
+                if caller.await.expect("caller task").is_err() {
+                    failures += 1;
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            joined.is_ok(),
+            "100 callers against one silent peer never came back"
+        );
+        assert_eq!(failures, 100, "a silent peer cannot serve anybody");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the queue behind a wedged peer must not serialise 100 full deadlines, took {:?}",
+            started.elapsed()
+        );
+
+        peer.abort();
+    }
+
+    #[tokio::test]
+    async fn an_idle_connection_is_replaced_before_the_peer_reaps_it() {
+        // The serving side reclaims a slot from a connection that goes quiet.
+        // Discovering that by writing into an already-closed socket would
+        // cost one failed RPC per quiet period, so this side recycles first.
+        use std::sync::atomic::Ordering;
+
+        let (addr, accepted, peer) = counting_peer().await;
+        let client = PeerClient::with_timeouts(
+            addr,
+            None,
+            None,
+            PeerTimeouts {
+                idle_reuse_max: Duration::from_millis(100),
+                ..PeerTimeouts::default()
+            },
+        );
+
+        client.get("a".to_string()).await.expect("first get");
+        client.get("b".to_string()).await.expect("second get");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "back-to-back requests must share one connection"
+        );
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        client.get("c".to_string()).await.expect("third get");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            2,
+            "a connection idle past the reuse window must be replaced"
+        );
+
+        peer.abort();
+    }
+
+    #[tokio::test]
+    async fn a_phase_cannot_outlive_the_whole_request_budget() {
+        // The mechanism behind the connect and TLS bounds: a generous phase
+        // cap is still clamped by the overall deadline, so five phases
+        // cannot add up to five times the number an operator was promised.
+        let deadline = Deadline::now() + Duration::from_millis(100);
+        let started = Instant::now();
+        let outcome = under_deadline(
+            deadline,
+            Duration::from_secs(60),
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert!(outcome.is_err(), "the overall deadline must win");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "waited {:?}, so the phase cap was used instead of the deadline",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn the_shipped_outbound_deadlines_are_the_documented_ones() {
+        // A default that drifts is a bound nobody reviewed.
+        let timeouts = PeerTimeouts::default();
+        assert_eq!(timeouts.lock_wait, Duration::from_secs(5));
+        assert_eq!(timeouts.connect, Duration::from_secs(3));
+        assert_eq!(timeouts.tls, Duration::from_secs(5));
+        assert_eq!(timeouts.write, Duration::from_secs(10));
+        assert_eq!(timeouts.read, Duration::from_secs(10));
+        assert_eq!(timeouts.scan_read, Duration::from_secs(60));
+        assert_eq!(timeouts.total, Duration::from_secs(15));
+        assert_eq!(timeouts.scan_total, Duration::from_secs(90));
+        assert_eq!(timeouts.idle_reuse_max, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn a_scan_gets_the_scan_budget_and_a_point_op_does_not() {
+        // One number cannot serve both: a purge legitimately walks the
+        // peer's shard, a get is a hash lookup on a request path.
+        let timeouts = PeerTimeouts::default();
+        assert_eq!(
+            timeouts.budget_for(&CacheOp::Get {
+                key: "k".to_string()
+            }),
+            (timeouts.total, timeouts.read)
+        );
+        assert_eq!(
+            timeouts.budget_for(&CacheOp::PurgePrefix {
+                prefix: String::new()
+            }),
+            (timeouts.scan_total, timeouts.scan_read)
+        );
+        assert_eq!(
+            timeouts.budget_for(&CacheOp::SnapshotPrefix {
+                prefix: "member:".to_string(),
+                maximum: 16,
+            }),
+            (timeouts.scan_total, timeouts.scan_read)
+        );
     }
 }

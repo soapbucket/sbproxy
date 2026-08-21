@@ -1,6 +1,6 @@
 # Classifier Sidecar
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 SBproxy heavily invests in out-of-process AI safety via the `sbproxy-classifier-sidecar` and `sbproxy-classifier-client` crates. These components allow you to run remote or local Machine Learning safety classifiers (e.g., prompt injection detection, PII detection, toxicity) outside of the main proxy process using gRPC.
 
@@ -40,7 +40,153 @@ cargo run -p sbproxy-classifier-sidecar -- \
   --model prompt-injection=/opt/models/deberta-injection.onnx:/opt/models/tokenizer.json
 ```
 
-## 3. Configuring the Proxy
+## 3. Request Limits and Load Shedding
+
+The sidecar accepts caller-supplied text and hands it to a synchronous,
+CPU-bound model on Tokio's blocking pool. Every RPC that does that is
+bounded, and every bound has a finite default, so a sidecar started with
+no limit flags at all is still bounded.
+
+### What the defaults are
+
+| Flag | Applies to | Default | Ceiling |
+|---|---|---|---|
+| `--inference-max-request-bytes` | `Classify`, `Embed` | `1048576` (1 MiB) | `16777216` |
+| `--inference-max-items` | `Embed` batch size | `64` | `4096` |
+| `--inference-max-concurrent` | `Classify`, and separately `Embed` | this host's available parallelism, held between `4` and `64` | `64` |
+| `--inference-max-queued` | `Classify`, and separately `Embed` | eight per running slot | `1024` |
+| `--inference-timeout-ms` | `Classify`, `Embed`, `Compress` | `30000` | `600000` |
+| `--token-max-request-bytes` | `Compress` | `1048576` (1 MiB) | `16777216` |
+| `--token-max-concurrent` | `Compress` | `2` | `64` |
+| `--token-max-queued` | `Compress` | `8` | `1024` |
+
+`Classify`, `Embed`, and `Compress` each hold their own running and queue
+semaphores, so a burst of one RPC cannot consume the slots another needs.
+`Compress` keeps the tighter concurrency default because a token-pruning
+pass over a long document costs far more than one classification.
+
+The two concurrency defaults print in `--help` as the numbers this host
+resolved them to. They are derived rather than written down because a
+classification is CPU-bound work: one forward pass holds one thread until
+it returns, so how many a box can genuinely run at once is its core count,
+and any literal is wrong on every box but the one it was chosen on. Being
+wrong low is the expensive direction. A sidecar that sheds below what the
+hardware can serve does not show up as latency an operator can watch; the
+detector gives up after 250 ms and treats the refusal exactly like a
+sidecar that is down, so the shed lands as a `failure_posture` decision on
+live traffic.
+
+Queue depth follows the running set for the same reason in reverse. What
+matters about a queue slot is how long its occupant waits, and a request
+`n` deep behind a full running set starts after roughly
+`n / max_concurrent` service times, so a flat count is a different wait on
+every machine and the small machine draws the long one. Eight slots per
+running slot holds the wait steady instead. At the floor that is four
+running and thirty-two queued, so no host gets a shallower queue than a
+flat default would have handed it.
+
+### Setting the limits on a supervised sidecar
+
+When the proxy spawns the sidecar itself (the `Supervisor` in
+`sbproxy_classifier_client`, described in
+[prompt-injection-v2.md](prompt-injection-v2.md#child-supervisor-auto-spawn)),
+the operator never types the child's command line. `SupervisorConfig`
+carries the five inference limits as optional overrides, and the supervisor
+appends the matching flag for each one it is given:
+
+```rust,ignore
+Supervisor::spawn(SupervisorConfig {
+    binary: PathBuf::from("/opt/sbproxy/sbproxy-classifier-sidecar"),
+    uds_path: uds_path.clone(),
+    models: vec!["prompt-injection=/models/model.onnx:/models/tokenizer.json".into()],
+    default_model: Some("prompt-injection".into()),
+    inference_max_concurrent: Some(24),
+    inference_max_queued: Some(96),
+    ..SupervisorConfig::default()
+});
+```
+
+Leave a field `None` and the child applies its own default, which for
+concurrency and queue depth means deriving it from the host it lands on.
+That is the right answer in almost every case: the supervisor has no better
+view of that machine than the child does. The `--token-*` limits have no
+passthrough because the supervisor emits no `--token-model` either, so a
+supervised child never serves `Compress`.
+
+The gRPC transport decoder is separate and shared: it admits
+`max(4 MiB, the largest configured per-RPC budget)`. Each handler then
+applies its own exact budget to `encoded_len` before the model is
+resolved and before any text reaches a tokenizer.
+
+### What a refused request gets back
+
+```mermaid
+flowchart TD
+    A[Classify or Embed arrives] --> B{"encoded_len over\nthe byte budget?"}
+    B -->|yes| R[RESOURCE_EXHAUSTED]
+    B -->|no| C{"Embed batch over\nthe item budget?"}
+    C -->|yes| R
+    C -->|no| D{Model loaded?}
+    D -->|no| N["NOT_FOUND (Classify)\nFAILED_PRECONDITION (Embed)"]
+    D -->|yes| E{"Running and queue\nboth full?"}
+    E -->|yes| R
+    E -->|no| Q{"Got a running slot inside\n--inference-timeout-ms?"}
+    Q -->|no| T[DEADLINE_EXCEEDED]
+    Q -->|yes| F["spawn_blocking: run inference,\npermit released when the thread ends"]
+    F --> G{"Finished inside\nthe same deadline?"}
+    G -->|no| T
+    G -->|yes| H{Model returned a result?}
+    H -->|no| I[INTERNAL]
+    H -->|yes| S[OK]
+```
+
+Two of those deserve a note.
+
+**The deadline frees the caller, not the thread.** Blocking work cannot
+be cancelled, so when `--inference-timeout-ms` fires the caller gets
+`DEADLINE_EXCEEDED` while the wedged model keeps its running slot until
+it returns. That is deliberate: handing the slot back while the thread
+is still burning a core would let a stuck model oversubscribe the box.
+A sidecar that keeps returning `DEADLINE_EXCEEDED` and then
+`RESOURCE_EXHAUSTED` is telling you the model is stuck, not that it is
+merely busy.
+
+The clock starts when the request arrives, so the deadline covers the
+wait for a running slot as well as the inference itself. Bounding only
+the inference would leave the half that actually grows under load
+unbounded. It is not, and is not meant to be, the deadline your caller
+observes: callers set their own and theirs are far shorter, and a caller
+that gives up drops the gRPC stream, which cancels the handler wherever
+it is parked. The 30 s default is the backstop for the caller that sets
+no deadline at all, which is why it sits above the slowest inference the
+sidecar will accept (a `Compress` across `--token-max-windows` windows)
+rather than anywhere near the detector's 250 ms.
+
+**A panic inside inference does not take the sidecar down.** The Tokio
+runtime contains it and the RPC returns `INTERNAL` with a fixed message
+(`classify inference ended without a result`). The panic payload is
+derived from the caller's own text, so it goes to the sidecar's stderr
+through the panic hook and never onto the wire. The running slot is
+released as the task unwinds, so one panicking request does not leak
+capacity.
+
+### Watching for shedding
+
+Every refusal increments a per-reason counter for the life of the
+process: `request_bytes`, `batch_items`, `queue_full`,
+`admission_unavailable`, `deadline_exceeded`, and `task_failed`. The
+first refusal of each reason logs a `warn` carrying `rpc`, `reason`, and
+the running `total`, and every hundredth after that logs again. The
+sampling is on purpose: a refusal storm is exactly the load these bounds
+exist to shed, and a line per refusal would turn it into a log flood.
+The counts stay exact regardless of what is logged.
+
+The sidecar has no `/metrics` endpoint of its own yet, so those counters
+are process-local today. On the proxy side, a refused call is a failed
+call: it takes the `failure_posture` path of whatever policy dialed the
+sidecar, the same as a sidecar that is down.
+
+## 4. Configuring the Proxy
 
 Once your sidecar is running, select it as the detector on a `prompt_injection_v2` policy. `detector_config.endpoint` must be an `http://` URL:
 
@@ -62,7 +208,7 @@ policies:
 
 See [`examples/prompt-injection-sidecar/`](../examples/prompt-injection-sidecar/) for a complete working config, including both a `tag` and a `block` origin against the same sidecar.
 
-## 4. Building a Custom Sidecar
+## 5. Building a Custom Sidecar
 
 Because the proxy uses a standard gRPC contract, you can build a custom sidecar in any language (Python, Go, Node.js) to run your own proprietary ML models.
 

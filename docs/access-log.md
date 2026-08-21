@@ -1,6 +1,6 @@
 # Access log
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 ![a GET and a POST proxied through an origin that emits a structured JSON access-log line for each](assets/access-log.gif)
 
@@ -277,6 +277,7 @@ restricts the rule set; accepted names are `email`, `us_ssn`,
 | `config_revision` | string? | Short hex tag identifying the set of origins this node was serving when the request landed. The same value webhooks and alerts carry. During a rolling change that adds, removes or renames an origin, the fleet's lines show two of these at once, which is what separates "the rollout is half finished" from "something is broken". A rollout that only changes behavior behind existing hostnames does not move it, so this field cannot stage-track that kind of change; `/admin/drift` compares the loaded bytes and can. |
 | `cache_config_fingerprint` | string? | Digest of the serving origin's cache-relevant config, and the last segment of every response-cache key it produces. Two nodes logging different values for one origin are reading and writing separate entry sets. Absent for origins with no response cache. See [Which config changes rotate the cache](configuration.md#which-config-changes-rotate-the-cache). |
 | `upstream_host` | string? | Upstream host the proxy contacted; absent on short-circuited requests (auth deny, WAF block, cache hit). |
+| `zone_locality` | string? | How the zone-locality stage shaped the load-balancer selection: `local` (narrowed to the proxy's own zone) or `spilled` (no same-zone target was healthy, so selection widened across zones). Absent when the stage did not engage, which is every request on an unzoned proxy or an unlabeled pool. The same two strings appear on the admin request log and on the `verdict` label of `sbproxy_lb_zone_locality_total`, so a spilled line joins to the series that alerted. See [Routing](routing.md). |
 | `request_headers` | object? | Captured request headers, lowercased keys. Absent when no allowlist or no matches. |
 | `response_headers` | object? | Captured response headers, same shape as `request_headers`. |
 | `attribution` | object? | Resolved business attribution tags (project, feature, okr, team, customer, environment, agent_type, risk_tier, trace_id) merged from the credential `attrs:` and `SB-Attr-*` headers. Same tag set the per-attribution spend metric is labeled by. Absent when none resolved. |
