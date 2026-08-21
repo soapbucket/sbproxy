@@ -244,7 +244,9 @@ impl ToolAccessPolicy {
         for rule in &self.tool_quotas {
             parse_quota_window(&rule.rate.per).map_err(|error| {
                 format!(
-                    "tool_quotas rule for tool '{}' has an unparseable rate.per '{}' ({error});                      accepted suffixes are ms, s, m, h, d (for example 30s, 15m, 24h, 7d)",
+                    "tool_quotas rule for tool '{}' has an unparseable rate.per '{}' \
+                     ({error}); accepted suffixes are ms, s, m, h, d \
+                     (for example 30s, 15m, 24h, 7d)",
                     rule.tool_name, rule.rate.per
                 )
             })?;
@@ -335,15 +337,37 @@ impl QuotaClock for SystemClock {
 /// long before this matters. The ceiling is the backstop for the case
 /// the sweep cannot help with: more distinct principals genuinely
 /// active inside their own windows than this process will track.
+///
+/// Acts as a backstop behind [`MAX_TRACKED_QUOTA_KEYS_PER_TENANT`]: a
+/// single tenant cannot reach this ceiling on its own, so this bounds
+/// the number of *distinct tenants* holding live windows at once, ten
+/// at full sub-cap. That is a deployment-sizing fact, not a
+/// per-tenant isolation guarantee; the sub-cap is what isolates one
+/// tenant's flood from every other tenant's traffic.
 const MAX_TRACKED_QUOTA_KEYS: usize = 100_000;
+
+/// Ceiling on the number of distinct `QuotaKey`s one tenant may hold a
+/// sliding window for in this process.
+///
+/// Without it the global ceiling alone is a cross-tenant denial of
+/// service: `principal_id` is caller-presented, so one tenant able to
+/// authenticate under many distinct `sub` values fills the whole map,
+/// and from that moment every *other* tenant's next unseen principal
+/// is refused `tools/call` fail-closed. The same gap, with the same
+/// remedy, that `sessions::MAX_TRACKED_SESSIONS_PER_TENANT` and
+/// `peer_profile::MAX_TRACKED_PEERS_PER_TENANT` already close for
+/// their own registries. A tenant at its sub-cap is refused a new
+/// window while every other tenant, and every one of this tenant's
+/// own live windows, is unaffected.
+const MAX_TRACKED_QUOTA_KEYS_PER_TENANT: usize = 10_000;
 
 /// Shortest interval between two full sweeps of the counter map.
 ///
-/// The sweep is O(keys) and only ever runs when the map is at the
+/// The sweep is O(keys) and only ever runs when the map is at a
 /// ceiling, so without this a saturated store would walk every key on
 /// every request. One second bounds that to a single walk per second
-/// while still reclaiming aged-out windows fast enough that the
-/// ceiling is reached only under genuine live cardinality.
+/// while still reclaiming aged-out windows fast enough that a ceiling
+/// is reached only under genuine live cardinality.
 const QUOTA_SWEEP_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
 /// One principal's sliding window for one tool.
@@ -370,11 +394,13 @@ struct QuotaCounter {
 /// `rate.max` entries because the check refuses the call at that
 /// length rather than pushing. The *number of deques* is not bounded
 /// by the policy, because the key carries a caller-presented principal
-/// id. Two mechanisms bound it instead: a sweep drops keys whose
-/// window has fully aged out, and `MAX_TRACKED_QUOTA_KEYS` (100_000)
-/// caps what is left. A new key past the ceiling is refused the call rather than
-/// waved through, on the same grounds as `peer_profile`'s saturation
-/// handling: a limiter that cannot count is not a limiter.
+/// id. Three mechanisms bound it instead: a sweep drops keys whose
+/// window has fully aged out, [`MAX_TRACKED_QUOTA_KEYS_PER_TENANT`]
+/// caps what any one tenant may hold, and `MAX_TRACKED_QUOTA_KEYS`
+/// (100_000) caps the whole map. A new key past either ceiling is
+/// refused the call rather than waved through, on the same grounds as
+/// `peer_profile`'s saturation handling: a limiter that cannot count
+/// is not a limiter.
 pub struct ToolQuotaStore<C: QuotaClock = SystemClock> {
     state: Mutex<QuotaState>,
     /// Ceiling on `state.counters.len()`. Always
@@ -382,17 +408,56 @@ pub struct ToolQuotaStore<C: QuotaClock = SystemClock> {
     /// direct read of the constant so a test can drive the saturation
     /// branch without allocating six figures of keys.
     max_tracked_keys: usize,
+    /// Ceiling on one tenant's share of `state.counters`. Always
+    /// `MAX_TRACKED_QUOTA_KEYS_PER_TENANT` in production, a field for
+    /// the same test reason as `max_tracked_keys`.
+    max_tracked_keys_per_tenant: usize,
     clock: C,
 }
 
 /// Everything the quota check mutates, under one lock so the sweep
-/// timestamp cannot drift from the map it describes.
+/// timestamp and the per-tenant counts cannot drift from the map they
+/// describe.
 #[derive(Default)]
 struct QuotaState {
     counters: HashMap<QuotaKey, QuotaCounter>,
+    /// Live key count per `tenant_id`, so the per-tenant sub-cap is an
+    /// O(1) read rather than a scan of six figures of keys on every
+    /// first call by a principal. Maintained at exactly the two places
+    /// `counters` changes size: incremented on insert below, rebuilt
+    /// wholesale by [`Self::sweep`], which is the only remover.
+    per_tenant: HashMap<String, usize>,
     /// Last time the whole map was walked, so the sweep is amortized
     /// rather than per-request. `None` until the first sweep.
     last_sweep: Option<Instant>,
+}
+
+impl QuotaState {
+    /// Drop every key whose window has fully aged out and rebuild the
+    /// per-tenant counts from what survived.
+    ///
+    /// Rebuilding rather than decrementing is deliberate: the counts
+    /// are a cache of `counters`, and a cache that is recomputed from
+    /// its source at the only point entries leave cannot drift from
+    /// it. The walk is O(keys) either way, so the rebuild is free.
+    fn sweep(&mut self, now: Instant) {
+        self.counters.retain(|_, counter| {
+            counter
+                .hits
+                .back()
+                .is_some_and(|last| now.duration_since(*last) < counter.window)
+        });
+        self.per_tenant.clear();
+        for key in self.counters.keys() {
+            *self.per_tenant.entry(key.tenant_id.clone()).or_insert(0) += 1;
+        }
+        self.last_sweep = Some(now);
+    }
+
+    /// Live windows this tenant holds.
+    fn tenant_live(&self, tenant_id: &str) -> usize {
+        self.per_tenant.get(tenant_id).copied().unwrap_or(0)
+    }
 }
 
 impl ToolQuotaStore<SystemClock> {
@@ -414,20 +479,36 @@ impl<C: QuotaClock> ToolQuotaStore<C> {
         Self {
             state: Mutex::new(QuotaState::default()),
             max_tracked_keys: MAX_TRACKED_QUOTA_KEYS,
+            max_tracked_keys_per_tenant: MAX_TRACKED_QUOTA_KEYS_PER_TENANT,
             clock,
         }
     }
 
-    /// Construct a store with a lowered key ceiling.
+    /// Construct a store with lowered key ceilings.
     ///
-    /// Test-only, and only the *ceiling* moves: the saturation branch
+    /// Test-only, and only the *ceilings* move: the saturation branch
     /// under test is the production one in [`Self::check_quota`],
-    /// reached the same way. The default ceiling is six figures, which
-    /// no unit test should be allocating its way to.
+    /// reached the same way. The defaults are five and six figures,
+    /// which no unit test should be allocating its way to.
     #[cfg(test)]
     fn with_clock_and_max(clock: C, max_tracked_keys: usize) -> Self {
         Self {
             max_tracked_keys,
+            // A sub-cap above the global cap can never bind, which
+            // keeps the existing ceiling tests exercising the global
+            // branch. Tests that want the sub-cap set it explicitly
+            // with `with_clock_and_tenant_max`.
+            max_tracked_keys_per_tenant: max_tracked_keys.saturating_add(1),
+            ..Self::with_clock(clock)
+        }
+    }
+
+    /// Construct a store with a lowered per-tenant sub-cap and a
+    /// global ceiling high enough that only the sub-cap can bind.
+    #[cfg(test)]
+    fn with_clock_and_tenant_max(clock: C, max_tracked_keys_per_tenant: usize) -> Self {
+        Self {
+            max_tracked_keys_per_tenant,
             ..Self::with_clock(clock)
         }
     }
@@ -492,34 +573,69 @@ impl<C: QuotaClock> ToolQuotaStore<C> {
             tool_name: tool.to_string(),
         };
 
-        let mut state = self.state.lock().expect("quota counter mutex poisoned");
-        if !state.counters.contains_key(&key) && state.counters.len() >= self.max_tracked_keys {
-            // At the ceiling and this principal has no window yet.
-            // Reclaim whatever has aged out before deciding, at most
-            // once per `QUOTA_SWEEP_MIN_INTERVAL` so a saturated store
-            // does not walk every key on every request.
-            let due = state
-                .last_sweep
-                .is_none_or(|last| now.duration_since(last) >= QUOTA_SWEEP_MIN_INTERVAL);
-            if due {
-                state.counters.retain(|_, counter| {
-                    counter
-                        .hits
-                        .back()
-                        .is_some_and(|last| now.duration_since(*last) < counter.window)
-                });
-                state.last_sweep = Some(now);
+        // A poisoned quota mutex must not take the whole gateway down
+        // with it: the critical section below is map arithmetic with
+        // no panic site, so a poisoned lock means some other thread
+        // died elsewhere and the counts are still readable.
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let is_new_key = !state.counters.contains_key(&key);
+        if is_new_key {
+            let at_tenant_cap =
+                state.tenant_live(&key.tenant_id) >= self.max_tracked_keys_per_tenant;
+            let at_global_cap = state.counters.len() >= self.max_tracked_keys;
+            if at_tenant_cap || at_global_cap {
+                // At a ceiling and this principal has no window yet.
+                // Reclaim whatever has aged out before deciding, at
+                // most once per `QUOTA_SWEEP_MIN_INTERVAL` so a
+                // saturated store does not walk every key on every
+                // request.
+                let due = state
+                    .last_sweep
+                    .is_none_or(|last| now.duration_since(last) >= QUOTA_SWEEP_MIN_INTERVAL);
+                if due {
+                    state.sweep(now);
+                }
+                // Fail closed on whichever ceiling still binds. A
+                // limiter that cannot count is not a limiter, and
+                // admitting the call would hand an attacker minting
+                // distinct principal ids an unmetered lane through
+                // every quota at once.
+                //
+                // The sub-cap is reported first, the same order
+                // `SessionStore::create_capped` uses and for the same
+                // reason: a caller whose own tenant is full needs to
+                // hear that, not that some unrelated tenant filled the
+                // process. The global ceiling behind it bounds how
+                // many distinct tenants hold windows at once.
+                if state.tenant_live(&key.tenant_id) >= self.max_tracked_keys_per_tenant {
+                    warn_quota_registry_saturated(
+                        tool,
+                        "tenant",
+                        self.max_tracked_keys_per_tenant,
+                    );
+                    sbproxy_observe::metrics::record_mcp_tool_quota_registry_saturated();
+                    return Err(QuotaExceeded {
+                        tool_name: tool.to_string(),
+                    });
+                }
+                if state.counters.len() >= self.max_tracked_keys {
+                    warn_quota_registry_saturated(tool, "global", self.max_tracked_keys);
+                    sbproxy_observe::metrics::record_mcp_tool_quota_registry_saturated();
+                    return Err(QuotaExceeded {
+                        tool_name: tool.to_string(),
+                    });
+                }
             }
-            if state.counters.len() >= self.max_tracked_keys {
-                // Fail closed. A limiter that cannot count is not a
-                // limiter, and admitting the call would hand an
-                // attacker minting distinct principal ids an
-                // unmetered lane through every quota at once.
-                warn_quota_registry_saturated(tool, self.max_tracked_keys);
-                return Err(QuotaExceeded {
-                    tool_name: tool.to_string(),
-                });
-            }
+            // Admitted a new key: charge it to its tenant. This is the
+            // only place `counters` grows, so it is the only place the
+            // per-tenant count has to move outside `sweep`.
+            *state
+                .per_tenant
+                .entry(key.tenant_id.clone())
+                .or_insert(0) += 1;
         }
         let counter = state.counters.entry(key).or_insert_with(|| QuotaCounter {
             window,
@@ -560,20 +676,34 @@ fn warn_unparseable_window(tool: &str, per: &str, error: &str) {
             tool = %tool,
             per = %per,
             error = %error,
-            "mcp tool quota window is unparseable; denying tools/call for this tool.              Accepted suffixes are ms, s, m, h, d (for example 30s, 15m, 24h, 7d)"
+            "mcp tool quota window is unparseable; denying tools/call for this tool. \
+             Accepted suffixes are ms, s, m, h, d (for example 30s, 15m, 24h, 7d)"
         );
     });
 }
 
-/// Log quota-registry saturation once per process, for the same
-/// flood reason as [`warn_unparseable_window`].
-fn warn_quota_registry_saturated(tool: &str, max_tracked_keys: usize) {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
+/// Log quota-registry saturation once per process per `scope`, for the
+/// same flood reason as [`warn_unparseable_window`].
+///
+/// One `Once` per scope rather than one for both: a store that hits
+/// its per-tenant sub-cap first would otherwise silence the global
+/// ceiling forever, and those are different operator actions (raise
+/// the tenant's traffic expectations, versus size the process for the
+/// number of tenants it now serves). The counter beside this line,
+/// `sbproxy_mcp_tool_quota_registry_saturated_total`, is what shows
+/// how much traffic the refusal covers; the log line only names it
+/// once.
+fn warn_quota_registry_saturated(tool: &str, scope: &'static str, cap: usize) {
+    static TENANT: std::sync::Once = std::sync::Once::new();
+    static GLOBAL: std::sync::Once = std::sync::Once::new();
+    let once = if scope == "tenant" { &TENANT } else { &GLOBAL };
+    once.call_once(|| {
         tracing::warn!(
             tool = %tool,
-            max_tracked_quota_keys,
-            "mcp tool quota registry is saturated; denying tools/call for principals              with no live window until aged-out windows are reclaimed"
+            scope = %scope,
+            cap = cap,
+            "mcp tool quota registry is saturated; denying tools/call for principals \
+             with no live window until aged-out windows are reclaimed"
         );
     });
 }
@@ -970,6 +1100,41 @@ mod tests {
             store.check_quota(&policy, &first, "delete_user").is_ok(),
             "an already-tracked principal keeps its window",
         );
+    }
+
+    /// One tenant flooding distinct principals must not refuse
+    /// `tools/call` for anybody else.
+    ///
+    /// The global ceiling alone made the fail-closed refusal a
+    /// cross-tenant denial of service: `principal_id` is
+    /// caller-presented, so a tenant that can authenticate under many
+    /// distinct `sub` values fills the whole map and every other
+    /// tenant's next unseen principal is refused. The per-tenant
+    /// sub-cap is what confines the flood to its own tenant, the same
+    /// remedy `SessionStore` and `peer_profile` already carry.
+    #[test]
+    fn one_tenants_flood_cannot_saturate_another_tenants_quota_windows() {
+        let clock = FakeClock::new(Instant::now());
+        let store = ToolQuotaStore::with_clock_and_tenant_max(clock.clone(), 4);
+        let policy = quota_policy();
+
+        for index in 0..64 {
+            let sub = format!("flood-{index}");
+            let noisy = principal("noisy", &sub, None, None, None);
+            let _ = store.check_quota(&policy, &noisy, "delete_user");
+        }
+        assert_eq!(
+            store.tracked_keys(),
+            4,
+            "the flooding tenant must stop at its own sub-cap",
+        );
+
+        let quiet = principal("quiet", "analyst", None, None, None);
+        assert!(
+            store.check_quota(&policy, &quiet, "delete_user").is_ok(),
+            "another tenant's first principal must still be tracked and admitted",
+        );
+        assert_eq!(store.tracked_keys(), 5);
     }
 
     /// Once a window ages out, its key is reclaimed and the ceiling

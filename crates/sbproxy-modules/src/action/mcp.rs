@@ -4401,14 +4401,12 @@ impl McpAction {
         // rule so the operator does not have to guess which row is
         // wrong. Iterated in sorted label order so the message a given
         // config produces does not depend on hash iteration order.
-        let mut labels: Vec<&String> = cfg.rbac_policies.keys().collect();
-        labels.sort();
-        for label in labels {
-            if let Some(policy) = cfg.rbac_policies.get(label) {
-                policy.validate_quota_windows().map_err(|error| {
-                    anyhow::anyhow!("mcp action: rbac_policies['{label}']: {error}")
-                })?;
-            }
+        let mut policies: Vec<(&String, &ToolAccessPolicy)> = cfg.rbac_policies.iter().collect();
+        policies.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (label, policy) in policies {
+            policy
+                .validate_quota_windows()
+                .map_err(|error| anyhow::anyhow!("mcp action: rbac_policies['{label}']: {error}"))?;
         }
 
         // WOR-2384 fix round 1, item 1 (critical): federation's

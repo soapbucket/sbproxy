@@ -2453,6 +2453,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_mcp_tool_quota_registry_saturated_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_mcp_tool_quota_registry_saturated"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &[],
+        description: "MCP tools/call refused because the per-tool quota store was at capacity, globally or for the caller's tenant.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_mcp_content_filter_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_mcp_content_filter"),

@@ -45,6 +45,20 @@
 //! not. [`ConcealmentClass::VariationSelector`] is its own class rather than
 //! folded into [`ConcealmentClass::ZeroWidth`] so an operator watching the
 //! per-class metric can see which findings are the noisy ones.
+//!
+//! The emoji selector is not the only legitimate use, and this is the one
+//! place the "never the scripts that need them" rule above is bent rather
+//! than kept. `U+E0100..=U+E01EF` is the Ideographic Variation Sequence
+//! range: Japanese and Chinese text uses it to pick a specific glyph for a
+//! kanji or hanzi, so a tool description written in Japanese can carry
+//! several without anything being hidden. `U+180E`, flagged under
+//! [`ConcealmentClass::ZeroWidth`] below, is the Mongolian vowel separator
+//! and is the same story. Both are reported anyway, because the code point a
+//! script needs and the code point a payload rides on are the same code
+//! point, and there is no signal in the text that separates them. An operator
+//! whose catalogue is CJK or Mongolian should expect a standing
+//! `variation_selector` finding rate and read it as noise, which is exactly
+//! why the class is broken out rather than merged into the others.
 
 /// A class of character that hides content from a reader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -60,8 +74,10 @@ pub enum ConcealmentClass {
     ZeroWidth,
     /// `U+FE00..=U+FE0F` and `U+E0100..=U+E01EF`, the variation selectors.
     /// 256 invisible, non-control code points, wide enough to carry a byte
-    /// each. Includes `U+FE0F`, which legitimate emoji also carry; see the
-    /// module docs for why that false positive is accepted.
+    /// each. Includes `U+FE0F`, which legitimate emoji carry, and the
+    /// Ideographic Variation Sequence range, which legitimate CJK text
+    /// carries; see the module docs for why those false positives are
+    /// accepted.
     VariationSelector,
     /// C0 and C1 controls other than tab, line feed, and carriage return.
     OtherControl,
@@ -266,6 +282,25 @@ mod tests {
             vec![ConcealmentClass::VariationSelector]
         );
         assert_eq!(strip_concealed("Deploy \u{2705}\u{fe0f}"), "Deploy \u{2705}");
+    }
+
+    /// A CJK ideographic variation sequence classifies too, and that is
+    /// also deliberate.
+    ///
+    /// `U+E0100..=U+E01EF` is not only a smuggling channel: it is the range
+    /// Japanese and Chinese text uses to select a specific glyph for a
+    /// character. Nothing in the code point separates that from a payload,
+    /// so the detector reports both and the operator baselines the noise.
+    /// Pinned here so a later narrowing has to break this on purpose.
+    #[test]
+    fn cjk_ideographic_variation_sequence_classifies_deliberately() {
+        // U+845B (kanji) followed by variation selector 18, a real IVS.
+        let text = "\u{845b}\u{e0101}";
+        assert_eq!(
+            concealment_classes(text),
+            vec![ConcealmentClass::VariationSelector]
+        );
+        assert_eq!(strip_concealed(text), "\u{845b}");
     }
 
     /// The nearby invisible format characters, none of which are controls.

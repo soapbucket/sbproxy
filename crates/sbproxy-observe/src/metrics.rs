@@ -5260,6 +5260,38 @@ pub fn record_mcp_peer_registry_saturated() {
     counter.inc();
 }
 
+/// Record one MCP `tools/call` refused because the per-tool quota
+/// store could not track the caller's principal, either for the
+/// caller's tenant
+/// (`sbproxy_extension::mcp::MAX_TRACKED_QUOTA_KEYS_PER_TENANT`) or
+/// globally (`MAX_TRACKED_QUOTA_KEYS`), on
+/// `sbproxy_mcp_tool_quota_registry_saturated_total`.
+///
+/// The refusal is fail-closed, on the grounds that a limiter which
+/// cannot count is not a limiter, so without this counter it is
+/// indistinguishable on a dashboard from a caller genuinely over
+/// quota. Alert on it: a non-zero rate means some share of traffic is
+/// being refused for a capacity reason rather than a policy one.
+///
+/// No labels, the same reasoning as
+/// [`record_mcp_peer_registry_saturated`]: the tenant and principal
+/// that caused it are exactly the caller-controlled strings the caps
+/// exist to bound. Ticks on every refused call, while the
+/// `tracing::warn!` beside it fires once per scope per process.
+pub fn record_mcp_tool_quota_registry_saturated() {
+    use prometheus::{register_int_counter, IntCounter};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter!(
+            "sbproxy_mcp_tool_quota_registry_saturated_total",
+            "MCP tools/call refused because the per-tool quota store was at capacity, globally or for the caller's tenant",
+        )
+        .expect("mcp tool quota registry saturated counter registers")
+    });
+    counter.inc();
+}
+
 /// Record one `content_filters` category outcome that was not a plain
 /// miss, on `sbproxy_mcp_content_filter_total{tenant, category,
 /// verdict}` (WOR-2384, MCP01/MCP10). `category` is `"secrets"` or

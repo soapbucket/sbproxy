@@ -196,8 +196,14 @@ config load with an error naming the policy and the rule. The store is
 per-action and lives in process memory; SIGHUP reload rebuilds the
 action and resets the counters. Windows are held per
 `(tenant_id, principal_id, tool_name)` and reclaimed once they age
-out; past 100,000 live windows a principal with no window of its own
-is refused rather than admitted unmetered.
+out; past 10,000 live windows for one tenant, or 100,000 across the
+process, a principal with no window of its own is refused rather than
+admitted unmetered. The per-tenant ceiling is what keeps the sentence
+above true under load: without it, one tenant authenticating under
+many distinct `sub` values fills the whole map and every other
+tenant's next unseen principal is refused too. That refusal is counted
+on `sbproxy_mcp_tool_quota_registry_saturated_total`, which is what
+tells it apart from a caller genuinely over quota.
 
 ## See also
 
