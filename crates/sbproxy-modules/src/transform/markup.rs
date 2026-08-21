@@ -220,40 +220,57 @@ impl HtmlTransform {
         html.to_string()
     }
 
-    /// Rewrite an attribute on tags matching the selector (tag name only).
+    /// Rewrite an attribute on every tag matching the selector (tag name only).
+    ///
+    /// One pass over the opening tags handles both cases a page can mix. A
+    /// tag that already carries the attribute has its value replaced in
+    /// place; a tag that does not gets the attribute inserted just before
+    /// the tag's closing `>`, keeping a self-closing `/`. Doing both in the
+    /// same pass is what makes a mixed page come out uniform: an earlier
+    /// version rewrote the tags that already had the attribute and then
+    /// returned, so the tags that lacked it were never stamped, and when no
+    /// tag had it only the first match was stamped.
+    ///
+    /// `[^>]*` still bounds an opening tag, so a `>` inside an attribute
+    /// value cuts the match short. That limitation predates this pass and
+    /// is the price of not carrying an HTML parser.
     fn rewrite_attr(&self, html: &str, rewrite: &AttributeRewrite) -> String {
         let tag = regex::escape(&rewrite.selector);
         let attr = regex::escape(&rewrite.attribute);
-        let pattern = format!(
-            r#"(?i)(<{tag}\b[^>]*)\b{attr}\s*=\s*["'][^"']*["']"#,
-            tag = tag,
+        let Ok(tag_re) = Regex::new(&format!(r"(?is)<{tag}\b[^>]*>", tag = tag)) else {
+            return html.to_string();
+        };
+        // The leading `\s` keeps `target` from matching inside
+        // `data-target`; every attribute in a well-formed opening tag is
+        // preceded by whitespace, because the tag name comes first.
+        let Ok(attr_re) = Regex::new(&format!(
+            r#"(?i)\s{attr}\s*=\s*["'][^"']*["']"#,
             attr = attr
-        );
+        )) else {
+            return html.to_string();
+        };
+        let assignment = format!(r#" {}="{}""#, rewrite.attribute, rewrite.value);
 
-        if let Ok(re) = Regex::new(&pattern) {
-            let replacement = format!(r#"${{1}}{}="{}""#, rewrite.attribute, rewrite.value);
-            let result = re.replace_all(html, replacement.as_str()).into_owned();
-            // If the attribute was replaced at least once, return.
-            if result != html {
-                return result;
-            }
-        }
-
-        // If the attribute was not found on any matching tag, add it to the first match.
-        let tag_pattern = format!(r"(?i)<{tag}\b", tag = tag);
-        if let Ok(re) = Regex::new(&tag_pattern) {
-            if let Some(m) = re.find(html) {
-                let mut result = String::with_capacity(
-                    html.len() + rewrite.attribute.len() + rewrite.value.len() + 5,
-                );
-                result.push_str(&html[..m.end()]);
-                result.push_str(&format!(r#" {}="{}""#, rewrite.attribute, rewrite.value));
-                result.push_str(&html[m.end()..]);
-                return result;
-            }
-        }
-
-        html.to_string()
+        tag_re
+            .replace_all(html, |caps: &regex::Captures| {
+                let open = &caps[0];
+                if attr_re.is_match(open) {
+                    // `NoExpand`: an operator's value is literal text, not a
+                    // capture-group reference, so a `$1` in it stays a `$1`.
+                    return attr_re
+                        .replace_all(open, regex::NoExpand(assignment.as_str()))
+                        .into_owned();
+                }
+                let Some(body) = open.strip_suffix('>') else {
+                    return open.to_string();
+                };
+                let (body, close) = match body.strip_suffix('/') {
+                    Some(rest) => (rest, "/>"),
+                    None => (body, ">"),
+                };
+                format!("{}{}{}", body.trim_end(), assignment, close)
+            })
+            .into_owned()
     }
 }
 
@@ -932,6 +949,92 @@ mod tests {
         let result = std::str::from_utf8(&body).unwrap();
         assert!(result.contains(r#"target="_blank""#));
         assert!(!result.contains("_self"));
+    }
+
+    fn rewrite_attributes_transform(selector: &str, attribute: &str, value: &str) -> HtmlTransform {
+        HtmlTransform {
+            remove_selectors: vec![],
+            inject: vec![],
+            rewrite_attributes: vec![AttributeRewrite {
+                selector: selector.into(),
+                attribute: attribute.into(),
+                value: value.into(),
+            }],
+            format_options: None,
+        }
+    }
+
+    fn rewritten(transform: &HtmlTransform, html: &str) -> String {
+        let mut body = BytesMut::from(html.as_bytes());
+        transform.apply(&mut body).unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn html_rewrite_attribute_stamps_every_match() {
+        let t = rewrite_attributes_transform("p", "data-rewritten", "true");
+        let result = rewritten(&t, "<p>one</p><p>two</p>");
+        assert_eq!(
+            result.matches(r#"data-rewritten="true""#).count(),
+            2,
+            "both paragraphs should be stamped: {result}"
+        );
+    }
+
+    #[test]
+    fn html_rewrite_attribute_stamps_a_page_that_mixes_present_and_absent() {
+        let t = rewrite_attributes_transform("a", "target", "_blank");
+        let result = rewritten(&t, r#"<a target="_self">x</a><a>y</a>"#);
+        assert_eq!(
+            result.matches(r#"target="_blank""#).count(),
+            2,
+            "the tag carrying the attribute and the one without it both get it: {result}"
+        );
+        assert!(
+            !result.contains("_self"),
+            "the old value should be gone: {result}"
+        );
+    }
+
+    #[test]
+    fn html_rewrite_attribute_keeps_a_self_closing_slash() {
+        let t = rewrite_attributes_transform("img", "loading", "lazy");
+        let result = rewritten(&t, r#"<img src="/a.png"/>"#);
+        assert_eq!(
+            result, r#"<img src="/a.png" loading="lazy"/>"#,
+            "the self-closing slash stays at the end of the tag"
+        );
+    }
+
+    #[test]
+    fn html_rewrite_attribute_does_not_match_a_longer_attribute_name() {
+        let t = rewrite_attributes_transform("a", "target", "_blank");
+        let result = rewritten(&t, r#"<a data-target="keep">x</a>"#);
+        assert!(
+            result.contains(r#"data-target="keep""#),
+            "data-target is a different attribute: {result}"
+        );
+        assert!(
+            result.contains(r#" target="_blank""#),
+            "the requested attribute is added: {result}"
+        );
+    }
+
+    #[test]
+    fn html_rewrite_attribute_value_is_literal_text() {
+        let t = rewrite_attributes_transform("a", "target", "$1_blank");
+        let result = rewritten(&t, r#"<a target="_self">x</a>"#);
+        assert!(
+            result.contains(r#"target="$1_blank""#),
+            "a $1 in the configured value is not a capture reference: {result}"
+        );
+    }
+
+    #[test]
+    fn html_rewrite_attribute_leaves_a_page_without_the_selector_alone() {
+        let t = rewrite_attributes_transform("a", "target", "_blank");
+        let source = "<p>no links here</p>";
+        assert_eq!(rewritten(&t, source), source);
     }
 
     #[test]

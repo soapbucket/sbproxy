@@ -30,7 +30,7 @@ origins:
           <body>
             <h1>Headline to remove</h1>
             <p target="_self">paragraph one</p>
-            <p target="_self">paragraph two</p>
+            <p>paragraph two</p>
           </body>
         </html>
     transforms:
@@ -67,9 +67,11 @@ origins:
         "banner should be injected at body_start: {}",
         body
     );
-    assert!(
-        body.contains(r#"target="_blank""#),
-        "target attribute should be rewritten to _blank: {}",
+    assert_eq!(
+        body.matches(r#"target="_blank""#).count(),
+        2,
+        "both paragraphs should carry target=_blank, the one that already had \
+         a target and the one that had none: {}",
         body
     );
     assert!(

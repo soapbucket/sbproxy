@@ -742,8 +742,12 @@ pub struct ModelHostConfig {
     /// resolve from the directory containing the active `sb.yml`.
     #[serde(default)]
     pub catalog_file: Option<String>,
-    /// Directory for the content-addressed weight cache. `None` uses
-    /// the platform default (`$HF_HOME` / `~/.cache/sbproxy/models`).
+    /// Directory for the content-addressed weight cache, as an absolute
+    /// path. `None` uses the platform default (`$HF_HOME` /
+    /// `~/.cache/sbproxy/models`). A relative path is refused at config
+    /// load: the engine subprocess that reads this cache has its own
+    /// working directory and requires an absolute snapshot path, so a
+    /// relative value fails only after a full model download.
     #[serde(default)]
     pub cache_dir: Option<String>,
     /// Support: preview.
@@ -918,6 +922,21 @@ impl ModelHostConfig {
         }
         // Names: unique, no nameless raw refs.
         self.model_names()?;
+        // The weight cache root is opened by this process and read by an
+        // engine subprocess with its own working directory, so a relative
+        // path names two different places. Catch it here instead of after
+        // the download (WOR-2534).
+        if let Some(cache_dir) = self.cache_dir.as_deref() {
+            if cache_dir.trim().is_empty() {
+                return Err("serve cache_dir must not be blank".to_string());
+            }
+            if !std::path::Path::new(cache_dir).is_absolute() {
+                return Err(format!(
+                    "serve cache_dir '{cache_dir}' must be an absolute path; a relative one \
+                     resolves against whichever working directory the process happens to have"
+                ));
+            }
+        }
         // keep_alive durations parse.
         for e in &self.models {
             if let Some(variant) = &e.variant {
@@ -1534,6 +1553,37 @@ models:
             .validate()
             .unwrap_err()
             .contains("acquire.version"));
+    }
+
+    #[test]
+    fn relative_serve_cache_dir_is_refused_at_config_load() {
+        let relative: ModelHostConfig =
+            serde_yaml::from_str("cache_dir: ./models\nmodels:\n  - model: qwen3-14b\n").unwrap();
+        let error = relative
+            .validate()
+            .expect_err("a relative serve cache_dir is refused");
+        assert!(
+            error.contains("must be an absolute path"),
+            "the message should name the rule: {error}"
+        );
+        assert!(
+            error.contains("./models"),
+            "the message should quote the value: {error}"
+        );
+
+        let blank: ModelHostConfig =
+            serde_yaml::from_str("cache_dir: '  '\nmodels:\n  - model: qwen3-14b\n").unwrap();
+        assert!(blank.validate().unwrap_err().contains("blank"));
+
+        let absolute: ModelHostConfig = serde_yaml::from_str(
+            "cache_dir: /var/lib/sbproxy/models\nmodels:\n  - model: qwen3-14b\n",
+        )
+        .unwrap();
+        assert!(absolute.validate().is_ok());
+
+        let omitted: ModelHostConfig =
+            serde_yaml::from_str("models:\n  - model: qwen3-14b\n").unwrap();
+        assert!(omitted.validate().is_ok());
     }
 
     #[test]

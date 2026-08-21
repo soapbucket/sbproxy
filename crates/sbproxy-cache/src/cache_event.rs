@@ -41,19 +41,21 @@
 //! cache entry. That refusal is load bearing: a silently-inert dimension
 //! is the poisoning bug wearing a working config's clothes.
 //!
-//! `compute_cache_key` builds `<workspace>:<hostname>:<method>:<path>:
-//! <query>:<vary-fingerprint>`, and a policy reaches only the last
-//! segment. Every earlier segment is stamped by the host whatever the
+//! `compute_cache_key` builds `v2:<workspace>:<tenant>:<hostname>:
+//! <method>:<path>:<identity>:<query>:<vary-fingerprint>:
+//! <config-fingerprint>`, and a policy reaches only the vary
+//! fingerprint. Every other field is stamped by the host whatever the
 //! policy returns, so a policy can narrow a key and there is no
 //! document it can return that widens one.
 //!
-//! Worth being precise about which segment does the separating, because
+//! Worth being precise about which field does the separating, because
 //! the obvious answer is wrong in this build: `workspace` is passed as
-//! the empty string on every production path, so tenant separation
-//! comes from `hostname` plus the per-origin store handle
-//! (`cache_store_for(origin)`), not from a workspace prefix. The
-//! structural property holds either way, since a plan only ever
-//! produces vary pairs and those are hashed into the last segment.
+//! the empty string on every production path. Tenant separation comes
+//! from `tenant` (the origin's resolved tenant), `hostname`, and the
+//! per-origin store handle (`cache_store_for(origin)`), and caller
+//! separation from `identity`, none of which a plan can address. The
+//! structural property holds whatever those resolve to, since a plan
+//! only ever produces vary pairs and those are hashed into one field.
 //!
 //! ## Determinism is a correctness property, not a preference
 //!
@@ -143,8 +145,9 @@ pub struct CacheKeyPlan {
     /// decode so ordering cannot change the resulting key.
     ///
     /// These are **added** to the host's key material. Nothing here can
-    /// remove the workspace, hostname, method, or path segments, which
-    /// is what makes cross-tenant poisoning unreachable from a policy.
+    /// remove the workspace, tenant, hostname, method, path, or
+    /// identity fields, which is what makes cross-tenant poisoning
+    /// unreachable from a policy.
     pub vary: Vec<String>,
     /// Skip the cache lookup for this request and go upstream.
     ///
@@ -538,35 +541,31 @@ mod tests {
 
         // Whatever the names are, they only ever reach the vary
         // fingerprint, which is a hash. A dimension name carrying the
-        // key's own `:` separator, or a traversal-looking one, cannot
-        // inject a segment into the key: it is hashed with the rest.
+        // key's own `:` delimiter, or a traversal-looking one, cannot
+        // inject a field into the key: it is hashed with the rest.
         assert_eq!(folded.len(), 3);
-        let key_a = crate::response::compute_cache_key(
-            "tenant-a",
-            "api.local",
-            "GET",
-            "/v1/thing",
-            None,
-            &crate::response::QueryMode::Sort,
-            &folded,
-            "00112233445566ff",
-        );
-        let key_b = crate::response::compute_cache_key(
-            "tenant-b",
-            "api.local",
-            "GET",
-            "/v1/thing",
-            None,
-            &crate::response::QueryMode::Sort,
-            &folded,
-            "00112233445566ff",
-        );
+        let key_for_tenant = |tenant: &str| {
+            crate::response::compute_cache_key(
+                "",
+                tenant,
+                "api.local",
+                "GET",
+                "/v1/thing",
+                "",
+                None,
+                &crate::response::QueryMode::Sort,
+                &folded,
+                "00112233445566ff",
+            )
+        };
+        let key_a = key_for_tenant("tenant-a");
+        let key_b = key_for_tenant("tenant-b");
         assert_ne!(
             key_a, key_b,
             "identical policy output under two tenants must not collide"
         );
-        assert!(key_a.starts_with("tenant-a:"));
-        assert!(key_b.starts_with("tenant-b:"));
+        assert!(key_a.starts_with("v2::tenant-a:"));
+        assert!(key_b.starts_with("v2::tenant-b:"));
     }
 
     #[test]
@@ -768,10 +767,12 @@ mod tests {
                 let folded =
                     plan.fold_into_vary(|name| name.to_owned(), |_| Some(format!("req-{i}")));
                 crate::response::compute_cache_key(
+                    "",
                     "tenant-a",
                     "api.local",
                     "GET",
                     "/v1/thing",
+                    "",
                     None,
                     &crate::response::QueryMode::Sort,
                     &folded,
