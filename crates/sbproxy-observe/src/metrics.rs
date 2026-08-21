@@ -4893,7 +4893,7 @@ pub fn set_cert_store_degraded(backend: &str, degraded: bool) {
     let gauge = G.get_or_init(|| {
         register_int_gauge_vec!(
             "sbproxy_cert_store_degraded",
-            "1 when the configured certificate store could not be opened and an              in-memory fallback is in use, 0 when the configured backend opened",
+            "1 when the configured certificate store could not be opened and an in-memory fallback is in use, 0 when the configured backend opened",
             &["backend"],
         )
         .expect("cert store degraded gauge registers")

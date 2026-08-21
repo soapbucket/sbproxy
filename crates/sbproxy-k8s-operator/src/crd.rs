@@ -209,8 +209,21 @@ impl SBProxyStatus {
     /// Treating that as a delivered hash would compare a real hash against
     /// an empty string on every pass, which reads as "the config changed"
     /// forever.
+    ///
+    /// An empty `observedConfigHash` disqualifies the hash too, and that
+    /// rule is what makes an operator upgrade safe. Before `configHash`
+    /// meant "delivered" it was written straight after validation and meant
+    /// only "seen", so a CR whose last pre-upgrade pass stamped a hash and
+    /// then failed its ConfigMap apply carries a `configHash` the pods never
+    /// received. Read as delivered, that value pins the pod template where
+    /// it is and suppresses the hot reload, and the fleet stays on the old
+    /// config while the CR reads healthy. Every pass of an operator that
+    /// separates the two writes `observedConfigHash` first, so its presence
+    /// is the proof that `configHash` was written under the newer meaning.
+    /// The cost when it is absent is one redundant delivery, in the same
+    /// direction the code is already wrong in.
     pub fn delivered_config_hash(&self) -> Option<&str> {
-        if self.config_hash.is_empty() {
+        if self.config_hash.is_empty() || self.observed_config_hash.is_empty() {
             return None;
         }
         Some(self.config_hash.as_str())

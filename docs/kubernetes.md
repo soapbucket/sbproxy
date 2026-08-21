@@ -44,13 +44,17 @@ Two hashes, because the pass has two interesting moments and they answer differe
 |---|---|---|
 | `status.observedConfigHash` | after validation, before anything is applied | the operator has read and validated this config |
 | `status.configHash` | after the ConfigMap, Service, and workload have all been applied, or after every pod accepted a hot reload | this is the config the pods are running |
-| `status.lastError` | cleared at the same point as `configHash`; set by either pre-rollout guard | the reason nothing moved |
+| `status.lastError` | cleared at the same point as `configHash`; set by any of the pre-rollout guards (config validation, the multi-replica ACME store check, clustered config rendering) | the reason nothing moved |
 
-So `configHash` equal to `observedConfigHash` with an empty `lastError` is the fleet being on the config you applied. `configHash` trailing `observedConfigHash` means the rollout is in progress or is stuck; the reconcile error is in the operator's log, and any guard refusal is in `lastError`. The two used to be one field written straight after validation, which reported a completed rollout while a 403 on the very next ConfigMap patch left every pod on the previous config.
+So `configHash` equal to `observedConfigHash` with an empty `lastError` is the fleet being on the config you applied. `configHash` trailing `observedConfigHash` means the rollout is in progress or is stuck. The two used to be one field written straight after validation, which reported a completed rollout while a 403 on the very next ConfigMap patch left every pod on the previous config.
+
+Read `lastError` carefully while a rollout is stuck. It carries the last guard refusal and is cleared only when a rollout completes, so during a stuck rollout it can still name a refusal from an earlier pass that no longer applies. Failures after the guards (a 403 on the ConfigMap patch, a rejected apply) do not write it at all. The hash gap is what tells you the rollout is stuck; the operator's own log is what tells you why.
 
 Config-only changes prefer the hot-reload branch; a cluster-topology change (replica count, ports, flipping `clustering.enabled`) always takes the rollout path, because those are process-owned identity and never swap on a live reload. See [Hot-reload (recommended)](#hot-reload-recommended) and [Clustered proxies](#clustered-proxies) below for what each branch actually does to the pods.
 
 A pass over an unchanged `SBProxy` writes nothing and reloads nothing. Deciding that needs the two hashes above rather than the pod template's `sbproxy.dev/config-hash` annotation: a successful hot reload deliberately leaves that annotation alone, since changing it is the rolling restart the reload exists to avoid. The operator reads `status.configHash` for "what have the pods been given" and keeps the annotation at whatever the pods were started with until something actually has to roll them.
+
+Upgrade the CRDs along with the operator image. `observedConfigHash` is new, and until the CRD carries it the apiserver prunes the field on every status write. The operator only trusts a `configHash` that has an `observedConfigHash` beside it, because an older build wrote `configHash` before applying anything and a hash that means "seen" would read as "delivered". So an operator running against the old CRD reloads the fleet once per requeue instead of skipping the pass, which is wasteful rather than wrong and stops as soon as the CRD is applied. `helm upgrade` handles this; a raw `kubectl apply` needs `deploy/crds/sbproxy.yaml` reapplied too.
 
 ## Install the chart
 

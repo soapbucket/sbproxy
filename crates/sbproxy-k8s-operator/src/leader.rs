@@ -51,7 +51,10 @@
 //!   stamped when a renewal *begins*, before the API call. So the incumbent
 //!   measures its own deadline from that same instant rather than from when
 //!   the call returned. Measuring from the return would under-count the
-//!   elapsed time by the call's whole latency.
+//!   elapsed time by the call's whole latency. The one anchor the hold loop
+//!   cannot take itself is the acquisition's, so it renews once immediately
+//!   on entry rather than riding an inherited one for a whole
+//!   [`RENEW_PERIOD`].
 //! * The deadline is absolute and is enforced from *inside* the wait, not
 //!   checked after it. An apiserver that hangs rather than erroring never
 //!   returns, so a check placed after the call runs late by however long the
@@ -433,12 +436,25 @@ pub(crate) async fn hold_via<A: LeaseApi>(api: &A, cfg: &LeaderConfig, gate: &Wr
     // difference is the API call's latency, and counting from the return
     // would give this holder that much longer than the successor gives it.
     let mut last_ok = tokio::time::Instant::now();
+    // The anchor above is inherited, not measured: `acquire_lease` stamped
+    // its `renewTime` before its API call was even sent, so by the time this
+    // loop starts the successor's clock is already the whole acquire round
+    // trip ahead of `last_ok`. Renew once immediately to replace the
+    // inherited anchor with a stamp this loop took itself, and only then
+    // settle into `RENEW_PERIOD`. Without it a slow acquire silently spends
+    // its own latency out of the margin between the fence and the earliest
+    // legal takeover.
+    let mut anchor_is_inherited = true;
     loop {
         // Absolute. Every wait below is capped at it, so it is a deadline the
         // gate closes on rather than a condition that gets checked whenever
         // the apiserver next decides to answer.
         let fence_at = last_ok + SAFETY_DEADLINE;
-        let wake_at = std::cmp::min(tokio::time::Instant::now() + RENEW_PERIOD, fence_at);
+        let wake_at = if std::mem::take(&mut anchor_is_inherited) {
+            tokio::time::Instant::now()
+        } else {
+            std::cmp::min(tokio::time::Instant::now() + RENEW_PERIOD, fence_at)
+        };
         tokio::time::sleep_until(wake_at).await;
 
         // The last attempt is allowed to start exactly at the deadline and is
@@ -879,6 +895,39 @@ mod tests {
         assert!(
             state.resource_version.unwrap().parse::<u64>().unwrap() > 1,
             "renewals must actually write the Lease"
+        );
+        holder.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_hold_loop_re_anchors_before_spending_any_of_the_margin() {
+        // `acquire_lease` stamps `renewTime` before its API call is sent, so
+        // the instant `hold_via` starts is already that call's whole latency
+        // past the instant a successor measures the lease from. Inheriting
+        // that anchor for a full RENEW_PERIOD spends the acquire's latency
+        // out of the margin between the fence and the earliest legal
+        // takeover, which is the one number the two sides have to agree on.
+        // So the first renewal happens straight away.
+        let fake = std::sync::Arc::new(FakeLease::default());
+        let gate = WriteGate::for_election();
+        let cfg = cfg("a");
+        acquire_via(&*fake, &cfg, &gate).await;
+        let at_acquisition = fake.stored().unwrap().resource_version;
+
+        let holder = tokio::spawn({
+            let fake = std::sync::Arc::clone(&fake);
+            let gate = gate.clone();
+            let cfg = cfg.clone();
+            async move { hold_via(&*fake, &cfg, &gate).await }
+        });
+        // Far short of one renewal period: the point is that no wait happens.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        assert_ne!(
+            fake.stored().unwrap().resource_version,
+            at_acquisition,
+            "the hold loop must replace the inherited anchor with a stamp it \
+             took itself, not wait a full renewal period on it"
         );
         holder.abort();
     }
