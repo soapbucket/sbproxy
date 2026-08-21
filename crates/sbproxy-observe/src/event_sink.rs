@@ -1716,8 +1716,16 @@ mod tests {
         // the string has landed.
         let _ = stub.join();
         let request = seen.lock().map(|slot| slot.clone()).unwrap_or_default();
+        // Lowercased, like `webhook_sink_posts_a_signed_batch` above:
+        // hyper writes `HeaderName::as_str()`, which is the canonical
+        // lowercase form, so the `X-Sbproxy-Signature` this code spells
+        // in title case never appears that way on the wire. Matching on
+        // the value as well as the name, so an empty or malformed header
+        // cannot read as a signed batch.
         assert!(
-            request.contains("X-Sbproxy-Signature"),
+            request
+                .to_ascii_lowercase()
+                .contains("x-sbproxy-signature: v1="),
             "the signed batch never arrived: {request}"
         );
     }

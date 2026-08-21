@@ -12161,9 +12161,10 @@ pub(super) async fn read_capped_response_body(
         Some(c) if c > 0 => c,
         _ => {
             return resp.bytes().await.map_err(|e| {
-                // Not `error = %e`: a reqwest Display ends with the whole
-                // upstream URL, and some providers carry the API key in
-                // the query string (WOR-2629).
+                // Not `error = %e`: a reqwest Display ends with
+                // `" for url ({url})"` for every error that carries one,
+                // and some providers carry the API key in that URL's
+                // query string (WOR-2629).
                 //
                 // The cause handed to `Error::because` needs the same
                 // treatment, and for the same reason. pingora's own
@@ -12172,6 +12173,13 @@ pub(super) async fn read_capped_response_body(
                 // out of `request_filter`, so the reqwest Display reaches
                 // a second log line this one cannot see. `without_url`
                 // is what keeps the URL off both.
+                //
+                // Which reqwest errors carry a URL is reqwest's business
+                // and it changes: 0.12 attaches it on the send path and
+                // not on this read path, and its successor attaches it
+                // here too. `without_url` holds the property whichever
+                // is resolved, which is the point of calling it on a
+                // path where today it happens to be a no-op.
                 let summary = sbproxy_httpkit::request_error_summary(&e);
                 warn!(error = %summary, "AI proxy: failed to read upstream response body");
                 Error::because(
@@ -16881,6 +16889,26 @@ mod external_guardrail_context_tests {
         downstream_wire_session(wire).await
     }
 
+    /// Close a session the way pingora closes one after a generated
+    /// response: read whatever the client still has in flight first.
+    ///
+    /// A refusal answers without ever reading the request body, and a
+    /// socket dropped with bytes still in its receive queue closes with
+    /// an RST rather than a FIN. The RST discards the response the
+    /// gateway already wrote, so the client fixture sees a 413 whose
+    /// body never arrived and the test fails on a race it cannot win.
+    /// Production does not have that problem: pingora drains the
+    /// downstream body before closing on a generated response. This
+    /// harness calls `handle_ai_proxy` directly, so the drain has to
+    /// happen here or the refusal tests are flaky by construction.
+    async fn drain_and_close(mut session: Session) {
+        let drain = async { while let Ok(Some(_)) = session.read_request_body().await {} };
+        // Bounded: a body the session will not give up must not turn a
+        // failed assertion into a hung test.
+        let _ = tokio::time::timeout(Duration::from_secs(2), drain).await;
+        drop(session);
+    }
+
     async fn downstream_wire_session(wire: Vec<u8>) -> (Session, DownstreamClient) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -17008,6 +17036,69 @@ mod external_guardrail_context_tests {
         upstream_bytes_fixture_with_status(body, content_type, 200).await
     }
 
+    /// Read one whole request off `stream` before answering it.
+    ///
+    /// Not cosmetic. A fixture that answers with bytes still sitting
+    /// unread in its receive queue turns its own close into an RST, and
+    /// the RST arrives at the gateway between the response headers and
+    /// the response body: the relay's body read then fails with
+    /// `ConnectionReset` and the test sees a transport error instead of
+    /// the 200 the upstream actually wrote. The old single 4096-byte
+    /// read was under every request any test sent until one carried a
+    /// body larger than that (WOR-2616's inside-the-cap forward).
+    async fn drain_upstream_request(stream: &mut tokio::net::TcpStream) {
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let read = match stream.read(&mut chunk).await {
+                Ok(0) => return,
+                Ok(read) => read,
+                Err(_) => return,
+            };
+            request.extend_from_slice(&chunk[..read]);
+            let Some(headers_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..headers_end]);
+            let chunked = headers.lines().any(|line| {
+                line.split_once(':').is_some_and(|(name, value)| {
+                    name.eq_ignore_ascii_case("transfer-encoding")
+                        && value.to_ascii_lowercase().contains("chunked")
+                })
+            });
+            if chunked {
+                // Chunked uploads end with the zero-length chunk; a
+                // fixture that stopped at the headers would leave the
+                // whole body unread.
+                while !request.ends_with(b"0\r\n\r\n") {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => request.extend_from_slice(&chunk[..read]),
+                    }
+                }
+                return;
+            }
+            let declared = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            let expected = headers_end + 4 + declared;
+            while request.len() < expected {
+                match stream.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => request.extend_from_slice(&chunk[..read]),
+                }
+            }
+            return;
+        }
+    }
+
     async fn upstream_bytes_fixture_with_status(
         body: Vec<u8>,
         content_type: Option<&'static str>,
@@ -17022,11 +17113,7 @@ mod external_guardrail_context_tests {
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept upstream request");
             observed.fetch_add(1, Ordering::SeqCst);
-            let mut request = [0_u8; 4096];
-            let _ = stream
-                .read(&mut request)
-                .await
-                .expect("read upstream request");
+            drain_upstream_request(&mut stream).await;
             let content_type_header = content_type
                 .map(|content_type| format!("content-type: {content_type}\r\n"))
                 .unwrap_or_default();
@@ -18056,7 +18143,7 @@ origins:
         )
         .await
         .expect("an oversize body is a refusal, not a transport error");
-        drop(session);
+        drain_and_close(session).await;
 
         let response = live_downstream_body(client).await;
         assert!(response.starts_with(b"HTTP/1.1 413"), "{response:?}");
@@ -18095,7 +18182,7 @@ origins:
         )
         .await
         .expect("an oversize declared length is a refusal");
-        drop(session);
+        drain_and_close(session).await;
 
         let response = live_downstream_body(client).await;
         assert!(response.starts_with(b"HTTP/1.1 413"), "{response:?}");
@@ -18133,7 +18220,7 @@ origins:
         )
         .await
         .expect("an oversize body is a refusal, not a transport error");
-        drop(session);
+        drain_and_close(session).await;
 
         let response = live_downstream_body(client).await;
         assert!(response.starts_with(b"HTTP/1.1 413"), "{response:?}");
@@ -25067,10 +25154,17 @@ mod upstream_body_error_redaction_tests {
     use super::read_capped_response_body;
 
     /// An upstream that promises a body and then hangs up, so the body
-    /// read fails with a `reqwest::Error` that still carries the request
-    /// URL. The provider path puts an API key in that URL's query on
-    /// several providers, which is why this one is a leak and not just
-    /// noise.
+    /// read fails. The provider path puts an API key in that URL's query
+    /// on several providers, which is why anything that renders the URL
+    /// on this path is a leak and not just noise.
+    ///
+    /// Note what this fixture does *not* prove, because the sibling test
+    /// below used to claim it did: the error reqwest hands back here
+    /// carries no URL. `Response::bytes` maps its failure through
+    /// `error::decode`, which leaves `url` unset, so a reqwest 0.12
+    /// body-read error renders as `error decoding response body` and
+    /// nothing more. See [`an_unstripped_cause_is_rendered_by_pingora_and_would_leak`]
+    /// for why `without_url` is still the thing that has to be there.
     async fn truncated_upstream() -> (String, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -25133,27 +25227,59 @@ mod upstream_body_error_redaction_tests {
         );
     }
 
-    /// The half this pins is pingora's, not reqwest's: a cause that has
-    /// not been stripped does reach the rendered error, so the assertion
-    /// above is testing the fix rather than an accident of formatting.
-    #[tokio::test]
-    async fn an_unstripped_cause_is_rendered_by_pingora_and_would_leak() {
-        let (url, server) = truncated_upstream().await;
-        let resp = reqwest::Client::new()
-            .get(&url)
+    /// A `reqwest::Error` that does carry its request URL.
+    ///
+    /// reqwest attaches the URL on its send path and not on its read
+    /// path: `async_impl::client` calls `with_url` on a connect, TLS, or
+    /// timeout failure, while `Response::bytes` goes through
+    /// `error::decode` and leaves it unset. Both are the same
+    /// `reqwest::Error` type reaching the same `Error::because` call, so
+    /// a refused connect is the honest way to get one with a URL in it.
+    async fn url_bearing_send_error() -> reqwest::Error {
+        // Bind to learn a free port, then release it, so the connect is
+        // refused immediately rather than left hanging on a port that
+        // might belong to something else.
+        let port = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("a loopback listener binds");
+            listener
+                .local_addr()
+                .expect("the listener has an addr")
+                .port()
+        };
+        reqwest::Client::new()
+            .get(format!(
+                "http://127.0.0.1:{port}/v1/messages?api-key=query-secret"
+            ))
             .send()
             .await
-            .expect("the stub upstream answers with headers");
-        let raw = resp
-            .bytes()
-            .await
-            .expect_err("a truncated body is a read failure");
-        server.abort();
+            .expect_err("nothing is listening on a released port")
+    }
 
+    /// The half this pins is pingora's, not reqwest's: a cause that has
+    /// not been stripped is rendered verbatim into the error text, so any
+    /// cause carrying a URL reaches the second log line pingora-proxy
+    /// writes when `request_filter` hands this error back.
+    ///
+    /// It builds that cause from a send failure rather than from
+    /// [`truncated_upstream`]'s read failure, because reqwest 0.12 does
+    /// not attach the URL to a read failure. The strip is not thereby
+    /// pointless: `without_url` is applied to whatever reqwest returns,
+    /// reqwest's own successor attaches the URL to the read path too
+    /// (`do_bytes` calls `with_url`, and 0.13 is already in this
+    /// workspace's dependency graph), and the send-shaped error pinned
+    /// here is the same type reaching the same `Error::because`. Making
+    /// the guarantee hold by construction rather than by knowing which
+    /// reqwest variant is in the tree is the whole point of the call.
+    #[tokio::test]
+    async fn an_unstripped_cause_is_rendered_by_pingora_and_would_leak() {
+        let raw = url_bearing_send_error().await;
         assert!(
             format!("{raw}").contains("query-secret"),
             "the premise changed: a reqwest Display no longer carries its url"
         );
+
         let leaked = format!(
             "{}",
             Error::because(
@@ -25165,6 +25291,25 @@ mod upstream_body_error_redaction_tests {
         assert!(
             leaked.contains("query-secret"),
             "pingora stopped rendering the cause; the strip is now untested: {leaked}"
+        );
+
+        // And the strip is what closes it: the same error, stripped, is
+        // rendered by the same pingora call without the URL.
+        let stripped = format!(
+            "{}",
+            Error::because(
+                ErrorType::ReadError,
+                "failed to read upstream response",
+                url_bearing_send_error().await.without_url()
+            )
+        );
+        assert!(
+            !stripped.contains("query-secret"),
+            "without_url stopped removing the url: {stripped}"
+        );
+        assert!(
+            stripped.contains("failed to read upstream response"),
+            "the context was lost along with the url: {stripped}"
         );
     }
 }
