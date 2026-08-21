@@ -604,6 +604,19 @@ pub struct ProxyMetrics {
     /// taken so the drift can be diagnosed in production.
     pub mirror_state_drift: prometheus::IntCounter,
 
+    /// Counter `sbproxy_request_body_drain_timeout_total` incremented when
+    /// the post-response drain of a client's request body hits its bound
+    /// and the connection is closed with bytes still unread.
+    ///
+    /// A response sbproxy writes itself goes out before the client's body
+    /// has been read, and closing a socket with unread bytes queued makes
+    /// the kernel send an RST that destroys the response (WOR-2599). The
+    /// drain exists to avoid that, and this counter is how an operator
+    /// sees it give up: every increment is a client that may have lost a
+    /// response it was already sent. A steady rate means either very slow
+    /// uploads or something holding connections open deliberately.
+    pub request_body_drain_timeout: prometheus::IntCounter,
+
     // --- Agent Skills ---
     /// Counter `sbproxy_agent_skill_digest_mismatch_total` of artifact
     /// `GET`s where the served body re-hash did not match the manifest
@@ -1015,6 +1028,12 @@ impl ProxyMetrics {
         )
         .unwrap();
 
+        let request_body_drain_timeout = prometheus::IntCounter::new(
+            "sbproxy_request_body_drain_timeout_total",
+            "Times the post-response drain of a client's request body hit its bound and the connection was closed with bytes unread",
+        )
+        .unwrap();
+
         // --- Content transform counters ---
 
         let boilerplate_stripped_bytes = IntCounterVec::new(
@@ -1158,6 +1177,9 @@ impl ProxyMetrics {
             .register(Box::new(mirror_state_drift.clone()))
             .unwrap();
         registry
+            .register(Box::new(request_body_drain_timeout.clone()))
+            .unwrap();
+        registry
             .register(Box::new(agent_skill_digest_mismatch.clone()))
             .unwrap();
         registry.register(Box::new(phase_duration.clone())).unwrap();
@@ -1204,6 +1226,7 @@ impl ProxyMetrics {
             cache_reserve_evictions,
             synthetic_probe_failures,
             mirror_state_drift,
+            request_body_drain_timeout,
             agent_skill_digest_mismatch,
             phase_duration,
             boilerplate_stripped_bytes,
@@ -3431,6 +3454,17 @@ pub fn dec_active(origin: &str) {
 /// best-effort no-op with a counter so operators can spot drift.
 pub fn record_mirror_state_drift() {
     metrics().mirror_state_drift.inc();
+}
+
+/// Increment `sbproxy_request_body_drain_timeout_total`.
+///
+/// Called when the drain of a client's remaining request body, run after
+/// sbproxy has already answered the request, hits its time bound. The
+/// connection is then closed with bytes still unread, which is the
+/// pre-WOR-2599 behavior and can cost the client the response it was
+/// sent.
+pub fn record_request_body_drain_timeout() {
+    metrics().request_body_drain_timeout.inc();
 }
 
 /// Add `bytes` to `sbproxy_boilerplate_stripped_bytes_total{hostname}`.

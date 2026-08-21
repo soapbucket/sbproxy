@@ -448,6 +448,108 @@ fn downstream_half_closed(session: &Session) -> bool {
     }
 }
 
+/// How long a request that has already been answered may go on reading the
+/// rest of the client's body.
+///
+/// The drained bytes are discarded as they arrive, so the resource at risk
+/// is worker time, not memory, and a time bound is the one that fits.
+/// nginx bounds `lingering_close` the same way rather than by byte count,
+/// and five seconds is its `lingering_timeout` default.
+const LINGERING_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Read and discard whatever is left of the client's request body before
+/// the connection is torn down.
+///
+/// A response sbproxy writes itself goes out before the client's body has
+/// been read. That happens in the request phase (`type: mock`,
+/// `type: static`, `type: echo`, every policy denial) and again in
+/// [`ProxyHttp::fail_to_proxy`], which answers 502 for an upstream that
+/// could not be reached and so never consumed the body either. Pingora
+/// sees an unfinished downstream body when the header goes out, stamps
+/// `Connection: close`, and closes the socket when the session ends.
+/// Closing a socket that still has unread bytes queued makes the kernel
+/// send a TCP RST instead of a FIN, and an RST discards whatever the peer
+/// had buffered but not yet read, including the response just written. The
+/// client sees a reset mid-response rather than the answer it was sent.
+///
+/// The effect only appears once the body outgrows a socket buffer, which
+/// is why WOR-2599 reported it as "roughly 70 KB": below that the whole
+/// exchange completes before the close, and the reset lands on a
+/// connection neither side still cares about. It is a race, not a cap, so
+/// the same size passes and fails on different attempts. Measured on the
+/// unfixed binary, a 1 MiB POST to a `type: static` origin came back
+/// intact 16 times out of 20.
+///
+/// Draining first turns the RST back into an ordinary FIN. This is
+/// nginx's `lingering_close`, and it is bounded by
+/// [`LINGERING_DRAIN_TIMEOUT`] so a slow client cannot pin a worker on a
+/// request that has already been answered. Hitting that bound leaves the
+/// connection exactly where it was before this drain existed, and ticks
+/// `sbproxy_request_body_drain_timeout_total` so the give-up is visible
+/// rather than silent.
+///
+/// What this does **not** do is win the connection back. Pingora decides
+/// keep-alive when the response header is written, which is long before
+/// this runs, so a request that carried a body still gets
+/// `Connection: close` and still costs a connection. The change is that
+/// the close is orderly. Bodyless requests to the same origins keep
+/// their connection as they always did.
+///
+/// Called from [`ProxyHttp::logging`], which is the one hook Pingora runs
+/// on every terminal path (request-phase short circuit, proxied response,
+/// and `fail_to_proxy`) and always before the session is finished or
+/// dropped.
+async fn lingering_drain_downstream_body(session: &mut Session, ctx: &RequestContext) {
+    // HTTP/2 gives every request its own stream, so an unread body costs
+    // the stream and never the connection. This is an HTTP/1.x problem.
+    if !matches!(
+        session.as_downstream(),
+        pingora_core::protocols::http::ServerSession::H1(_)
+    ) {
+        return;
+    }
+    // A tunnel's body is the tunnel. Once a 101 is accepted Pingora
+    // reframes the request side to carry WebSocket frames, so draining
+    // would consume the tunnel rather than a request body. A tunnel that
+    // closed normally is already covered, because `finish_body` forces
+    // the request reader done for an upgraded session; this covers the
+    // abnormal teardown, where the enforcement is the immediate close and
+    // lingering would blunt it.
+    //
+    // Deliberately not Pingora's `is_upgrade_req()`: that is
+    // `HTTP/1.1 && an Upgrade header is present`, blind to the value and
+    // to whether the upgrade was ever granted, so any client could switch
+    // this drain off with one header and hand itself WOR-2599 back.
+    // `ctx.websocket_tunnel` is set only once an upgrade is accepted.
+    if ctx.websocket_tunnel.is_some() {
+        return;
+    }
+    // The common case: a bodyless request, or one whose body was already
+    // read (the AI proxy buffers it whole, and a proxied request streams
+    // it upstream). A CONNECT or a refused upgrade lands here too, since
+    // a request with neither `Content-Length` nor chunked framing is
+    // zero-length by RFC 9112 section 6.3.
+    if session.as_mut().is_body_done() {
+        return;
+    }
+    let drained = tokio::time::timeout(LINGERING_DRAIN_TIMEOUT, async {
+        // Stops on `Ok(None)` (body finished) and on any read error, which
+        // means the connection is already gone and there is nothing left
+        // to be polite about.
+        while matches!(session.read_request_body().await, Ok(Some(_))) {}
+    })
+    .await;
+    if drained.is_err() {
+        sbproxy_observe::metrics::record_request_body_drain_timeout();
+        warn!(
+            request_id = %ctx.request_id,
+            timeout = ?LINGERING_DRAIN_TIMEOUT,
+            "client body still arriving after the response was sent; closing with it unread, \
+             which can cost the client the response"
+        );
+    }
+}
+
 fn client_disconnected(
     error_source: Option<pingora_error::ErrorSource>,
     downstream_half_closed: bool,
@@ -7780,6 +7882,15 @@ impl ProxyHttp for SbProxy {
             latency_ms_envelope,
             error_class,
         );
+
+        // WOR-2599. Last, deliberately: everything above is bookkeeping
+        // this request's teardown should not wait on, and the drain can
+        // linger for up to `LINGERING_DRAIN_TIMEOUT`. Pingora calls this
+        // hook once on every terminal path and always before the session
+        // is finished or dropped, which makes it the only place that
+        // covers a request-phase short circuit, a proxied response, and a
+        // `fail_to_proxy` error alike.
+        lingering_drain_downstream_body(session, ctx).await;
     }
 }
 

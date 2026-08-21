@@ -331,6 +331,35 @@ the next version cut.
 
 ### Fixed
 
+- **A large request body no longer costs the client the response
+  sbproxy already wrote.** Any response the proxy generates itself goes
+  out before the client's body has been read: `type: mock`,
+  `type: static`, `type: echo`, `type: beacon`, every policy denial,
+  and the 502 for an upstream that could not be reached. The socket
+  therefore still held unread bytes when the session ended, and closing
+  a socket in that state makes the kernel send a TCP RST rather than a
+  FIN, which discards whatever the peer had buffered but not yet read,
+  the response included. Clients saw a reset connection instead of
+  their 200, 403, or 502. The proxy now reads and discards the rest of
+  the body before closing, bounded at five seconds the way nginx bounds
+  `lingering_close`; the response still goes out immediately and only
+  the teardown waits. Hitting the bound increments the new
+  `sbproxy_request_body_drain_timeout_total`. One consequence worth
+  knowing: a client that sends `Expect: 100-continue`, receives the
+  final response instead of a 100, and then correctly sends no body now
+  holds its connection for that bound rather than being closed at once.
+
+- **`type: mock` and `type: beacon` responses declare
+  `Content-Length`.** Without it the body was close-delimited, so the
+  only end-of-body signal was the connection closing: a client could
+  not tell a complete body from a killed one, and every mock or beacon
+  response burned a connection even when it advertised `keep-alive`.
+  That missing header is why the reset above surfaced on the mock path
+  from roughly 70 KB while `type: static`, which has always declared
+  its length, survived to a megabyte. Neither arm declares a length on
+  204 or 304, where RFC 9110 section 8.6 forbids it; `type: static` no
+  longer does either.
+
 - **Prompts admin page "Add version" now sends the field the backend
   expects.** The form built a `content` key while
   `POST /admin/prompts/<host>/<name>/versions` deserializes into a

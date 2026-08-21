@@ -29,6 +29,7 @@ Hello from sbproxy
 $ curl -i -H 'Host: api.local' http://127.0.0.1:8080/users/42
 HTTP/1.1 200 OK
 content-type: application/json
+content-length: 37
 X-Mock: true
 
 {"id":42,"name":"ada","role":"admin"}
