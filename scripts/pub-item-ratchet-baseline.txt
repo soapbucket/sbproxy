@@ -525,3 +525,7 @@
 # this workspace should be able to use twice. The count moves so the
 # ratchet keeps working; the mesh item is no more wired than it was
 # yesterday and is still worth a look.
+
+2026-08-21 (batch-4 merge from main): 296 -> 295. The ground was gained by the
+lanes that landed in #1195, not by this branch; merging main into the batch is
+where the count first became visible to a gate.

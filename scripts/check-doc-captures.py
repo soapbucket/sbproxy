@@ -428,6 +428,12 @@ UNCAPTURED_BLOCKS: dict[str, dict[str, str]] = {
             "a fixture that exists nowhere else in the repo, so the example "
             "wants shipping before the stack does"
         ),
+        "/admin/cache/purge": (
+            "the fence below this command is not its output: it is the cache "
+            "key's wire format, printed so an operator writing a `key` or a "
+            "`prefix` by hand can see the field order. The purge call answers "
+            "with a count, so there is nothing here for a marker to replay"
+        ),
     },
 }
 

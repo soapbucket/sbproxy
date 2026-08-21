@@ -35,10 +35,14 @@ openssl x509 -req -days 1 \
   -out state/authority/admin.pem
 ```
 
-Start the authority first:
+Start the authority first. Each of the four config files puts its weight cache
+under `SB_MODEL_CACHE_DIR`, which has to be an absolute path and defaults to
+the service path `/var/lib/sbproxy/models`; point it somewhere this user can
+write before starting anything:
 
 ```bash
 export SB_ADMIN_PASSWORD=local-admin
+export SB_MODEL_CACHE_DIR="$HOME/.cache/sbproxy-models"
 sbproxy -f examples/model-cluster-split/sb.yml
 ```
 
@@ -77,6 +81,7 @@ Start the gateway and workers in three more shells:
 
 ```bash
 export SB_ADMIN_PASSWORD=local-admin
+export SB_MODEL_CACHE_DIR="$HOME/.cache/sbproxy-models"
 sbproxy -f examples/model-cluster-split/gateway.yml
 sbproxy -f examples/model-cluster-split/worker-a.yml
 sbproxy -f examples/model-cluster-split/worker-b.yml

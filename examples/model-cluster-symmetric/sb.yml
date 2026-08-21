@@ -59,7 +59,10 @@ proxy:
     authority: file_managed
     handoff_timeout_ms: 15000
     cache:
-      directory: "${SB_STATE_DIR:-./state/node-a}/models"
+      # Absolute path required: the engine subprocess this cache feeds
+      # has its own working directory. Unlike SB_STATE_DIR above, which
+      # may be relative, this one cannot be.
+      directory: "${SB_MODEL_CACHE_DIR:-/var/lib/sbproxy/models}/${SB_NODE_ID:-node-a}"
       budget_gib: 4
       max_resident_models: 1
     engines:

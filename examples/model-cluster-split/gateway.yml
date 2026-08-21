@@ -33,7 +33,8 @@ proxy:
     authority: file_managed
     handoff_timeout_ms: 15000
     cache:
-      directory: ./state/gateway/models
+      # Absolute path required; see sb.yml for why.
+      directory: ${SB_MODEL_CACHE_DIR:-/var/lib/sbproxy/models}/gateway
       budget_gib: 4
       max_resident_models: 1
     engines:
