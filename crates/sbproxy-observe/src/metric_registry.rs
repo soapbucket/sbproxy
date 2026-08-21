@@ -3324,6 +3324,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_request_body_drain_timeout_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_request_body_drain_timeout"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &[],
+        description: "Times the post-response drain of a client's request body hit its bound and the connection was closed with bytes unread.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_request_duration_seconds",
         kind: MetricKind::Histogram,
         writer: Writer::Field("request_duration"),
