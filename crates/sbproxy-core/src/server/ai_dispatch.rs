@@ -4054,7 +4054,10 @@ fn price_ceiling_deny_reason(
 /// the documented default allowance.
 ///
 /// Shared by both candidate sets the ceiling filters (provider order and
-/// cascade tiers) so the two cannot price the same request differently.
+/// cascade tiers) as the base cap the request itself declared. What a
+/// candidate's reasoning transform then adds on top of it is a
+/// per-candidate question, answered by
+/// [`PriceCeilingAllowance::for_candidate`].
 fn price_ceiling_completion_allowance(body: &serde_json::Value) -> u64 {
     body.get("max_tokens")
         .or_else(|| body.get("max_completion_tokens"))
@@ -4063,8 +4066,8 @@ fn price_ceiling_completion_allowance(body: &serde_json::Value) -> u64 {
         .unwrap_or(sbproxy_ai::budget::PRICE_CEILING_DEFAULT_COMPLETION_TOKENS)
 }
 
-/// The completion-token volume the price ceiling (WOR-2559) prices a
-/// request at once the reasoning policy has had its say.
+/// The reasoning-aware output volume the price ceiling (WOR-2559)
+/// prices one routing candidate at.
 ///
 /// The caller's declared cap is not what the upstream is asked to
 /// generate: on a `reasoning: {budget: N}` origin the dispatch loop's
@@ -4075,46 +4078,197 @@ fn price_ceiling_completion_allowance(body: &serde_json::Value) -> u64 {
 /// times the estimate the ceiling cleared it on, with the admin row
 /// still reading `price_ceiling:allow`.
 ///
-/// Rather than re-derive which transform a candidate will take (the
-/// provider format, the model's manual-thinking support, and the
-/// 1024-token floor all decide it, and none of that is reachable from
-/// here), this asks the transform itself: a probe body carrying only
-/// the declared cap goes through the same public entry point the
-/// dispatch loop calls, per candidate, with the same eligibility the
-/// dispatch loop captured before compression. Every non-raising
-/// transform leaves `max_tokens` alone, so the probe reads back the
-/// declared cap and the estimate is unchanged; the raising one reads
-/// back `declared + budget`. The worst case across candidates is the
-/// shared number, because one allowance is shared by both candidate
-/// sets the ceiling filters.
-fn price_ceiling_completion_allowance_after_reasoning(
-    body: &serde_json::Value,
+/// The raise is per candidate, never one worst case shared by all of
+/// them. Which transform runs is decided by the candidate's provider
+/// format and by whether the model it dispatches supports manual
+/// thinking, and both of those differ across a mixed-vendor origin and
+/// across a cascade's tiers. A shared maximum priced a non-raising
+/// candidate at a raising sibling's cap and could refuse a request no
+/// candidate could have made that expensive; a shared number probed
+/// against the *request's* model was blind to the raise entirely on a
+/// cascade, whose defining property is that the tier's model is not the
+/// request's.
+#[derive(Clone, Copy)]
+struct PriceCeilingAllowance {
+    /// The output cap the request itself declared, or the documented
+    /// default when it declared none.
+    declared: u64,
+    /// The reasoning policy this surface will apply, `Off` where the
+    /// surface has none to apply.
     policy: sbproxy_ai::ReasoningPolicy,
+    /// Eligibility facts captured before any request-body compression,
+    /// the same ones the dispatch loop transforms with.
     eligibility: sbproxy_ai::ReasoningEligibility,
-    providers: &[sbproxy_ai::ProviderConfig],
-    candidates: &[usize],
-    requested_model: &str,
-) -> u64 {
-    let declared = price_ceiling_completion_allowance(body);
-    if policy == sbproxy_ai::ReasoningPolicy::Off {
-        return declared;
+}
+
+impl PriceCeilingAllowance {
+    /// The output volume this candidate would really be billed for.
+    ///
+    /// Rather than re-derive which transform the candidate will take
+    /// (the provider format, the model's manual-thinking support, and
+    /// the 1024-token floor all decide it, and none of that is
+    /// reachable from here), this asks the transform itself: a probe
+    /// body carrying only the declared cap goes through the same public
+    /// entry point the dispatch loop calls, with the same eligibility
+    /// the dispatch loop captured before compression. Every non-raising
+    /// transform leaves `max_tokens` alone, so the probe reads back the
+    /// declared cap and the estimate is unchanged; the raising one
+    /// reads back `declared + budget`.
+    ///
+    /// `dispatch_model` is the model this candidate would send *before*
+    /// its `model_map` rename, because that rename is what the dispatch
+    /// sites themselves apply: the request's model over the provider
+    /// order, the tier's own model over a cascade's tier list.
+    fn for_candidate(self, provider: &sbproxy_ai::ProviderConfig, dispatch_model: &str) -> u64 {
+        if self.policy == sbproxy_ai::ReasoningPolicy::Off {
+            return self.declared;
+        }
+        let mut probe = serde_json::json!({ "max_tokens": self.declared });
+        let _ = sbproxy_ai::apply_reasoning_policy_with_eligibility(
+            self.policy,
+            provider,
+            &provider.map_model(dispatch_model),
+            &mut probe,
+            self.eligibility,
+        );
+        self.declared
+            .max(price_ceiling_completion_allowance(&probe))
     }
-    let mut allowance = declared;
+}
+
+/// Split the provider order against the price ceiling, pricing each
+/// candidate on its own reasoning-adjusted output volume (WOR-2559).
+///
+/// [`sbproxy_ai::budget::partition_by_price_ceiling`] already resolves
+/// each candidate's own model; the output allowance has to travel with
+/// it, or a candidate whose transform does not raise the cap is priced
+/// at a raising sibling's cap and refused for a cost it could never
+/// incur. Handing the shared partition one candidate at a time is the
+/// whole of the difference.
+fn price_ceiling_partition_over_provider_order(
+    ceiling_usd: f64,
+    candidates: &[usize],
+    providers: &[sbproxy_ai::ProviderConfig],
+    requested_model: &str,
+    prompt_tokens: u64,
+    allowance: PriceCeilingAllowance,
+) -> sbproxy_ai::budget::PriceCeilingPartition {
+    let mut partition = sbproxy_ai::budget::PriceCeilingPartition {
+        kept: Vec::new(),
+        excluded: Vec::new(),
+    };
     for &index in candidates {
+        // An index the provider set does not have cannot dispatch, so
+        // it is dropped rather than kept unpriced, which is what the
+        // shared partition does with the same case.
         let Some(provider) = providers.get(index) else {
             continue;
         };
-        let mut probe = serde_json::json!({ "max_tokens": declared });
-        let _ = sbproxy_ai::apply_reasoning_policy_with_eligibility(
-            policy,
-            provider,
-            &provider.map_model(requested_model),
-            &mut probe,
-            eligibility,
+        let one = sbproxy_ai::budget::partition_by_price_ceiling(
+            ceiling_usd,
+            std::slice::from_ref(&index),
+            providers,
+            requested_model,
+            prompt_tokens,
+            allowance.for_candidate(provider, requested_model),
         );
-        allowance = allowance.max(price_ceiling_completion_allowance(&probe));
+        partition.kept.extend(one.kept);
+        partition.excluded.extend(one.excluded);
     }
-    allowance
+    partition
+}
+
+/// Split a confidence cascade's tier list against the price ceiling,
+/// pricing each tier on the model that tier would actually dispatch
+/// (WOR-2559).
+///
+/// The tier's model is authoritative on this path: the executor writes
+/// it into the request body and remaps it through its provider's
+/// `model_map`, then applies the reasoning policy to that. Probing the
+/// request's model instead missed every raise a cascade can produce,
+/// which is all of them whenever a tier renames the model, and renaming
+/// the model is what a cascade is for.
+fn price_ceiling_partition_over_cascade_tiers(
+    ceiling_usd: f64,
+    tiers: &[sbproxy_ai::routing::CascadeTier],
+    providers: &[sbproxy_ai::ProviderConfig],
+    prompt_tokens: u64,
+    allowance: PriceCeilingAllowance,
+) -> sbproxy_ai::budget::PriceCeilingPartition {
+    let mut partition = sbproxy_ai::budget::PriceCeilingPartition {
+        kept: Vec::new(),
+        excluded: Vec::new(),
+    };
+    for (index, tier) in tiers.iter().enumerate() {
+        // A tier naming no configured provider takes the declared cap
+        // and is kept by the shared partition below: it cannot dispatch
+        // either way, and the executor's own skip-and-warn owns it.
+        let tier_allowance = match providers
+            .iter()
+            .find(|provider| provider.name.as_str() == tier.provider_id)
+        {
+            Some(provider) => allowance.for_candidate(provider, &tier.model),
+            None => allowance.declared,
+        };
+        let one = sbproxy_ai::budget::partition_cascade_tiers_by_price_ceiling(
+            ceiling_usd,
+            std::slice::from_ref(tier),
+            providers,
+            prompt_tokens,
+            tier_allowance,
+        );
+        // The shared partition indexes the slice it was given, which is
+        // this one tier, so the caller's tier index is restored here.
+        if one.kept.is_empty() {
+            partition.excluded.extend(one.excluded);
+        } else {
+            partition.kept.push(index);
+        }
+    }
+    partition
+}
+
+/// Whether a configured confidence cascade is the whole of this
+/// request's dispatch (WOR-2559).
+///
+/// A cascade routes over its own tier list rather than over
+/// `provider_order`, but only on the one path where its executor runs.
+/// A streaming request gets the tier-1 pin and the ordinary sequential
+/// loop instead, because cascade does not retry mid-stream; a candidate
+/// set carrying a provider this gateway serves itself falls through to
+/// that same loop by design. On both of those the request dispatches
+/// over `provider_order`, at the request's own model.
+///
+/// That makes this the exact condition under which the price ceiling's
+/// provider-order filter may stand down. A stand-down any wider is a
+/// request that dispatches with no ceiling applied to anything, while
+/// the admin row still carries a verdict saying one ran, so the filter,
+/// the admin candidate snapshot, and the executor's own gate all read
+/// this one function.
+fn cascade_owns_dispatch(
+    disallow_training: bool,
+    is_stream: bool,
+    has_managed_local: bool,
+) -> bool {
+    !disallow_training && !is_stream && !has_managed_local
+}
+
+/// Whether a routing candidate set contains a provider this gateway
+/// serves itself (WOR-2559).
+///
+/// Read by the cascade executor's own gate and by the price ceiling's
+/// stand-down, which has to mirror that gate exactly: a stand-down
+/// wider than the executor is a request that dispatches with no ceiling
+/// applied to anything. One function so the two cannot drift.
+fn candidates_include_managed_local(
+    providers: &[sbproxy_ai::ProviderConfig],
+    candidates: &[usize],
+) -> bool {
+    candidates.iter().any(|&index| {
+        providers
+            .get(index)
+            .is_some_and(|provider| provider.serve.is_some() || provider.is_managed_model())
+    })
 }
 
 /// Append one narrowing reason to [`RequestContext::ai_route_reason`]
@@ -4173,6 +4327,36 @@ fn preflight_prompt_token_estimate(
     })
 }
 
+/// The pre-flight prompt estimate, computed only on a request that has
+/// a reader for it (WOR-2556).
+///
+/// [`preflight_prompt_token_estimate`]'s fallback arm is not free: the
+/// two native chat surfaces never carry a budget estimate, so every one
+/// of their requests walked the canonical body through
+/// [`canonical_chat_prompt_tokens`], which deep-clones and re-parses
+/// each message on the way. Its only consumer,
+/// [`sbproxy_ai::typed_fallbacks::preflight_context_window_reroute`],
+/// returns on its first line when no typed candidate list resolved, so
+/// an origin with no `context_window_fallbacks` was paying an
+/// O(prompt-size) clone per request for a number nothing would read.
+///
+/// The gate is that consumer's own precondition rather than a guess at
+/// one: no applicable strategy, or no list that resolved to a
+/// candidate, means no reroute can happen and no estimate is needed. A
+/// request that already has a budget-accounting estimate still reads it
+/// straight through, since that number costs nothing here.
+fn typed_preflight_prompt_token_estimate(
+    applies: bool,
+    context_window_fallback_order: &[usize],
+    budget_estimate: Option<u64>,
+    surface: &sbproxy_ai::handler::AiSurface,
+    body: &serde_json::Value,
+) -> Option<u64> {
+    (applies && !context_window_fallback_order.is_empty())
+        .then(|| preflight_prompt_token_estimate(budget_estimate, surface, body))
+        .flatten()
+}
+
 /// Whether a client-error status is one the body-refined classifier can
 /// turn into a typed fallback trigger (WOR-2556).
 ///
@@ -4186,6 +4370,65 @@ fn preflight_prompt_token_estimate(
 /// is entered only where the body can actually decide something.
 fn body_refinable_client_status(status: u16) -> bool {
     matches!(status, 400 | 422)
+}
+
+/// One `semantic_route` embedding call, carrying the quota-pool
+/// reservation its embedding source actually owes (WOR-2564).
+///
+/// The reservation is minted here, at the dispatch seam, and settled at
+/// the send seam inside
+/// [`sbproxy_ai::routing::semantic_route::embed_route_text`], the way
+/// the semantic cache's lookup embedding is. Which calls owe one is the
+/// strategy's own question, answered by
+/// `SemanticRouteConfig::embed_meters_quota_pool`: an unmetered source
+/// is handed `None` rather than a guard the callee would have to give
+/// back.
+///
+/// Minting first and releasing inside meant a `source: sidecar` origin
+/// took a real unit out of a shared store for a local classifier call,
+/// two round-trips per request for traffic the pool never sees, and
+/// could be denied by that pool. A denial folds to
+/// `EmbedderUnavailable`, so a full pool dropped a `semantic_route`
+/// origin onto its fallback deployment, and a denial on the very first
+/// request also strikes the exemplar index and keeps the strategy off
+/// for the whole retry floor.
+#[allow(clippy::too_many_arguments)]
+async fn embed_route_text_with_pool_reservation(
+    semantic: &sbproxy_ai::routing::semantic_route::SemanticRouteConfig,
+    client: &sbproxy_ai::client::AiClient,
+    quota_pool: Option<&sbproxy_ai::QuotaPoolConfig>,
+    admission: &sbproxy_ai::quota_pool::QuotaPoolAdmission,
+    reservation_id: &str,
+    providers: &[sbproxy_ai::ProviderConfig],
+    allowed: &[String],
+    blocked: &[String],
+    text: &str,
+) -> anyhow::Result<Vec<f32>> {
+    let quota_attempt = if semantic.embed_meters_quota_pool() {
+        let reserved = reserve_quota_pool_attempt(quota_pool, admission, reservation_id)
+            .await
+            .map_err(|rejection| match rejection {
+                QuotaPoolErrorDisposition::Reject { status, message } => anyhow::anyhow!(
+                    "semantic_route embedding was refused by the quota pool ({status}): {message}"
+                ),
+                QuotaPoolErrorDisposition::Admit => anyhow::anyhow!(
+                    "semantic_route embedding found the quota pool state unavailable"
+                ),
+            })?;
+        Some(reserved)
+    } else {
+        None
+    };
+    sbproxy_ai::routing::semantic_route::embed_route_text(
+        semantic,
+        client,
+        providers,
+        allowed,
+        blocked,
+        text,
+        quota_attempt,
+    )
+    .await
 }
 
 /// Stable label for a `semantic_route` embedding source, used in the
@@ -9153,10 +9396,14 @@ pub(super) async fn handle_ai_proxy(
     // top of this function, so a caller who set it on a surface this filter
     // never reaches has already been refused rather than dispatched.
     //
-    // The token volumes are resolved once, here, and shared by both
+    // The prompt volume is resolved once, here, and shared by both
     // candidate-set filters, so the provider order and a cascade's tier
-    // list cannot end up pricing the same request off different numbers.
-    // Nothing is estimated when no ceiling is in force.
+    // list cannot end up pricing the same request off different prompt
+    // numbers. The output volume stays a per-candidate question: each
+    // filter asks `PriceCeilingAllowance::for_candidate` about the model
+    // that candidate would really dispatch, because the reasoning
+    // transform that raises the cap is chosen per candidate. Nothing is
+    // estimated when no ceiling is in force.
     let price_ceiling_tokens = price_ceiling_usd
         .filter(|_| price_ceiling_enforceable_surface(&surface))
         .map(|_| {
@@ -9166,25 +9413,23 @@ pub(super) async fn handle_ai_proxy(
                 // they are estimated from the same canonical body here.
                 estimated_prompt_tokens_for_budget
                     .unwrap_or_else(|| canonical_chat_prompt_tokens(&body)),
-                // The declared output cap when the request carries one,
-                // else a documented 1024-token assumption, so an
-                // output-priced frontier model cannot slip under the
-                // ceiling on a short prompt alone. Plus whatever the
-                // reasoning policy will add to that cap later in this
-                // same request, or the ceiling would price an allowance
-                // the gateway itself is about to raise.
-                price_ceiling_completion_allowance_after_reasoning(
-                    &body,
-                    if surface.supports_reasoning_policy() {
+                PriceCeilingAllowance {
+                    // The declared output cap when the request carries
+                    // one, else a documented 1024-token assumption, so an
+                    // output-priced frontier model cannot slip under the
+                    // ceiling on a short prompt alone.
+                    declared: price_ceiling_completion_allowance(&body),
+                    // Whatever the reasoning policy will add to that cap
+                    // later in this same request is added per candidate,
+                    // or the ceiling would price an allowance the gateway
+                    // itself is about to raise.
+                    policy: if surface.supports_reasoning_policy() {
                         config.reasoning
                     } else {
                         sbproxy_ai::ReasoningPolicy::Off
                     },
-                    reasoning_eligibility,
-                    &config.providers,
-                    &provider_order,
-                    &model,
-                ),
+                    eligibility: reasoning_eligibility,
+                },
             )
         });
     // WOR-2559: a confidence cascade discards the request's model and
@@ -9194,20 +9439,33 @@ pub(super) async fn handle_ai_proxy(
     // which prices what will actually be sent; this one has nothing
     // truthful to say about a cascade and stands down rather than
     // guessing.
+    //
+    // Only where the cascade really is the whole of dispatch, though.
+    // The executor below runs on `!is_stream && !disallow_training &&
+    // !has_managed_local`, and a stand-down any wider than that gate is
+    // a request with no ceiling applied to anything: a streaming cascade
+    // and a cascade carrying a managed-local provider both fall through
+    // to the sequential loop, at the request's own model, over this very
+    // provider order. The managed-local test reads the pre-strategy
+    // order, a superset of the one the executor's own test reads later,
+    // so this gate can only be more conservative than the site it
+    // mirrors, never wider than it.
+    let origin_has_managed_local =
+        candidates_include_managed_local(&config.providers, &provider_order);
     let cascade_will_dispatch = (routing_policy_cascade.is_some()
         || router.cascade_config().is_some())
-        && !disallow_training;
-    if let Some(((prompt_tokens, completion_allowance), ceiling_usd)) = price_ceiling_tokens
+        && cascade_owns_dispatch(disallow_training, is_stream, origin_has_managed_local);
+    if let Some(((prompt_tokens, allowance), ceiling_usd)) = price_ceiling_tokens
         .zip(price_ceiling_usd)
         .filter(|_| !cascade_will_dispatch)
     {
-        let partition = sbproxy_ai::budget::partition_by_price_ceiling(
+        let partition = price_ceiling_partition_over_provider_order(
             ceiling_usd,
             &provider_order,
             &config.providers,
             &model,
             prompt_tokens,
-            completion_allowance,
+            allowance,
         );
         log_price_ceiling_exclusions(ceiling_usd, &partition.excluded);
         // An empty candidate set that the ceiling did not empty is not a
@@ -9364,17 +9622,20 @@ pub(super) async fn handle_ai_proxy(
         // a hot-path cost with no reader.
         let prompt = semantic_query_text(&body);
         let ai_client = AI_CLIENT.load_full();
-        // WOR-2564: routing embeddings are upstream calls on the
-        // origin's own providers, so they meter against the origin's
-        // `quota_pool` the way the semantic cache's lookup embedding
-        // does. One reservation per embedding call, because the
-        // exemplar build and the per-request query each cost one
-        // upstream POST; the ordinal keeps the ids distinct within a
-        // request the way the race path's `:race:{n}` ids do. A pool
-        // denial is returned as an embed error rather than a response,
-        // which the strategy folds into its ordinary
-        // `EmbedderUnavailable` fallback: the shared limit is honored
-        // without the routing decision ever failing a request.
+        // WOR-2564: a routing embedding through `source: provider` or
+        // `source: openai` is an upstream call, so it meters against the
+        // origin's `quota_pool` the way the semantic cache's lookup
+        // embedding does. One reservation per such embedding call,
+        // because the exemplar build and the per-request query each cost
+        // one upstream POST; the ordinal keeps the ids distinct within a
+        // request the way the race path's `:race:{n}` ids do. A
+        // `source: sidecar` embed reserves nothing: see
+        // `embed_route_text_with_pool_reservation`, which owns that
+        // decision for both sides of the seam. A pool denial is returned
+        // as an embed error rather than a response, which the strategy
+        // folds into its ordinary `EmbedderUnavailable` fallback: the
+        // shared limit is honored without the routing decision ever
+        // failing a request.
         let embed_source_label = semantic_route_source_label(semantic);
         let embed_reservations = std::sync::atomic::AtomicUsize::new(0);
         let embed_request_id = ctx.request_id.to_string();
@@ -9386,29 +9647,16 @@ pub(super) async fn handle_ai_proxy(
                 "{embed_request_id}:quota-pool:semantic-route:{embed_source_label}:{ordinal}"
             );
             async move {
-                let quota_attempt = reserve_quota_pool_attempt(
+                embed_route_text_with_pool_reservation(
+                    semantic,
+                    &client,
                     config.quota_pool.as_ref(),
                     quota_admission,
                     &reservation_id,
-                )
-                .await
-                .map_err(|rejection| match rejection {
-                    QuotaPoolErrorDisposition::Reject { status, message } => anyhow::anyhow!(
-                        "semantic_route embedding was refused by the quota pool ({status}): \
-                         {message}"
-                    ),
-                    QuotaPoolErrorDisposition::Admit => anyhow::anyhow!(
-                        "semantic_route embedding found the quota pool state unavailable"
-                    ),
-                })?;
-                sbproxy_ai::routing::semantic_route::embed_route_text(
-                    semantic,
-                    &client,
                     &config.providers,
                     allowed_providers,
                     blocked_providers,
                     &text,
-                    Some(quota_attempt),
                 )
                 .await
             }
@@ -9501,8 +9749,13 @@ pub(super) async fn handle_ai_proxy(
     // classification still covers a sequential fall-through.
     let typed_preflight_applies =
         !router.is_race() && routing_policy_cascade.is_none() && router.cascade_config().is_none();
-    let typed_preflight_prompt_tokens =
-        preflight_prompt_token_estimate(estimated_prompt_tokens_for_budget, &surface, &body);
+    let typed_preflight_prompt_tokens = typed_preflight_prompt_token_estimate(
+        typed_preflight_applies,
+        &context_window_fallback_order,
+        estimated_prompt_tokens_for_budget,
+        &surface,
+        &body,
+    );
     if let Some(reroute) = sbproxy_ai::typed_fallbacks::preflight_context_window_reroute(
         &mut provider_order,
         &config.providers,
@@ -9554,16 +9807,18 @@ pub(super) async fn handle_ai_proxy(
     // Filtering here, before the streaming tier-1 pin, means both
     // cascade entry points see the same surviving tier list. The pin
     // simply finds no tier when the ceiling excluded them all and leaves
-    // the (already filtered) provider order to the sequential loop; the
-    // non-streaming executor, which is the only path where the cascade
-    // is the whole of dispatch, refuses instead.
+    // the provider order to the sequential loop, which the filter above
+    // did price: its stand-down mirrors the executor's own gate, so
+    // every path that can reach the sequential loop was priced by one
+    // filter or the other. The non-streaming executor, which is the only
+    // path where the cascade is the whole of dispatch, refuses instead.
     let mut cascade_ceiling: Option<sbproxy_ai::routing::CascadeConfig> = None;
     // The ceiling and the exclusions that produced `cascade_ceiling`,
     // kept together so the refusal below reports the number this filter
     // actually applied instead of re-deriving it from a second source.
     let mut cascade_ceiling_refusal: Option<(f64, Vec<sbproxy_ai::budget::PriceCeilingExclusion>)> =
         None;
-    if let Some(((prompt_tokens, completion_allowance), ceiling_usd)) =
+    if let Some(((prompt_tokens, allowance), ceiling_usd)) =
         price_ceiling_tokens.zip(price_ceiling_usd)
     {
         if let Some(configured) = routing_policy_cascade
@@ -9571,18 +9826,21 @@ pub(super) async fn handle_ai_proxy(
             .or_else(|| router.cascade_config())
             .filter(|_| !disallow_training)
         {
-            let partition = sbproxy_ai::budget::partition_cascade_tiers_by_price_ceiling(
+            let partition = price_ceiling_partition_over_cascade_tiers(
                 ceiling_usd,
                 &configured.tiers,
                 &config.providers,
                 prompt_tokens,
-                completion_allowance,
+                allowance,
             );
-            if partition.excluded.is_empty() {
-                // The provider-order filter stands down on a cascade
-                // origin (its model is not the one that dispatches), so
-                // this is the only site that can tell an operator the
-                // ceiling ran and everything fit.
+            if partition.excluded.is_empty() && cascade_will_dispatch {
+                // Only when the provider-order filter stood down. Where
+                // it ran (a streaming cascade, or one carrying a
+                // managed-local provider) it already wrote the verdict
+                // for the candidate set that will actually dispatch, and
+                // overwriting a narrowing it recorded with an `allow`
+                // would tell an operator the ceiling touched nothing on
+                // a request it did narrow.
                 set_price_ceiling_verdict(ctx, "allow");
             }
             if !partition.excluded.is_empty() {
@@ -9661,10 +9919,7 @@ pub(super) async fn handle_ai_proxy(
     // request to the right provider without re-deriving from
     // `provider_idx`.
     let mut last_provider_name: String = String::new();
-    let has_managed_local = provider_order.iter().any(|&index| {
-        let provider = &config.providers[index];
-        provider.serve.is_some() || provider.is_managed_model()
-    });
+    let has_managed_local = candidates_include_managed_local(&config.providers, &provider_order);
     // A routing-policy plan supersedes the configured strategy for this
     // request, and the admin view should say so; but only when the plan
     // actually reaches dispatch. The disallow_training filter (both
@@ -9705,7 +9960,7 @@ pub(super) async fn handle_ai_proxy(
     } else if let Some(cascade_cfg) = cascade_ceiling
         .as_ref()
         .or_else(|| router.cascade_config())
-        .filter(|_| !is_stream && !disallow_training && !has_managed_local)
+        .filter(|_| cascade_owns_dispatch(disallow_training, is_stream, has_managed_local))
     {
         cascade_candidates(cascade_cfg)
     } else {
@@ -9729,8 +9984,10 @@ pub(super) async fn handle_ai_proxy(
         .as_ref()
         .or(routing_policy_cascade.as_ref())
         .or_else(|| router.cascade_config())
-        .filter(|_| !disallow_training && !has_managed_local)
+        .filter(|_| cascade_owns_dispatch(disallow_training, is_stream, has_managed_local))
     {
+        // Already excluded by the predicate above; kept as the block
+        // boundary the non-streaming executor has always had.
         if !is_stream {
             // WOR-2557: the cascade executor does not route over
             // `provider_order`; each tier names its own provider, and a
@@ -20861,13 +21118,20 @@ origins:
         let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
             "providers": [
                 {
+                    // `provider_type` is load bearing on this path: the
+                    // surface gate keys capability on the provider TYPE,
+                    // and a typeless entry supports no verb surface, so
+                    // the request would 501 before reaching the routing
+                    // stage this test is about.
                     "name": "code-pool",
+                    "provider_type": "openai",
                     "base_url": code_url,
                     "allow_private_base_url": true,
                     "api_key": "fixture-key"
                 },
                 {
                     "name": "chat-pool",
+                    "provider_type": "openai",
                     "base_url": chat_url,
                     "allow_private_base_url": true,
                     "api_key": "fixture-key"
@@ -20876,6 +21140,7 @@ origins:
                     // Named only as the embedding source. Disabled, so it
                     // is never a routing candidate for the verb path.
                     "name": "embedder",
+                    "provider_type": "openai",
                     "base_url": chat_url,
                     "allow_private_base_url": true,
                     "api_key": "fixture-key",
@@ -24771,6 +25036,49 @@ mod routing_batch_seam_tests {
         .expect("ProviderConfig fixture")
     }
 
+    /// A provider that renames the request's model on its way out, the
+    /// shape a mixed-vendor origin uses to serve one logical name from
+    /// two catalogs.
+    fn mapping_provider(
+        name: &str,
+        provider_type: &str,
+        from: &str,
+        to: &str,
+    ) -> sbproxy_ai::ProviderConfig {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "provider_type": provider_type,
+            "api_key": "fixture-key",
+            "model_map": {from: to}
+        }))
+        .expect("ProviderConfig fixture")
+    }
+
+    /// One confidence-cascade tier, deserialized the way the routing
+    /// config does so the fixture cannot drift from what operators write.
+    fn tier(provider_id: &str, model: &str) -> sbproxy_ai::routing::CascadeTier {
+        serde_json::from_value(serde_json::json!({
+            "provider_id": provider_id,
+            "model": model,
+            "quality_threshold": 0.5
+        }))
+        .expect("CascadeTier fixture")
+    }
+
+    /// The output volume the ceiling starts from, plus the reasoning
+    /// inputs each candidate's own transform is probed with.
+    fn ceiling_allowance(
+        declared: u64,
+        policy: sbproxy_ai::ReasoningPolicy,
+        body: &serde_json::Value,
+    ) -> super::PriceCeilingAllowance {
+        super::PriceCeilingAllowance {
+            declared,
+            policy,
+            eligibility: sbproxy_ai::reasoning_eligibility(body),
+        }
+    }
+
     fn price_ceiling_outcome_count(outcome: &str) -> f64 {
         prometheus::gather()
             .into_iter()
@@ -24824,6 +25132,65 @@ mod routing_batch_seam_tests {
         );
     }
 
+    /// The estimate's fallback arm walks the canonical body and clones
+    /// every message to parse it, and its only consumer returns on its
+    /// first line when no typed candidate list resolved. Computing it
+    /// unconditionally charged every `/v1/messages` and `/v1/responses`
+    /// request an O(prompt-size) clone for a number nothing would read.
+    #[test]
+    fn the_preflight_estimate_is_skipped_where_no_typed_list_can_read_it() {
+        use sbproxy_ai::handler::AiSurface;
+        let body = serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Draft the quarterly summary."}]
+        });
+        assert_eq!(
+            super::typed_preflight_prompt_token_estimate(
+                true,
+                &[],
+                None,
+                &AiSurface::Messages,
+                &body
+            ),
+            None,
+            "an origin with no context_window_fallbacks has no reader for the estimate"
+        );
+        assert_eq!(
+            super::typed_preflight_prompt_token_estimate(
+                false,
+                &[0],
+                None,
+                &AiSurface::Messages,
+                &body
+            ),
+            None,
+            "race and cascade run their own plans and ignore a pre-flight reroute"
+        );
+        assert!(
+            super::typed_preflight_prompt_token_estimate(
+                true,
+                &[0],
+                None,
+                &AiSurface::Messages,
+                &body
+            )
+            .is_some_and(|tokens| tokens > 0),
+            "a configured list still gets its estimate on the native chat surfaces"
+        );
+        // A budget-accounting estimate costs nothing to read, so it
+        // still comes straight through where one exists.
+        assert_eq!(
+            super::typed_preflight_prompt_token_estimate(
+                true,
+                &[0],
+                Some(4242),
+                &AiSurface::ChatCompletions,
+                &body
+            ),
+            Some(4242)
+        );
+    }
+
     /// The gateway raises the caller's output cap on a
     /// `reasoning: {budget: N}` origin, so pricing the declared cap let
     /// a request dispatch at a cost the ceiling never estimated.
@@ -24834,52 +25201,224 @@ mod routing_batch_seam_tests {
             "max_tokens": 1000,
             "messages": [{"role": "user", "content": "Summarize the incident review."}]
         });
-        let eligibility = sbproxy_ai::reasoning_eligibility(&body);
         let providers = vec![
             provider("anthropic", "anthropic"),
             provider("openai", "openai"),
         ];
+        let budgeted = ceiling_allowance(1000, sbproxy_ai::ReasoningPolicy::Budget(8192), &body);
 
         // The Anthropic-shaped transform adds the thinking budget on top
         // of the visible answer's cap, which is the case the ceiling was
         // blind to.
         assert_eq!(
-            super::price_ceiling_completion_allowance_after_reasoning(
-                &body,
-                sbproxy_ai::ReasoningPolicy::Budget(8192),
-                eligibility,
-                &providers,
-                &[0],
-                "claude-sonnet-4-5",
-            ),
-            9192,
+            budgeted.for_candidate(&providers[0], "claude-sonnet-4-5"),
+            9192
         );
         // The OpenAI-shaped transform caps rather than raises, so the
         // declared allowance stands and the ceiling does not
         // over-refuse a candidate whose cost it already knows.
-        assert_eq!(
-            super::price_ceiling_completion_allowance_after_reasoning(
-                &body,
-                sbproxy_ai::ReasoningPolicy::Budget(8192),
-                eligibility,
-                &providers,
-                &[1],
-                "gpt-4o",
-            ),
-            1000,
-        );
+        assert_eq!(budgeted.for_candidate(&providers[1], "gpt-4o"), 1000);
         // No policy, no headroom.
         assert_eq!(
-            super::price_ceiling_completion_allowance_after_reasoning(
-                &body,
-                sbproxy_ai::ReasoningPolicy::Off,
-                eligibility,
-                &providers,
-                &[0],
-                "claude-sonnet-4-5",
-            ),
-            1000,
+            ceiling_allowance(1000, sbproxy_ai::ReasoningPolicy::Off, &body)
+                .for_candidate(&providers[0], "claude-sonnet-4-5"),
+            1000
         );
+    }
+
+    /// The allowance travels with the candidate it was probed for.
+    /// Taking the worst case across candidates and applying it to every
+    /// one of them priced the OpenAI candidate at the Anthropic
+    /// candidate's raised cap: $0.092 of `gpt-4o` output the request
+    /// could never have bought, which refused the whole request at a
+    /// $0.05 ceiling.
+    #[test]
+    fn each_provider_candidate_is_priced_on_its_own_reasoning_raise() {
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "max_tokens": 1000,
+            "messages": [{"role": "user", "content": "Summarize the incident review."}]
+        });
+        let providers = vec![
+            mapping_provider("anthropic", "anthropic", "gpt-4o", "claude-sonnet-4-5"),
+            provider("openai", "openai"),
+        ];
+        let allowance = ceiling_allowance(1000, sbproxy_ai::ReasoningPolicy::Budget(8192), &body);
+        // The two candidates serve one logical model at two different
+        // output volumes, which is the whole of the finding.
+        assert_eq!(allowance.for_candidate(&providers[0], "gpt-4o"), 9192);
+        assert_eq!(allowance.for_candidate(&providers[1], "gpt-4o"), 1000);
+
+        // claude-sonnet-4-5 at $15/M over 9,192 output tokens is $0.138
+        // and is refused; gpt-4o at $10/M over the declared 1,000 is
+        // $0.010 and stays routable.
+        let partition = super::price_ceiling_partition_over_provider_order(
+            0.05,
+            &[0, 1],
+            &providers,
+            "gpt-4o",
+            100,
+            allowance,
+        );
+        assert_eq!(
+            partition.kept,
+            vec![1],
+            "the capped candidate cannot incur the raising candidate's cost"
+        );
+        assert_eq!(partition.excluded.len(), 1, "{:?}", partition.excluded);
+        assert_eq!(partition.excluded[0].model, "claude-sonnet-4-5");
+    }
+
+    /// A cascade tier dispatches its own model, not the request's, so
+    /// probing the request's model asked whether `gpt-4o-mini` supports
+    /// manual thinking. It does not, so the raise was invisible and the
+    /// tier priced at the declared 1,000 output tokens, cleared a
+    /// ceiling the real 9,192 is nearly three times over, and the
+    /// executor then dispatched it.
+    #[test]
+    fn each_cascade_tier_is_priced_on_the_model_that_tier_dispatches() {
+        let body = serde_json::json!({
+            "model": "gpt-4o-mini",
+            "max_tokens": 1000,
+            "messages": [{"role": "user", "content": "Summarize the incident review."}]
+        });
+        let providers = vec![
+            provider("openai", "openai"),
+            provider("anthropic", "anthropic"),
+        ];
+        let tiers = vec![
+            tier("openai", "gpt-4o-mini"),
+            tier("anthropic", "claude-sonnet-4-5"),
+        ];
+        let allowance = ceiling_allowance(1000, sbproxy_ai::ReasoningPolicy::Budget(8192), &body);
+
+        let partition = super::price_ceiling_partition_over_cascade_tiers(
+            0.05, &tiers, &providers, 100, allowance,
+        );
+        assert_eq!(
+            partition.kept,
+            vec![0],
+            "the cheap tier still serves the request"
+        );
+        assert_eq!(partition.excluded.len(), 1, "{:?}", partition.excluded);
+        assert_eq!(partition.excluded[0].provider, "anthropic");
+        assert!(
+            partition.excluded[0].estimated_cost_usd > 0.05,
+            "the tier is refused on what it will really be billed: {:?}",
+            partition.excluded[0]
+        );
+    }
+
+    /// The ceiling's provider-order filter may stand down only where the
+    /// cascade executor really is the whole of dispatch. A stand-down
+    /// that asked no more than "is a cascade configured" opened three
+    /// paths that dispatch over the provider order with nothing priced
+    /// at all, while the admin row still read `price_ceiling:allow`.
+    #[test]
+    fn only_a_cascade_that_owns_dispatch_stands_the_price_ceiling_down() {
+        assert!(super::cascade_owns_dispatch(false, false, false));
+        assert!(
+            !super::cascade_owns_dispatch(false, true, false),
+            "streaming pins tier one and hands everything else to the sequential loop"
+        );
+        assert!(
+            !super::cascade_owns_dispatch(false, false, true),
+            "a managed-local candidate is the documented fall-through to that same loop"
+        );
+        assert!(
+            !super::cascade_owns_dispatch(true, false, false),
+            "a no-training request never reaches the cascade executor"
+        );
+    }
+
+    /// A streaming cascade whose every tier is over the ceiling has
+    /// nothing left to pin: the tier refusal lives on the non-streaming
+    /// path, and the tier-1 pin finds no surviving tier, so the request
+    /// dispatches over `provider_order` at its own model. The filter has
+    /// to have priced that order, or the request serves at roughly twice
+    /// the ceiling and answers 200.
+    #[test]
+    fn a_streaming_cascade_over_the_ceiling_prices_the_order_it_falls_through_to() {
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "max_tokens": 1000,
+            "stream": true,
+            "messages": [{"role": "user", "content": "Summarize the incident review."}]
+        });
+        let providers = vec![provider("openai", "openai")];
+        let tiers = vec![tier("openai", "gpt-4o")];
+        let allowance = ceiling_allowance(1000, sbproxy_ai::ReasoningPolicy::Off, &body);
+
+        assert!(
+            !super::cascade_owns_dispatch(false, true, false),
+            "the executor does not run on a streaming request, so the filter must"
+        );
+
+        // gpt-4o at $10/M output: the declared 1,000 tokens alone is
+        // twice the ceiling, so the one candidate the sequential loop
+        // would have dispatched is excluded and the empty kept set is
+        // the 402.
+        let order = super::price_ceiling_partition_over_provider_order(
+            0.005,
+            &[0],
+            &providers,
+            "gpt-4o",
+            100,
+            allowance,
+        );
+        assert!(
+            order.kept.is_empty(),
+            "nothing may serve at the request's model: {:?}",
+            order.kept
+        );
+        assert_eq!(order.excluded.len(), 1);
+        assert_eq!(order.excluded[0].model, "gpt-4o");
+
+        // The tier list empties too, so the pin cannot put a tier model
+        // back into the body on the way out.
+        let cascade = super::price_ceiling_partition_over_cascade_tiers(
+            0.005, &tiers, &providers, 100, allowance,
+        );
+        assert!(cascade.kept.is_empty(), "{:?}", cascade.kept);
+    }
+
+    /// A cascade carrying a provider the gateway serves itself takes the
+    /// documented fall-through: the executor stands down and the
+    /// sequential loop dispatches over the provider order. The priced
+    /// remote candidate in that order is still the ceiling's business.
+    #[test]
+    fn a_cascade_carrying_a_managed_local_provider_still_prices_its_remote_candidate() {
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "max_tokens": 1000,
+            "messages": [{"role": "user", "content": "Summarize the incident review."}]
+        });
+        let providers = vec![
+            mapping_provider("local-llama", "managed_model", "gpt-4o", "llama-3.1-70b"),
+            provider("openai", "openai"),
+        ];
+        assert!(super::candidates_include_managed_local(&providers, &[0, 1]));
+        assert!(
+            !super::cascade_owns_dispatch(false, false, true),
+            "the executor's own gate drops this cascade, so the filter has to run"
+        );
+
+        // The local deployment's model is in no price layer, so it
+        // prices at the pessimistic $5/$5 fallback, $0.0055 here, and
+        // stays under the ceiling; the remote candidate at $0.0103 does
+        // not and is dropped.
+        let partition = super::price_ceiling_partition_over_provider_order(
+            0.006,
+            &[0, 1],
+            &providers,
+            "gpt-4o",
+            100,
+            ceiling_allowance(1000, sbproxy_ai::ReasoningPolicy::Off, &body),
+        );
+        assert_eq!(partition.kept, vec![0]);
+        assert_eq!(partition.excluded.len(), 1, "{:?}", partition.excluded);
+        assert_eq!(partition.excluded[0].provider, "openai");
+        assert_eq!(partition.excluded[0].model, "gpt-4o");
     }
 
     /// The block's own comment promises a refusal here is "counted,
@@ -24922,6 +25461,203 @@ mod routing_batch_seam_tests {
         let reason = super::price_ceiling_request_refusal_reason("invalid_header", "embeddings");
         assert!(!reason.contains("0.05"), "{reason}");
         assert!(reason.len() < 256, "{reason}");
+    }
+
+    /// Captures the fields a `Span::record` call writes.
+    ///
+    /// The sibling refusal test above hands `record_price_ceiling_request_refusal`
+    /// a `tracing::Span::none()`, on which every `record` is a no-op, so
+    /// it cannot tell `invalid_request` from `budget_exceeded` and the
+    /// span half of that function has no coverage at all. This is the
+    /// same layer shape `sbproxy_ai::tracing_spans`' own tests use.
+    #[derive(Clone, Default)]
+    struct SpanFieldCapture {
+        fields: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    }
+
+    struct SpanFieldVisitor<'a>(&'a mut std::collections::HashMap<String, String>);
+
+    impl tracing::field::Visit for SpanFieldVisitor<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SpanFieldCapture {
+        fn on_record(
+            &self,
+            _id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = self
+                .fields
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            values.record(&mut SpanFieldVisitor(&mut *fields));
+        }
+    }
+
+    /// Both request-level ceiling refusals answer 400 because the
+    /// caller's own input was unusable, so the span carries
+    /// `invalid_request` rather than the `budget_exceeded` a spend block
+    /// would use. Reading it back off a real subscriber is the only way
+    /// to see it: deleting the `record_error` call, or misspelling the
+    /// constant, left the whole suite green and the 400s looking like
+    /// successful spans in the trace backend.
+    #[test]
+    fn a_request_level_ceiling_refusal_marks_the_span_invalid_request() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let capture = SpanFieldCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let mut ctx = crate::context::RequestContext::new();
+        tracing::subscriber::with_default(subscriber, || {
+            let span = sbproxy_ai::tracing_spans::ai_request_span(
+                "embeddings",
+                sbproxy_ai::tracing_spans::OP_EMBEDDINGS,
+                "POST",
+            );
+            let reason =
+                super::price_ceiling_request_refusal_reason("unsupported_surface", "embeddings");
+            super::record_price_ceiling_request_refusal(
+                &mut ctx,
+                &span,
+                "unsupported_surface",
+                reason,
+            );
+        });
+        let fields = capture
+            .fields
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            fields.get("error.type").map(String::as_str),
+            Some(sbproxy_ai::tracing_spans::error_type::INVALID_REQUEST),
+            "{fields:?}"
+        );
+        // The literal too: the taxonomy value is what a trace backend
+        // groups on, so a rename is a silent break for every dashboard
+        // built on it.
+        assert_eq!(
+            fields.get("error.type").map(String::as_str),
+            Some("invalid_request")
+        );
+        assert_eq!(
+            fields.get("otel.status_code").map(String::as_str),
+            Some("ERROR"),
+            "a refused request is not a successful span: {fields:?}"
+        );
+        assert!(
+            fields
+                .get("otel.status_message")
+                .is_some_and(|message| message.contains("embeddings")),
+            "{fields:?}"
+        );
+    }
+
+    /// A `semantic_route` config fixture, parsed and validated the way
+    /// the handler's routing deserializer does.
+    fn semantic_route(
+        source: serde_json::Value,
+    ) -> sbproxy_ai::routing::semantic_route::SemanticRouteConfig {
+        let mut routing = serde_json::json!({
+            "routes": [{"deployment": "code-pool", "centroid": [1.0, 0.0]}]
+        });
+        let object = routing.as_object_mut().expect("fixture is an object");
+        for (key, value) in source.as_object().expect("source is an object") {
+            object.insert(key.clone(), value.clone());
+        }
+        let config: sbproxy_ai::routing::semantic_route::SemanticRouteConfig =
+            serde_json::from_value(routing).expect("semantic_route fixture parses");
+        config.validate().expect("semantic_route fixture validates");
+        config
+    }
+
+    /// The routing embed's pool reservation is minted for the sources
+    /// the pool represents and for nothing else. Minting it before the
+    /// source was known meant a `sidecar` origin took a real unit out of
+    /// a shared store for a local classifier call and could be denied by
+    /// a pool it never spends against, which folds to
+    /// `EmbedderUnavailable` and parks the origin on its fallback
+    /// deployment for as long as the pool stays full.
+    #[tokio::test]
+    async fn only_the_metered_embedding_sources_take_a_quota_pool_reservation() {
+        let pool: sbproxy_ai::QuotaPoolConfig = serde_json::from_value(serde_json::json!({
+            "name": "shared-upstream",
+            "total_limit": 1,
+            "weights": {"virtual-key-a": 1},
+            "policy": "burst"
+        }))
+        .expect("quota pool fixture");
+        let store: std::sync::Arc<dyn sbproxy_ai::quota_pool::QuotaPoolStore> = std::sync::Arc::new(
+            sbproxy_ai::quota_pool::LocalQuotaPool::new(vec![pool.clone()]).expect("local pool"),
+        );
+        let admission = sbproxy_ai::quota_pool::QuotaPoolAdmission::new(
+            Some(pool.clone()),
+            Ok(Some(store)),
+            Ok("virtual-key-a".to_string()),
+        );
+        // The pool's only unit, held for the rest of the test, so the
+        // next reservation against it is denied.
+        let _held = admission
+            .reserve_attempt("req-0:quota-pool:holder")
+            .await
+            .expect("the pool's only unit");
+
+        // Nothing is listening on port 1: a metered source is decided by
+        // the pool before the socket, an unmetered one by the socket.
+        let client = sbproxy_ai::client::AiClient::new();
+        let metered = semantic_route(serde_json::json!({
+            "source": "openai",
+            "openai": {"base_url": "http://127.0.0.1:1/v1", "model": "m", "timeout_ms": 200}
+        }));
+        let unmetered = semantic_route(serde_json::json!({
+            "source": "sidecar",
+            "sidecar": {"endpoint": "http://127.0.0.1:1", "timeout_ms": 200}
+        }));
+        assert!(metered.embed_meters_quota_pool());
+        assert!(!unmetered.embed_meters_quota_pool());
+
+        let denied = super::embed_route_text_with_pool_reservation(
+            &metered,
+            &client,
+            Some(&pool),
+            &admission,
+            "req-1:quota-pool:semantic-route:openai:0",
+            &[],
+            &[],
+            &[],
+            "route me",
+        )
+        .await
+        .expect_err("the pool has no unit left");
+        assert!(
+            denied.to_string().contains("refused by the quota pool"),
+            "an upstream embedding call still meters: {denied}"
+        );
+
+        let served = super::embed_route_text_with_pool_reservation(
+            &unmetered,
+            &client,
+            Some(&pool),
+            &admission,
+            "req-1:quota-pool:semantic-route:sidecar:0",
+            &[],
+            &[],
+            &[],
+            "route me",
+        )
+        .await
+        .expect_err("nothing is listening on port 1");
+        assert!(
+            !served.to_string().contains("quota pool"),
+            "a local classifier call is not the pool's traffic: {served}"
+        );
     }
 
     /// A typed reroute followed by a generic failover is the two-hop

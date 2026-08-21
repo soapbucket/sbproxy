@@ -119,10 +119,26 @@ set rather than manufacturing an outage. Unlike those two axes, the
 write side is the dispatch loop's own failure classification, so a
 configured `cooldown_policy` acts on real traffic immediately (see "What
 is adaptive, and what fails over" for the breaker's read-side-only
-status). Each cooldown logs a `WARN` naming the provider, the cause, and
-the duration. Transport-level failures (connection refused, DNS) carry
-no HTTP status to classify and do not feed this axis; the generic
-failover chain handles them as before.
+status).
+
+Each cooldown ticks
+`sbproxy_ai_provider_cooldowns_total{provider, cause}` and logs a `WARN`
+naming the provider, the cause, and the duration. The counter is the
+alertable half and the `WARN` line is the per-event detail: parking a
+provider is the moment traffic stops reaching it, and
+`rate(sbproxy_ai_provider_cooldowns_total{cause="auth"}[5m]) > 0` is the
+expression for a rotated credential parking the whole pool. `cause` is
+the classified failure that parked it, so it takes one of the seven
+values `cooldown_policy` accepts: `timeout`, `rate_limit`,
+`server_error`, `content_policy`, `auth`, `bad_request`, and
+`context_window`, which reports on the counter under the classifier's
+own name, `context_window_exceeded`. `provider` is a declared
+`providers[].name`, so neither label grows with traffic; the stability
+tier is in [metrics-stability.md](metrics-stability.md).
+
+Transport-level failures (connection refused, DNS) carry no HTTP status
+to classify and do not feed this axis; the generic failover chain
+handles them as before.
 
 ## Typed fallback triggers
 
@@ -162,10 +178,14 @@ action:
 
 Each list names providers from the same action's `providers:`; a name
 that matches nothing fails config load, and nesting either key inside
-`routing:` is refused rather than silently ignored. The lists are
-ordered and can never widen what a request may reach: candidates are
-filtered by the same credential provider policy, model eligibility, and
-`enabled` checks as every other selection.
+`routing:` or inside `resilience:` is refused rather than silently
+ignored. `resilience:` is checked because it is the likelier of the two
+misplacements: `content_policy_fallback`, the singular boolean, is a
+real key that already lives there, so the plural list is one character
+and one nesting level away from a spelling operators already use. The
+lists are ordered and can never widen what a request may reach:
+candidates are filtered by the same credential provider policy, model
+eligibility, and `enabled` checks as every other selection.
 
 How a request moves through the triggers:
 

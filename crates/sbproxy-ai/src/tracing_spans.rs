@@ -1160,6 +1160,11 @@ mod tests {
         assert_eq!(error_type::BUDGET_EXCEEDED, "budget_exceeded");
         assert_eq!(error_type::UPSTREAM_5XX, "upstream_5xx");
         assert_eq!(error_type::TIMEOUT, "timeout");
+        assert_eq!(error_type::PROVIDER_ERROR, "provider_error");
+        // WOR-2559: the class the gateway uses when the caller's own
+        // input was unusable, kept distinct from BUDGET_EXCEEDED so a
+        // mistyped header does not alert as an exhausted budget.
+        assert_eq!(error_type::INVALID_REQUEST, "invalid_request");
     }
 
     /// WOR-1228: prompt / completion content lands on the OpenInference

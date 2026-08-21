@@ -517,12 +517,20 @@ routing:
     model: text-embedding-3-small
 ```
 
-`routes` declares up to 64 deployments with up to 64 exemplars each. A rule
-may carry a precomputed `centroid` vector instead of (or alongside) exemplar
-texts; centroids never trigger an embedding call. A rule's score is the best
-cosine similarity over all of its vectors, and the best-scoring rule wins.
-Score ties keep the earliest declared exemplar, so decisions are
-deterministic.
+`routes` declares up to 64 deployments with up to 64 exemplars each, and at
+most 256 exemplar texts across every route combined. The aggregate is a
+config-load refusal rather than a runtime truncation: the per-route cap on
+its own would admit 4,096 texts, and every one of them is a billed embedding
+call on whichever request happens to build the index. A config over it is
+named at load, with the count it declared (`semantic_route routes: must
+declare at most 256 exemplar texts across every route, and this config
+declares 300`), and the proxy does not start.
+
+A rule may carry a precomputed `centroid` vector instead of (or alongside)
+exemplar texts; centroids never trigger an embedding call and count against
+neither exemplar cap. A rule's score is the best cosine similarity over all
+of its vectors, and the best-scoring rule wins. Score ties keep the earliest
+declared exemplar, so decisions are deterministic.
 
 The embedding source reuses the semantic cache's source shapes: `provider`
 (an `embedding: {provider, model}` block naming one of the origin's
@@ -538,11 +546,26 @@ refused, the way cascade tiers are.
 
 Exemplar texts embed once per process on first use and the vectors are
 cached, so the steady-state cost is one embedding call per request, bounded
-by the embedding source's own timeout. Every non-match is a fallback, never
-a failure: a below-floor score, a request with no user message, and an
-unavailable embedder all route to the declared `fallback` deployment (or
-round-robin across the eligible set when none is declared). The request is
-never failed or hung on this strategy's account.
+by the embedding source's own timeout. The first-use build is single-flighted:
+one request holds the gate and embeds the whole index, and a request that
+arrives while that build is in flight takes the fallback rather than waiting
+on it, so a cold start under load pays for one build instead of one per
+request. A build that fails is negatively cached behind a retry floor that
+starts at 30s and doubles per consecutive failure up to a 300s ceiling;
+requests arriving inside that window also take the fallback, without touching
+the embedder at all. A permanently unbuildable index (a mistyped
+`embedding.model`, a centroid whose dimensions disagree with the embedder's
+real output) therefore costs one attempt per window rather than one per
+request.
+
+Every non-match is a fallback, never a failure: a below-floor score, a
+request with no user message, an unavailable embedder, a build already in
+flight, and a build inside its retry floor all route to the declared
+`fallback` deployment (or round-robin across the eligible set when none is
+declared). The request is never failed or hung on this strategy's account.
+The last three report the same `embed_error` outcome, so a burst of it in the
+first seconds after a deploy is the cold start rather than an embedder
+outage; a rate that persists is the outage.
 
 Each decision ticks
 `sbproxy_ai_semantic_route_decisions_total{outcome}` (`matched`,
@@ -557,11 +580,13 @@ never a label.
 
 Per-request, the decision lands on the admin request log as
 `routing_detail` (the console renders it as **Routing detail** beside the
-strategy and the selected target), which is the durable record. The
-matching `ai.semantic_route.route` and `ai.semantic_route.fallback` log
-events carry the same deployment, exemplar ordinal, and score, at `debug`
-for the two expected outcomes and `warn` for an ineligible target or an
-unavailable embedder.
+strategy and the selected target), which is the durable record. Three log
+events carry the same decision: `ai.semantic_route.route` at `debug` for a
+match, with the deployment, the winning exemplar's ordinal, the score, and
+the floor; `ai.semantic_route.route_miss` at `warn` when the best-scoring
+deployment is not eligible for this request; and
+`ai.semantic_route.fallback` for the rest, at `debug` for a below-floor
+score or a promptless request and at `warn` for an unavailable embedder.
 
 See [examples/semantic-routing](../examples/semantic-routing/) for a
 runnable two-pool config with a below-floor fallback walkthrough.
@@ -1695,13 +1720,13 @@ The value must be positive. A ceiling of zero or below admits nothing, so the co
 
 A caller can tighten it per request with the `x-sbproxy-max-price` header (USD). The header only ever lowers the effective ceiling; a request cannot raise a guard the operator set. A malformed or non-positive header value is refused with 400 rather than ignored, since a caller who asked for a bound and mistyped it must not dispatch unbounded.
 
-Before provider selection, the gateway estimates what each routing candidate would charge for this request and drops every candidate whose estimate exceeds the effective ceiling. The estimate reuses the exact price resolution that cost tracking bills with (`model_prices`, then the rate card, then the built-in catalog, then the pessimistic $5 / $5 fallback), so there is no second price table to drift: a model your cost reports price at $2.50 per million input tokens is gated at $2.50 per million input tokens. Each candidate is priced against the model it would actually dispatch, after its `model_map` rename. The token volumes are the same pre-dispatch prompt estimate budget accounting uses, plus the request's declared output cap (`max_tokens`, `max_completion_tokens`, or `max_output_tokens`); a request that declares no output cap is assumed to produce 1,024 completion tokens, so an output-priced frontier model cannot slip under the ceiling on a short prompt alone. A model no price layer knows gets the same $5 / $5 fallback as billing, which usually excludes it under a tight ceiling: unpriced is treated as expensive, not free.
+Before provider selection, the gateway estimates what each routing candidate would charge for this request and drops every candidate whose estimate exceeds the effective ceiling. The estimate reuses the exact price resolution that cost tracking bills with (`model_prices`, then the rate card, then the built-in catalog, then the pessimistic $5 / $5 fallback), so there is no second price table to drift: a model your cost reports price at $2.50 per million input tokens is gated at $2.50 per million input tokens. Each candidate is priced against the model it would actually dispatch, after its `model_map` rename. The token volumes are the same pre-dispatch prompt estimate budget accounting uses, plus the request's declared output cap (`max_tokens`, `max_completion_tokens`, or `max_output_tokens`); a request that declares no output cap is assumed to produce 1,024 completion tokens, so an output-priced frontier model cannot slip under the ceiling on a short prompt alone. On an origin with a [`reasoning:` budget](#reasoning-policy) the priced output volume also carries what that budget will add, because the gateway raises the cap itself after selection: the Anthropic-shaped transform rewrites `max_tokens` to `declared + budget` so the visible answer survives the thinking spend. The ceiling runs that same transform ahead of time and prices the cap it reads back, so a `{budget: 8192}` origin prices a request declaring 1,000 output tokens at 9,192 of them. Pricing the declared cap alone would clear a request the gateway then dispatches at several times the estimate it cleared on. A model no price layer knows gets the same $5 / $5 fallback as billing, which usually excludes it under a tight ceiling: unpriced is treated as expensive, not free.
 
 ```mermaid
 flowchart TD
     A[Request reaches routing] --> B{"effective ceiling?\n(min of config and\nx-sbproxy-max-price)"}
     B -->|none| G[Candidate set unchanged]
-    B -->|set| K["Candidate set:\nthe provider order, and a\ncascade's tier list when the\norigin cascades"]
+    B -->|set| K["Candidate set:\na cascade's tier list when the\ncascade will dispatch, else the\nprovider order (a streaming or\nmanaged-local cascade prices both)"]
     K --> C["Estimate each candidate:\nprompt est x input rate +\noutput cap x output rate\n(same layers as cost tracking)"]
     C --> D{estimate <= ceiling?}
     D -->|yes| E[Candidate stays routable]
@@ -1765,13 +1790,17 @@ DEBUG sbproxy_core::server::ai_dispatch: price ceiling excluded a routing candid
   estimated_cost_usd=0.01003 price_source=catalog ceiling_usd=0.005
 ```
 
-Every request the ceiling ran on carries its verdict in the admin request record's policy decisions: `price_ceiling:allow` when every candidate fit, `price_ceiling:narrowed` when some were dropped, and `price_ceiling:deny` on a refusal, where the deny reason names the ceiling and the excluded candidates' prices. One verdict per request, so a row never carries two. Exclusions and refusals increment `sbproxy_ai_price_ceiling_total`, labeled `outcome="candidate_excluded"` per dropped candidate and `outcome="refused"` per fully excluded request, so a dashboard can tell "the ceiling is trimming the expensive tier" from "the ceiling is blocking all traffic."
+Every request the ceiling ran on carries its verdict in the admin request record's policy decisions: `price_ceiling:allow` when every candidate fit, `price_ceiling:narrowed` when some were dropped, and `price_ceiling:deny` on a refusal, where the deny reason names the ceiling and the excluded candidates' prices. One verdict per request, so a row never carries two.
+
+`sbproxy_ai_price_ceiling_total{outcome}` carries a closed set of four: `candidate_excluded` per dropped candidate, `refused` per fully excluded request, `invalid_header` when `x-sbproxy-max-price` was not a positive USD amount, and `unsupported_surface` when that header arrived on a surface the estimate cannot price. A rising `candidate_excluded` rate against a flat `refused` rate is the ceiling trimming the expensive tier; a rising `refused` rate is the ceiling blocking traffic outright. The two 400 outcomes are caller mistakes rather than gateway decisions, so alert on them separately or not at all: a client library that defaults the header onto `/v1/embeddings` shows up on `unsupported_surface` and nowhere else. [metrics-stability.md](metrics-stability.md) lists the same four.
+
+A 402 refusal is represented everywhere the gateway's other refusals are, not only in a log line. It writes a `security_audit` record (`event_type: price_ceiling`, carrying the hostname, request id, tenant, and resolved key id), which reaches a configured [`events:` sink](events.md) as a `policy_denied` event, appears in the admin audit feed, and lands on the tamper-evident chain when `audit.sink: chain` is on. The request carries the closed `price_ceiling_block` value on both the `outcome` label of `sbproxy_ai_requests_attributed_total` and the rejection `reason` of `sbproxy_ai_gateway_decisions_total`, rather than the `budget_exceeded` a bare 402 would otherwise read as, so a ceiling refusal stays separable from an exhausted tenant budget, and the durable spend rollups count it as blocked rather than errored.
 
 #### Confidence cascades and the ceiling
 
-A [confidence cascade](#cascade) does not route over the provider order. Each tier names its own provider and its own model, and the tier's model overrides the request's, so the tier list is a second candidate set. The ceiling filters it the same way, pricing each tier against the model that tier would dispatch after its provider's `model_map` rename. Tiers over the ceiling are skipped. On the non-streaming path, where the cascade owns the whole of dispatch, a cascade with no tier left under the ceiling refuses with the same 402. Without that, an origin could set a ceiling, watch it narrow the provider order, and still be billed for tier one at the frontier model the tier names.
+A [confidence cascade](#cascade) does not route over the provider order. Each tier names its own provider and its own model, and the tier's model overrides the request's, so the tier list is a second candidate set. The ceiling filters it the same way, pricing each tier against the model that tier would dispatch after its provider's `model_map` rename. Tiers over the ceiling are skipped. It is also the only set priced when the cascade owns the whole of dispatch: the provider-order filter stands down there, because pricing the provider order against a model the request will never send would refuse a request every tier could have served under the ceiling. On that non-streaming path, a cascade with no tier left under the ceiling refuses with the same 402. Without that, an origin could set a ceiling and still be billed for tier one at the frontier model the tier names.
 
-A streaming request on that same cascade does not refuse. Streaming pins tier one and hands the response to the relay unchanged, so an emptied tier list leaves nothing to pin and the request falls through to the provider order, which the ceiling has already filtered on its own. The request is still priced against the ceiling; what it does not get is the cascade's tier models or the 402. If you want a streaming cascade to refuse rather than serve from the provider order, keep at least one tier under the ceiling, or set the ceiling so the provider order empties too.
+A streaming request on that same cascade does not refuse from the tier list. Streaming pins tier one and hands the response to the relay unchanged, so an emptied tier list leaves nothing to pin and the request falls through to the provider order. That fall-through is still gated. The provider-order filter only stands down when the cascade is the thing that will dispatch, which on a streaming request it is not, so the provider order is priced and narrowed here exactly as it would be on an origin with no cascade at all, and it answers the same 402 when nothing survives. A cascade origin carrying a managed local model behaves the same way, because that origin also dispatches from the provider order rather than from the tiers. What the streaming request does not get is the cascade's tier models: it serves from the surviving provider order at the request's own model. One ordering detail matters if you are tuning this: on a streaming cascade the provider-order refusal runs before the tier pin, so a tier priced under the ceiling only keeps the request alive when that tier's provider also survived the provider-order filter at the request's own model. Set the ceiling low enough that the provider order empties and the streaming request refuses; leave one provider above water and it serves from the provider order at the request's model, whatever the tiers say.
 
 A tier naming a provider that is not configured is left alone: it cannot dispatch either way, and the cascade's own skip-and-warn handling covers it.
 

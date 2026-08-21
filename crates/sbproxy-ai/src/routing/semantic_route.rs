@@ -37,12 +37,19 @@
 //! timeout, the same bound the semantic cache's lookup path relies on.
 //!
 //! Embedding traffic this strategy generates is metered against the
-//! origin's `quota_pool` when one is configured: the dispatcher reserves
-//! an attempt per embedding call and [`embed_route_text`] settles it at
-//! the send seam, exactly as the semantic cache's lookup embedding does.
-//! A pool denial folds into the same fallback outcome as an embedder
-//! outage, so the shared limit is honored without the routing decision
-//! ever failing a request.
+//! origin's `quota_pool` when one is configured and the source is one
+//! the pool represents: the dispatcher reserves an attempt per embedding
+//! call through `source: provider` or `source: openai`, and
+//! [`embed_route_text`] settles it at the send seam, exactly as the
+//! semantic cache's lookup embedding does. A `source: sidecar` embed
+//! reserves nothing, because a local classifier process is not a pooled
+//! provider call: taking a unit for it would let a full pool deny
+//! traffic the pool never sees and push the origin onto its fallback
+//! deployment for as long as the pool stays full.
+//! [`SemanticRouteConfig::embed_meters_quota_pool`] is the one answer
+//! both sides read. A pool denial folds into the same fallback outcome
+//! as an embedder outage, so the shared limit is honored without the
+//! routing decision ever failing a request.
 //!
 //! Requiring an embedding source is a config-compile refusal, not a
 //! runtime surprise, matching the posture `token_rate`'s refusal set:
@@ -331,6 +338,27 @@ pub enum SemanticRouteOutcome {
 }
 
 impl SemanticRouteConfig {
+    /// Whether one embedding call through this config's source spends
+    /// against the origin's `quota_pool` (WOR-2564).
+    ///
+    /// `provider` and `openai` both POST to an upstream the pool
+    /// represents, so each of their calls owes one reservation.
+    /// `sidecar` is a local classifier process the pool does not
+    /// represent, and `inprocess` never calls out at all (and
+    /// [`Self::validate`] refuses it besides).
+    ///
+    /// The dispatcher reads this to decide whether to mint a
+    /// reservation and [`embed_route_text`] is documented against the
+    /// same answer, so the two sides cannot disagree about who owns the
+    /// guard.
+    #[must_use]
+    pub const fn embed_meters_quota_pool(&self) -> bool {
+        matches!(
+            self.source,
+            EmbeddingSource::Provider | EmbeddingSource::Openai
+        )
+    }
+
     /// Validate every bound and the embedding-source contract before the
     /// handler accepts the strategy.
     ///
@@ -700,20 +728,32 @@ where
 /// [`SemanticRouteOutcome::EmbedderUnavailable`] by [`decide`]'s callers
 /// and never carry into a response.
 ///
+/// # Who owns the quota-pool reservation
+///
 /// `quota_attempt` is one reservation against the origin's `quota_pool`,
-/// minted by the dispatcher for this call and settled at the send seam
-/// by the `_with_quota` embedding variants, mirroring the semantic
+/// minted by the dispatcher for this call and settled here at the send
+/// seam by the `_with_quota` embedding variants, mirroring the semantic
 /// cache's lookup embedding. Without it, a `semantic_route` origin
 /// sharing a pool would drive two upstream calls per admitted request
-/// and meter one. Pass `None` only where no pool is configured: a
-/// no-op guard from [`crate::quota_pool::QuotaPoolAdmission`] is the
-/// right value on a pooled origin, since it keeps every embedding call
-/// on the metered path whatever the pool's admission state is.
+/// and meter one.
+///
+/// Whether there is a reservation at all is the caller's decision, and
+/// [`SemanticRouteConfig::embed_meters_quota_pool`] is that decision:
+/// `Some` for the two sources that POST to an upstream the pool
+/// represents, `None` for the ones that do not, including on a pooled
+/// origin where the admission state would make it a no-op guard. This
+/// function never hands a reservation back, because a caller that
+/// minted one for an unmetered call has already spent a unit of a
+/// shared store and can already have been denied by a pool that call
+/// never spends against.
 ///
 /// The guard is per call, not per request, because a cold start embeds
-/// every exemplar and each of those is its own upstream call. The
-/// sidecar source releases the reservation instead of settling it: a
-/// local classifier process is not a pooled provider call.
+/// every exemplar and each of those is its own upstream call. A guard
+/// that reaches an error path before any upstream call (a credential
+/// the embedding provider is not available to, a missing source block)
+/// is released when it drops, which is the right settlement for a call
+/// that did not happen, so every path through here settles or releases
+/// exactly once.
 pub async fn embed_route_text(
     config: &SemanticRouteConfig,
     client: &crate::client::AiClient,
@@ -767,8 +807,18 @@ pub async fn embed_route_text(
             }
         }
         EmbeddingSource::Sidecar => {
-            // No provider call to meter, so the reservation is released
-            // rather than settled.
+            // A local classifier process is not a pooled provider call,
+            // so this source owes no reservation and the dispatch seam
+            // mints none for it. One arriving anyway is a caller that
+            // has already taken a unit out of a shared store for
+            // traffic the pool cannot see, which is what the assertion
+            // is here to fail; releasing it is the best that can still
+            // be done for the unit.
+            debug_assert!(
+                quota_attempt.is_none(),
+                "a sidecar embed takes no quota-pool reservation; the dispatch seam gates on \
+                 SemanticRouteConfig::embed_meters_quota_pool"
+            );
             drop(quota_attempt);
             match config.sidecar.as_ref() {
                 Some(sidecar) => {
