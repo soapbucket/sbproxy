@@ -36,6 +36,7 @@
 //!   RPC; the supervisor's restart loop only fires on child
 //!   exit, not on RPC-level failures.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -77,6 +78,17 @@ pub struct SupervisorConfig {
     /// Grace period [`Supervisor::shutdown`] waits between SIGTERM
     /// and SIGKILL.
     pub shutdown_grace: Duration,
+    /// Optional `--inference-max-request-bytes` for the child.
+    pub inference_max_request_bytes: Option<usize>,
+    /// Optional `--inference-max-items` for the child.
+    pub inference_max_items: Option<usize>,
+    /// Optional `--inference-max-concurrent` for the child.
+    pub inference_max_concurrent: Option<usize>,
+    /// Optional `--inference-max-queued` for the child. `Some(0)` is
+    /// meaningful and disables waiting, so it is passed through.
+    pub inference_max_queued: Option<usize>,
+    /// Optional `--inference-timeout-ms` for the child.
+    pub inference_timeout_ms: Option<u64>,
 }
 
 impl Default for SupervisorConfig {
@@ -90,6 +102,11 @@ impl Default for SupervisorConfig {
             max_backoff: Duration::from_secs(30),
             healthy_after: Duration::from_secs(30),
             shutdown_grace: Duration::from_secs(5),
+            inference_max_request_bytes: None,
+            inference_max_items: None,
+            inference_max_concurrent: None,
+            inference_max_queued: None,
+            inference_timeout_ms: None,
         }
     }
 }
@@ -308,17 +325,68 @@ async fn run_loop(
     let _ = consecutive_failures; // diagnostic counter; not currently exposed
 }
 
+/// Build the child's argv, everything after the binary itself.
+///
+/// Split out of `spawn_child` so the argument list can be asserted without
+/// forking a process. A limit an operator sets on [`SupervisorConfig`] is
+/// only real if it reaches this vector, and the supervised deployment is
+/// the one that cannot reach the child's command line any other way.
+///
+/// Only the inference limits are exposed, and only as overrides. Leave one
+/// unset and the child applies its own default, which for concurrency and
+/// queue depth it derives from the host it lands on; the supervisor has no
+/// better view of that host than the child does. The `--token-*` limits
+/// are deliberately absent because the supervisor cannot load a token
+/// model either: it emits no `--token-model`, so the supervised child never
+/// serves `Compress`.
+fn child_args(cfg: &SupervisorConfig) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
+        OsString::from("--listen-uds"),
+        cfg.uds_path.clone().into_os_string(),
+    ];
+    if let Some(default_model) = cfg.default_model.as_ref() {
+        args.push(OsString::from("--default-model"));
+        args.push(OsString::from(default_model));
+    }
+    for spec in &cfg.models {
+        args.push(OsString::from("--model"));
+        args.push(OsString::from(spec));
+    }
+    for (flag, value) in [
+        (
+            "--inference-max-request-bytes",
+            cfg.inference_max_request_bytes.map(|v| v.to_string()),
+        ),
+        (
+            "--inference-max-items",
+            cfg.inference_max_items.map(|v| v.to_string()),
+        ),
+        (
+            "--inference-max-concurrent",
+            cfg.inference_max_concurrent.map(|v| v.to_string()),
+        ),
+        (
+            "--inference-max-queued",
+            cfg.inference_max_queued.map(|v| v.to_string()),
+        ),
+        (
+            "--inference-timeout-ms",
+            cfg.inference_timeout_ms.map(|v| v.to_string()),
+        ),
+    ] {
+        if let Some(value) = value {
+            args.push(OsString::from(flag));
+            args.push(OsString::from(value));
+        }
+    }
+    args
+}
+
 /// Fork the child with the configured CLI arguments. Returns the
 /// child handle on success.
 async fn spawn_child(cfg: &SupervisorConfig) -> Result<Child, std::io::Error> {
     let mut cmd = Command::new(&cfg.binary);
-    cmd.arg("--listen-uds").arg(&cfg.uds_path);
-    if let Some(default_model) = cfg.default_model.as_ref() {
-        cmd.arg("--default-model").arg(default_model);
-    }
-    for spec in &cfg.models {
-        cmd.arg("--model").arg(spec);
-    }
+    cmd.args(child_args(cfg));
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -390,12 +458,11 @@ mod tests {
             // the task exits.
             binary: PathBuf::from("/nonexistent/sbproxy-sidecar-fixture"),
             uds_path: tempdir.path().join("sock"),
-            models: vec![],
-            default_model: None,
             initial_backoff: Duration::from_millis(10),
             max_backoff: Duration::from_millis(50),
             healthy_after: Duration::from_secs(60),
             shutdown_grace: Duration::from_millis(100),
+            ..SupervisorConfig::default()
         };
         let sup = Supervisor::spawn(cfg);
 
@@ -458,5 +525,71 @@ mod tests {
         // must not panic.
         sup.shutdown().await;
         assert_eq!(sup.state(), SupervisorState::Stopped);
+    }
+
+    fn rendered(cfg: &SupervisorConfig) -> Vec<String> {
+        child_args(cfg)
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn child_argv_carries_the_configured_inference_limits() {
+        // The supervised deployment has no other way to reach the child's
+        // command line, so a limit that stops here is a limit the docs
+        // promise an operator they can widen and they cannot.
+        let cfg = SupervisorConfig {
+            uds_path: PathBuf::from("/run/sbproxy/classifier.sock"),
+            models: vec!["injection=/m.onnx:/t.json".to_string()],
+            default_model: Some("injection".to_string()),
+            inference_max_request_bytes: Some(2 * 1024 * 1024),
+            inference_max_items: Some(128),
+            inference_max_concurrent: Some(24),
+            // Zero is a real setting: it disables waiting entirely, so it
+            // has to survive the Option rather than read as "unset".
+            inference_max_queued: Some(0),
+            inference_timeout_ms: Some(1_500),
+            ..SupervisorConfig::default()
+        };
+
+        assert_eq!(
+            rendered(&cfg),
+            [
+                "--listen-uds",
+                "/run/sbproxy/classifier.sock",
+                "--default-model",
+                "injection",
+                "--model",
+                "injection=/m.onnx:/t.json",
+                "--inference-max-request-bytes",
+                "2097152",
+                "--inference-max-items",
+                "128",
+                "--inference-max-concurrent",
+                "24",
+                "--inference-max-queued",
+                "0",
+                "--inference-timeout-ms",
+                "1500",
+            ]
+        );
+    }
+
+    #[test]
+    fn child_argv_omits_inference_limits_the_operator_left_unset() {
+        let cfg = SupervisorConfig {
+            uds_path: PathBuf::from("/run/sbproxy/classifier.sock"),
+            ..SupervisorConfig::default()
+        };
+
+        // An unset field must not become a flag. The child derives its
+        // concurrency and queue defaults from the host it runs on, and a
+        // supervisor-supplied number would overwrite that with an opinion
+        // formed nowhere.
+        assert_eq!(
+            rendered(&cfg),
+            ["--listen-uds", "/run/sbproxy/classifier.sock"]
+        );
     }
 }

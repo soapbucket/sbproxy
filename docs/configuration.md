@@ -321,9 +321,9 @@ egress:
 | Sub-block | Purpose(s) armed | Gates |
 |---|---|---|
 | `ai_providers` | `ai_provider` | Every upstream AI provider dispatch the AI gateway client makes. |
-| `usage_sinks` | `usage_sink`, `webhook` | Langfuse, Datadog, and object-store usage-sink deliveries (`usage_sink`), plus webhook usage-sink deliveries (`webhook`, a separate purpose the same sub-block arms with one allowlist). |
+| `usage_sinks` | `usage_sink`, `webhook` | Langfuse, Datadog, and object-store usage-sink deliveries (`usage_sink`), plus webhook usage-sink deliveries and the `events:` webhook sink (`webhook`, a separate purpose the same sub-block arms with one allowlist). |
 | `model_artifacts` | `model_artifact` | The model-host artifact fetcher's HTTP downloads. |
-| `token_exchange` | `token_exchange` | The non-MCP outbound-credential resolver's OAuth token-endpoint calls. The MCP token-exchange path has its own per-server `egress:` block (see [mcp-security.md](mcp-security.md)) and is unaffected by this section. |
+| `token_exchange` | `token_exchange` | Every OAuth token-endpoint call this proxy makes: the non-MCP outbound-credential resolver's, and the MCP run-as-user token exchange's. A per-server `egress:` block gates that server's upstream connects and OpenAPI tool calls; it does not reach this purpose, so this sub-block is the only way to arm a token endpoint. |
 | `telemetry` | `telemetry` | The OTLP trace, metric, and log exporter endpoints. Authorized once at boot, where each exporter is constructed; a denied endpoint refuses boot with a fatal error naming it. A config reload re-verifies the still-running trace and metric exporters against the new allowlist and refuses the reload, naming the endpoint, if either is now denied; the log exporter is rebuilt on every reload and re-authorizes itself then. |
 
 Each sub-block accepts `mode` (`deny_by_default` or `allow_by_default`,
@@ -1597,7 +1597,7 @@ origins:
 | `allowed_models` | list | empty (allow all) | Allow-list of model names. |
 | `blocked_models` | list | | Block-list of model names. Takes precedence over allow-list. |
 | `data_posture` | object | unset | Data-handling posture requirement: `require_zdr` (default `false`) and `allow_data_collection` (default `true`). A hard provider-eligibility filter applied before any routing strategy runs, composed with the per-request `x-sbproxy-require-zdr` / `x-sbproxy-disallow-data-collection` headers (most restrictive wins). A request left with no eligible provider fails closed naming the constraint and the excluded providers; a block that excludes every configured provider is refused at config load. See [ai-gateway.md](ai-gateway.md#provider-data-posture). |
-| `max_body_size` | int | | Maximum request body size in bytes. |
+| `max_body_size` | int | `67108864` (64 MiB) | Maximum request body size in bytes the gateway accepts, checked while the body arrives rather than once it is buffered. An oversize declared `Content-Length` is refused before the first read, and a chunked upload that declares nothing is refused on the chunk that crosses the cap. Either way the answer is `413` and no provider is contacted, so nothing reaches the response cache or the idempotency store. The same number bounds the buffered upstream response. Unset means 64 MiB rather than unlimited, `0` reads as unset, and values above 1 GiB are clamped to 1 GiB. |
 | `guardrails` | object | | Input/output guardrails pipeline. |
 | `budget` | object | | Budget enforcement configuration. |
 | `model_rate_limits` | map | | Per-model rate limit overrides keyed by model name. |
@@ -2341,6 +2341,34 @@ The `authentication` block is a sibling of `action`, not nested inside it. It co
 
 Anything else falls through to the inventory-based auth plugin registry, so a linked third-party crate can register additional types (`oauth`, `oauth_introspection`, `oauth_client_credentials`, `ext_authz`, `biscuit`, `saml`, ...) without patching the proxy. Plugins register on the typed `AuthPluginRegistration` channel and surface through the standard `authentication.type` config field.
 
+### Unknown keys are refused
+
+Every one of the eleven configurable built-in providers refuses a key it
+does not recognize, at `serve`, `validate`, and hot reload. The error names
+the key you wrote and lists the ones the provider accepts:
+
+```
+unknown field `require_dp0p`, expected `tokens` or `require_dpop`
+```
+
+This closes a fail-open. Until it landed, an unrecognized key was dropped
+silently and the setting it was meant to be took its default, so
+`require_dp0p: true` on a bearer block served every request with DPoP
+proof-of-possession off while the config read as though it were on. The
+same held for `require_mtls_bound` on `jwt`, and for every other optional
+switch on every other provider.
+
+Two things stay open on purpose. `noop` has no configuration to check, so a
+stray key on a `noop` block is still accepted. And the per-credential
+entries inside `api_keys:`, `tokens:`, `users:`, and `hmac_auth`'s `keys:`
+stay permissive, because each one flattens the free-form attribution
+metadata (`project`, `team`, `tags`, ...) into the same mapping and there is
+no way to tell an unknown key from an intended one there.
+
+Upgrading: a config that carried a stray key inside an `authentication`
+block used to boot and now fails to compile. See
+[config-stability.md](config-stability.md#unknown-keys-inside-an-authentication-block).
+
 ### Accepting more than one provider
 
 `authentication` also takes a list of two or more provider blocks. Providers run in declared order and the first one that accepts the request wins. This is the shape of a credential migration (keep accepting legacy API keys while callers move to JWTs on the same origin) and of mixed-client origins (services present tokens, crawlers present signatures).
@@ -2460,6 +2488,10 @@ origins:
 | `tokens` | list | required | Accepted bearer tokens (each entry is either the raw secret or `{secret, dpop_jkt, ...}`) |
 | `require_dpop` | bool | `false` | When `true`, every accepted token MUST come with a valid RFC 9449 DPoP proof whose `jkt` matches the token entry's `dpop_jkt` metadata. Tokens without `dpop_jkt` metadata fail closed. |
 
+Any other key on a `bearer` block is rejected at config load. Misspelling
+`require_dpop` used to leave DPoP off silently; see
+[Unknown keys are refused](#unknown-keys-are-refused).
+
 #### Sender-constrained Bearer (RFC 9449)
 
 DPoP binds an opaque bearer token to a proof-of-possession key
@@ -2518,6 +2550,10 @@ origins:
 | `jwe.decryption_key` | string | | PEM private key for decrypting JWE (RFC 7516) encrypted tokens before the usual signature checks. See "Encrypted tokens" below. |
 
 The list must contain at least one entry; an empty list rejects all tokens. Bearer tokens must be supplied via `Authorization: Bearer <jwt>`.
+
+Any other key on a `jwt` block is rejected at config load. Misspelling
+`require_dpop` or `require_mtls_bound` used to leave that binding off
+silently; see [Unknown keys are refused](#unknown-keys-are-refused).
 
 #### Sender-constrained JWT (RFC 9449 + RFC 8705)
 
@@ -3421,7 +3457,7 @@ policies:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `max_body_size` | int | unset | Maximum request body size in bytes. |
+| `max_body_size` | int | unset | Maximum request body size in bytes. Checked against a declared `Content-Length` in the request phase and against the running total as chunks arrive, so a chunked upload that declares nothing is caught too. It also bounds what a linked Rust action plugin buffers before it runs: that action answers from the request phase and returns, so it never reaches the streaming check and applies this cap itself. Left unset it still buffers no more than 64 MiB, and a value above 1 GiB is clamped there. A proxied request has no body cap without this field. `type: ai_proxy` has the same problem and its own key, [`max_body_size` on the action](#ai_proxy), which is the one it reads. |
 | `max_header_count` | int | unset | Maximum number of request headers. Alias: `max_headers_count`. |
 | `max_header_size` | int or string | unset | Maximum size of a single header value. Strings like `"4KB"` or `"1MB"` are accepted. |
 | `max_url_length` | int | unset | Maximum URL length in characters. |

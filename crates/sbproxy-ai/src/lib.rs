@@ -37,7 +37,6 @@ pub mod local_host;
 pub mod managed_replica;
 pub mod model_alias;
 pub mod model_directory;
-pub mod multimodal;
 pub mod prompt_fingerprint;
 pub mod prompt_optimizer;
 pub mod prompts;
@@ -83,9 +82,6 @@ pub use identity::VirtualKeyConfig;
 pub use ids::{ModelId, ProviderName};
 pub use key_scoping::KeyPermissions;
 pub use model_alias::{ModelAlias, ModelAliasRegistry};
-pub use multimodal::{
-    detect_modality, filter_providers_by_modality, provider_supports_modality, Modality,
-};
 pub use prompt_fingerprint::prompt_fingerprint;
 pub use provider::ProviderConfig;
 pub use provider_ratelimit::{

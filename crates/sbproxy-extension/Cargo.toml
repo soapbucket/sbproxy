@@ -71,7 +71,15 @@ base64.workspace = true
 sha2.workspace = true
 hex.workspace = true
 # WOR-2289: zeroize resolved bundle secret_vars plaintext on drop.
+# WOR-2621 adds a second consumer: the run-as-user token cache holds
+# exchanged `Bearer …` strings, so an eviction has to wipe rather than
+# free.
 zeroize.workspace = true
+
+# WOR-2621: the run-as-user token cache is bounded and LRU-evicting
+# rather than an unbounded HashMap. Same workspace pin the tls,
+# middleware, and modules crates already resolve.
+lru.workspace = true
 
 # Capability-based bundle traversal prevents path replacement between
 # containment checks and reads.

@@ -1,5 +1,5 @@
 # Local inference for gateway helper models
-*Last modified: 2026-08-13*
+*Last modified: 2026-08-21*
 
 SBproxy can run four AI-gateway features on local ONNX models instead of paid
 APIs:
@@ -88,6 +88,30 @@ sidecar does not have to be up before the proxy starts. For a co-located
 deployment, use `--listen-uds /run/sbproxy/classifier.sock` instead of
 `--listen` to skip the loopback TCP round trip.
 
+### Bounds on `Classify` and `Embed`
+
+Both RPCs hand caller-supplied text to a synchronous model on the blocking
+pool, so both are bounded whether or not you pass a flag. The command above
+sets none of these and still runs inside them:
+
+| Flag | Default | Hard ceiling | What it limits |
+|---|---:|---:|---|
+| `--inference-max-request-bytes` | 1,048,576 | 16 MiB | Exact encoded protobuf size of one `Classify` or `Embed` request |
+| `--inference-max-items` | 64 | 4,096 | Texts in one `Embed` batch |
+| `--inference-max-concurrent` | this host's available parallelism, held between 4 and 64 | 64 | Classifications running at once, and separately embeddings |
+| `--inference-max-queued` | 8 per running slot | 1,024 | Requests waiting behind running inference |
+| `--inference-timeout-ms` | 30,000 | 600,000 | One request from arrival to answer, including its wait for a running slot |
+
+The two concurrency defaults are derived from the host rather than fixed,
+because one classification is one thread until it returns and a literal
+would be wrong on every machine but the one that produced it. `--help`
+prints the numbers this host resolved them to. A request over any of these
+bounds comes back `RESOURCE_EXHAUSTED` or `DEADLINE_EXCEEDED`, which the
+proxy treats as a failed call and routes through the calling policy's
+`failure_posture`. See
+[classifier-sidecar.md](classifier-sidecar.md#3-request-limits-and-load-shedding)
+for the status each bound returns and for the per-reason refusal counters.
+
 ### Run token pruning
 
 Token pruning needs an operator-supplied LLMLingua-2-compatible ONNX token
@@ -133,8 +157,9 @@ still selects the requested ID. Model IDs are limited to 256 UTF-8 bytes.
 The standard model-file limit is 209,715,200 bytes. A typical float32 mBERT
 LLMLingua-2 ONNX export is about 709 MB, so the command raises only that limit
 to 750,000,000 bytes. Set the smallest value that admits your pinned artifact.
-The remaining flags spell out the defaults so the deployment's resource
-envelope is visible:
+The remaining flags spell out the defaults so the `Compress` half of the
+deployment's resource envelope is visible; the `Classify` and `Embed` half
+is the `--inference-*` table above:
 
 | Flag | Default | Hard ceiling | What it limits |
 |---|---:|---:|---|
@@ -148,10 +173,15 @@ envelope is visible:
 
 `--token-max-queued 0` disables waiting. Requests beyond the active and queued
 limits fail at this lever instead of growing sidecar memory without a bound.
-The shared gRPC decoder keeps the existing 4 MiB envelope used by `Classify`
-and `Embed`; raising the `Compress` byte limit above 4 MiB raises that decoder
-envelope to match. The sidecar still enforces the exact `Compress` size shown
-in the table after decoding.
+The gRPC decoder is shared by every RPC and admits the larger of 4 MiB and
+the biggest configured per-RPC byte budget, so raising either
+`--token-max-request-bytes` or `--inference-max-request-bytes` above 4 MiB
+raises the decoder envelope to match, and neither one lowers it. Decoding is
+not acceptance: after the message decodes, `Compress` enforces the exact size
+shown in the table and `Classify` and `Embed` enforce their own
+`--inference-max-request-bytes`, which defaults to 1 MiB. A 3 MiB `Classify`
+therefore decodes and is then refused with `RESOURCE_EXHAUSTED` unless you
+raise that flag.
 
 The sidecar divides longer text into punctuation-aware windows, scores
 subtokens, averages their scores for each source word, and reconstructs output

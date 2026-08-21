@@ -683,9 +683,13 @@ async fn reconcile_deployment_workload(
                 // restarts for unrelated reasons.
                 return Ok(Action::requeue(Duration::from_secs(300)));
             }
-            Err(e) => {
+            // `hot_reload_error`, not `e`: `HotReloadError::Request`
+            // wraps a `reqwest::Error`, whose Display ends with the pod
+            // URL it dialled. `try_hot_reload` strips that URL before
+            // wrapping, and the name is what says so here (WOR-2629).
+            Err(hot_reload_error) => {
                 tracing::warn!(
-                    error = %e,
+                    error = %hot_reload_error,
                     name = %name,
                     namespace = %ns,
                     "hot-reload failed; falling back to rollout-restart"
@@ -817,9 +821,13 @@ async fn reconcile_clustered_workload(
                 );
                 return Ok(Action::requeue(Duration::from_secs(300)));
             }
-            Err(e) => {
+            // `hot_reload_error`, not `e`: `HotReloadError::Request`
+            // wraps a `reqwest::Error`, whose Display ends with the pod
+            // URL it dialled. `try_hot_reload` strips that URL before
+            // wrapping, and the name is what says so here (WOR-2629).
+            Err(hot_reload_error) => {
                 tracing::warn!(
-                    error = %e,
+                    error = %hot_reload_error,
                     name = %name,
                     namespace = %ns,
                     "hot-reload failed; falling back to rollout-restart"
@@ -921,7 +929,10 @@ async fn try_hot_reload(
             .header("authorization", &auth_header)
             .send()
             .await
-            .map_err(HotReloadError::Request)?;
+            // The URL is a pod IP and the fixed `/admin/reload` path, so
+            // the leak is small, but the rule is that no reqwest Display
+            // reaches a log line with its URL attached (WOR-2629).
+            .map_err(|error| HotReloadError::Request(error.without_url()))?;
         let status = resp.status();
         if !status.is_success() {
             return Err(HotReloadError::ProxyRejected(status.as_u16()));

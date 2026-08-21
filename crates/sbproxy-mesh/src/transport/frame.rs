@@ -322,6 +322,68 @@ where
     Ok(buf)
 }
 
+/// Why a deadline-bounded frame read produced no frame.
+///
+/// The two timeout variants are kept apart because they are different
+/// facts about the peer, and the inbound-rejection counter labels on that
+/// difference. A connection that is simply quiet between requests is
+/// healthy right up until it is not; a connection that announced a frame
+/// length and then stopped delivering is a peer holding a buffer open.
+#[derive(Debug)]
+pub(crate) enum FrameReadError {
+    /// No new frame started inside the idle deadline.
+    Idle,
+    /// A frame's length prefix landed but its body did not arrive inside
+    /// the frame deadline.
+    Stalled,
+    /// Ordinary I/O failure. `UnexpectedEof` here is the normal way a peer
+    /// closes a connection.
+    Io(tokio::io::Error),
+}
+
+/// Read one frame under two deadlines that never restart mid-frame.
+///
+/// `idle` bounds the wait for the four-byte length prefix, measured from
+/// the moment this call starts, so a peer that dribbles one byte of the
+/// prefix per minute still trips it: the deadline covers the whole prefix
+/// read rather than each poll of it. `body` then bounds delivery of the
+/// announced payload, again as one deadline over the whole `read_exact`
+/// rather than a per-read timer that a single byte could reset. That
+/// distinction is the whole point. A timeout that restarts on every byte
+/// received is exactly the hole slowloris walks through, and a caller that
+/// wraps a per-read timeout around a loop has not bounded anything.
+///
+/// The length cap is applied before the buffer is allocated, so a peer
+/// cannot make this node reserve 4 GiB by claiming it in the prefix.
+pub(crate) async fn read_frame_bounded<R>(
+    r: &mut R,
+    idle: std::time::Duration,
+    body: std::time::Duration,
+) -> Result<Vec<u8>, FrameReadError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let len = match tokio::time::timeout(idle, r.read_u32()).await {
+        Err(_elapsed) => return Err(FrameReadError::Idle),
+        Ok(Err(error)) => return Err(FrameReadError::Io(error)),
+        Ok(Ok(len)) => len as usize,
+    };
+    if len > MAX_FRAME_BYTES {
+        return Err(FrameReadError::Io(tokio::io::Error::new(
+            tokio::io::ErrorKind::InvalidData,
+            "frame exceeds 16 MiB cap",
+        )));
+    }
+    let mut buf = vec![0u8; len];
+    match tokio::time::timeout(body, r.read_exact(&mut buf)).await {
+        Err(_elapsed) => Err(FrameReadError::Stalled),
+        Ok(Err(error)) => Err(FrameReadError::Io(error)),
+        Ok(Ok(_)) => Ok(buf),
+    }
+}
+
 // --- Tests ---
 
 #[cfg(test)]
@@ -766,5 +828,93 @@ mod tests {
         // the length check before attempting `read_exact`.
         let err = read_frame(&mut b).await.unwrap_err();
         assert_eq!(err.kind(), tokio::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn bounded_read_gives_up_when_no_frame_starts() {
+        let (_a, mut b) = duplex(64);
+        let err = read_frame_bounded(
+            &mut b,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect_err("a silent peer must not be waited on forever");
+        assert!(
+            matches!(err, FrameReadError::Idle),
+            "expected Idle, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_read_body_deadline_does_not_reset_on_each_byte() {
+        // The slowloris shape: announce a body, then deliver it one byte at
+        // a time, slowly enough to be useless and fast enough that a
+        // per-read timer would never fire. The body deadline has to be a
+        // total, so 6 bytes at 40ms apart must lose against a 100ms budget
+        // even though no single read waits longer than 40ms.
+        use tokio::io::AsyncWriteExt;
+        let (mut a, mut b) = duplex(64);
+        let dribble = tokio::spawn(async move {
+            a.write_u32(6).await.expect("prefix");
+            for _ in 0..6u8 {
+                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                if a.write_all(b"x").await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let err = read_frame_bounded(
+            &mut b,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .expect_err("a dribbled body must lose against the total body deadline");
+        assert!(
+            matches!(err, FrameReadError::Stalled),
+            "expected Stalled, got {err:?}"
+        );
+        dribble.abort();
+    }
+
+    #[tokio::test]
+    async fn bounded_read_accepts_a_prompt_frame() {
+        let (mut a, mut b) = duplex(1024);
+        write_frame(&mut a, b"payload").await.expect("write");
+        let got = read_frame_bounded(
+            &mut b,
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("a prompt frame must pass both deadlines");
+        assert_eq!(got, b"payload");
+    }
+
+    #[tokio::test]
+    async fn bounded_read_rejects_an_oversized_length_before_allocating() {
+        use tokio::io::AsyncWriteExt;
+        let (mut a, mut b) = duplex(64);
+        a.write_u32((MAX_FRAME_BYTES as u32).saturating_add(1))
+            .await
+            .expect("write prefix");
+        let err = read_frame_bounded(
+            &mut b,
+            std::time::Duration::from_secs(5),
+            // A body deadline of zero proves the cap short-circuits before
+            // the body read is even attempted: any path that allocated and
+            // then read would come back `Stalled` instead.
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect_err("an oversized length prefix must be refused");
+        match err {
+            FrameReadError::Io(error) => {
+                assert_eq!(error.kind(), tokio::io::ErrorKind::InvalidData);
+            }
+            other => panic!("expected an InvalidData io error, got {other:?}"),
+        }
     }
 }

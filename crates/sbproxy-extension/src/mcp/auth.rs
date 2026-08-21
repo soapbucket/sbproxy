@@ -12,19 +12,46 @@
 //! [`crate::mcp::federation::McpFederation::call_tool_with_upstream_headers`]
 //! so [`crate::mcp::streamable::send_request`] attaches them on the
 //! outbound POST. Never put credentials in tool arguments.
+//!
+//! # The token-exchange POST is a governed dial
+//!
+//! Token exchange is the one mode here that leaves the process, and it
+//! leaves carrying two credentials: the caller's inbound bearer as the
+//! `subject_token` form field, and (when configured) a client secret in
+//! HTTP Basic. It goes out through
+//! [`sbproxy_security::governed_egress`], the workspace's one bounded
+//! redirect loop, which authorizes the endpoint, pins the dial to the
+//! addresses that authorization resolved, re-authorizes any redirect
+//! before a second connect, refuses to replay a body off-origin, and
+//! caps the reply. None of that held before WOR-2620: the endpoint was
+//! authorized, the pin set was discarded, and a shared client resolved
+//! the host again and replayed the form body at whatever `Location`
+//! came back.
+//!
+//! # The token cache is keyed by the host, and bounded
+//!
+//! Exchanged credentials are cached, and a cache on a credential path
+//! is two questions rather than one. What identifies an entry is
+//! `cache_key`, which mixes in the tenant the request pipeline resolved
+//! along with every other input that changes what a successful exchange
+//! returns (WOR-2619). How large it may get is `TOKEN_CACHE_CAPACITY`
+//! and the expiry sweep beside it, because the key hashes a rotating
+//! inbound bearer and the map it replaced had no bound and deleted
+//! nothing (WOR-2621).
 
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
 use sbproxy_plugin::{McpExecutionContext, Principal, PrincipalSource};
 use sbproxy_security::egress::{
-    evaluate_hop, record_egress_refused, record_egress_seen, CachedSystemResolver,
-    EgressAuthorizer, EgressPurpose, EgressSightingStatus, RedirectRule,
+    CachedSystemResolver, EgressAuthorizer, EgressPurpose, HostResolver,
 };
+use sbproxy_security::governed_egress::{GovernedEgress, GovernedEgressError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 /// How the MCP upstream expects credentials.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,7 +247,16 @@ pub async fn mint_upstream_authorization(
                 secret_lookup,
                 http,
                 egress,
+                // The tenant comes off the principal the request
+                // pipeline resolved, never off anything the caller
+                // sent, which is what makes the cache key's tenant
+                // mixing a host decision rather than a caller one.
                 ctx.principal.tenant_id.as_str(),
+                // A live, short-TTL-cached resolver, so the pins
+                // describe DNS rather than a fixture and
+                // `allow_private` can refuse an IdP hostname that
+                // resolves onto the pod network.
+                &CachedSystemResolver,
             )
             .await
         }
@@ -258,86 +294,186 @@ pub fn assert_args_unmutated(before: &serde_json::Value, after: &serde_json::Val
             .unwrap_or(true)
 }
 
-/// Send one token-exchange POST, re-authorizing each redirect hop
-/// (WOR-2165).
-///
-/// The subject token travels in the form body, and a 307 or 308 replays
-/// that body at whatever host the `Location` names. The HTTP client's
-/// own credential stripping does not reach a request body, so the only
-/// safe handling is to refuse the hop: a token endpoint is operator
-/// configuration naming one IdP, and a token endpoint that redirects
-/// off its own origin is indistinguishable from an attack.
-async fn send_token_exchange(
-    http: &reqwest::Client,
-    egress: Option<&EgressAuthorizer>,
-    tenant: &str,
-    origin: &str,
-    mut request: reqwest::Request,
-) -> Result<reqwest::Response, UpstreamAuthError> {
-    let mut hop = 0usize;
-    loop {
-        let replay = request.try_clone();
-        let from = request.url().clone();
-        let resp = http
-            .execute(request)
-            .await
-            .map_err(|_| UpstreamAuthError::TokenExchangeFailed)?;
-        if !resp.status().is_redirection() {
-            return Ok(resp);
-        }
-        let Some(location) = resp
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string)
-        else {
-            return Ok(resp);
-        };
-        hop += 1;
-        let next = evaluate_hop(
-            egress,
-            EgressPurpose::TokenExchange,
-            &from,
-            &location,
-            hop,
-            RedirectRule::SameOriginOnly,
-            &CachedSystemResolver,
-            origin,
-        )
-        .map_err(|denied| {
-            record_egress_refused(EgressPurpose::TokenExchange, denied, tenant, origin);
-            UpstreamAuthError::EgressDenied
-        })?;
-        let Some(mut replay) = replay else {
-            return Ok(resp);
-        };
-        if next.strip_credentials {
-            replay.headers_mut().remove(reqwest::header::AUTHORIZATION);
-        }
-        *replay.url_mut() = next.url;
-        request = replay;
-    }
-}
+/// Timeout for one token-exchange hop.
+const TOKEN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Ceiling on the bytes read from a token endpoint's reply.
+///
+/// An RFC 8693 token response is a small JSON object. Reading it with
+/// `bytes()` buffered whatever the endpoint chose to send, on a
+/// connection opened because operator config named that host, so a
+/// compromised or merely broken IdP could hand this process an
+/// allocation bounded by nothing at all. 64 KiB is orders of magnitude
+/// past any real response and small enough that the worst case is not
+/// worth measuring.
+const TOKEN_RESPONSE_MAX_BYTES: usize = 64 * 1024;
+
+/// One cached exchanged credential.
+///
+/// `header_value` is [`Zeroizing`] so an LRU eviction, a replacement, or
+/// a clear wipes the bearer material instead of leaving it in a freed
+/// allocation for the rest of the process's life.
 struct CachedToken {
-    header_value: String,
+    header_value: Zeroizing<String>,
     expires_at: Instant,
 }
 
-static TOKEN_CACHE: Lazy<Mutex<HashMap<String, CachedToken>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+/// Entry ceiling for [`TOKEN_CACHE`] (WOR-2621).
+///
+/// A const rather than a config key on purpose. [`cache_key`] hashes
+/// the caller's inbound bearer, so every rotation mints a distinct
+/// entry; the map this replaced was a plain `HashMap` with no bound and
+/// no deletion anywhere, which made a normal token-rotation cadence a
+/// slow leak of `Bearer …` strings. What that needs is a bound, and
+/// 4096 live exchanged credentials is well past any real working set. A
+/// config key would drag in the config types, the compiler, schema
+/// regeneration, and a number no operator has the information to pick.
+const TOKEN_CACHE_CAPACITY: usize = 4096;
 
+/// [`TOKEN_CACHE_CAPACITY`] in the shape `lru::LruCache::new` wants.
+///
+/// Written as a `const` match rather than an `unwrap` or an `expect` so
+/// the branch that cannot happen is settled at compile time instead of
+/// becoming a panic site on a credential path.
+const TOKEN_CACHE_BOUND: NonZeroUsize = match NonZeroUsize::new(TOKEN_CACHE_CAPACITY) {
+    Some(bound) => bound,
+    None => NonZeroUsize::MIN,
+};
+
+/// How many expired rows one insert reclaims before it stores.
+///
+/// Bounded so a mint never pays for a scan of the whole map. The LRU
+/// bound already caps memory; this only returns an expired credential's
+/// bytes early rather than leaving it to sit until eviction pressure
+/// happens to reach it.
+const TOKEN_CACHE_SWEEP_PER_INSERT: usize = 16;
+
+/// Bounded, self-expiring store for exchanged credentials.
+///
+/// Three properties the `HashMap` behind it had none of: a capacity, so
+/// a rotating subject token cannot grow it without limit; removal of an
+/// expired row on the read that finds it, rather than stepping over it
+/// forever; and zeroized values, so eviction does not leave bearer
+/// material behind.
+///
+/// `now` is a parameter on both methods rather than read inside, so a
+/// test drives expiry deterministically without a clock trait.
+struct TokenCache {
+    entries: lru::LruCache<String, CachedToken>,
+}
+
+impl TokenCache {
+    fn new() -> Self {
+        Self {
+            entries: lru::LruCache::new(TOKEN_CACHE_BOUND),
+        }
+    }
+
+    /// The live credential for `key`, if there is one.
+    fn get(&mut self, key: &str, now: Instant) -> Option<Zeroizing<String>> {
+        let live = match self.entries.get(key) {
+            Some(entry) if now < entry.expires_at => Some(entry.header_value.clone()),
+            Some(_) => None,
+            None => return None,
+        };
+        if live.is_none() {
+            // Expired. Remove it rather than falling through: nothing in
+            // this module ever deleted a row, so stepping over an
+            // expired one is what let the map keep every credential it
+            // had ever minted.
+            self.entries.pop(key);
+        }
+        live
+    }
+
+    /// Store `header_value` under `key`, evicting as needed.
+    fn insert(
+        &mut self,
+        key: String,
+        header_value: Zeroizing<String>,
+        expires_at: Instant,
+        now: Instant,
+    ) {
+        self.sweep_expired(now);
+        self.entries.put(
+            key,
+            CachedToken {
+                header_value,
+                expires_at,
+            },
+        );
+    }
+
+    /// Drop up to [`TOKEN_CACHE_SWEEP_PER_INSERT`] expired rows.
+    ///
+    /// `iter` walks most-recently-used first and does not promote what
+    /// it touches, so a sweep cannot reorder the eviction queue it is
+    /// walking. A full cache of live entries makes the walk cost
+    /// [`TOKEN_CACHE_CAPACITY`] pointer hops and find nothing, which is
+    /// the worst case and is fine: this runs once per cache miss, and a
+    /// cache miss is already an HTTP round trip to an identity
+    /// provider.
+    fn sweep_expired(&mut self, now: Instant) {
+        let stale: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| now >= entry.expires_at)
+            .take(TOKEN_CACHE_SWEEP_PER_INSERT)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in stale {
+            self.entries.pop(&key);
+        }
+    }
+}
+
+static TOKEN_CACHE: Lazy<Mutex<TokenCache>> = Lazy::new(|| Mutex::new(TokenCache::new()));
+
+/// Identity of one cached exchanged credential (WOR-2619).
+///
+/// Every input that changes which credential a successful exchange
+/// returns is in the digest, and the host supplies all of them. `tenant`
+/// comes off `ctx.principal.tenant_id`, which the request pipeline
+/// derived from the matched origin rather than from anything the caller
+/// sent; no policy, script, or tool argument reaches this function, so
+/// nothing a caller controls can widen a key past its own tenant.
+///
+/// What used to be missing was not academic. `scope` and
+/// `client_credential_ref` are read only on a cache miss, so two
+/// federated servers sharing a `token_endpoint` and `audience` and
+/// differing only in `scope` produced one key: the first server's
+/// `read` token was then served to the second server's `admin` request.
+/// And because the tenant is decided by the origin the request matched,
+/// not by the token, the same inbound bearer arriving at two origins
+/// collided across tenants.
+///
+/// `v2` leads the digest so no pre-existing entry can be read back
+/// under the new scheme. The `None`/`Some("")` discriminator matters
+/// for the same reason the separators do: without it an absent scope
+/// and an empty one hash alike, and the fields either side of an
+/// unseparated boundary can be slid into each other.
 fn cache_key(
+    tenant: &str,
     endpoint: &str,
     audience: &str,
+    scope: Option<&str>,
+    client_credential_ref: Option<&str>,
     subject_id: &str,
     subject_token: Option<&str>,
 ) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(b"v2");
+    hasher.update([0]);
+    // Tenant first, so a digest can never be read as another tenant's
+    // however the fields after it happen to line up.
+    hasher.update(tenant.as_bytes());
+    hasher.update([0]);
     hasher.update(endpoint.as_bytes());
     hasher.update([0]);
     hasher.update(audience.as_bytes());
     hasher.update([0]);
+    hash_optional(&mut hasher, canonical_scope(scope).as_deref());
+    hash_optional(&mut hasher, client_credential_ref);
     // Subject id is mandatory for isolation: tokens for user A must
     // never be served to user B even when subject tokens collide.
     hasher.update(subject_id.as_bytes());
@@ -348,6 +484,46 @@ fn cache_key(
     hex::encode(hasher.finalize())
 }
 
+/// Feed one optional field, distinguishing absent from empty.
+fn hash_optional(hasher: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update(value.as_bytes());
+        }
+        None => hasher.update([2]),
+    }
+    hasher.update([0]);
+}
+
+/// An RFC 6749 scope is a set, not a string.
+///
+/// `"a b"` and `"b a"` request the same thing, so hashing the raw
+/// string would mint and cache two credentials for one grant. Split on
+/// whitespace, deduplicate, sort.
+fn canonical_scope(scope: Option<&str>) -> Option<String> {
+    let scope = scope?;
+    let mut parts: Vec<&str> = scope.split_whitespace().collect();
+    parts.sort_unstable();
+    parts.dedup();
+    Some(parts.join(" "))
+}
+
+/// Exchange the caller's subject token for an upstream credential.
+///
+/// The POST carries the caller's inbound bearer as a form field and, if
+/// the operator configured one, a client secret in HTTP Basic. Both
+/// travel on a dial that [`GovernedEgress`] authorized, pinned, and
+/// will not redirect off its origin (WOR-2620). Before that loop
+/// existed this function authorized the endpoint, threw away the pin
+/// set, and handed the URL to a shared client that resolved the host
+/// again and replayed the form body at whatever `Location` came back.
+///
+/// `resolver` is a parameter so a test can make the authorize-time and
+/// dial-time answers disagree the way a rebinding DNS server does.
+/// Production passes [`CachedSystemResolver`], which is the same
+/// 30-second answer both calls read, so the pin check reports a real
+/// change rather than a race between two lookups.
 #[allow(clippy::too_many_arguments)] // mint needs exchange + subject + egress seams together
 async fn mint_token_exchange(
     token_endpoint: &url::Url,
@@ -360,62 +536,35 @@ async fn mint_token_exchange(
     http: &reqwest::Client,
     egress: Option<&EgressAuthorizer>,
     tenant: &str,
+    resolver: &dyn HostResolver,
 ) -> Result<UpstreamAuthorization, UpstreamAuthError> {
     let endpoint = token_endpoint.as_str();
-    // WOR-2165: a live resolver, so the pins recorded here describe DNS
-    // rather than a fixture, and `allow_private` can actually refuse an
-    // IdP hostname that resolves onto the pod network.
     let endpoint_host = token_endpoint.host_str().unwrap_or("unset").to_string();
-    // WOR-2476: every token endpoint lands in the egress inventory, whether
-    // an authorizer is configured or not. This gate previously had no
-    // `else` arm at all, so an omitted authorizer produced no record.
-    match egress {
-        Some(auth) => match auth.authorize(
-            EgressPurpose::TokenExchange,
-            endpoint,
-            &CachedSystemResolver,
-        ) {
-            Ok(_) => {
-                record_egress_seen(
-                    EgressPurpose::TokenExchange,
-                    endpoint,
-                    &endpoint_host,
-                    EgressSightingStatus::Allowed,
-                    None,
-                );
-            }
-            Err(denied) => {
-                record_egress_seen(
-                    EgressPurpose::TokenExchange,
-                    endpoint,
-                    &endpoint_host,
-                    EgressSightingStatus::Denied,
-                    Some(denied),
-                );
-                record_egress_refused(EgressPurpose::TokenExchange, denied, tenant, &endpoint_host);
-                return Err(UpstreamAuthError::EgressDenied);
-            }
-        },
-        None => {
-            record_egress_seen(
-                EgressPurpose::TokenExchange,
-                endpoint,
-                &endpoint_host,
-                EgressSightingStatus::Ungated,
-                None,
-            );
-        }
-    }
 
-    let key = cache_key(endpoint, audience, subject_id, subject_token);
-    if let Ok(guard) = TOKEN_CACHE.lock() {
-        if let Some(entry) = guard.get(&key) {
-            if Instant::now() < entry.expires_at {
-                return Ok(UpstreamAuthorization {
-                    header_name: "authorization".to_string(),
-                    header_value: entry.header_value.clone(),
-                });
-            }
+    // The cache read comes before authorization, deliberately. The
+    // allowlist decides where this process may send a credential; it is
+    // not a license check on one already minted. A hit dials nothing,
+    // resolves nothing, and reaches no host, so there is no destination
+    // for the gate to have an opinion about, and stamping a sighting
+    // for it would put a row in `GET /api/egress` for a destination
+    // that was not reached. Every miss goes through `GovernedEgress`
+    // below, which authorizes and pins before the connect, so no
+    // ungoverned dial is possible on either path.
+    let key = cache_key(
+        tenant,
+        endpoint,
+        audience,
+        scope,
+        client_credential_ref,
+        subject_id,
+        subject_token,
+    );
+    if let Ok(mut guard) = TOKEN_CACHE.lock() {
+        if let Some(header_value) = guard.get(&key, Instant::now()) {
+            return Ok(UpstreamAuthorization {
+                header_name: "authorization".to_string(),
+                header_value: header_value.to_string(),
+            });
         }
     }
 
@@ -449,38 +598,63 @@ async fn mint_token_exchange(
     let request = req
         .build()
         .map_err(|_| UpstreamAuthError::TokenExchangeFailed)?;
-    let resp = send_token_exchange(http, egress, tenant, &endpoint_host, request).await?;
-    if !resp.status().is_success() {
+
+    let governed = GovernedEgress {
+        purpose: EgressPurpose::TokenExchange,
+        authorizer: egress,
+        resolver,
+        // Configuration-scoped: the token endpoint's host is operator
+        // config, not a request-scoped value, and it is what an
+        // operator reading a refusal needs to recognize.
+        origin: &endpoint_host,
+        tenant,
+        // Nothing extra to declare. The client credential rides in
+        // `Authorization`, which the loop always strips, and the
+        // subject token is in the body, which is why a cross-origin hop
+        // is refused outright rather than replayed without it.
+        sensitive_headers: &[],
+        max_response_bytes: TOKEN_RESPONSE_MAX_BYTES,
+        no_redirect_client: http,
+        timeout: TOKEN_EXCHANGE_TIMEOUT,
+    };
+    let response = governed.send(request).await.map_err(|error| match error {
+        GovernedEgressError::Denied(_) => UpstreamAuthError::EgressDenied,
+        // Everything else is a transport, ceiling, or client-construction
+        // failure. None of them says anything about the caller, and the
+        // closed reason is already on the egress log line, so the typed
+        // error stays the one the caller can act on.
+        _ => UpstreamAuthError::TokenExchangeFailed,
+    })?;
+    if !(200u16..300).contains(&response.status) {
         return Err(UpstreamAuthError::TokenExchangeFailed);
     }
-    let body = resp
-        .bytes()
-        .await
+    let parsed: serde_json::Value = serde_json::from_slice(&response.body)
         .map_err(|_| UpstreamAuthError::TokenExchangeFailed)?;
-    let v: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|_| UpstreamAuthError::TokenExchangeFailed)?;
-    let token = v
+    let token = parsed
         .get("access_token")
         .and_then(|t| t.as_str())
         .ok_or(UpstreamAuthError::TokenExchangeFailed)?;
-    let expires_in = v.get("expires_in").and_then(|e| e.as_u64()).unwrap_or(60);
-    let header_value = format!("Bearer {token}");
+    let expires_in = parsed
+        .get("expires_in")
+        .and_then(|e| e.as_u64())
+        .unwrap_or(60);
+    let header_value = Zeroizing::new(format!("Bearer {token}"));
 
     if let Some(ttl) = expires_in.checked_sub(30).filter(|&s| s > 0) {
         if let Ok(mut guard) = TOKEN_CACHE.lock() {
+            let now = Instant::now();
             guard.insert(
                 key,
-                CachedToken {
-                    header_value: header_value.clone(),
-                    expires_at: Instant::now() + Duration::from_secs(ttl),
-                },
+                header_value.clone(),
+                now + Duration::from_secs(ttl),
+                now,
             );
         }
     }
 
     Ok(UpstreamAuthorization {
         header_name: "authorization".to_string(),
-        header_value,
+        header_value: header_value.to_string(),
     })
 }
 
@@ -488,7 +662,7 @@ async fn mint_token_exchange(
 #[cfg(test)]
 pub fn clear_token_cache_for_tests() {
     if let Ok(mut guard) = TOKEN_CACHE.lock() {
-        guard.clear();
+        guard.entries.clear();
     }
 }
 
@@ -886,64 +1060,212 @@ mod tests {
         }
     }
 
-    /// One-shot loopback fixture serving `response` verbatim.
+    /// One-shot loopback fixture serving `response` verbatim. The flag
+    /// latches on connect and the string keeps whatever the request
+    /// carried, so a test can prove a credential did not travel rather
+    /// than only that a socket was quiet.
     fn dial_fixture(
         response: String,
     ) -> Option<(
         std::net::SocketAddr,
         std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::sync::Arc<std::sync::Mutex<String>>,
     )> {
         use std::io::{Read, Write};
         use std::sync::atomic::{AtomicBool, Ordering};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
         let addr = listener.local_addr().ok()?;
         let hit = std::sync::Arc::new(AtomicBool::new(false));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let hit_writer = std::sync::Arc::clone(&hit);
+        let seen_writer = std::sync::Arc::clone(&seen);
         std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
                 hit_writer.store(true, Ordering::SeqCst);
-                let mut scratch = [0u8; 4096];
-                let _ = stream.read(&mut scratch);
+                let mut scratch = [0u8; 8192];
+                let read = stream.read(&mut scratch).unwrap_or(0);
+                if let Ok(mut slot) = seen_writer.lock() {
+                    *slot = String::from_utf8_lossy(&scratch[..read]).to_string();
+                }
                 let _ = stream.write_all(response.as_bytes());
                 let _ = stream.flush();
             }
         });
-        Some((addr, hit))
+        Some((addr, hit, seen))
     }
 
+    /// A loopback fixture that answers `bodies` in order, one
+    /// connection each, so a test can tell a cache hit from a fresh
+    /// exchange by which token came back.
+    fn issuer_fixture(bodies: Vec<String>) -> Option<u16> {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+        let port = listener.local_addr().ok()?.port();
+        std::thread::spawn(move || {
+            for body in bodies {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut scratch = [0u8; 8192];
+                let _ = stream.read(&mut scratch);
+                let _ = stream.write_all(ok_json(&body).as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        Some(port)
+    }
+
+    fn token_body(token: &str) -> String {
+        format!(r#"{{"access_token":"{token}","token_type":"Bearer","expires_in":3600}}"#)
+    }
+
+    /// A complete `200 OK` response carrying `body` as JSON.
+    fn ok_json(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// A resolver that answers each call from a fixed sequence, so a
+    /// test can make authorize time and dial time disagree the way a
+    /// rebinding DNS server does.
+    struct SequenceResolver {
+        answers: std::sync::Mutex<Vec<Vec<std::net::SocketAddr>>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl HostResolver for SequenceResolver {
+        fn resolve(&self, _host: &str, _port: u16) -> Result<Vec<std::net::SocketAddr>, ()> {
+            let index = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let answers = self.answers.lock().map_err(|_| ())?;
+            answers
+                .get(index)
+                .or_else(|| answers.last())
+                .cloned()
+                .ok_or(())
+        }
+    }
+
+    /// WOR-2620: the endpoint is authorized, its pin set is kept, and a
+    /// dial-time answer outside that set refuses the exchange instead of
+    /// being dialed.
+    ///
+    /// Red before the fix in the only way that matters: `mint_token_exchange`
+    /// took `Ok(_)` from `authorize`, dropped the `pinned_addrs` it had
+    /// just resolved, and POSTed through a shared client that looked the
+    /// host up again, so the rebound address got the subject token.
+    #[tokio::test]
+    async fn token_exchange_never_dials_an_address_the_pin_set_excludes() {
+        use std::sync::atomic::Ordering;
+        clear_token_cache_for_tests();
+        let Some((authorized, authorized_hit, _)) = dial_fixture(ok_json(&token_body("pinned")))
+        else {
+            return;
+        };
+        let Some((rebound, rebound_hit, rebound_seen)) =
+            dial_fixture(ok_json(&token_body("stolen")))
+        else {
+            return;
+        };
+
+        // Authorization sees the allowed address; the dial-time
+        // re-resolve answers with the other one.
+        let resolver = SequenceResolver {
+            answers: std::sync::Mutex::new(vec![vec![authorized], vec![rebound]]),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let egress = enforce_token_exchange(&["idp.test"], &[authorized.port()]);
+        let lookup = lookup_ok(StdHashMap::new());
+        let http = reqwest::Client::new();
+        let endpoint =
+            url::Url::parse(&format!("http://idp.test:{}/token", authorized.port())).unwrap();
+
+        let err = mint_token_exchange(
+            &endpoint,
+            "https://mcp.example",
+            None,
+            None,
+            "user-a",
+            Some("inbound-subject-token"),
+            &lookup,
+            &http,
+            Some(&egress),
+            "acme",
+            &resolver,
+        )
+        .await
+        .expect_err("a rebound answer must refuse the exchange");
+
+        assert_eq!(err, UpstreamAuthError::EgressDenied);
+        assert!(
+            !rebound_hit.load(Ordering::SeqCst),
+            "the rebound address must never be dialed"
+        );
+        assert!(
+            !authorized_hit.load(Ordering::SeqCst),
+            "nothing is dialed at all once the pin check fails"
+        );
+        assert!(
+            !rebound_seen
+                .lock()
+                .expect("fixture lock")
+                .contains("inbound-subject-token"),
+            "the subject token must not reach an unpinned address"
+        );
+    }
+
+    /// WOR-2620: the whole `mint_upstream_authorization` path refuses a
+    /// cross-origin redirect rather than replaying the form body, and
+    /// the target never sees the subject token.
     #[tokio::test]
     async fn token_exchange_refuses_a_cross_origin_redirect_hop() {
         use std::sync::atomic::Ordering;
-        // The IdP 302s the exchange at another host. The subject token
-        // is in the form body, which a 307 or 308 would replay verbatim
-        // and no client-side credential stripping would touch, so the
-        // hop must be refused and the target never contacted.
-        let Some((sink_addr, sink_hit)) = dial_fixture(
+        clear_token_cache_for_tests();
+        // The IdP 307s the exchange at another origin. The subject token
+        // is in the form body, which a 307 replays verbatim and no
+        // client-side credential stripping would touch, so the hop must
+        // be refused and the target never contacted.
+        let Some((sink_addr, sink_hit, sink_seen)) = dial_fixture(
             "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_string(),
         ) else {
             return;
         };
         let redirect = format!(
-            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{}/token\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:{}/token\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             sink_addr.port()
         );
-        let Some((idp_addr, idp_hit)) = dial_fixture(redirect) else {
+        let Some((idp_addr, idp_hit, _)) = dial_fixture(redirect) else {
             return;
         };
 
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("test client builds");
-        let request = http
-            .post(format!("http://{idp_addr}/token"))
-            .form(&[("subject_token", "user-secret-token")])
-            .build()
-            .expect("test request builds");
+        let principal = identified_principal();
+        let ctx = ctx_for(&principal, None);
+        let cfg = McpUpstreamAuthConfig::TokenExchange {
+            token_endpoint: url::Url::parse(&format!("http://{idp_addr}/token")).unwrap(),
+            audience: "https://mcp.example".to_string(),
+            scope: None,
+            client_credential_ref: None,
+        };
+        // Both origins on the allowlist. This is exactly the hop
+        // `evaluate_hop` alone would follow, because with an authorizer
+        // armed it treats the allowlist as the authority for a
+        // cross-origin target; the credential rule is what refuses it.
+        let egress = enforce_token_exchange(&["127.0.0.1"], &[idp_addr.port(), sink_addr.port()]);
+        let lookup = lookup_ok(StdHashMap::new());
+        let http = reqwest::Client::new();
 
-        let err = send_token_exchange(&http, None, "tenant-a", "idp.test", request)
-            .await
-            .expect_err("a cross-origin hop must be refused, not followed");
+        let err = mint_upstream_authorization(
+            &cfg,
+            &ctx,
+            &lookup,
+            &http,
+            Some(&egress),
+            Some("user-secret-token"),
+        )
+        .await
+        .expect_err("a cross-origin hop must be refused, not followed");
         assert_eq!(err, UpstreamAuthError::EgressDenied);
         assert!(
             idp_hit.load(Ordering::SeqCst),
@@ -952,6 +1274,216 @@ mod tests {
         assert!(
             !sink_hit.load(Ordering::SeqCst),
             "the redirect target must never receive the subject token"
+        );
+        assert!(
+            !sink_seen
+                .lock()
+                .expect("fixture lock")
+                .contains("user-secret-token"),
+            "the form body must not leave the authorized origin"
+        );
+    }
+
+    /// WOR-2620: an identity provider that answers with an unbounded
+    /// body does not get to size this process's allocation.
+    #[tokio::test]
+    async fn token_exchange_refuses_an_oversized_token_response() {
+        clear_token_cache_for_tests();
+        let payload = "x".repeat(TOKEN_RESPONSE_MAX_BYTES + 1);
+        let Some((idp_addr, _, _)) = dial_fixture(ok_json(&payload)) else {
+            return;
+        };
+
+        let egress = enforce_token_exchange(&["127.0.0.1"], &[idp_addr.port()]);
+        let lookup = lookup_ok(StdHashMap::new());
+        let http = reqwest::Client::new();
+        let endpoint = url::Url::parse(&format!("http://{idp_addr}/token")).unwrap();
+
+        let err = mint_token_exchange(
+            &endpoint,
+            "https://mcp.example",
+            None,
+            None,
+            "user-a",
+            Some("inbound-subject-token"),
+            &lookup,
+            &http,
+            Some(&egress),
+            "acme",
+            &CachedSystemResolver,
+        )
+        .await
+        .expect_err("a reply past the ceiling must not be buffered whole");
+        assert_eq!(err, UpstreamAuthError::TokenExchangeFailed);
+    }
+
+    /// WOR-2619: scope, client credential reference, and tenant are all
+    /// part of a cache entry's identity.
+    ///
+    /// Red before the fix three times over. `cache_key` hashed only
+    /// endpoint, audience, subject id, and subject token, so two
+    /// federated servers sharing an endpoint and audience and differing
+    /// only in `scope` shared one entry; so did two differing only in
+    /// `client_credential_ref`; and because the tenant comes from the
+    /// matched origin rather than from the token, one inbound bearer
+    /// arriving at two origins collided across tenants. Each of the
+    /// three second mints below returned the first mint's token.
+    #[tokio::test]
+    async fn token_cache_isolates_scope_tenant_and_client() {
+        clear_token_cache_for_tests();
+        let Some(port) = issuer_fixture(vec![
+            token_body("token-1"),
+            token_body("token-2"),
+            token_body("token-3"),
+            token_body("token-4"),
+        ]) else {
+            return;
+        };
+        let endpoint = url::Url::parse(&format!("http://127.0.0.1:{port}/token")).unwrap();
+        let egress = enforce_token_exchange(&["127.0.0.1"], &[port]);
+        let lookup = lookup_ok(StdHashMap::from([(
+            "vault://client".to_string(),
+            "client-secret".to_string(),
+        )]));
+        let http = reqwest::Client::new();
+        let subject = "shared-inbound-token";
+
+        let base =
+            |scope: Option<&str>, client: Option<&str>| McpUpstreamAuthConfig::TokenExchange {
+                token_endpoint: endpoint.clone(),
+                audience: "https://mcp.example".to_string(),
+                scope: scope.map(str::to_string),
+                client_credential_ref: client.map(str::to_string),
+            };
+        let acme = identified_principal();
+        let ctx_acme = ctx_for(&acme, None);
+
+        let read = mint_upstream_authorization(
+            &base(Some("read"), None),
+            &ctx_acme,
+            &lookup,
+            &http,
+            Some(&egress),
+            Some(subject),
+        )
+        .await
+        .expect("scope read");
+        let admin = mint_upstream_authorization(
+            &base(Some("admin"), None),
+            &ctx_acme,
+            &lookup,
+            &http,
+            Some(&egress),
+            Some(subject),
+        )
+        .await
+        .expect("scope admin");
+        assert_ne!(
+            read.header_value, admin.header_value,
+            "a `read` token must never be served to an `admin` request"
+        );
+
+        let with_client = mint_upstream_authorization(
+            &base(Some("read"), Some("vault://client")),
+            &ctx_acme,
+            &lookup,
+            &http,
+            Some(&egress),
+            Some(subject),
+        )
+        .await
+        .expect("client credential");
+        assert_ne!(
+            read.header_value, with_client.header_value,
+            "a token minted without client authentication must not be reused with it"
+        );
+
+        let other_tenant = Principal {
+            tenant_id: TenantId::from("globex"),
+            sub: "user-a".to_string(),
+            source: PrincipalSource::Jwt,
+            virtual_key: None,
+            attrs: PrincipalAttrs::default(),
+        };
+        let ctx_globex = ctx_for(&other_tenant, None);
+        let crossed = mint_upstream_authorization(
+            &base(Some("read"), None),
+            &ctx_globex,
+            &lookup,
+            &http,
+            Some(&egress),
+            Some(subject),
+        )
+        .await
+        .expect("other tenant");
+        assert_ne!(
+            read.header_value, crossed.header_value,
+            "one tenant's exchanged credential must never be served to another"
+        );
+    }
+
+    /// A scope is a set: reordering it must not mint a second entry.
+    #[test]
+    fn cache_key_canonicalizes_scope_and_separates_absent_from_empty() {
+        let key = |scope: Option<&str>| {
+            cache_key(
+                "acme",
+                "https://idp.test/token",
+                "https://mcp.example",
+                scope,
+                None,
+                "user-a",
+                Some("subject"),
+            )
+        };
+        assert_eq!(key(Some("a b")), key(Some("b  a")));
+        assert_eq!(key(Some("a b")), key(Some("a b a")));
+        assert_ne!(
+            key(None),
+            key(Some("")),
+            "an absent scope and an empty one are different requests"
+        );
+        assert_ne!(key(Some("read")), key(Some("admin")));
+    }
+
+    /// WOR-2621: the cache has a ceiling and an expired row leaves it.
+    ///
+    /// Red before the fix on both counts. The `HashMap` behind this grew
+    /// past any capacity, because it had none, and an expired hit fell
+    /// through to a fresh exchange without ever removing the row it had
+    /// just found dead.
+    #[test]
+    fn token_cache_bounds_and_expires() {
+        let mut cache = TokenCache::new();
+        let now = Instant::now();
+        let ttl = Duration::from_secs(60);
+        for index in 0..=TOKEN_CACHE_CAPACITY {
+            cache.insert(
+                format!("key-{index}"),
+                Zeroizing::new(format!("Bearer token-{index}")),
+                now + ttl,
+                now,
+            );
+        }
+        assert!(
+            cache.entries.len() <= TOKEN_CACHE_CAPACITY,
+            "the cache grew past its ceiling: {}",
+            cache.entries.len()
+        );
+
+        let live = format!("key-{TOKEN_CACHE_CAPACITY}");
+        assert!(
+            cache.get(&live, now).is_some(),
+            "the most recent entry must still be served"
+        );
+        let after_expiry = now + ttl + Duration::from_secs(1);
+        assert!(
+            cache.get(&live, after_expiry).is_none(),
+            "an expired entry must not be served"
+        );
+        assert!(
+            cache.get(&live, now).is_none(),
+            "an expired entry must be removed on the read that finds it, not stepped over"
         );
     }
 }

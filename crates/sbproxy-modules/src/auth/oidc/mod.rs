@@ -47,7 +47,13 @@ use serde::Deserialize;
 /// [`compile_auth`](crate::compile::compile_auth) at config-load
 /// time and stored on `Auth::Oidc`. The request-time `check` path
 /// (step 3/3) reads these fields without further parsing.
+///
+/// WOR-2181: unknown keys are refused, so a misspelled cookie or
+/// allowlist key fails the config instead of silently leaving that
+/// control at its default. `type:` is stripped by
+/// `crate::auth::provider_config_from_value` before this parses.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OidcAuth {
     /// IdP `authorization_endpoint`. The proxy redirects
     /// unauthenticated callers here with the configured `client_id`,
@@ -192,9 +198,9 @@ impl OidcAuth {
     /// Compile an [`OidcAuth`] from a generic JSON config value.
     /// Mirrors every other auth provider's `from_config` shape so
     /// the dispatcher in [`crate::compile::compile_auth`] stays
-    /// uniform.
+    /// uniform. Unknown keys are refused (WOR-2181).
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
-        let mut parsed: Self = serde_json::from_value(value)?;
+        let mut parsed: Self = crate::auth::provider_config_from_value(value)?;
         // WOR-1784: resolve provider-URI secret references in client_secret
         // and cookie_secret before validation, so a resolved secret is used
         // (and length-checked) rather than the literal reference reaching the

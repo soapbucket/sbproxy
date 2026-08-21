@@ -12,4 +12,6 @@
 pub mod bufferpool;
 pub mod outbound;
 
-pub use outbound::{default_outbound, token_bearing_outbound, OutboundClientBuilder};
+pub use outbound::{
+    default_outbound, request_error_summary, token_bearing_outbound, OutboundClientBuilder,
+};

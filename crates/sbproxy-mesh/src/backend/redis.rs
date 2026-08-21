@@ -20,47 +20,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use sbproxy_security::url_redact::redacted_url_with_path;
 use sbproxy_storage::{EphemeralKv, PersistentKv, RedisStore, SetKv};
-use url::Url;
-
-// --- WOR-48: credential-safe redaction for Redis DSNs ---
-
-/// Redact the password component of a Redis URL so the result is safe
-/// to log or surface in an error message.
-///
-/// Redis DSNs commonly embed credentials inline, e.g.
-/// `redis://user:password@host:6379/0`. Startup crashes and connection
-/// errors get shipped to shared observability systems, so leaking the
-/// raw DSN is a credential disclosure. This helper parses the URL with
-/// the `url` crate, replaces the password with `***`, and returns the
-/// rebuilt string. Username (when present without a password) is left
-/// alone because usernames are typically public ACL identifiers.
-///
-/// Falls back to `"<unparseable redis url>"` for inputs that cannot be
-/// parsed at all. Never returns the original string in that path. That
-/// is deliberate: an unparseable input might be a typo that pasted a
-/// password into the wrong field, and echoing it back through a log
-/// would leak it.
-pub(crate) fn redact_redis_url(url: &str) -> String {
-    let Ok(parsed) = Url::parse(url) else {
-        return "<unparseable redis url>".to_string();
-    };
-    if parsed.password().is_none() {
-        // No password component, nothing to redact. Hand back the
-        // input verbatim (parsed and serialized are equivalent here
-        // for valid URLs, but using the original avoids cosmetic
-        // re-encoding differences).
-        return url.to_string();
-    }
-    let mut redacted = parsed.clone();
-    // `set_password(Some("***"))` only fails on cannot-be-a-base URLs
-    // (data:, mailto:), which redis:// is not. Guard anyway so a future
-    // schema accident does not panic.
-    if redacted.set_password(Some("***")).is_err() {
-        return "<unparseable redis url>".to_string();
-    }
-    redacted.to_string()
-}
 
 /// Configuration for connecting to a Redis instance via the storage
 /// trait surface.
@@ -136,19 +97,20 @@ impl RedisBackend {
     /// Returns `Err` when the supplied DSN is unparseable. WOR-48: the
     /// previous implementation panicked here with the raw `config.url`
     /// in the panic message, leaking any inline credentials into crash
-    /// logs. The error returned now redacts the password component via
-    /// `redact_redis_url`.
+    /// logs. The error now carries only the redacted origin and the
+    /// database index (WOR-2640 moved that rendering to the shared
+    /// [`redacted_url_with_path`]).
     pub fn new(config: RedisBackendConfig) -> Result<Self> {
         let store_prefix = trim_trailing_colon(&config.key_prefix);
         let store = RedisStore::new(&config.url, store_prefix.to_string()).map_err(|e| {
             // Two-stage redaction: strip credentials out of the DSN
-            // before it ever lands in the error message, *and* wipe
-            // any echo of the URL that `RedisStore::new`'s error string
-            // may have included by reporting a kind tag rather than
-            // the inner Display.
+            // before it ever lands in the error message, *and* report a
+            // kind tag rather than the inner Display. `RedisStore::new`
+            // redacts its own message now too, so this is belt and
+            // braces rather than the only defense it once was.
             anyhow::anyhow!(
                 "invalid redis url '{}': {}",
-                redact_redis_url(&config.url),
+                redacted_url_with_path(&config.url),
                 e.kind()
             )
         })?;
@@ -356,81 +318,41 @@ mod tests {
         assert_eq!(backend.key_prefix(), "p:");
     }
 
-    // --- WOR-48: redactor + fallible constructor tests ---
-
-    #[test]
-    fn redact_redis_url_strips_password() {
-        assert_eq!(
-            redact_redis_url("redis://user:secret@host:6379/0"),
-            "redis://user:***@host:6379/0"
-        );
-    }
-
-    #[test]
-    fn redact_redis_url_passthrough_when_no_password() {
-        // No userinfo at all: nothing to redact, value is returned verbatim.
-        assert_eq!(redact_redis_url("redis://host:6379"), "redis://host:6379");
-        // Username present, password absent: ACL usernames are public,
-        // so the username is preserved.
-        let with_user = redact_redis_url("redis://aclname@host:6379");
-        assert!(
-            with_user.contains("aclname"),
-            "expected username preserved, got {with_user}"
-        );
-        assert!(!with_user.contains("***"));
-    }
-
-    #[test]
-    fn redact_redis_url_unparseable_returns_sentinel() {
-        // A bare string is not a URL at all. Must NOT echo the input
-        // back, because operators sometimes paste secrets into the
-        // wrong field and we don't want logs to capture them.
-        assert_eq!(redact_redis_url("not a url"), "<unparseable redis url>");
-    }
-
-    #[test]
-    fn redact_redis_url_handles_rediss_and_path() {
-        // TLS scheme + database index must round-trip cleanly.
-        assert_eq!(
-            redact_redis_url("rediss://admin:hunter2@redis.prod.example.com:6380/3"),
-            "rediss://admin:***@redis.prod.example.com:6380/3"
-        );
-    }
+    // --- WOR-48 / WOR-2640: fallible constructor, credential-safe error ---
+    //
+    // The rendering itself is pinned in sbproxy-security's url_redact
+    // tests. What these pin is the seam: that `RedisBackend::new` routes
+    // its DSN through the redactor before building an error string.
 
     #[test]
     fn backend_new_invalid_url_returns_err_without_panic() {
-        // Garbage input: must be `Err`, not a panic.
+        // Garbage input: must be `Err`, not a panic, and the error must
+        // not echo the input back. Operators do paste secrets into the
+        // wrong config key, so unparseable input renders as a constant.
         let result = RedisBackend::new(RedisBackendConfig::new("not a url at all"));
         let err = result.expect_err("invalid url should error, not panic");
         let msg = format!("{err}");
-        // The error string must not echo the original input verbatim
-        // (WOR-48 leak vector); the redactor returns the sentinel
-        // for unparseable input.
         assert!(
-            msg.contains("<unparseable redis url>"),
-            "expected redacted sentinel in error, got: {msg}"
+            msg.contains("[invalid url]"),
+            "expected the invalid-url constant in the error, got: {msg}"
         );
+        assert!(!msg.contains("not a url at all"), "input echoed: {msg}");
     }
 
     #[test]
     fn backend_new_with_password_in_url_does_not_leak_secret() {
-        // Even if the URL is well-formed but `RedisStore::new` rejects
-        // it for some other reason, the password must never reach the
-        // error message. We use an obviously-malformed scheme to force
-        // the redis client to reject the DSN.
-        let dsn = "http://user:topsecret@host:6379";
+        // Well formed, but `RedisStore::new` rejects the scheme. The
+        // password must not reach the error message; the origin and the
+        // database index must, so an operator can tell which DSN broke.
+        let dsn = "http://aclname:topsecret@host:6379/3";
         let result = RedisBackend::new(RedisBackendConfig::new(dsn));
         let err = result.expect_err("non-redis scheme should error");
         let msg = format!("{err}");
+        assert!(!msg.contains("topsecret"), "password leaked: {msg}");
+        assert!(!msg.contains("aclname"), "username leaked: {msg}");
         assert!(
-            !msg.contains("topsecret"),
-            "password leaked into error message: {msg}"
-        );
-        // The redacted form *should* show up so operators can identify
-        // which DSN was at fault.
-        assert!(
-            msg.contains("***"),
-            "expected redacted password marker in error, got: {msg}"
+            msg.contains("http://host:6379/3"),
+            "expected the redacted origin and db index, got: {msg}"
         );
     }
 

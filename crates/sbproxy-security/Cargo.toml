@@ -53,5 +53,18 @@ tokio.workspace = true
 # Same workspace version the observe, ai, and mesh crates already
 # resolve, so this adds no new lock entries.
 prometheus.workspace = true
+# WOR-2612 / WOR-2620: `governed_egress` is the one bounded redirect
+# loop every credential-carrying egress path dials through, and a
+# redirect loop that re-authorizes each hop has to own the client it
+# hands each hop's pin set to. Putting it in a consumer crate instead
+# would mean one copy per consumer, which is the defect it exists to
+# close: three near-copies each got a different subset of the contract
+# right. Same workspace version and feature set the observe, ai, and
+# extension crates already resolve, so this adds no lock entries; it
+# does put reqwest in the build graph of the five crates that depend on
+# sbproxy-security without it (cache, config, keystore, mesh,
+# middleware), which is a build-order cost in an isolated `-p` build and
+# nothing at all in a workspace build.
+reqwest.workspace = true
 
 [dev-dependencies]

@@ -1726,7 +1726,19 @@ async fn send_governed(
         let replay = request.try_clone();
         let from = request.url().clone();
         let started = std::time::Instant::now();
-        let resp = http.execute(request).await?;
+        // `without_url` rather than a bare `?`. A provider dial carries
+        // an API key, some providers carry it in the query string, and a
+        // `reqwest::Error`'s Display ends with `" for url ({url})"`. This
+        // error becomes an `anyhow::Error` with no context of its own, so
+        // its Display *is* the reqwest Display, and callers hand it to
+        // `warn!(error = %error, ..)` and to pingora's `Error::because`
+        // (WOR-2629). Stripping the URL rather than replacing the error
+        // keeps the type, which `ai_transport_error_type` downcasts to
+        // separate a timeout from a provider error.
+        let resp = http
+            .execute(request)
+            .await
+            .map_err(reqwest::Error::without_url)?;
         if let Some(signer) = signer {
             // Lets a scheme learn from the answer: SigV4 reads the
             // `Date` header off a rejection to measure local clock
@@ -2365,10 +2377,13 @@ impl AiClient {
             let raw_bytes = match resp.bytes().await {
                 Ok(b) => b,
                 Err(e) => {
+                    // Not `error = %e`: a reqwest Display ends with the
+                    // provider URL, and some providers carry the API key
+                    // in the query string (WOR-2629).
                     warn!(
                         tier = tier_idx,
                         provider = %provider.name,
-                        error = %e,
+                        error = %sbproxy_httpkit::request_error_summary(&e),
                         "cascade: body read failed; trying next tier"
                     );
                     ai_metrics::record_cascade_tier_outcome(tier_idx, "retry");
@@ -2705,8 +2720,17 @@ async fn run_shadow_request(
     let mut resp =
         match send_governed(&http, None, &provider.name, as_signer(&signer), request).await {
             Ok(r) => r,
-            Err(e) => {
-                warn!(provider = %provider.name, error = %e, "shadow request transport error");
+            // `transport_error`, not `e`: `send_governed` strips the URL
+            // off the `reqwest::Error` before it becomes an
+            // `anyhow::Error`, and the name says at the log site which
+            // error is in hand rather than leaving the next reader to go
+            // and check (WOR-2629).
+            Err(transport_error) => {
+                warn!(
+                    provider = %provider.name,
+                    error = %transport_error,
+                    "shadow request transport error"
+                );
                 ai_metrics::record_provider_error(&provider.name, "transport");
                 return failed_shadow_call(started);
             }

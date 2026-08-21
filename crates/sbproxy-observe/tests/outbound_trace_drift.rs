@@ -270,10 +270,14 @@ const EXEMPT: &[Exemption] = &[
                  locally hosted engine runs under AI dispatch. WOR-2318.",
     },
     Exemption {
-        file: "crates/sbproxy-extension/src/mcp/auth.rs",
-        reason: "On the MCP request path and not yet plumbed. Run-as-user credential \
-                 minting against the upstream identity provider, sending a prebuilt \
-                 `reqwest::Request` through a redirect loop. WOR-2318.",
+        file: "crates/sbproxy-security/src/governed_egress.rs",
+        reason: "The governed dial itself, which owns the per-hop pinned client every \
+                 caller now sends through (WOR-2612, WOR-2620). It takes a prebuilt \
+                 `reqwest::Request` and knows nothing about the span that produced it, \
+                 so the context has to be injected by the caller before it arrives \
+                 here. Its two callers are the MCP run-as-user token exchange, which \
+                 is on the request path and not yet plumbed, and the events webhook, \
+                 which is a background batch with no single request to join. WOR-2318.",
     },
     Exemption {
         file: "crates/sbproxy-extension/src/mcp/sse_client.rs",
