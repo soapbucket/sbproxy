@@ -404,35 +404,40 @@ pub(super) fn enforce_upstream_subprotocol_selection(
 /// Whether this request is riding an upgraded tunnel, and whether the
 /// gateway's own frame scanner already tore it down (WOR-2551).
 ///
-/// `Some(true)` means the `websocket` action's `max_message_size` guard
-/// tripped, which already logged, counted, and audited at the scan site.
-/// `Some(false)` means a tunnel is open and nothing has reported why it
-/// is ending yet. `None` means the client is still speaking HTTP.
+/// `Some(true)` means the frame scanner tore the tunnel down, either on
+/// `max_message_size` or on RFC 6455's control-frame rules, and the scan
+/// site already logged, counted, and audited it. `Some(false)` means a
+/// tunnel is open and nothing has reported why it is ending yet. `None`
+/// means the client is still speaking HTTP.
 ///
-/// Two surfaces reach 101 and then speak raw frames, and both belong
-/// here:
+/// The guard answers for every surface now.
+/// [`websocket_tunnel_guard_for_upgrade`] arms
+/// [`RequestContext::websocket_tunnel`] on any `101` whose downstream
+/// request asked for a WebSocket upgrade, so `Action::WebSocket`, AI
+/// realtime (`type: ai_proxy` reaching `/v1/realtime`), a `type: proxy`
+/// or `type: load_balancer` origin fronting a WebSocket backend, and a
+/// forward rule onto any of them all arrive here with a guard. Its
+/// presence is the proxy's own record that the upgrade settled.
 ///
-/// - `Action::WebSocket`, which arms
-///   [`RequestContext::websocket_tunnel`] in `response_filter` right
-///   after the upstream's 101 passes subprotocol enforcement. The guard
-///   exists because that action scans frames; its presence is the
-///   proxy's own record that the upgrade settled.
-/// - AI realtime (`type: ai_proxy` reaching `/v1/realtime`), dispatched
-///   through `action_dispatch::handle_action` into
-///   `ctx.ai_realtime_dispatch`. It never arms a frame-scanner guard,
-///   because scanning is a `websocket`-action duty, so it needs the
-///   second half of the test: `ctx.response_status` carries the
-///   upstream's status from `response_filter`, and a 101 there is the
-///   same proof of an open tunnel the guard gives the other surface.
-///   Without this arm a realtime provider reset wrote `bad gateway`
-///   into the client's audio frame stream, which is the exact defect
-///   WOR-2551 fixed on the `websocket` action and left standing here.
+/// The realtime arm below is, as a result, unreachable today, and it is
+/// kept deliberately rather than deleted. Realtime dispatch is gated on
+/// `is_websocket_upgrade_request` (`action_dispatch.rs`), the same
+/// predicate the arming uses, and the arming runs earlier in
+/// `response_filter` than `ctx.response_status` is set, so a realtime
+/// `101` always has a guard by the time anything asks. What the arm
+/// costs is two lines; what it buys is that a future realtime surface
+/// negotiated without an `Upgrade` header (an h2 extended `CONNECT`, a
+/// provider that tunnels over a plain `200`) still reports its open
+/// tunnel here instead of writing `bad gateway` into a client's audio
+/// frame stream. That was the exact defect WOR-2551 fixed on the
+/// `websocket` action, and it is cheaper to keep the belt than to
+/// rediscover it.
 ///
-/// The realtime arm is deliberately keyed on the status rather than on
-/// `ai_realtime_dispatch` alone: the dispatch context is populated
-/// before the provider answers, so a realtime request the provider
-/// refused with a 401 is still an ordinary HTTP exchange and still owes
-/// its client a readable error body.
+/// It is keyed on the status rather than on `ai_realtime_dispatch`
+/// alone for the same reason it always was: the dispatch context is
+/// populated before the provider answers, so a realtime request the
+/// provider refused with a 401 is still an ordinary HTTP exchange and
+/// still owes its client a readable error body.
 fn upgraded_tunnel_torn_down(ctx: &RequestContext) -> Option<bool> {
     if let Some(guard) = ctx.websocket_tunnel.as_ref() {
         return Some(guard.violated());

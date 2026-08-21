@@ -107,6 +107,17 @@ MANIFEST: dict[str, dict] = {
         # re-ordered replay would find the raise already lapsed.
         "sections": [{"stack": "temp_budget_override", "fresh_each": False}],
     },
+    "examples/transform-json-schema/README.md": {
+        # One walkthrough, one stack, no fixture: both origins are static
+        # actions, so the proxy alone is the whole stack. Marked because
+        # this page spent an unknown stretch documenting the opposite of
+        # what the code did: it recorded the generated-body fail-open as
+        # a permanent "known limitation", and no lane could tell. The
+        # example sweeps only compile the config, and the json_schema
+        # e2e case uses `type: proxy`, so the one shape that rotted was
+        # the one nothing replayed.
+        "sections": [{"stack": "transform_json_schema", "fresh_each": False}],
+    },
     "examples/api-deprecation/README.md": {
         # One walkthrough, one stack, no fixture: every origin in the
         # config is a static action, so the proxy alone is the whole
@@ -467,11 +478,30 @@ def start_api_deprecation_stack(binary: Path, logs: Path) -> Stack | None:
     return stack
 
 
+def start_transform_json_schema_stack(binary: Path, logs: Path) -> Stack | None:
+    """Just the proxy: both origins are static actions."""
+    stack = Stack()
+    proxy_log = (logs / "transform-json-schema-proxy.log").open("w")
+    stack.procs.append(
+        subprocess.Popen(
+            [str(binary), "serve", "-f", "examples/transform-json-schema/sb.yml"],
+            cwd=ROOT,
+            stdout=proxy_log,
+            stderr=subprocess.STDOUT,
+        )
+    )
+    if not _wait_for_http("http://127.0.0.1:8080/metrics", stack.procs):
+        stack.stop()
+        return None
+    return stack
+
+
 STACK_STARTERS = {
     "settlement": start_settlement_stack,
     "usage_bridge": start_usage_bridge_stack,
     "temp_budget_override": start_temp_budget_override_stack,
     "api_deprecation": start_api_deprecation_stack,
+    "transform_json_schema": start_transform_json_schema_stack,
 }
 
 

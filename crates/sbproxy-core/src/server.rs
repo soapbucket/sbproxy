@@ -384,8 +384,12 @@ fn stamp_content_negotiation(
 /// decides it. An `InvariantViolated` is still the host's own bug and
 /// still a 500 either way.
 ///
-/// Both response paths that run transforms consult this, so the two
-/// cannot drift apart.
+/// All three response paths that run transforms consult this, so they
+/// cannot drift apart: the upstream body filter, the plugin-action
+/// response, and the locally generated (`static` / `mock`) body. The
+/// third was added last and is the reason this sentence counts them:
+/// for a while it read "both", and the path that did not consult this
+/// served an invariant violation as a `200`.
 ///
 /// [`TransformError`]: sbproxy_modules::transform::TransformError
 pub(crate) fn transform_error_is_unconditional_500(
@@ -5560,10 +5564,13 @@ pub(crate) struct GeneratedBodyTransformOutcome {
 /// fields (content shape, markdown projection, canonical URL, CEL
 /// header mutations) behave exactly as they do for an upstream body.
 ///
-/// A failing transform reaches its own `failure_posture`, exactly as it
-/// does on the proxied path and the plugin-action path. The earlier
-/// reasoning for warning and continuing here was that a generated body
-/// is operator-authored, so there is nothing untrusted to fail closed
+/// A failing transform is routed the same way the proxied path and the
+/// plugin-action path route one, in the same order: first
+/// [`transform_error_is_unconditional_500`], which promotes a host
+/// invariant violation to a 500 whatever the posture says, and only then
+/// the transform's own `failure_posture`. The earlier reasoning for
+/// warning and continuing here was that a generated body is
+/// operator-authored, so there is nothing untrusted to fail closed
 /// against. That does not survive a bundle transform: the untrusted
 /// party is the *transform*, and a redaction transform that faults on a
 /// `static` body ships the exact string it existed to strip. `open`
@@ -5602,6 +5609,35 @@ fn apply_origin_transforms_to_generated_body(
             apply_transform_with_ctx(compiled_transform, &mut buf, Some(content_type), ctx)
         {
             let transform_name = compiled_transform.transform.transform_type();
+            // Substituting the body before returning is what makes a
+            // refusal safe: the caller serves whatever is in this
+            // buffer, and serving the untransformed generated body
+            // would deliver exactly the bytes the refusal exists to
+            // withhold.
+            let refuse = |ctx: &mut RequestContext| {
+                ctx.transform_error_attribution = Some(transform_name.to_string());
+                GeneratedBodyTransformOutcome {
+                    body: Bytes::from_static(b"{\"error\":\"internal server error\"}"),
+                    terminal_failure: true,
+                }
+            };
+            // The invariant carve-out comes first, ahead of the posture,
+            // the same order `apply_plugin_action_response_transforms`
+            // and the upstream body filter use. A typed `TransformError`
+            // that is not a dynamic bundle hook's own is a host bug, not
+            // a policy outcome, so no posture admits it (WOR-168,
+            // WOR-2268). Consulting the shared predicate rather than
+            // re-deriving the rule here is the point: it is the thing
+            // that keeps the three response paths from drifting.
+            if transform_error_is_unconditional_500(compiled_transform, &e) {
+                tracing::error!(
+                    hostname = %ctx.hostname,
+                    transform = transform_name,
+                    error = %e,
+                    "generated-response transform invariant violated, returning a generic response"
+                );
+                return refuse(ctx);
+            }
             // Read the resolved posture off the compiled transform, never
             // the legacy `fail_on_error` wire boolean, the same way the
             // proxied body filter does.
@@ -5614,17 +5650,14 @@ fn apply_origin_transforms_to_generated_body(
                     failure_posture = posture.as_label(),
                     "generated-response transform failed; response failed by failure_posture"
                 );
-                // Substitute before returning: the caller serves whatever
-                // is in this buffer, and serving the untransformed
-                // generated body would deliver exactly the bytes this
-                // refusal exists to withhold.
-                ctx.transform_error_attribution = Some(transform_name.to_string());
-                return GeneratedBodyTransformOutcome {
-                    body: Bytes::from_static(b"{\"error\":\"internal server error\"}"),
-                    terminal_failure: true,
-                };
+                return refuse(ctx);
             }
+            // `hostname` is not decoration here: `open` is the default
+            // posture for a `transforms:` entry, so this is the line an
+            // operator actually sees, and a config with many static
+            // origins needs it to say which one dropped a transform.
             warn!(
+                hostname = %ctx.hostname,
                 transform = transform_name,
                 error = %e,
                 failure_posture = posture.as_label(),
@@ -6171,6 +6204,21 @@ mod generated_body_failure_posture_tests {
     /// controls the posture and the fault independently of what any
     /// built-in transform's config validation allows.
     fn static_origin_pipeline(posture: FailureMode) -> crate::pipeline::CompiledPipeline {
+        let inner =
+            sbproxy_modules::transform::HtmlToMarkdownTransform::from_config(serde_json::json!({}))
+                .expect("default html_to_markdown");
+        static_origin_pipeline_with(
+            posture,
+            sbproxy_modules::transform::Transform::HtmlToMarkdown(inner),
+        )
+    }
+
+    /// The same fixture with the transform itself supplied, so a test
+    /// can pick the *kind* of fault as well as the posture.
+    fn static_origin_pipeline_with(
+        posture: FailureMode,
+        transform: sbproxy_modules::transform::Transform,
+    ) -> crate::pipeline::CompiledPipeline {
         const YAML: &str = r#"
 origins:
   "status.example":
@@ -6183,16 +6231,37 @@ origins:
         let config = sbproxy_config::compile_config(YAML).expect("fixture config");
         let mut pipeline =
             crate::pipeline::CompiledPipeline::from_config(config).expect("fixture pipeline");
-        let inner =
-            sbproxy_modules::transform::HtmlToMarkdownTransform::from_config(serde_json::json!({}))
-                .expect("default html_to_markdown");
         pipeline.transforms = vec![vec![sbproxy_modules::transform::CompiledTransform {
-            transform: sbproxy_modules::transform::Transform::HtmlToMarkdown(inner),
+            transform,
             content_types: Vec::new(),
             failure_posture: posture,
             max_body_size: 1024,
         }]];
         pipeline
+    }
+
+    /// A linked (not bundle-supplied) transform with a host-side bug.
+    /// `dispatch_plugin` turns the unwind into
+    /// `TransformError::Plugin`, and because the plugin declares no
+    /// posture of its own, `transform_error_is_unconditional_500` says
+    /// no posture may admit it.
+    struct PanickingLinkedTransform;
+
+    impl sbproxy_plugin::TransformHandler for PanickingLinkedTransform {
+        fn transform_type(&self) -> &str {
+            "wor168_panicking_transform"
+        }
+
+        fn apply<'a>(
+            &'a self,
+            _body: &'a mut bytes::BytesMut,
+            _content_type: Option<&'a str>,
+            _ctx: &'a sbproxy_plugin::TransformContext,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = sbproxy_plugin::PluginResult<()>> + Send + 'a>,
+        > {
+            Box::pin(async { panic!("host invariant violated") })
+        }
     }
 
     /// Invalid UTF-8 makes `html_to_markdown` fault deterministically
@@ -6253,5 +6322,60 @@ origins:
             "an open posture passes the untransformed body through unchanged"
         );
         assert!(ctx.transform_error_attribution.is_none());
+    }
+
+    /// A typed `TransformError` from a host-side bug is a 500 whatever
+    /// the posture says, because the operator's `open` is a statement
+    /// about the transform's own failures and not about the proxy's.
+    ///
+    /// The upstream body filter and the plugin-action path have both
+    /// held this since WOR-168; the generated-body path was the one that
+    /// did not, so an `open` invariant violation on a `static` origin
+    /// served the untransformed body with a `200` while the identical
+    /// config on a `type: proxy` origin got the 500.
+    #[test]
+    fn an_open_transform_whose_host_invariant_breaks_is_still_a_500_on_a_generated_body() {
+        let pipeline = static_origin_pipeline_with(
+            FailureMode::Open,
+            sbproxy_modules::transform::Transform::Plugin(
+                sbproxy_modules::PluginTransform::linked(Box::new(PanickingLinkedTransform)),
+            ),
+        );
+        let mut ctx = RequestContext::new();
+
+        let outcome = apply_origin_transforms_to_generated_body(
+            &pipeline,
+            Some(0),
+            &mut ctx,
+            Bytes::from_static(SECRET_BODY),
+            "text/plain",
+        );
+
+        assert!(
+            outcome.terminal_failure,
+            "an invariant violation is a 500 under every posture, `open` included"
+        );
+        assert!(
+            !outcome.body.windows(7).any(|window| window == b"sk-live"),
+            "the untransformed body must not reach the client: {:?}",
+            outcome.body
+        );
+        assert_eq!(
+            ctx.transform_error_attribution.as_deref(),
+            Some("wor168_panicking_transform"),
+        );
+    }
+
+    /// The same predicate, asked directly, so the test above cannot go
+    /// green for the wrong reason (an `open` posture that started
+    /// refusing everything would also pass it).
+    #[test]
+    fn an_ordinary_open_transform_fault_is_not_promoted() {
+        let pipeline = static_origin_pipeline(FailureMode::Open);
+        let compiled = &pipeline.transforms[0][0];
+        assert!(
+            !transform_error_is_unconditional_500(compiled, &anyhow::anyhow!("plain failure")),
+            "an untyped failure is the transform's own, and `open` admits it"
+        );
     }
 }

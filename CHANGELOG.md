@@ -241,6 +241,30 @@ the next version cut.
   replacement key with `POST /admin/keys`, move callers over, and revoke
   the seeded id.
 
+- **Every upgraded WebSocket tunnel is now scanned, and every one that
+  is not a `websocket` action's is held to a 10 MB message ceiling.**
+  The frame scanner was armed inside a match on `Action::WebSocket`, so
+  `/v1/realtime` (which runs under an `ai_proxy` origin and hands off to
+  transparent forwarding) and any `type: proxy` or `type: load_balancer`
+  origin fronting a WebSocket backend opened a completely unscanned
+  tunnel. Those now get the scanner, with the same documented 10 MB
+  default a `websocket` action gets when it configures nothing. A `101`
+  for a non-WebSocket upgrade is still left alone.
+
+  Check this one before you upgrade if you front a WebSocket backend
+  through any action other than `websocket` and your peers send messages
+  larger than 10 MB. Those tunnels were unbounded on every prior release
+  and are not any more: the first oversized message drops both TCP
+  connections mid-message, with no close frame and no HTTP status,
+  because nothing HTTP may be written into a stream the client is
+  already reading as frames. `sbproxy_websocket_teardowns_total{reason="message_too_large"}`
+  and a `websocket_message_too_large` audit record are how it shows up.
+  There is no config key to raise the ceiling for those origins yet;
+  `max_message_size` is a `websocket`-action field, so today the escape
+  hatch is to front the backend with a `websocket` action, which also
+  gets you the subprotocol allowlist. Widening the key to the other
+  action types is tracked separately.
+
 - **`transport: stdio` MCP servers now run as one supervised
   persistent child per configured server, not one process per
   JSON-RPC exchange.** Server-side session state survives between
@@ -298,16 +322,6 @@ the next version cut.
   and no teardown. RFC 6455 section 5.5 is now enforced on the frames
   it governs: a control frame over 125 payload bytes, or one arriving
   without `FIN`, closes the tunnel.
-
-- **Every upgraded WebSocket tunnel is scanned, not only a `websocket`
-  action's.** The frame scanner was armed inside a match on
-  `Action::WebSocket`, so `/v1/realtime` (which runs under an
-  `ai_proxy` origin and hands off to transparent forwarding) and any
-  `type: proxy` or `type: load_balancer` origin fronting a WebSocket
-  backend opened a completely unscanned tunnel. Those now get the
-  scanner with the same documented 10 MB default a `websocket` action
-  gets when it configures nothing. A `101` for a non-WebSocket upgrade
-  is still left alone.
 
 - **`print()` inside a Rego bundle hook is bounded and redacted.** A
   transform hook's input is the complete buffered response body, so
