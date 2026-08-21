@@ -366,6 +366,34 @@ no surface carries the URL.
 find the `webhook` row for your collector, and add that host (and its port, if
 it is not 80 or 443) to `egress.usage_sinks.hosts`.
 
+### `agent_classes.resolver.rdns_enabled` now runs under fixed lookup bounds
+
+**Who this reaches.** Any config that leaves `agent_classes.resolver.rdns_enabled`
+at its default `true` and whose crawlers publish more than four PTR names for a
+single address. A config that sets it to `false`, or whose crawler zones publish
+one PTR per address as vendors do, resolves exactly as before.
+
+**What changes.** Resolver step 2 queries a zone the client being identified
+controls, and it previously followed that zone wherever it led: every PTR name
+it returned got its own forward lookup, serially, with the host resolver's
+default timeout and no ceiling on the total. Four bounds now apply. At most four
+PTR names per address are forward-confirmed; each query is capped at two
+seconds; the forward-confirm loop as a whole is capped at two more; and a DNS
+failure is cached for 30 seconds instead of being re-queried on the next
+request. Nothing about the config schema changes.
+
+**What an operator sees when it bites.** A crawler that used to resolve with an
+`rdns` agent-id source resolves from its `User-Agent` instead, which is the same
+degradation path an unreachable resolver has always taken. The agent is still
+classified; only the source stamp and the confidence change. A policy that keys
+on the rDNS source specifically stops matching for that vendor.
+
+**What to do before upgrading.** If a crawler you verify by rDNS publishes more
+than four PTR names per address, verify it by Web Bot Auth `keyid` instead
+(resolver step 1, and higher confidence than rDNS), or accept the UA-based
+classification. There is no knob to raise the cap: it is a bound on what a
+remote party can spend of your request path.
+
 ### `egress.token_exchange` now gates the MCP run-as-user token exchange
 
 **Who this reaches.** Any config with `egress.token_exchange` set to

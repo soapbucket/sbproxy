@@ -289,6 +289,24 @@ agent_classes:
 | `resolver.bot_auth_keyid_enabled` | bool | `true` | Let a verified Web Bot Auth `keyid` match `expected_keyids` as resolver step 1. |
 | `resolver.cache_size` | int | `10000` | Per-process reverse-DNS verdict cache capacity. |
 
+Step 2 queries a reverse zone the client controls, so it runs under fixed
+bounds rather than operator-set ones:
+
+- At most four PTR names per address are forward-confirmed. A zone that
+  answers with more is not verified further.
+- Each DNS query is capped at two seconds, and the forward-confirm loop
+  as a whole at two more.
+- Verdicts are cached per client IP for the `cache_size` window: 300
+  seconds for a resolved verdict, 30 seconds for a DNS failure, so an
+  address with no PTR record costs one lookup per 30 seconds rather than
+  one per request.
+- All of it runs off the request's worker thread.
+
+A client that fails or exceeds any of these is not classified by rDNS;
+resolution falls through to the User-Agent pass, exactly as it does for
+an unreachable resolver. Set `resolver.rdns_enabled: false` to skip step
+2 entirely.
+
 ### Egress allowlists
 
 The optional top-level `egress` block arms per-purpose outbound

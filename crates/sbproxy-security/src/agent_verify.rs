@@ -9,9 +9,15 @@
 //!    (case-insensitive).
 //!
 //! All three steps must succeed. Any failure produces a
-//! [`ReverseDnsVerdict`] that the caller can attach to the request
-//! context as the agent-id source diagnostic; we never silently fall
-//! back to `User-Agent` matching.
+//! [`ReverseDnsVerdict`] that the caller attaches to the request
+//! context as the agent-id source diagnostic. The verdict does not by
+//! itself settle the agent class: the resolver chain in
+//! `sbproxy-modules::policy::agent_class` reads anything other than
+//! `Verified` as "rDNS did not identify this client" and continues to
+//! its `User-Agent` pass, so a `DnsError` or `NotMatched` client can
+//! still be classified from its UA header alone. Only a `Verified`
+//! verdict is stamped with the `Rdns` agent-id source, which is the
+//! distinction a policy should key on.
 //!
 //! # Per-vendor expected suffixes
 //!
@@ -38,12 +44,40 @@
 //!   forward lookups via `hickory-resolver` and the host DNS
 //!   configuration.
 //!
+//! # Cost control
+//!
+//! This runs on the request path, and the client owns the reverse zone
+//! that answers step 1. Every bound below exists because the client,
+//! not the operator, decides what that zone returns:
+//!
+//! - A whole verification is capped at four forward lookups
+//!   (`MAX_FORWARD_CONFIRMS`). A reverse zone that answers with 50 PTR
+//!   names costs the same as one that answers with four.
+//! - A whole verification is capped at two seconds of wall clock
+//!   (`VERIFY_BUDGET`) measured across the forward-confirm loop and
+//!   checked before each forward lookup is issued.
+//! - [`SystemResolver`] caps each individual query and runs it on one
+//!   shared background runtime with one shared `hickory-resolver`
+//!   instance, so a lookup costs neither an OS thread nor a fresh
+//!   resolver (and repeat queries hit hickory's own response cache).
+//!
+//! A run that hits either cap without forward-confirming anything
+//! returns [`ReverseDnsVerdict::DnsError`] rather than
+//! [`ReverseDnsVerdict::NotMatched`]: we stopped early, so we do not
+//! know that the client is unmatched, only that we refused to keep
+//! looking.
+//!
 //! # Caching
 //!
-//! Verdicts are cached per-IP so a hot crawler does not re-issue PTR
-//! lookups on every request. The cache TTL is the lower of the
-//! observed PTR / forward TTLs and is capped at one hour. The cache
-//! is process-local; no cross-pod sharing in the OSS distribution.
+//! Verdicts are cached per-IP by the caller so a hot crawler does not
+//! re-issue PTR lookups on every request. The [`Resolver`] port carries
+//! no record TTL, so the cache TTL is a fixed value the caller picks,
+//! not the observed PTR / forward TTL. The production caller
+//! (`sbproxy-modules::policy::agent_class`) uses 300 seconds for a
+//! `Verified` or `NotMatched` verdict and 30 seconds for a `DnsError`,
+//! and [`ReverseDnsCache`] clamps whatever it is handed at one hour.
+//! The cache is process-local; no cross-pod sharing in the OSS
+//! distribution.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -71,6 +105,24 @@ pub enum ReverseDnsVerdict {
     DnsError(String),
 }
 
+/// Ceiling on how many PTR names one reverse zone can make the
+/// verifier forward-confirm.
+///
+/// Step 1 is answered by the client's own reverse zone, so the length
+/// of that answer is chosen by the party we are trying to identify.
+/// Four is generous: a vendor crawler publishes one PTR per address.
+/// Anything past the fourth name is not checked.
+const MAX_FORWARD_CONFIRMS: usize = 4;
+
+/// Wall-clock budget for the forward-confirm loop of a single
+/// `verify_reverse_dns` call.
+///
+/// Checked before each forward lookup is issued, so the real ceiling is
+/// this budget plus one query timeout. It exists so a zone that answers
+/// slowly rather than not at all cannot turn `MAX_FORWARD_CONFIRMS`
+/// queries into `MAX_FORWARD_CONFIRMS` times the per-query timeout.
+const VERIFY_BUDGET: Duration = Duration::from_secs(2);
+
 /// DNS resolver port surfaced to `agent_verify`. Keeps this crate free
 /// of a hard DNS dependency; callers wire in a real implementation
 /// (e.g. `hickory-resolver`) and tests wire in [`StubResolver`].
@@ -92,6 +144,10 @@ pub trait Resolver: Send + Sync {
 /// `expected_suffixes` may include either `".vendor.com"` or
 /// `"vendor.com"`; both forms compare against the resolved hostname's
 /// last n bytes after lowercasing.
+///
+/// The forward-confirm loop is bounded, in count and in wall clock; see
+/// the module-level "Cost control" section for why, and for what a run
+/// that stops early returns.
 pub fn verify_reverse_dns(
     resolver: &dyn Resolver,
     client_ip: IpAddr,
@@ -118,8 +174,23 @@ pub fn verify_reverse_dns(
     // the original client IP is in the forward set. If yes, then we
     // check whether the hostname ends with an expected suffix. The
     // first PTR that satisfies both wins.
+    //
+    // The loop is bounded twice over because `ptrs` came from the
+    // client's own reverse zone: a zone that answers with 50 names
+    // pointing at black-holed forward zones would otherwise buy 50
+    // sequential timeouts on whatever thread called us.
+    let started = Instant::now();
     let mut last_forward_error: Option<String> = None;
-    for ptr in &ptrs {
+    let mut stopped_early: Option<&'static str> = None;
+    for (checked, ptr) in ptrs.iter().enumerate() {
+        if checked >= MAX_FORWARD_CONFIRMS {
+            stopped_early = Some("PTR set exceeded the forward-confirm cap");
+            break;
+        }
+        if started.elapsed() >= VERIFY_BUDGET {
+            stopped_early = Some("forward-confirm budget exhausted");
+            break;
+        }
         let host = strip_trailing_dot(ptr).to_ascii_lowercase();
         // Forward-confirm.
         let forwards = match resolver.forward(&host) {
@@ -138,6 +209,16 @@ pub fn verify_reverse_dns(
         }
     }
 
+    // A truncated run is reported as a DNS error rather than
+    // `NotMatched`. `NotMatched` is a statement about the client ("we
+    // checked, it is not this vendor") and gets the long cache TTL; we
+    // did not check, so we must not make that statement.
+    if let Some(reason) = stopped_early {
+        return ReverseDnsVerdict::DnsError(match last_forward_error {
+            Some(err) => format!("{reason}; last forward error: {err}"),
+            None => reason.to_string(),
+        });
+    }
     if let Some(err) = last_forward_error {
         return ReverseDnsVerdict::DnsError(format!(
             "no PTR forward-confirmed; last forward error: {err}"
@@ -242,22 +323,39 @@ impl Resolver for StubResolver {
 
 // --- SystemResolver (hickory resolver) ---
 
+/// Ceiling on a single PTR or forward query.
+///
+/// Deliberately the same 2s as the SSRF module's
+/// `DNS_RESOLUTION_TIMEOUT`, and for the same reason: the zone being
+/// queried belongs to the party we are trying to identify, so it must
+/// not get to decide how long a request-path thread waits. The system
+/// default is 5s with 2 retries, which is 15s per query.
+const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Slack on the caller-side wait so the in-task timeout is normally the
+/// one that fires and the error string stays specific.
+const DNS_QUERY_WAIT_SLACK: Duration = Duration::from_millis(250);
+
 /// [`Resolver`] backed by the host DNS configuration through
 /// `hickory-resolver`.
 ///
-/// Used in production today only when an operator explicitly opts in;
-/// the resolver chain falls back to UA matching when DNS returns an
-/// error verdict, which matches the ADR-defined ordering.
+/// This is what the proxy binary installs by default: `hickory-resolver`
+/// is a non-optional dependency of this crate and
+/// `install_agent_class_resolver` runs unconditionally when the
+/// `agent-class` feature is on, which it is in the default build. An
+/// operator who does not want PTR lookups on the request path sets
+/// `agent_classes.resolver.rdns_enabled: false`, which skips step 2
+/// entirely.
+///
+/// Every lookup goes through one shared background runtime and one
+/// shared `hickory-resolver` instance, and each query is capped at two
+/// seconds. See the module-level "Cost control" section.
 #[derive(Debug, Default)]
 pub struct SystemResolver;
 
 impl Resolver for SystemResolver {
     fn reverse(&self, ip: IpAddr) -> Result<Vec<String>, String> {
-        run_hickory_lookup(move || async move {
-            let resolver = hickory_resolver::Resolver::builder_tokio()
-                .map_err(|e| format!("DNS resolver init: {e}"))?
-                .build()
-                .map_err(|e| format!("DNS resolver build: {e}"))?;
+        run_hickory_lookup(move |resolver| async move {
             let lookup = resolver
                 .reverse_lookup(ip)
                 .await
@@ -278,11 +376,7 @@ impl Resolver for SystemResolver {
 
     fn forward(&self, hostname: &str) -> Result<Vec<IpAddr>, String> {
         let hostname = hostname.to_string();
-        run_hickory_lookup(move || async move {
-            let resolver = hickory_resolver::Resolver::builder_tokio()
-                .map_err(|e| format!("DNS resolver init: {e}"))?
-                .build()
-                .map_err(|e| format!("DNS resolver build: {e}"))?;
+        run_hickory_lookup(move |resolver| async move {
             let lookup = resolver
                 .lookup_ip(hostname.as_str())
                 .await
@@ -292,31 +386,116 @@ impl Resolver for SystemResolver {
     }
 }
 
+/// The one background runtime every hickory lookup runs on.
+///
+/// It is built once. The shape this replaced built a fresh
+/// multi-thread `Runtime` (which starts one worker per CPU) inside a
+/// freshly spawned OS thread for every single query, so a client IP
+/// with no PTR record paid a thread plus a whole runtime on every
+/// request, forever, because a `DnsError` verdict is not cached for
+/// long. One worker thread is enough here: the work is IO-bound and
+/// bounded by `MAX_FORWARD_CONFIRMS`.
+fn dns_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
+    static RUNTIME: std::sync::OnceLock<Result<tokio::runtime::Runtime, String>> =
+        std::sync::OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name("sbproxy-agent-dns")
+                .enable_all()
+                .build()
+                .map_err(|e| format!("DNS runtime init: {e}"))
+        })
+        .as_ref()
+        .map_err(|e| e.clone())
+}
+
+/// The one process-wide `hickory-resolver` instance.
+///
+/// Sharing it is not only about construction cost: a `Resolver` owns a
+/// TTL-bounded response cache, and rebuilding one per query threw that
+/// cache away every time, so even a well-behaved crawler re-queried
+/// its own PTR record on every cache-missing request.
+fn shared_resolver() -> Result<&'static hickory_resolver::TokioResolver, String> {
+    static RESOLVER: std::sync::OnceLock<Result<hickory_resolver::TokioResolver, String>> =
+        std::sync::OnceLock::new();
+    RESOLVER
+        .get_or_init(|| {
+            let mut builder = hickory_resolver::Resolver::builder_tokio()
+                .map_err(|e| format!("DNS resolver init: {e}"))?;
+            let options = builder.options_mut();
+            options.timeout = DNS_QUERY_TIMEOUT;
+            // One retry, not the default two. The caller retries at a
+            // much coarser grain (the next request after the negative
+            // cache entry expires), so burning three query timeouts
+            // inline buys nothing.
+            options.attempts = 1;
+            builder
+                .build()
+                .map_err(|e| format!("DNS resolver build: {e}"))
+        })
+        .as_ref()
+        .map_err(|e| e.clone())
+}
+
+/// Run one hickory query on the shared runtime and block the caller
+/// until it answers or `DNS_QUERY_TIMEOUT` elapses.
+///
+/// The caller is blocked, not the runtime: `Runtime::block_on` panics
+/// when it is called from a thread that is already driving a Tokio
+/// runtime, which a Pingora worker is, so the result comes back over a
+/// std channel instead. The wait is bounded, which is the property
+/// that matters, and the request-path caller
+/// (`sbproxy-core::agent_class::stamp_request_context_offloaded`) hands
+/// this to `spawn_blocking` so the blocked thread is a blocking-pool
+/// thread rather than an async worker.
 fn run_hickory_lookup<T, F, Fut>(f: F) -> Result<T, String>
 where
-    F: FnOnce() -> Fut + Send + 'static,
+    F: FnOnce(&'static hickory_resolver::TokioResolver) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<T, String>> + Send + 'static,
     T: Send + 'static,
 {
-    std::thread::spawn(move || {
-        let runtime =
-            tokio::runtime::Runtime::new().map_err(|e| format!("DNS runtime init: {e}"))?;
-        runtime.block_on(f())
-    })
-    .join()
-    .map_err(|_| "DNS lookup thread panicked".to_string())?
+    let runtime = dns_runtime()?;
+    let resolver = shared_resolver()?;
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    runtime.spawn(async move {
+        let outcome = match tokio::time::timeout(DNS_QUERY_TIMEOUT, f(resolver)).await {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "DNS query exceeded {}s",
+                DNS_QUERY_TIMEOUT.as_secs()
+            )),
+        };
+        // A caller that already gave up dropped the receiver. Nothing
+        // to report and nothing to leak: the task ends here.
+        let _ = tx.send(outcome);
+    });
+    match rx.recv_timeout(DNS_QUERY_TIMEOUT + DNS_QUERY_WAIT_SLACK) {
+        Ok(outcome) => outcome,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err("DNS query timed out".to_string()),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err("DNS query task ended without a result".to_string())
+        }
+    }
 }
 
 // --- Verdict cache ---
 
 /// Process-local cache of [`ReverseDnsVerdict`] keyed by client IP.
 ///
-/// Entries are evicted by elapsed wall-clock; the TTL is the smaller
-/// of the observed PTR / forward TTLs (clamped at one hour). The cache
-/// is bounded to `max_entries` and uses a coarse FIFO ring eviction
-/// when full because verdict lookups dominate over inserts. The OSS
-/// default capacity is 4096, picked so a single flooded /24 of bots
-/// fits without thrashing the cache while staying well under any
+/// Entries are evicted by elapsed wall clock. The TTL is whatever the
+/// caller passes to [`Self::insert`], clamped at one hour: the
+/// [`Resolver`] port returns hostnames and addresses with no record
+/// TTL attached, so nothing here can observe the PTR or forward TTL.
+/// The production caller (`sbproxy-modules::policy::agent_class`)
+/// passes 300 seconds for a resolved verdict and 30 seconds for a
+/// `DnsError`.
+///
+/// The cache is bounded to `max_entries` and uses a coarse FIFO ring
+/// eviction when full because verdict lookups dominate over inserts.
+/// The OSS default capacity is 4096, picked so a single flooded /24 of
+/// bots fits without thrashing the cache while staying well under any
 /// memory-pressure threshold.
 pub struct ReverseDnsCache {
     inner: Mutex<CacheInner>,
@@ -334,8 +513,8 @@ struct CacheEntry {
 }
 
 impl ReverseDnsCache {
-    /// Hard cap on cached verdict TTL. Even if the underlying DNS
-    /// records claim to be valid for longer, we re-verify after this.
+    /// Hard cap on cached verdict TTL. Whatever the caller asks for,
+    /// we re-verify after this.
     pub(crate) const MAX_TTL: Duration = Duration::from_secs(60 * 60);
 
     /// Build a cache with the supplied entry capacity.
@@ -507,6 +686,83 @@ mod tests {
             ReverseDnsVerdict::DnsError(msg) => assert!(msg.contains("REFUSED"), "got {msg}"),
             other => panic!("expected DnsError from a failed forward lookup, got {other:?}"),
         }
+    }
+
+    /// Resolver that counts forward lookups. The cap is a claim about
+    /// how many queries a hostile PTR set can buy, and a test that
+    /// cannot count queries cannot check that claim.
+    struct CountingResolver {
+        ptrs: Vec<String>,
+        forward_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Resolver for CountingResolver {
+        fn reverse(&self, _ip: IpAddr) -> Result<Vec<String>, String> {
+            Ok(self.ptrs.clone())
+        }
+
+        fn forward(&self, _hostname: &str) -> Result<Vec<IpAddr>, String> {
+            self.forward_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Never forward-confirms, so the loop runs to whichever
+            // bound stops it first.
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn hostile_ptr_set_stops_at_the_forward_confirm_cap() {
+        // Step 1 is answered by the client's own reverse zone, so the
+        // client picks how many names come back. Without the cap this
+        // bought one sequential forward lookup per name, on the calling
+        // thread, on every request (the resulting verdict is only
+        // negatively cached for a short window).
+        let ip = ip4(203, 0, 113, 7);
+        let resolver = CountingResolver {
+            ptrs: (0..50).map(|i| format!("h{i}.evil.example")).collect(),
+            forward_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let verdict = verify_reverse_dns(&resolver, ip, &[".googlebot.com"]);
+
+        assert_eq!(
+            resolver
+                .forward_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            MAX_FORWARD_CONFIRMS,
+            "the forward-confirm loop must stop at the cap, not at the end of the PTR set"
+        );
+        match verdict {
+            // A truncated run has not established that the client is
+            // unmatched, so it must not return the verdict that gets
+            // the long positive cache TTL.
+            ReverseDnsVerdict::DnsError(msg) => {
+                assert!(msg.contains("forward-confirm cap"), "got {msg}")
+            }
+            other => panic!("expected DnsError from a truncated run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ptr_set_at_the_cap_still_verifies() {
+        // The cap must not be narrower than its claim: a zone that
+        // answers with exactly the cap's worth of names, the last of
+        // which is the real one, still forward-confirms.
+        let ip = ip4(66, 249, 66, 2);
+        let mut ptrs: Vec<String> = (0..MAX_FORWARD_CONFIRMS - 1)
+            .map(|i| format!("decoy{i}.example.net"))
+            .collect();
+        ptrs.push("crawl-2.googlebot.com".to_string());
+        let resolver = StubResolver::new()
+            .with_ptr(ip, ptrs)
+            .with_forward("crawl-2.googlebot.com", vec![ip]);
+
+        let verdict = verify_reverse_dns(&resolver, ip, &[".googlebot.com"]);
+
+        assert_eq!(
+            verdict,
+            ReverseDnsVerdict::Verified("crawl-2.googlebot.com".to_string())
+        );
     }
 
     #[test]

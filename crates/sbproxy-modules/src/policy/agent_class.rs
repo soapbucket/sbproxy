@@ -26,6 +26,7 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use sbproxy_classifiers::{AgentClass, AgentClassCatalog, AgentId, AgentIdSource, AgentPurpose};
 use sbproxy_security::agent_verify::{
@@ -33,6 +34,25 @@ use sbproxy_security::agent_verify::{
 };
 
 // --- Public API ---
+
+/// Cache TTL for a verdict the verifier actually reached, verified or
+/// not.
+///
+/// A fixed value, not a DNS-derived one: the `Resolver` port hands back
+/// hostnames and addresses with no record TTL attached, so there is no
+/// observed PTR TTL to honor here.
+const RESOLVED_VERDICT_TTL: Duration = Duration::from_secs(300);
+
+/// Cache TTL for a `DnsError` verdict.
+///
+/// Short, because a DNS error can be the operator's resolver having a
+/// bad minute and we want to re-check soon. Not zero, because the
+/// overwhelmingly common `DnsError` is "this client IP has no PTR
+/// record", which is a stable fact about the client: leaving it
+/// uncached meant every request from such an IP re-ran the full PTR
+/// lookup on the request path, and an IP whose reverse zone answers
+/// slowly could charge the proxy that cost once per request.
+const DNS_ERROR_VERDICT_TTL: Duration = Duration::from_secs(30);
 
 /// Inputs to the resolver. The resolver is pure: every piece of state
 /// it needs is plumbed through here so the same call yields the same
@@ -227,11 +247,54 @@ impl AgentClassResolver {
         Resolved::human()
     }
 
+    /// True when [`Self::resolve`] would issue a live DNS query for
+    /// these inputs.
+    ///
+    /// The request pipeline uses this to decide whether a request needs
+    /// to be moved onto Tokio's blocking pool: the DNS port is
+    /// synchronous, so a cache-missing rDNS step blocks whatever thread
+    /// calls `resolve`, and on a Pingora worker that is an async worker
+    /// thread. Paying a blocking-pool hop on every request instead
+    /// would cost far more than it saves, since the rDNS step is the
+    /// only part of the chain that can block and it only blocks on a
+    /// cache miss.
+    ///
+    /// This mirrors the short-circuits in [`Self::resolve`], so the two
+    /// can drift. `predicate_agrees_with_resolve` pins them together by
+    /// deriving the expected answer from a resolver that counts its own
+    /// calls, rather than by re-reading this function.
+    ///
+    /// What it cannot see: a query that `hickory-resolver` will answer
+    /// out of its own in-process response cache. Those report `true`
+    /// here and are simply fast, which is the safe direction to be
+    /// wrong in.
+    pub fn resolve_would_query_dns(&self, inputs: &ResolveInputs<'_>) -> bool {
+        // Step 1 short-circuits the whole chain before step 2 runs.
+        if self.bot_auth_keyid_enabled {
+            if let Some(keyid) = inputs.bot_auth_keyid {
+                if self.catalog.lookup_by_keyid(keyid).is_some() {
+                    return false;
+                }
+            }
+        }
+        if !self.rdns_enabled {
+            return false;
+        }
+        let Some(ip) = inputs.client_ip else {
+            return false;
+        };
+        if self.rdns_cache.get(ip).is_some() {
+            return false;
+        }
+        !self.catalog.all_rdns_suffixes().is_empty()
+    }
+
     /// Resolve an rDNS verdict, consulting the cache first and
-    /// falling back to a fresh `verify_reverse_dns` call. Cache TTL
-    /// for both verified and not-matched results is 5 minutes; DNS
-    /// errors are not cached so a transient outage doesn't pin a
-    /// false negative.
+    /// falling back to a fresh `verify_reverse_dns` call.
+    ///
+    /// Every verdict is cached, including `DnsError`; see
+    /// `RESOLVED_VERDICT_TTL` and `DNS_ERROR_VERDICT_TTL` for the two
+    /// TTLs and why the error one is short rather than absent.
     fn cached_rdns(&self, ip: IpAddr) -> Option<ReverseDnsVerdict> {
         if let Some(v) = self.rdns_cache.get(ip) {
             return Some(v);
@@ -242,17 +305,11 @@ impl AgentClassResolver {
         }
         let suffixes_ref: Vec<&str> = suffixes_owned.iter().map(|s| s.as_str()).collect();
         let verdict = verify_reverse_dns(self.dns_resolver.as_ref(), ip, &suffixes_ref);
-        match &verdict {
-            ReverseDnsVerdict::Verified(_) | ReverseDnsVerdict::NotMatched => {
-                self.rdns_cache
-                    .insert(ip, verdict.clone(), std::time::Duration::from_secs(300));
-            }
-            ReverseDnsVerdict::DnsError(_) => {
-                // Don't cache DNS errors; resolver tries again next
-                // request when the operator may have recovered the
-                // upstream resolver.
-            }
-        }
+        let ttl = match &verdict {
+            ReverseDnsVerdict::Verified(_) | ReverseDnsVerdict::NotMatched => RESOLVED_VERDICT_TTL,
+            ReverseDnsVerdict::DnsError(_) => DNS_ERROR_VERDICT_TTL,
+        };
+        self.rdns_cache.insert(ip, verdict.clone(), ttl);
         Some(verdict)
     }
 }
@@ -380,9 +437,55 @@ mod tests {
     use super::*;
     use sbproxy_security::agent_verify::StubResolver;
     use std::net::Ipv4Addr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn googlebot_ip() -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(66, 249, 66, 1))
+    }
+
+    /// [`StubResolver`] that counts PTR lookups.
+    ///
+    /// The cache and the offload predicate are both claims about
+    /// whether a DNS query happens; a test that cannot see the query
+    /// cannot check either one.
+    struct CountingResolver {
+        inner: StubResolver,
+        reverse_calls: AtomicUsize,
+    }
+
+    impl CountingResolver {
+        fn new(inner: StubResolver) -> Self {
+            Self {
+                inner,
+                reverse_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn reverse_calls(&self) -> usize {
+            self.reverse_calls.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Resolver for CountingResolver {
+        fn reverse(&self, ip: IpAddr) -> Result<Vec<String>, String> {
+            self.reverse_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.reverse(ip)
+        }
+
+        fn forward(&self, hostname: &str) -> Result<Vec<IpAddr>, String> {
+            self.inner.forward(hostname)
+        }
+    }
+
+    fn build_counting(
+        catalog: AgentClassCatalog,
+        stub: StubResolver,
+        rdns_enabled: bool,
+    ) -> (AgentClassResolver, Arc<CountingResolver>) {
+        let counting = Arc::new(CountingResolver::new(stub));
+        let resolver =
+            AgentClassResolver::new(Arc::new(catalog), counting.clone(), 64, rdns_enabled, true);
+        (resolver, counting)
     }
 
     fn build_resolver_with_dns(stub: StubResolver) -> AgentClassResolver {
@@ -522,6 +625,118 @@ mod tests {
         // expect the same verdict.
         let second = resolver.resolve(&inputs);
         assert_eq!(second.agent_id.as_str(), "google-googlebot");
+    }
+
+    #[test]
+    fn dns_error_verdict_is_negatively_cached() {
+        // The common case for a client IP is "no PTR record", which
+        // surfaces as DnsError. Leaving that verdict uncached meant the
+        // request path re-ran the whole PTR lookup on every single
+        // request from that IP, and a client that owns a slow reverse
+        // zone got to charge the proxy that cost per request.
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+        // No PTR entry for this IP, which is what an address with no
+        // reverse record looks like to the verifier.
+        let (resolver, counting) =
+            build_counting(AgentClassCatalog::defaults(), StubResolver::new(), true);
+        let inputs = ResolveInputs {
+            client_ip: Some(ip),
+            user_agent: Some("Mozilla/5.0 Chrome/123.0"),
+            ..Default::default()
+        };
+
+        resolver.resolve(&inputs);
+        resolver.resolve(&inputs);
+        resolver.resolve(&inputs);
+
+        assert_eq!(
+            counting.reverse_calls(),
+            1,
+            "a DNS failure must be negatively cached, not re-queried once per request"
+        );
+    }
+
+    #[test]
+    fn predicate_agrees_with_resolve() {
+        // `resolve_would_query_dns` is what the request pipeline uses to
+        // decide whether to move a request onto the blocking pool, so a
+        // predicate narrower than the enforcer means a blocking DNS
+        // query lands back on an async worker. The expected answer here
+        // is derived from the resolver's own behavior, not from
+        // re-reading the predicate.
+        fn check(
+            label: &str,
+            resolver: &AgentClassResolver,
+            counting: &CountingResolver,
+            inputs: &ResolveInputs<'_>,
+        ) {
+            let predicted = resolver.resolve_would_query_dns(inputs);
+            let before = counting.reverse_calls();
+            resolver.resolve(inputs);
+            let queried = counting.reverse_calls() > before;
+            assert_eq!(
+                predicted, queried,
+                "{label}: predicate said {predicted}, resolver queried {queried}"
+            );
+        }
+
+        let ip = googlebot_ip();
+        let stub = || {
+            StubResolver::new()
+                .with_ptr(ip, vec!["crawl-1.googlebot.com".to_string()])
+                .with_forward("crawl-1.googlebot.com", vec![ip])
+        };
+        let browser_ua =
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/123.0";
+
+        // Cold cache with rDNS on: a query happens.
+        let (resolver, counting) = build_counting(AgentClassCatalog::defaults(), stub(), true);
+        let inputs = ResolveInputs {
+            client_ip: Some(ip),
+            user_agent: Some(browser_ua),
+            ..Default::default()
+        };
+        check("cold cache", &resolver, &counting, &inputs);
+        // Same resolver, now warm: no query.
+        check("warm cache", &resolver, &counting, &inputs);
+
+        // rDNS disabled: no query, whatever the cache holds.
+        let (resolver, counting) = build_counting(AgentClassCatalog::defaults(), stub(), false);
+        check("rdns disabled", &resolver, &counting, &inputs);
+
+        // No client IP: nothing to reverse.
+        let (resolver, counting) = build_counting(AgentClassCatalog::defaults(), stub(), true);
+        let no_ip = ResolveInputs {
+            user_agent: Some(browser_ua),
+            ..Default::default()
+        };
+        check("no client ip", &resolver, &counting, &no_ip);
+
+        // A keyid that a catalog entry claims wins at step 1, so step 2
+        // never runs. The built-in catalog publishes no keyids, so this
+        // case needs its own catalog.
+        let signing_catalog = AgentClassCatalog::from_yaml_str(
+            r#"
+agent_classes:
+  - id: signing-bot
+    vendor: Example
+    purpose: training
+    expected_user_agent_pattern: "(?i)\bSigningBot/\d"
+    expected_reverse_dns_suffixes:
+      - .signing.example
+    expected_keyids:
+      - key-1
+"#,
+        )
+        .expect("test catalog parses");
+        let (resolver, counting) = build_counting(signing_catalog, stub(), true);
+        let signed = ResolveInputs {
+            bot_auth_keyid: Some("key-1"),
+            client_ip: Some(ip),
+            user_agent: Some(browser_ua),
+            ..Default::default()
+        };
+        check("bot-auth keyid wins", &resolver, &counting, &signed);
     }
 
     #[test]
