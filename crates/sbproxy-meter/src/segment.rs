@@ -34,6 +34,22 @@
 //! that names another node, so a merge cannot happen by accident on the
 //! recording path either.
 //!
+//! # What a recorder holds in memory
+//!
+//! Two structures, and only one of them is driven by traffic. The unit
+//! totals are keyed by `(tenant, unit, source)`, so they are bounded by the
+//! operator's own configuration: a deployment with ten tenants and four
+//! priced units has forty lines whatever its request rate.
+//!
+//! The fold set is the one that is not. It exists so a retry of a claim
+//! already counted is folded rather than added, and a claim id is a fresh
+//! per-request value, so a set that never evicted would grow with every
+//! metered request for the life of the process. It is therefore a fixed
+//! window over the most recent claim ids rather than a record of all of
+//! them, sized for the claims that could still be retried. The count a
+//! segment publishes is a separate integer, so bounding the window does not
+//! shorten the total.
+//!
 //! # The totals are a summary, not the record
 //!
 //! [`crate::segment::ChainSegment::totals`] is a convenience for answering
@@ -42,7 +58,8 @@
 //! chain means this recorder missed an append or counted one twice, and the
 //! chain wins.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -186,6 +203,33 @@ impl RecordOutcome {
     }
 }
 
+/// How many recently folded claim ids a recorder remembers.
+///
+/// The fold set exists for one job: recognizing a second attempt at a claim
+/// the node already counted, so four tries at a flaky origin stay one sale.
+/// Every attempt at one claim happens inside one request's lifetime, so the
+/// set only ever needs to cover the claims currently in flight, and keeping
+/// an id after the request that minted it has finished buys nothing.
+///
+/// Keeping them anyway is a leak with a clock on it. A metering node at
+/// 1,000 requests a second mints about 86 million distinct claim ids a day,
+/// and a set that never evicts grows on the order of a gigabyte a day until
+/// the process is killed, which reads as generic memory pressure rather than
+/// as the meter.
+///
+/// 65,536 is the window because it is the in-flight count no real deployment
+/// reaches: even at 1,000 requests a second it is 65 seconds of traffic, and
+/// a retry that arrives more than a minute after its first attempt has
+/// already outlived the request it belongs to. It costs a few megabytes
+/// resident, and that is the whole budget rather than a per-day rate.
+///
+/// The consequence of getting the size wrong is worth stating plainly: a
+/// retry that arrives after its claim has aged out of the window is counted
+/// as a new sale, so the totals over-count rather than under-count. That is
+/// the reason the window is sized for the pathological case rather than the
+/// typical one.
+const CLAIM_FOLD_WINDOW: usize = 65_536;
+
 /// Mutable recorder state, behind one lock.
 ///
 /// A `BTreeMap` rather than a `HashMap` so the totals come out in a
@@ -193,12 +237,35 @@ impl RecordOutcome {
 /// is a wire document that operators diff between gathers, and a summary
 /// whose lines move around between two identical readings wastes their
 /// time.
+///
+/// The fold window is the opposite choice, deliberately: nothing reads it in
+/// order, it is hit once per settled request, and it is the one structure
+/// here whose size is driven by traffic rather than by the operator's
+/// configuration.
 #[derive(Default)]
 struct RecorderState {
     /// `(tenant, unit, source)` to the count metered under it.
     totals: BTreeMap<(String, String, UnitSource), u64>,
-    /// Claim ids already folded on this node.
-    claims: BTreeSet<String>,
+    /// Claim ids inside the fold window, for the membership test.
+    ///
+    /// Shares its allocations with `fold_order`, so one claim id is one
+    /// heap string however long it stays in the window.
+    folded: HashSet<Arc<str>>,
+    /// The same ids in arrival order, so the oldest can be dropped once the
+    /// window is full.
+    ///
+    /// Insertion order rather than true least-recently-used. A claim's
+    /// attempts are seconds apart at most, so refreshing an id on a fold
+    /// would move it a few places in a queue 65,536 long and change nothing
+    /// about which id leaves next.
+    fold_order: VecDeque<Arc<str>>,
+    /// Distinct claims folded since this recorder started.
+    ///
+    /// Counted rather than derived from `folded.len()`, which is now the
+    /// size of a window rather than a lifetime total. This is the number
+    /// [`ChainSegment::claims`] publishes, so it has to keep counting after
+    /// the ids themselves are gone.
+    distinct_claims: u64,
 }
 
 /// One node's running view of its own chain.
@@ -223,7 +290,11 @@ impl std::fmt::Debug for SegmentRecorder {
         formatter
             .debug_struct("SegmentRecorder")
             .field("node_id", &self.node_id)
-            .field("claims", &state.claims.len())
+            .field("claims", &state.distinct_claims)
+            // The resident half, next to the lifetime count, so a log line
+            // shows both that the recorder is working and that the memory
+            // it holds for retry folding is bounded.
+            .field("fold_window", &state.fold_order.len())
             .field("total_lines", &state.totals.len())
             .finish()
     }
@@ -258,9 +329,22 @@ impl SegmentRecorder {
             return RecordOutcome::ForeignNode;
         }
         let mut state = self.state.lock();
-        if !state.claims.insert(claim.claim_id().to_string()) {
+        if state.folded.contains(claim.claim_id()) {
             return RecordOutcome::Folded;
         }
+        // One allocation shared by the set and the queue: the set answers
+        // "have I seen this", the queue answers "which one leaves next".
+        let folded_id: Arc<str> = Arc::from(claim.claim_id());
+        state.folded.insert(Arc::clone(&folded_id));
+        state.fold_order.push_back(folded_id);
+        if state.fold_order.len() > CLAIM_FOLD_WINDOW {
+            if let Some(evicted) = state.fold_order.pop_front() {
+                state.folded.remove(&evicted);
+            }
+        }
+        // Saturating for the same reason the unit totals are: a claim count
+        // that wrapped would read as a quiet month.
+        state.distinct_claims = state.distinct_claims.saturating_add(1);
         for unit in units {
             let key = (tenant.to_string(), unit.name.clone(), unit.source);
             let entry = state.totals.entry(key).or_insert(0);
@@ -273,9 +357,14 @@ impl SegmentRecorder {
         RecordOutcome::Recorded
     }
 
-    /// Distinct claims folded so far.
+    /// Distinct claims folded since this recorder started.
+    ///
+    /// A lifetime count, not the size of anything held in memory. The ids
+    /// themselves are kept only for as long as a retry could still arrive
+    /// (see `CLAIM_FOLD_WINDOW`); this number keeps counting after they are
+    /// dropped.
     pub fn claims(&self) -> u64 {
-        self.state.lock().claims.len() as u64
+        self.state.lock().distinct_claims
     }
 
     /// The running totals, in a deterministic order.
@@ -541,6 +630,56 @@ mod tests {
         assert!(
             !rendered.contains("a-very-identifiable-customer"),
             "{rendered}"
+        );
+    }
+
+    #[test]
+    fn the_fold_window_evicts_rather_than_keeping_every_claim_id_forever() {
+        let recorder = SegmentRecorder::new("node-a");
+        let first = ClaimKey::new("node-a", "claim-first");
+
+        assert_eq!(
+            recorder.record(&first, "tenant-1", &[weighted("call", 1)]),
+            RecordOutcome::Recorded,
+        );
+
+        // One full window of other claims, which is what pushes the first
+        // id out. Every one is distinct, the way a per-request claim id is.
+        for index in 0..CLAIM_FOLD_WINDOW {
+            let claim = ClaimKey::new("node-a", format!("claim-{index}"));
+            recorder.record(&claim, "tenant-1", &[weighted("call", 1)]);
+        }
+
+        // The assertion this test exists for. While the fold set was a
+        // `BTreeSet` nothing ever removed from, this id was still in memory
+        // and this call folded, which is another way of saying the process
+        // held one 26-character string per metered request until it was
+        // OOM-killed. Recording it again is the observable consequence of
+        // the id having been dropped.
+        assert_eq!(
+            recorder.record(&first, "tenant-1", &[weighted("call", 1)]),
+            RecordOutcome::Recorded,
+            "a claim id older than the fold window must not still be resident",
+        );
+
+        // A retry inside the window still folds, which is the property the
+        // window exists to keep.
+        let recent = ClaimKey::new("node-a", format!("claim-{}", CLAIM_FOLD_WINDOW - 1));
+        assert_eq!(
+            recorder.record(&recent, "tenant-1", &[weighted("call", 1)]),
+            RecordOutcome::Folded,
+        );
+
+        // The published count is a lifetime total and is unaffected by
+        // eviction: one for the first claim, one per windowed claim, and one
+        // for the re-record above.
+        assert_eq!(recorder.claims(), CLAIM_FOLD_WINDOW as u64 + 2);
+
+        // And the resident half stays at the window, not at the total.
+        let rendered = format!("{recorder:?}");
+        assert!(
+            rendered.contains(&format!("fold_window: {CLAIM_FOLD_WINDOW}")),
+            "{rendered}",
         );
     }
 }
