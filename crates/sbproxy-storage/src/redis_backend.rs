@@ -48,6 +48,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
 use redis::{aio::MultiplexedConnection, AsyncCommands};
+use sbproxy_security::url_redact::redacted_url_with_path;
 use tokio::sync::Mutex;
 
 use crate::error::{check_key, check_value, StorageError};
@@ -112,7 +113,13 @@ impl RedisStore {
     /// unavailable Redis at construction time is not fatal.
     pub fn new(redis_url: &str, key_prefix: impl Into<String>) -> Result<Self, StorageError> {
         let client = redis::Client::open(redis_url).map_err(|e| {
-            StorageError::InvalidConfig(format!("invalid redis url {redis_url:?}: {e}"))
+            // Origin and database index only. This string is handed
+            // straight to callers that log it, and a Redis DSN carries
+            // its password inline (WOR-2640).
+            StorageError::InvalidConfig(format!(
+                "invalid redis url {}: {e}",
+                redacted_url_with_path(redis_url)
+            ))
         })?;
         Ok(Self {
             client,
@@ -756,7 +763,26 @@ mod tests {
     #[test]
     fn new_rejects_malformed_url() {
         let err = RedisStore::new("not a url at all", "ws").unwrap_err();
+        let msg = err.to_string();
         assert!(matches!(err, StorageError::InvalidConfig(_)));
+        // The rejected input is never echoed: an operator who pasted a
+        // password into the wrong config key would otherwise find it in
+        // whatever log this error reaches.
+        assert!(!msg.contains("not a url at all"), "input echoed: {msg}");
+        assert!(msg.contains("[invalid url]"), "unexpected message: {msg}");
+    }
+
+    #[test]
+    fn new_rejects_a_bad_scheme_by_origin_not_by_password() {
+        let dsn = "http://aclname:topsecret@cache.internal:6379/3";
+        let err = RedisStore::new(dsn, "ws").unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.contains("topsecret"), "password leaked: {msg}");
+        assert!(!msg.contains("aclname"), "username leaked: {msg}");
+        assert!(
+            msg.contains("http://cache.internal:6379/3"),
+            "expected the redacted origin in the error, got: {msg}"
+        );
     }
 
     #[test]

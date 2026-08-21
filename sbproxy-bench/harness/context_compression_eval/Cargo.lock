@@ -5424,6 +5424,7 @@ dependencies = [
  "regex",
  "reqwest 0.12.28",
  "sbproxy-capability",
+ "sbproxy-httpkit",
  "sbproxy-meter",
  "sbproxy-plugin",
  "sbproxy-security",

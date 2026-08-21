@@ -1,4 +1,5 @@
-//! sbproxy-security: Cryptography, IP utilities, host filtering, PII masking, and SSRF protection.
+//! sbproxy-security: Cryptography, IP utilities, host filtering, PII
+//! masking, URL redaction, and SSRF protection.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -16,6 +17,7 @@ pub mod pii;
 pub mod sealed_record;
 pub mod span;
 pub mod ssrf;
+pub mod url_redact;
 
 #[cfg(feature = "agent-class")]
 pub use agent_verify::{

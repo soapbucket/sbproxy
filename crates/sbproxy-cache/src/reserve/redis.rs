@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use redis::{aio::ConnectionManager, AsyncCommands, Client};
+use sbproxy_security::url_redact::redacted_url_with_path;
 use tokio::sync::Mutex;
 
 use super::{CacheReserveBackend, ReserveMetadata};
@@ -44,8 +45,14 @@ impl std::fmt::Debug for RedisReserve {
 
 impl RedisReserve {
     /// Build a new reserve from a `redis://...` URL.
+    ///
+    /// A rejected DSN is reported by origin and database index only. The
+    /// caller in `sbproxy-core`'s pipeline publishes this error with
+    /// `warn!(error = %e, ...)`, so a raw DSN here is a password in the
+    /// process log on every misconfigured boot (WOR-2640).
     pub fn new(url: &str, key_prefix: impl Into<String>) -> Result<Self> {
-        let client = Client::open(url).with_context(|| format!("invalid redis url '{url}'"))?;
+        let client = Client::open(url)
+            .with_context(|| format!("invalid redis url '{}'", redacted_url_with_path(url)))?;
         Ok(Self {
             client,
             conn: Mutex::new(None),
@@ -183,5 +190,29 @@ mod tests {
         // doesn't silently swallow a malformed URL.
         let res = RedisReserve::new("not a url", "p:");
         assert!(res.is_err());
+    }
+
+    /// This constructor's error is the one live DSN leak the WOR-2640
+    /// survey found: `sbproxy-core`'s pipeline publishes it verbatim
+    /// through `warn!(error = %e, ...)` when the reserve fails to build.
+    #[test]
+    fn a_rejected_dsn_reports_its_origin_and_not_its_password() {
+        let dsn = "http://aclname:topsecret@cache.internal:6379/3";
+        let err = RedisReserve::new(dsn, "p:").expect_err("a non-redis scheme cannot open");
+        let msg = format!("{err:#}");
+        assert!(!msg.contains("topsecret"), "password leaked: {msg}");
+        assert!(!msg.contains("aclname"), "username leaked: {msg}");
+        assert!(
+            msg.contains("http://cache.internal:6379/3"),
+            "expected the redacted origin in the error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_dsn_is_not_echoed_back() {
+        let err = RedisReserve::new("hunter2", "p:").expect_err("not a url");
+        let msg = format!("{err:#}");
+        assert!(!msg.contains("hunter2"), "input echoed back: {msg}");
+        assert!(msg.contains("[invalid url]"), "unexpected message: {msg}");
     }
 }

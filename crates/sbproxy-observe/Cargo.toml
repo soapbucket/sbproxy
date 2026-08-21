@@ -15,6 +15,11 @@ publish = false
 sbproxy-capability.workspace = true
 sbproxy-plugin.workspace = true
 sbproxy-util.workspace = true
+# `request_error_summary`, the reqwest-error reducer the alerting and
+# event-sink delivery paths log instead of the raw error, whose Display
+# ends with " for url ({url})" (WOR-2629). httpkit is a leaf: bytes,
+# parking_lot, and the reqwest this crate already resolves.
+sbproxy-httpkit.workspace = true
 # SSRF guard for alert webhook URLs (WOR-604). No cycle: sbproxy-security
 # does not depend on sbproxy-observe.
 sbproxy-security.workspace = true

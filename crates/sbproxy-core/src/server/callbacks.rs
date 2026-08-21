@@ -6,6 +6,9 @@
 
 use super::*;
 
+use sbproxy_httpkit::request_error_summary;
+use sbproxy_security::url_redact::redacted_url;
+
 // --- Callback firing ---
 
 /// Lazily-initialized HTTP client for firing callbacks. Builder
@@ -149,14 +152,23 @@ pub(super) async fn fire_request_mirror(
         req = req.body(b);
     }
 
+    // Origin only, at both sites. `full_url` is an operator mirror target
+    // and its path can be the credential; the reqwest error's own Display
+    // would write the whole URL again even if the field did not
+    // (WOR-2629).
+    let mirror_origin = redacted_url(&full_url);
     match req.send().await {
         Ok(resp) => {
-            debug!(url = %full_url, status = %resp.status(), "mirror sent");
+            debug!(url = %mirror_origin, status = %resp.status(), "mirror sent");
             // Drain the body so the connection can be returned to the pool.
             let _ = resp.bytes().await;
         }
         Err(e) => {
-            debug!(url = %full_url, error = %e, "mirror delivery failed");
+            debug!(
+                url = %mirror_origin,
+                error = %request_error_summary(&e),
+                "mirror delivery failed"
+            );
         }
     }
 }
@@ -496,7 +508,12 @@ pub(super) fn build_webhook_request(
                 req = req.header("x-sbproxy-signature", sig);
             }
             Err(e) => {
-                warn!(url = %url, event = %event, error = %e, "webhook signing failed; sending without signature");
+                warn!(
+                    url = %redacted_url(url),
+                    event = %event,
+                    error = %e,
+                    "webhook signing failed; sending without signature"
+                );
             }
         }
     }
@@ -530,15 +547,27 @@ pub(super) async fn send_webhook(
     ) else {
         return;
     };
+    let webhook_origin = redacted_url(url);
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
-            debug!(url = %url, event = %event, "webhook sent");
+            debug!(url = %webhook_origin, event = %event, "webhook sent");
         }
         Ok(resp) => {
-            warn!(url = %url, event = %event, status = %resp.status(), "webhook non-success");
+            warn!(
+                url = %webhook_origin,
+                event = %event,
+                status = %resp.status(),
+                "webhook non-success"
+            );
         }
         Err(e) => {
-            warn!(url = %url, event = %event, error = %e, "webhook delivery failed");
+            let summary = request_error_summary(&e);
+            warn!(
+                url = %webhook_origin,
+                event = %event,
+                error = %summary,
+                "webhook delivery failed"
+            );
         }
     }
 }
@@ -572,11 +601,12 @@ pub(super) async fn send_webhook_collect_inject(
     ) else {
         return Vec::new();
     };
+    let webhook_origin = redacted_url(url);
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
             let injected = extract_inject_headers(resp.headers());
             debug!(
-                url = %url,
+                url = %webhook_origin,
                 event = %event,
                 injected = injected.len(),
                 "enrichment webhook returned"
@@ -584,11 +614,22 @@ pub(super) async fn send_webhook_collect_inject(
             injected
         }
         Ok(resp) => {
-            warn!(url = %url, event = %event, status = %resp.status(), "enrichment webhook non-success");
+            warn!(
+                url = %webhook_origin,
+                event = %event,
+                status = %resp.status(),
+                "enrichment webhook non-success"
+            );
             Vec::new()
         }
         Err(e) => {
-            warn!(url = %url, event = %event, error = %e, "enrichment webhook delivery failed");
+            let summary = request_error_summary(&e);
+            warn!(
+                url = %webhook_origin,
+                event = %event,
+                error = %summary,
+                "enrichment webhook delivery failed"
+            );
             Vec::new()
         }
     }
