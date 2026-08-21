@@ -1022,12 +1022,21 @@ fn bundle_secret_field_names_slot() -> &'static std::sync::RwLock<std::sync::Arc
 /// Replace the set of bundle-declared secret/masked var names treated
 /// as key-bearing for redaction.
 ///
-/// Call once per pipeline publication with the union of every
-/// `secret_vars` and `masked_vars` the adopted registry's hooks
-/// declare (`DynamicBundleRegistry::secret_field_names`). A name here
-/// is redacted by key in every structured sink, regardless of tenant
-/// or origin scope, the same way a `secret_vars` value is always
-/// resolved and always masked regardless of which attachment used it.
+/// Call it from pipeline publication with every `secret_vars` and
+/// `masked_vars` the adopted registry's hooks declare
+/// (`DynamicBundleRegistry::secret_field_names`). A name here is
+/// redacted by key in every structured sink, regardless of tenant or
+/// origin scope, the same way a `secret_vars` value is always resolved
+/// and always masked regardless of which attachment used it.
+///
+/// Twice per publication, in practice: the publisher installs the
+/// union of the outgoing and incoming sets before the pipeline swap
+/// and narrows to the incoming set after it, so no field is
+/// under-redacted on either side of the boundary. Going only one way
+/// leaves a window: install early and a dropped bundle's fields are in
+/// cleartext while its generation is still serving; install late and a
+/// newly added bundle's fields are in cleartext once its generation
+/// is.
 ///
 /// Do not call it from a load path. A candidate that is built and
 /// dropped must leave the serving generation's denylist alone.

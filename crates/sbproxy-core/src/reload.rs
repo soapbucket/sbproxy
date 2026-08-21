@@ -194,8 +194,23 @@ pub fn load_pipeline(new_pipeline: CompiledPipeline) {
     // dropped, leaving the still-serving config logging its own
     // `secret_vars` in cleartext. Installing at the publication boundary
     // makes the denylist as durable as the pipeline it describes.
-    let bundle_secret_fields = new_pipeline.extension_registry().secret_field_names();
-    sbproxy_observe::logging::set_bundle_secret_field_names(bundle_secret_fields.to_vec());
+    //
+    // The union goes in before the swap and the adopted set after it,
+    // because neither ordering is safe on its own. Installing only
+    // before would un-redact a dropped bundle's field names for the
+    // generation still serving, which is a narrower version of the bug
+    // this moved to fix; installing only after would leave a newly
+    // added bundle's names in cleartext until the swap lands. Redacting
+    // the union across the boundary is the one direction with no window
+    // in it, and it costs an over-redacted field for a few microseconds
+    // on a reload.
+    let bundle_secret_fields = new_pipeline
+        .extension_registry()
+        .secret_field_names()
+        .to_vec();
+    let mut across_the_swap = sbproxy_observe::logging::bundle_secret_field_names().to_vec();
+    across_the_swap.extend_from_slice(&bundle_secret_fields);
+    sbproxy_observe::logging::set_bundle_secret_field_names(across_the_swap);
     // This is the only pipeline publisher. Hold the flag-store write lock
     // while the pipeline pointer is swapped, then install its matching flag
     // snapshot before CEL readers can resume. Direct/library callers therefore
@@ -208,6 +223,10 @@ pub fn load_pipeline(new_pipeline: CompiledPipeline) {
         pipeline_store().store(Arc::new(new_pipeline));
         advance_config_version();
     });
+    // Narrow the denylist from the union back to what the generation
+    // now serving actually declares, so a reload that drops a bundle
+    // also drops its names rather than leaking them forward forever.
+    sbproxy_observe::logging::set_bundle_secret_field_names(bundle_secret_fields);
 }
 
 /// Monotonically increasing counter used as the projection cache's
@@ -875,6 +894,19 @@ hooks:
         assert!(
             live.iter().any(|name| name == "billing_key"),
             "a dropped candidate must not disarm the serving config's redactor: {live:?}"
+        );
+
+        // Publishing a generation that drops the bundle drops its
+        // names too. Without the narrowing step after the swap, the
+        // union installed across the boundary would leak forward and
+        // the denylist would only ever grow.
+        let successor = CompiledPipeline::from_config(make_config("successor.example.com"))
+            .expect("the bundle-free successor compiles");
+        load_pipeline(successor);
+        let live = sbproxy_observe::logging::bundle_secret_field_names();
+        assert!(
+            !live.iter().any(|name| name == "billing_key"),
+            "a reload that drops a bundle must drop the names it declared: {live:?}"
         );
 
         sbproxy_observe::logging::set_bundle_secret_field_names(Vec::new());

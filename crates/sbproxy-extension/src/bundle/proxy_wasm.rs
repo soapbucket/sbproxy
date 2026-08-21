@@ -1528,6 +1528,21 @@ fn sanitize_guest_log_line(line: &str) -> String {
     out
 }
 
+/// Split one guest write into the records it becomes: one per
+/// non-empty line, control characters escaped.
+///
+/// Splitting is the half of the forgery defense that
+/// [`sanitize_guest_log_line`] cannot do on its own, so the two live
+/// behind one function that both `host_log` and its test call. A test
+/// that re-split the payload itself would keep passing if `host_log`
+/// stopped.
+fn guest_log_records(message: &str) -> impl Iterator<Item = String> + '_ {
+    message
+        .split('\n')
+        .filter(|line| !line.is_empty())
+        .map(sanitize_guest_log_line)
+}
+
 /// Emit one already-sanitized guest line at the clamped level.
 fn emit_guest_log_line(level: i32, context_id: u32, line: &str) {
     match clamped_guest_log_level(level) {
@@ -1561,16 +1576,21 @@ fn host_log(mut caller: Caller<'_, ProxyWasmHostState>, level: i32, data: i32, s
     if !(0..=5).contains(&level) || abi_usize(size) > 4096 {
         return STATUS_BAD_ARGUMENT;
     }
-    let message = match read_guest(&mut caller, data, size) {
-        Ok(message) => String::from_utf8_lossy(&message).into_owned(),
+    let raw = match read_guest(&mut caller, data, size) {
+        Ok(raw) => raw,
         Err(status) => return status,
     };
-    // Budget is claimed on the bytes the guest handed over, before any
-    // splitting or escaping, so escaping cannot be used to spend more
-    // than was written and a refusal cannot depend on the payload's
-    // shape. Answering STATUS_OK past the cap is deliberate: the guest
-    // gets no backpressure signal to branch on.
-    if !caller.data_mut().claim_log_budget(message.len()) {
+    // Budget is claimed on the bytes the guest handed over, before the
+    // lossy UTF-8 decode, the newline split, or the escaping, so none
+    // of those can be used to spend more than was written and a
+    // refusal cannot depend on the payload's shape. (Lossy decoding
+    // alone inflates invalid input threefold, which is why the claim
+    // is not made on the decoded string.) Answering STATUS_OK past the
+    // cap is deliberate: the guest gets no backpressure signal to
+    // branch on.
+    let claimed = raw.len();
+    let message = String::from_utf8_lossy(&raw).into_owned();
+    if !caller.data_mut().claim_log_budget(claimed) {
         if !caller.data().log_budget_reported {
             caller.data_mut().log_budget_reported = true;
             tracing::warn!(
@@ -1587,8 +1607,8 @@ fn host_log(mut caller: Caller<'_, ProxyWasmHostState>, level: i32, data: i32, s
     // newline used to be emitted verbatim under the text formatter,
     // which let a payload of "\nERROR sbproxy::server: ..." forge a
     // whole log record that no part of the proxy wrote.
-    for line in message.split('\n').filter(|line| !line.is_empty()) {
-        emit_guest_log_line(level, context_id, &sanitize_guest_log_line(line));
+    for line in guest_log_records(&message) {
+        emit_guest_log_line(level, context_id, &line);
     }
     STATUS_OK
 }
@@ -2289,19 +2309,19 @@ mod tests {
     /// bytes straight into `message = %message`, so under the text
     /// formatter a payload containing a newline and a plausible prefix
     /// rendered as a second, whole log line that no part of the proxy
-    /// wrote. `host_log` now splits on `\n` and hands each line
-    /// through this, which escapes everything else a payload can use
-    /// to repaint a line.
+    /// wrote. `host_log` now runs every write through
+    /// `guest_log_records`, which is what this calls: splitting and
+    /// escaping together, rather than a test that re-splits the
+    /// payload itself and would keep passing if `host_log` stopped.
     #[test]
     fn guest_log_lines_cannot_forge_a_record() {
         let forged = "ERROR sbproxy::server: upstream 10.0.0.5 authentication succeeded";
         let payload = format!("benign\n{forged}");
-        let lines: Vec<String> = payload
-            .split('\n')
-            .filter(|line| !line.is_empty())
-            .map(sanitize_guest_log_line)
-            .collect();
+        let lines: Vec<String> = guest_log_records(&payload).collect();
         assert_eq!(lines, ["benign", forged]);
+
+        // A payload that is only newlines mints no records at all.
+        assert_eq!(guest_log_records("\n\n\n").count(), 0);
 
         // Everything else that rewrites a rendered line is escaped
         // rather than passed through.
