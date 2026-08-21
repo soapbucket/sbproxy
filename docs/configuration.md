@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -151,7 +151,23 @@ an editor may flag an alias the proxy accepts. Module payloads and aliases
 are the boundaries an editor cannot check.
 
 Run `sbproxy validate <path>` for the authoritative check. It loads the same
-configuration and constructs the same runtime modules as `serve`.
+configuration and constructs the same runtime modules as `serve`, then throws
+them away.
+
+What it deliberately does not do is anything `serve` would leave behind.
+Validation opens no listener, resolves no secret reference, opens no key
+store and no receipt ledger, dials neither Redis nor the mesh for a semantic
+cache, and creates no state directory: every module that would reach the
+filesystem or the network at boot is constructed in a validation mode that
+stubs that part out. So running it against a candidate file on a host that is
+already serving traffic cannot change what that proxy is doing.
+
+What it does read is the process environment and the local files the document
+points at. A `${VAR}` is interpolated before the YAML is parsed, and material
+such as a Redis client certificate or a config-authority signing key is read
+from disk to check it is usable. Two validate runs of the same file agree
+unless one of those inputs changed between them, which is also why a run on a
+laptop and a boot on a server can legitimately disagree.
 
 Regenerate the schema locally with:
 
@@ -407,7 +423,7 @@ proxy:
 | `credentials` | list | `[]` | Proxy-scope credentials inherited by tenant and origin scopes. |
 | `extensions` | object | | Opaque map for out-of-tree top-level config blocks. The proxy never parses them. |
 | `payments` | object | unset | Durable settlement for paid requests: SQLite intent/attempt/proof/receipt store, challenge binding key, authorization timeout, and the infra-failure posture. Absent keeps every payment provider config-only. See [payments.md](payments.md#getting-paid-proxypayments). |
-| `attestation` | object | unset | Which half (or both) of receipt attestation this node performs, and its failure/enforcement posture; origins may narrow or widen `role`. Backs the `/api/meter/*` operator surface. See [metering.md](metering.md#configuration). |
+| `attestation` | object | unset | Receipt attestation for this node: whether it writes signed, hash-chained receipts, and its failure/enforcement posture. `role: claim` and `role: both` are refused at load because the claim half is not implemented, so an origin may narrow `role` but not widen it into that half. Backs the `/api/meter/*` operator surface. See [metering.md](metering.md#configuration). |
 
 ### Choosing a bind address
 

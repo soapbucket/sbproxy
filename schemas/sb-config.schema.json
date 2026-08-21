@@ -6161,7 +6161,7 @@
           ]
         },
         "enforcement_mode": {
-          "description": "What happens when attestation *does* reach a verdict and that verdict is \"refuse\": a claim that exceeds an agreement's ceiling, for instance. [`EnforcementMode::Observe`] is the rollout posture, and it is a different question from [`Self::failure_mode`]: a control can reasonably observe while it is being tuned and still need to fail closed when its backend disappears.",
+          "description": "What happens when attestation *does* reach a verdict and that verdict is \"refuse\": a claim that exceeds an agreement's ceiling, for instance. [`EnforcementMode::Observe`] is the rollout posture, and it is a different question from [`Self::failure_mode`]: a control can reasonably observe while it is being tuned and still need to fail closed when its backend disappears.\n\nThe only verdict attestation reaches is a claim measured against an agreement's ceiling, and the claim half is not implemented in this build, so this key records a posture nothing acts on yet.",
           "default": "block",
           "allOf": [
             {
@@ -6241,7 +6241,7 @@
       "additionalProperties": false
     },
     "AttestationRole": {
-      "description": "What part this proxy plays in attesting to consumption.\n\nThe two halves answer the two halves of a billing dispute and are independently useful, which is why this is four values rather than a boolean. A claim is made before the call and says what it is going to cost; a receipt is written after it and says what it actually consumed. A gateway in front of somebody else's metered API wants [`Self::Claim`] alone. A proxy selling its own upstream wants [`Self::Receipt`] alone. An operator reselling metered capacity wants [`Self::Both`], because they have to answer to a buyer and a supplier at once.",
+      "description": "What part this proxy plays in attesting to consumption.\n\nThe two halves answer the two halves of a billing dispute and are independently useful, which is why this is four values rather than a boolean. A claim is made before the call and says what it is going to cost; a receipt is written after it and says what it actually consumed. A gateway in front of somebody else's metered API wants [`Self::Claim`] alone. A proxy selling its own upstream wants [`Self::Receipt`] alone. An operator reselling metered capacity wants [`Self::Both`], because they have to answer to a buyer and a supplier at once.\n\nThis build implements the receipt half only. `compile_config` refuses [`Self::Claim`] and [`Self::Both`], at the proxy block and at a per-origin override alike, because nothing writes a claim before a call is served, nothing reads [`AttestationConfig::queue`], and no ceiling is computed for [`AttestationConfig::enforcement_mode`] to act on. Both variants stay in the vocabulary so the refusal can name what is missing instead of reporting an unknown value.",
       "oneOf": [
         {
           "description": "Attest to nothing. The default, and what every config that does not mention the block gets.",
@@ -6251,7 +6251,7 @@
           ]
         },
         {
-          "description": "Assert what a call is going to cost, before it is served.",
+          "description": "Assert what a call is going to cost, before it is served. Not implemented in this build: a config that names it is refused at compile.",
           "type": "string",
           "enum": [
             "claim"
@@ -6265,7 +6265,7 @@
           ]
         },
         {
-          "description": "Both halves. The posture for reselling metered capacity.",
+          "description": "Both halves. The posture for reselling metered capacity. Not implemented in this build either, because the claim half is not: a config that names it is refused at compile.",
           "type": "string",
           "enum": [
             "both"
@@ -6293,7 +6293,7 @@
       ]
     },
     "AttestationQueueConfig": {
-      "description": "`proxy.attestation.queue`: where claims wait until they settle.\n\nA claim is written when the call starts and settled when it finishes, and the gap between those is where a crash loses money. The queue is that gap made durable.",
+      "description": "`proxy.attestation.queue`: where claims wait until they settle.\n\nA claim is written when the call starts and settled when it finishes, and the gap between those is where a crash loses money. The queue is that gap made durable.\n\nNothing writes this queue today. The claim half is not implemented in this build and [`AttestationRole::Claim`] is refused at config compile, so the block is validated and its path resolved, and no file or directory is created for it.",
       "type": "object",
       "required": [
         "path"
