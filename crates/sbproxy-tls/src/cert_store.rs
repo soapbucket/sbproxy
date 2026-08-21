@@ -125,6 +125,12 @@ impl CertStore {
     /// publication path does not use it: metadata now travels inside the
     /// bundle record so it cannot describe a generation the store does not
     /// have.
+    // WOR-2635: no production caller remains. The fenced single-record
+    // publish replaced this; the only callers left are the tests that
+    // stage a legacy record to prove migration still reads one. Gating it
+    // to test builds is what stops an unfenced write path from being
+    // reachable again, which is the whole point of the fencing work.
+    #[cfg(test)]
     pub(crate) fn put_meta(&self, hostname: &str, meta: &CertMeta) -> Result<()> {
         let json = serde_json::to_vec(meta)?;
         self.store.put(meta_key(hostname).as_bytes(), &json)?;
@@ -205,8 +211,31 @@ impl CertStore {
         ) else {
             return Ok(Ok(None));
         };
-        if crate::cert_resolver::load_certified_key(&cert_pem, &key_pem).is_err() {
-            return Ok(Err(BundleReject::TornLegacy));
+        // Both halves have to parse AND belong to each other. Parsing
+        // alone proves nothing here: `load_certified_key` reads the chain
+        // and the key independently and never compares them, so a row
+        // whose key was replaced by a later generation's parses perfectly
+        // and then fails every TLS handshake it is served for.
+        // `keys_match` compares the key's SubjectPublicKeyInfo against the
+        // certificate's, which is the thing "these are a pair" means.
+        match crate::cert_resolver::load_certified_key(&cert_pem, &key_pem) {
+            Err(_) => return Ok(Err(BundleReject::TornLegacy)),
+            Ok(certified) => match certified.keys_match() {
+                Ok(()) => {}
+                Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::Unknown)) => {
+                    // The key type cannot produce its public key, so the
+                    // pairing is unprovable rather than disproved. Adopting
+                    // matches the behavior before single-record publishing
+                    // and keeps a working deployment working; the warning is
+                    // what makes the one case we cannot check visible.
+                    tracing::warn!(
+                        target: "sbproxy::tls",
+                        hostname = %hostname,
+                        "legacy certificate row adopted without a key-pair check:                          the signing key cannot produce its public key"
+                    );
+                }
+                Err(_) => return Ok(Err(BundleReject::TornLegacy)),
+            },
         }
         match CertBundle::new(hostname, 0, &cert_pem, &key_pem, meta) {
             Ok(bundle) => Ok(Ok(Some(bundle))),
@@ -222,6 +251,12 @@ impl CertStore {
     /// Crate-internal convenience over [`Self::get_cert_bundle`], which is
     /// what production readers consume so a refusal stays distinguishable
     /// from an absence.
+    // WOR-2635: no production caller remains. The fenced single-record
+    // publish replaced this; the only callers left are the tests that
+    // stage a legacy record to prove migration still reads one. Gating it
+    // to test builds is what stops an unfenced write path from being
+    // reachable again, which is the whole point of the fencing work.
+    #[cfg(test)]
     pub(crate) fn get_cert_and_key(&self, hostname: &str) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         match self.get_cert_bundle(hostname)? {
             Ok(Some(bundle)) => Ok(Some((bundle.cert_pem, bundle.key_pem))),
@@ -247,6 +282,12 @@ impl CertStore {
     /// [`Self::put_cert_bundle_fenced`] so every publication is checked
     /// against the issuance lease. This unfenced form exists for tests and
     /// single-node tooling inside the crate.
+    // WOR-2635: no production caller remains. The fenced single-record
+    // publish replaced this; the only callers left are the tests that
+    // stage a legacy record to prove migration still reads one. Gating it
+    // to test builds is what stops an unfenced write path from being
+    // reachable again, which is the whole point of the fencing work.
+    #[cfg(test)]
     pub(crate) fn put_cert_bundle(
         &self,
         hostname: &str,

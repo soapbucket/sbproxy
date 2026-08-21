@@ -521,16 +521,14 @@ fn from_lease(lease: &Lease) -> LeaseState {
 }
 
 impl LeaseApi for KubeLeaseApi {
-    fn read(&self) -> impl Future<Output = anyhow::Result<Option<LeaseState>>> + Send {
-        async move {
-            Ok(self
-                .api
-                .get_opt(&self.name)
-                .await
-                .map_err(anyhow::Error::from)?
-                .as_ref()
-                .map(from_lease))
-        }
+    async fn read(&self) -> anyhow::Result<Option<LeaseState>> {
+        Ok(self
+            .api
+            .get_opt(&self.name)
+            .await
+            .map_err(anyhow::Error::from)?
+            .as_ref()
+            .map(from_lease))
     }
 
     fn create(
