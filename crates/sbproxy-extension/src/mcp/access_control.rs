@@ -611,11 +611,7 @@ impl<C: QuotaClock> ToolQuotaStore<C> {
                 // process. The global ceiling behind it bounds how
                 // many distinct tenants hold windows at once.
                 if state.tenant_live(&key.tenant_id) >= self.max_tracked_keys_per_tenant {
-                    warn_quota_registry_saturated(
-                        tool,
-                        "tenant",
-                        self.max_tracked_keys_per_tenant,
-                    );
+                    warn_quota_registry_saturated(tool, "tenant", self.max_tracked_keys_per_tenant);
                     sbproxy_observe::metrics::record_mcp_tool_quota_registry_saturated();
                     return Err(QuotaExceeded {
                         tool_name: tool.to_string(),
@@ -632,10 +628,7 @@ impl<C: QuotaClock> ToolQuotaStore<C> {
             // Admitted a new key: charge it to its tenant. This is the
             // only place `counters` grows, so it is the only place the
             // per-tenant count has to move outside `sweep`.
-            *state
-                .per_tenant
-                .entry(key.tenant_id.clone())
-                .or_insert(0) += 1;
+            *state.per_tenant.entry(key.tenant_id.clone()).or_insert(0) += 1;
         }
         let counter = state.counters.entry(key).or_insert_with(|| QuotaCounter {
             window,
