@@ -16,7 +16,7 @@
 //! to the caller; the next call transparently reconnects on demand. There is
 //! no background reconnect task in the MVP - reconnection is lazy.
 //!
-//! # Deadlines (WOR-2637)
+//! # Deadlines
 //!
 //! Every await in the request engine below is bounded twice: by its own
 //! phase cap, and by one overall deadline for the whole call that is fixed
@@ -742,6 +742,13 @@ impl PeerClient {
                 None => MeshConn::Plain(tcp),
             };
             guard.stream = Some(conn);
+            // The recycle clock starts when the socket exists, not when the
+            // first round trip finishes on it. Starting it at the round trip
+            // leaves a connection that never completed one (an encode or
+            // decode failure returns without tearing the stream down) with
+            // `last_used == None` forever, which switches the recycle off for
+            // that connection and hands it straight to the peer's reaper.
+            guard.last_used = Some(Instant::now());
         }
 
         let request_id = guard.next_id;
@@ -1437,6 +1444,47 @@ mod tests {
         (addr, task)
     }
 
+    /// A peer that accepts, counts the connection, and answers every framed
+    /// request with a frame whose body is not a decodable `Response`.
+    ///
+    /// This drives the one path that leaves a connection cached without a
+    /// completed round trip on it: the response frame arrives intact, so the
+    /// socket stays byte-aligned and is deliberately kept, but the decode
+    /// fails and the request never finished.
+    async fn garbling_peer() -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::AtomicUsize;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr").to_string();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        let task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    loop {
+                        if read_frame(&mut stream).await.is_err() {
+                            break;
+                        }
+                        // Eight continuation bytes are an unterminated
+                        // postcard varint, so the `request_id` field alone
+                        // fails before any variant is reached.
+                        if write_frame(&mut stream, &[0xFFu8; 8]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, accepted, task)
+    }
+
     /// A peer that answers every framed request with `Value(None)` and
     /// counts the connections it accepted.
     async fn counting_peer() -> (
@@ -1551,7 +1599,7 @@ mod tests {
         assert_eq!(failures, 100, "a silent peer cannot serve anybody");
         assert!(
             started.elapsed() < Duration::from_secs(5),
-            "the queue behind a wedged peer must not serialise 100 full deadlines, took {:?}",
+            "the queue behind a wedged peer must not serialize 100 full deadlines, took {:?}",
             started.elapsed()
         );
 
@@ -1590,6 +1638,52 @@ mod tests {
             accepted.load(Ordering::SeqCst),
             2,
             "a connection idle past the reuse window must be replaced"
+        );
+
+        peer.abort();
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_never_completed_a_round_trip_still_recycles() {
+        // The recycle clock has to start at the connect, not at the first
+        // successful round trip. A response that arrives framed but does not
+        // decode is kept (the socket is still byte-aligned) and returns an
+        // error, so the connection is cached having completed nothing. Keying
+        // the recycle off the round trip leaves that connection with no
+        // recorded activity, switches the recycle off for it permanently, and
+        // hands it to the peer's five-minute reaper instead.
+        use std::sync::atomic::Ordering;
+
+        let (addr, accepted, peer) = garbling_peer().await;
+        let client = PeerClient::with_timeouts(
+            addr,
+            None,
+            None,
+            PeerTimeouts {
+                idle_reuse_max: Duration::from_millis(100),
+                ..PeerTimeouts::default()
+            },
+        );
+
+        let first = client.get("a".to_string()).await;
+        assert!(
+            first.is_err(),
+            "an undecodable response is not a successful get"
+        );
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "the first call opens exactly one connection"
+        );
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let second = client.get("b".to_string()).await;
+        assert!(second.is_err(), "the peer still garbles every answer");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            2,
+            "a connection idle past the reuse window must be replaced even \
+             though no request ever succeeded on it"
         );
 
         peer.abort();
