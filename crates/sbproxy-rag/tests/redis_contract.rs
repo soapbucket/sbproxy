@@ -288,6 +288,14 @@ async fn run_search(
         .await
 }
 
+/// Runs a search on a background task so two can be in flight over one
+/// cached connection at the same time.
+fn spawn_search(
+    store: Arc<RedisVectorStore>,
+) -> tokio::task::JoinHandle<Result<Vec<sbproxy_rag::RetrievedChunk>, VectorStoreError>> {
+    tokio::spawn(async move { run_search(&store).await })
+}
+
 fn find_command<'a>(commands: &'a [Vec<Vec<u8>>], name: &[u8]) -> Option<&'a Vec<Vec<u8>>> {
     commands.iter().find(|command| {
         command
@@ -651,6 +659,127 @@ async fn redis_reconnect_revalidates_dns_before_dial() {
     assert_eq!(resolver_calls.load(Ordering::SeqCst), 2, "resolver calls");
     assert_eq!(policy_calls.load(Ordering::SeqCst), 2, "policy calls");
     assert_eq!(second_accepts.load(Ordering::SeqCst), 0, "second accepts");
+}
+
+/// A search failing on a socket that died earlier must not evict the
+/// connection a later search already dialed.
+///
+/// Drives `RedisVectorStore::discard_connection`'s generation tag
+/// through the public `search` seam: two searches share the first
+/// connection and both stall, and the second one's timeout lands after a
+/// third search has already dialed and cached a replacement. With an
+/// untagged discard that straggler cleared the slot regardless of which
+/// connection it had failed on, so the replacement was thrown away and
+/// the fourth search dialed a third time.
+#[tokio::test]
+async fn redis_late_failure_keeps_the_replacement_connection() {
+    // The stagger sets how far apart the two stalled searches time out,
+    // which is the window the replacement dial has to land in. The test
+    // asserts that ordering actually held rather than assuming it, so a
+    // machine slow enough to break it fails loudly instead of passing
+    // for the wrong reason.
+    let store_timeout = Duration::from_millis(1500);
+    let stagger = Duration::from_millis(800);
+
+    // First dial: answers connection setup, then never answers a search.
+    let stalling = spawn_resp_fixture(vec![ConnectionScript {
+        search_replies: Vec::new(),
+        after: AfterReplies::StallSilently,
+    }])
+    .await;
+    // Second dial: serves the replacement search, and the fourth search
+    // too once the connection survives the straggler.
+    let replacement = spawn_resp_fixture(vec![ConnectionScript {
+        search_replies: vec![valid_search_reply(), valid_search_reply()],
+        after: AfterReplies::StallSilently,
+    }])
+    .await;
+    // Third dial: must never happen. Counts accepts only.
+    let third_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let third_addr = third_listener.local_addr().unwrap();
+    let third_accepts = Arc::new(AtomicUsize::new(0));
+    let third_accepts_task = Arc::clone(&third_accepts);
+    tokio::spawn(async move {
+        while third_listener.accept().await.is_ok() {
+            third_accepts_task.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+
+    let resolver_calls = Arc::new(AtomicUsize::new(0));
+    let hosts = Arc::new(Mutex::new(Vec::new()));
+    let config = redis_config("redis://redis-fixture.invalid:6390", None, None);
+    let store = Arc::new(
+        RedisVectorStore::from_config_with_resolver(
+            &config,
+            store_timeout,
+            scripted_resolver(
+                vec![
+                    vec![stalling.addr],
+                    vec![replacement.addr],
+                    vec![third_addr],
+                ],
+                Arc::clone(&resolver_calls),
+                hosts,
+            ),
+            allow_all(),
+        )
+        .unwrap(),
+    );
+
+    // The first search dials and stalls. The second joins the same
+    // cached connection `stagger` later and stalls too, so its timeout
+    // lands `stagger` after the first one's.
+    let first = spawn_search(Arc::clone(&store));
+    tokio::time::sleep(stagger).await;
+    let second = spawn_search(Arc::clone(&store));
+
+    assert_eq!(
+        first.await.unwrap().unwrap_err(),
+        VectorStoreError::Timeout,
+        "the first stalled search times out"
+    );
+
+    // Dials the replacement and caches it as the next generation.
+    run_search(&store)
+        .await
+        .expect("the replacement search succeeds");
+    assert!(
+        !second.is_finished(),
+        "fixture ordering broke: the straggler must still be in flight \
+         when the replacement is cached, or this test proves nothing"
+    );
+
+    // The straggler now fails on the generation that is already gone.
+    assert_eq!(
+        second.await.unwrap().unwrap_err(),
+        VectorStoreError::Timeout,
+        "the straggling search times out"
+    );
+
+    // The search after the straggler must reuse the replacement.
+    run_search(&store)
+        .await
+        .expect("the search after the straggler reuses the replacement");
+    assert_eq!(
+        third_accepts.load(Ordering::SeqCst),
+        0,
+        "the straggler's discard evicted the replacement and forced a third dial"
+    );
+    assert_eq!(
+        resolver_calls.load(Ordering::SeqCst),
+        2,
+        "resolver calls: one per real dial, none after the straggler"
+    );
+    assert_eq!(
+        replacement.accepts.load(Ordering::SeqCst),
+        1,
+        "both later searches ran over one replacement connection"
+    );
+    assert_eq!(
+        stalling.accepts.load(Ordering::SeqCst),
+        1,
+        "the stalling fixture was dialed exactly once"
+    );
 }
 
 #[tokio::test]

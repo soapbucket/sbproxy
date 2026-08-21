@@ -1,6 +1,6 @@
 # RAG integration
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-21*
 
 SBproxy supports retrieval-augmented generation on two surfaces, and they
 answer different questions.
@@ -226,6 +226,18 @@ cosine metric, because `min_score` is compared against the store's returned
 score as a cosine similarity. An index built with dot product or Euclidean
 distance returns scores on a different scale and will match too much or
 nothing at all.
+
+The `redis` adapter opens one multiplexed connection on the first search and
+reuses it for every search after that; nothing connects at config load, so a
+validation run never touches your Redis. When Redis drops the socket, the
+search that hits the dead connection fails and the next search reconnects,
+resolving the hostname again and rechecking every address it gets back
+against the same protected-address policy `allow_private_url` governs. A DNS
+record that changes under you therefore cannot steer a reconnect at a
+private address. Searches that were in flight together on a dropped
+connection share one replacement: a search whose failure surfaces late does
+not discard the connection a search after it already opened, so an outage
+costs one reconnect per drop rather than one per failed search.
 
 ### Tenant and static filters
 
