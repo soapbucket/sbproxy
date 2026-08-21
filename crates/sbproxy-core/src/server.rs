@@ -3000,11 +3000,14 @@ async fn check_auth_with_tls_outcome(
             // Synthesize the request shape the RFC 9421 verifier reads
             // method / target-uri / headers from, mirroring bot_auth.
             // The body is empty because auth runs before the body is
-            // buffered; the provider verifies with the safe-by-default
-            // form, so a signature covering `content-digest` on a
-            // body-bearing request fails closed rather than passing
-            // unverified (body-digest binding is the WOR-2518
-            // follow-up).
+            // buffered, so the provider verifies with the deferring form
+            // and the `content-digest` binding is completed against the
+            // real body in the request body filter, armed by
+            // `request_phase::arm_deferred_body_digest_binding`. Handing
+            // these empty bytes to the enforcing form instead compares
+            // the covered digest against zero bytes, which refuses an
+            // honest client and admits one declaring the empty-body
+            // digest.
             let target_uri = match query {
                 Some(q) if !q.is_empty() => format!("{}?{}", path, q),
                 _ => path.to_string(),

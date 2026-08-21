@@ -1536,6 +1536,87 @@ hooks:
         assert!(compile_auth(&json).is_err());
     }
 
+    /// Extract the `type:` string literals from the match arms of
+    /// `compile_auth_with_optional_registry`, in source order.
+    ///
+    /// Reads them out of this file rather than a retyped list, so a new
+    /// arm is picked up automatically. The scan runs from the function's
+    /// signature to its catch-all `other =>` arm and, on every line
+    /// carrying a `=>`, collects the quoted literals to the left of it.
+    /// That is exactly the shape of an arm pattern, including the
+    /// alternations (`"bearer" | "bearer_token"`).
+    fn compile_auth_arm_type_names(source: &str) -> Vec<&str> {
+        let start = source
+            .find("fn compile_auth_with_optional_registry")
+            .expect("compile_auth_with_optional_registry is defined in this file");
+        let mut names = Vec::new();
+        for line in source[start..].lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("other =>") {
+                break;
+            }
+            let Some((pattern, _)) = line.split_once("=>") else {
+                continue;
+            };
+            let mut rest = pattern;
+            while let Some(open) = rest.find('"') {
+                let after = &rest[open + 1..];
+                let Some(close) = after.find('"') else { break };
+                names.push(&after[..close]);
+                rest = &after[close + 1..];
+            }
+        }
+        names
+    }
+
+    /// The OSS auth catalog must name every type `compile_auth`
+    /// compiles, and nothing it does not.
+    ///
+    /// `sbproxy_config::validate::KNOWN_AUTH_TYPES` does two jobs, and a
+    /// missing entry breaks both. `sbproxy validate` warns that an
+    /// unlisted type "is not in the OSS catalog (will fail at
+    /// runtime)", which is false for a type this function compiles;
+    /// `ldap_auth` shipped that way, so the repo's own
+    /// `examples/auth-ldap/sb.yml` drew a warning it did not deserve.
+    /// And `reserved_builtin_hook_names()` derives its reservation set
+    /// from the same list, so an unlisted type stops reserving its own
+    /// name and a bundle can shadow a built-in auth hook, which
+    /// WOR-2426 forbids.
+    ///
+    /// Set equality in both directions, so neither a new arm nor a
+    /// removed one can land without the catalog moving with it.
+    #[test]
+    fn known_auth_types_match_compile_auth_arms() {
+        use std::collections::BTreeSet;
+
+        let arms: BTreeSet<&str> = compile_auth_arm_type_names(include_str!("compile.rs"))
+            .into_iter()
+            .collect();
+        assert!(
+            arms.len() >= 14,
+            "the source scan found only {} arms ({arms:?}); the scan is broken, \
+             not the catalog",
+            arms.len()
+        );
+        let known: BTreeSet<&str> = sbproxy_config::validate::KNOWN_AUTH_TYPES
+            .iter()
+            .copied()
+            .collect();
+
+        let missing: Vec<&&str> = arms.difference(&known).collect();
+        assert!(
+            missing.is_empty(),
+            "compile_auth accepts these auth types but KNOWN_AUTH_TYPES omits them, so \
+             `sbproxy validate` warns they will fail at runtime and \
+             reserved_builtin_hook_names() lets a bundle shadow them: {missing:?}"
+        );
+        let stale: Vec<&&str> = known.difference(&arms).collect();
+        assert!(
+            stale.is_empty(),
+            "KNOWN_AUTH_TYPES names auth types compile_auth has no arm for: {stale:?}"
+        );
+    }
+
     // --- compile_auth composition (WOR-2517) ---
 
     #[test]

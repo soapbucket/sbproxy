@@ -135,6 +135,8 @@ pub const KNOWN_AUTH_TYPES: &[&str] = &[
     "hmac_auth",
     "forward_auth",
     "forward",
+    "ldap_auth",
+    "ldap",
     "bot_auth",
     "web_bot_auth",
     "cap",
@@ -1278,6 +1280,40 @@ origins:
             .collect();
         assert_eq!(unknown.len(), 1, "got findings: {findings:?}");
         assert_eq!(unknown[0].severity, Severity::Warn);
+    }
+
+    #[test]
+    fn ldap_auth_and_its_alias_validate_clean() {
+        // `ldap_auth` / `ldap` shipped missing from KNOWN_AUTH_TYPES, so
+        // `sbproxy validate` told operators the type "will fail at
+        // runtime" for a provider `compile_auth` builds happily. The
+        // repo's own examples/auth-ldap/sb.yml drew the warning.
+        for type_name in ["ldap_auth", "ldap"] {
+            let yaml = format!(
+                r#"
+origins:
+  intranet.example.com:
+    action:
+      type: proxy
+      url: https://upstream.example.com
+    authentication:
+      type: {type_name}
+      url: ldaps://directory.internal:636
+      base_dn: ou=users,dc=example,dc=org
+"#
+            );
+            let cfg = parse(&yaml);
+            let findings = validate(&cfg, &ValidationOptions::default());
+            let unknown: Vec<_> = findings
+                .iter()
+                .filter(|f| f.rule_id == "unknown-auth-type")
+                .collect();
+            assert!(
+                unknown.is_empty(),
+                "`{type_name}` is a built-in auth type and must validate clean; \
+                 got findings: {findings:?}"
+            );
+        }
     }
 
     #[test]

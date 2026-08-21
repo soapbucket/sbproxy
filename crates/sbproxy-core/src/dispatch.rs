@@ -75,7 +75,14 @@ pub async fn dispatch_h3_request(
 
     // --- 3. Auth check ---
     if let Some(auth) = pipeline.auths.get(origin_idx).and_then(|a| a.as_ref()) {
-        let authorized = check_auth(auth, &headers, &uri, &method).await;
+        let authorized = check_auth(
+            auth,
+            &headers,
+            &uri,
+            &method,
+            body.as_deref().unwrap_or(&[]),
+        )
+        .await;
         if !authorized {
             debug!(hostname = %hostname, "H3: auth failed");
             let mut resp = text_response(401, "Unauthorized");
@@ -139,6 +146,30 @@ async fn handle_acme_challenge(path: &str) -> Result<HttpResponse> {
 
 // --- Auth checking ---
 
+/// Complete the `content-digest` half of an RFC 9421 proof against the
+/// bytes that actually arrived.
+///
+/// The H1/H2 path defers this to the request body filter, which has the
+/// buffered body; the H3 dispatch holds the body already and has no such
+/// filter behind it, so it finishes the proof inline. Returns `true`
+/// when the signature covers no `content-digest` (there is nothing to
+/// bind) and fails closed on a covered digest whose header is absent or
+/// does not describe `body`.
+///
+/// `repr-digest` is accepted alongside `content-digest` to match
+/// `trust_tier::verify_and_finalize_body_proof`, so the two paths cannot
+/// disagree about what counts as a body proof.
+fn signature_body_binding_holds(headers: &http::HeaderMap, body: &[u8]) -> bool {
+    if !sbproxy_middleware::signatures::signature_input_covers_content_digest(headers) {
+        return true;
+    }
+    headers
+        .get("content-digest")
+        .or_else(|| headers.get("repr-digest"))
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| sbproxy_middleware::digest::verify_content_digest(value, body))
+}
+
 /// Returns true if the request passes the configured auth check, false otherwise.
 ///
 /// Async because JWT validation can refetch a rotated JWKS key set over
@@ -149,6 +180,7 @@ async fn check_auth(
     headers: &http::HeaderMap,
     uri: &http::Uri,
     method: &http::Method,
+    body: &[u8],
 ) -> bool {
     let query = uri.query();
     match auth {
@@ -165,20 +197,38 @@ async fn check_auth(
             digest.check_request(headers, method.as_str())
         }
         Auth::Hmac(h) => {
-            // RFC 9421 verification needs only method + uri + headers,
-            // all of which the H3 dispatch has, so it verifies for real
-            // here rather than failing closed like the providers that
-            // need wiring the H3 path lacks. The body is empty for the
-            // same reason as the H1/H2 path: a signature covering
-            // `content-digest` on a body-bearing request fails closed.
+            // RFC 9421 verification needs method + uri + headers, all of
+            // which the H3 dispatch has, so it verifies for real here
+            // rather than failing closed like the providers that need
+            // wiring the H3 path lacks.
+            //
+            // Unlike the H1/H2 path, this one already holds the complete
+            // body, and there is no request body filter downstream to
+            // defer to. So both halves of the proof happen here:
+            // `HmacAuth::verify` checks the covered components and
+            // `signature_body_binding_holds` completes the
+            // `content-digest` binding against the bytes that arrived.
+            // Dropping the second half would make body coverage a no-op
+            // on this path, which is worse than the empty-body compare
+            // it replaced.
             let builder = http::Request::builder()
                 .method(method.clone())
                 .uri(uri.clone());
-            match builder.body(bytes::Bytes::new()) {
+            match builder.body(bytes::Bytes::copy_from_slice(body)) {
                 Ok(mut req) => {
                     *req.headers_mut() = headers.clone();
                     match h.verify(&req) {
-                        sbproxy_modules::auth::HmacVerdict::Verified { .. } => true,
+                        sbproxy_modules::auth::HmacVerdict::Verified { .. } => {
+                            if signature_body_binding_holds(headers, body) {
+                                true
+                            } else {
+                                warn!(
+                                    "H3: hmac_auth signature verified but its covered \
+                                     content-digest does not describe the request body; denying"
+                                );
+                                false
+                            }
+                        }
                         verdict => {
                             debug!(?verdict, "H3: hmac_auth verification failed");
                             false
@@ -252,7 +302,7 @@ async fn check_auth(
             // its turn. Boxed because async recursion needs a pinned
             // future.
             for provider in providers {
-                if Box::pin(check_auth(provider, headers, uri, method)).await {
+                if Box::pin(check_auth(provider, headers, uri, method, body)).await {
                     return true;
                 }
             }
@@ -1200,11 +1250,92 @@ mod tests {
         let headers = http::HeaderMap::new();
         let uri: http::Uri = "/protected".parse().unwrap();
 
-        let authorized = check_auth(&auth, &headers, &uri, &http::Method::GET).await;
+        let authorized = check_auth(&auth, &headers, &uri, &http::Method::GET, b"").await;
 
         assert!(
             !authorized,
             "forward_auth over H3 must fail closed (return false), not bypass auth"
+        );
+    }
+
+    // --- hmac_auth body binding over H3 ---
+    //
+    // The H1/H2 path defers the `content-digest` half of the proof to
+    // the request body filter. This path has no filter behind it and
+    // already holds the body, so it has to finish the proof itself. If
+    // it does not, routing `hmac_auth` through the deferring verifier
+    // turns body coverage into a no-op here.
+
+    /// Sign `POST /v1/transfer` over method, target-uri, and
+    /// content-digest, returning the header set a client would send.
+    fn h3_signed_headers(secret_hex: &str, key_id: &str, digest: &str) -> http::HeaderMap {
+        use base64::Engine as _;
+        use hmac::{KeyInit as _, Mac as _};
+        use sha2::Sha256;
+        type HmacSha256 = hmac::Hmac<Sha256>;
+
+        let created = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let raw_input = format!(
+            "sig1=(\"@method\" \"@target-uri\" \"content-digest\");created={created};\
+             keyid=\"{key_id}\";alg=\"hmac-sha256\""
+        )
+        .replace("\n", "")
+        .replace("             ", "");
+        let entry = sbproxy_middleware::signatures::parse_signature_input(&raw_input)
+            .unwrap()
+            .pop()
+            .unwrap()
+            .1;
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("/v1/transfer")
+            .header("content-digest", digest)
+            .body(bytes::Bytes::new())
+            .unwrap();
+        let base = sbproxy_middleware::signatures::build_signature_base(&req, &entry).unwrap();
+        let mut mac = HmacSha256::new_from_slice(&hex::decode(secret_hex).unwrap()).unwrap();
+        mac.update(base.as_bytes());
+        let sig = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("signature-input", raw_input.parse().unwrap());
+        headers.insert("signature", format!("sig1=:{sig}:").parse().unwrap());
+        headers.insert("content-digest", digest.parse().unwrap());
+        headers
+    }
+
+    #[tokio::test]
+    async fn h3_hmac_auth_binds_a_covered_digest_to_the_body_it_received() {
+        const SIGNED_BODY: &[u8] = br#"{"to":"acct-1091","amount":"25.00"}"#;
+        const SUBSTITUTED_BODY: &[u8] = br#"{"to":"acct-9999","amount":"250000.00"}"#;
+
+        let secret_hex = "00112233445566778899aabbccddeeff";
+        let key_id = "svc-billing";
+        let auth = sbproxy_modules::compile::compile_auth(&serde_json::json!({
+            "type": "hmac_auth",
+            "keys": [{"key_id": key_id, "secret": secret_hex}],
+        }))
+        .expect("hmac provider compiles");
+
+        let digest = sbproxy_middleware::digest::compute_content_digest(
+            sbproxy_middleware::digest::Algorithm::Sha256,
+            SIGNED_BODY,
+        );
+        let headers = h3_signed_headers(secret_hex, key_id, &digest);
+        let uri: http::Uri = "/v1/transfer".parse().unwrap();
+        let method = http::Method::POST;
+
+        assert!(
+            check_auth(&auth, &headers, &uri, &method, SIGNED_BODY).await,
+            "the body the signature covered must be admitted"
+        );
+        assert!(
+            !check_auth(&auth, &headers, &uri, &method, SUBSTITUTED_BODY).await,
+            "H3 holds the body and has no filter behind it, so a substituted body \
+             must be refused here or the covered digest means nothing"
         );
     }
 
@@ -1222,20 +1353,20 @@ mod tests {
         let mut with_key = http::HeaderMap::new();
         with_key.insert("x-api-key", "h3-key".parse().unwrap());
         assert!(
-            check_auth(&auth, &with_key, &uri, &http::Method::GET).await,
+            check_auth(&auth, &with_key, &uri, &http::Method::GET, b"").await,
             "the first provider's credential must be accepted"
         );
 
         let mut with_token = http::HeaderMap::new();
         with_token.insert("authorization", "Bearer h3-token".parse().unwrap());
         assert!(
-            check_auth(&auth, &with_token, &uri, &http::Method::GET).await,
+            check_auth(&auth, &with_token, &uri, &http::Method::GET, b"").await,
             "the second provider's credential must be accepted"
         );
 
         let empty = http::HeaderMap::new();
         assert!(
-            !check_auth(&auth, &empty, &uri, &http::Method::GET).await,
+            !check_auth(&auth, &empty, &uri, &http::Method::GET, b"").await,
             "a request neither provider accepts must be denied"
         );
     }

@@ -2951,14 +2951,18 @@ impl ProxyHttp for SbProxy {
                 &inbound_body,
                 ctx,
             ) {
+                warn!(
+                    provider = %ctx.principal.source.as_str(),
+                    "content-digest body binding failed on the GraphQL inbound body; refusing"
+                );
                 let body = serde_json::json!({
-                    "error": "bot_auth: content-digest body mismatch",
+                    "error": "signature: content-digest body mismatch",
                 })
                 .to_string();
                 ctx.validator_failed = Some((401, body, "application/json".to_string()));
                 return Err(pingora_error::Error::explain(
                     pingora_error::ErrorType::HTTPStatus(401),
-                    "bot_auth: content-digest body binding failed",
+                    "signature: content-digest body binding failed",
                 ));
             }
 
@@ -4911,15 +4915,24 @@ impl ProxyHttp for SbProxy {
                     &session.req_header().headers,
                     &collected,
                 ) {
-                    debug!("bot_auth content-digest body binding check failed; rejecting request");
+                    // `warn!`, not `debug!`: this is the forgery this
+                    // binding exists to catch, and `release_max_level_info`
+                    // compiles `debug!` out, so at debug the shipped binary
+                    // records a refused body-bound signature as nothing at
+                    // all. Carries no digest values and no body length, which
+                    // would hand a prober a size oracle.
+                    warn!(
+                        provider = %ctx.principal.source.as_str(),
+                        "content-digest body binding failed; refusing request"
+                    );
                     let body_str = serde_json::json!({
-                        "error": "bot_auth: content-digest body mismatch",
+                        "error": "signature: content-digest body mismatch",
                     })
                     .to_string();
                     ctx.validator_failed = Some((401, body_str, "application/json".into()));
                     return Err(pingora_error::Error::explain(
                         pingora_error::ErrorType::HTTPStatus(401),
-                        "bot_auth: content-digest body binding failed",
+                        "signature: content-digest body binding failed",
                     ));
                 }
                 let pipeline = ctx.pipeline.clone();
