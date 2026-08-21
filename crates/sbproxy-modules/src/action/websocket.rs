@@ -14,7 +14,7 @@ use super::ForwardingHeaderControls;
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 
 /// Largest payload RFC 6455 section 5.5 permits on a control frame.
-const MAX_CONTROL_FRAME_PAYLOAD: u64 = 125;
+pub const MAX_CONTROL_FRAME_PAYLOAD: u64 = 125;
 
 fn default_max_message_size() -> usize {
     DEFAULT_MAX_MESSAGE_SIZE

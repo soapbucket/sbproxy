@@ -27,6 +27,16 @@ pub(super) async fn handle_action(
     origin_idx: Option<usize>,
     ctx: &mut RequestContext,
 ) -> Result<bool> {
+    // WOR-2565: route settlement. Both settlement sites (a matched
+    // forward rule and the origin's own action) enter through here
+    // exactly once per request, so this is where a deprecated route
+    // counts its callers and where the post-sunset `gone` posture
+    // refuses with 410 before any action work happens.
+    if let Some(idx) = origin_idx {
+        if deprecation::enforce_at_route(session, pipeline, idx, ctx).await? {
+            return Ok(true);
+        }
+    }
     match action {
         Action::Proxy(_) | Action::LoadBalancer(_) | Action::A2a(_) => Ok(false),
 
@@ -2909,6 +2919,397 @@ origins:
         assert!(
             logs.contains("assertion passed") && logs.contains("static-answers-200"),
             "an assertion policy must evaluate against a generated response: {logs}"
+        );
+    }
+
+    // --- WOR-2565: API deprecation announcements ---
+    //
+    // The `deprecation:` block must reach the wire on generated
+    // responses (static, mock, redirect answer in the request phase
+    // and never see Pingora's `response_filter`), the per-rule block
+    // must scope to the requests its rule matches, and the
+    // `after_sunset` posture must gate at route settlement.
+
+    #[tokio::test]
+    async fn origin_deprecation_block_stamps_all_four_headers() {
+        let pipeline = pipeline_from_yaml(
+            r#"
+origins:
+  "dep-origin.test":
+    deprecation:
+      deprecated: 2026-09-01
+      sunset: 2026-12-31T23:59:59Z
+      successor: https://api.example.com/v2/
+      link: https://developer.example.com/deprecation
+    action:
+      type: static
+      status: 200
+      content_type: text/plain
+      body: "ok"
+"#,
+        );
+
+        let (result, wire) = exchange(&pipeline.actions[0], &pipeline, Some(0)).await;
+
+        assert!(result.expect("static action must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        let lower = response.to_ascii_lowercase();
+        // Byte-exact wire forms: RFC 9745 structured-field Date,
+        // RFC 8594 IMF-fixdate, RFC 8288 Link relations.
+        assert!(
+            lower.contains("deprecation: @1788220800"),
+            "response: {response}"
+        );
+        assert!(
+            lower.contains("sunset: thu, 31 dec 2026 23:59:59 gmt"),
+            "response: {response}"
+        );
+        assert!(
+            lower.contains("link: <https://api.example.com/v2/>; rel=\"successor-version\""),
+            "response: {response}"
+        );
+        assert!(
+            lower
+                .contains("link: <https://developer.example.com/deprecation>; rel=\"deprecation\""),
+            "response: {response}"
+        );
+    }
+
+    /// The YAML fixture for the per-rule scoping tests: `/v1/*` is
+    /// deprecated, `/v2/*` on the same origin is not, and the origin
+    /// itself carries no block.
+    fn per_rule_pipeline() -> CompiledPipeline {
+        pipeline_from_yaml(
+            r#"
+origins:
+  "dep-rules.test":
+    action:
+      type: static
+      status: 200
+      content_type: text/plain
+      body: "root"
+    forward_rules:
+      - rules:
+          - path:
+              prefix: /v1/
+        deprecation:
+          deprecated: 2026-09-01
+          sunset: 2026-12-31
+        origin:
+          id: v1-legacy
+          action:
+            type: static
+            status: 200
+            content_type: text/plain
+            body: "v1"
+      - rules:
+          - path:
+              prefix: /v2/
+        origin:
+          id: v2
+          action:
+            type: static
+            status: 200
+            content_type: text/plain
+            body: "v2"
+"#,
+        )
+    }
+
+    #[tokio::test]
+    async fn forward_rule_deprecation_scopes_to_the_matching_rule() {
+        let pipeline = per_rule_pipeline();
+
+        // A request the deprecated /v1/ rule matched.
+        let (result, wire) = exchange_with(
+            &pipeline.forward_rules[0][0].action,
+            &pipeline,
+            Some(0),
+            b"GET /v1/jobs HTTP/1.1\r\nHost: dep-rules.test\r\nconnection: close\r\n\r\n",
+            |ctx| ctx.forward_rule_idx = Some(0),
+        )
+        .await;
+        assert!(result.expect("v1 static action must dispatch"));
+        let v1 = String::from_utf8(wire)
+            .expect("HTTP response is UTF-8")
+            .to_ascii_lowercase();
+        assert!(v1.contains("deprecation: @1788220800"), "response: {v1}");
+        assert!(
+            v1.contains("sunset: thu, 31 dec 2026 00:00:00 gmt"),
+            "response: {v1}"
+        );
+
+        // A request the undeprecated /v2/ rule matched: same origin,
+        // no headers.
+        let (result, wire) = exchange_with(
+            &pipeline.forward_rules[0][1].action,
+            &pipeline,
+            Some(0),
+            b"GET /v2/jobs HTTP/1.1\r\nHost: dep-rules.test\r\nconnection: close\r\n\r\n",
+            |ctx| ctx.forward_rule_idx = Some(1),
+        )
+        .await;
+        assert!(result.expect("v2 static action must dispatch"));
+        let v2 = String::from_utf8(wire)
+            .expect("HTTP response is UTF-8")
+            .to_ascii_lowercase();
+        assert!(
+            !v2.contains("deprecation:") && !v2.contains("sunset:"),
+            "the /v2/ rule must not inherit the /v1/ rule's block: {v2}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deprecated_route_hits_increment_the_usage_counter() {
+        let pipeline = per_rule_pipeline();
+        let counter = || {
+            sbproxy_observe::metrics::metrics()
+                .deprecated_requests_total
+                .with_label_values(&["dep-rules.test", "v1-legacy", "false", "served"])
+                .get()
+        };
+        let before = counter();
+
+        let (result, _) = exchange_with(
+            &pipeline.forward_rules[0][0].action,
+            &pipeline,
+            Some(0),
+            b"GET /v1/jobs HTTP/1.1\r\nHost: dep-rules.test\r\nconnection: close\r\n\r\n",
+            |ctx| {
+                ctx.hostname = "dep-rules.test".into();
+                ctx.forward_rule_idx = Some(0);
+            },
+        )
+        .await;
+        assert!(result.expect("v1 static action must dispatch"));
+        assert_eq!(
+            counter(),
+            before + 1,
+            "a deprecated-route hit must increment sbproxy_deprecated_requests_total"
+        );
+
+        // The undeprecated sibling rule must not count under any label.
+        let untouched = counter();
+        let (result, _) = exchange_with(
+            &pipeline.forward_rules[0][1].action,
+            &pipeline,
+            Some(0),
+            b"GET /v2/jobs HTTP/1.1\r\nHost: dep-rules.test\r\nconnection: close\r\n\r\n",
+            |ctx| {
+                ctx.hostname = "dep-rules.test".into();
+                ctx.forward_rule_idx = Some(1);
+            },
+        )
+        .await;
+        assert!(result.expect("v2 static action must dispatch"));
+        assert_eq!(
+            counter(),
+            untouched,
+            "an undeprecated route must not increment the counter"
+        );
+    }
+
+    #[tokio::test]
+    async fn past_sunset_hits_count_with_the_past_sunset_label() {
+        // The sunset instant is long past; the default `serve` posture
+        // keeps answering, and the counter's `past_sunset` label says
+        // the caller is a straggler.
+        let pipeline = pipeline_from_yaml(
+            r#"
+origins:
+  "dep-straggler.test":
+    deprecation:
+      deprecated: 2020-01-01
+      sunset: 2020-06-01
+    action:
+      type: static
+      status: 200
+      content_type: text/plain
+      body: "still here"
+"#,
+        );
+        // `served` and `gone` are the same `past_sunset="true"` series
+        // without the outcome label, which is the conflation the fix
+        // round removed: an operator running both postures could not
+        // count who was actually being cut off.
+        let counter = |outcome: &str| {
+            sbproxy_observe::metrics::metrics()
+                .deprecated_requests_total
+                .with_label_values(&["dep-straggler.test", "", "true", outcome])
+                .get()
+        };
+        let before = counter("served");
+        let before_gone = counter("gone");
+
+        let (result, wire) = exchange_with(
+            &pipeline.actions[0],
+            &pipeline,
+            Some(0),
+            DEFAULT_TEST_REQUEST,
+            |ctx| ctx.hostname = "dep-straggler.test".into(),
+        )
+        .await;
+
+        assert!(result.expect("static action must dispatch"));
+        let response = String::from_utf8(wire)
+            .expect("HTTP response is UTF-8")
+            .to_ascii_lowercase();
+        assert!(
+            response.starts_with("http/1.1 200"),
+            "the default posture keeps serving past sunset: {response}"
+        );
+        assert!(
+            response.contains("sunset: mon, 01 jun 2020 00:00:00 gmt"),
+            "headers still announce the (elapsed) sunset: {response}"
+        );
+        assert_eq!(
+            counter("served"),
+            before + 1,
+            "a straggler served past sunset counts as past_sunset=true, outcome=served"
+        );
+        assert_eq!(
+            counter("gone"),
+            before_gone,
+            "the default posture served this request; nothing may land on outcome=gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn after_sunset_gone_refuses_with_410_and_headers() {
+        let pipeline = pipeline_from_yaml(
+            r#"
+origins:
+  "dep-gone.test":
+    deprecation:
+      deprecated: 2020-01-01
+      sunset: 2020-06-01
+      after_sunset: gone
+      successor: https://api.example.com/v2/
+    action:
+      type: static
+      status: 200
+      content_type: text/plain
+      body: "unreachable"
+"#,
+        );
+
+        // Fix round on the #1177 review: the refusal is enforcement, so
+        // it has to be countable AS a refusal and it has to reach the
+        // audit channel. Before the fix `past_sunset="true"` was the
+        // only signal and it counted served and refused hits on one
+        // series, and the 410 reached no audit channel, no event, and
+        // no log line at any level.
+        let counter = |outcome: &str| {
+            sbproxy_observe::metrics::metrics()
+                .deprecated_requests_total
+                .with_label_values(&["dep-gone.test", "", "true", outcome])
+                .get()
+        };
+        let before_gone = counter("gone");
+        let before_served = counter("served");
+
+        let (result, wire) = exchange_with(
+            &pipeline.actions[0],
+            &pipeline,
+            Some(0),
+            DEFAULT_TEST_REQUEST,
+            |ctx| {
+                ctx.hostname = "dep-gone.test".into();
+                ctx.request_id = "req-gone-dispatch-1".into();
+            },
+        )
+        .await;
+
+        assert!(result.expect("the gate must short-circuit the request"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        let lower = response.to_ascii_lowercase();
+        assert!(
+            lower.starts_with("http/1.1 410"),
+            "past-sunset `gone` must answer 410: {response}"
+        );
+        assert_eq!(
+            counter("gone"),
+            before_gone + 1,
+            "a 410 refusal must be countable as a refusal, not folded in with served hits"
+        );
+        assert_eq!(
+            counter("served"),
+            before_served,
+            "a refused request must never land on outcome=served"
+        );
+        let audited = sbproxy_observe::audit_ring::recent_audit_events(
+            64,
+            Some("security"),
+            Some("api_deprecation"),
+            None,
+        );
+        assert!(
+            audited
+                .iter()
+                .any(|event| event.request_id.as_deref() == Some("req-gone-dispatch-1")),
+            "the 410 refusal must reach the security audit channel from the real gate, not              only from a direct call to the helper"
+        );
+        assert!(
+            !response.contains("unreachable"),
+            "the static body must not be served: {response}"
+        );
+        assert!(
+            lower.contains("sunset: mon, 01 jun 2020 00:00:00 gmt"),
+            "the refusal still carries the headers: {response}"
+        );
+        assert!(
+            lower.contains("link: <https://api.example.com/v2/>; rel=\"successor-version\""),
+            "the refusal still carries the successor link: {response}"
+        );
+        assert!(
+            response.contains("\"successor\":\"https://api.example.com/v2/\""),
+            "the body must name the successor: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spec_staged_deprecation_stamps_generated_responses() {
+        // The `openapi_validation` enforcer stages a spec-driven match
+        // on the context; the response path must honor it exactly like
+        // a config block.
+        let pipeline = pipeline_from_yaml(
+            r#"
+origins:
+  "dep-spec.test":
+    action:
+      type: static
+      status: 200
+      content_type: text/plain
+      body: "ok"
+"#,
+        );
+        let compiled = sbproxy_config::compile_deprecation(
+            &serde_yaml::from_str("deprecated: 2026-09-01\n").expect("fixture block"),
+            "test fixture",
+        )
+        .expect("fixture compiles");
+
+        let (result, wire) = exchange_with(
+            &pipeline.actions[0],
+            &pipeline,
+            Some(0),
+            DEFAULT_TEST_REQUEST,
+            |ctx| {
+                ctx.openapi_deprecation = Some(crate::context::SpecDeprecation {
+                    template: "/jobs".to_string(),
+                    config: std::sync::Arc::new(compiled),
+                });
+            },
+        )
+        .await;
+
+        assert!(result.expect("static action must dispatch"));
+        let response = String::from_utf8(wire)
+            .expect("HTTP response is UTF-8")
+            .to_ascii_lowercase();
+        assert!(
+            response.contains("deprecation: @1788220800"),
+            "a spec-staged match must stamp the header: {response}"
         );
     }
 }

@@ -389,6 +389,11 @@ fn compile_policy_with_optional_registry(
         "request_validator" => Ok(Policy::RequestValidator(
             crate::policy::RequestValidatorPolicy::from_config(config.clone())?,
         )),
+        // WOR-2563: structural JSON/XML body threat limits, the
+        // shape-enforcement complement to the WAF's signature rules.
+        "body_threat_protection" => Ok(Policy::BodyThreatProtection(
+            crate::policy::BodyThreatProtectionPolicy::from_config(config.clone())?,
+        )),
         "content_digest" => Ok(Policy::ContentDigest(
             crate::policy::ContentDigestPolicy::from_config(config.clone())?,
         )),

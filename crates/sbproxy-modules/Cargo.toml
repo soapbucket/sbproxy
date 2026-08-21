@@ -104,6 +104,8 @@ prometheus.workspace = true
 
 arc-swap.workspace = true
 bytes.workspace = true
+# WOR-2563: XML structural scan in `policy/body_threat_protection.rs`.
+quick-xml.workspace = true
 compact_str.workspace = true
 semver.workspace = true
 serde.workspace = true

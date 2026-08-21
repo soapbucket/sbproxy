@@ -49,6 +49,46 @@ pub struct RecordBudget {
     pub max_cost_usd: Option<f64>,
 }
 
+/// A temporary, auto-expiring raise on top of a key's base budget (WOR-2561).
+///
+/// The override never replaces the base [`RecordBudget`]: while
+/// `expires_at` is in the future the effective cap is the base cap plus the
+/// increase, and once the instant passes the base cap applies again with no
+/// operator action and no background sweeper. Expiry is evaluated wherever
+/// the budget is read (see [`KeyRecord::effective_budget`]), so a restart
+/// changes nothing: an unexpired persisted override keeps applying and an
+/// expired one is ignored.
+///
+/// An older node that replicates this record as JSON drops the field it does
+/// not know, which here fails closed: the key falls back to its tighter base
+/// cap. That is why this field needs no fleet capability gate the way
+/// `credential_id` does.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BudgetOverride {
+    /// Extra total tokens granted on top of `budget.max_tokens`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens_increase: Option<u64>,
+    /// Extra USD granted on top of `budget.max_cost_usd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost_usd_increase: Option<f64>,
+    /// Instant the raise stops applying. Compared lazily at read time.
+    pub expires_at: DateTime<Utc>,
+    /// Audit identity of the operator who granted the raise. Never a secret.
+    pub granted_by: String,
+    /// When the raise was granted.
+    pub granted_at: DateTime<Utc>,
+    /// Optional operator note ("launch-day spike", a ticket id, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl BudgetOverride {
+    /// Whether the raise still applies at `now`.
+    pub fn is_active(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at > now
+    }
+}
+
 fn default_hash_alg() -> String {
     "hmac-sha256.v1".to_string()
 }
@@ -98,6 +138,10 @@ pub struct KeyRecord {
     /// Per-key budget caps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<RecordBudget>,
+    /// Temporary, auto-expiring raise on top of [`Self::budget`] (WOR-2561).
+    /// Granted and cleared through the admin API, never by the config seed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_override: Option<BudgetOverride>,
     /// Models this key may use (empty = all).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_models: Vec<String>,
@@ -214,6 +258,7 @@ impl KeyRecord {
             max_tokens_per_minute: None,
             priority: None,
             budget: None,
+            budget_override: None,
             allowed_models: Vec::new(),
             blocked_models: Vec::new(),
             allowed_providers: Vec::new(),
@@ -260,6 +305,44 @@ impl KeyRecord {
             }
         }
         false
+    }
+
+    /// The budget override, if one is present and unexpired at `now`.
+    pub fn active_budget_override(&self, now: DateTime<Utc>) -> Option<&BudgetOverride> {
+        self.budget_override
+            .as_ref()
+            .filter(|grant| grant.is_active(now))
+    }
+
+    /// The budget the enforcement path must compare against at `now`
+    /// (WOR-2561).
+    ///
+    /// This is the one choke point for override arithmetic: the request-path
+    /// policy lowering, the admin usage snapshot, and the effective-policy
+    /// preview all read the budget through here, so the cap an operator
+    /// previews and the cap a request is held to cannot disagree.
+    ///
+    /// With no override, or an expired one, this is the base
+    /// [`Self::budget`] unchanged. While an override is active, each capped
+    /// axis of the base budget is raised by the override's increase for that
+    /// axis (saturating). An axis the base budget leaves uncapped stays
+    /// uncapped: unlimited plus an increase is still unlimited, and a raise
+    /// must never introduce a cap that was not there. A record with no base
+    /// budget at all has nothing to raise, so the result stays `None`; the
+    /// admin API refuses to grant such an override in the first place.
+    pub fn effective_budget(&self, now: DateTime<Utc>) -> Option<RecordBudget> {
+        let base = self.budget.clone()?;
+        let Some(grant) = self.active_budget_override(now) else {
+            return Some(base);
+        };
+        Some(RecordBudget {
+            max_tokens: base
+                .max_tokens
+                .map(|tokens| tokens.saturating_add(grant.max_tokens_increase.unwrap_or_default())),
+            max_cost_usd: base
+                .max_cost_usd
+                .map(|usd| usd + grant.max_cost_usd_increase.unwrap_or_default()),
+        })
     }
 
     /// Whether `model` is permitted by this record's allow/block lists.
@@ -557,6 +640,100 @@ mod tests {
         });
         let r: KeyRecord = serde_json::from_value(legacy).unwrap();
         assert!(r.credential_id.is_none());
+    }
+
+    fn override_grant(expires_at: DateTime<Utc>) -> BudgetOverride {
+        BudgetOverride {
+            max_tokens_increase: Some(5_000),
+            max_cost_usd_increase: Some(10.0),
+            expires_at,
+            granted_by: "casey".into(),
+            granted_at: now(),
+            reason: Some("launch-day spike".into()),
+        }
+    }
+
+    #[test]
+    fn an_active_override_raises_each_capped_axis_and_expiry_restores_the_base() {
+        let mut r = KeyRecord::new("id", "hash", now());
+        r.budget = Some(RecordBudget {
+            max_tokens: Some(1_000),
+            max_cost_usd: Some(5.0),
+        });
+        r.budget_override = Some(override_grant(now() + Duration::seconds(60)));
+
+        // Inside the window: base plus the increase, on both axes.
+        let raised = r.effective_budget(now()).unwrap();
+        assert_eq!(raised.max_tokens, Some(6_000));
+        assert_eq!(raised.max_cost_usd, Some(15.0));
+        assert!(r.active_budget_override(now()).is_some());
+
+        // At and past the expiry instant: the base resumes, with no
+        // mutation and no sweeper involved.
+        for later in [
+            now() + Duration::seconds(60),
+            now() + Duration::seconds(3600),
+        ] {
+            let base = r.effective_budget(later).unwrap();
+            assert_eq!(base.max_tokens, Some(1_000));
+            assert_eq!(base.max_cost_usd, Some(5.0));
+            assert!(r.active_budget_override(later).is_none());
+        }
+    }
+
+    #[test]
+    fn an_override_never_caps_an_uncapped_axis_and_needs_a_base_budget() {
+        let mut r = KeyRecord::new("id", "hash", now());
+        // No base budget: nothing to raise.
+        r.budget_override = Some(override_grant(now() + Duration::seconds(60)));
+        assert_eq!(r.effective_budget(now()), None);
+
+        // A base that caps only tokens: the cost axis stays unlimited even
+        // though the grant names a cost increase.
+        r.budget = Some(RecordBudget {
+            max_tokens: Some(1_000),
+            max_cost_usd: None,
+        });
+        let raised = r.effective_budget(now()).unwrap();
+        assert_eq!(raised.max_tokens, Some(6_000));
+        assert_eq!(raised.max_cost_usd, None);
+    }
+
+    #[test]
+    fn a_token_raise_near_the_integer_ceiling_saturates_instead_of_wrapping() {
+        let mut r = KeyRecord::new("id", "hash", now());
+        r.budget = Some(RecordBudget {
+            max_tokens: Some(u64::MAX - 1),
+            max_cost_usd: None,
+        });
+        r.budget_override = Some(override_grant(now() + Duration::seconds(60)));
+        let raised = r.effective_budget(now()).unwrap();
+        assert_eq!(raised.max_tokens, Some(u64::MAX));
+    }
+
+    #[test]
+    fn a_budget_override_round_trips_and_a_legacy_record_still_loads() {
+        let mut r = KeyRecord::new("id", "hash", now());
+        r.budget = Some(RecordBudget {
+            max_tokens: Some(1_000),
+            max_cost_usd: None,
+        });
+        r.budget_override = Some(override_grant(now() + Duration::seconds(60)));
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["budget_override"]["granted_by"], "casey");
+        let back: KeyRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(back, r);
+
+        // Mixed-version fleets replicate records as plain JSON; a record
+        // written before WOR-2561 must keep loading, with no override.
+        let legacy = serde_json::json!({
+            "key_id": "abcd",
+            "secret_hash": "deadbeef",
+            "created_at": "2023-11-14T22:13:20Z",
+            "updated_at": "2023-11-14T22:13:20Z"
+        });
+        let restored: KeyRecord = serde_json::from_value(legacy).unwrap();
+        assert!(restored.budget_override.is_none());
     }
 
     #[test]

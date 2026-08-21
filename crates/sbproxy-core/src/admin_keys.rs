@@ -38,7 +38,7 @@ use serde_json::json;
 use crate::key_plane::{block_on_keystore, current_key_plane, KeyPlane};
 use sbproxy_ai::governance::{GovernanceError, GovernanceLimits, SnapshotKey};
 use sbproxy_keystore::record::{
-    CredentialMaterial, CredentialRecord, KeyRecord, RecordBudget, RecordStatus,
+    BudgetOverride, CredentialMaterial, CredentialRecord, KeyRecord, RecordBudget, RecordStatus,
 };
 use sbproxy_keystore::KeyPolicyCasResult;
 
@@ -103,6 +103,20 @@ fn key_subroute(method: &str, rest: &str, body: Option<&str>) -> Resp {
         Some("usage") if method.eq_ignore_ascii_case("GET") => get_key_usage(id),
         Some("effective-policy/preview") if method.eq_ignore_ascii_case("POST") => {
             preview_effective_key_policy(id, body)
+        }
+        // WOR-2561: temporary, auto-expiring budget overrides. Counted
+        // like every other arm here: the route CAS-writes the same
+        // `KeyRecord` through `store_key_if_revision`, so it is the key
+        // resource, and raising a spending ceiling is the mutation an
+        // operator most wants on a "key operations by type" panel.
+        Some("budget-override") => {
+            if method.eq_ignore_ascii_case("POST") {
+                count_key_operation("budget_override_grant", grant_budget_override(id, body))
+            } else if method.eq_ignore_ascii_case("DELETE") {
+                count_key_operation("budget_override_clear", clear_budget_override(id, body))
+            } else {
+                method_not_allowed()
+            }
         }
         Some(action) if method.eq_ignore_ascii_case("POST") => match action {
             "revoke" => {
@@ -479,12 +493,46 @@ fn list_keys() -> Resp {
     let store = plane.cache().store().clone();
     match block_on_keystore(async move { store.list_keys().await }) {
         Ok(keys) => {
-            let views: Vec<KeyView> = keys.iter().map(KeyView::from).collect();
+            // WOR-2561: listing is a read the operator trusts, so lapsed
+            // budget overrides are retired (and their expiry audited) here.
+            //
+            // Bounded, because each retirement is a blocking store write
+            // plus two cache invalidations on the request thread. A
+            // tenant whose keys all lapsed at once (one launch window,
+            // one TTL) would otherwise make the first `GET /admin/keys`
+            // after expiry do one redb write per key before rendering
+            // anything. Past the cap the remaining lapsed grants are
+            // simply shown as what they are: `KeyView` already hides an
+            // expired override and `effective_budget` already ignores
+            // one, so the only thing deferred is the bookkeeping write
+            // and its expiry record, which the next read picks up.
+            let mut budget = MAX_RETIREMENTS_PER_LIST;
+            let views: Vec<KeyView> = keys
+                .into_iter()
+                .map(|rec| {
+                    if budget > 0 && rec.budget_override.is_some() {
+                        budget -= 1;
+                        KeyView::from(&retire_expired_override(&plane, rec))
+                    } else {
+                        KeyView::from(&rec)
+                    }
+                })
+                .collect();
             ok(json!({ "keys": views }))
         }
         Err(e) => internal_error(&format!("list keys: {e:#}")),
     }
 }
+
+/// How many lapsed budget overrides one `GET /admin/keys` will retire
+/// before deferring the rest to a later read.
+///
+/// The retirement is bookkeeping, never enforcement, so a bound here
+/// costs an expiry record its promptness and nothing else. Sized to keep
+/// the worst-case listing latency in the same order as an ordinary one:
+/// each retirement is a compare-and-swap store write plus a record and a
+/// resolved-credential invalidation, all on the request thread.
+const MAX_RETIREMENTS_PER_LIST: usize = 32;
 
 fn get_key(id: &str) -> Resp {
     let plane = match plane_or_err() {
@@ -492,7 +540,10 @@ fn get_key(id: &str) -> Resp {
         Err(e) => return e,
     };
     match load_key(&plane, id) {
-        Ok(Some(rec)) => ok(json!({ "key": KeyView::from(&rec) })),
+        Ok(Some(rec)) => {
+            let rec = retire_expired_override(&plane, rec);
+            ok(json!({ "key": KeyView::from(&rec) }))
+        }
         Ok(None) => not_found("key not found"),
         Err(e) => internal_error(&e),
     }
@@ -706,16 +757,21 @@ fn preview_effective_key_policy(id: &str, body: Option<&str>) -> Resp {
             .as_deref()
             .unwrap_or(origin_tenant_id.as_str())
     };
-    let policy = match crate::key_policy::key_record_to_effective_policy(&record, policy_origin) {
-        Ok(policy) => policy,
-        Err(error) => {
-            tracing::warn!(
-                reason = error.safe_reason(),
-                "admin key policy preview: stored policy rejected"
-            );
-            return internal_error("stored key policy is invalid");
-        }
-    };
+    // WOR-2561: lower the policy at the sample's instant, so a preview dated
+    // before an override's expiry shows the raised caps and one dated after
+    // shows the base, matching what enforcement would do at that time.
+    let at = sample.at.unwrap_or_else(Utc::now);
+    let policy =
+        match crate::key_policy::key_record_to_effective_policy_at(&record, policy_origin, at) {
+            Ok(policy) => policy,
+            Err(error) => {
+                tracing::warn!(
+                    reason = error.safe_reason(),
+                    "admin key policy preview: stored policy rejected"
+                );
+                return internal_error("stored key policy is invalid");
+            }
+        };
     let policy_version = match policy.policy_version() {
         Ok(version) => version,
         Err(_) => return internal_error("effective policy serialization failed"),
@@ -724,6 +780,7 @@ fn preview_effective_key_policy(id: &str, body: Option<&str>) -> Resp {
         &record,
         &policy,
         sample,
+        at,
         origin_tenant_id,
         tenant_allowed,
         tenant_reason_code,
@@ -815,13 +872,13 @@ fn evaluate_policy_preview(
     record: &KeyRecord,
     policy: &sbproxy_ai::effective_key_policy::EffectiveKeyPolicy,
     sample: PolicyPreviewSample,
+    at: DateTime<Utc>,
     origin_tenant_id: String,
     tenant_allowed: bool,
     tenant_reason_code: &'static str,
 ) -> Result<EffectivePolicyPreviewDecisions, &'static str> {
     use sbproxy_ai::effective_key_policy::EffectiveKeyStatus;
 
-    let at = sample.at.unwrap_or_else(Utc::now);
     let lifecycle_reason_code = match policy.status {
         EffectiveKeyStatus::Revoked => "revoked",
         EffectiveKeyStatus::Blocked => "blocked",
@@ -946,7 +1003,7 @@ fn evaluate_policy_preview(
     let usage = sample.usage.unwrap_or_default();
     let estimated_tokens = sample.estimated_tokens.unwrap_or(0);
     let estimated_micro_usd = sample.estimated_micro_usd.unwrap_or(0);
-    let limits = policy_preview_limits(record)?;
+    let limits = policy_preview_limits(record, at)?;
     let requests_per_minute =
         preview_counter(limits.requests_per_minute, usage.requests_in_window, 1);
     let tokens_per_minute = preview_counter(
@@ -1071,9 +1128,15 @@ fn evaluate_policy_preview(
     })
 }
 
-fn policy_preview_limits(record: &KeyRecord) -> Result<PolicyPreviewLimits, &'static str> {
-    let total_micro_usd = record
-        .budget
+fn policy_preview_limits(
+    record: &KeyRecord,
+    at: DateTime<Utc>,
+) -> Result<PolicyPreviewLimits, &'static str> {
+    // WOR-2561: preview against the budget that would be enforced at the
+    // sample's instant, so a preview dated past an override's expiry shows
+    // the base caps the request path would apply then.
+    let budget = record.effective_budget(at);
+    let total_micro_usd = budget
         .as_ref()
         .and_then(|budget| budget.max_cost_usd)
         .map(policy_preview_usd_to_micro_usd)
@@ -1081,7 +1144,7 @@ fn policy_preview_limits(record: &KeyRecord) -> Result<PolicyPreviewLimits, &'st
     Ok(PolicyPreviewLimits {
         requests_per_minute: record.max_requests_per_minute,
         tokens_per_minute: record.max_tokens_per_minute,
-        total_tokens: record.budget.as_ref().and_then(|budget| budget.max_tokens),
+        total_tokens: budget.as_ref().and_then(|budget| budget.max_tokens),
         total_micro_usd,
     })
 }
@@ -1169,8 +1232,11 @@ fn get_key_usage(id: &str) -> Resp {
 }
 
 fn governance_limits(record: &KeyRecord) -> Result<GovernanceLimits, &'static str> {
-    let total_micro_usd = record
-        .budget
+    // WOR-2561: the usage snapshot reports the limits enforcement is holding
+    // the key to right now, which is the effective budget: base caps plus any
+    // unexpired override.
+    let budget = record.effective_budget(Utc::now());
+    let total_micro_usd = budget
         .as_ref()
         .and_then(|budget| budget.max_cost_usd)
         .map(usd_to_micro_usd)
@@ -1179,7 +1245,7 @@ fn governance_limits(record: &KeyRecord) -> Result<GovernanceLimits, &'static st
     Ok(GovernanceLimits {
         requests_per_window: record.max_requests_per_minute,
         tokens_per_window: record.max_tokens_per_minute,
-        total_tokens: record.budget.as_ref().and_then(|budget| budget.max_tokens),
+        total_tokens: budget.as_ref().and_then(|budget| budget.max_tokens),
         total_micro_usd,
         window_millis: 60_000,
     })
@@ -1236,6 +1302,12 @@ fn update_key(id: &str, body: Option<&str>) -> Resp {
         return terminal_key(id, rec.policy_revision);
     }
     apply_key_mutation(&mut rec, &m);
+    // WOR-2561: a raise only exists relative to a base budget. A PATCH that
+    // removes the base entirely leaves any override with nothing to raise,
+    // so it goes with it rather than lingering as a badge over no budget.
+    if rec.budget.is_none() {
+        rec.budget_override = None;
+    }
     rec.updated_at = Utc::now();
     let rec = match store_key_if_revision(&plane, rec, expected_revision) {
         Ok(rec) => rec,
@@ -1395,6 +1467,305 @@ fn rotate_key(id: &str, body: Option<&str>) -> Resp {
         "grace_expires_at": rec.prev_hash_expires_at,
         "key": KeyView::from(&rec),
     }))
+}
+
+// --- Temporary budget overrides (WOR-2561) ---
+
+/// Longest accepted `reason` on a budget-override grant, so one pathological
+/// note cannot dominate the record or the audit trail.
+const MAX_BUDGET_OVERRIDE_REASON_BYTES: usize = 256;
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct BudgetOverrideGrantRequest {
+    /// Optional optimistic revision. Omitted grants use the server-read value.
+    expected_revision: Option<u64>,
+    /// Extra total tokens on top of the base `budget.max_tokens`.
+    max_tokens_increase: Option<u64>,
+    /// Extra USD on top of the base `budget.max_cost_usd`.
+    max_cost_usd_increase: Option<f64>,
+    /// Seconds from now until the raise expires. Exclusive with `expires_at`.
+    ttl_secs: Option<i64>,
+    /// Absolute expiry instant. Exclusive with `ttl_secs`.
+    expires_at: Option<DateTime<Utc>>,
+    /// Optional operator note, kept on the record and in the audit diff.
+    reason: Option<String>,
+}
+
+/// Grant a temporary raise on the key's base budget. The raise applies at
+/// once (the policy cache is invalidated the same way every other key
+/// mutation invalidates it) and stops applying at its expiry with no further
+/// call: expiry is evaluated lazily wherever the budget is read.
+fn grant_budget_override(id: &str, body: Option<&str>) -> Resp {
+    let plane = match plane_or_err() {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let req: BudgetOverrideGrantRequest = match parse_body(body) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if req.expected_revision == Some(0) {
+        return bad_request("expected_revision must be at least 1");
+    }
+    if req.max_tokens_increase.is_none() && req.max_cost_usd_increase.is_none() {
+        return bad_request("budget override needs max_tokens_increase or max_cost_usd_increase");
+    }
+    if req.max_tokens_increase == Some(0) {
+        return bad_request("max_tokens_increase must be a positive integer");
+    }
+    if let Some(value) = req.max_cost_usd_increase {
+        if !value.is_finite() || value <= 0.0 {
+            return bad_request("max_cost_usd_increase must be a finite positive number");
+        }
+    }
+    if req
+        .reason
+        .as_ref()
+        .is_some_and(|reason| reason.len() > MAX_BUDGET_OVERRIDE_REASON_BYTES)
+    {
+        return bad_request("reason is longer than 256 bytes");
+    }
+    let now = Utc::now();
+    let expires_at = match (req.ttl_secs, req.expires_at) {
+        (Some(_), Some(_)) => {
+            return bad_request("use ttl_secs or expires_at, not both");
+        }
+        (None, None) => {
+            return bad_request("budget override needs an expiry: ttl_secs or expires_at");
+        }
+        (Some(ttl), None) => {
+            if ttl < 1 {
+                return bad_request("ttl_secs must be at least 1");
+            }
+            now + chrono::Duration::seconds(ttl)
+        }
+        (None, Some(instant)) => {
+            if instant <= now {
+                return bad_request("expires_at must be in the future");
+            }
+            instant
+        }
+    };
+    let mut rec = match load_key(&plane, id) {
+        Ok(Some(r)) => r,
+        Ok(None) => return not_found("key not found"),
+        Err(e) => return internal_error(&e),
+    };
+    let expected_revision = req.expected_revision.unwrap_or(rec.policy_revision);
+    if rec.policy_revision != expected_revision {
+        return revision_conflict(id, expected_revision, rec.policy_revision);
+    }
+    if rec.status == RecordStatus::Revoked {
+        return terminal_key(id, rec.policy_revision);
+    }
+    // A raise only lifts caps that exist. Refusing here, rather than storing
+    // a no-op grant, is what tells the operator the number on their screen
+    // will not change.
+    let Some(base) = rec.budget.as_ref() else {
+        return bad_request(
+            "key has no base budget to raise; set max_budget_tokens or max_budget_usd first",
+        );
+    };
+    if req.max_tokens_increase.is_some() && base.max_tokens.is_none() {
+        return bad_request(
+            "max_tokens_increase raises max_budget_tokens, which this key does not cap",
+        );
+    }
+    if req.max_cost_usd_increase.is_some() && base.max_cost_usd.is_none() {
+        return bad_request(
+            "max_cost_usd_increase raises max_budget_usd, which this key does not cap",
+        );
+    }
+    // Refuse a raise whose applied sum the enforcement path could not
+    // represent, so the stored record can never fail closed at lowering.
+    if let (Some(base_usd), Some(increase)) = (base.max_cost_usd, req.max_cost_usd_increase) {
+        if usd_to_micro_usd(base_usd + increase).is_err() {
+            return bad_request(
+                "max_cost_usd_increase plus the base cap cannot be represented as micro-USD",
+            );
+        }
+    }
+    let before = rec.budget_override.clone();
+    rec.budget_override = Some(BudgetOverride {
+        max_tokens_increase: req.max_tokens_increase,
+        max_cost_usd_increase: req.max_cost_usd_increase,
+        expires_at,
+        // WOR-2094's thread-local names the authenticated operator; a grant
+        // arriving outside an authenticated admin dispatch is recorded as
+        // unattributed rather than inventing an identity.
+        granted_by: crate::admin::current_admin_actor()
+            .filter(|actor| !actor.is_empty())
+            .unwrap_or_else(|| "unattributed".to_string()),
+        granted_at: now,
+        reason: req.reason,
+    });
+    rec.updated_at = now;
+    let rec = match store_key_if_revision(&plane, rec, expected_revision) {
+        Ok(rec) => rec,
+        Err(response) => return response,
+    };
+    invalidate(&plane, id);
+    audit_budget_override(
+        "budget_override_grant",
+        id,
+        rec.tenant_id.as_deref(),
+        before.as_ref(),
+        rec.budget_override.as_ref(),
+        true,
+    );
+    ok(json!({ "key": KeyView::from(&rec) }))
+}
+
+/// End a raise early. The base budget resumes immediately. Clearing a raise
+/// that already lapsed retires it exactly the way a read would, with the
+/// expiry audit record rather than a clear record.
+fn clear_budget_override(id: &str, body: Option<&str>) -> Resp {
+    let plane = match plane_or_err() {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let request: RevisionRequest = match parse_body(body) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if request.expected_revision == Some(0) {
+        return bad_request("expected_revision must be at least 1");
+    }
+    let mut rec = match load_key(&plane, id) {
+        Ok(Some(r)) => r,
+        Ok(None) => return not_found("key not found"),
+        Err(e) => return internal_error(&e),
+    };
+    let expected_revision = request.expected_revision.unwrap_or(rec.policy_revision);
+    if rec.policy_revision != expected_revision {
+        return revision_conflict(id, expected_revision, rec.policy_revision);
+    }
+    if rec.status == RecordStatus::Revoked {
+        return terminal_key(id, rec.policy_revision);
+    }
+    let Some(before) = rec.budget_override.take() else {
+        return not_found("no budget override to clear");
+    };
+    let now = Utc::now();
+    let was_active = before.is_active(now);
+    rec.updated_at = now;
+    let rec = match store_key_if_revision(&plane, rec, expected_revision) {
+        Ok(rec) => rec,
+        Err(response) => return response,
+    };
+    invalidate(&plane, id);
+    audit_budget_override(
+        if was_active {
+            "budget_override_clear"
+        } else {
+            "budget_override_expire"
+        },
+        id,
+        rec.tenant_id.as_deref(),
+        Some(&before),
+        None,
+        was_active,
+    );
+    ok(json!({ "key": KeyView::from(&rec) }))
+}
+
+/// Retire a lapsed override from a record the admin plane is about to show.
+///
+/// Enforcement never needs this: [`KeyRecord::effective_budget`] ignores an
+/// expired override wherever the budget is read. This is bookkeeping, so the
+/// expiry lands in the audit trail exactly once and the record stops carrying
+/// a grant that no longer does anything. The write is a compare-and-swap at
+/// the revision this read observed: whichever reader wins emits the audit
+/// record, a loser just returns what it read (the view already hides expired
+/// overrides), and a backend without CAS skips retirement rather than risking
+/// a lost concurrent mutation.
+fn retire_expired_override(plane: &KeyPlane, rec: KeyRecord) -> KeyRecord {
+    let now = Utc::now();
+    let expired = rec
+        .budget_override
+        .as_ref()
+        .is_some_and(|grant| !grant.is_active(now));
+    if !expired {
+        return rec;
+    }
+    let mut cleared = rec.clone();
+    let before = cleared.budget_override.take();
+    cleared.updated_at = now;
+    match store_key_if_revision(plane, cleared, rec.policy_revision) {
+        Ok(stored) => {
+            invalidate(plane, &stored.key_id);
+            audit_budget_override(
+                "budget_override_expire",
+                &stored.key_id,
+                stored.tenant_id.as_deref(),
+                before.as_ref(),
+                None,
+                false,
+            );
+            stored
+        }
+        Err(response) => {
+            // Losing this CAS is expected under a polling console: a
+            // concurrent PATCH bumped the revision between the read and
+            // the retirement write. Enforcement is unaffected either
+            // way (`effective_budget` filters on `is_active(now)`
+            // wherever the budget is read) and the next admin read
+            // retries, so this is not an error. It is still a write
+            // that did not happen, and swallowing it entirely left no
+            // way to tell "retirement is racing" from "retirement is
+            // broken".
+            tracing::debug!(
+                key_id = %rec.key_id,
+                status = response.0,
+                "budget-override retirement lost its compare-and-swap; the lapsed grant stays \
+                 on the record until the next admin read"
+            );
+            rec
+        }
+    }
+}
+
+/// Secret-free audit projection of one override, for the audit diff.
+fn budget_override_audit_value(grant: &BudgetOverride) -> serde_json::Value {
+    json!({
+        "max_tokens_increase": grant.max_tokens_increase,
+        "max_cost_usd_increase": grant.max_cost_usd_increase,
+        "expires_at": grant.expires_at,
+        "granted_by": grant.granted_by,
+        "reason": grant.reason,
+    })
+}
+
+/// Emit a `key_audit` record for a budget-override mutation. `attributed`
+/// distinguishes an operator's act (grant, early clear) from time doing the
+/// work (expiry), which carries no actor.
+fn audit_budget_override(
+    op: &str,
+    id: &str,
+    tenant_id: Option<&str>,
+    before: Option<&BudgetOverride>,
+    after: Option<&BudgetOverride>,
+    attributed: bool,
+) {
+    let mut entry = sbproxy_observe::KeyAuditEntry::new(op, "key", id);
+    if attributed {
+        if let Some(actor) = crate::admin::current_admin_actor() {
+            entry = entry.with_actor(actor);
+        }
+    }
+    if let Some(tenant_id) = tenant_id {
+        entry = entry.with_tenant_id(tenant_id);
+    }
+    entry = entry.with_diff(
+        Some(json!({
+            "budget_override": before.map(budget_override_audit_value)
+        })),
+        Some(json!({
+            "budget_override": after.map(budget_override_audit_value)
+        })),
+    );
+    entry.emit();
 }
 
 // --- Credential handlers ---
@@ -1662,6 +2033,17 @@ struct KeyView {
     #[serde(skip_serializing_if = "Option::is_none")]
     priority: Option<String>,
     budget: Option<RecordBudget>,
+    /// WOR-2561: the active temporary raise on the base budget, when one is
+    /// granted and unexpired at view time. An expired override is never
+    /// shown: the read path retires it, and the view recomputes activity
+    /// against the clock so the two cannot disagree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget_override: Option<BudgetOverride>,
+    /// The budget the enforcement path is comparing spend against right now:
+    /// the base caps plus any active override. Equals `budget` when no
+    /// override is active.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effective_budget: Option<RecordBudget>,
     allowed_models: Vec<String>,
     blocked_models: Vec<String>,
     allowed_providers: Vec<String>,
@@ -1705,6 +2087,7 @@ struct KeyView {
 
 impl From<&KeyRecord> for KeyView {
     fn from(r: &KeyRecord) -> Self {
+        let now = Utc::now();
         Self {
             key_id: r.key_id.clone(),
             policy_revision: r.policy_revision,
@@ -1715,6 +2098,8 @@ impl From<&KeyRecord> for KeyView {
             max_tokens_per_minute: r.max_tokens_per_minute,
             priority: r.priority.clone(),
             budget: r.budget.clone(),
+            budget_override: r.active_budget_override(now).cloned(),
+            effective_budget: r.effective_budget(now),
             allowed_models: r.allowed_models.clone(),
             blocked_models: r.blocked_models.clone(),
             allowed_providers: r.allowed_providers.clone(),
@@ -1875,11 +2260,22 @@ fn invalidate(plane: &KeyPlane, id: &str) {
 /// The three are never folded: a rate panel that cannot tell a busy
 /// console from an outage answers no operator question.
 ///
-/// Scope is the key resource. `/admin/credentials` mutations are not
-/// counted here, because this family's `operation` label is the closed
-/// key-lifecycle set and its declared cardinality is that set times the
-/// three outcomes; a credential surface gets its own family rather than
-/// silently doubling this one's.
+/// Scope is the key resource, and the test is which record the route
+/// writes rather than which URL it hangs off. Every mutation that loads
+/// and CAS-writes a `KeyRecord` is counted, which includes
+/// `/admin/keys/{id}/budget-override` in both directions
+/// (`budget_override_grant`, `budget_override_clear`): it raises a
+/// spending ceiling on the same record `update` edits, and leaving it
+/// off meant its 500s and its twelve refusal paths were invisible to
+/// `rate(sbproxy_key_operations_total{outcome="error"}[5m])`.
+/// `/admin/credentials` mutations are not counted here, because they
+/// write a different record; a credential surface gets its own family
+/// rather than silently doubling this one's.
+///
+/// The closed `operation` set is therefore `mint`, `update`, `delete`,
+/// `revoke`, `block`, `unblock`, `rotate`, `budget_override_grant`,
+/// `budget_override_clear`: nine values times three outcomes, which is
+/// the declared cardinality in `docs/observability.md`.
 fn count_key_operation(operation: &'static str, resp: Resp) -> Resp {
     let outcome = match resp.0 {
         200..=299 => "ok",
@@ -2170,6 +2566,61 @@ mod tests {
             sbproxy_config::KeyGovernanceConfig::default(),
             governance_store,
             None,
+        ));
+        crate::key_plane::install_key_plane_for_test(plane);
+    }
+
+    /// A store that is down for every operation, so a handler's 5xx
+    /// path is the real store-error path rather than a synthetic
+    /// status.
+    struct DownStore;
+    #[async_trait]
+    impl KeyStore for DownStore {
+        async fn get_key(&self, _: &str) -> anyhow::Result<Option<KeyRecord>> {
+            anyhow::bail!("store down")
+        }
+        async fn list_keys(&self) -> anyhow::Result<Vec<KeyRecord>> {
+            anyhow::bail!("store down")
+        }
+        async fn put_key(&self, _: KeyRecord) -> anyhow::Result<()> {
+            anyhow::bail!("store down")
+        }
+        async fn put_key_if_revision(
+            &self,
+            _: KeyRecord,
+            _: u64,
+        ) -> anyhow::Result<KeyPolicyCasResult> {
+            anyhow::bail!("store down")
+        }
+        async fn delete_key(&self, _: &str) -> anyhow::Result<()> {
+            anyhow::bail!("store down")
+        }
+        async fn get_credential(&self, _: &str) -> anyhow::Result<Option<CredentialRecord>> {
+            anyhow::bail!("store down")
+        }
+        async fn list_credentials(&self) -> anyhow::Result<Vec<CredentialRecord>> {
+            anyhow::bail!("store down")
+        }
+        async fn put_credential(&self, _: CredentialRecord) -> anyhow::Result<()> {
+            anyhow::bail!("store down")
+        }
+        async fn delete_credential(&self, _: &str) -> anyhow::Result<()> {
+            anyhow::bail!("store down")
+        }
+        async fn revision(&self) -> anyhow::Result<u64> {
+            anyhow::bail!("store down")
+        }
+    }
+
+    /// Install a key plane whose store fails every call, so a
+    /// handler's 5xx path is the real store-error path rather than a
+    /// synthetic status.
+    fn install_down_plane() {
+        let crypto = KeyCrypto::new(b"pepper".to_vec(), b"master".to_vec());
+        let store: Arc<dyn KeyStore> = Arc::new(DownStore);
+        let cache = Arc::new(TtlCache::new(store, TtlCacheConfig::default()));
+        let plane = Arc::new(crate::key_plane::KeyPlane::from_parts(
+            crypto, cache, false, false, None,
         ));
         crate::key_plane::install_key_plane_for_test(plane);
     }
@@ -3556,6 +4007,264 @@ mod tests {
         assert!(!KeyView::from(&record).rotation_pending);
     }
 
+    // --- Temporary budget overrides (WOR-2561) ---
+
+    /// Mint a key with a token/cost base budget and return its id.
+    fn mint_budgeted_key(max_tokens: Option<u64>, max_usd: Option<f64>) -> String {
+        let mut body = serde_json::Map::new();
+        if let Some(tokens) = max_tokens {
+            body.insert("max_budget_tokens".into(), json!(tokens));
+        }
+        if let Some(usd) = max_usd {
+            body.insert("max_budget_usd".into(), json!(usd));
+        }
+        let resp = dispatch(
+            "POST",
+            "/admin/keys",
+            Some(&serde_json::Value::Object(body).to_string()),
+        )
+        .unwrap();
+        assert_eq!(resp.0, 201, "{}", resp.2);
+        parse(&resp)["key"]["key_id"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn a_budget_override_grant_raises_the_effective_budget_and_names_the_grantor() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane_with_governance(
+            Arc::new(MemoryKeyStore::new()),
+            Arc::new(RecordingGovernanceStore::healthy()),
+        );
+        let _actor = crate::admin::set_current_admin_actor(Some((
+            "casey".to_string(),
+            sbproxy_config::types::AdminRole::Admin,
+        )));
+        let id = mint_budgeted_key(Some(1_000), Some(5.0));
+
+        let resp = dispatch(
+            "POST",
+            &format!("/admin/keys/{id}/budget-override"),
+            Some(r#"{"max_tokens_increase":500,"max_cost_usd_increase":10.0,"ttl_secs":60,"reason":"launch-day spike"}"#),
+        )
+        .unwrap();
+        assert_eq!(resp.0, 200, "{}", resp.2);
+        let key = &parse(&resp)["key"];
+        // The base is untouched; the raise and the enforced sum ride beside it.
+        assert_eq!(key["budget"]["max_tokens"], 1_000);
+        assert_eq!(key["budget_override"]["max_tokens_increase"], 500);
+        assert_eq!(key["budget_override"]["granted_by"], "casey");
+        assert_eq!(key["budget_override"]["reason"], "launch-day spike");
+        assert!(key["budget_override"]["expires_at"].is_string());
+        assert_eq!(key["effective_budget"]["max_tokens"], 1_500);
+        assert_eq!(key["effective_budget"]["max_cost_usd"], 15.0);
+
+        // The grant is in the audit trail, attributed to the operator.
+        let events = sbproxy_observe::audit_ring::recent_audit_events(
+            5,
+            Some("key"),
+            Some("budget_override_grant"),
+            Some(&id),
+        );
+        assert_eq!(events.len(), 1, "exactly one grant event for this key");
+        assert_eq!(events[0].actor.as_deref(), Some("casey"));
+
+        // The usage snapshot asks the governance store for the raised caps,
+        // not the base, so the operator's remaining-budget view matches
+        // enforcement.
+        let usage = dispatch("GET", &format!("/admin/keys/{id}/usage"), None).unwrap();
+        assert_eq!(usage.0, 200, "{}", usage.2);
+        assert_eq!(parse(&usage)["usage"]["total_tokens"]["limit"], 1_500);
+    }
+
+    #[test]
+    fn a_budget_override_grant_is_validated_at_the_boundary() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+        let budgeted = mint_budgeted_key(Some(1_000), None);
+        let unbudgeted = mint_budgeted_key(None, None);
+
+        for (id, body, why) in [
+            (
+                &unbudgeted,
+                r#"{"max_tokens_increase":500,"ttl_secs":60}"#,
+                "no base budget to raise",
+            ),
+            (
+                &budgeted,
+                r#"{"ttl_secs":60}"#,
+                "no increase on either axis",
+            ),
+            (
+                &budgeted,
+                r#"{"max_tokens_increase":0,"ttl_secs":60}"#,
+                "zero token increase",
+            ),
+            (
+                &budgeted,
+                r#"{"max_cost_usd_increase":10.0,"ttl_secs":60}"#,
+                "cost increase on a key with no cost cap",
+            ),
+            (&budgeted, r#"{"max_tokens_increase":500}"#, "no expiry"),
+            (
+                &budgeted,
+                r#"{"max_tokens_increase":500,"ttl_secs":60,"expires_at":"2030-01-01T00:00:00Z"}"#,
+                "both expiry forms",
+            ),
+            (
+                &budgeted,
+                r#"{"max_tokens_increase":500,"expires_at":"2001-01-01T00:00:00Z"}"#,
+                "expiry in the past",
+            ),
+            (
+                &budgeted,
+                r#"{"max_tokens_increase":500,"ttl_secs":0}"#,
+                "zero ttl",
+            ),
+        ] {
+            let resp = dispatch(
+                "POST",
+                &format!("/admin/keys/{id}/budget-override"),
+                Some(body),
+            )
+            .unwrap();
+            assert_eq!(resp.0, 400, "{why}: {}", resp.2);
+        }
+
+        // A revoked key is terminal for grants like every other mutation.
+        let revoked = mint_budgeted_key(Some(1_000), None);
+        let resp = dispatch("POST", &format!("/admin/keys/{revoked}/revoke"), None).unwrap();
+        assert_eq!(resp.0, 200, "{}", resp.2);
+        let resp = dispatch(
+            "POST",
+            &format!("/admin/keys/{revoked}/budget-override"),
+            Some(r#"{"max_tokens_increase":500,"ttl_secs":60}"#),
+        )
+        .unwrap();
+        assert_eq!(resp.0, 409, "{}", resp.2);
+    }
+
+    #[test]
+    fn clearing_a_budget_override_restores_the_base_at_once() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+        let id = mint_budgeted_key(Some(1_000), None);
+        let resp = dispatch(
+            "POST",
+            &format!("/admin/keys/{id}/budget-override"),
+            Some(r#"{"max_tokens_increase":500,"ttl_secs":600}"#),
+        )
+        .unwrap();
+        assert_eq!(resp.0, 200, "{}", resp.2);
+
+        let resp = dispatch("DELETE", &format!("/admin/keys/{id}/budget-override"), None).unwrap();
+        assert_eq!(resp.0, 200, "{}", resp.2);
+        let key = &parse(&resp)["key"];
+        assert!(key["budget_override"].is_null());
+        assert_eq!(key["effective_budget"]["max_tokens"], 1_000);
+        let events = sbproxy_observe::audit_ring::recent_audit_events(
+            5,
+            Some("key"),
+            Some("budget_override_clear"),
+            Some(&id),
+        );
+        assert_eq!(events.len(), 1, "the early clear is audited");
+
+        // With nothing left to clear, the route says so.
+        let resp = dispatch("DELETE", &format!("/admin/keys/{id}/budget-override"), None).unwrap();
+        assert_eq!(resp.0, 404, "{}", resp.2);
+    }
+
+    #[test]
+    fn an_expired_override_is_retired_and_audited_by_the_next_admin_read() {
+        let _g = crate::key_plane::test_plane_guard();
+        let store = Arc::new(MemoryKeyStore::new());
+        install_test_plane_with_store(store.clone());
+        let id = mint_budgeted_key(Some(1_000), None);
+
+        // Persist an already-expired override straight into the store, the
+        // state a restarted process finds after a raise lapsed while it was
+        // down. No admin call ever saw this grant expire.
+        let mut rec = block_on_keystore(store.get_key(&id)).unwrap().unwrap();
+        rec.budget_override = Some(BudgetOverride {
+            max_tokens_increase: Some(500),
+            max_cost_usd_increase: None,
+            expires_at: Utc::now() - chrono::Duration::seconds(5),
+            granted_by: "casey".into(),
+            granted_at: Utc::now() - chrono::Duration::seconds(65),
+            reason: None,
+        });
+        block_on_keystore(store.put_key(rec)).unwrap();
+
+        // The read shows the base budget alone, never the lapsed raise.
+        let resp = dispatch("GET", &format!("/admin/keys/{id}"), None).unwrap();
+        assert_eq!(resp.0, 200, "{}", resp.2);
+        let key = &parse(&resp)["key"];
+        assert!(key["budget_override"].is_null());
+        assert_eq!(key["effective_budget"]["max_tokens"], 1_000);
+
+        // The read also retired the grant from the record and wrote the
+        // expiry into the audit trail, exactly once.
+        let stored = block_on_keystore(store.get_key(&id)).unwrap().unwrap();
+        assert!(stored.budget_override.is_none());
+        let events = sbproxy_observe::audit_ring::recent_audit_events(
+            5,
+            Some("key"),
+            Some("budget_override_expire"),
+            Some(&id),
+        );
+        assert_eq!(events.len(), 1, "expiry lands in the audit trail once");
+        assert!(events[0].actor.is_none(), "time has no operator");
+
+        // A second read finds nothing to retire and audits nothing new.
+        let resp = dispatch("GET", &format!("/admin/keys/{id}"), None).unwrap();
+        assert_eq!(resp.0, 200, "{}", resp.2);
+        let events = sbproxy_observe::audit_ring::recent_audit_events(
+            5,
+            Some("key"),
+            Some("budget_override_expire"),
+            Some(&id),
+        );
+        assert_eq!(events.len(), 1, "retirement is not repeated");
+    }
+
+    #[test]
+    fn policy_preview_reflects_the_override_at_the_sample_instant() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+        let id = mint_budgeted_key(Some(1_000), None);
+        let resp = dispatch(
+            "POST",
+            &format!("/admin/keys/{id}/budget-override"),
+            Some(r#"{"max_tokens_increase":500,"expires_at":"2029-01-01T00:00:00Z"}"#),
+        )
+        .unwrap();
+        assert_eq!(resp.0, 200, "{}", resp.2);
+
+        // Sampled before the expiry: the raised cap admits 1,200 tokens.
+        let before = dispatch(
+            "POST",
+            &format!("/admin/keys/{id}/effective-policy/preview"),
+            Some(r#"{"at":"2028-12-31T00:00:00Z","estimated_tokens":1200}"#),
+        )
+        .unwrap();
+        assert_eq!(before.0, 200, "{}", before.2);
+        let decisions = &parse(&before)["decisions"];
+        assert_eq!(decisions["budget"]["tokens"]["limit"], 1_500);
+        assert_eq!(decisions["budget"]["allowed"], true);
+
+        // Sampled after: the base cap governs and refuses the same request.
+        let after = dispatch(
+            "POST",
+            &format!("/admin/keys/{id}/effective-policy/preview"),
+            Some(r#"{"at":"2029-01-01T00:00:01Z","estimated_tokens":1200}"#),
+        )
+        .unwrap();
+        assert_eq!(after.0, 200, "{}", after.2);
+        let decisions = &parse(&after)["decisions"];
+        assert_eq!(decisions["budget"]["tokens"]["limit"], 1_000);
+        assert_eq!(decisions["budget"]["allowed"], false);
+    }
+
     /// WOR-2572: every admin key-lifecycle route lands on
     /// `sbproxy_key_operations_total` with an outcome derived from the
     /// status class the handler actually returned. The three outcome
@@ -3565,72 +4274,7 @@ mod tests {
     #[test]
     fn key_operations_move_at_the_admin_seam_with_separate_outcomes() {
         let _g = crate::key_plane::test_plane_guard();
-
-        fn op_count(operation: &str, outcome: &str) -> f64 {
-            let want = [
-                format!("operation={operation}"),
-                format!("outcome={outcome}"),
-            ];
-            let mut total = 0.0;
-            for family in prometheus::gather() {
-                if family.name() != "sbproxy_key_operations_total" {
-                    continue;
-                }
-                for metric in family.get_metric() {
-                    let labels: Vec<String> = metric
-                        .get_label()
-                        .iter()
-                        .map(|pair| format!("{}={}", pair.name(), pair.value()))
-                        .collect();
-                    if want.iter().all(|label| labels.contains(label)) {
-                        total += metric.get_counter().value();
-                    }
-                }
-            }
-            total
-        }
-
-        /// A store that is down for every operation, so a handler's 5xx
-        /// path is the real store-error path rather than a synthetic
-        /// status.
-        struct DownStore;
-        #[async_trait]
-        impl KeyStore for DownStore {
-            async fn get_key(&self, _: &str) -> anyhow::Result<Option<KeyRecord>> {
-                anyhow::bail!("store down")
-            }
-            async fn list_keys(&self) -> anyhow::Result<Vec<KeyRecord>> {
-                anyhow::bail!("store down")
-            }
-            async fn put_key(&self, _: KeyRecord) -> anyhow::Result<()> {
-                anyhow::bail!("store down")
-            }
-            async fn put_key_if_revision(
-                &self,
-                _: KeyRecord,
-                _: u64,
-            ) -> anyhow::Result<KeyPolicyCasResult> {
-                anyhow::bail!("store down")
-            }
-            async fn delete_key(&self, _: &str) -> anyhow::Result<()> {
-                anyhow::bail!("store down")
-            }
-            async fn get_credential(&self, _: &str) -> anyhow::Result<Option<CredentialRecord>> {
-                anyhow::bail!("store down")
-            }
-            async fn list_credentials(&self) -> anyhow::Result<Vec<CredentialRecord>> {
-                anyhow::bail!("store down")
-            }
-            async fn put_credential(&self, _: CredentialRecord) -> anyhow::Result<()> {
-                anyhow::bail!("store down")
-            }
-            async fn delete_credential(&self, _: &str) -> anyhow::Result<()> {
-                anyhow::bail!("store down")
-            }
-            async fn revision(&self) -> anyhow::Result<u64> {
-                anyhow::bail!("store down")
-            }
-        }
+        let op_count = key_operation_count;
 
         let before_mint_ok = op_count("mint", "ok");
         let before_mint_error = op_count("mint", "error");
@@ -3644,15 +4288,7 @@ mod tests {
 
         // A dead store is an `error`: the operator asked for something
         // legitimate and the infrastructure could not do it.
-        {
-            let crypto = KeyCrypto::new(b"pepper".to_vec(), b"master".to_vec());
-            let store: Arc<dyn KeyStore> = Arc::new(DownStore);
-            let cache = Arc::new(TtlCache::new(store, TtlCacheConfig::default()));
-            let plane = Arc::new(crate::key_plane::KeyPlane::from_parts(
-                crypto, cache, false, false, None,
-            ));
-            crate::key_plane::install_key_plane_for_test(plane);
-        }
+        install_down_plane();
         let resp = dispatch("POST", "/admin/keys", None).unwrap();
         assert_eq!(resp.0, 500, "{}", resp.2);
         assert_eq!(
@@ -3715,6 +4351,118 @@ mod tests {
             op_count("mint", "error") - before_mint_error,
             1.0,
             "the healthy-plane run must not have added error outcomes"
+        );
+    }
+
+    /// Sum `sbproxy_key_operations_total` across every series carrying
+    /// this `(operation, outcome)` pair.
+    fn key_operation_count(operation: &str, outcome: &str) -> f64 {
+        let want = [
+            format!("operation={operation}"),
+            format!("outcome={outcome}"),
+        ];
+        let mut total = 0.0;
+        for family in prometheus::gather() {
+            if family.name() != "sbproxy_key_operations_total" {
+                continue;
+            }
+            for metric in family.get_metric() {
+                let labels: Vec<String> = metric
+                    .get_label()
+                    .iter()
+                    .map(|pair| format!("{}={}", pair.name(), pair.value()))
+                    .collect();
+                if want.iter().all(|label| labels.contains(label)) {
+                    total += metric.get_counter().value();
+                }
+            }
+        }
+        total
+    }
+
+    /// Fix round on the #1177 review, red-first: the budget-override
+    /// route was the one arm of `key_subroute` with no
+    /// `count_key_operation` wrapper, so raising a spending ceiling was
+    /// invisible on `sbproxy_key_operations_total` and so were its 500s
+    /// and its twelve refusal paths. The alert operators are told to
+    /// run, `rate(sbproxy_key_operations_total{outcome="error"}[5m])`,
+    /// stayed flat while the route 500'd.
+    ///
+    /// All three outcomes, because the seam derives them from the
+    /// status class and a route that only ever proves `ok` proves the
+    /// least interesting third of the contract.
+    #[test]
+    fn budget_override_routes_are_counted_like_every_other_key_mutation() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+        let id = mint_budgeted_key(Some(1_000), None);
+
+        let before_grant_ok = key_operation_count("budget_override_grant", "ok");
+        let before_grant_refused = key_operation_count("budget_override_grant", "refused");
+        let before_clear_ok = key_operation_count("budget_override_clear", "ok");
+        let before_clear_refused = key_operation_count("budget_override_clear", "refused");
+
+        let resp = dispatch(
+            "POST",
+            &format!("/admin/keys/{id}/budget-override"),
+            Some(r#"{"max_tokens_increase":500,"ttl_secs":600}"#),
+        )
+        .unwrap();
+        assert_eq!(resp.0, 200, "{}", resp.2);
+
+        // A raise on an axis the base budget does not cap is a refusal
+        // the caller can fix, not an outage.
+        let resp = dispatch(
+            "POST",
+            &format!("/admin/keys/{id}/budget-override"),
+            Some(r#"{"max_cost_usd_increase":10.0,"ttl_secs":600}"#),
+        )
+        .unwrap();
+        assert!((400..500).contains(&resp.0), "{}", resp.2);
+
+        let resp = dispatch("DELETE", &format!("/admin/keys/{id}/budget-override"), None).unwrap();
+        assert_eq!(resp.0, 200, "{}", resp.2);
+        // Nothing left to clear: the 404 is a refusal.
+        let resp = dispatch("DELETE", &format!("/admin/keys/{id}/budget-override"), None).unwrap();
+        assert_eq!(resp.0, 404, "{}", resp.2);
+
+        assert_eq!(
+            key_operation_count("budget_override_grant", "ok") - before_grant_ok,
+            1.0,
+            "a granted raise must reach sbproxy_key_operations_total"
+        );
+        assert_eq!(
+            key_operation_count("budget_override_grant", "refused") - before_grant_refused,
+            1.0,
+            "a refused raise must be countable, or outcome=refused cannot show a caller \
+             hammering the route"
+        );
+        assert_eq!(
+            key_operation_count("budget_override_clear", "ok") - before_clear_ok,
+            1.0,
+            "an early clear must reach the counter too"
+        );
+        assert_eq!(
+            key_operation_count("budget_override_clear", "refused") - before_clear_refused,
+            1.0,
+            "clearing a raise that is not there is a refusal"
+        );
+
+        // The store goes down under a legitimate grant: `error`, never
+        // folded into `refused`.
+        let before_grant_error = key_operation_count("budget_override_grant", "error");
+        install_down_plane();
+        let resp = dispatch(
+            "POST",
+            &format!("/admin/keys/{id}/budget-override"),
+            Some(r#"{"max_tokens_increase":500,"ttl_secs":600}"#),
+        )
+        .unwrap();
+        assert_eq!(resp.0, 500, "{}", resp.2);
+        assert_eq!(
+            key_operation_count("budget_override_grant", "error") - before_grant_error,
+            1.0,
+            "a store outage on the raise route must page, not read as a caller mistake"
         );
     }
 

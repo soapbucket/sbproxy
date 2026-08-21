@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from "vue";
+import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
 import {
   api,
   asList,
@@ -9,6 +9,7 @@ import {
   rebaseKeyPolicyDraft,
   type AdminKey,
   type AdminKeyPolicyPatch,
+  type KeyBudgetOverrideGrant,
   type EffectivePolicyDecisionName,
   type EffectivePolicyPreview,
   type GovernanceBackendStatus,
@@ -702,6 +703,111 @@ function statusOf(k: AdminKey): string {
   if (k.blocked) return "blocked";
   return String(k.status ?? k.state ?? "active");
 }
+
+// ---- temporary budget raise (WOR-2561) ----
+// A raise applies on top of the base budget until its expiry, then the base
+// resumes on its own; the server evaluates expiry lazily on read, so any
+// `budget_override` in a listing is an active one.
+const boostKey = ref<AdminKey | null>(null);
+const boostBusy = ref(false);
+const boostError = ref<ApiError | null>(null);
+const boostForm = reactive({
+  max_tokens_increase: "",
+  max_cost_usd_increase: "",
+  ttl_minutes: "60",
+  reason: "",
+});
+
+function openBoost(k: AdminKey) {
+  boostKey.value = k;
+  boostError.value = null;
+  Object.assign(boostForm, {
+    max_tokens_increase: "",
+    max_cost_usd_increase: "",
+    ttl_minutes: "60",
+    reason: "",
+  });
+}
+
+function closeBoost() {
+  boostKey.value = null;
+}
+
+async function submitBoost() {
+  const k = boostKey.value;
+  if (!k) return;
+  boostBusy.value = true;
+  boostError.value = null;
+  try {
+    const grant: KeyBudgetOverrideGrant = {};
+    const tokens = parseOptionalNumber(boostForm.max_tokens_increase, "Token increase", true);
+    if (tokens !== null && tokens > 0) grant.max_tokens_increase = tokens;
+    const usd = parseOptionalNumber(boostForm.max_cost_usd_increase, "USD increase");
+    if (usd !== null && usd > 0) grant.max_cost_usd_increase = usd;
+    if (grant.max_tokens_increase === undefined && grant.max_cost_usd_increase === undefined) {
+      throw new Error("Raise at least one axis: a token increase or a USD increase.");
+    }
+    const minutes = parseOptionalNumber(boostForm.ttl_minutes, "Duration (minutes)", true);
+    if (minutes === null || minutes < 1) {
+      throw new Error("Duration (minutes) must be at least 1.");
+    }
+    grant.ttl_secs = minutes * 60;
+    if (boostForm.reason.trim()) grant.reason = boostForm.reason.trim();
+    await api.grantBudgetOverride(keyId(k), grant);
+    toast.success("Temporary budget raise granted", shortId(keyId(k)));
+    boostKey.value = null;
+    keysReq.run();
+  } catch (e) {
+    boostError.value = e instanceof ApiError ? e : new ApiError(0, String(e));
+  } finally {
+    boostBusy.value = false;
+  }
+}
+
+async function clearBoost(k: AdminKey) {
+  const id = keyId(k);
+  rowBusy.value = id + "clear-boost";
+  try {
+    await api.clearBudgetOverride(id);
+    toast.success("Budget raise cleared", shortId(id));
+    keysReq.run();
+  } catch (e) {
+    toast.error(e, "Clear budget raise");
+  } finally {
+    rowBusy.value = null;
+  }
+}
+
+// Ticking clock for the visible countdown to a raise's expiry. Thirty
+// seconds is enough resolution for a minutes-grained display.
+const overrideNow = ref(Date.now());
+let overrideTicker: number | undefined;
+onMounted(() => {
+  overrideTicker = window.setInterval(() => {
+    overrideNow.value = Date.now();
+  }, 30_000);
+});
+onUnmounted(() => {
+  if (overrideTicker !== undefined) window.clearInterval(overrideTicker);
+});
+
+function overrideCountdown(expiresAt: string): string {
+  const remaining = new Date(expiresAt).getTime() - overrideNow.value;
+  if (!Number.isFinite(remaining) || remaining <= 0) return "expiring now";
+  const minutes = Math.ceil(remaining / 60_000);
+  if (minutes < 60) return `${minutes}m left`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m left`;
+}
+
+function overrideRaiseSummary(k: AdminKey): string {
+  const grant = k.budget_override;
+  if (!grant) return "";
+  const parts: string[] = [];
+  if (grant.max_cost_usd_increase) parts.push(`+${formatUsd(grant.max_cost_usd_increase)}`);
+  if (grant.max_tokens_increase) parts.push(`+${formatNumber(grant.max_tokens_increase)} tokens`);
+  return parts.join(", ");
+}
 </script>
 
 <template>
@@ -852,7 +958,18 @@ function statusOf(k: AdminKey): string {
               no restrictions
             </span>
           </td>
-          <td>{{ budgetOf(k) !== undefined ? formatUsd(budgetOf(k)) : "n/a" }}</td>
+          <td>
+            <div>{{ budgetOf(k) !== undefined ? formatUsd(budgetOf(k)) : "n/a" }}</div>
+            <div v-if="k.budget_override" class="boost-note">
+              <StatusBadge label="raised" tone="warn" />
+              <div class="sb-faint">
+                {{ overrideRaiseSummary(k) }}
+                until <span class="sb-mono">{{ formatTime(k.budget_override.expires_at) }}</span>
+                ({{ overrideCountdown(k.budget_override.expires_at) }})
+              </div>
+              <div class="sb-faint">granted by {{ k.budget_override.granted_by }}</div>
+            </div>
+          </td>
           <td>{{ k.expires_at ? formatTime(k.expires_at) : "never" }}</td>
           <td class="actions">
             <RouterLink
@@ -892,6 +1009,23 @@ function statusOf(k: AdminKey): string {
               @click="doAction(k, 'rotate')"
             >
               Rotate
+            </button>
+            <button
+              v-if="statusOf(k) !== 'revoked' && !k.budget_override"
+              class="sb-btn sb-btn--sm"
+              title="Grant a temporary budget raise that expires on its own"
+              @click="openBoost(k)"
+            >
+              Raise budget
+            </button>
+            <button
+              v-else-if="statusOf(k) !== 'revoked' && k.budget_override"
+              class="sb-btn sb-btn--sm"
+              :disabled="rowBusy === keyId(k) + 'clear-boost'"
+              title="End the temporary raise now; the base budget resumes immediately"
+              @click="clearBoost(k)"
+            >
+              Clear raise
             </button>
             <button
               v-if="statusOf(k) === 'active' && supportsPolicyAction('block')"
@@ -1246,6 +1380,48 @@ function statusOf(k: AdminKey): string {
     </p>
     <template #footer>
       <button class="sb-btn sb-btn--primary" @click="dismissReveal">Done</button>
+    </template>
+  </ModalDialog>
+
+  <!-- Temporary budget raise modal (WOR-2561) -->
+  <ModalDialog v-if="boostKey" title="Raise budget temporarily" @close="closeBoost">
+    <p class="sb-faint">
+      The raise applies on top of the key's base budget and expires on its
+      own; the base budget resumes with no further action. Both the grant and
+      the expiry land in the audit trail.
+    </p>
+    <ErrorState v-if="boostError" :error="boostError" title="Grant failed" />
+    <form @submit.prevent="submitBoost">
+      <div class="two">
+        <div class="sb-field">
+          <label class="sb-label">USD increase</label>
+          <input class="sb-input" v-model="boostForm.max_cost_usd_increase" inputmode="decimal" placeholder="50" />
+        </div>
+        <div class="sb-field">
+          <label class="sb-label">Token increase</label>
+          <input class="sb-input" v-model="boostForm.max_tokens_increase" inputmode="numeric" placeholder="1000000" />
+        </div>
+      </div>
+      <div class="two">
+        <div class="sb-field">
+          <label class="sb-label">Duration (minutes)</label>
+          <input class="sb-input" v-model="boostForm.ttl_minutes" inputmode="numeric" />
+        </div>
+        <div class="sb-field">
+          <label class="sb-label">Reason (optional)</label>
+          <input class="sb-input" v-model="boostForm.reason" placeholder="launch-day spike" />
+        </div>
+      </div>
+      <p class="sb-hint">
+        An axis the base budget leaves uncapped stays uncapped; a raise only
+        lifts caps that exist. Keys without a base budget cannot be raised.
+      </p>
+    </form>
+    <template #footer>
+      <button class="sb-btn" @click="closeBoost">Cancel</button>
+      <button class="sb-btn sb-btn--primary" :disabled="boostBusy" @click="submitBoost">
+        {{ boostBusy ? "Granting..." : "Grant raise" }}
+      </button>
     </template>
   </ModalDialog>
 
@@ -1710,6 +1886,13 @@ function statusOf(k: AdminKey): string {
 .policy {
   min-width: 240px;
   font-size: 0.8rem;
+}
+.boost-note {
+  margin-top: 6px;
+  font-size: 0.78rem;
+  display: grid;
+  gap: 2px;
+  justify-items: start;
 }
 .pol {
   display: flex;

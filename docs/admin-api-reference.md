@@ -276,6 +276,8 @@ the policy model these records drive.
 | POST | `/admin/keys/{id}/block` | Mark blocked (reversible). |
 | POST | `/admin/keys/{id}/unblock` | Mark active. |
 | POST | `/admin/keys/{id}/rotate` | Mint a new secret with a grace-window dual-key transition. |
+| POST | `/admin/keys/{id}/budget-override` | Grant a temporary, auto-expiring raise on the key's base budget. |
+| DELETE | `/admin/keys/{id}/budget-override` | End an active raise early; the base budget resumes immediately. |
 | GET | `/admin/credentials` | List upstream credentials (no secrets). |
 | POST | `/admin/credentials` | Create a credential (`vault_ref` or `secret`, envelope-sealed at rest). |
 | GET | `/admin/credentials/{id}` | Fetch one credential. |
@@ -378,6 +380,37 @@ the inbound resolver can parse. Rotating one returns
 nothing, so the credential in the field keeps working. To replace a
 seeded key, create a new one with `POST /admin/keys`, move callers over,
 then revoke the seeded id.
+
+### `POST /admin/keys/{id}/budget-override`
+
+Body: `{"max_tokens_increase": <optional>, "max_cost_usd_increase":
+<optional>, "ttl_secs": <or expires_at>, "expires_at": <RFC 3339>,
+"reason": <optional>, "expected_revision": <optional>}`. At least one
+increase is required, each must be positive, and each must raise an axis
+the base budget actually caps; exactly one of `ttl_secs` or `expires_at`
+names the expiry, which must be in the future. `reason` is capped at 256
+bytes and a longer one is refused with a 400. The raise applies on top
+of the base budget until then, after which the base resumes with no
+further call. Regranting replaces the current raise. Read responses
+carry `budget` (the base), `budget_override` (increases, `expires_at`,
+`granted_by`, `granted_at`, `reason`), and `effective_budget` while a
+raise is live.
+
+`DELETE` on the same path ends the raise early. It is `404` only when the
+record carries no override at all; a grant that has already lapsed but
+has not yet been retired is still on the record, so `DELETE` clears it
+with a `200` and audits it as an expiry rather than a cancellation. A
+cleanup script that reads `404` as "already expired" will mis-report
+every expiry it races.
+
+Three `key_audit` records cover the lifecycle, and the distinction
+between the last two is the whole point of having both:
+`budget_override_grant` names the operator who granted the raise,
+`budget_override_clear` names the operator who ended one that was still
+live, and `budget_override_expire` is the unattributed time-driven end,
+written when an admin read (or a `DELETE`) first observes a lapsed grant
+and retires it. A reconciliation rule matching only grant and expire
+misses every operator-initiated early clear.
 
 ### `GET /admin/keys/{id}/usage`
 
@@ -662,6 +695,17 @@ longer carries it.
 
 Origins whose action is not `load_balancer` (e.g. `proxy`,
 `ai_proxy`, `static`, `redirect`) are omitted from `origins`.
+
+The same per-target verdict is exported to Prometheus as
+`sbproxy_target_health_state{origin, target}` (0 healthy, 1 degraded
+with the breaker half-open, 2 excluded from selection). Both surfaces
+render from one pipeline walk, so a dashboard on the gauge and a
+`curl` against this endpoint always agree; graph the gauge instead of
+polling this endpoint. The gauge's `target` label is the configured
+URL, or `url#index` matching the `index` field above when one origin
+configures the same URL more than once, so every row here has exactly
+one series and vice versa. See
+[observability.md](observability.md#budget-headroom-and-target-health).
 
 ### `GET /api/stats`
 

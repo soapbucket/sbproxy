@@ -1,5 +1,5 @@
 # SBproxy Features Hub
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-20*
 
 SBproxy is a high-performance reverse proxy and AI gateway built on Cloudflare's Pingora framework. It unifies traditional API proxying, AI model routing, Agent-to-Agent (A2A) communication, Model Context Protocol (MCP) tool integration, and Agent-specific workflows into a single binary.
 
@@ -29,7 +29,7 @@ Protect your endpoints with 11 built-in authentication types: API Keys, Basic Au
 ### Security & Guardrails
 A built-in Web Application Firewall (WAF) screens requests before they hit your upstream. It ships a curated, CRS-derived baseline of 16 rules: 4 built-in patterns plus a 12-rule managed bundle with CRS-style IDs and paranoia levels. The rule set extends through a signed remote rule feed, verified with HMAC-SHA256, cached on disk, and rejected when older than a configured staleness bound, and repeat offenders can be blocked persistently through strike-based blocking. Both corpora are independent flags and neither implies the other: `owasp_crs.enabled: true` gives you the 4 built-in patterns, and `owasp_crs.managed_bundle: true` adds the 12-rule bundle. Operators who need full OWASP CRS coverage (anomaly scoring, transformation pipelines, body processors) should put ModSecurity, Coraza, or a CDN WAF in front and keep SBproxy's WAF as a baseline layer. [WAF options](waf-options.md) records why there is no SecLang engine in the dataplane, and gives the recipes for running one in front, publishing your own rules through the signed feed, and layering the policies already in the binary. SBproxy also mitigates DDoS attacks and HTTP request smuggling, and enforces token-bucket rate limiting.
 * **Docs:** [WAF Options](waf-options.md), [Threat Model](threat-model.md), [Exposed Credentials](exposed-credentials.md), [Security Model Host](security-model-host.md), [AI Gateway Security Coverage](ai-gateway-security-coverage.md), [Security Overview](security.md)
-* **Examples:** [WAF](../examples/waf/), [Layered WAF](../examples/waf-layered/), [DDoS Protection](../examples/ddos-protection/), [Rate Limiting](../examples/rate-limiting/), [IP Filter](../examples/ip-filter/), [CSRF](../examples/csrf/), [Defense in Depth](../examples/defense-in-depth/), [DLP Catalog](../examples/dlp-catalog/), [HSTS](../examples/hsts/), [Page Shield](../examples/page-shield/), [Security Headers](../examples/security-headers/), [SRI](../examples/sri/), [Request Limit](../examples/request-limit/)
+* **Examples:** [WAF](../examples/waf/), [Layered WAF](../examples/waf-layered/), [DDoS Protection](../examples/ddos-protection/), [Rate Limiting](../examples/rate-limiting/), [IP Filter](../examples/ip-filter/), [CSRF](../examples/csrf/), [Defense in Depth](../examples/defense-in-depth/), [Body Threat Protection](../examples/body-threat-protection/), [DLP Catalog](../examples/dlp-catalog/), [HSTS](../examples/hsts/), [Page Shield](../examples/page-shield/), [Security Headers](../examples/security-headers/), [SRI](../examples/sri/), [Request Limit](../examples/request-limit/)
 
 ### Scripting & Custom Transforms
 When declarative config isn't enough, inject custom logic via Lua, JavaScript, WebAssembly (WASM), or CEL expressions. You can rewrite headers, transform payloads, and implement bespoke policies. Package complex behaviors with Extension Bundles.
@@ -149,14 +149,14 @@ An origin's `action:` decides what serves the request, and forward rules can pic
 
 ## 7. Reference: every policy type
 
-[policy.md](policy.md) is the catalog, with a one-line job description for each of the twenty-seven `policies:` types and a link to its full documentation. The names, grouped by the job you are hiring for:
+[policy.md](policy.md) is the catalog, with a one-line job description for each of the twenty-eight `policies:` types and a link to its full documentation. The names, grouped by the job you are hiring for:
 
 * **Rate, volume, and budget:** `rate_limiting`, `rate_limit_budget`, `concurrent_limit`, `request_limit`, `ddos`, `ip_filter`, `agent_budget`.
 * **Identity and access:** `object_authz` (BOLA and BFLA enforcement, plus enumeration detection), `agent_class`, `a2a`, `csrf`, `security_headers`.
-* **Content, validation, and DLP:** `request_validator`, `openapi_validation`, `waf`, `http_framing`, `sri`, `content_digest`, `page_shield`, `dlp`, `exposed_credentials`.
+* **Content, validation, and DLP:** `request_validator`, `openapi_validation`, `body_threat_protection`, `waf`, `http_framing`, `sri`, `content_digest`, `page_shield`, `dlp`, `exposed_credentials`.
 * **AI-specific:** `ai_crawl_control`, `prompt_injection_v2`, `semantic_constraint`.
 * **Scripting-driven:** `expression` (CEL), `rego`, `assertion`.
-* **Packs:** `owasp_api_top10` is not a twenty-eighth type. The compiler expands it into entries from the groups above, backs off per item when you author the type yourself, and reports each of the ten items in a five-state manifest, including the ones it does not cover. Docs: [owasp-api-top10.md](owasp-api-top10.md).
+* **Packs:** `owasp_api_top10` is not a twenty-ninth type. The compiler expands it into entries from the groups above, backs off per item when you author the type yourself, and reports each of the ten items in a five-state manifest, including the ones it does not cover. Docs: [owasp-api-top10.md](owasp-api-top10.md).
 
 Authentication is a separate axis, configured on an origin's `auth:` block rather than in `policies:`: `api_key`, `basic_auth`, `bearer`, `jwt`, `digest`, `forward_auth`, `ldap_auth`, `oidc`, `bot_auth` (Web Bot Auth), and `cap`, plus mTLS client verification at the listener. The Authentication section above links the docs and examples.
 

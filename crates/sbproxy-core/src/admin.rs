@@ -993,13 +993,66 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 
 // --- Target health rendering ---
 
-/// Walk the live pipeline and emit a JSON snapshot of every load
-/// balancer target's resilience state: active health verdict, outlier
-/// ejection state, and circuit breaker state. Operators query this to
-/// see exactly what `select_target` would skip right now.
-fn render_target_health() -> String {
+/// One load-balancer target's resilience state, as walked from the
+/// live pipeline. Shared by `GET /api/health/targets` (the JSON body)
+/// and the `sbproxy_target_health_state` gauge (WOR-2560), so the two
+/// surfaces cannot disagree about what `select_target` would skip.
+struct TargetHealthRow {
+    /// Position in the origin's target list.
+    index: usize,
+    /// Target URL as configured.
+    url: String,
+    /// Active health probe verdict.
+    healthy: bool,
+    /// Outlier detector eject state.
+    outlier_ejected: bool,
+    /// Circuit breaker state, when one is configured.
+    breaker_state: Option<&'static str>,
+    /// Configured selection weight, echoed for the JSON body.
+    weight: u32,
+    /// Whether the target is a fallback-only backup.
+    backup: bool,
+    /// Deployment group tag (blue-green / canary), when set.
+    group: Option<String>,
+}
+
+impl TargetHealthRow {
+    /// Whether `select_target` would consider this target at all.
+    fn eligible(&self) -> bool {
+        self.healthy && !self.outlier_ejected && self.breaker_state != Some("open")
+    }
+
+    /// The tri-state `sbproxy_target_health_state` value, on LiteLLM's
+    /// 0/1/2 deployment-state scale so Grafana panels built against
+    /// that convention port over: ineligible is 2 (full outage as far
+    /// as selection is concerned), an eligible target whose breaker is
+    /// half-open is 1 (carrying trial traffic), everything else is 0.
+    fn metric_state(&self) -> i64 {
+        if !self.eligible() {
+            sbproxy_observe::metrics::TARGET_HEALTH_EXCLUDED
+        } else if self.breaker_state == Some("half_open") {
+            sbproxy_observe::metrics::TARGET_HEALTH_DEGRADED
+        } else {
+            sbproxy_observe::metrics::TARGET_HEALTH_HEALTHY
+        }
+    }
+}
+
+/// Per-origin grouping of [`TargetHealthRow`]s.
+struct OriginTargetHealth {
+    /// Origin hostname as configured.
+    hostname: String,
+    /// Stable configured origin id; the `origin` label on the gauge.
+    origin_id: String,
+    /// The origin's load-balancer targets, in config order.
+    targets: Vec<TargetHealthRow>,
+}
+
+/// Walk the live pipeline and collect every load-balancer target's
+/// resilience state: active health verdict, outlier ejection state,
+/// and circuit breaker state.
+fn collect_target_health(pipeline: &crate::pipeline::CompiledPipeline) -> Vec<OriginTargetHealth> {
     use sbproxy_modules::Action;
-    let pipeline = crate::reload::current_pipeline();
     let mut origins = Vec::new();
     for (idx, origin) in pipeline.config.origins.iter().enumerate() {
         let action = match pipeline.actions.get(idx) {
@@ -1027,28 +1080,119 @@ fn render_target_health() -> String {
                     sbproxy_platform::CircuitState::Open => "open",
                     sbproxy_platform::CircuitState::HalfOpen => "half_open",
                 });
-            let eligible = healthy && !outlier_ejected && breaker_state != Some("open");
-            // `zone` was rendered here while the config still parsed it;
-            // the key is refused at config compile now (WOR-2498), so
-            // there is no label left to echo.
-            targets.push(serde_json::json!({
-                "index": t_idx,
-                "url": target.url,
-                "eligible": eligible,
-                "healthy": healthy,
-                "outlier_ejected": outlier_ejected,
-                "circuit_breaker_state": breaker_state,
-                "weight": target.weight,
-                "backup": target.backup,
-                "group": target.group,
-            }));
+            targets.push(TargetHealthRow {
+                index: t_idx,
+                url: target.url.clone(),
+                healthy,
+                outlier_ejected,
+                breaker_state,
+                weight: target.weight,
+                backup: target.backup,
+                group: target.group.clone(),
+            });
         }
-        origins.push(serde_json::json!({
-            "hostname": origin.hostname.as_str(),
-            "origin_id": origin.origin_id.as_str(),
-            "targets": targets,
-        }));
+        origins.push(OriginTargetHealth {
+            hostname: origin.hostname.as_str().to_string(),
+            origin_id: origin.origin_id.as_str().to_string(),
+            targets,
+        });
     }
+    origins
+}
+
+/// Install the scrape-time source for the `sbproxy_target_health_state`
+/// gauge (WOR-2560).
+///
+/// Called from `reload::load_pipeline` at every pipeline publication.
+/// The closure walks whatever pipeline is current when a scrape
+/// happens, through the same [`collect_target_health`] that renders
+/// `GET /api/health/targets`, so `/metrics` and the admin endpoint can
+/// never tell different stories about the same target. Reinstalling on
+/// every publication is deliberate: it costs one boxed closure and
+/// keeps the seam correct for library embedders who never call the
+/// startup path exactly once.
+pub(crate) fn install_target_health_metrics_source() {
+    sbproxy_observe::metrics::set_target_health_source(|| {
+        target_health_samples(&collect_target_health(&crate::reload::current_pipeline()))
+    });
+}
+
+/// Project one pipeline walk onto the gauge's sample list.
+///
+/// A free function rather than a closure body so the collision rule
+/// below is testable without a live pipeline.
+///
+/// The `target` label is the configured URL when that URL is unique
+/// within its origin, which is the normal case and the readable one.
+/// When an origin configures the same URL more than once, every
+/// colliding row takes the load balancer's own `url#index` identifier
+/// instead, the same string [`sbproxy_modules::action::loadbalancer`]
+/// hands the outlier detector. Two same-URL targets are a real config
+/// (weighting, or a blue/green pair addressed through one host), and
+/// keying the label on the URL alone collapsed them onto one series:
+/// last write won, an outlier-ejected target read as healthy, and
+/// `GET /api/health/targets` went on rendering both rows with distinct
+/// `index` values. That is precisely the disagreement between the two
+/// surfaces this gauge promises cannot happen.
+fn target_health_samples(
+    origins: &[OriginTargetHealth],
+) -> Vec<sbproxy_observe::metrics::TargetHealthSample> {
+    let mut samples = Vec::new();
+    for origin in origins {
+        for row in &origin.targets {
+            let collides = origin
+                .targets
+                .iter()
+                .any(|other| other.index != row.index && other.url == row.url);
+            samples.push(sbproxy_observe::metrics::TargetHealthSample {
+                origin: origin.origin_id.clone(),
+                target: if collides {
+                    format!("{}#{}", row.url, row.index)
+                } else {
+                    row.url.clone()
+                },
+                state: row.metric_state(),
+            });
+        }
+    }
+    samples
+}
+
+/// Emit the `GET /api/health/targets` JSON snapshot from the live
+/// pipeline walk. Operators query this to see exactly what
+/// `select_target` would skip right now.
+fn render_target_health() -> String {
+    let pipeline = crate::reload::current_pipeline();
+    let origins: Vec<serde_json::Value> = collect_target_health(&pipeline)
+        .into_iter()
+        .map(|origin| {
+            let targets: Vec<serde_json::Value> = origin
+                .targets
+                .into_iter()
+                .map(|row| {
+                    // `zone` was rendered here while the config still
+                    // parsed it; the key is refused at config compile
+                    // now (WOR-2498), so there is no label left to echo.
+                    serde_json::json!({
+                        "index": row.index,
+                        "url": row.url,
+                        "eligible": row.eligible(),
+                        "healthy": row.healthy,
+                        "outlier_ejected": row.outlier_ejected,
+                        "circuit_breaker_state": row.breaker_state,
+                        "weight": row.weight,
+                        "backup": row.backup,
+                        "group": row.group,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "hostname": origin.hostname,
+                "origin_id": origin.origin_id,
+                "targets": targets,
+            })
+        })
+        .collect();
     serde_json::json!({
         "config_revision": pipeline.config_revision,
         "origins": origins,
@@ -3764,7 +3908,7 @@ fn audit_admin_reload_rejection(prior_revision: &str, reason: &str) {
 }
 
 /// Clears the actor slot when the dispatch scope ends.
-struct AdminActorGuard;
+pub(crate) struct AdminActorGuard;
 
 impl Drop for AdminActorGuard {
     fn drop(&mut self) {
@@ -3774,7 +3918,11 @@ impl Drop for AdminActorGuard {
 
 /// Install `actor` as the dispatching operator for this thread and
 /// return a guard that clears it on scope exit.
-fn set_current_admin_actor(actor: Option<(String, AdminRole)>) -> AdminActorGuard {
+///
+/// `pub(crate)` so tests below the sync dispatcher (admin_keys' audit
+/// attribution tests) can install an operator through the same seam the
+/// production dispatcher uses, rather than through a test-only side door.
+pub(crate) fn set_current_admin_actor(actor: Option<(String, AdminRole)>) -> AdminActorGuard {
     CURRENT_ADMIN_ACTOR.with(|slot| *slot.borrow_mut() = actor);
     AdminActorGuard
 }
@@ -7457,6 +7605,125 @@ mod tests {
         );
     }
 
+    /// WOR-2560: the tri-state gauge value is derived from the same
+    /// row the admin JSON renders, on LiteLLM's 0/1/2 scale. Each case
+    /// pins one arm: any ineligibility source reads 2, an eligible
+    /// half-open breaker reads 1 (it is carrying trial traffic, which
+    /// is degraded rather than out), and only a fully clean target
+    /// reads 0.
+    #[test]
+    fn target_health_metric_state_matches_selection_eligibility() {
+        let row = |healthy: bool, ejected: bool, breaker: Option<&'static str>| TargetHealthRow {
+            index: 0,
+            url: "http://127.0.0.1:9601".to_string(),
+            healthy,
+            outlier_ejected: ejected,
+            breaker_state: breaker,
+            weight: 1,
+            backup: false,
+            group: None,
+        };
+        use sbproxy_observe::metrics::{
+            TARGET_HEALTH_DEGRADED, TARGET_HEALTH_EXCLUDED, TARGET_HEALTH_HEALTHY,
+        };
+        assert_eq!(
+            row(true, false, Some("closed")).metric_state(),
+            TARGET_HEALTH_HEALTHY
+        );
+        // No breaker configured is the common case and is healthy.
+        assert_eq!(row(true, false, None).metric_state(), TARGET_HEALTH_HEALTHY);
+        assert_eq!(
+            row(true, false, Some("half_open")).metric_state(),
+            TARGET_HEALTH_DEGRADED
+        );
+        assert_eq!(
+            row(false, false, None).metric_state(),
+            TARGET_HEALTH_EXCLUDED,
+            "probe-unhealthy must exclude"
+        );
+        assert_eq!(
+            row(true, true, None).metric_state(),
+            TARGET_HEALTH_EXCLUDED,
+            "outlier ejection must exclude"
+        );
+        assert_eq!(
+            row(true, false, Some("open")).metric_state(),
+            TARGET_HEALTH_EXCLUDED,
+            "an open breaker must exclude"
+        );
+        // A half-open breaker on an ejected target is still excluded:
+        // eligibility wins over the degraded reading.
+        assert_eq!(
+            row(true, true, Some("half_open")).metric_state(),
+            TARGET_HEALTH_EXCLUDED
+        );
+    }
+
+    /// Fix round on the #1177 review, red-first: keying the gauge's
+    /// `target` label on `row.url` alone collapsed two same-URL targets
+    /// into one series. The load balancer refuses that assumption in
+    /// its own identifier (`target_id` is `url#index` "so two targets
+    /// with the same URL stay distinguishable"), and two same-URL
+    /// targets are a real config: a weighted pair, or blue and green
+    /// addressed through one host.
+    ///
+    /// Before the fix both rows wrote
+    /// `with_label_values(&["lb.local", "http://a:8080"])`, last write
+    /// won, and the ejected target read healthy on `/metrics` while
+    /// `GET /api/health/targets` still showed it ejected at its own
+    /// `index`. That is exactly the disagreement between the two
+    /// surfaces the registry description, `docs/observability.md`, and
+    /// the example README all promise cannot happen.
+    #[test]
+    fn same_url_targets_get_distinct_health_gauge_series() {
+        use sbproxy_observe::metrics::{TARGET_HEALTH_EXCLUDED, TARGET_HEALTH_HEALTHY};
+        let row = |index: usize, url: &str, ejected: bool| TargetHealthRow {
+            index,
+            url: url.to_string(),
+            healthy: true,
+            outlier_ejected: ejected,
+            breaker_state: None,
+            weight: 1,
+            backup: false,
+            group: None,
+        };
+        let origins = vec![OriginTargetHealth {
+            hostname: "lb.local".to_string(),
+            origin_id: "lb.local".to_string(),
+            targets: vec![
+                row(0, "http://a:8080", true),
+                row(1, "http://a:8080", false),
+                row(2, "http://b:8080", false),
+            ],
+        }];
+
+        let samples = target_health_samples(&origins);
+        let labels: Vec<&str> = samples.iter().map(|s| s.target.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["http://a:8080#0", "http://a:8080#1", "http://b:8080"],
+            "colliding URLs take the load balancer's own url#index id; a unique URL stays \
+             readable"
+        );
+
+        // The ejected row is still readable as ejected, which is the
+        // whole failure the collapse hid.
+        assert_eq!(samples[0].state, TARGET_HEALTH_EXCLUDED);
+        assert_eq!(samples[1].state, TARGET_HEALTH_HEALTHY);
+        assert_eq!(samples[2].state, TARGET_HEALTH_HEALTHY);
+
+        // Every sample is a distinct (origin, target) pair, so nothing
+        // can be overwritten by a later `set`.
+        let mut pairs: Vec<(&str, &str)> = samples
+            .iter()
+            .map(|s| (s.origin.as_str(), s.target.as_str()))
+            .collect();
+        pairs.sort_unstable();
+        let before = pairs.len();
+        pairs.dedup();
+        assert_eq!(before, pairs.len(), "two rows still share one gauge series");
+    }
+
     #[test]
     fn api_stats_returns_200_with_count() {
         let state = make_state();
@@ -8482,6 +8749,7 @@ origins:
                 error_pages: None,
                 problem_details: None,
                 proxy_status: None,
+                deprecation: None,
                 message_signatures: None,
                 olp: None,
                 web_bot_auth_publish: None,

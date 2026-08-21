@@ -471,6 +471,8 @@ mod tests {
             action: load_balancer_with_breaker(open),
             request_modifiers: Vec::new(),
             parameters: Vec::new(),
+            id: None,
+            deprecation: None,
         }]]
     }
 
