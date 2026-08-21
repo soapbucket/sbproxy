@@ -13,6 +13,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::ai_metrics;
+use crate::aws_sigv4::AwsSigV4Signer;
 use crate::compression::{SummarizationOutput, SummarizerError};
 use crate::handler::AiHandlerConfig;
 use crate::provider::ProviderConfig;
@@ -40,6 +41,129 @@ const MAX_SHADOW_RESPONSE_METADATA_BYTES: usize = 1024 * 1024;
 const PROVIDER_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
 const PROVIDER_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 const PROVIDER_RETRY_JITTER_PCT: u64 = 25;
+
+/// One outbound credential scheme, applied to a fully built request
+/// immediately before it goes on the wire.
+///
+/// # Contract
+///
+/// This is the seam every non-bearer credential scheme plugs into, so
+/// these rules are the contract rather than an implementation detail
+/// of the one scheme that exists today,
+/// [`crate::aws_sigv4::AwsSigV4Signer`].
+///
+/// 1. **Position.** `send_governed` calls [`OutboundSigner::sign`]
+///    immediately before each `Client::execute`. Nothing between that
+///    call and the socket mutates the request except the headers hyper
+///    writes itself (`host`, `content-length`, `accept-encoding`). A
+///    scheme that covers a header therefore has to be able to
+///    guarantee that header's value, and has to leave the ones hyper
+///    owns alone.
+/// 2. **Per attempt, per hop.** `sign` runs again on every retry and
+///    again on every redirect hop, after the URL has been rewritten to
+///    the next target. A credential bound to a host, a path, or a body
+///    is always bound to the one being sent, never to the previous
+///    one. Any code that mutates a request has to run above this
+///    boundary; nothing below it may touch the body.
+/// 3. **Idempotence.** The same request object reaches `sign` more
+///    than once, because a same-origin redirect replays it. An
+///    implementation overwrites every header it owns rather than
+///    appending, and never lets one application's output become the
+///    next application's input.
+/// 4. **Fail closed.** An error from `sign` fails the attempt. There
+///    is no unsigned fallback, and a refusing implementation leaves no
+///    partially applied credential behind.
+/// 5. **Secrecy.** No implementation puts credential material into a
+///    log line, an error string, a `Debug` render, a metric label, or
+///    a panic message, and every header it writes is marked sensitive
+///    so `strip_sensitive_headers` drops it on a cross-origin hop.
+///
+/// A scheme that needs to see what the upstream said (an expiry
+/// signal, a challenge, a clock reading) implements
+/// [`OutboundSigner::observe_response`], called once per response with
+/// the status, the headers, and the round-trip time. It runs on the
+/// request path, so it must not block.
+#[async_trait::async_trait]
+pub trait OutboundSigner: Send + Sync + std::fmt::Debug {
+    /// Stable label for this scheme, for logs and diagnostics. Never
+    /// derived from a credential value.
+    fn scheme(&self) -> &'static str;
+
+    /// Apply this scheme's credential to `request` in place.
+    ///
+    /// # Errors
+    ///
+    /// Any failure fails the attempt; there is no unsigned fallback.
+    async fn sign(&self, request: &mut reqwest::Request) -> Result<()>;
+
+    /// Observe one upstream response. Ignored by default.
+    fn observe_response(
+        &self,
+        _status: reqwest::StatusCode,
+        _headers: &reqwest::header::HeaderMap,
+        _round_trip: Duration,
+    ) {
+    }
+}
+
+/// Per-provider outbound signers, built on first use.
+///
+/// Building a signer can cost an STS round trip, so it happens once
+/// per provider rather than once per request. A config reload replaces
+/// the whole [`AiClient`] (see `sbproxy_core::server::reload_ai_client`),
+/// which drops this cache with it, so a provider name is a sufficient
+/// key: an entry can never outlive the `aws_sigv4:` block that
+/// produced it.
+#[derive(Default)]
+struct SignerCache {
+    built: tokio::sync::Mutex<std::collections::HashMap<String, Arc<AwsSigV4Signer>>>,
+}
+
+impl SignerCache {
+    /// The signer for `provider`, or `None` when the provider carries
+    /// no `aws_sigv4:` block.
+    ///
+    /// Absence of the block is what selects verbatim credential
+    /// pass-through, so there is no runtime branch in which an
+    /// unsigned provider acquires a signer or a signed provider also
+    /// forwards a static credential header.
+    async fn signer_for(&self, provider: &ProviderConfig) -> Result<Option<Arc<AwsSigV4Signer>>> {
+        let Some(config) = provider.aws_sigv4.as_ref() else {
+            return Ok(None);
+        };
+        // Fail closed on a block that cannot sign, before anything
+        // dials AWS with it. This is the only place that check runs
+        // today: the handler's per-provider validation loop
+        // (`AiHandlerConfig::from_config`, alongside `validate_base_url`)
+        // is where it belongs, so the operator learns at config load
+        // rather than on the first request, and adding it there is the
+        // one follow-up this lane could not land itself.
+        provider
+            .validate_aws_sigv4()
+            .map_err(|reason| anyhow::anyhow!("provider {}: {reason}", provider.name))?;
+        let mut built = self.built.lock().await;
+        if let Some(existing) = built.get(provider.name.as_str()) {
+            return Ok(Some(existing.clone()));
+        }
+        let signer = Arc::new(
+            AwsSigV4Signer::build(config, provider.effective_provider_type())
+                .await
+                .map_err(anyhow::Error::new)?,
+        );
+        debug!(
+            provider = %provider.name,
+            scheme = %OutboundSigner::scheme(signer.as_ref()),
+            "built an outbound request signer for provider"
+        );
+        built.insert(provider.name.as_str().to_string(), signer.clone());
+        Ok(Some(signer))
+    }
+}
+
+/// Borrow an optional signer as the trait object `send_governed` takes.
+fn as_signer(signer: &Option<Arc<AwsSigV4Signer>>) -> Option<&dyn OutboundSigner> {
+    signer.as_deref().map(|s| s as &dyn OutboundSigner)
+}
 
 /// Supervisor for shadow / side-by-side eval tasks.
 ///
@@ -310,6 +434,11 @@ struct ShadowCallResult {
 struct PreparedShadowRequest {
     permit: ShadowPermit,
     http: reqwest::Client,
+    /// WOR-2648: a shadow copy is a real, billable upstream call, so a
+    /// SigV4 provider's shadow leg is signed exactly like its primary.
+    /// It reaches AWS as a genuine `InvokeModel` and appears in
+    /// CloudTrail as one; `x-sbproxy-shadow: 1` marks it on the wire.
+    signers: Arc<SignerCache>,
     provider: ProviderConfig,
     path: String,
     body: serde_json::Value,
@@ -330,6 +459,8 @@ pub struct AiClient {
     /// Optional purpose-scoped egress authorizer. `None` preserves
     /// legacy ungated provider calls (omitted `proxy.egress` config).
     egress: Option<EgressAuthorizer>,
+    /// Per-provider outbound request signers, built on first use.
+    signers: Arc<SignerCache>,
 }
 
 impl AiClient {
@@ -349,6 +480,7 @@ impl AiClient {
                 .expect("AI HTTP client builder failed; cannot enforce the request timeout"),
             shadow_supervisor: Arc::new(ShadowSupervisor::default()),
             egress: None,
+            signers: Arc::new(SignerCache::default()),
         }
     }
 
@@ -376,6 +508,7 @@ impl AiClient {
                 .expect("AI HTTP client builder failed; cannot enforce the request timeout"),
             shadow_supervisor: supervisor,
             egress: None,
+            signers: Arc::new(SignerCache::default()),
         }
     }
 
@@ -454,7 +587,15 @@ impl AiClient {
         provider: &ProviderConfig,
     ) -> Result<reqwest::Response> {
         apply_provider_timeout(&mut request, provider);
-        send_governed(&self.http, self.egress.as_ref(), &provider.name, request).await
+        let signer = self.signers.signer_for(provider).await?;
+        send_governed(
+            &self.http,
+            self.egress.as_ref(),
+            &provider.name,
+            as_signer(&signer),
+            request,
+        )
+        .await
     }
 
     /// Borrow the shadow supervisor (test + diagnostic accessor).
@@ -797,6 +938,7 @@ impl AiClient {
         Ok(PreparedShadowRequest {
             permit,
             http: self.http.clone(),
+            signers: self.signers.clone(),
             provider: shadow_provider,
             path: path.to_string(),
             body: body_owned,
@@ -815,6 +957,7 @@ impl AiClient {
         let PreparedShadowRequest {
             permit,
             http,
+            signers,
             provider,
             path,
             body,
@@ -833,7 +976,15 @@ impl AiClient {
             ai_metrics::record_reasoning_policy_attempt(&provider.name, reasoning_outcome);
             match tokio::time::timeout(
                 task_timeout,
-                run_shadow_request(http, provider, path, body, http_timeout, quota_attempt),
+                run_shadow_request(
+                    http,
+                    signers,
+                    provider,
+                    path,
+                    body,
+                    http_timeout,
+                    quota_attempt,
+                ),
             )
             .await
             {
@@ -1069,21 +1220,23 @@ impl AiClient {
         self.gate_provider_url(&url_string, &provider.name)?;
         let url = reqwest::Url::parse(&url_string)?;
 
-        let (auth_header, auth_value) = provider_auth_header(provider)?;
+        let auth = provider_auth_header(provider)?;
 
         debug!(
             url = %url,
             provider = %provider.name,
             format = ?format,
-            auth_header = %auth_header,
+            signed = provider.aws_sigv4.is_some(),
             "forwarding AI request to provider"
         );
 
         let mut req = self
             .http
             .post(url)
-            .header("content-type", "application/json")
-            .header(auth_header, &auth_value);
+            .header("content-type", "application/json");
+        if let Some((auth_header, auth_value)) = auth {
+            req = req.header(auth_header, auth_value);
+        }
 
         // Anthropic requires an api-version header; default the most
         // widely deployed value when the caller didn't set one.
@@ -1130,7 +1283,7 @@ impl AiClient {
         self.gate_provider_url(&url_string, &provider.name)?;
         let url = reqwest::Url::parse(&url_string)?;
 
-        let (auth_header, auth_value) = provider_auth_header(provider)?;
+        let auth = provider_auth_header(provider)?;
 
         debug!(
             url = %url,
@@ -1138,7 +1291,11 @@ impl AiClient {
             "forwarding AI GET request to provider"
         );
 
-        let req = self.http.get(url).header(auth_header, auth_value).build()?;
+        let mut req = self.http.get(url);
+        if let Some((auth_header, auth_value)) = auth {
+            req = req.header(auth_header, auth_value);
+        }
+        let req = req.build()?;
         commit_quota_attempt(quota_attempt).await?;
         let resp = self.send_provider_request(req, provider).await?;
 
@@ -1209,7 +1366,7 @@ impl AiClient {
         self.gate_provider_url(&url_string, &provider.name)?;
         let url = reqwest::Url::parse(&url_string)?;
 
-        let (auth_header, auth_value) = provider_auth_header(provider)?;
+        let auth = provider_auth_header(provider)?;
 
         debug!(
             url = %url,
@@ -1221,10 +1378,10 @@ impl AiClient {
 
         let reqwest_method = parse_http_method(method)?;
 
-        let mut req = self
-            .http
-            .request(reqwest_method, url)
-            .header(auth_header, &auth_value);
+        let mut req = self.http.request(reqwest_method, url);
+        if let Some((auth_header, auth_value)) = auth {
+            req = req.header(auth_header, auth_value);
+        }
 
         if matches!(format, ProviderFormat::Anthropic) {
             req = req.header("anthropic-version", "2023-06-01");
@@ -1332,7 +1489,7 @@ impl AiClient {
         let url_string = build_url(base_url, native_path);
         self.gate_provider_url(&url_string, &provider.name)?;
         let url = reqwest::Url::parse(&url_string)?;
-        let (auth_header, auth_value) = provider_auth_header(provider)?;
+        let auth = provider_auth_header(provider)?;
         let reqwest_method = parse_http_method(method)?;
 
         debug!(
@@ -1347,8 +1504,10 @@ impl AiClient {
         let mut req = self
             .http
             .request(reqwest_method, url)
-            .header(auth_header, &auth_value)
             .header("content-type", "application/json");
+        if let Some((auth_header, auth_value)) = auth {
+            req = req.header(auth_header, auth_value);
+        }
         if matches!(format, ProviderFormat::Anthropic) {
             req = req.header("anthropic-version", "2023-06-01");
         }
@@ -1416,7 +1575,7 @@ impl AiClient {
         let url_string = build_url(base_url, path);
         self.gate_provider_url(&url_string, &provider.name)?;
         let url = reqwest::Url::parse(&url_string)?;
-        let (auth_header, auth_value) = provider_auth_header(provider)?;
+        let auth = provider_auth_header(provider)?;
         let content_type_header = reqwest::header::HeaderValue::from_str(content_type)?;
         let reqwest_method = parse_http_method(method)?;
 
@@ -1429,13 +1588,14 @@ impl AiClient {
             "forwarding AI raw-body request to provider"
         );
 
-        let req = self
+        let mut req = self
             .http
             .request(reqwest_method, url)
-            .header(auth_header, auth_value)
-            .header("content-type", content_type_header)
-            .body(body)
-            .build()?;
+            .header("content-type", content_type_header);
+        if let Some((auth_header, auth_value)) = auth {
+            req = req.header(auth_header, auth_value);
+        }
+        let req = req.body(body).build()?;
         commit_quota_attempt(quota_attempt).await?;
         let resp = self.send_provider_request(req, provider).await?;
         Ok(resp)
@@ -1451,14 +1611,28 @@ async fn commit_quota_attempt(
     Ok(())
 }
 
+/// The verbatim credential header for `provider`, or `None` when the
+/// provider authenticates with a request signature instead.
+///
+/// WOR-2648: the bearer mode and the signing mode are structurally
+/// exclusive rather than a runtime branch. A provider entry carrying an
+/// `aws_sigv4:` block emits no static credential header at all, so
+/// there is no path on which an operator string could ride alongside a
+/// signature, and the "a signed provider never sends `api_key`"
+/// property holds by construction. Config validation refuses the two
+/// keys together, so this returning `None` is never a silently dropped
+/// credential.
 fn provider_auth_header(
     provider: &ProviderConfig,
-) -> Result<(reqwest::header::HeaderName, reqwest::header::HeaderValue)> {
+) -> Result<Option<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>> {
+    if provider.aws_sigv4.is_some() {
+        return Ok(None);
+    }
     let (name, value) = provider.auth_header();
     let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())?;
     let mut value = reqwest::header::HeaderValue::from_str(&value)?;
     value.set_sensitive(true);
-    Ok((name, value))
+    Ok(Some((name, value)))
 }
 
 /// Parse an HTTP method string into a `reqwest::Method`. Accepts the
@@ -1522,18 +1696,36 @@ fn apply_provider_timeout(request: &mut reqwest::Request, provider: &ProviderCon
 /// happens at all. With an authorizer, each hop is authorized against
 /// the allowlist for [`EgressPurpose::AiProvider`] and credentials are
 /// stripped when the hop crosses origin.
+///
+/// WOR-2648: this is also the signing boundary. `signer` runs against
+/// the fully built request immediately before each `execute`, which is
+/// the only place in the outbound path where the method, host, path,
+/// headers, and body are all final and all still mutable. A signature
+/// computed anywhere upstream would be invalidated by the redirect
+/// rewrite below, and one computed downstream is impossible. See
+/// [`OutboundSigner`] for the contract this position imposes on a
+/// scheme.
 async fn send_governed(
     http: &reqwest::Client,
     egress: Option<&EgressAuthorizer>,
     origin_label: &str,
+    signer: Option<&dyn OutboundSigner>,
     mut request: reqwest::Request,
 ) -> Result<reqwest::Response> {
     let mut hop = 0usize;
     loop {
+        // The signing boundary. This runs once per attempt and once per
+        // hop, after `*replay.url_mut() = next.url` below has moved the
+        // request to the next host and path, so the credential is
+        // always bound to the request actually being sent.
+        if let Some(signer) = signer {
+            signer.sign(&mut request).await?;
+        }
         // Clone before the send consumes the request so a hop can reuse
         // the method, headers, and body.
         let replay = request.try_clone();
         let from = request.url().clone();
+        let started = std::time::Instant::now();
         // `without_url` rather than a bare `?`. A provider dial carries
         // an API key, some providers carry it in the query string, and a
         // `reqwest::Error`'s Display ends with `" for url ({url})"`. This
@@ -1547,6 +1739,12 @@ async fn send_governed(
             .execute(request)
             .await
             .map_err(reqwest::Error::without_url)?;
+        if let Some(signer) = signer {
+            // Lets a scheme learn from the answer: SigV4 reads the
+            // `Date` header off a rejection to measure local clock
+            // skew, which is otherwise indistinguishable from a bad key.
+            signer.observe_response(resp.status(), resp.headers(), started.elapsed());
+        }
         if !resp.status().is_redirection() {
             return Ok(resp);
         }
@@ -1693,6 +1891,10 @@ impl AiClient {
                 prepare_provider_attempt_body(config, &provider, body);
             let http = self.http.clone();
             let egress = self.egress.clone();
+            // Resolved before the spawn so a provider whose credentials
+            // cannot be built refuses the whole race rather than losing
+            // one leg silently mid-flight.
+            let signer = self.signers.signer_for(&provider).await?;
             let i = *idx;
             // Pre-authorize before spawning so an unlisted host is
             // denied without opening a connection.
@@ -1717,12 +1919,12 @@ impl AiClient {
                 // cross-origin hop strips it, the same as every other
                 // provider dial. The raw `provider.auth_header()` pair
                 // this leg used to build did not.
-                let auth = provider_auth_header(&provider);
-                let mut req = match auth {
-                    Ok((auth_header, auth_value)) => http
+                let mut req = match provider_auth_header(&provider) {
+                    Ok(Some((auth_header, auth_value))) => http
                         .post(&url)
                         .header("content-type", "application/json")
                         .header(auth_header, auth_value),
+                    Ok(None) => http.post(&url).header("content-type", "application/json"),
                     Err(error) => return (i, provider, Err(error)),
                 };
                 if matches!(format, ProviderFormat::Anthropic) {
@@ -1732,7 +1934,14 @@ impl AiClient {
                 let resp = match req.json(send_body).build() {
                     Ok(mut request) => {
                         apply_provider_timeout(&mut request, &provider);
-                        send_governed(&http, egress.as_ref(), &provider.name, request).await
+                        send_governed(
+                            &http,
+                            egress.as_ref(),
+                            &provider.name,
+                            as_signer(&signer),
+                            request,
+                        )
+                        .await
                     }
                     Err(error) => Err(anyhow::Error::new(error)),
                 };
@@ -2436,6 +2645,7 @@ fn response_is_empty_or_refused(body: &[u8]) -> bool {
 /// drain the body so connections return to the pool.
 async fn run_shadow_request(
     http: reqwest::Client,
+    signers: Arc<SignerCache>,
     provider: ProviderConfig,
     path: String,
     body: serde_json::Value,
@@ -2456,19 +2666,34 @@ async fn run_shadow_request(
             return failed_shadow_call(started);
         }
     };
-    let (auth_header, auth_value) = match provider_auth_header(&provider) {
+    let auth = match provider_auth_header(&provider) {
         Ok(header) => header,
         Err(error) => {
             warn!(provider = %provider.name, %error, "shadow request auth header is invalid");
             return failed_shadow_call(started);
         }
     };
+    // WOR-2648: a shadow copy of a SigV4 provider is signed with the
+    // same credential as the primary and reaches AWS as a real
+    // `InvokeModel`. Excluding signed providers from shadow would be an
+    // undocumented routing carve-out, and a shadow copy already costs
+    // real money at every other vendor; `shadow:` is the switch for
+    // operators who do not want the extra call.
+    let signer = match signers.signer_for(&provider).await {
+        Ok(signer) => signer,
+        Err(error) => {
+            warn!(provider = %provider.name, %error, "shadow request signer is unavailable");
+            return failed_shadow_call(started);
+        }
+    };
     let mut req = http
         .post(url)
-        .header(auth_header, auth_value)
         .header("x-sbproxy-shadow", "1")
         .json(send_body)
         .timeout(timeout);
+    if let Some((auth_header, auth_value)) = auth {
+        req = req.header(auth_header, auth_value);
+    }
     if matches!(format, ProviderFormat::Anthropic) {
         req = req.header("anthropic-version", "2023-06-01");
     }
@@ -2492,22 +2717,24 @@ async fn run_shadow_request(
             return failed_shadow_call(started);
         }
     };
-    let mut resp = match send_governed(&http, None, &provider.name, request).await {
-        Ok(r) => r,
-        // `transport_error`, not `e`: `send_governed` strips the URL off
-        // the `reqwest::Error` before it becomes an `anyhow::Error`, and
-        // the name says at the log site which error is in hand rather
-        // than leaving the next reader to go and check (WOR-2629).
-        Err(transport_error) => {
-            warn!(
-                provider = %provider.name,
-                error = %transport_error,
-                "shadow request transport error"
-            );
-            ai_metrics::record_provider_error(&provider.name, "transport");
-            return failed_shadow_call(started);
-        }
-    };
+    let mut resp =
+        match send_governed(&http, None, &provider.name, as_signer(&signer), request).await {
+            Ok(r) => r,
+            // `transport_error`, not `e`: `send_governed` strips the URL
+            // off the `reqwest::Error` before it becomes an
+            // `anyhow::Error`, and the name says at the log site which
+            // error is in hand rather than leaving the next reader to go
+            // and check (WOR-2629).
+            Err(transport_error) => {
+                warn!(
+                    provider = %provider.name,
+                    error = %transport_error,
+                    "shadow request transport error"
+                );
+                ai_metrics::record_provider_error(&provider.name, "transport");
+                return failed_shadow_call(started);
+            }
+        };
     let status = resp.status();
     if !status.is_success() {
         let kind = if status.is_server_error() {
@@ -4506,6 +4733,197 @@ mod tests {
         )
     }
 
+    /// Serve a sequence of responses on one listener, one connection
+    /// each, and hand back the raw text of every request received.
+    ///
+    /// `dial_fixture` accepts a single connection, which is enough for
+    /// a refused hop but not for a redirect that is actually followed.
+    /// `build` receives the bound address so a response can name the
+    /// listener's own port, which a plain `Vec<String>` cannot do.
+    fn dial_sequence(
+        build: impl FnOnce(std::net::SocketAddr) -> Vec<String>,
+    ) -> Option<(std::net::SocketAddr, Arc<parking_lot::Mutex<Vec<String>>>)> {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+        let addr = listener.local_addr().ok()?;
+        let responses = build(addr);
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let writer = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for response in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut scratch = [0u8; 4096];
+                let read = stream.read(&mut scratch).unwrap_or(0);
+                let text = String::from_utf8_lossy(&scratch[..read]).to_string();
+                writer.lock().push(text);
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        Some((addr, seen))
+    }
+
+    /// A signer that records the URL it was handed and stamps a marker
+    /// header, so a test can see exactly when and against what the
+    /// signing boundary fired.
+    #[derive(Debug)]
+    struct RecordingSigner {
+        seen: parking_lot::Mutex<Vec<String>>,
+        fail: bool,
+    }
+
+    impl RecordingSigner {
+        fn new(fail: bool) -> Self {
+            Self {
+                seen: parking_lot::Mutex::new(Vec::new()),
+                fail,
+            }
+        }
+
+        fn urls(&self) -> Vec<String> {
+            self.seen.lock().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl OutboundSigner for RecordingSigner {
+        fn scheme(&self) -> &'static str {
+            "recording"
+        }
+
+        async fn sign(&self, request: &mut reqwest::Request) -> Result<()> {
+            self.seen.lock().push(request.url().to_string());
+            if self.fail {
+                return Err(anyhow::anyhow!("signing refused"));
+            }
+            let index = self.seen.lock().len();
+            let mut value = reqwest::header::HeaderValue::from_str(&format!("signed-{index}"))?;
+            value.set_sensitive(true);
+            request
+                .headers_mut()
+                .insert(reqwest::header::AUTHORIZATION, value);
+            Ok(())
+        }
+    }
+
+    fn sigv4_provider_json(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "provider_type": "bedrock",
+            "aws_sigv4": {"region": "us-east-1"},
+        })
+    }
+
+    #[test]
+    fn a_signed_provider_emits_no_verbatim_credential_header() {
+        // The bearer mode and the signing mode have to be exclusive at
+        // the point the header is built, not merely refused at config
+        // load, because the signer overwrites `Authorization` and a
+        // static credential riding along would be invisible.
+        let signed: ProviderConfig =
+            serde_json::from_value(sigv4_provider_json("bedrock")).expect("config parses");
+        assert!(
+            provider_auth_header(&signed)
+                .expect("header resolution succeeds")
+                .is_none(),
+            "a SigV4 provider must contribute no static credential header"
+        );
+
+        let bearer: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test",
+        }))
+        .expect("config parses");
+        let (name, value) = provider_auth_header(&bearer)
+            .expect("header resolution succeeds")
+            .expect("a bearer provider still sends its credential");
+        assert_eq!(name.as_str(), "authorization");
+        assert!(value.is_sensitive());
+    }
+
+    #[tokio::test]
+    async fn the_signer_runs_again_on_every_hop_against_the_rewritten_url() {
+        // A signature is bound to the host and path it covers, so
+        // replaying hop one's signature onto hop two is an
+        // authentication failure that looks like a network problem.
+        // `send_governed` must therefore sign after the URL rewrite,
+        // once per hop.
+        let Some((addr, seen)) = dial_sequence(|addr| {
+            vec![
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{}/v1/moved\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    addr.port()
+                ),
+                ok_response("{}"),
+            ]
+        }) else {
+            return;
+        };
+
+        let client = AiClient::new();
+        let request = client
+            .http
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .json(&serde_json::json!({"model": "m"}))
+            .build()
+            .expect("test request builds");
+        let signer = RecordingSigner::new(false);
+        let resp = send_governed(&client.http, None, "test-provider", Some(&signer), request)
+            .await
+            .expect("a same-origin hop is followed");
+        assert_eq!(resp.status().as_u16(), 200);
+
+        let urls = signer.urls();
+        assert_eq!(urls.len(), 2, "one signature per hop, got {urls:?}");
+        assert!(urls[0].ends_with("/v1/chat/completions"));
+        assert!(
+            urls[1].ends_with("/v1/moved"),
+            "the second signature must cover the redirect target, got {}",
+            urls[1]
+        );
+
+        let requests = seen.lock().clone();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0].contains("signed-1"),
+            "hop one carries the first signature"
+        );
+        assert!(
+            requests[1].contains("signed-2") && !requests[1].contains("signed-1"),
+            "hop two carries the second signature and not the first: {}",
+            requests[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_signer_failure_fails_the_attempt_without_dialing() {
+        // Fail closed. An unsigned request to a SigV4 endpoint is a 403
+        // and a wasted round trip; worse, a scheme that silently fell
+        // through would send the credential-free request as if it were
+        // fine.
+        let Some((addr, hit)) = dial_fixture(ok_response("{}")) else {
+            return;
+        };
+        let client = AiClient::new();
+        let request = client
+            .http
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .build()
+            .expect("test request builds");
+        let signer = RecordingSigner::new(true);
+        let error = send_governed(&client.http, None, "test-provider", Some(&signer), request)
+            .await
+            .expect_err("a signing failure fails the attempt");
+        assert!(format!("{error:#}").contains("signing refused"));
+        assert!(
+            !hit.load(Ordering::SeqCst),
+            "nothing may be dialed once signing has failed"
+        );
+    }
+
     #[tokio::test]
     async fn provider_dial_refuses_a_cross_origin_redirect_hop() {
         // Hop one is the host the operator configured and serves a 302
@@ -4535,7 +4953,7 @@ mod tests {
             .build()
             .expect("test request builds");
 
-        let err = send_governed(&client.http, None, "test-provider", request)
+        let err = send_governed(&client.http, None, "test-provider", None, request)
             .await
             .expect_err("a cross-origin hop must be refused, not followed");
         let rendered = format!("{err:#}");
@@ -4568,7 +4986,7 @@ mod tests {
             .get(format!("http://{addr}/v1/models"))
             .build()
             .expect("test request builds");
-        let resp = send_governed(&client.http, None, "test-provider", request)
+        let resp = send_governed(&client.http, None, "test-provider", None, request)
             .await
             .expect("a non-redirect response returns unchanged");
         assert_eq!(resp.status().as_u16(), 200);

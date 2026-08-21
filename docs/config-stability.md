@@ -577,6 +577,30 @@ through a release yet, so they are tiered separately.
 | `add` | - | object | `{}` | **stable** |
 | `remove` | `delete` | array | `[]` | **stable** |
 
+### `providers[].aws_sigv4` - AWS SigV4 request signing
+
+| Field | Type | Default | Stability | Notes |
+|---|---|---|---|---|
+| `region` | string | required | **beta** | Credential scope. Independent of `base_url`; never inferred from the endpoint host. |
+| `service` | string | from `provider_type` | **beta** | Signing service name. Defaults to `bedrock` / `sagemaker`. |
+| `refresh_margin_secs` | integer | 900 | **beta** | Refresh window before a short-lived credential expires. Minimum 600. |
+| `credentials.source` | string | `default_chain` | **beta** | `default_chain`, `static`, or `assume_role`. |
+| `credentials.access_key_id` | string | - | **beta** | Read by `static` only. |
+| `credentials.secret_access_key` | string | - | **beta** | Read by `static` only. Secret-resolving. |
+| `credentials.session_token` | string | - | **beta** | Read by `static` only. Secret-resolving. Not renewable by SBproxy. |
+| `credentials.role_arn` | string | - | **beta** | Read by `assume_role` only. |
+| `credentials.external_id` | string | - | **beta** | Read by `assume_role` only. Secret-resolving. |
+| `credentials.session_name` | string | `sbproxy` | **beta** | Read by `assume_role` only. |
+| `credentials.session_duration_secs` | integer | role default | **beta** | Read by `assume_role` only. |
+| `credentials.profile` | string | - | **beta** | Read by `default_chain` and by the `assume_role` base identity. |
+
+The whole block is **beta** for its first release. The shape that is least
+likely to move is `region` plus a credential source, and the part most likely
+to gain fields is `credentials`, where AWS keeps adding provider kinds. Every
+field a source does not read is refused rather than ignored, so a rename would
+surface as a config error rather than as a silently unsigned request.
+`api_key` and `aws_sigv4` on one provider entry are refused together.
+
 ### Body Modifier (request)
 
 | Field | Type | Stability |

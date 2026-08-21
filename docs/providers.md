@@ -1,5 +1,5 @@
 # Supported providers
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 SBproxy ships native adapters for 72 LLM providers behind one OpenAI-compatible API. The 72 breaks down as: 66 entries that speak the OpenAI wire format and pass through unchanged, 3 with in-tree request and response translators (Anthropic, Gemini, Bedrock), and 3 `Custom`-format entries (SageMaker, Oracle, Watsonx) that pass through in their native shape with no translation. You bring your own key per provider, and the `model` field passes straight through to the upstream, so the gateway reaches 200+ models (and whatever a provider ships next) without enumerating them.
 
@@ -25,7 +25,7 @@ Each provider has a default base URL and auth format. Override `base_url` if you
 | `anthropic` | Anthropic Claude | Anthropic Messages | `x-api-key` | `https://api.anthropic.com/v1` |
 | `gemini` | Google Gemini | Google | `x-goog-api-key` | `https://generativelanguage.googleapis.com/v1beta` |
 | `azure` | Azure OpenAI | OpenAI | `api-key` | `https://{resource}.openai.azure.com/openai` |
-| `bedrock` | AWS Bedrock | Bedrock | Authorization (SigV4 signed externally)[^sigv4] | `https://bedrock-runtime.{region}.amazonaws.com` |
+| `bedrock` | AWS Bedrock | Bedrock | AWS SigV4[^sigv4] | `https://bedrock-runtime.{region}.amazonaws.com` |
 | `cohere` | Cohere | OpenAI | `Authorization: Bearer` | `https://api.cohere.com/v2` |
 | `mistral` | Mistral AI | OpenAI | `Authorization: Bearer` | `https://api.mistral.ai/v1` |
 | `groq` | Groq | OpenAI | `Authorization: Bearer` | `https://api.groq.com/openai/v1` |
@@ -39,7 +39,7 @@ Each provider has a default base URL and auth format. Override `base_url` if you
 | `fireworks` | Fireworks AI | OpenAI | `Authorization: Bearer` | `https://api.fireworks.ai/inference/v1` |
 | `perplexity` | Perplexity | OpenAI | `Authorization: Bearer` | `https://api.perplexity.ai` |
 | `xai` | xAI (Grok) | OpenAI | `Authorization: Bearer` | `https://api.x.ai/v1` |
-| `sagemaker` | Amazon SageMaker | Custom | Authorization (SigV4 signed externally)[^sigv4] | `https://runtime.sagemaker.{region}.amazonaws.com` |
+| `sagemaker` | Amazon SageMaker | Custom | AWS SigV4[^sigv4] | `https://runtime.sagemaker.{region}.amazonaws.com` |
 | `databricks` | Databricks | OpenAI | `Authorization: Bearer` | `https://{workspace}.cloud.databricks.com/serving-endpoints` |
 | `oracle` | Oracle OCI Generative AI | Custom | `Authorization: Bearer` | `https://inference.generativeai.{region}.oci.oraclecloud.com` |
 | `watsonx` | IBM watsonx | Custom | `Authorization: Bearer` | `https://us-south.ml.cloud.ibm.com/ml/v1` |
@@ -102,9 +102,9 @@ The `cloudflare`, `vertex`, `runpod`, `azure_foundry`, and `snowflake` defaults 
 
 `format` is the wire protocol the upstream expects. OpenAI-compatible upstreams pass through unchanged. Anthropic, Google Gemini, and AWS Bedrock are translated bidirectionally for chat-completions requests: clients send OpenAI-shaped bodies, SBproxy rewrites the body and path on the way out, and SBproxy rewrites the response back to OpenAI shape. For streaming, the relay parses native Anthropic, Gemini, and Bedrock stream frames into the internal hub stream and re-emits OpenAI Chat, Anthropic Messages, or OpenAI Responses shape based on the inbound route. Gemini embeddings at `/v1/embeddings` translate to and from Gemini embedding calls. Oracle OCI, Watsonx, SageMaker, and other `Custom` formats remain native pass-through, so clients must send the provider's native body shape or route through OpenRouter/custom translation.
 
-Override `base_url` to use a region other than us-south for watsonx, or to point Bedrock and SageMaker at a non-default region.
+Override `base_url` to use a region other than us-south for watsonx. Bedrock and SageMaker take their region from `aws_sigv4.region`, which fills the `{region}` placeholder in the default URL; set `base_url` as well only when the endpoint itself moves, as it does for a VPC endpoint.
 
-[^sigv4]: SBproxy does not compute AWS SigV4 signatures. Bedrock and SageMaker requests must arrive already signed, by your AWS SDK, a signing sidecar, or other operator tooling; the gateway forwards the signed `Authorization` header verbatim. Gateways that sign for you do so by holding your AWS access keys; SBproxy holds no AWS credentials on this path.
+[^sigv4]: Bedrock and SageMaker do not accept a bearer token. Add `aws_sigv4:` to the provider entry and SBproxy computes the signature for each request. An entry without that block still forwards `api_key` verbatim as the `Authorization` header, which is what you want when a signing sidecar already sits in front of the endpoint. See [AWS SigV4 signing for Bedrock and SageMaker](#aws-sigv4-signing-for-bedrock-and-sagemaker).
 
 [^ollama]: Ollama allows blank API keys; SBproxy forwards an empty Bearer token if `api_key` is unset.
 
@@ -163,6 +163,78 @@ providers:
     max_retries: 3
     timeout_ms: 30000
 ```
+
+### AWS SigV4 signing for Bedrock and SageMaker
+
+Bedrock and SageMaker reject a bearer token. Each request needs an `Authorization: AWS4-HMAC-SHA256 ...` header computed over a canonical form of that exact request, body hash included. Add `aws_sigv4:` and SBproxy computes it per request:
+
+```yaml
+providers:
+  - name: bedrock
+    aws_sigv4:
+      region: us-east-1
+    default_model: anthropic.claude-sonnet-4-5-20250929-v1:0
+```
+
+That is the whole minimum. A signed entry has no `api_key`, and setting both is refused at config load, because the signature overwrites `Authorization` and the static credential would be discarded without a word.
+
+`region` is required, and it sets the credential scope. Where the request goes is `base_url`'s business: overriding it moves the endpoint and leaves the signing region alone, which is how the AWS SDKs behave and what makes a PrivateLink endpoint work:
+
+```yaml
+providers:
+  - name: bedrock
+    base_url: https://vpce-0a1b2c3d.bedrock-runtime.us-east-1.vpce.amazonaws.com
+    aws_sigv4:
+      region: us-east-1
+```
+
+With `base_url` unset, `region` fills the `{region}` placeholder in the catalog default, so the dial goes to `https://bedrock-runtime.us-east-1.amazonaws.com`.
+
+`service` defaults to `bedrock` or `sagemaker` from the provider type. Set it only when a provider entry fronts some other AWS service.
+
+#### Credentials
+
+`credentials.source` selects where the key comes from. Omit `credentials:` entirely and you get `default_chain`.
+
+| Source | Reads | Use it for |
+|---|---|---|
+| `default_chain` | `AWS_ACCESS_KEY_ID` and the other standard environment variables, the shared config and credentials files, the EKS web identity token, the ECS task role, the EC2 instance profile | Anything running inside AWS. The chain renews short-lived credentials itself. |
+| `static` | `access_key_id`, `secret_access_key`, optional `session_token` | An IAM user key held outside AWS. |
+| `assume_role` | `role_arn`, optional `external_id`, `session_name`, `session_duration_secs` | Cross-account access, and any deployment that wants short-lived credentials SBproxy renews. The base identity comes from the default chain. |
+
+`secret_access_key`, `session_token`, and `external_id` are secret-resolving fields: `${VAR}`, `vault://`, `awssm://`, `secret://`, and `file:` are all dereferenced at config load, and a reference that cannot be resolved is a hard error rather than a value that reaches AWS verbatim. Once resolved they are held in a type whose `Debug` prints `[REDACTED]` and whose bytes are zeroed on drop, and no SBproxy code path formats them into a log line, an error string, or a metric label.
+
+Prefer a reference over an inlined literal, for `external_id` especially. The admin config endpoints run a redaction pass over the raw config text before returning it, and that pass keys off a fixed list of credential field names. `secret_access_key` and `session_token` are covered; `external_id` is not, because the same field name carries a non-secret payment identifier elsewhere in SBproxy and masking it there would hide reconciliation IDs. A reference sidesteps the question: the file holds `vault://...`, which the redactor deliberately preserves and which is not a secret.
+
+`profile` names a profile in the shared AWS config files and applies to `default_chain` and to the identity `assume_role` starts from.
+
+```yaml
+providers:
+  - name: bedrock
+    aws_sigv4:
+      region: us-east-1
+      credentials:
+        source: assume_role
+        role_arn: arn:aws:iam::123456789012:role/sbproxy-bedrock
+        external_id: ${BEDROCK_EXTERNAL_ID}
+        session_name: sbproxy-prod
+```
+
+#### Expiry and clock skew
+
+An `assume_role` session is renewed 900 seconds before it expires. If STS is unreachable at that moment, the request still goes out on the cached credential and the refresh is retried on the next one, with a WARN naming the failure. Only inside the last 600 seconds does a failed refresh fail the request. Both windows are botocore's, from `RefreshableCredentials`. `refresh_margin_secs` moves the first one and has to stay at or above 600; leave it above 600 if you want the overlap that makes a failed refresh survivable.
+
+A `static` block carrying a `session_token` is the one credential SBproxy cannot renew, because a session token arrives already issued and there is nothing to reissue it from. Once it lapses, Bedrock answers 403 `ExpiredTokenException` until the config supplies a new one. Use `assume_role` or `default_chain` when you want the renewal handled.
+
+Clock skew is the other way a correct key produces a 403. AWS refuses a signature whose timestamp sits too far from its own clock, and Bedrock reports that as a plain 403 that looks much like a permissions error. SBproxy reads the `Date` header off the rejection, estimates the local offset against the round trip's midpoint, and once the offset passes four minutes it logs a WARN naming clock skew and applies the correction to later signatures. Traffic recovers on its own; the log line is your cue to fix NTP on that host, since a correction is not a repair. A wrong secret key never moves the measured offset, which is what tells the two apart in the log.
+
+#### What signing does not cover
+
+Active health checks are skipped for a signed provider, and the startup log names each one skipped. `bedrock-runtime` has no cheap liveness route worth signing, and the control plane's `ListFoundationModels` is a different host, a different signing service, and a different IAM action, so it reports nothing about the data plane. The health axis abstains and routing leans on real-traffic failures instead. Envoy arrives at the same behavior from the other direction: its `aws_request_signing` filter lives in the HTTP filter chain, and active health checks never traverse it.
+
+Shadow and race legs are signed like anything else. A shadow copy of a Bedrock call is a real `InvokeModel` billed to your account and recorded in CloudTrail, tagged on the wire with `x-sbproxy-shadow: 1`. Turn `shadow:` off if you do not want the second call.
+
+A request whose body is a stream is refused rather than signed as `UNSIGNED-PAYLOAD`, which is an Amazon S3 extension `bedrock-runtime` does not accept. It should not come up on this path anyway: Bedrock's streaming operations stream the response and take an ordinary buffered JSON request body.
 
 ## Reaching providers not on this list
 

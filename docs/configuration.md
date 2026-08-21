@@ -1660,11 +1660,44 @@ Peak EWMA accepts the object form:
 | `api_version` | string | | API version header value (e.g. for Anthropic and Azure OpenAI). |
 | `no_prompt_training` | bool | `false` | Marks the provider safe for training-sensitive prompts. Requests carrying the `x-sbproxy-disallow-prompt-training: true` header only route to providers with this flag; a request with the header and no marked provider in the chain gets a 400 `no_compliant_provider`. |
 | `data_posture` | object | unset | Operator override of this entry's declared data-handling posture, consulted by the action-level `data_posture:` filter: `zdr: true` declares this deployment holds a zero-data-retention arrangement (the only thing that makes a vendor which retains by default eligible for `require_zdr`), and `retains_data` overrides the catalog's retention declaration in either direction. Unset keeps the provider catalog's declaration. See [ai-gateway.md](ai-gateway.md#provider-data-posture). |
+| `aws_sigv4` | object | unset | Sign this provider's requests with AWS Signature Version 4, which is what Bedrock and SageMaker require in place of a bearer token. Presence of the block selects the signer. See [AWS SigV4 fields](#aws-sigv4-fields-providersaws_sigv4). |
 
 A `managed_model` provider must set a non-empty `deployment` and must not set
 `api_key`, `base_url`, or the legacy `serve` block. Conversely, `deployment` is
 rejected for every other provider type. Managed traffic resolves through the
 deployment runtime rather than an operator-supplied upstream URL.
+
+A provider entry sets `api_key` or `aws_sigv4`, never both: the signature
+overwrites `Authorization`, so a static credential alongside it would be
+discarded. `accept_native_credentials_for` is refused with `aws_sigv4` for the
+same reason, since it substitutes a caller-owned key for an `api_key` a signed
+provider does not use, and `aws_sigv4` is refused on a `serve:` or
+`managed_model` entry because neither dials AWS.
+
+#### AWS SigV4 fields (`providers[].aws_sigv4`)
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `region` | string | required | AWS region used for the credential scope. Independent of `base_url`: pointing the endpoint at a VPC endpoint or a private host does not change the region a signature is scoped to, matching an AWS SDK's `endpoint_url` override. When `base_url` is unset, this also fills the `{region}` placeholder in the provider catalog's default endpoint. |
+| `service` | string | from `provider_type` | Signing service name in the credential scope. Defaults to `bedrock` and `sagemaker` for those provider types; required for any other. |
+| `refresh_margin_secs` | int | `900` | Seconds before expiry at which a short-lived credential is refreshed. A refresh that fails inside this window is logged and retried on the next request while the cached credential keeps serving, until 600 seconds remain. Must be at least 600. |
+| `credentials.source` | string | `default_chain` | One of `default_chain`, `static`, `assume_role`. |
+| `credentials.access_key_id` | string | unset | AWS access key ID. Required by `static`, refused by the other sources. |
+| `credentials.secret_access_key` | string | unset | AWS secret access key. Required by `static`, refused by the other sources. `${VAR}`, `vault://`, `awssm://`, `secret://`, and `file:` are dereferenced at config load; an unresolvable reference is a hard error. |
+| `credentials.session_token` | string | unset | Session token for an already-issued short-lived key pair. Read by `static` only. SBproxy cannot renew a token it was handed; use `assume_role` for credentials that expire. |
+| `credentials.role_arn` | string | unset | Role to assume. Required by `assume_role`, refused by the other sources. |
+| `credentials.external_id` | string | unset | External ID demanded by the role's trust policy. Read by `assume_role` only. Held as a credential and never formatted by SBproxy, but not covered by the admin-config redaction pass, so supply it as a reference rather than an inlined literal. |
+| `credentials.session_name` | string | `sbproxy` | Role session name recorded in CloudTrail. Read by `assume_role` only. |
+| `credentials.session_duration_secs` | int | role default | Requested role session length. Read by `assume_role` only. |
+| `credentials.profile` | string | unset | Named profile in the shared AWS config files. Read by `default_chain` and by the base identity `assume_role` starts from. |
+
+`default_chain` covers environment variables, the shared config and credentials
+files, an EKS web identity token, the ECS task role, and the EC2 instance
+profile, and it renews short-lived credentials itself. A signed provider is
+skipped by `resilience.health_check`, because there is no signable liveness
+route on `bedrock-runtime`; shadow and race legs are signed and reach AWS as
+real calls. See [providers.md](providers.md#aws-sigv4-signing-for-bedrock-and-sagemaker)
+for the expiry and clock-skew behavior.
 
 #### AI reasoning policy
 
