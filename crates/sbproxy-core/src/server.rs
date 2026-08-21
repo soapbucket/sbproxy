@@ -1384,7 +1384,10 @@ fn spawn_swr_revalidation(
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(
-                    error = %e,
+                    // The reqwest Display would repeat the URL the next
+                    // field already carries, so it adds nothing and takes
+                    // the redaction decision out of this line's hands.
+                    error = %sbproxy_httpkit::request_error_summary(&e),
                     url = %full_url,
                     "swr: revalidation request failed"
                 );
@@ -1491,7 +1494,9 @@ fn spawn_swr_revalidation(
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(e) => {
-                    tracing::warn!(error = %e, "swr: failed to read refresh body");
+                    // Same reqwest Display, same trailing URL (WOR-2629).
+                    let summary = sbproxy_httpkit::request_error_summary(&e);
+                    tracing::warn!(error = %summary, "swr: failed to read refresh body");
                     return;
                 }
             };
@@ -3938,7 +3943,14 @@ async fn check_forward_auth(
     req = sbproxy_observe::telemetry::inject_reqwest_trace_context(req, None);
 
     let response = req.send().await.map_err(|e| {
-        warn!(error = %e, url = %fwd.url, "forward auth request failed");
+        // Not `error = %e`: the reqwest Display ends with the full URL,
+        // and a forward-auth endpoint is operator config that can carry a
+        // token in its path (WOR-2629).
+        warn!(
+            error = %sbproxy_httpkit::request_error_summary(&e),
+            url = %sbproxy_security::url_redact::redacted_url(&fwd.url),
+            "forward auth request failed"
+        );
         (
             503u16,
             "auth service unavailable".to_string(),

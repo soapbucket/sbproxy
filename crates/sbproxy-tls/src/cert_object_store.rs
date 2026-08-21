@@ -25,6 +25,7 @@ use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 use sbproxy_platform::KVStore;
+use sbproxy_security::url_redact::redacted_url;
 
 /// Dedicated multi-thread runtime for the async object_store ops.
 fn rt() -> &'static tokio::runtime::Runtime {
@@ -71,10 +72,32 @@ pub struct ObjectStoreCertKv {
 impl ObjectStoreCertKv {
     /// Build from a URL such as `s3://bucket/prefix` or `gs://bucket/prefix`.
     /// Credentials are read from the environment (object_store `from_env`).
+    ///
+    /// Neither failure names more than the origin. `object_store` reads
+    /// credentials from the environment, but nothing stops an operator
+    /// writing `s3://key:secret@bucket/prefix`, and both of these errors
+    /// are reported at boot where they get logged (WOR-2640).
     pub fn from_url(url: &str) -> Result<Self> {
-        let parsed = url::Url::parse(url).with_context(|| format!("parse cert store url {url}"))?;
-        let (store, prefix) =
-            object_store::parse_url(&parsed).with_context(|| format!("open object store {url}"))?;
+        let mut parsed = url::Url::parse(url).context("cert store url did not parse")?;
+        // Redacting our own context string is not enough on its own:
+        // `object_store` echoes the URL it was handed back out of several
+        // of its own errors (`Unable to recognise URL "..."`), and anyhow
+        // prints the whole chain. So the credential is removed before the
+        // URL is handed over.
+        //
+        // The password only. The username is not a credential here and
+        // for one backend it is load bearing: `object_store`'s Azure
+        // builder reads the username of an `abfs`/`abfss` URL as the ADLS
+        // Gen2 filesystem name, so `abfss://fs@acct.dfs.core.windows.net`
+        // means container `fs` on account `acct`. Clearing it sends the
+        // builder down its fsspec branch, where `acct.dfs.core.windows.net`
+        // is rejected as a container name for containing a dot, and the
+        // whole cert store silently falls back to memory. The aws and gcp
+        // builders never read the username at all, so leaving it costs
+        // them nothing.
+        let _ = parsed.set_password(None);
+        let (store, prefix) = object_store::parse_url(&parsed)
+            .with_context(|| format!("open object store {}", redacted_url(url)))?;
         Ok(Self {
             store: Arc::from(store),
             prefix,
@@ -369,6 +392,61 @@ mod tests {
             },
             dir,
         )
+    }
+
+    #[test]
+    fn from_url_reports_the_origin_and_never_the_password() {
+        // `object_store` quotes the URL it was handed in its own error,
+        // so this pins both halves: our context is redacted, and the
+        // inner error has no password left to quote (WOR-2640).
+        let url = "ftp://aclname:topsecret@bucket.test/certs";
+        // `expect_err` would demand `Debug` on the store, which holds a
+        // `dyn ObjectStore` and deliberately does not implement it.
+        let Err(err) = ObjectStoreCertKv::from_url(url) else {
+            unreachable!("ftp is not an object store");
+        };
+        let msg = format!("{err:#}");
+        assert!(!msg.contains("topsecret"), "password leaked: {msg}");
+        assert!(
+            msg.contains("ftp://bucket.test"),
+            "expected the redacted origin in the error, got: {msg}"
+        );
+    }
+
+    /// The username is deliberately left on the URL, because for one
+    /// backend it is not userinfo at all. `object_store`'s Azure builder
+    /// reads the username of an `abfs`/`abfss` URL as the ADLS Gen2
+    /// filesystem name. Clearing it takes the builder down its fsspec
+    /// branch, where the account host is rejected as a container name for
+    /// containing a dot, `parse_url` returns `Unable to recognise URL`,
+    /// and `open_cert_backend` falls back to an in-memory cert store that
+    /// re-issues on every restart.
+    #[test]
+    fn an_azure_filesystem_name_survives_into_the_builder() {
+        // No credentials are needed to reach this point: the Azure
+        // builder falls through to the managed-identity provider, which
+        // constructs without a network call. What fails, and what this
+        // pins, is URL recognition.
+        for url in [
+            "abfss://certs@myacct.dfs.core.windows.net/sbproxy",
+            // The same shape with a password, which is stripped. The
+            // builder never reads it, so the store still opens.
+            "abfss://certs:hunter2@myacct.dfs.core.windows.net/sbproxy",
+            "abfs://certs@myacct.dfs.core.windows.net/sbproxy",
+        ] {
+            if let Err(err) = ObjectStoreCertKv::from_url(url) {
+                panic!("the azure filesystem name did not reach the builder: {err:#}");
+            }
+        }
+    }
+
+    #[test]
+    fn from_url_does_not_echo_an_unparseable_value() {
+        let Err(err) = ObjectStoreCertKv::from_url("hunter2") else {
+            unreachable!("`hunter2` is not a url");
+        };
+        let msg = format!("{err:#}");
+        assert!(!msg.contains("hunter2"), "input echoed back: {msg}");
     }
 
     /// A store with no conditional write, to pin the refusal.

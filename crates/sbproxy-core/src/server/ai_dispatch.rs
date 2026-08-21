@@ -12161,8 +12161,24 @@ pub(super) async fn read_capped_response_body(
         Some(c) if c > 0 => c,
         _ => {
             return resp.bytes().await.map_err(|e| {
-                warn!(error = %e, "AI proxy: failed to read upstream response body");
-                Error::because(ErrorType::ReadError, "failed to read upstream response", e)
+                // Not `error = %e`: a reqwest Display ends with the whole
+                // upstream URL, and some providers carry the API key in
+                // the query string (WOR-2629).
+                //
+                // The cause handed to `Error::because` needs the same
+                // treatment, and for the same reason. pingora's own
+                // `Display` writes `" cause: {c}"` for a non-pingora
+                // cause, and pingora-proxy logs the error it gets back
+                // out of `request_filter`, so the reqwest Display reaches
+                // a second log line this one cannot see. `without_url`
+                // is what keeps the URL off both.
+                let summary = sbproxy_httpkit::request_error_summary(&e);
+                warn!(error = %summary, "AI proxy: failed to read upstream response body");
+                Error::because(
+                    ErrorType::ReadError,
+                    "failed to read upstream response",
+                    e.without_url(),
+                )
             });
         }
     };
@@ -12183,8 +12199,13 @@ pub(super) async fn read_capped_response_body(
     let mut buf = bytes::BytesMut::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| {
-            warn!(error = %e, "AI proxy: failed to read upstream response body");
-            Error::because(ErrorType::ReadError, "failed to read upstream response", e)
+            let summary = sbproxy_httpkit::request_error_summary(&e);
+            warn!(error = %summary, "AI proxy: failed to read upstream response body");
+            Error::because(
+                ErrorType::ReadError,
+                "failed to read upstream response",
+                e.without_url(),
+            )
         })?;
         if buf.len().saturating_add(chunk.len()) > cap {
             warn!(
@@ -25040,6 +25061,114 @@ mod served_model_rewrite_tests {
 }
 
 #[cfg(test)]
+mod upstream_body_error_redaction_tests {
+    use pingora_error::{Error, ErrorType};
+
+    use super::read_capped_response_body;
+
+    /// An upstream that promises a body and then hangs up, so the body
+    /// read fails with a `reqwest::Error` that still carries the request
+    /// URL. The provider path puts an API key in that URL's query on
+    /// several providers, which is why this one is a leak and not just
+    /// noise.
+    async fn truncated_upstream() -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback listener binds");
+        let port = listener
+            .local_addr()
+            .expect("the listener has an addr")
+            .port();
+        let server = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut scratch = [0u8; 1024];
+                let _ = socket.read(&mut scratch).await;
+                // Content-Length promises 4096 bytes; four are sent and
+                // the connection closes, so the body read errors.
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\nabcd")
+                    .await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (
+            format!("http://127.0.0.1:{port}/v1/messages?api-key=query-secret"),
+            server,
+        )
+    }
+
+    /// The `warn!` was redacted first and the pingora cause was not, which
+    /// is not redaction: pingora's `Display` writes `" cause: {c}"` for a
+    /// non-pingora cause, and pingora-proxy logs the error it gets back
+    /// out of `request_filter`. So the URL reached a second log line the
+    /// first fix could not see.
+    #[tokio::test]
+    async fn a_body_read_failure_never_carries_the_upstream_url_into_the_cause() {
+        let (url, server) = truncated_upstream().await;
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .send()
+            .await
+            .expect("the stub upstream answers with headers");
+
+        let err = read_capped_response_body(resp, None)
+            .await
+            .expect_err("a truncated body is a read failure");
+        server.abort();
+
+        let rendered = format!("{err}");
+        assert!(
+            !rendered.contains("query-secret"),
+            "the query string reached the pingora cause chain: {rendered}"
+        );
+        assert!(
+            !rendered.contains("127.0.0.1"),
+            "the upstream origin reached the pingora cause chain: {rendered}"
+        );
+        assert!(
+            rendered.contains("failed to read upstream response"),
+            "the context was lost along with the url: {rendered}"
+        );
+    }
+
+    /// The half this pins is pingora's, not reqwest's: a cause that has
+    /// not been stripped does reach the rendered error, so the assertion
+    /// above is testing the fix rather than an accident of formatting.
+    #[tokio::test]
+    async fn an_unstripped_cause_is_rendered_by_pingora_and_would_leak() {
+        let (url, server) = truncated_upstream().await;
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .send()
+            .await
+            .expect("the stub upstream answers with headers");
+        let raw = resp
+            .bytes()
+            .await
+            .expect_err("a truncated body is a read failure");
+        server.abort();
+
+        assert!(
+            format!("{raw}").contains("query-secret"),
+            "the premise changed: a reqwest Display no longer carries its url"
+        );
+        let leaked = format!(
+            "{}",
+            Error::because(
+                ErrorType::ReadError,
+                "failed to read upstream response",
+                raw
+            )
+        );
+        assert!(
+            leaked.contains("query-secret"),
+            "pingora stopped rendering the cause; the strip is now untested: {leaked}"
+        );
+    }
+}
+
 mod price_ceiling_tests {
     //! WOR-2559: the per-request price ceiling's request-level resolution
     //! and its fail-closed refusal body. Candidate-set partition behavior

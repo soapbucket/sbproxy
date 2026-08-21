@@ -668,9 +668,13 @@ async fn deliver_batch(
             count_batch_drop("webhook", "http_error", count);
         }
         Err(error) => {
+            // Not `error = %error`: a `reqwest::Error` Display ends with
+            // " for url ({url})", and the events webhook is the same
+            // shape of operator secret this file already refuses to log
+            // above (WOR-2629).
             tracing::warn!(
                 target: "events",
-                error = %error,
+                error = %sbproxy_httpkit::request_error_summary(&error),
                 count,
                 "events webhook delivery failed; batch dropped"
             );

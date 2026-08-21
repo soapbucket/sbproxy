@@ -1474,10 +1474,14 @@ configured:
 Rules report `inactive`, `ok`, or `firing`, their thresholds, latest reading,
 sample count, and evaluation timestamp. Provider error-rate evaluation stays
 inactive until at least 10 provider attempts contribute to the interval.
-Channels report only their type, stable index, sanitized scheme and host, or
-whether a PagerDuty routing key is configured. URLs, paths, credentials,
-headers, and routing keys are never returned. Delivery health is `untested`,
-`healthy`, or `failing`, with a bounded error summary and latest-attempt time.
+Channels report only their type, stable index, sanitized origin (scheme,
+host, and port), or whether a PagerDuty routing key is configured. Paths,
+query strings, credentials, headers, and routing keys are never returned;
+a Slack or Teams webhook keeps its whole secret in the path, so the origin
+is as much of the URL as this surface will show. The port is part of the
+origin, so two receivers on one host are distinguishable here. Delivery
+health is `untested`, `healthy`, or `failing`, with a bounded error summary
+and latest-attempt time.
 
 History retains at most 200 fired, resolved, and channel-test events for the
 life of the process. It is not durable. `authority: "file"` and

@@ -75,10 +75,13 @@ fn spawn_refresh_task(cache: Arc<JwksCache>, url: String, refresh_secs: u64) {
             .build()
             .expect("JWKS refresh client builder failed; cannot enforce the request timeout");
         loop {
-            if let Err(e) = cache.refresh_with(&client).await {
+            // `refresh_error`, not `e`: `refresh_with` strips the URL
+            // off its transport errors, and the name says so at the log
+            // site rather than leaving it to be re-derived (WOR-2629).
+            if let Err(refresh_error) = cache.refresh_with(&client).await {
                 tracing::warn!(
                     jwks_url = %url,
-                    error = %e,
+                    error = %refresh_error,
                     "JWKS refresh failed; will retry on next interval"
                 );
             }
@@ -238,12 +241,12 @@ impl JwksCache {
             sbproxy_observe::metrics::record_jwks_unknown_kid_refetch("rate_limited");
             return None;
         }
-        if let Err(e) = self.refresh_with(client).await {
+        if let Err(refresh_error) = self.refresh_with(client).await {
             sbproxy_observe::metrics::record_jwks_unknown_kid_refetch("failure");
             tracing::warn!(
                 jwks_url = %self.jwks_url,
                 kid = requested_kid,
-                error = %e,
+                error = %refresh_error,
                 "JWKS unknown-kid refresh failed"
             );
             return None;
@@ -264,19 +267,25 @@ impl JwksCache {
     /// can log them; callers on the request path should treat any
     /// error as "keep the existing cache and let the request fail
     /// closed if it cannot find a key".
+    ///
+    /// `without_url` on each transport error is what keeps the JWKS
+    /// endpoint out of those log lines. A `reqwest::Error`'s `Display`
+    /// ends with `" for url ({url})"`, this message interpolates it, and
+    /// an issuer's JWKS URL is operator configuration that can carry a
+    /// tenant token in its path or query (WOR-2629).
     pub async fn refresh_with(&self, client: &reqwest::Client) -> anyhow::Result<()> {
         let resp = client
             .get(&self.jwks_url)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("JWKS GET failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("JWKS GET failed: {}", e.without_url()))?;
         if !resp.status().is_success() {
             anyhow::bail!("JWKS GET returned status {}", resp.status());
         }
         let body = resp
             .text()
             .await
-            .map_err(|e| anyhow::anyhow!("JWKS body read failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("JWKS body read failed: {}", e.without_url()))?;
         let set: JwkSet =
             serde_json::from_str(&body).map_err(|e| anyhow::anyhow!("JWKS parse failed: {}", e))?;
         self.set_keys(set.keys);
@@ -289,13 +298,13 @@ impl JwksCache {
         let resp = client
             .get(&self.jwks_url)
             .send()
-            .map_err(|e| anyhow::anyhow!("JWKS GET failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("JWKS GET failed: {}", e.without_url()))?;
         if !resp.status().is_success() {
             anyhow::bail!("JWKS GET returned status {}", resp.status());
         }
         let body = resp
             .text()
-            .map_err(|e| anyhow::anyhow!("JWKS body read failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("JWKS body read failed: {}", e.without_url()))?;
         let set: JwkSet =
             serde_json::from_str(&body).map_err(|e| anyhow::anyhow!("JWKS parse failed: {}", e))?;
         self.set_keys(set.keys);

@@ -6012,7 +6012,10 @@ async fn handle_oidc_callback(
         Ok(resp) if resp.status().is_success() => match resp.text().await {
             Ok(t) => t,
             Err(e) => {
-                warn!(error = %e, "oidc callback: token response body read failed");
+                warn!(
+                    error = %sbproxy_httpkit::request_error_summary(&e),
+                    "oidc callback: token response body read failed"
+                );
                 send_error(session, 502, "oidc token endpoint failed").await?;
                 return Ok(());
             }
@@ -6023,7 +6026,10 @@ async fn handle_oidc_callback(
             return Ok(());
         }
         Err(e) => {
-            warn!(error = %e, "oidc callback: token endpoint POST failed");
+            warn!(
+                error = %sbproxy_httpkit::request_error_summary(&e),
+                "oidc callback: token endpoint POST failed"
+            );
             send_error(session, 502, "oidc token endpoint failed").await?;
             return Ok(());
         }
@@ -6139,13 +6145,24 @@ async fn handle_oidc_callback(
                                 .map(|(k, v)| (k.to_string(), v))
                                 .collect();
                             }
-                            Err(e) => warn!(error = %e, "oidc callback: userinfo parse failed"),
+                            // Named rather than `e`: this one is a claims
+                            // parse failure, not the reqwest error the
+                            // two arms below carry (WOR-2629).
+                            Err(parse_error) => {
+                                warn!(error = %parse_error, "oidc callback: userinfo parse failed")
+                            }
                         }
                     }
-                    Err(e) => warn!(error = %e, "oidc callback: userinfo body read failed"),
+                    Err(e) => warn!(
+                        error = %sbproxy_httpkit::request_error_summary(&e),
+                        "oidc callback: userinfo body read failed"
+                    ),
                 },
                 Ok(resp) => warn!(status = %resp.status(), "oidc callback: userinfo non-2xx"),
-                Err(e) => warn!(error = %e, "oidc callback: userinfo request failed"),
+                Err(e) => warn!(
+                    error = %sbproxy_httpkit::request_error_summary(&e),
+                    "oidc callback: userinfo request failed"
+                ),
             }
         } else {
             warn!("oidc callback: userinfo configured but token response had no access_token");

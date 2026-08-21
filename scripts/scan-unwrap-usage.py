@@ -332,7 +332,13 @@ def analyze(path: Path) -> tuple[str, list[tuple[int, int]], list[str], bool]:
     return code, merge_spans(spans), modules, whole_file
 
 
-def collect(repo: Path):
+def production_code(repo: Path):
+    """Yield `(path, blanked code, test-only spans)` per production file.
+
+    Shared with the other scanners in this directory, because "which of
+    these bytes are production code" is the expensive half of every scan
+    over this tree and a second copy of it would drift.
+    """
     files = sorted((repo / "crates").glob("*/src/**/*.rs"))
     analyzed = {path: analyze(path) for path in files}
 
@@ -359,11 +365,19 @@ def collect(repo: Path):
                     excluded.add(resolved)
                     changed = True
 
+    kept = [
+        (path, analyzed[path][0], analyzed[path][1])
+        for path in files
+        if path.resolve() not in excluded
+    ]
+    return kept, sorted(excluded)
+
+
+def collect(repo: Path):
+    kept, excluded = production_code(repo)
+
     hits = []
-    for path in files:
-        if path.resolve() in excluded:
-            continue
-        code, spans, _, _ = analyzed[path]
+    for path, code, spans in kept:
         for kind, pattern in PATTERNS.items():
             for match in pattern.finditer(code):
                 start = match.start()
