@@ -466,12 +466,9 @@ pub trait ChatFormat: Send + Sync + 'static {
 pub(crate) fn parse_role(
     obj: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<Role, ChatError> {
-    let role_s = obj
-        .get("role")
-        .and_then(|r| r.as_str())
-        .ok_or_else(|| {
-            ChatError::bad_request_coded("role_missing", "chat message is missing a 'role' field")
-        })?;
+    let role_s = obj.get("role").and_then(|r| r.as_str()).ok_or_else(|| {
+        ChatError::bad_request_coded("role_missing", "chat message is missing a 'role' field")
+    })?;
     match role_s {
         "user" => Ok(Role::User),
         "assistant" => Ok(Role::Assistant),

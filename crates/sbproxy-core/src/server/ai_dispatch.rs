@@ -923,7 +923,10 @@ mod default_model_tests {
     #[test]
     fn one_provider_naming_a_default_supplies_it() {
         let config = config(&[("openai", Some("gpt-4o"), true)]);
-        assert_eq!(unambiguous_default_model(&config).as_deref(), Some("gpt-4o"));
+        assert_eq!(
+            unambiguous_default_model(&config).as_deref(),
+            Some("gpt-4o")
+        );
     }
 
     #[test]
@@ -932,7 +935,10 @@ mod default_model_tests {
             ("openai", Some("gpt-4o"), true),
             ("azure", Some("gpt-4o"), true),
         ]);
-        assert_eq!(unambiguous_default_model(&config).as_deref(), Some("gpt-4o"));
+        assert_eq!(
+            unambiguous_default_model(&config).as_deref(),
+            Some("gpt-4o")
+        );
     }
 
     #[test]
@@ -941,7 +947,10 @@ mod default_model_tests {
         // rest say nothing. Reading an absent value as a disagreement
         // would make the field unusable on any multi-provider origin.
         let config = config(&[("openai", None, true), ("azure", Some("gpt-4o"), true)]);
-        assert_eq!(unambiguous_default_model(&config).as_deref(), Some("gpt-4o"));
+        assert_eq!(
+            unambiguous_default_model(&config).as_deref(),
+            Some("gpt-4o")
+        );
     }
 
     #[test]
@@ -965,7 +974,10 @@ mod default_model_tests {
             ("openai", Some("gpt-4o"), true),
             ("retired", Some("gpt-4o-mini"), false),
         ]);
-        assert_eq!(unambiguous_default_model(&config).as_deref(), Some("gpt-4o"));
+        assert_eq!(
+            unambiguous_default_model(&config).as_deref(),
+            Some("gpt-4o")
+        );
     }
 
     #[test]
@@ -16278,7 +16290,11 @@ fn lift_gateway_prompt_reference(bytes: &bytes::Bytes) -> (bytes::Bytes, Option<
     let Some(object) = parsed.as_object_mut() else {
         return (bytes.clone(), None);
     };
-    let Some(reference) = object.get("prompt").and_then(|v| v.as_str()).map(str::to_owned) else {
+    let Some(reference) = object
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+    else {
         return (bytes.clone(), None);
     };
     object.remove("prompt");
@@ -22450,8 +22466,7 @@ origins:
             if let crate::policy_bus::AuditRecord::Decision(audit) = record {
                 assert!(
                     !(audit.request_id == "req-ai-admission-lossy"
-                        && audit.event
-                            == sbproxy_observe::decision::DecisionEvent::AiAdmission),
+                        && audit.event == sbproxy_observe::decision::DecisionEvent::AiAdmission),
                     "a dropped-with-a-note field is lossiness, not an admission denial"
                 );
             }

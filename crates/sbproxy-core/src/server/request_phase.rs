@@ -7477,8 +7477,8 @@ origins:
             .response_cache
             .clone()
             .expect("the fixture enables the cache");
-        let req = pingora_http::RequestHeader::build("GET", b"/v1/thing", None)
-            .expect("request header");
+        let req =
+            pingora_http::RequestHeader::build("GET", b"/v1/thing", None).expect("request header");
 
         let (plan, bypass) = evaluate_cache_key(&ctx, &req, &cfg).await;
 
