@@ -837,6 +837,13 @@ WARN key store unavailable; falling through to configured auth with no per-key
      policy, budget, or attribution failure_posture="degraded" guarantee_waived=true
 ```
 
+An outage of the store is transient, not sticky. The `redis` backend holds a
+reconnecting connection, so a Redis restart, a failover, or a `CLIENT KILL`
+costs the resolutions that were in flight plus one redial: the next resolution
+opens a fresh socket, `sbproxy_key_store_unavailable` returns to 0, and the
+posture stops applying. Redis coming back is enough; the proxy does not need a
+restart to notice.
+
 The older boolean `failure_mode_allow` still parses and still means what it
 always meant. It is used only when `failure_posture` is absent: `false` resolves
 to `closed`, and `true` resolves to `degraded`. Nothing in the runtime reads the
