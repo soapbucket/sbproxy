@@ -1,6 +1,6 @@
 # Problem-Details default renderer
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-21*
 
 ![Problem-Details default renderer](../../docs/assets/problem-details.gif)
 
@@ -14,8 +14,8 @@ the renderer catches every other error the proxy generates on this
 origin with a structured body that downstream clients can introspect
 without scraping prose. That is authentication denials (a bad or missing
 API key, a failed JWT check), policy denials from the `policies:` chain
-(`ip_filter`, `waf`, `dlp`, and the rest), and upstream connection
-failures.
+that do not write their own body (`ip_filter`, `waf`, `dlp`, `csrf`,
+`rego`, and the rest), and upstream connection failures.
 
 Denials whose body a protocol pins keep their own shape: the 429
 rate-limit set, the AI-crawl payment family, and agent-to-agent chain
@@ -51,10 +51,10 @@ curl -sv -H 'Host: api.local' -H 'X-Api-Key: secret-key' \
      http://127.0.0.1:8080/get 2>&1 | grep -E '^< HTTP|^< content-type|^\{'
 # < HTTP/1.1 403 Forbidden
 # < content-type: application/problem+json
-# {"type":"https://api.example.com/errors/403","title":"Forbidden","status":403,"detail":"forbidden","instance":"/get"}
+# {"detail":"forbidden","instance":"/get","status":403,"title":"Forbidden","type":"https://api.example.com/errors/403"}
 ```
 
-Formatted, that body is:
+The keys come out sorted; formatted and reordered for reading, that body is:
 
 ```json
 {

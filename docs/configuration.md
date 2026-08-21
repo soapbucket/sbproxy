@@ -2438,8 +2438,9 @@ prompt and tells a scripted client which scheme to retry with:
 ```bash
 $ curl -i -H 'Host: admin.example.com' http://localhost:8080/
 HTTP/1.1 401 Unauthorized
-www-authenticate: Basic realm="Admin Panel"
 content-type: application/json
+content-length: 24
+www-authenticate: Basic realm="Admin Panel"
 
 {"error":"unauthorized"}
 ```
@@ -5002,7 +5003,7 @@ origins:
 
 ## Error pages
 
-Error pages let you replace upstream error responses with operator-defined bodies. Each entry declares the status codes it covers, the `Content-Type` it produces, and the response body. When more than one entry matches the status code, the proxy performs `Accept` header content negotiation across the candidates and picks the highest-quality match. With no concrete preference it prefers `application/json`, then `text/html`, then the first candidate.
+Error pages let you replace the error responses the proxy itself generates with operator-defined bodies. A status the upstream returned is relayed as the upstream wrote it and never runs through this table. Each entry declares the status codes it covers, the `Content-Type` it produces, and the response body. When more than one entry matches the status code, the proxy performs `Accept` header content negotiation across the candidates and picks the highest-quality match. With no concrete preference it prefers `application/json`, then `text/html`, then the first candidate.
 
 The block is a list at the origin level. Each entry's `status` field accepts a single integer or a list of integers. When `template` is true, the body is rendered with `{{ status_code }}` and `{{ request.path }}` substituted at request time.
 
@@ -5092,9 +5093,8 @@ anything below that no authored page matches renders as problem+json:
   the rendered body.
 - **Policy denials** from the origin's `policies:` chain that do not
   author their own response: `ip_filter`, `waf`, `dlp`, `csrf`, `rego`,
-  `expression`, `object_authz`, `request_limit`, `concurrent_limit`,
-  `http_framing`, `content_digest`, `exposed_credentials`,
-  `prompt_injection`, `semantic_constraint`, and `agent_budget`.
+  `expression`, `object_authz`, `request_limit`, `http_framing`,
+  `exposed_credentials`, `semantic_constraint`, and `agent_budget`.
 - **Upstream failures** (connect refused, connect timeout, TLS
   handshake errors, mid-stream connection loss) routed through
   Pingora's `fail_to_proxy` path. The `detail` field carries the
@@ -5115,6 +5115,13 @@ does not change them:
   refusals, and any policy that authored its own body and media type.
   The wire format is part of those specs, so a generic envelope would
   break the client that reads them.
+- **Policies that write their own body on every refusal**:
+  `concurrent_limit`, `content_digest`, and `prompt_injection_v2`. Each
+  carries an operator-settable body (`error_body` /
+  `error_content_type`, `block_body` / `block_content_type`) and emits
+  it, or its own JSON default, straight to the client. The knob the
+  operator already has for those three is the body itself, so the
+  renderer stays out of the way rather than overwriting it.
 - **The default 404 for an unmatched `Host`**. No origin resolved, so
   there is no `problem_details` block to read.
 - **Refusals that run before the policy chain**: `bot_detection`'s 403,
@@ -5126,7 +5133,10 @@ does not change them:
   exhausting its own budget. Both write their headers and body in one
   piece from their own emitters.
 - **AI gateway surface errors** (`/v1/chat/completions` and the rest of
-  the AI dispatch path), which answer in the provider's own error shape.
+  the AI dispatch path). Those answer from their own emitters: some in
+  the provider's `{"error": {...}}` envelope so an SDK's error handling
+  still works, the rest as a flat `{"error": "..."}`. Neither reads the
+  origin's `error_pages` or `problem_details`.
 - **Upstream-returned status codes**. A 500 the backend produced is
   relayed as the backend wrote it; the renderer only shapes errors the
   proxy itself generates.

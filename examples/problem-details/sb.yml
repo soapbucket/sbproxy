@@ -6,12 +6,14 @@
 # `error_pages` entry as `application/problem+json` per RFC 9457. The two
 # blocks compose: per-status custom pages still win when authored.
 #
-# Coverage is the whole class of errors the proxy generates itself:
-# authentication denials, policy denials from the `policies:` chain, and
-# upstream connection failures. Denials whose body a protocol pins (the
-# 429 rate-limit set, the AI-crawl payment family, agent-to-agent chain
-# refusals) keep their own shapes, as does the 404 for a Host matching no
-# origin, since no origin config is resolved for it.
+# Coverage is the class of errors the proxy generates itself: authentication
+# denials, policy denials from the `policies:` chain that do not write their
+# own body, and upstream connection failures. Denials whose body a protocol
+# pins (the 429 rate-limit set, the AI-crawl payment family, agent-to-agent
+# chain refusals) keep their own shapes, as do concurrent_limit,
+# content_digest, and prompt_injection_v2, which always emit their own. So
+# does the 404 for a Host matching no origin, since no origin config is
+# resolved for it.
 #
 # This origin is protected by API key authentication and carries an
 # ip_filter policy, so it can show both halves. `error_pages` matches 401

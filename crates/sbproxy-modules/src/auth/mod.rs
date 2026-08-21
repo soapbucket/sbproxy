@@ -522,7 +522,12 @@ impl ApiKeyAuth {
 pub struct BasicAuthProvider {
     /// Accepted username/password pairs.
     pub users: Vec<BasicAuthUser>,
-    /// Optional realm shown in the `WWW-Authenticate` challenge.
+    /// Realm sent in the `WWW-Authenticate` challenge on a 401.
+    ///
+    /// Optional in config only. RFC 9110 section 11.6.1 makes the
+    /// parameter mandatory on the wire, so an origin that sets none is
+    /// challenged as `Basic realm="restricted"` rather than left
+    /// without a challenge.
     #[serde(default)]
     pub realm: Option<String>,
 }

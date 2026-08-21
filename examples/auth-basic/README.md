@@ -1,6 +1,6 @@
 # HTTP Basic authentication
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-21*
 
 ![HTTP Basic authentication](../../docs/assets/auth-basic.gif)
 
@@ -22,6 +22,7 @@ No credentials:
 $ curl -i -H 'Host: basic.local' http://127.0.0.1:8080/get
 HTTP/1.1 401 Unauthorized
 content-type: application/json
+content-length: 24
 www-authenticate: Basic realm="sbproxy demo"
 
 {"error":"unauthorized"}
@@ -52,9 +53,9 @@ $ curl -s -o /dev/null -w '%{http_code}\n' \
 Wrong password, rejected:
 
 ```bash
-$ curl -is -u admin:wrong -H 'Host: basic.local' http://127.0.0.1:8080/get | head -n 3
+$ curl -is -u admin:wrong -H 'Host: basic.local' http://127.0.0.1:8080/get \
+    | grep -Ei '^HTTP|^www-authenticate'
 HTTP/1.1 401 Unauthorized
-content-type: application/json
 www-authenticate: Basic realm="sbproxy demo"
 ```
 

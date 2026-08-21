@@ -2277,7 +2277,9 @@ async fn send_error_with_extra_headers(
 /// 2. RFC 9457 `application/problem+json` when
 ///    [`sbproxy_config::ProblemDetailsConfig`] is enabled on the
 ///    origin.
-/// 3. Plain-text default (`send_error`).
+/// 3. The `{"error": message}` JSON default, written inline rather
+///    than through `send_error` so the extra headers below reach
+///    this branch too.
 ///
 /// When multiple custom pages match a status and the client expresses
 /// no concrete preference, JSON is preferred, then HTML, then the
