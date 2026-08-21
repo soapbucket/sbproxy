@@ -1021,6 +1021,12 @@ struct ProxyWasmHostState {
     stream_actions: [Option<ProxyWasmAction>; 2],
     active_stream: Option<usize>,
     failure: Option<ProxyWasmCallFailure>,
+    /// Bytes of guest log output still admissible in this callback.
+    /// Reset per callback by [`Self::reset_callback`].
+    log_budget_remaining: usize,
+    /// Whether the budget-exhausted line has already been emitted for
+    /// this callback, so the refusal itself cannot become the flood.
+    log_budget_reported: bool,
 }
 
 impl ProxyWasmHostState {
@@ -1048,6 +1054,8 @@ impl ProxyWasmHostState {
             stream_actions: [None; 2],
             active_stream: None,
             failure: None,
+            log_budget_remaining: PROXY_WASM_LOG_BUDGET_BYTES,
+            log_budget_reported: false,
         }
     }
 
@@ -1059,6 +1067,24 @@ impl ProxyWasmHostState {
         self.local_response = None;
         self.active_stream = None;
         self.failure = None;
+        self.log_budget_remaining = PROXY_WASM_LOG_BUDGET_BYTES;
+        self.log_budget_reported = false;
+    }
+
+    /// Claim `bytes` of this callback's log budget.
+    ///
+    /// Returns `false` once the budget is spent. The guest is told
+    /// nothing (`proxy_log` still answers `STATUS_OK`): a filter that
+    /// learns its logging is being dropped can retry or branch on it,
+    /// and there is no useful thing for it to do about a host-side
+    /// budget anyway.
+    fn claim_log_budget(&mut self, bytes: usize) -> bool {
+        if self.log_budget_remaining < bytes {
+            self.log_budget_remaining = 0;
+            return false;
+        }
+        self.log_budget_remaining -= bytes;
+        true
     }
 
     fn set_buffer(&mut self, buffer_id: i32, value: Vec<u8>) {
@@ -1452,6 +1478,85 @@ fn enforce_map_output_limit(caller: &mut Caller<'_, ProxyWasmHostState>) -> Resu
     Ok(())
 }
 
+/// Per-callback ceiling on the bytes a guest can push through
+/// `proxy_log`, mirroring the envelope path's `STDERR_CAPTURE_LIMIT`.
+///
+/// `proxy_log` caps one *message* at 4 KiB but had no ceiling on the
+/// number of calls, so a filter looping inside
+/// `proxy_on_http_request_headers` turned a single request into
+/// thousands of log records. One mebibyte per callback is generous for
+/// a filter that logs deliberately and closes the flood primitive.
+const PROXY_WASM_LOG_BUDGET_BYTES: usize = 1024 * 1024;
+
+/// Name of the `tracing` level a guest-chosen Proxy-Wasm level is
+/// emitted at.
+///
+/// The guest's own number is kept on the record as `log_level`, but it
+/// does not choose the channel. A guest that can mint `error` lines
+/// trains operators to ignore the error channel, and the host is the
+/// only party that knows whether anything actually went wrong: an
+/// error the *guest* reports is, from the proxy's side, a filter
+/// saying something, which is a `warn` at most. Trace and debug fold
+/// together for the same reason `BoundedStderrPipe::drain_to_log`
+/// keeps healthy guest chatter at debug: the workspace enables
+/// `tracing/release_max_level_info`, so that level costs nothing in
+/// the binary operators run.
+fn clamped_guest_log_level(level: i32) -> &'static str {
+    match level {
+        0 | 1 => "debug",
+        2 => "info",
+        _ => "warn",
+    }
+}
+
+/// Render one guest log line safely for a text log formatter.
+///
+/// Control characters are escaped rather than passed through. The
+/// caller has already split on `\n`, so what this catches is
+/// everything else a payload can use to forge a record: a carriage
+/// return that rewrites the line under a terminal, and the ANSI escape
+/// introducer that repaints it.
+fn sanitize_guest_log_line(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    for character in line.chars() {
+        if character.is_control() {
+            out.extend(character.escape_default());
+        } else {
+            out.push(character);
+        }
+    }
+    out
+}
+
+/// Emit one already-sanitized guest line at the clamped level.
+fn emit_guest_log_line(level: i32, context_id: u32, line: &str) {
+    match clamped_guest_log_level(level) {
+        "debug" => tracing::debug!(
+            target: "sbproxy::proxy_wasm",
+            log_level = level,
+            context_id,
+            message = %line,
+            "Proxy-Wasm guest log"
+        ),
+        "info" => tracing::info!(
+            target: "sbproxy::proxy_wasm",
+            log_level = level,
+            context_id,
+            message = %line,
+            "Proxy-Wasm guest log"
+        ),
+        // `clamped_guest_log_level` returns only these three, and warn is
+        // the ceiling: a guest cannot mint an error record.
+        _ => tracing::warn!(
+            target: "sbproxy::proxy_wasm",
+            log_level = level,
+            context_id,
+            message = %line,
+            "Proxy-Wasm guest log"
+        ),
+    }
+}
+
 fn host_log(mut caller: Caller<'_, ProxyWasmHostState>, level: i32, data: i32, size: i32) -> i32 {
     if !(0..=5).contains(&level) || abi_usize(size) > 4096 {
         return STATUS_BAD_ARGUMENT;
@@ -1460,43 +1565,30 @@ fn host_log(mut caller: Caller<'_, ProxyWasmHostState>, level: i32, data: i32, s
         Ok(message) => String::from_utf8_lossy(&message).into_owned(),
         Err(status) => return status,
     };
-    match level {
-        0 => tracing::trace!(
-            target: "sbproxy::proxy_wasm",
-            log_level = level,
-            context_id = caller.data().active_context,
-            message = %message,
-            "Proxy-Wasm guest log"
-        ),
-        1 => tracing::debug!(
-            target: "sbproxy::proxy_wasm",
-            log_level = level,
-            context_id = caller.data().active_context,
-            message = %message,
-            "Proxy-Wasm guest log"
-        ),
-        2 => tracing::info!(
-            target: "sbproxy::proxy_wasm",
-            log_level = level,
-            context_id = caller.data().active_context,
-            message = %message,
-            "Proxy-Wasm guest log"
-        ),
-        3 => tracing::warn!(
-            target: "sbproxy::proxy_wasm",
-            log_level = level,
-            context_id = caller.data().active_context,
-            message = %message,
-            "Proxy-Wasm guest log"
-        ),
-        4 | 5 => tracing::error!(
-            target: "sbproxy::proxy_wasm",
-            log_level = level,
-            context_id = caller.data().active_context,
-            message = %message,
-            "Proxy-Wasm guest log"
-        ),
-        _ => unreachable!("log level was validated"),
+    // Budget is claimed on the bytes the guest handed over, before any
+    // splitting or escaping, so escaping cannot be used to spend more
+    // than was written and a refusal cannot depend on the payload's
+    // shape. Answering STATUS_OK past the cap is deliberate: the guest
+    // gets no backpressure signal to branch on.
+    if !caller.data_mut().claim_log_budget(message.len()) {
+        if !caller.data().log_budget_reported {
+            caller.data_mut().log_budget_reported = true;
+            tracing::warn!(
+                target: "sbproxy::proxy_wasm",
+                context_id = caller.data().active_context,
+                budget_bytes = PROXY_WASM_LOG_BUDGET_BYTES,
+                "Proxy-Wasm guest exhausted its per-callback log budget; further lines dropped"
+            );
+        }
+        return STATUS_OK;
+    }
+    let context_id = caller.data().active_context;
+    // One record per line. A single guest write carrying an embedded
+    // newline used to be emitted verbatim under the text formatter,
+    // which let a payload of "\nERROR sbproxy::server: ..." forge a
+    // whole log record that no part of the proxy wrote.
+    for line in message.split('\n').filter(|line| !line.is_empty()) {
+        emit_guest_log_line(level, context_id, &sanitize_guest_log_line(line));
     }
     STATUS_OK
 }
@@ -2155,8 +2247,17 @@ mod tests {
         fn exit(&self, _span: &tracing::span::Id) {}
     }
 
+    /// A guest cannot mint an `error` record.
+    ///
+    /// The `log-levels` fixture calls `proxy_log` once at each of the
+    /// six Proxy-Wasm levels from `proxy_on_request_headers`. Levels 4
+    /// and 5 used to reach `tracing::error!` verbatim, so a filter
+    /// looping on level 4 owned the error channel of a process it is a
+    /// guest in. The host picks the channel now: the guest's number
+    /// survives on the record as `log_level`, and `warn` is the
+    /// ceiling.
     #[test]
-    fn guest_logs_preserve_proxy_wasm_severity() {
+    fn guest_log_severity_is_clamped_at_warn() {
         let levels = Arc::new(Mutex::new(Vec::new()));
         let capture = GuestLogLevelCapture {
             levels: Arc::clone(&levels),
@@ -2172,14 +2273,78 @@ mod tests {
         assert_eq!(
             *levels.lock().unwrap(),
             [
-                tracing::Level::TRACE,
+                tracing::Level::DEBUG,
                 tracing::Level::DEBUG,
                 tracing::Level::INFO,
                 tracing::Level::WARN,
-                tracing::Level::ERROR,
-                tracing::Level::ERROR,
+                tracing::Level::WARN,
+                tracing::Level::WARN,
             ]
         );
+    }
+
+    /// A guest payload cannot forge a log record.
+    ///
+    /// `host_log` emitted `String::from_utf8_lossy` of the guest's
+    /// bytes straight into `message = %message`, so under the text
+    /// formatter a payload containing a newline and a plausible prefix
+    /// rendered as a second, whole log line that no part of the proxy
+    /// wrote. `host_log` now splits on `\n` and hands each line
+    /// through this, which escapes everything else a payload can use
+    /// to repaint a line.
+    #[test]
+    fn guest_log_lines_cannot_forge_a_record() {
+        let forged = "ERROR sbproxy::server: upstream 10.0.0.5 authentication succeeded";
+        let payload = format!("benign\n{forged}");
+        let lines: Vec<String> = payload
+            .split('\n')
+            .filter(|line| !line.is_empty())
+            .map(sanitize_guest_log_line)
+            .collect();
+        assert_eq!(lines, ["benign", forged]);
+
+        // Everything else that rewrites a rendered line is escaped
+        // rather than passed through.
+        assert_eq!(sanitize_guest_log_line("a\rb"), "a\\rb");
+        assert_eq!(sanitize_guest_log_line("a\u{1b}[2Kb"), "a\\u{1b}[2Kb");
+        assert_eq!(sanitize_guest_log_line("a\u{0}b"), "a\\u{0}b");
+        // Ordinary text, including non-ASCII, is untouched.
+        assert_eq!(sanitize_guest_log_line("dépêche 日本"), "dépêche 日本");
+    }
+
+    /// A guest cannot spend more than one callback's log budget.
+    ///
+    /// `host_log` capped one message at 4 KiB and nothing else, so a
+    /// filter looping `proxy_log` inside one callback emitted
+    /// unbounded output for a single request. The budget is claimed on
+    /// the bytes the guest wrote, refuses past the cap while still
+    /// answering the guest `STATUS_OK`, and is restored at the next
+    /// callback boundary.
+    #[test]
+    fn guest_log_budget_is_spent_per_callback_and_restored() {
+        let store_limits = StoreLimitsBuilder::new().build();
+        let mut state = ProxyWasmHostState::new(store_limits, 1024, 1024, b"{}");
+
+        let chunk = 4096;
+        let affordable = PROXY_WASM_LOG_BUDGET_BYTES / chunk;
+        for index in 0..affordable {
+            assert!(state.claim_log_budget(chunk), "claim {index} must fit");
+        }
+        assert!(
+            !state.claim_log_budget(chunk),
+            "the budget must refuse once a callback has spent it",
+        );
+        assert!(
+            !state.claim_log_budget(1),
+            "a spent budget stays spent for the rest of the callback",
+        );
+
+        state.reset_callback();
+        assert!(
+            state.claim_log_budget(chunk),
+            "the next callback starts with a fresh budget",
+        );
+        assert!(!state.log_budget_reported);
     }
 
     #[test]
