@@ -1,5 +1,7 @@
 # Temporary budget overrides
 
+*Last modified: 2026-08-20*
+
 A governed key carries a base budget. This example grants a temporary raise
 on top of it through the admin API, watches the raised cap admit a request
 the base cap refused, and then watches the base cap come back on its own

@@ -104,12 +104,16 @@ fn key_subroute(method: &str, rest: &str, body: Option<&str>) -> Resp {
         Some("effective-policy/preview") if method.eq_ignore_ascii_case("POST") => {
             preview_effective_key_policy(id, body)
         }
-        // WOR-2561: temporary, auto-expiring budget overrides.
+        // WOR-2561: temporary, auto-expiring budget overrides. Counted
+        // like every other arm here: the route CAS-writes the same
+        // `KeyRecord` through `store_key_if_revision`, so it is the key
+        // resource, and raising a spending ceiling is the mutation an
+        // operator most wants on a "key operations by type" panel.
         Some("budget-override") => {
             if method.eq_ignore_ascii_case("POST") {
-                grant_budget_override(id, body)
+                count_key_operation("budget_override_grant", grant_budget_override(id, body))
             } else if method.eq_ignore_ascii_case("DELETE") {
-                clear_budget_override(id, body)
+                count_key_operation("budget_override_clear", clear_budget_override(id, body))
             } else {
                 method_not_allowed()
             }
@@ -491,15 +495,44 @@ fn list_keys() -> Resp {
         Ok(keys) => {
             // WOR-2561: listing is a read the operator trusts, so lapsed
             // budget overrides are retired (and their expiry audited) here.
+            //
+            // Bounded, because each retirement is a blocking store write
+            // plus two cache invalidations on the request thread. A
+            // tenant whose keys all lapsed at once (one launch window,
+            // one TTL) would otherwise make the first `GET /admin/keys`
+            // after expiry do one redb write per key before rendering
+            // anything. Past the cap the remaining lapsed grants are
+            // simply shown as what they are: `KeyView` already hides an
+            // expired override and `effective_budget` already ignores
+            // one, so the only thing deferred is the bookkeeping write
+            // and its expiry record, which the next read picks up.
+            let mut budget = MAX_RETIREMENTS_PER_LIST;
             let views: Vec<KeyView> = keys
                 .into_iter()
-                .map(|rec| KeyView::from(&retire_expired_override(&plane, rec)))
+                .map(|rec| {
+                    if budget > 0 && rec.budget_override.is_some() {
+                        budget -= 1;
+                        KeyView::from(&retire_expired_override(&plane, rec))
+                    } else {
+                        KeyView::from(&rec)
+                    }
+                })
                 .collect();
             ok(json!({ "keys": views }))
         }
         Err(e) => internal_error(&format!("list keys: {e:#}")),
     }
 }
+
+/// How many lapsed budget overrides one `GET /admin/keys` will retire
+/// before deferring the rest to a later read.
+///
+/// The retirement is bookkeeping, never enforcement, so a bound here
+/// costs an expiry record its promptness and nothing else. Sized to keep
+/// the worst-case listing latency in the same order as an ordinary one:
+/// each retirement is a compare-and-swap store write plus a record and a
+/// resolved-credential invalidation, all on the request thread.
+const MAX_RETIREMENTS_PER_LIST: usize = 32;
 
 fn get_key(id: &str) -> Resp {
     let plane = match plane_or_err() {
@@ -1392,7 +1425,26 @@ fn rotate_key(id: &str, body: Option<&str>) -> Resp {
     if rec.status == RecordStatus::Revoked {
         return terminal_key(id, rec.policy_revision);
     }
-    let minted = plane.crypto().mint_secret(id);
+    // Refuse before minting, and mint from the record's own id rather than
+    // the URL path segment.
+    //
+    // `format_token` builds `sbp_<id>_<secret>` from whatever string it is
+    // handed, while `parse_minted_token` asserts an exact 85 characters and
+    // a 16-lowercase-hex id. A config-seeded id such as `seed0001` produces
+    // a 77-character token that parses on no inbound path at all, so the
+    // `200 OK` would hand the operator a credential that authenticates
+    // nowhere while the grace window quietly runs out on the one that still
+    // worked. A 409 naming the reason is the only honest answer: there is
+    // no token shape this endpoint can mint for a non-conforming id that
+    // the current resolver would accept.
+    if !sbproxy_keystore::crypto::is_conforming_key_id(&rec.key_id) {
+        return conflict(
+            "key id is not in the minted format (16 lowercase hex characters), so a rotated \
+             token could not be parsed back by the inbound resolver; create a replacement key \
+             with POST /admin/keys and retire this one instead of rotating it",
+        );
+    }
+    let minted = plane.crypto().mint_secret(&rec.key_id);
     let now = Utc::now();
     // The current secret becomes the graced prior secret.
     rec.prev_secret_hash = Some(rec.secret_hash.clone());
@@ -1653,7 +1705,24 @@ fn retire_expired_override(plane: &KeyPlane, rec: KeyRecord) -> KeyRecord {
             );
             stored
         }
-        Err(_) => rec,
+        Err(response) => {
+            // Losing this CAS is expected under a polling console: a
+            // concurrent PATCH bumped the revision between the read and
+            // the retirement write. Enforcement is unaffected either
+            // way (`effective_budget` filters on `is_active(now)`
+            // wherever the budget is read) and the next admin read
+            // retries, so this is not an error. It is still a write
+            // that did not happen, and swallowing it entirely left no
+            // way to tell "retirement is racing" from "retirement is
+            // broken".
+            tracing::debug!(
+                key_id = %rec.key_id,
+                status = response.0,
+                "budget-override retirement lost its compare-and-swap; the lapsed grant stays \
+                 on the record until the next admin read"
+            );
+            rec
+        }
     }
 }
 
@@ -2191,11 +2260,22 @@ fn invalidate(plane: &KeyPlane, id: &str) {
 /// The three are never folded: a rate panel that cannot tell a busy
 /// console from an outage answers no operator question.
 ///
-/// Scope is the key resource. `/admin/credentials` mutations are not
-/// counted here, because this family's `operation` label is the closed
-/// key-lifecycle set and its declared cardinality is that set times the
-/// three outcomes; a credential surface gets its own family rather than
-/// silently doubling this one's.
+/// Scope is the key resource, and the test is which record the route
+/// writes rather than which URL it hangs off. Every mutation that loads
+/// and CAS-writes a `KeyRecord` is counted, which includes
+/// `/admin/keys/{id}/budget-override` in both directions
+/// (`budget_override_grant`, `budget_override_clear`): it raises a
+/// spending ceiling on the same record `update` edits, and leaving it
+/// off meant its 500s and its twelve refusal paths were invisible to
+/// `rate(sbproxy_key_operations_total{outcome="error"}[5m])`.
+/// `/admin/credentials` mutations are not counted here, because they
+/// write a different record; a credential surface gets its own family
+/// rather than silently doubling this one's.
+///
+/// The closed `operation` set is therefore `mint`, `update`, `delete`,
+/// `revoke`, `block`, `unblock`, `rotate`, `budget_override_grant`,
+/// `budget_override_clear`: nine values times three outcomes, which is
+/// the declared cardinality in `docs/observability.md`.
 fn count_key_operation(operation: &'static str, resp: Resp) -> Resp {
     let outcome = match resp.0 {
         200..=299 => "ok",
@@ -2486,6 +2566,61 @@ mod tests {
             sbproxy_config::KeyGovernanceConfig::default(),
             governance_store,
             None,
+        ));
+        crate::key_plane::install_key_plane_for_test(plane);
+    }
+
+    /// A store that is down for every operation, so a handler's 5xx
+    /// path is the real store-error path rather than a synthetic
+    /// status.
+    struct DownStore;
+    #[async_trait]
+    impl KeyStore for DownStore {
+        async fn get_key(&self, _: &str) -> anyhow::Result<Option<KeyRecord>> {
+            anyhow::bail!("store down")
+        }
+        async fn list_keys(&self) -> anyhow::Result<Vec<KeyRecord>> {
+            anyhow::bail!("store down")
+        }
+        async fn put_key(&self, _: KeyRecord) -> anyhow::Result<()> {
+            anyhow::bail!("store down")
+        }
+        async fn put_key_if_revision(
+            &self,
+            _: KeyRecord,
+            _: u64,
+        ) -> anyhow::Result<KeyPolicyCasResult> {
+            anyhow::bail!("store down")
+        }
+        async fn delete_key(&self, _: &str) -> anyhow::Result<()> {
+            anyhow::bail!("store down")
+        }
+        async fn get_credential(&self, _: &str) -> anyhow::Result<Option<CredentialRecord>> {
+            anyhow::bail!("store down")
+        }
+        async fn list_credentials(&self) -> anyhow::Result<Vec<CredentialRecord>> {
+            anyhow::bail!("store down")
+        }
+        async fn put_credential(&self, _: CredentialRecord) -> anyhow::Result<()> {
+            anyhow::bail!("store down")
+        }
+        async fn delete_credential(&self, _: &str) -> anyhow::Result<()> {
+            anyhow::bail!("store down")
+        }
+        async fn revision(&self) -> anyhow::Result<u64> {
+            anyhow::bail!("store down")
+        }
+    }
+
+    /// Install a key plane whose store fails every call, so a
+    /// handler's 5xx path is the real store-error path rather than a
+    /// synthetic status.
+    fn install_down_plane() {
+        let crypto = KeyCrypto::new(b"pepper".to_vec(), b"master".to_vec());
+        let store: Arc<dyn KeyStore> = Arc::new(DownStore);
+        let cache = Arc::new(TtlCache::new(store, TtlCacheConfig::default()));
+        let plane = Arc::new(crate::key_plane::KeyPlane::from_parts(
+            crypto, cache, false, false, None,
         ));
         crate::key_plane::install_key_plane_for_test(plane);
     }
@@ -2985,6 +3120,54 @@ mod tests {
             .expect("legacy record in list response");
         assert!(legacy_view["policy_digest"].is_null());
         assert!(!listed.2.contains("sensitive-stored-verifier"));
+    }
+
+    #[test]
+    fn rotating_a_config_seeded_key_id_refuses_rather_than_minting_a_dead_token() {
+        let _g = crate::key_plane::test_plane_guard();
+        let store = Arc::new(MemoryKeyStore::new());
+        install_test_plane_with_store(store.clone());
+
+        // `seed0001` is the id `examples/ai-dynamic-keys/sb.yml` used to
+        // seed and `docs/tapes/ai-dynamic-keys.tape` used to rotate, so this
+        // is the shipped demo's own key id rather than a contrived one; the
+        // example moved to a conforming id in the same change. Nothing
+        // validates the field: `lower_seed_key` takes
+        // `key_management.seed.keys[].key_id` verbatim, so any string an
+        // operator writes there still reaches this endpoint.
+        let seeded = KeyRecord::new(
+            "seed0001".to_string(),
+            "seeded-secret-hash".to_string(),
+            Utc::now(),
+        );
+        block_on_keystore(store.put_key(seeded)).unwrap();
+
+        let resp = dispatch("POST", "/admin/keys/seed0001/rotate", Some("{}")).unwrap();
+        assert_eq!(
+            resp.0, 409,
+            "a non-conforming key id must be refused, not rotated: {}",
+            resp.2
+        );
+        assert!(
+            !resp.2.contains("sbp_"),
+            "the refusal must not carry a token: {}",
+            resp.2
+        );
+
+        // The prior secret is untouched, so whatever still holds the old
+        // token keeps working. A 200 here would have opened a grace window
+        // that expires onto a token nothing can parse.
+        let after = block_on_keystore(store.get_key("seed0001"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.secret_hash, "seeded-secret-hash");
+        assert!(after.prev_secret_hash.is_none());
+
+        // The reason the refusal exists: the token this endpoint would have
+        // built for that id parses on no inbound path.
+        let would_have_minted = format!("sbp_seed0001_{}", "a".repeat(64));
+        assert!(sbproxy_keystore::crypto::parse_minted_token(&would_have_minted).is_none());
+        assert!(sbproxy_keystore::crypto::parse_token(&would_have_minted).is_none());
     }
 
     #[test]
@@ -4091,72 +4274,7 @@ mod tests {
     #[test]
     fn key_operations_move_at_the_admin_seam_with_separate_outcomes() {
         let _g = crate::key_plane::test_plane_guard();
-
-        fn op_count(operation: &str, outcome: &str) -> f64 {
-            let want = [
-                format!("operation={operation}"),
-                format!("outcome={outcome}"),
-            ];
-            let mut total = 0.0;
-            for family in prometheus::gather() {
-                if family.name() != "sbproxy_key_operations_total" {
-                    continue;
-                }
-                for metric in family.get_metric() {
-                    let labels: Vec<String> = metric
-                        .get_label()
-                        .iter()
-                        .map(|pair| format!("{}={}", pair.name(), pair.value()))
-                        .collect();
-                    if want.iter().all(|label| labels.contains(label)) {
-                        total += metric.get_counter().value();
-                    }
-                }
-            }
-            total
-        }
-
-        /// A store that is down for every operation, so a handler's 5xx
-        /// path is the real store-error path rather than a synthetic
-        /// status.
-        struct DownStore;
-        #[async_trait]
-        impl KeyStore for DownStore {
-            async fn get_key(&self, _: &str) -> anyhow::Result<Option<KeyRecord>> {
-                anyhow::bail!("store down")
-            }
-            async fn list_keys(&self) -> anyhow::Result<Vec<KeyRecord>> {
-                anyhow::bail!("store down")
-            }
-            async fn put_key(&self, _: KeyRecord) -> anyhow::Result<()> {
-                anyhow::bail!("store down")
-            }
-            async fn put_key_if_revision(
-                &self,
-                _: KeyRecord,
-                _: u64,
-            ) -> anyhow::Result<KeyPolicyCasResult> {
-                anyhow::bail!("store down")
-            }
-            async fn delete_key(&self, _: &str) -> anyhow::Result<()> {
-                anyhow::bail!("store down")
-            }
-            async fn get_credential(&self, _: &str) -> anyhow::Result<Option<CredentialRecord>> {
-                anyhow::bail!("store down")
-            }
-            async fn list_credentials(&self) -> anyhow::Result<Vec<CredentialRecord>> {
-                anyhow::bail!("store down")
-            }
-            async fn put_credential(&self, _: CredentialRecord) -> anyhow::Result<()> {
-                anyhow::bail!("store down")
-            }
-            async fn delete_credential(&self, _: &str) -> anyhow::Result<()> {
-                anyhow::bail!("store down")
-            }
-            async fn revision(&self) -> anyhow::Result<u64> {
-                anyhow::bail!("store down")
-            }
-        }
+        let op_count = key_operation_count;
 
         let before_mint_ok = op_count("mint", "ok");
         let before_mint_error = op_count("mint", "error");
@@ -4170,15 +4288,7 @@ mod tests {
 
         // A dead store is an `error`: the operator asked for something
         // legitimate and the infrastructure could not do it.
-        {
-            let crypto = KeyCrypto::new(b"pepper".to_vec(), b"master".to_vec());
-            let store: Arc<dyn KeyStore> = Arc::new(DownStore);
-            let cache = Arc::new(TtlCache::new(store, TtlCacheConfig::default()));
-            let plane = Arc::new(crate::key_plane::KeyPlane::from_parts(
-                crypto, cache, false, false, None,
-            ));
-            crate::key_plane::install_key_plane_for_test(plane);
-        }
+        install_down_plane();
         let resp = dispatch("POST", "/admin/keys", None).unwrap();
         assert_eq!(resp.0, 500, "{}", resp.2);
         assert_eq!(
@@ -4241,6 +4351,118 @@ mod tests {
             op_count("mint", "error") - before_mint_error,
             1.0,
             "the healthy-plane run must not have added error outcomes"
+        );
+    }
+
+    /// Sum `sbproxy_key_operations_total` across every series carrying
+    /// this `(operation, outcome)` pair.
+    fn key_operation_count(operation: &str, outcome: &str) -> f64 {
+        let want = [
+            format!("operation={operation}"),
+            format!("outcome={outcome}"),
+        ];
+        let mut total = 0.0;
+        for family in prometheus::gather() {
+            if family.name() != "sbproxy_key_operations_total" {
+                continue;
+            }
+            for metric in family.get_metric() {
+                let labels: Vec<String> = metric
+                    .get_label()
+                    .iter()
+                    .map(|pair| format!("{}={}", pair.name(), pair.value()))
+                    .collect();
+                if want.iter().all(|label| labels.contains(label)) {
+                    total += metric.get_counter().value();
+                }
+            }
+        }
+        total
+    }
+
+    /// Fix round on the #1177 review, red-first: the budget-override
+    /// route was the one arm of `key_subroute` with no
+    /// `count_key_operation` wrapper, so raising a spending ceiling was
+    /// invisible on `sbproxy_key_operations_total` and so were its 500s
+    /// and its twelve refusal paths. The alert operators are told to
+    /// run, `rate(sbproxy_key_operations_total{outcome="error"}[5m])`,
+    /// stayed flat while the route 500'd.
+    ///
+    /// All three outcomes, because the seam derives them from the
+    /// status class and a route that only ever proves `ok` proves the
+    /// least interesting third of the contract.
+    #[test]
+    fn budget_override_routes_are_counted_like_every_other_key_mutation() {
+        let _g = crate::key_plane::test_plane_guard();
+        install_test_plane();
+        let id = mint_budgeted_key(Some(1_000), None);
+
+        let before_grant_ok = key_operation_count("budget_override_grant", "ok");
+        let before_grant_refused = key_operation_count("budget_override_grant", "refused");
+        let before_clear_ok = key_operation_count("budget_override_clear", "ok");
+        let before_clear_refused = key_operation_count("budget_override_clear", "refused");
+
+        let resp = dispatch(
+            "POST",
+            &format!("/admin/keys/{id}/budget-override"),
+            Some(r#"{"max_tokens_increase":500,"ttl_secs":600}"#),
+        )
+        .unwrap();
+        assert_eq!(resp.0, 200, "{}", resp.2);
+
+        // A raise on an axis the base budget does not cap is a refusal
+        // the caller can fix, not an outage.
+        let resp = dispatch(
+            "POST",
+            &format!("/admin/keys/{id}/budget-override"),
+            Some(r#"{"max_cost_usd_increase":10.0,"ttl_secs":600}"#),
+        )
+        .unwrap();
+        assert!((400..500).contains(&resp.0), "{}", resp.2);
+
+        let resp = dispatch("DELETE", &format!("/admin/keys/{id}/budget-override"), None).unwrap();
+        assert_eq!(resp.0, 200, "{}", resp.2);
+        // Nothing left to clear: the 404 is a refusal.
+        let resp = dispatch("DELETE", &format!("/admin/keys/{id}/budget-override"), None).unwrap();
+        assert_eq!(resp.0, 404, "{}", resp.2);
+
+        assert_eq!(
+            key_operation_count("budget_override_grant", "ok") - before_grant_ok,
+            1.0,
+            "a granted raise must reach sbproxy_key_operations_total"
+        );
+        assert_eq!(
+            key_operation_count("budget_override_grant", "refused") - before_grant_refused,
+            1.0,
+            "a refused raise must be countable, or outcome=refused cannot show a caller \
+             hammering the route"
+        );
+        assert_eq!(
+            key_operation_count("budget_override_clear", "ok") - before_clear_ok,
+            1.0,
+            "an early clear must reach the counter too"
+        );
+        assert_eq!(
+            key_operation_count("budget_override_clear", "refused") - before_clear_refused,
+            1.0,
+            "clearing a raise that is not there is a refusal"
+        );
+
+        // The store goes down under a legitimate grant: `error`, never
+        // folded into `refused`.
+        let before_grant_error = key_operation_count("budget_override_grant", "error");
+        install_down_plane();
+        let resp = dispatch(
+            "POST",
+            &format!("/admin/keys/{id}/budget-override"),
+            Some(r#"{"max_tokens_increase":500,"ttl_secs":600}"#),
+        )
+        .unwrap();
+        assert_eq!(resp.0, 500, "{}", resp.2);
+        assert_eq!(
+            key_operation_count("budget_override_grant", "error") - before_grant_error,
+            1.0,
+            "a store outage on the raise route must page, not read as a caller mistake"
         );
     }
 

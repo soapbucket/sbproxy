@@ -920,9 +920,14 @@ While the raise is live, read responses carry three budget fields: the
 untouched `budget`, the `budget_override` (increases, `expires_at`,
 `granted_by`, `granted_at`, `reason`), and the `effective_budget` the
 request path is enforcing. `DELETE /admin/keys/{id}/budget-override` ends
-a raise early; expiry needs no call at all. The grant and the expiry are
-both written to the `key_audit` trail (`budget_override_grant`, naming
-the operator, and `budget_override_expire`). The override lifecycle,
+a raise early; expiry needs no call at all. Three ends of the raise's
+life reach the `key_audit` trail: `budget_override_grant` naming the
+operator who granted it, `budget_override_clear` naming the operator who
+ended a live raise early, and `budget_override_expire` for the
+unattributed, time-driven end an admin read retires. Reconcile every
+raise against `clear` OR `expire`; matching only one of them leaves
+operator-cancelled raises looking like they are still running. The
+override lifecycle,
 the enforcement seam, and the runnable walkthrough are in
 [ai-gateway.md](ai-gateway.md) under "Temporary budget overrides".
 
@@ -1041,7 +1046,10 @@ or support bundles.
 Successful key mutations emit a structured `key_audit` event with the operation,
 resource kind, and public record id. The event does not contain a plaintext
 secret or verifier hash. Route that tracing target to a protected audit sink and
-apply normal operational-log access controls. See [Audit log](audit-log.md).
+apply normal operational-log access controls. With `audit.key_path` set, the
+same mutations also land on the tamper-evident key chain, browsable from the
+console's Audit view with per-read verification; see
+[Audit log](audit-log.md#browsing-it-from-the-console).
 
 Mint, revoke, rotate, and block additionally publish typed events on the
 `events:` egress (`key_minted`, `key_revoked`, `key_rotated`, `key_blocked`),
@@ -1409,6 +1417,14 @@ survive a reload instead.
 For a self-contained config, declare keys and credentials inline. A seed key
 takes either a `secret` (hashed at boot) or a precomputed `secret_hash`.
 
+Give a seeded key an id in the shape the gateway mints, sixteen lowercase hex
+characters. Nothing validates the field, and a seeded key with any id
+authenticates fine as `sk-<key_id>-<secret>`, but the minted token shape is
+`sbp_<16 hex>_<64 hex>` and a rotated token has to parse back on the inbound
+path. `POST /admin/keys/{id}/rotate` refuses a non-conforming id with a `409`
+rather than hand you a token that authenticates nowhere. Avoid a dash in the
+id for the same family of reasons: the legacy parser splits on the first one.
+
 The `key_management:` block nests under `proxy:`; a top-level `key_management:`
 key is silently dropped with a warning and the feature stays off.
 
@@ -1421,7 +1437,7 @@ proxy:
       master_key: env:SBPROXY_KEY_MASTER
     seed:
       keys:
-        - key_id: ci0001
+        - key_id: a1b2c3d4e5f60789
           secret: rotate-me-in-production
           name: ci-runner
           max_requests_per_minute: 60

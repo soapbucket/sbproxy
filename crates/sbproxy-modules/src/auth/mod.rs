@@ -917,12 +917,16 @@ impl JwtAuth {
         // payload as a nested JWS (RFC 7519 section 5.2) through the
         // exact code below, so decryption never bypasses a signature
         // check. Every refusal returns `None`, which the caller turns
-        // into the same challenge as a bad signature; the debug lines
-        // name only public header values, never the key or payload.
+        // into the same challenge as a bad signature; the log lines name
+        // only public header values, never the key or payload. They are
+        // `info!` rather than `debug!` because the release profile pins
+        // tracing to `release_max_level_info`, which compiles `debug!`
+        // out: at `debug` the shipped binary records nothing for a
+        // refused token, which is the opposite of what the docs promise.
         let decrypted;
         let token = if jwe::is_compact_jwe(token) {
             let Some(jwe_config) = &self.jwe else {
-                tracing::debug!(
+                tracing::info!(
                     "JWE token presented but the jwt provider has no `jwe` decryption key; refusing"
                 );
                 return None;
@@ -933,7 +937,7 @@ impl JwtAuth {
                     decrypted.as_str()
                 }
                 Err(err) => {
-                    tracing::debug!(error = %err, "JWE decryption failed; refusing token");
+                    tracing::info!(error = %err, "JWE decryption failed; refusing token");
                     return None;
                 }
             }

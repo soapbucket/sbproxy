@@ -349,7 +349,10 @@ tail and a runtime log-level control.
   renders roots, descendants, parents outside the ring, and ungrouped
   requests with per-session summaries. The Gateway column reads cache,
   retry, failover, load-balancer, and guardrail decisions as one causal
-  rail; expanding a row shows every bounded field.
+  rail; expanding a row shows every bounded field. For `admin`
+  operators, an expanded AI-dispatched row also offers "Replay in
+  playground", which re-runs the entry through the governed dispatch
+  path (see [Replay a logged request](#replay-a-logged-request)).
 - **Mutations:** none directly on request data; `GET`/`PUT /admin/log-level`
   reads and sets the live tracing filter (e.g.
   `debug` or `sbproxy_ai=debug`) without a restart.
@@ -431,6 +434,72 @@ Only properties listed in the origin's `properties.rollup_keys` become
 durable spend dimensions; every captured property stays filterable in Logs
 for the life of the ring. Redacted keys show as `[redacted]` everywhere.
 
+## Routing decisions (`/routing-decisions`)
+
+Per-request routing traces: which strategy or operator plan decided each
+request, the candidates it weighed, the winner, the reason, and the
+fallback chain it actually traversed. Neither Kong nor Cloudflare AI
+Gateway can answer "why this provider" per request; sbproxy already
+records the underlying decision data, and this page renders it.
+
+Where a row comes from, end to end:
+
+```mermaid
+flowchart TD
+    REQ["AI dispatch\n(handle_ai_proxy)"] --> PLANQ{"Operator routing\npolicy produced a plan?"}
+    PLANQ -->|"yes (CEL / Lua / JS / WASM / Rego)"| PLAN["Plan: ordered tiers + reason\n(strategy reported as\nai_routing_policy)"]
+    PLANQ -->|no| STRAT["Configured strategy orders\nthe eligible providers\n(round_robin, fallback_chain,\ncascade, lowest_latency, ...)"]
+    PLAN --> SNAP["Request context snapshot:\ncandidates, reason,\nattempted-provider trail,\nopen detail map"]
+    STRAT --> SNAP
+    SNAP --> DISPATCH["Provider dispatch\n(failover + cascade record\neach attempt as it happens)"]
+    DISPATCH --> LOG["End-of-request logging hook\nbuilds one decision record"]
+    LOG --> RING["In-memory ring\n(proxy.admin.max_log_entries,\ndrops oldest, clears on restart)"]
+    RING --> API["GET /api/routing-decisions\n(filters: origin, strategy,\nmodel, provider, since/until)"]
+    API --> VIEW["Routing decisions view\n(/routing-decisions)"]
+```
+
+- **Shows:** `GET /api/routing-decisions`: one row per routed request,
+  newest first, with strategy, winner (provider and model), the traversed
+  provider chain, the decision reason, status, and latency. Expanding a
+  row lists the candidates in the order the router weighed them with the
+  winner marked, the failover pair, tenant, request id, and every key of
+  the open `detail` map. A `substituted` badge marks rows where the served
+  model differs from the requested one.
+- **Filters:** origin, strategy, model (matches the requested or the
+  served side of a substitution), selected provider, and a rolling time
+  window, all applied server-side; deep links may pre-seed `origin`,
+  `strategy`, and `model` query parameters.
+- **Mutations:** none.
+- **Empty/error notes:** a config with no AI origin or load-balanced
+  upstream records no decisions, and the page says so rather than
+  erroring; plain proxied requests that never routed do not appear.
+- **Retention boundary:** the ring shares `proxy.admin.max_log_entries`
+  (default 1000) with the Logs ring and clears on restart. It is a
+  runtime sample for diagnosis, not durable routing history; ship the
+  decision audit records to your log pipeline for that.
+
+### Reading a failover trace
+
+A caller reports a slow, oddly-worded answer. Open Routing decisions and
+filter by the model they asked for:
+
+1. The row's chain reads `openai › anthropic` with a `substituted`
+   badge: the primary failed and the request was served by the second
+   tier under a different model.
+2. Expand the row. Candidates list the plan's order with `anthropic /
+   claude-sonnet-5` marked `selected`; the reason field carries the
+   operator plan's own words (or is empty for a built-in strategy,
+   which decides by its name's criterion); the failover pair and
+   attempt count quantify the detour.
+3. The request id links the decision to the same request's row in
+   [Logs](#logs-logs) and its access-log line, so cost, tokens, and
+   the response itself are one filter away.
+
+The four planned columns for this page (typed fallback triggers, data-
+posture eligibility results, price-ceiling exclusions, and semantic-match
+scores) will land as keys of the `detail` map and render in the expanded
+row without a redesign.
+
 ## Metrics (`/metrics`)
 
 ![Metrics: live stat tiles with sparklines, request-rate and latency charts, and per-origin activity](assets/admin-metrics.png)
@@ -493,15 +562,70 @@ windowed history.
   response also advertises promoted property keys, which appear as
   `Property: <key>` groupings and query as `group_by=property:<key>`.
   Labels in the by-origin breakdown link through to Logs filtered to
-  that origin, which is the one spend dimension the request log can
-  filter on; the other breakdowns are deliberately not linked, because
-  landing on an unfiltered log is worse than no link.
+  that origin; the other breakdowns are deliberately not linked,
+  because landing on an unfiltered log is worse than no link. For
+  by-model, by-key, by-tenant, or by-user drill-down over the recent
+  ring, use [Reports](#reports-reports), which filters on exactly
+  those dimensions.
 - **Mutations:** none.
 - **Empty/error notes:** no AI traffic yet renders an empty state; a
   `window`/`group_by` combination with no matching rollup data renders
   an empty chart, not an error. If a selected property disappears in
   another window, the selector preserves it with an unavailable hint
   rather than changing the operator's query.
+
+## Reports (`/reports`)
+
+Spend and usage over the recent-request ring, grouped by any mix of
+model, API key, tenant, and user at once, with the whole view encoded
+in the URL and raw export a click away. OpenRouter's org exports group
+by model, key, or the human who made the call; LiteLLM persists its
+dashboard state in URL params so a filtered view travels as a link.
+This page does both at the same time, over data sbproxy already
+records on every request.
+
+- **Shows:** `GET /api/requests/report`: one row per composite group
+  with request count, tokens in/out, and estimated cost, sorted by
+  spend, plus filtered totals as stat tiles. The Group by row toggles
+  the four dimensions independently; grouped columns appear and
+  disappear as dimensions toggle. A dimension a request lacks (an
+  unkeyed call, an anonymous user) renders as `(unattributed)`.
+- **Filters:** model, API key id, tenant, and user, applied
+  server-side by the same parser that filters Logs, so a report and
+  the log rows behind it can never disagree.
+- **Shareable state:** every applied filter and the grouping selection
+  serialize into URL query params (`?tenant=acme&group_by=model,user`).
+  Copying the address bar shares the exact view; opening a shared link
+  restores filters and grouping before the first fetch. There is no
+  separate saved-filter object to manage: the URL is the saved filter.
+- **Export:** two links download the current filtered view (the raw
+  rows, not the grouped ones) via `GET /api/requests/export`, as CSV
+  for spreadsheets or JSONL for tooling. The export is bounded by the
+  ring cap and hardened against CSV formula injection; see the
+  [export reference](admin-api-reference.md#get-apirequestsexport).
+- **Mutations:** none.
+- **Empty/error notes:** no matching requests renders an empty state
+  naming the ring as the source. A hand-edited link whose `group_by`
+  names an unknown or repeated dimension is normalized before the
+  first fetch (unknown dropped, repeats collapsed, canonical order
+  restored) and falls back to the default grouping if nothing
+  survives, rather than rendering the API's `400`.
+- **Retention boundary:** the ring shares `proxy.admin.max_log_entries`
+  (default 1000) with Logs and clears on restart. For durable,
+  windowed spend history use [Spend](#spend-spend), whose rollups
+  survive restarts; this page answers "who spent what just now,
+  exactly, and let me hand you the rows."
+
+### Answering "who spent what" in one pass
+
+Finance asks why the morning's AI spend spiked. Open Reports, group by
+model and user simultaneously, and the spend-first sort puts the
+answer on row one: which human drove which model, with tokens and cost
+side by side. Filter to that user to confirm, copy the URL into the
+thread so everyone sees the same cut, and export CSV for the
+reconciliation sheet. The same questions through Logs would be a
+row-by-row scroll; through Spend, a windowed chart without the
+per-user cut.
 
 ## AI performance (`/ai-performance`)
 
@@ -610,6 +734,140 @@ with, and see the response, token usage, cost, and latency.
 - **Empty/error notes:** no AI origins configured is an empty state
   ("nothing to talk to yet"); an upstream failure surfaces the
   provider's error, not a generic one.
+
+### Replay a logged request
+
+An expanded row on the Logs page offers "Replay in playground" on any
+AI-dispatched entry (`admin` role only; the dispatch route refuses
+`read_only` operators). It opens this page with the entry's request id
+in the URL and pre-fills the form with what the request log actually
+retains:
+
+- **Always reconstructable:** the origin, the model, and the minted
+  virtual key the request ran as. These live on the ring entry itself,
+  so they survive even when no content was captured.
+- **The body, only when it was captured:** the prompt loads from the
+  redacted content sample retained when the AI origin sets
+  `capture_content: true` and the governed key's policy consents with
+  `allow_content_capture`. The page reads it through
+  `GET /api/requests/{request_id}/content`, the same audited admin
+  read behind the "View captured content" button on the Logs page, so
+  a replay surfaces nothing a normal log read would not. A captured
+  replay carries every captured message in order; the Prompt box edits
+  the last user message. Capture redacts before storage, so the replay
+  sends the redacted text, not the original bytes.
+- **Never reconstructable:** sampling parameters (temperature, token
+  limits) are not retained in the log, so the replay dispatches with
+  the playground's defaults. When no content sample exists (capture
+  not enabled, key consent absent, or the bounded sample store evicted
+  or restarted), the page states the gap and pre-fills only origin,
+  model, and key. It never fabricates a prompt.
+
+```mermaid
+flowchart LR
+    A[Logs: expanded AI request row] -->|Replay in playground| B[Playground, request id in the URL]
+    B --> C{"Content sample retained?\n(capture_content AND\nallow_content_capture)"}
+    C -->|yes, read is audited| D["Origin, model, key, and the\nredacted messages pre-fill"]
+    C -->|no| E["Origin, model, and key pre-fill;\nthe body gap is stated"]
+    D --> F["POST /admin/api/playground/dispatch"]
+    E --> F
+    F --> G["Governed pipeline: key policy, budgets,\nrouting, guardrails, like the original run"]
+```
+
+#### A worked replay
+
+Two flags have to agree before there is a body to replay, so this runs
+both sides. The origin opts in, and the key consents when it is minted:
+
+```yaml
+# /tmp/sbproxy-replay-demo/sb.yml
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      require_governed_key: true
+      # Half of the two-sided gate. The other half is the key policy's
+      # allow_content_capture, set when the key is minted below.
+      capture_content: true
+      providers:
+        - name: openai
+          provider_type: openai
+          api_key: ${FIXTURE_API_KEY:-fixture-local-token}
+          base_url: http://127.0.0.1:18087/v1
+          allow_private_base_url: true
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+```
+
+Mint the consenting key, then drive one two-message call through it:
+
+```bash
+TOKEN=$(curl -s -X POST -u admin:secret -H 'Content-Type: application/json' \
+  -d '{"name":"replay-demo","allow_content_capture":true}' \
+  http://127.0.0.1:9090/admin/keys | jq -r .token)
+
+curl -s -o /dev/null http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Host: ai.local' -H "Authorization: Bearer $TOKEN" \
+  -H 'X-Sb-User-Id: dev@acme.test' -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4o-mini","messages":[
+        {"role":"system","content":"You are a release assistant."},
+        {"role":"user","content":"Summarize the v1.13 changelog."}]}'
+```
+
+"Replay in playground" on that row is a link to this page carrying the
+request id and the three fields the ring retained, and nothing else:
+
+```text
+/playground?replay=01a021dde3d07cb2ac5a663f5039f782&origin=ai.local&model=gpt-4o-mini&key=5c22524e5b2675aa
+```
+
+The page then fills the form from one audited read, the same one the
+Logs page's "View captured content" button makes:
+
+```bash
+curl -s -u admin:secret \
+  'http://127.0.0.1:9090/api/requests/01a021dde3d07cb2ac5a663f5039f782/content' | jq
+```
+
+```json
+{
+    "request_id": "01a021dde3d07cb2ac5a663f5039f782",
+    "api_key_id": "5c22524e5b2675aa",
+    "tenant_id": "__default__",
+    "origin": "ai.local",
+    "model": "gpt-4o-mini",
+    "captured_at": "2026-08-21T01:09:45.082442+00:00",
+    "input_messages": [
+        {
+            "role": "system",
+            "content": "You are a release assistant."
+        },
+        {
+            "role": "user",
+            "content": "Summarize the v1.13 changelog."
+        }
+    ],
+    "output_text": "ok"
+}
+```
+
+Both captured messages load in order and render above the Prompt box.
+The Prompt box holds the last user message, "Summarize the v1.13
+changelog."; editing it replaces that message rather than appending a
+new one, and the system message travels with the dispatch unchanged.
+Note `output_text` is captured too and is not replayed: a replay sends
+input, and the new response is the point of running it.
+
+Turn either flag off and this read answers `404`. The page then states
+which consent is missing, pre-fills only origin, model and key, and
+invents no prompt.
+
+The dispatch is the governed one described above, pre-selected to the
+original request's virtual key when that key is still active. A
+replayed request is a new request: it runs the full policy chain
+again, spends real budget, and lands in the log under its own request
+id. The replay never touches the ungoverned `/chat` route.
 
 ## Cache (`/cache`)
 
@@ -722,16 +980,41 @@ resident, and what can be reclaimed.
 
 ## Audit (`/audit`)
 
-Rate-limit budget actions (suspend, throttle, resume) with the reason
-each fired.
+Three records of what happened, ordered by how much they prove. At the
+top, the tamper-evident chain viewer: the durable, hash-chained,
+Ed25519-signed files themselves, re-verified on every page read. Below
+it, the bounded runtime samples: the unified security and change event
+ring, and the rate-limit budget actions (suspend, throttle, resume)
+with the reason each fired.
 
-- **Shows:** `GET /api/audit/recent?limit=100`, `GET /api/rate_limits/budget`
-  (per-workspace tier and cool-down state).
+The chain section shows one card per channel (`security`, `config`,
+`key`, `admin`), each labeled `verified`, `broken`, `unreadable`, or
+`off`, with the entry count and the signing key id. Entries from every
+enabled chain merge into one table, filterable by channel, actor, and
+time range, with Older/Newer paging inside a single channel. If any
+walked chain fails verification, a banner names the channel, the first
+broken sequence number, and the reason, and the table serves only the
+records that verified; see
+[audit-log.md](audit-log.md#browsing-it-from-the-console) for what the
+walk checks and why a break is served rather than hidden.
+
+- **Shows:** `GET /api/audit/chain` (the chained files, verified per
+  read), `GET /api/audit/events?limit=200` (the in-memory event
+  sample), `GET /api/audit/recent?limit=100`,
+  `GET /api/rate_limits/budget` (per-workspace tier and cool-down
+  state).
 - **Mutations:** `POST /api/rate_limits/resume` (manually clear a
   workspace's escalation back to `normal`).
-- **Empty/error notes:** no `rate_limits:` block configured returns an
-  empty audit list and a `404` on the budget snapshot; both render as
-  "not configured," not an error, since there is nothing to audit.
+- **Empty/error notes:** with no chain configured, all four cards read
+  "off" and the chain table explains which config keys turn each
+  channel on. No `rate_limits:` block configured returns an empty audit
+  list and a `404` on the budget snapshot; both render as "not
+  configured," not an error, since there is nothing to audit.
+- **Roles:** the whole page is readable by a `read_only` operator; the
+  chain route is GET-only. A login narrowed with
+  `proxy.admin.operators[].tenant` is refused the chain section with a
+  `403`, since the chains are deployment-wide; the rest of the page still
+  renders. Every chain read is itself recorded on the admin channel.
 
 ## Users (`/users`)
 

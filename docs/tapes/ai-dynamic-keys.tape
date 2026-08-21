@@ -52,7 +52,7 @@ Sleep 1.2s
 Enter
 Sleep 400ms
 
-Type `curl -s -u admin:admin -X POST localhost:9090/admin/keys/seed0001/rotate -d '{"grace_secs":3600}' | jq '{token: (.token[0:20] + "...REDACTED"), grace_expires_at, key_id: .key.key_id}'`
+Type `curl -s -u admin:admin -X POST localhost:9090/admin/keys/a1b2c3d4e5f60789/rotate -d '{"grace_secs":3600}' | jq '{token: (.token[0:20] + "...REDACTED"), grace_expires_at, key_id: .key.key_id}'`
 Enter
 Sleep 2.5s
 
@@ -61,6 +61,6 @@ Sleep 1.2s
 Enter
 Sleep 400ms
 
-Type `curl -s -u admin:admin -X POST localhost:9090/admin/keys/seed0001/revoke | jq '.key | {key_id, status}'`
+Type `curl -s -u admin:admin -X POST localhost:9090/admin/keys/a1b2c3d4e5f60789/revoke | jq '.key | {key_id, status}'`
 Enter
 Sleep 3s

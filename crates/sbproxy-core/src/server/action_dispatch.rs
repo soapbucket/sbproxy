@@ -9,7 +9,7 @@ use super::*;
 use sbproxy_config::types::FailureMode;
 
 /// Whether the inbound request asks for a WebSocket upgrade.
-fn is_websocket_upgrade_request(request: &pingora_http::RequestHeader) -> bool {
+pub(super) fn is_websocket_upgrade_request(request: &pingora_http::RequestHeader) -> bool {
     request
         .headers
         .get(http::header::UPGRADE)
@@ -556,13 +556,17 @@ pub(super) async fn handle_action(
             // (`content_shape_transform`, `markdown_projection`,
             // `canonical_url`, `rsl_urn`, `citation_required`). The walk
             // itself is shared with the mock arm (WOR-2496).
-            let mut body_bytes = apply_origin_transforms_to_generated_body(
+            let transform_outcome = apply_origin_transforms_to_generated_body(
                 pipeline,
                 origin_idx,
                 ctx,
                 Bytes::copy_from_slice(s.body.as_bytes()),
                 &ct,
             );
+            if transform_outcome.terminal_failure {
+                return serve_generated_transform_failure(session, ctx, transform_outcome).await;
+            }
+            let mut body_bytes = transform_outcome.body;
 
             // Wave 4 day-5 Items 3 + 4: shape-driven body rewrite +
             // Content-Type override.
@@ -774,11 +778,20 @@ pub(super) async fn handle_action(
                 .map_err(|e| {
                     Error::because(ErrorType::InternalError, "failed to set content-type", e)
                 })?;
-            header
-                .insert_header("content-length", body_bytes.len().to_string())
-                .map_err(|e| {
-                    Error::because(ErrorType::InternalError, "failed to set content-length", e)
-                })?;
+            // WOR-2599: same 204/304 carve-out the mock arm takes. RFC 9110
+            // section 8.6 forbids `Content-Length` on a 204, Pingora writes
+            // no body for either status, and an intermediary that frames a
+            // 204 by its declared length would eat the head of whatever
+            // came next on the connection. This arm has declared a length
+            // unconditionally since it was written; the two arms would
+            // otherwise disagree on a rule that applies to both.
+            if !matches!(effective_status, 204 | 304) {
+                header
+                    .insert_header("content-length", body_bytes.len().to_string())
+                    .map_err(|e| {
+                        Error::because(ErrorType::InternalError, "failed to set content-length", e)
+                    })?;
+            }
             for (k, v) in &s.headers {
                 if cel_header_removals
                     .iter()
@@ -943,14 +956,38 @@ pub(super) async fn handle_action(
             // WOR-2496: the origin's transform chain applies to the
             // mock body the same way it does to a static body or an
             // upstream response.
-            let body = apply_origin_transforms_to_generated_body(
+            let transform_outcome = apply_origin_transforms_to_generated_body(
                 pipeline,
                 origin_idx,
                 ctx,
                 Bytes::from(serde_json::to_vec(&m.body).unwrap_or_default()),
                 "application/json",
             );
-            let num_headers = 1 + m.headers.len();
+            if transform_outcome.terminal_failure {
+                return serve_generated_transform_failure(session, ctx, transform_outcome).await;
+            }
+            let body = transform_outcome.body;
+            // WOR-2599: without a declared length Pingora frames the body
+            // close-delimited, so the only end-of-body signal is the
+            // connection dying and a client cannot tell a finished body
+            // from a killed one. That is why the mock path broke at 70 KB
+            // while the static arm, which has always declared its length,
+            // survived to a megabyte. `body` is final here: the transform
+            // walk above has already run, and `apply_generated_response_phases`
+            // below only takes it by reference.
+            //
+            // 204 and 304 are the exception. RFC 9110 section 8.6 forbids
+            // `Content-Length` on a 204, Pingora writes no body for either
+            // status, and neither is close-delimited, so there is nothing
+            // to frame and a length would only be a lie. A mocked
+            // `DELETE -> 204` is an ordinary thing to configure, and
+            // `body` defaults to JSON `null` rather than to nothing, so
+            // this is reachable without the operator writing a body at
+            // all. HEAD is deliberately not in this set: Pingora suppresses
+            // the body there too, but RFC 9110 section 9.3.2 wants the
+            // length the equivalent GET would have carried.
+            let declares_length = !matches!(m.status, 204 | 304);
+            let num_headers = 1 + usize::from(declares_length) + m.headers.len();
             let mut header = pingora_http::ResponseHeader::build(m.status, Some(num_headers))
                 .map_err(|e| {
                     Error::because(ErrorType::InternalError, "failed to build mock header", e)
@@ -980,6 +1017,21 @@ pub(super) async fn handle_action(
                     }
                 }
             }
+            // Framing goes on last, after the operator headers and the CEL
+            // mutations, because `insert_header` replaces where
+            // `append_header` accumulates: a CEL `append` of
+            // `content-length` would otherwise leave two values, which
+            // Pingora refuses to reconcile and answers by falling back to
+            // exactly the close-delimited framing this is here to remove.
+            // Writing it last means sbproxy always owns the one value that
+            // describes the bytes it is about to send.
+            if declares_length {
+                header
+                    .insert_header("content-length", body.len().to_string())
+                    .map_err(|e| {
+                        Error::because(ErrorType::InternalError, "failed to set content-length", e)
+                    })?;
+            }
             // WOR-2496: response-phase policies and cookies apply to the
             // generated response exactly as they would to a proxied one.
             apply_generated_response_phases(session, ctx, pipeline, origin_idx, &mut header, &body);
@@ -1001,13 +1053,24 @@ pub(super) async fn handle_action(
             // Stamp the status for the access log and metrics, mirroring
             // the static and mock arms (WOR-1782).
             ctx.response_status = Some(200);
-            let mut header = pingora_http::ResponseHeader::build(200, Some(2)).map_err(|e| {
+            let mut header = pingora_http::ResponseHeader::build(200, Some(3)).map_err(|e| {
                 Error::because(ErrorType::InternalError, "failed to build beacon header", e)
             })?;
             header
                 .insert_header("content-type", "image/gif")
                 .map_err(|e| {
                     Error::because(ErrorType::InternalError, "failed to set content-type", e)
+                })?;
+            // WOR-2599: the third generated-body arm that never declared a
+            // length, and the same close-delimited framing follows from it.
+            // The pixel is 43 bytes so it can never reach the large-body
+            // race the mock arm hit, but every beacon request was still
+            // burning a whole TCP connection to signal end-of-body, on the
+            // one endpoint a page is likely to hit repeatedly.
+            header
+                .insert_header("content-length", GIF_1X1.len().to_string())
+                .map_err(|e| {
+                    Error::because(ErrorType::InternalError, "failed to set content-length", e)
                 })?;
             header
                 .insert_header("cache-control", "no-cache, no-store")
@@ -1362,6 +1425,48 @@ pub(super) async fn handle_action(
             }
         }
     }
+}
+
+/// Serve the `failure_posture: closed` refusal for a locally generated
+/// response whose transform chain faulted.
+///
+/// A `static` or `mock` action answers in the request phase, so there is
+/// no committed upstream header to work around: the status line is still
+/// ours to write and the refusal is an ordinary `500` carrying the
+/// substituted body, not the generated one. `x-sbproxy-transform-error`
+/// names the transform, matching the attribution the proxied path
+/// stamps.
+async fn serve_generated_transform_failure(
+    session: &mut Session,
+    ctx: &mut RequestContext,
+    outcome: crate::server::GeneratedBodyTransformOutcome,
+) -> Result<bool> {
+    ctx.response_status = Some(500);
+    ctx.response_status_override = Some(500);
+    let attribution = ctx.transform_error_attribution.clone();
+    let mut header = pingora_http::ResponseHeader::build(500, Some(3)).map_err(|e| {
+        Error::because(
+            ErrorType::InternalError,
+            "failed to build transform-failure header",
+            e,
+        )
+    })?;
+    header
+        .insert_header("content-type", "application/json")
+        .map_err(|e| Error::because(ErrorType::InternalError, "failed to set content-type", e))?;
+    header
+        .insert_header("content-length", outcome.body.len().to_string())
+        .map_err(|e| Error::because(ErrorType::InternalError, "failed to set content-length", e))?;
+    if let Some(name) = attribution {
+        let _ = header.insert_header("x-sbproxy-transform-error", name);
+    }
+    session
+        .write_response_header(Box::new(header), false)
+        .await?;
+    session
+        .write_response_body(Some(outcome.body), true)
+        .await?;
+    Ok(true)
 }
 
 struct PluginActionTransformOutcome {
@@ -3015,7 +3120,7 @@ origins:
         let counter = || {
             sbproxy_observe::metrics::metrics()
                 .deprecated_requests_total
-                .with_label_values(&["dep-rules.test", "v1-legacy", "false"])
+                .with_label_values(&["dep-rules.test", "v1-legacy", "false", "served"])
                 .get()
         };
         let before = counter();
@@ -3025,7 +3130,10 @@ origins:
             &pipeline,
             Some(0),
             b"GET /v1/jobs HTTP/1.1\r\nHost: dep-rules.test\r\nconnection: close\r\n\r\n",
-            |ctx| ctx.forward_rule_idx = Some(0),
+            |ctx| {
+                ctx.hostname = "dep-rules.test".into();
+                ctx.forward_rule_idx = Some(0);
+            },
         )
         .await;
         assert!(result.expect("v1 static action must dispatch"));
@@ -3042,7 +3150,10 @@ origins:
             &pipeline,
             Some(0),
             b"GET /v2/jobs HTTP/1.1\r\nHost: dep-rules.test\r\nconnection: close\r\n\r\n",
-            |ctx| ctx.forward_rule_idx = Some(1),
+            |ctx| {
+                ctx.hostname = "dep-rules.test".into();
+                ctx.forward_rule_idx = Some(1);
+            },
         )
         .await;
         assert!(result.expect("v2 static action must dispatch"));
@@ -3072,15 +3183,27 @@ origins:
       body: "still here"
 "#,
         );
-        let counter = || {
+        // `served` and `gone` are the same `past_sunset="true"` series
+        // without the outcome label, which is the conflation the fix
+        // round removed: an operator running both postures could not
+        // count who was actually being cut off.
+        let counter = |outcome: &str| {
             sbproxy_observe::metrics::metrics()
                 .deprecated_requests_total
-                .with_label_values(&["dep-straggler.test", "", "true"])
+                .with_label_values(&["dep-straggler.test", "", "true", outcome])
                 .get()
         };
-        let before = counter();
+        let before = counter("served");
+        let before_gone = counter("gone");
 
-        let (result, wire) = exchange(&pipeline.actions[0], &pipeline, Some(0)).await;
+        let (result, wire) = exchange_with(
+            &pipeline.actions[0],
+            &pipeline,
+            Some(0),
+            DEFAULT_TEST_REQUEST,
+            |ctx| ctx.hostname = "dep-straggler.test".into(),
+        )
+        .await;
 
         assert!(result.expect("static action must dispatch"));
         let response = String::from_utf8(wire)
@@ -3094,7 +3217,16 @@ origins:
             response.contains("sunset: mon, 01 jun 2020 00:00:00 gmt"),
             "headers still announce the (elapsed) sunset: {response}"
         );
-        assert_eq!(counter(), before + 1, "past_sunset label must be true");
+        assert_eq!(
+            counter("served"),
+            before + 1,
+            "a straggler served past sunset counts as past_sunset=true, outcome=served"
+        );
+        assert_eq!(
+            counter("gone"),
+            before_gone,
+            "the default posture served this request; nothing may land on outcome=gone"
+        );
     }
 
     #[tokio::test]
@@ -3116,7 +3248,32 @@ origins:
 "#,
         );
 
-        let (result, wire) = exchange(&pipeline.actions[0], &pipeline, Some(0)).await;
+        // Fix round on the #1177 review: the refusal is enforcement, so
+        // it has to be countable AS a refusal and it has to reach the
+        // audit channel. Before the fix `past_sunset="true"` was the
+        // only signal and it counted served and refused hits on one
+        // series, and the 410 reached no audit channel, no event, and
+        // no log line at any level.
+        let counter = |outcome: &str| {
+            sbproxy_observe::metrics::metrics()
+                .deprecated_requests_total
+                .with_label_values(&["dep-gone.test", "", "true", outcome])
+                .get()
+        };
+        let before_gone = counter("gone");
+        let before_served = counter("served");
+
+        let (result, wire) = exchange_with(
+            &pipeline.actions[0],
+            &pipeline,
+            Some(0),
+            DEFAULT_TEST_REQUEST,
+            |ctx| {
+                ctx.hostname = "dep-gone.test".into();
+                ctx.request_id = "req-gone-dispatch-1".into();
+            },
+        )
+        .await;
 
         assert!(result.expect("the gate must short-circuit the request"));
         let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
@@ -3124,6 +3281,28 @@ origins:
         assert!(
             lower.starts_with("http/1.1 410"),
             "past-sunset `gone` must answer 410: {response}"
+        );
+        assert_eq!(
+            counter("gone"),
+            before_gone + 1,
+            "a 410 refusal must be countable as a refusal, not folded in with served hits"
+        );
+        assert_eq!(
+            counter("served"),
+            before_served,
+            "a refused request must never land on outcome=served"
+        );
+        let audited = sbproxy_observe::audit_ring::recent_audit_events(
+            64,
+            Some("security"),
+            Some("api_deprecation"),
+            None,
+        );
+        assert!(
+            audited
+                .iter()
+                .any(|event| event.request_id.as_deref() == Some("req-gone-dispatch-1")),
+            "the 410 refusal must reach the security audit channel from the real gate, not              only from a direct call to the helper"
         );
         assert!(
             !response.contains("unreachable"),

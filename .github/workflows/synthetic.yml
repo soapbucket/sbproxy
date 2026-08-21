@@ -49,7 +49,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/pinned-toolchain
 
       # `bench-synthetic` is its own workspace, so it gets a dedicated
       # cache key. That keeps the proxy workspace cache from being
@@ -187,7 +187,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/pinned-toolchain
 
       - uses: Swatinem/rust-cache@v2
         with:

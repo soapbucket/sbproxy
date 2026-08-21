@@ -2063,6 +2063,75 @@ export interface RequestFilters {
   // WOR-2093: server-side key accountability filters.
   apiKeyId?: string;
   keyMode?: "none" | "minted" | "native";
+  // WOR-2578: reporting-dimension filters (exact matches).
+  model?: string;
+  tenant?: string;
+  user?: string;
+}
+
+// WOR-2578: multi-dimension aggregation of the request ring.
+export interface RequestReportRow {
+  /** Dimension name to value; an empty value means unattributed. */
+  group: Record<string, string>;
+  requests: number;
+  tokens_in: number;
+  tokens_out: number;
+  cost_usd_micros: number;
+}
+
+export interface RequestReportTotals {
+  requests: number;
+  tokens_in: number;
+  tokens_out: number;
+  cost_usd_micros: number;
+}
+
+export interface RequestReportResponse {
+  schema_version: number;
+  group_by: string[];
+  rows: RequestReportRow[];
+  totals: RequestReportTotals;
+}
+
+// WOR-2575: routing decision ring entry (GET /api/routing-decisions).
+export interface RoutingDecisionCandidate {
+  provider: string;
+  model?: string;
+}
+
+export interface RoutingDecision {
+  timestamp?: string;
+  origin?: string;
+  request_id?: string;
+  tenant_id?: string;
+  strategy?: string;
+  requested_model?: string;
+  selected_provider?: string;
+  selected_model?: string;
+  reason?: string;
+  candidates?: RoutingDecisionCandidate[];
+  attempted?: string[];
+  attempts?: number;
+  failover_engaged?: boolean;
+  failover_from?: string;
+  failover_to?: string;
+  status?: number;
+  latency_ms?: number;
+  // Open, additive detail map. Later columns (typed fallback triggers,
+  // eligibility filters, price-ceiling exclusions, semantic-match
+  // scores) land as keys here, not as a schema change.
+  detail?: Record<string, unknown>;
+  [k: string]: unknown;
+}
+
+export interface RoutingDecisionFilters {
+  origin?: string;
+  strategy?: string;
+  provider?: string;
+  model?: string;
+  since?: string;
+  until?: string;
+  limit?: number;
 }
 
 export type AlertRuleState = "inactive" | "ok" | "firing";
@@ -2207,6 +2276,46 @@ export interface AuditEventFilters {
   channel?: string;
   kind?: string;
   keyId?: string;
+}
+
+// WOR-2579: the tamper-evident chain viewer (GET /api/audit/chain).
+// One status object per channel; only channels the request walked carry
+// verification fields, and a disabled channel carries just its name.
+export interface AuditChainChannel {
+  channel: "security" | "config" | "key" | "admin" | string;
+  enabled: boolean;
+  path?: string;
+  key_id?: string;
+  chain_entries?: number;
+  verified_entries?: number;
+  ok?: boolean;
+  broken_seq?: number | null;
+  reason?: string | null;
+  total_matched?: number;
+  next_before_seq?: number | null;
+  error?: string;
+}
+
+export interface AuditChainEntry {
+  channel: string;
+  seq: number;
+  recorded_at: string;
+  actor?: string | null;
+  event: Record<string, unknown>;
+}
+
+export interface AuditChainResponse {
+  channels: AuditChainChannel[];
+  entries: AuditChainEntry[];
+}
+
+export interface AuditChainFilters {
+  channel?: string;
+  actor?: string;
+  since?: string;
+  until?: string;
+  beforeSeq?: number;
+  limit?: number;
 }
 
 // WOR-2096: one redacted content sample for one request.
@@ -2530,7 +2639,7 @@ export interface MeterVerifyResult {
   verified_at: string;
 }
 
-function requestsPath(filters: RequestFilters = {}): string {
+function requestsParams(filters: RequestFilters = {}): URLSearchParams {
   const params = new URLSearchParams();
   if (filters.method) params.set("method", filters.method);
   if (filters.status && /^\d{3}$/.test(filters.status)) {
@@ -2558,8 +2667,46 @@ function requestsPath(filters: RequestFilters = {}): string {
   if (filters.sessionId) params.set("session_id", filters.sessionId);
   if (filters.apiKeyId) params.set("api_key_id", filters.apiKeyId);
   if (filters.keyMode) params.set("key_mode", filters.keyMode);
-  const query = params.toString();
+  // WOR-2578: reporting-dimension filters, shared verbatim by the
+  // snapshot, the report, and the export.
+  if (filters.model) params.set("model", filters.model);
+  if (filters.tenant) params.set("tenant", filters.tenant);
+  if (filters.user) params.set("user", filters.user);
+  return params;
+}
+
+function requestsPath(filters: RequestFilters = {}): string {
+  const query = requestsParams(filters).toString();
   return query ? `/api/requests?${query}` : "/api/requests";
+}
+
+// WOR-2575: routing-decisions ring query. Server-side filter params
+// mirror the admin API's RoutingDecisionFilter, snake_case on the wire.
+function routingDecisionsPath(filters: RoutingDecisionFilters = {}): string {
+  const params = new URLSearchParams();
+  if (filters.origin) params.set("origin", filters.origin);
+  if (filters.strategy) params.set("strategy", filters.strategy);
+  if (filters.provider) params.set("provider", filters.provider);
+  if (filters.model) params.set("model", filters.model);
+  if (filters.since) params.set("since", filters.since);
+  if (filters.until) params.set("until", filters.until);
+  if (filters.limit) params.set("limit", String(filters.limit));
+  const query = params.toString();
+  return query
+    ? `/api/routing-decisions?${query}`
+    : "/api/routing-decisions";
+}
+
+function requestsReportPath(groupBy: string[], filters: RequestFilters = {}): string {
+  const params = requestsParams(filters);
+  params.set("group_by", groupBy.join(","));
+  return `/api/requests/report?${params.toString()}`;
+}
+
+function requestsExportPath(format: "csv" | "jsonl", filters: RequestFilters = {}): string {
+  const params = requestsParams(filters);
+  params.set("format", format);
+  return `/api/requests/export?${params.toString()}`;
 }
 
 export const api = {
@@ -2726,11 +2873,33 @@ export const api = {
   // Logs
   requests: (filters: RequestFilters = {}) =>
     getJson<RequestLog[]>(requestsPath(filters)),
+  // WOR-2578: multi-dimension aggregation of the same filtered ring.
+  requestsReport: (groupBy: string[], filters: RequestFilters = {}) =>
+    getJson<RequestReportResponse>(requestsReportPath(groupBy, filters)),
+  // WOR-2578: the raw export of the filtered view, as a URL for
+  // copying or a right-click save. A bare <a download> on it works,
+  // but it never enters `request()`'s failure handling, so a lapsed
+  // session saves `{"error":"Unauthorized"}` under the name
+  // `requests.csv` with nothing on screen; the console clicks through
+  // `requestsExport` below instead.
+  requestsExportUrl: (format: "csv" | "jsonl", filters: RequestFilters = {}) =>
+    requestsExportPath(format, filters),
+  // The same bytes through the typed client, so a 401 routes the
+  // operator to sign-in and any other status renders as an error
+  // rather than as a downloaded file. Bounded server-side by
+  // `proxy.admin.max_log_entries`, which is what makes holding the
+  // response acceptable here.
+  requestsExport: (format: "csv" | "jsonl", filters: RequestFilters = {}) =>
+    getText(requestsExportPath(format, filters)),
   // WOR-1870: operator UI settings (trace deep-link template).
   uiSettings: () => getJson<UiSettings>("/api/ui-settings"),
   // WOR-1870: SSE live tail of the request ring. EventSource sends the
   // session cookie same-origin; the server enforces auth on connect.
   requestsStreamUrl: () => "/api/requests/stream",
+  // WOR-2575: recent routing decisions ("why was this request routed
+  // here"), newest first from the in-memory ring.
+  routingDecisions: (filters: RoutingDecisionFilters = {}) =>
+    getJson<RoutingDecision[]>(routingDecisionsPath(filters)),
 
   // WOR-2094: unified audit sample (security/key/config/admin/policy).
   auditEvents: (filters: AuditEventFilters = {}) => {
@@ -2742,6 +2911,23 @@ export const api = {
     const query = params.toString();
     return getJson<AuditEvent[]>(
       query ? `/api/audit/events?${query}` : "/api/audit/events",
+    );
+  },
+  // WOR-2579: the durable, tamper-evident chains, read with verification.
+  // Without a channel the response merges the newest window across every
+  // enabled chain; `beforeSeq` pages one channel further back.
+  auditChain: (filters: AuditChainFilters = {}) => {
+    const params = new URLSearchParams();
+    if (filters.channel) params.set("channel", filters.channel);
+    if (filters.actor) params.set("actor", filters.actor);
+    if (filters.since) params.set("since", filters.since);
+    if (filters.until) params.set("until", filters.until);
+    if (filters.beforeSeq !== undefined)
+      params.set("before_seq", String(filters.beforeSeq));
+    if (filters.limit) params.set("limit", String(filters.limit));
+    const query = params.toString();
+    return getJson<AuditChainResponse>(
+      query ? `/api/audit/chain?${query}` : "/api/audit/chain",
     );
   },
   // WOR-2096: one request's redacted content sample (admin role only;

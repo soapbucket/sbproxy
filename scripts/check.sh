@@ -444,10 +444,20 @@ batch_examples_catalog() {
   PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/gen-examples-catalog.py" --check
 }
 
+# CI: review-evidence.yml runs the same fixtures before it parses a body.
+# The parser reads attacker-controlled text and decides whether a PR
+# carries review evidence, so a regression that loosened it would read
+# green in exactly the place the gate is supposed to be strict. The
+# fixtures are in-process and take under a second.
+batch_review_evidence() {
+  PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/check-review-evidence.py" --self-test
+}
+
 run_batch "generator --check drift scans" \
   batch_doc_assets "every promised doc asset exists" \
   batch_doc_configs "documentation configs match canonical examples" \
-  batch_examples_catalog "examples catalog is current"
+  batch_examples_catalog "examples catalog is current" \
+  batch_review_evidence "review-evidence parser fixtures"
 
 # Serial: the opt-in replay path spawns fixture and proxy processes on
 # real ports, and the phase records a skip on the default path.

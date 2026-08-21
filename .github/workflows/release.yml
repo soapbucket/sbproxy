@@ -147,6 +147,16 @@ jobs:
       # Linux jobs take their toolchain from the pinned rust:bookworm
       # container image; installing another one via rustup would only
       # reintroduce drift. macOS still needs the action.
+      #
+      # This is the one `@stable` left in the repository, and it is
+      # left on purpose. Every other lane now resolves its compiler
+      # from rust-toolchain.toml via ./.github/actions/pinned-toolchain.
+      # This job is the only one whose output is bytes we ship, and
+      # moving it changes which compiler builds the darwin_arm64
+      # tarball. That is a release-engineering decision, it can only be
+      # checked by a real tag build, and it wants to be made alongside
+      # the container tag above so all three legs agree rather than one
+      # leg at a time. Do not sweep it in with the rest.
       - uses: dtolnay/rust-toolchain@stable
         if: runner.os == 'macOS'
         with:
@@ -216,6 +226,30 @@ jobs:
         # so without this the build fails on a missing target std.
         # Whether release artifacts should move to the pin is its own
         # decision and is tracked separately.
+        #
+        # Read that reasoning against the matrix before editing it: the
+        # step above only runs on macOS, but this env applies to all
+        # three legs, and the two Linux legs run inside
+        # rust:1.97-bookworm, whose rustup was initialized with
+        # `--default-toolchain 1.97.x` and has no toolchain named
+        # `stable` installed. Whether rustup there installs stable on
+        # demand or refuses outright has not been observed, because
+        # nothing has cut a tag since this line landed. Either way the
+        # value is doing something other than what the paragraph above
+        # describes on two of the three legs.
+        #
+        # And RUSTUP_TOOLCHAIN is only half of it. `container:` mounts
+        # the checked-out workspace into the image, so rust-toolchain.toml
+        # is on disk beside the source and rustup honors it ahead of the
+        # image's default toolchain. Deleting this env would not restore
+        # the container pin; it would hand these legs the root pin
+        # instead. The `.dockerignore` entry that keeps the file out of
+        # a docker build context does nothing here, because this is a job
+        # container rather than an image build. So the container tag is
+        # currently the *stated* Linux toolchain and not necessarily the
+        # one that runs, which is the other half of why converging the
+        # three legs is a decision rather than an edit. Verifying any of
+        # it needs a real tag build.
         env:
           CARGO_PROFILE_RELEASE_LTO: ${{ matrix.lto }}
           CARGO_BUILD_JOBS: ${{ matrix.build_jobs }}
@@ -308,7 +342,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/pinned-toolchain
 
       # Restore-only. This key held ~2.6 GB, the largest single line against
       # the repo's 10 GB Actions cache budget, and the arithmetic in ci.yml's
@@ -387,7 +421,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/pinned-toolchain
 
       - uses: Swatinem/rust-cache@v2
         with:

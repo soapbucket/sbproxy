@@ -49,8 +49,9 @@ Points worth knowing before relying on it:
 
 - **The teardown is abrupt.** There is no `1009 Message Too Big` close handshake; the gateway will not forward a message it has refused, so both TCP connections are dropped. Clients see the socket die mid-message. Each teardown increments `sbproxy_websocket_teardowns_total` and writes a policy-violation audit record; see [Enforcement telemetry](#enforcement-telemetry).
 - **The cap measures wire bytes.** If the client and upstream negotiate `permessage-deflate`, payload lengths on the wire are compressed sizes, and the cap applies to those.
-- **Control frames do not count.** Pings, pongs, and closes interleave freely without affecting the running message total (RFC 6455 caps them at 125 bytes on its own).
+- **Control frames do not count toward a message, and are bounded on their own.** Pings, pongs, and closes interleave freely without affecting the running message total. The gateway holds them to RFC 6455 section 5.5 itself: a control frame declaring more than 125 payload bytes, or arriving without `FIN`, closes the connection. It has to check rather than assume, because a control frame's declared length is skipped rather than accumulated, so an unchecked one would both reach the upstream and desynchronize the gateway's own scanner for the life of the tunnel.
 - **The default is enforced too.** An action that never mentions `max_message_size` gets the documented 10 MB ceiling.
+- **Every upgraded tunnel is scanned, not just this action's.** A `101` on any origin whose request asked for a WebSocket upgrade gets the frame scanner, including `/v1/realtime` under an `ai_proxy` origin and a `type: proxy` or `type: load_balancer` origin fronting a WebSocket backend. Only a `websocket` action configures the cap, so every other action's tunnel is held to the same 10 MB default. A `101` for some other protocol upgrade is left alone: those bytes are not RFC 6455 frames.
 
 ## Subprotocol negotiation
 
@@ -68,14 +69,16 @@ The gateway never adds subprotocols the client did not offer, and it does not re
 
 Where an error happens decides what the client receives. Before the upstream answers `101`, the client is still speaking HTTP: a connect failure, a timeout, or the subprotocol refusal above renders an ordinary HTTP error response with a status and a body. After the `101`, the downstream connection speaks WebSocket frames, and an HTTP error body written into it would arrive as garbage bytes spliced into the frame stream. So for any post-upgrade failure (upstream reset, timeout, read error, or the gateway's own `max_message_size` teardown) the gateway closes both connections and writes nothing. The real failure mode still lands in the proxy log, classified the same way the `Proxy-Status` machinery classifies upstream errors, and on the teardown counter below.
 
+This applies to both surfaces that upgrade. A `websocket` action is one; the AI gateway's realtime tunnel (`type: ai_proxy` reaching `/v1/realtime`) is the other, and a provider that resets mid-session tears down the same way rather than splicing a `502` into the client's audio frames. What decides it is the `101` reaching the downstream wire, not which action opened the tunnel: a realtime request the provider refused with a `401` never upgraded, so it still renders an ordinary HTTP error the client can read.
+
 An upstream that closes *cleanly* is not one of these. A FIN after the last frame is an ordinary end of stream, not a failure: the tunnel ends, nothing is logged as an error, and nothing lands on the teardown counter. The counter's `upstream_error` reason means the transport broke, which is the event worth alerting on.
 
 ## Enforcement telemetry
 
 Every refusal and teardown on this page is operator-visible beyond the warn line:
 
-- `sbproxy_websocket_teardowns_total{reason, direction, tenant, origin}` counts every tunnel the gateway tore down and every upgrade it refused on the upstream's `101`. `reason` is a closed set of three: `message_too_large`, `subprotocol_violation`, and `upstream_error`. `direction` is `client_to_upstream` or `upstream_to_client` for the size cap and `none` for the other two reasons. The pre-connect `400` for an unservable client offer (point 2 above) is not on this counter: it is an ordinary HTTP refusal of a client that asked for something the origin does not speak, made before any enforcement engages, and it is visible the way any 4xx is.
-- A **policy-violation audit record** goes to the `security_audit` channel for the two violation reasons, the same record shape and the same channel every other refusal in the gateway uses. That one record reaches four places: the `security_audit` log target, the admin console's audit sample, the hash-chained tamper-evident file under `audit.sink: chain`, and, bridged, the `events:` sink as a `policy_denied` event ([events.md](events.md#how-the-four-audit-channels-relate-to-the-event-stream)). Its `event_type` is `websocket_message_too_large` or `websocket_subprotocol_violation`, which is the field to route a SIEM rule on; `reason` names the direction and the `observed` and `limit` byte counts for the size cap, or the offered and selected subprotocol token lists (capped at eight tokens of at most 64 characters each, sanitized to the RFC 7230 token grammar) for a negotiation refusal. Frame content is never captured. `status_code` is `502` for a subprotocol refusal and `0` for a size teardown, because a torn-down tunnel receives no HTTP status and the record does not invent one.
+- `sbproxy_websocket_teardowns_total{reason, direction, tenant, origin}` counts every tunnel the gateway tore down and every upgrade it refused on the upstream's `101`, on both upgrade surfaces: the `websocket` action and the AI gateway's realtime tunnel. `reason` is a closed set of four: `message_too_large`, `control_frame_violation`, `subprotocol_violation`, and `upstream_error`. `direction` is `client_to_upstream` or `upstream_to_client` for the two frame-scanner reasons and `none` for the other two. The pre-connect `400` for an unservable client offer (point 2 above) is not on this counter: it is an ordinary HTTP refusal of a client that asked for something the origin does not speak, made before any enforcement engages, and it is visible the way any 4xx is.
+- A **policy-violation audit record** goes to the `security_audit` channel for the three violation reasons, the same record shape and the same channel every other refusal in the gateway uses. That one record reaches four places: the `security_audit` log target, the admin console's audit sample, the hash-chained tamper-evident file under `audit.sink: chain`, and, bridged, the `events:` sink as a `policy_denied` event ([events.md](events.md#how-the-four-audit-channels-relate-to-the-event-stream)). Its `event_type` is `websocket_message_too_large`, `websocket_control_frame_violation`, or `websocket_subprotocol_violation`, which is the field to route a SIEM rule on; `reason` names the direction and the `observed` and `limit` byte counts for the size cap, the declared payload length or the opcode for a control-frame violation, or the offered and selected subprotocol token lists (capped at eight tokens of at most 64 characters each, sanitized to the RFC 7230 token grammar) for a negotiation refusal. Frame content is never captured. `status_code` is `502` for a subprotocol refusal and `0` for a size teardown, because a torn-down tunnel receives no HTTP status and the record does not invent one.
 - An `upstream_error` teardown gets the counter and nothing else. It is a transport failure, not an enforcement verdict; it already reaches the SIEM as a `request_error`, and filing it beside the violations would poison any alert built on them.
 
 The decision path, from the upstream's `101` to a closed tunnel:
@@ -89,6 +92,9 @@ flowchart TD
     E --> F{Message crosses max_message_size?}
     F -->|yes| G["warn + policy-violation record + teardown counter<br/>reason: message_too_large"]
     G --> H["Both connections dropped; zero HTTP bytes on the wire"]
+    E --> K{"Control frame over 125 bytes, or fragmented?"}
+    K -->|yes| L["warn + policy-violation record + teardown counter<br/>reason: control_frame_violation"]
+    L --> H
     E --> I{Upstream resets, times out, or fails a read?}
     I -->|yes| J["warn with the mapped failure mode + teardown counter<br/>reason: upstream_error, no violation record"]
     J --> H
@@ -98,7 +104,9 @@ Read the diagram left of the `101` write and right of it. Everything above node 
 
 ## Honest limits
 
-Beyond the message-size cap and the subprotocol allowlist, post-upgrade traffic gets no per-frame inspection: no PII redaction, no payload-shape validation, no per-message rate limiting, nothing that reads or acts on frame *content*. The `max_message_size` scanner reads frame headers only. If you need content-level control over what flows after the upgrade, that has to live in the WebSocket backend itself; the gateway's contribution stops at the pre-upgrade pipeline plus the two enforcement points described above.
+Beyond the message-size cap, the control-frame checks, and the subprotocol allowlist, post-upgrade traffic gets no per-frame inspection: no PII redaction, no payload-shape validation, no per-message rate limiting, nothing that reads or acts on frame *content*. The scanner reads frame headers only. If you need content-level control over what flows after the upgrade, that has to live in the WebSocket backend itself; the gateway's contribution stops at the pre-upgrade pipeline plus the enforcement points described above.
+
+One more limit worth naming: an upgraded tunnel that is not a `websocket` action's has no config key of its own for the cap. `/v1/realtime` and a proxied upgrade are scanned, and both are held to the 10 MB default; there is nowhere to raise or lower it for them today.
 
 ## Runnable example
 

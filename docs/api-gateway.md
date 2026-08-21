@@ -74,7 +74,7 @@ What a request sees, over the lifecycle:
 flowchart TD
     REQ["Request settles on a route\n(forward rule match, else origin)"] --> DEP{"deprecation: block?\n(rule wins over origin,\nelse a spec-deprecated\nopenapi_validation match)"}
     DEP -->|no| PLAIN["Response unchanged"]
-    DEP -->|yes| CNT["sbproxy_deprecated_requests_total\n{origin, rule, past_sunset}"]
+    DEP -->|yes| CNT["sbproxy_deprecated_requests_total\n{origin, route, past_sunset, outcome}"]
     CNT --> SUN{"Past the sunset\ninstant?"}
     SUN -->|"no (or no sunset:)"| HDR["Response + Deprecation,\nSunset, Link headers"]
     SUN -->|"yes, after_sunset: serve"| HDR2["Response + headers,\npast_sunset=true in the counter"]
@@ -83,7 +83,11 @@ flowchart TD
 
 Three details worth knowing. A bare `deprecated: true` emits no `Deprecation` header, because RFC 9745 requires a date value (the draft-era literal `true` did not survive into the RFC); config load warns and asks for a date. Config load also refuses a `sunset` earlier than the `deprecated` instant, which RFC 9745 forbids. And the announcement is kept consistent across surfaces: the emitted OpenAPI document marks covered operations `deprecated: true` with `x-sbproxy-sunset` / `x-sbproxy-successor` extensions, so the spec at `/.well-known/openapi.json` and the wire headers cannot disagree ([openapi-emission.md](openapi-emission.md)). The reverse direction works too: if your uploaded spec already marks operations `deprecated: true`, the `deprecation_headers` sub-block on the `openapi_validation` policy emits the headers for exactly those operations ([configuration.md](configuration.md#openapi_validation)).
 
-The `sbproxy_deprecated_requests_total` counter is the migration tracker: `rule` names which announcement matched and `past_sunset` separates the stragglers still calling after the retirement date. Unretired old versions are also the classic improper-inventory finding; see [api-security.md](api-security.md).
+The `sbproxy_deprecated_requests_total` counter is the migration tracker: `route` names which announcement matched (the forward rule's id or index, the OpenAPI path template, or empty for a whole-origin block), `past_sunset` separates the stragglers still calling after the retirement date, and `outcome` separates the ones still being served from the ones already refused with 410. `origin` is the request `Host`, the same value `sbproxy_requests_total` carries, so `sum by (origin) (rate(sbproxy_deprecated_requests_total[5m])) / sum by (origin) (rate(sbproxy_requests_total[5m]))` joins and gives you the share of traffic still on a deprecated route.
+
+The `410 Gone` refusal is enforcement, so it reaches the evidence channels too: a `policy_violation` audit record with `event_type: api_deprecation`, carrying the tenant and the accountable key id, on the `security_audit` target, the admin console's audit ring, the hash-chained audit file, and the `events:` egress as a `policy_denied` event. That is how you answer "who did we cut off, and when", which the counter alone cannot.
+
+Unretired old versions are also the classic improper-inventory finding; see [api-security.md](api-security.md).
 
 Field-by-field reference: [configuration.md](configuration.md#api-deprecation-rfc-9745--rfc-8594).
 

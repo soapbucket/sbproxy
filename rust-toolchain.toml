@@ -9,13 +9,20 @@
 # lands on whoever happened to push that morning.
 #
 # This file is the single source of truth for the version.
-# `.github/actions/rust-setup` parses `channel` out of it and hands it
-# to `dtolnay/rust-toolchain@master`, because that action reads no
-# toolchain file of its own: it selects purely from the `@rev` it is
-# called by. Raising the pin here raises it for every lane routed
-# through that composite, in one reviewable commit, and the new
-# release's lints get fixed in that same PR instead of in someone
-# else's.
+# `.github/actions/pinned-toolchain` parses `channel` out of it and
+# hands it to `dtolnay/rust-toolchain@master`, because that action
+# reads no toolchain file of its own: it selects purely from the
+# `@rev` it is called by. `rust-setup` calls that same action, so
+# lanes reach the pin either through the full setup composite or
+# through the toolchain one alone. Raising the pin here raises it for
+# all of them in one reviewable commit, and the new release's lints
+# get fixed in that same PR instead of in someone else's.
+#
+# One lane is deliberately outside this: release.yml's `build` job
+# still installs `@stable` for its macOS leg, because that job's
+# output is the tarball we ship and changing its compiler is a release
+# decision that only a real tag build can check. The comment at that
+# step says so. Everything else routes here.
 #
 # Pinned to current stable, not to the MSRV. `rust-version` in
 # Cargo.toml (1.95) is the floor we promise to compile on and msrv.yml

@@ -92,16 +92,16 @@ Connection: keep-alive
 
 ## Who has not migrated yet
 
-The three deprecated-route hits above each incremented the counter under their rule's id. `past_sunset` separates callers still arriving after the retirement date, which is the list you chase before flipping a route to `gone`.
+The three deprecated-route hits above each incremented the counter under their rule's id, which is what the `route` label carries. `past_sunset` separates callers still arriving after the retirement date, which is the list you chase before flipping a route to `gone`, and `outcome` separates the ones still being served from the ones already refused with 410. `/v0/` shows up as `outcome="gone"` because that rule's posture is `gone` and its sunset has passed; `/beta/` is past its sunset too and still reads `served`.
 
 <!-- CAPTURE: curl -s http://127.0.0.1:8080/metrics | grep deprecated -->
 
 ```text
 # HELP sbproxy_deprecated_requests_total Requests that resolved to a deprecated route
 # TYPE sbproxy_deprecated_requests_total counter
-sbproxy_deprecated_requests_total{origin="api.local",past_sunset="false",rule="v1"} 1
-sbproxy_deprecated_requests_total{origin="api.local",past_sunset="true",rule="beta"} 1
-sbproxy_deprecated_requests_total{origin="api.local",past_sunset="true",rule="v0"} 1
+sbproxy_deprecated_requests_total{origin="api.local",outcome="gone",past_sunset="true",route="v0"} 1
+sbproxy_deprecated_requests_total{origin="api.local",outcome="served",past_sunset="false",route="v1"} 1
+sbproxy_deprecated_requests_total{origin="api.local",outcome="served",past_sunset="true",route="beta"} 1
 ```
 
 ## The spec agrees with the wire
@@ -123,7 +123,7 @@ sbproxy_deprecated_requests_total{origin="api.local",past_sunset="true",rule="v0
 - `deprecation:` at forward-rule scope, overriding nothing and inherited by nothing: each rule announces only for itself
 - RFC 9745 `Deprecation` (structured-field Date), RFC 8594 `Sunset` (HTTP-date), RFC 5829 `successor-version` and RFC 9745 `deprecation` Link relations
 - `after_sunset: serve` (default) and `after_sunset: gone` (410 with the successor in the body)
-- `sbproxy_deprecated_requests_total{origin, rule, past_sunset}` usage tracking
+- `sbproxy_deprecated_requests_total{origin, route, past_sunset, outcome}` usage tracking, and a `policy_violation` audit record with `event_type: api_deprecation` for each 410 refusal
 - OpenAPI emission marking deprecated operations, via `expose_openapi: true`
 
 ## See also

@@ -5,14 +5,16 @@
 # `libfuzzer-sys` link does not contaminate the proxy's release build
 # graph. Mirrors the pattern used by `sbproxy-bench/harness/`.
 #
-# Run from this directory:
+# Run from this directory, and name the target triple:
 #
-#     cargo +nightly fuzz run rsl_xml_parser    -- -max_total_time=10
-#     cargo +nightly fuzz run robots_txt_parser -- -max_total_time=10
-#     cargo +nightly fuzz run llms_txt_parser   -- -max_total_time=10
+#     cargo +nightly fuzz run \
+#       --target "$(rustc +nightly -vV | sed -n 's/^host: //p')" \
+#       rsl_xml_parser -- -max_total_time=10
 #
-# The 10-second smoke pass is what landed in the commit message for
-# this change.
+# Without `--target`, cargo-fuzz uses the triple its own binary was
+# compiled for, which is not the host's when cargo-fuzz arrived as a
+# prebuilt. scripts/README.md carries the full invocation, the corpus
+# arguments that keep a run out of the working tree, and the reasoning.
 #
 # Nothing runs these targets automatically. They had a CI lane,
 # `.github/workflows/wave4-fuzz.yml`, gated on a `run-fuzz` pull
@@ -24,7 +26,10 @@
 # No target here has been observed passing anywhere. The only manual
 # dispatches of the old lane, one on `main` and one on a branch, failed
 # every target on "sanitizer is incompatible with statically linked
-# libc" and a missing `std` crate. WOR-2594 owns the fix.
+# libc" and missing `std` and `core` crates. All of it comes from the
+# target-triple default described above. The `--target` in the
+# invocation is the fix, derived from the error text rather than
+# confirmed by a passing run.
 #
 # G4.6 (llms.txt projection, WOR-130) has landed; the
 # `llms_txt_parser` target drives the public
@@ -69,7 +74,7 @@ arbitrary = { version = "1", features = ["derive"] }
 
 # Tokio is the runtime the WOR-34 stateful fuzzer uses to enforce
 # a per-op deadlock budget via `tokio::time::timeout`. The
-# `current_thread` flavour of the runtime is deliberately the only
+# `current_thread` flavor of the runtime is deliberately the only
 # scheduler enabled here; the fuzz target wants minimum overhead per
 # iteration, not a full thread-pool-per-iteration.
 tokio = { version = "1", features = ["rt", "time", "macros"] }

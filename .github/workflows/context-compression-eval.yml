@@ -58,7 +58,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/pinned-toolchain
         with:
           components: rustfmt, clippy
 

@@ -1,0 +1,70 @@
+# Install the Rust toolchain named in rust-toolchain.toml.
+#
+# `dtolnay/rust-toolchain` reads no toolchain file of its own. It
+# selects purely from the `@rev` it is called by, which is how
+# `@stable` floated onto 1.98.0 mid-week and turned the lint lane red
+# on pull requests that had touched none of the failing code. This
+# action parses `channel` out of the pin and hands it to
+# `dtolnay/rust-toolchain@master` explicitly.
+#
+# It exists so that parsing lives in one file rather than in every
+# lane that needs it. `rust-setup` had the only copy and covers the
+# lanes that also want disk reclaim, rust-cache, and apt packages;
+# lanes that own their own cache scope or install nothing call this
+# directly:
+#
+#   - uses: ./.github/actions/pinned-toolchain
+#     with:
+#       components: rustfmt, clippy
+#
+# Do not inline the version number anywhere. Reading the file is the
+# only sanctioned mechanism, and exactly one lane reads it outside this
+# action: perf-regression.yml, for the reason at the bottom of this
+# comment. Those two parses have to be kept in step by hand, which is
+# the cost of that lane's checkout layout, not a pattern to copy.
+#
+# Note that rustup already honors rust-toolchain.toml for every cargo
+# invocation inside the checkout, so a lane whose cargo runs in-tree
+# compiles with the pin no matter which toolchain got installed. What
+# this action fixes is the toolchain that gets installed and made
+# default: the redundant download, the stated intent, and the lanes
+# where cargo runs somewhere the pin does not reach.
+#
+# One requirement, and it comes from being a local action:
+# `actions/checkout` has to have run at the workspace root, because
+# that is where a `uses: ./...` path and rust-toolchain.toml are both
+# resolved from. perf-regression.yml checks out into subdirectories
+# and so reads the pin inline instead; it is the only lane that does,
+# and its comment says why.
+
+name: pinned-toolchain
+description: Install the Rust toolchain that rust-toolchain.toml names.
+
+inputs:
+  components:
+    description: 'rustup components to install, comma separated (for example "rustfmt, clippy").'
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: read the pinned toolchain
+      id: toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        pin="$GITHUB_WORKSPACE/rust-toolchain.toml"
+        channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$pin" | head -n1)"
+        if [ -z "$channel" ]; then
+          echo "::error::no channel found in rust-toolchain.toml; every Rust lane resolves its compiler from that file"
+          exit 1
+        fi
+        echo "pinned toolchain: $channel"
+        echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
+    - name: install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ steps.toolchain.outputs.channel }}
+        components: ${{ inputs.components }}

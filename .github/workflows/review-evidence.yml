@@ -1,0 +1,116 @@
+# Reads the pull request body and goes red when it carries no record of
+# the adversarial review required by the "Code review" section of
+# CLAUDE.md and AGENTS.md.
+#
+# --- This does not block a merge on its own ---
+#
+# The `main-protection` ruleset requires exactly one status check,
+# `build / test`. Until `adversarial review evidence` is added to that
+# list this workflow is a visible red X and nothing more. Adding it is a
+# deliberate follow-up, done after the first green run so the context
+# name is known good: a required context that has never reported blocks
+# every open pull request the moment it is added.
+#
+# --- Why it is not in ci.yml ---
+#
+# Every lane in there is a cargo build behind the `build / test`
+# aggregator's `needs:` graph, and the answer to "did you record the
+# review" does not need a compiler. Kept separate it reports in well
+# under a minute, so an author who forgot the block learns it while the
+# Rust lanes are still restoring their caches. It also has to run on
+# docs-only PRs, which the `changes` path filter excludes from most of
+# those lanes.
+#
+# --- Trigger ---
+#
+# `edited` is here because the fix for this check is a body edit, not a
+# push, and without it a corrected body would sit red until the next
+# commit. `synchronize` is here because a status check attaches to a
+# head sha: a push that does not re-run this check leaves the new sha
+# unjudged, which for a required check means a permanently pending PR.
+#
+# Known and accepted, for now: under `pull_request` GitHub runs the
+# workflow file from the PR head, so a pull request can weaken its own
+# gate by editing this file. Checking out the base ref does not fix
+# that, because the workflow file itself still comes from the head.
+#
+# The reason this is acceptable *today* is narrow and verifiable: the
+# check is advisory. `main-protection` requires only `build / test`, so
+# a pull request that edits this file is not the weakest link, it is
+# editing something that blocks nothing. The edit is also visible in the
+# diff of the PR making it.
+#
+# Before `adversarial review evidence` goes into the ruleset, settle the
+# trigger question rather than assuming it. `pull_request_target` runs
+# the base branch's copy of both the workflow and the script, and it is
+# safe here because this job never executes PR-supplied code: it reads
+# the body from $GITHUB_EVENT_PATH. What is documented for it is that
+# GITHUB_SHA is the base branch's last commit; whether the resulting
+# check run therefore attaches to the base sha, and so cannot satisfy a
+# required check on the head sha, is a separate question about how
+# Actions associates check runs with pull requests, and it is not
+# settled here. Settle it with a throwaway PR carrying a
+# `pull_request_target` workflow and compare
+# `gh api repos/soapbucket/sbproxy/commits/<head-sha>/check-runs`
+# against the same call for the base sha.
+#
+# Also worth evaluating at that point: a ruleset `workflows` rule pins a
+# required workflow to a repository and ref outside the pull request,
+# which is the purpose-built answer to "a PR must not be able to edit
+# its own gate" and composes with the ruleset already in place.
+#
+# --- Injection ---
+#
+# The body is read out of the event payload by the script rather than
+# interpolated into a shell command. A PR title or body is attacker
+# controlled on a fork, and `${{ github.event.pull_request.body }}` in a
+# `run:` block is a script injection.
+
+name: review-evidence
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  review-evidence:
+    name: adversarial review evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      # Fixtures for the checker itself, in-process and dependency-free.
+      # A gate whose parser has quietly stopped refusing things is worse
+      # than no gate, because it reads green.
+      - name: self-test the checker
+        run: python3 scripts/check-review-evidence.py --self-test
+
+      - name: check review evidence
+        run: |
+          set -uo pipefail
+          log="${RUNNER_TEMP}/review-evidence.log"
+          set +e
+          python3 scripts/check-review-evidence.py \
+            --event-path "${GITHUB_EVENT_PATH}" >"${log}" 2>&1
+          status=$?
+          set -e
+          cat "${log}"
+          {
+            echo '### Adversarial review evidence'
+            echo ''
+            echo '```'
+            cat "${log}"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+          if [ "${status}" -ne 0 ]; then
+            echo "::error::The pull request body carries no usable adversarial-review evidence. Add an '## Adversarial review' block with a Reviewer: line and a Findings: line; see the log above and the 'Code review' section of CLAUDE.md."
+          fi
+          exit "${status}"

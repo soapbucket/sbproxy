@@ -1,0 +1,102 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Admin reporting: who spent what, as a shareable link and a CSV.
+#
+# Two tenants, three governed keys, two models, and named human callers.
+# That is enough attribution for the admin API's reporting routes to
+# answer the question a finance thread actually asks: which person, on
+# which key, drove which model, and what did it cost.
+#
+# Three routes read the same in-memory ring, through one filter parser:
+#
+#   GET /api/requests          rows
+#   GET /api/requests/report   one row per composite group
+#   GET /api/requests/export   the same rows as CSV or JSONL
+#
+# A filter that selects rows on the first selects exactly the same rows
+# on the other two, so a grouped number always drills through to the
+# rows behind it, the unattributed group included. See
+# docs/admin-api-reference.md.
+#
+# README.md carries the whole walkthrough: the local OpenAI-shaped
+# fixture that stands in for the provider, the five calls that drive
+# attributed traffic through it, and the captured output of every
+# report, export, metric and audit record below. It is deliberately the
+# only copy of that fixture. A second copy here drifted from it, and a
+# reader who ran this file's version got totals that did not match a
+# single published number.
+
+proxy:
+  http_bind_port: 8080
+
+  admin:
+    enabled: true
+    bind: 127.0.0.1
+    port: 9090
+    username: admin
+    # Demo password for a loopback bind. Change before any other bind.
+    password: ${SB_ADMIN_PASSWORD:-demo-change-me}
+    # The reporting ring. Every report and export is bounded by this
+    # number, so it is also the ceiling on what one export can return.
+    max_log_entries: 1000
+
+  tenants:
+    - id: acme
+    - id: globex
+
+origins:
+  # Tenant one. The Host header picks the origin, and the origin
+  # stamps its tenant on every row the reporting routes group on.
+  "acme.ai.local":
+    tenant_id: acme
+    action:
+      type: ai_proxy
+      # Every request must present a governed key, so `api_key_id` is
+      # never empty and the by-key report has no `(unattributed)` row.
+      require_governed_key: true
+      routing: round_robin
+      providers:
+        - name: openai
+          provider_type: openai
+          # The fixture ignores the credential; the field exists because
+          # OpenAI-shaped provider configuration carries one. Against the
+          # real provider this would be ${OPENAI_API_KEY}.
+          api_key: ${FIXTURE_API_KEY:-fixture-local-token}
+          base_url: http://127.0.0.1:18086/v1
+          allow_private_base_url: true
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o
+            - gpt-4o-mini
+    credentials:
+      - name: acme-platform
+        type: ai_provider
+        provider: openai
+        key: ${ACME_PLATFORM_KEY:-vk-acme-platform}
+      - name: acme-research
+        type: ai_provider
+        provider: openai
+        key: ${ACME_RESEARCH_KEY:-vk-acme-research}
+
+  # Tenant two, same shape. Two tenants is what makes the `tenant`
+  # dimension worth grouping on rather than a constant column.
+  "globex.ai.local":
+    tenant_id: globex
+    action:
+      type: ai_proxy
+      require_governed_key: true
+      routing: round_robin
+      providers:
+        - name: openai
+          provider_type: openai
+          api_key: ${FIXTURE_API_KEY:-fixture-local-token}
+          base_url: http://127.0.0.1:18086/v1
+          allow_private_base_url: true
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o
+            - gpt-4o-mini
+    credentials:
+      - name: globex-platform
+        type: ai_provider
+        provider: openai
+        key: ${GLOBEX_PLATFORM_KEY:-vk-globex-platform}

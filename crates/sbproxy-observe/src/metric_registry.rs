@@ -507,6 +507,31 @@ pub const METRICS: &[MetricCapability] = &[
         description: "Current active connections.",
         dead_reason: None,
     },
+    // WOR-2578: the admin request-log export is the one route that
+    // returns the operational log in bulk, so its rate and its volume
+    // are what an operator alerts on for exfiltration.
+    MetricCapability {
+        name: "sbproxy_admin_request_export_rows_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_admin_request_export"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["format"],
+        description: "Rows written by admin request-log exports, by format.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_admin_request_exports_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_admin_request_export"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["format"],
+        description: "Admin request-log exports served, by format.",
+        dead_reason: None,
+    },
     MetricCapability {
         name: "sbproxy_agent_budget_decisions_total",
         kind: MetricKind::Counter,
@@ -1431,6 +1456,17 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["kind", "provider", "model", "surface", "project", "feature", "team", "agent_type", "environment"],
         description: "AI tokens classified as wasted, by waste class.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_audit_chain_read_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_audit_chain_read"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["channel", "outcome"],
+        description: "Audit-chain read attempts, by verification outcome (verified, broken, unreadable, denied).",
         dead_reason: None,
     },
     MetricCapability {
@@ -3288,6 +3324,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_request_body_drain_timeout_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_request_body_drain_timeout"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &[],
+        description: "Times the post-response drain of a client's request body hit its bound and the connection was closed with bytes unread.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_request_duration_seconds",
         kind: MetricKind::Histogram,
         writer: Writer::Field("request_duration"),
@@ -3411,11 +3458,13 @@ pub const METRICS: &[MetricCapability] = &[
     },
     // WOR-2565. Zalando rule 188: deprecated-API usage must be
     // monitored, because the whole point of announcing a deprecation
-    // is enumerating the callers who have not migrated yet. `rule`
+    // is enumerating the callers who have not migrated yet. `route`
     // names which announcement matched (forward-rule id or index,
-    // OpenAPI path template, or empty for a whole-origin block) and
+    // OpenAPI path template, or empty for a whole-origin block),
     // `past_sunset` separates stragglers still calling after the
-    // announced retirement instant.
+    // announced retirement instant, and `outcome` separates the ones
+    // still being served from the ones refused with 410, which
+    // `past_sunset` alone cannot do on a config running both postures.
     MetricCapability {
         name: "sbproxy_deprecated_requests_total",
         kind: MetricKind::Counter,
@@ -3423,8 +3472,8 @@ pub const METRICS: &[MetricCapability] = &[
         support: SupportLevel::Stable,
         compat: CompatTier::Beta,
         registry: Registry::Proxy,
-        labels: &["origin", "rule", "past_sunset"],
-        description: "Requests that resolved to a deprecated route.",
+        labels: &["origin", "route", "past_sunset", "outcome"],
+        description: "Requests that resolved to a deprecated route, by request Host, matched announcement, whether the hit landed after the announced sunset, and whether it was served or refused with 410.",
         dead_reason: None,
     },
     MetricCapability {
@@ -3512,7 +3561,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Proxy,
         labels: &["origin", "target"],
-        description: "Per-target tri-state health on LiteLLM's 0/1/2 scale: 0 healthy, 1 degraded (circuit breaker half-open), 2 excluded from selection (probe-unhealthy, outlier-ejected, or breaker open). Sampled at scrape time from the same pipeline walk that renders GET /api/health/targets.",
+        description: "Per-target tri-state health on LiteLLM's 0/1/2 scale: 0 healthy, 1 degraded (circuit breaker half-open), 2 excluded from selection (probe-unhealthy, outlier-ejected, or breaker open). Sampled at scrape time from the same pipeline walk that renders GET /api/health/targets. `origin` is the configured origin id, not the request Host. `target` is the configured target URL, or the load balancer's own url#index identifier when one origin configures that URL more than once.",
         dead_reason: None,
     },
     MetricCapability {
@@ -3682,7 +3731,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["reason", "direction", "tenant", "origin"],
-        description: "WebSocket upgrades refused or tunnels torn down by the gateway, by closed reason, direction, tenant, and origin.",
+        description: "WebSocket upgrades refused or tunnels torn down by the gateway, by closed reason, direction, tenant, and origin. Covers both upgrade surfaces: the `websocket` action and AI realtime.",
         dead_reason: None,
     },
 ];

@@ -1,6 +1,6 @@
 # Code review rubric
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-20*
 
 The checklist an automated reviewer runs against a branch before it
 becomes a PR, and the shape its output takes so the result can be pasted
@@ -339,16 +339,58 @@ it was last true.
 Findings first, ranked. Then a short "checked and sound" list so the
 absence of a finding is visible rather than ambiguous.
 
-```markdown
-### Review notes
+This output goes into the pull request body, where the `review-evidence`
+check parses it, so the shape below is the shape that check accepts.
+Test a draft before pasting it:
 
-**Blocker / Major / Minor** - `path/to/file.rs:LINE` - one-line claim.
-Failure scenario: concrete inputs or state, and what goes wrong.
+```bash
+python3 scripts/check-review-evidence.py --body-file /tmp/body.md
+```
+
+```markdown
+## Adversarial review
+
+Reviewer: <the agent, tool, or person that ran this rubric>
+Findings: 1 Blocker, 1 Major, 0 Minor
+Verification: <how the fixes were re-checked>
+
+- Blocker - `path/to/file.rs:LINE` - one-line claim. Failure scenario:
+  concrete inputs or state, and what goes wrong. Fixed in this branch.
+- Major - `path/to/other.rs:LINE` - one-line claim. Failure scenario:
+  what goes wrong. Not fixed here, and why.
 
 ### Checked and sound
 - Category: what was verified, in one line.
 ```
 
-Paste that into the PR body under a `## Review notes` heading. If a
-finding was accepted rather than fixed, say which and why, so the next
-reader does not rediscover it as new.
+One entry per finding, and one for every finding the `Findings:` counts
+declare. A list item leading with its severity is the short form; past
+about five findings, a table with a Severity column and a Disposition
+column reads better and the checker counts it the same way, reading that
+column for the disposition rather than the whole row. Group them
+under subheadings if that helps; `### Checked and sound` is exempt from
+the count.
+
+End each with a clause saying what happened to that finding. `Fixed`,
+`Addressed`, `Resolved`, `Mitigated`, `Reverted`, `Landed`,
+`Superseded`, `Accepted`, `Declined`, `Waived`, `Deferred`, `Filed`, and
+`Withdrawn` all count, as does any of them under `Not`, `Partly`,
+`Partially`, or `Already`, and so do `Not replicated`, `Not reproduced`,
+`Not applicable`, and `Not reachable`. Write the one that is true rather
+than the one that is shortest: "Not fixed here, the remedy is a separate
+change" tells the next reader more than "Accepted." does.
+
+The capital and the clause break are what separate a disposition from a
+description that happens to use the word, as in "the endpoint accepted a
+forged token". So front the qualifier, `Already fixed by #1177.` rather
+than `This was already fixed by #1177.`, and end the claim with a
+period, comma, semicolon, or colon before the disposition starts. The
+` - ` between a finding's severity, path, and claim is a field separator
+and does not open a clause.
+
+`Findings: none` is the form for a review that turned nothing up, and it
+needs no `Verification:` line. Everything else does, because a round
+that found something gets a second round on the fixes.
+
+A finding accepted rather than fixed says why on the same line, so the
+next reader does not rediscover it as new.

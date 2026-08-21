@@ -476,7 +476,7 @@ HTTP/3 is not served by this build. The `http3` shape is retained for forward co
 | `port` | int | 9090 | Listen port |
 | `username` | string | "admin" | Top-level admin HTTP Basic username |
 | `password` | string | "changeme" | Top-level admin HTTP Basic password. The default is rejected when the surface is reachable off loopback (see below) |
-| `max_log_entries` | int | 1000 | Recent-request log buffer size |
+| `max_log_entries` | int | 1000 | Recent-request log buffer size; the routing-decisions ring shares this cap |
 | `rate_limit_per_minute` | int | 240 | Admin API requests allowed per client IP per minute; the global cap across all clients is ten times this value. Valid range 1 to 100000; 0 is rejected because the limiter cannot be turned off |
 | `bind` | string | "127.0.0.1" | Bind address; set to `0.0.0.0` or an interface for remote admin. Must be an IP address literal; a value that does not parse is a validation error, not a silent fall back to loopback |
 | `allow_ips` | list | empty | IP / CIDR allowlist; empty keeps the loopback-only default (an empty list denies every non-loopback peer, it does not permit all) |
@@ -1519,7 +1519,7 @@ action:
 
 ### websocket
 
-Proxy WebSocket connections for real-time applications, chat systems, and streaming APIs. The action forwards the `Upgrade` request through the normal auth/policy/transform pipeline and then relays bytes transparently once the upstream answers `101`; it does not inspect frames after that point. See [websocket.md](websocket.md) for upgrade semantics and which of the two fields below are actually enforced today.
+Proxy WebSocket connections for real-time applications, chat systems, and streaming APIs. The action forwards the `Upgrade` request through the normal auth/policy/transform pipeline, and once the upstream answers `101` it relays bytes in both directions while parsing frame headers on the pipe: it never reads or buffers payload bytes, but it does enforce `max_message_size`, RFC 6455's 125-byte control-frame limit, and the `subprotocols` allowlist. See [websocket.md](websocket.md) for upgrade semantics and the exact enforcement points.
 
 ```yaml
 origins:
@@ -2536,8 +2536,8 @@ use for encrypted tokens: `RSA-OAEP` and `RSA-OAEP-256` key
 unwrap with an RSA private key, and `ECDH-ES` direct key
 agreement with a P-256 EC private key, all with `A256GCM`
 content encryption. Anything else, including the deprecated
-`RSA1_5`, is refused (debug-level logs name the offending
-algorithm).
+`RSA1_5`, is refused. The refusal is logged at `info`, which
+survives the release build, and names the offending algorithm.
 
 Failure handling is deliberately uniform: wrong key, garbage
 ciphertext, an unsupported algorithm, or a tampered tag all
@@ -2629,7 +2629,7 @@ origins:
 | `type` | string | required | Must be `hmac_auth`. |
 | `keys` | list | required | Accepted signing keys, at least one. Each entry needs a unique `key_id` (the RFC 9421 `keyid` the signer advertises) and a `secret`. Entries also accept the per-credential metadata fields (`project`, `user`, `team`, `tags`, `metadata`). |
 | `clock_skew_seconds` | int | 300 | Freshness window for the mandatory `created` signature parameter, applied in both directions. A `created` older than the window is refused as a replay; one further in the future is refused as skewed. |
-| `required_components` | list | `["@method", "@target-uri"]` | Components every accepted signature must cover. The default binds the verb and the path-and-query, so a captured signature cannot be replayed elsewhere. |
+| `required_components` | list | `["@method", "@target-uri"]` | Components every accepted signature must cover. The default binds the verb and the path-and-query, so a captured signature cannot be replayed against a different route. Add `content-digest` to bind the request body as well. |
 
 The `secret` resolves through the secret resolver like every other signing-key field: an inline literal, `${VAR}`, `env:NAME`, `file:PATH`, or a backend URI such as `vault://...`. A reference nothing can resolve refuses to boot rather than becoming the key. Verification failures answer `401` with a `WWW-Authenticate: Signature` challenge that carries no key material, and the failure reason is logged, never returned to the client.
 
@@ -2640,7 +2640,21 @@ Signature-Input: sig1=("@method" "@target-uri");created=1723800000;keyid="svc-bi
 Signature: sig1=:BASE64_HMAC_SHA256_OF_SIGNATURE_BASE:
 ```
 
-On a match the principal's `sub` is the `key_id`, `principal_kind` is `hmac_auth`, and the entry's metadata rides along for per-credential reporting. A signature that covers `content-digest` is checked against the request body available at the auth phase, which is empty, so body-covering signatures on body-bearing requests are refused rather than passed unverified; body-digest binding is a tracked follow-up. See [`examples/auth-hmac/`](../examples/auth-hmac/) for a complete working config with a signing script.
+On a match the principal's `sub` is the `key_id`, `principal_kind` is `hmac_auth`, and the entry's metadata rides along for per-credential reporting.
+
+The default components bind the verb and the route, not the body. A signature over `("@method" "@target-uri")` alone says nothing about the bytes that follow it, so a request captured off the wire can be replayed with a different body until its `created` timestamp falls outside `clock_skew_seconds`. Covering `content-digest` is what closes that:
+
+```text
+Content-Digest: sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:
+Signature-Input: sig1=("@method" "@target-uri" "content-digest");created=1723800000;keyid="svc-billing";alg="hmac-sha256"
+Signature: sig1=:BASE64_HMAC_SHA256_OF_SIGNATURE_BASE:
+```
+
+The check runs in two steps, because authentication happens before the proxy has read the body. The signature base binds the `Content-Digest` header value; the proxy then buffers the request body, hashes it, and answers `401` if the hash and the header disagree. Put `content-digest` in `required_components` to make that binding mandatory, and a signature that omits it is refused before the body is read.
+
+Buffering is what makes the second step possible, so a body-covering signature caps the request at the 8 MiB request-body buffer. A larger body answers `413`. Leave `content-digest` out of the covered components for routes that carry more than that, and accept that those routes are not body-bound.
+
+See [`examples/auth-hmac/`](../examples/auth-hmac/) for a complete working config with a signing script.
 
 ### forward_auth
 
@@ -2706,7 +2720,21 @@ Three behaviors are deliberate:
 - **Directory unreachable fails closed.** A dial failure, TLS failure, or timeout refuses the request with a `503`; wrong credentials get a `401`. An LDAP outage therefore reads as an outage, and requests are never admitted unchecked.
 - **Empty passwords are refused locally.** RFC 4513 defines a name-plus-empty-password simple bind as an *unauthenticated* bind, which many directories answer with success; the proxy refuses it without consulting the directory.
 
-Like `forward_auth`, and unlike the static-credential providers, this adds one network round-trip to the directory per request. Bind results are not cached: a cached bind would keep accepting a password the directory has already revoked or rotated. Budget `timeout_secs` for the directory's real latency.
+Like `forward_auth`, and unlike the static-credential providers, this dials out on the request hot path. That is a latency cost, and it is also an exposure: authentication runs before an origin's `policies:` are evaluated, so a `rate_limit` or `ddos` policy you write for the origin cannot cap what this provider dials. Without a bound of its own, anyone who can send an `Authorization: Basic` header drives one directory bind per HTTP request, which makes the gateway a 1:1 amplifier pointed at your directory and hands an attacker directory-side account lockout for any username they can guess.
+
+Three bounds run before the dial. None of them caches a success, so none extends a credential's life past a revocation or a password change:
+
+| Bound | Value | What it stops |
+|-------|-------|---------------|
+| Refused-credential cache | 30s | A credential the directory already refused is refused locally instead of dialing again. Keyed on a salted hash of the exact username and password, so it can match nothing else. |
+| Per-username failed-bind budget | 5 failures per 60s, then 1 bind per 12s | A username under password guessing drops from as fast as the attacker can send to the budget's rate. A successful bind clears it. Past the budget the directory is still consulted, just less often, so this slows guessing rather than stopping it. |
+| Outbound concurrency cap | 32 binds in flight | A burst cannot hold open an unbounded number of directory connections for `timeout_secs` each. Over the cap, requests are refused as unavailable. |
+
+Only a refusal the directory itself returned spends a budget. An empty password, which is refused locally without dialing, does not.
+
+The budget throttles, it does not block, and that is deliberate. A budget that blocked would let anyone who knows a username spend it with five wrong guesses and have every later request refused, the owner's correct password included, which trades an attack on your directory for an attack on your users. Past the budget a request waits for the next slot instead, and a throttled request answers `503`, not `401`: the proxy has not asked the directory and does not know whether the credential is good, so it does not claim the password was wrong.
+
+Two things these bounds do not do. An attacker who cycles through *distinct* usernames pays one bind per new name, because a per-username budget cannot see across names. And because the throttle still lets failures through at the budget's rate, a determined attacker can still drive a targeted username toward a directory-side lockout, just far more slowly. Neither is fixable here: both need a limit that runs before authentication, which today means a network-level or upstream rate limit in front of the origin. Budget `timeout_secs` for the directory's real latency.
 
 See [examples/auth-ldap/](../examples/auth-ldap/) for a runnable setup, including a local OpenLDAP fixture.
 
@@ -4814,6 +4842,8 @@ Threat protection guards against pathological JSON request bodies. When the requ
 
 The `body_threat_protection` *policy* ([api-security.md](api-security.md#structural-body-threat-limits)) is the successor surface for this job: it adds XML limits with a DTD refusal, returns a 400 naming the violated limit instead of a blanket 413, and has an observe-only `tap` mode. Prefer the policy for new configs; this origin-level block remains for existing ones.
 
+One knob does not carry over. The policy has no body-size limit of its own, so an origin that sets `json.max_total_size` here and then deletes this block for the policy silently widens its body cap to the proxy's 8 MiB buffering bound. Move the value to `request_limit.max_body_size` before removing `threat_protection:`.
+
 ```yaml
 origins:
   "api.example.com":
@@ -4835,7 +4865,7 @@ origins:
 | `json.max_keys` | int | unlimited | Maximum number of keys in any single object. |
 | `json.max_string_length` | int | unlimited | Maximum length of any single string value. |
 | `json.max_array_size` | int | unlimited | Maximum length of any single array. |
-| `json.max_total_size` | int | `8388608` | Maximum total body size in bytes, enforced while the body streams in and before parsing. A body past the cap is rejected with `413`, so proxy memory for the scan is bounded by the cap. Unset takes the proxy's 8 MiB buffering hard cap; the same bound applies to the body-validation buffer used by `request_validator`, `openapi_validation`, `content_digest`, and body-aware `prompt_injection_v2`. |
+| `json.max_total_size` | int | `8388608` | Maximum total body size in bytes, enforced while the body streams in and before parsing. A body past the cap is rejected with `413`, so proxy memory for the scan is bounded by the cap. Unset takes the proxy's 8 MiB buffering hard cap; the same bound applies to the body-validation buffer used by `request_validator`, `openapi_validation`, `content_digest`, `body_threat_protection`, and body-aware `prompt_injection_v2`. |
 
 ---
 
@@ -5001,7 +5031,7 @@ Announcing is half the job; the other half is finding who has not
 migrated. Every request that resolves to a deprecated route increments
 
 ```
-sbproxy_deprecated_requests_total{origin, rule, past_sunset}
+sbproxy_deprecated_requests_total{origin, route, past_sunset, outcome}
 ```
 
 where `rule` is the forward rule's `origin.id` (or its index), the

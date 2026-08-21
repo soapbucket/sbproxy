@@ -156,7 +156,7 @@ An origin's `action:` decides what serves the request, and forward rules can pic
 * **Content, validation, and DLP:** `request_validator`, `openapi_validation`, `body_threat_protection`, `waf`, `http_framing`, `sri`, `content_digest`, `page_shield`, `dlp`, `exposed_credentials`.
 * **AI-specific:** `ai_crawl_control`, `prompt_injection_v2`, `semantic_constraint`.
 * **Scripting-driven:** `expression` (CEL), `rego`, `assertion`.
-* **Packs:** `owasp_api_top10` is not a twenty-eighth type. The compiler expands it into entries from the groups above, backs off per item when you author the type yourself, and reports each of the ten items in a five-state manifest, including the ones it does not cover. Docs: [owasp-api-top10.md](owasp-api-top10.md).
+* **Packs:** `owasp_api_top10` is not a twenty-ninth type. The compiler expands it into entries from the groups above, backs off per item when you author the type yourself, and reports each of the ten items in a five-state manifest, including the ones it does not cover. Docs: [owasp-api-top10.md](owasp-api-top10.md).
 
 Authentication is a separate axis, configured on an origin's `auth:` block rather than in `policies:`: `api_key`, `basic_auth`, `bearer`, `jwt`, `digest`, `forward_auth`, `ldap_auth`, `oidc`, `bot_auth` (Web Bot Auth), and `cap`, plus mTLS client verification at the listener. The Authentication section above links the docs and examples.
 

@@ -563,6 +563,11 @@ fn built_in_auth_types_are_reserved_against_bundle_shadowing() {
     let reservations = reserved_builtin_hook_names();
     assert!(reservations.contains(&(BundleHookKind::Auth, "jwt".to_owned())));
     assert!(reservations.contains(&(BundleHookKind::Auth, "api_key".to_owned())));
+    // `ldap_auth` and its `ldap` alias were absent from the catalog
+    // the reservation set is built from, so neither name was reserved
+    // and a bundle could shadow a built-in auth hook.
+    assert!(reservations.contains(&(BundleHookKind::Auth, "ldap_auth".to_owned())));
+    assert!(reservations.contains(&(BundleHookKind::Auth, "ldap".to_owned())));
     assert!(!reservations.contains(&(BundleHookKind::Policy, "jwt".to_owned())));
 
     let yaml = replace_once(

@@ -1,6 +1,6 @@
 # Admin server
 
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-20*
 
 sbproxy has a built-in admin server: a small control-plane HTTP endpoint,
 separate from the data plane, for operating a running proxy. It exposes
@@ -33,7 +33,7 @@ proxy:
 | `enabled` | `false` | Turn the admin server on. |
 | `port` | `9090` | Port it binds. |
 | `username` / `password` | `admin` / `changeme` | The top-level admin's HTTP Basic credentials. Refused once the surface is reachable off loopback (see below). |
-| `max_log_entries` | `1000` | Size of the in-memory recent-request ring buffer. |
+| `max_log_entries` | `1000` | Size of the in-memory recent-request ring buffer, and of the routing-decisions ring that shares the cap. |
 | `rate_limit_per_minute` | `240` | Max admin API requests per client IP per minute; the global cap across all clients is ten times this value. Must be between 1 and 100000; cannot be disabled. |
 | `prompt_persistence_path` | unset | redb file that persists prompt-version edits across restarts. |
 | `tls` | unset | Serve HTTPS instead of plaintext (see [TLS](#tls)). |

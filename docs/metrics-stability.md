@@ -84,6 +84,8 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_acme_renewal_duration_seconds` | Histogram | `stable` | `beta` | `result` | ACME renewal full-flow duration, by outcome. |
 | `sbproxy_acme_renewals_total` | Counter | `stable` | `beta` | `result` | ACME certificate renewal attempts, by outcome. |
 | `sbproxy_active_connections` | Gauge | `stable` | `stable` | none | Current active connections. |
+| `sbproxy_admin_request_export_rows_total` | Counter | `stable` | `beta` | `format` | Rows written by admin request-log exports, by format. |
+| `sbproxy_admin_request_exports_total` | Counter | `stable` | `beta` | `format` | Admin request-log exports served, by format. |
 | `sbproxy_agent_budget_decisions_total` | Counter | `stable` | `beta` | `agent_id`, `outcome` | agent_budget policy verdicts, labeled by agent and outcome. |
 | `sbproxy_agent_detect_inference_seconds` | Histogram | `stable` | `stable` | none | Agent-detect scorer inference latency in seconds. |
 | `sbproxy_agent_detect_score` | Histogram | `stable` | `stable` | none | Agent-detect scorer output score, scaled 0-100. |
@@ -163,6 +165,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_ai_usage_parse_miss_total` | Counter | `stable` | `beta` | `provider`, `surface` | 2xx AI responses on a token surface that carried no parseable usage block (budget debited from an estimate). |
 | `sbproxy_ai_wasted_cost_dollars_total` | Counter | `stable` | `beta` | `kind`, `provider`, `model`, `surface`, `project`, `feature`, `team`, `agent_type`, `environment` | Estimated USD cost of AI spend classified as wasted. |
 | `sbproxy_ai_wasted_tokens_total` | Counter | `stable` | `beta` | `kind`, `provider`, `model`, `surface`, `project`, `feature`, `team`, `agent_type`, `environment` | AI tokens classified as wasted, by waste class. |
+| `sbproxy_audit_chain_read_total` | Counter | `stable` | `beta` | `channel`, `outcome` | Audit-chain read attempts, by verification outcome (verified, broken, unreadable, denied). |
 | `sbproxy_audit_emit_duration_seconds` | Histogram | `stable` | `beta` | `channel`, `outcome` | Wall-clock latency of one audit-channel emission. |
 | `sbproxy_audit_write_failures_total` | Counter | `stable` | `beta` | `channel` | Audit emissions that did not reach a sink they were promised, by audit channel; healthy systems read 0. |
 | `sbproxy_auth_results_total` | Counter | `stable` | `stable` | `origin`, `auth_type`, `result` | Auth check results. |
@@ -322,6 +325,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_redis_kv_connections_total` | Counter | `stable` | `beta` | `result` | Redis KV connection attempts by result. |
 | `sbproxy_redis_kv_operation_duration_seconds` | Histogram | `stable` | `beta` | `operation` | Redis KV operation duration in seconds. |
 | `sbproxy_redis_kv_operation_errors_total` | Counter | `stable` | `beta` | `operation`, `reason` | Redis KV operation failures by operation and reason. |
+| `sbproxy_request_body_drain_timeout_total` | Counter | `stable` | `beta` | none | Times the post-response drain of a client's request body hit its bound and the connection was closed with bytes unread. |
 | `sbproxy_request_duration_seconds` | Histogram | `stable` | `stable` | `hostname` | Request latency. |
 | `sbproxy_requests_total` | Counter | `stable` | `stable` | `hostname`, `method`, `status`, `agent_id`, `agent_class`, `agent_vendor`, `payment_rail`, `content_shape` | Total HTTP requests. |
 | `sbproxy_response_body_bytes` | Histogram | `stable` | `beta` | `direction` | Response body size, by compression direction. |
@@ -332,13 +336,13 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_decision_event_total` | Counter | `stable` | `alpha` | `event`, `engine`, `outcome`, `origin`, `tenant` | Decision events by pipeline point, engine, and outcome. |
 | `sbproxy_decision_event_duration_seconds` | Histogram | `stable` | `alpha` | `event`, `engine`, `origin` | Decision event evaluation latency. |
 | `sbproxy_decision_event_fail_open_total` | Counter | `stable` | `alpha` | `event`, `engine`, `origin`, `tenant` | Decision events that proceeded without the decision being made. |
-| `sbproxy_deprecated_requests_total` | Counter | `stable` | `beta` | `origin`, `rule`, `past_sunset` | Requests that resolved to a deprecated route. |
+| `sbproxy_deprecated_requests_total` | Counter | `stable` | `beta` | `origin`, `route`, `past_sunset`, `outcome` | Requests that resolved to a deprecated route, by request Host, matched announcement, whether the hit landed after the announced sunset, and whether it was served or refused with 410. |
 | `sbproxy_semantic_cache_results_total` | Counter | `stable` | `beta` | `tenant`, `origin`, `source`, `result` | Semantic-cache hit/miss/error counts. |
 | `sbproxy_serve_lane_admissions_total` | Counter | `config_only` (nothing emits this yet) | `alpha` | `priority`, `decision` | Served-lane admission gate decisions by priority lane. |
 | `sbproxy_silent_degradations_total` | Counter | `config_only` (nothing emits this yet) | `alpha` | `op` | Best-effort operations that failed and were previously dropped silently, by op. |
 | `sbproxy_sink_install_failures_total` | Counter | `stable` | `beta` | none | Failed installs of the process-wide telemetry sink dispatcher. |
 | `sbproxy_synthetic_probe_failures_total` | Counter | `stable` | `beta` | `reason` | Synthetic readiness probe failures by reason. |
-| `sbproxy_target_health_state` | Gauge | `stable` | `beta` | `origin`, `target` | Per-target tri-state health on LiteLLM's 0/1/2 scale: 0 healthy, 1 degraded (circuit breaker half-open), 2 excluded from selection (probe-unhealthy, outlier-ejected, or breaker open). Sampled at scrape time from the same pipeline walk that renders GET /api/health/targets. |
+| `sbproxy_target_health_state` | Gauge | `stable` | `beta` | `origin`, `target` | Per-target tri-state health on LiteLLM's 0/1/2 scale: 0 healthy, 1 degraded (circuit breaker half-open), 2 excluded from selection (probe-unhealthy, outlier-ejected, or breaker open). Sampled at scrape time from the same pipeline walk that renders GET /api/health/targets. `origin` is the configured origin id, not the request Host. `target` is the configured target URL, or the load balancer's own url#index identifier when one origin configures that URL more than once. |
 | `sbproxy_telemetry_dropped_total` | Counter | `stable` | `beta` | `kind`, `reason` | Telemetry records dropped or sinks that failed to set up, by kind and reason. |
 | `sbproxy_tokens_attributed_total` | Counter | `stable` | `beta` | `project`, `user`, `tag`, `direction` | AI token usage attributed to a credential's project / user / tag. |
 | `sbproxy_transport_duration_seconds` | Histogram | `config_only` (nothing emits this yet) | `alpha` | `protocol`, `result` | Transport-layer request duration, by protocol and outcome. |
@@ -352,4 +356,4 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_usage_bridge_enqueued_total` | Counter | `stable` | `beta` | `tenant_id`, `reporter`, `resource_type`, `result` | Billable units the request path queued for a usage reporter, by tenant, reporter, resource type, and whether the row was new. |
 | `sbproxy_usage_bridge_gap_total` | Counter | `stable` | `beta` | `tenant_id`, `failure_mode` | Billable units that could not be queued for a usage reporter, by tenant and the posture in force. |
 | `sbproxy_waf_persistent_blocks_total` | Counter | `stable` | `beta` | `origin`, `tenant`, `event`, `key_kind` | WAF persistent (time-boxed) block actions, by lifecycle event and key kind. |
-| `sbproxy_websocket_teardowns_total` | Counter | `stable` | `beta` | `reason`, `direction`, `tenant`, `origin` | WebSocket upgrades refused or tunnels torn down by the gateway, by closed reason, direction, tenant, and origin. |
+| `sbproxy_websocket_teardowns_total` | Counter | `stable` | `beta` | `reason`, `direction`, `tenant`, `origin` | WebSocket upgrades refused or tunnels torn down by the gateway, by closed reason, direction, tenant, and origin. Covers both upgrade surfaces: the `websocket` action and AI realtime. |
