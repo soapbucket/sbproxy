@@ -1182,15 +1182,13 @@ fn signature_verification_request_carries_the_listener_scheme() {
         ))
         .body(bytes::Bytes::new())
         .unwrap();
-    let entry = sbproxy_middleware::signatures::parse_signature_input(
-        r#"sig1=("@target-uri");keyid="k""#,
-    )
-    .unwrap()
-    .pop()
-    .unwrap()
-    .1;
-    let base =
-        sbproxy_middleware::signatures::build_signature_base(&req, &entry).unwrap();
+    let entry =
+        sbproxy_middleware::signatures::parse_signature_input(r#"sig1=("@target-uri");keyid="k""#)
+            .unwrap()
+            .pop()
+            .unwrap()
+            .1;
+    let base = sbproxy_middleware::signatures::build_signature_base(&req, &entry).unwrap();
     assert!(
         base.starts_with("\"@target-uri\": https://api.example.com/v1/orders?page=2\n"),
         "got: {base}"

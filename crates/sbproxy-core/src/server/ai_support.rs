@@ -1924,16 +1924,12 @@ pub(super) fn absolute_request_uri(
     if uri.scheme().is_some() {
         return uri.clone();
     }
-    let Some(authority) = uri
-        .authority()
-        .map(|a| a.as_str().to_string())
-        .or_else(|| {
-            headers
-                .get(http::header::HOST)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string)
-        })
-    else {
+    let Some(authority) = uri.authority().map(|a| a.as_str().to_string()).or_else(|| {
+        headers
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    }) else {
         return uri.clone();
     };
     let path_and_query = uri
