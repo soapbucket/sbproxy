@@ -2221,6 +2221,38 @@ pub fn record_key_operation(operation: &'static str, outcome: &'static str) {
     }
 }
 
+/// Count one shared-cache-tier invalidation that did not propagate, on
+/// `sbproxy_key_cache_invalidation_failures_total{scope}`.
+///
+/// `scope` is `key` (one id) or `all` (the whole tier). Both mean the
+/// same thing to an operator: the store write landed and the shared L2
+/// did not hear about it, so every other replica keeps answering with the
+/// record that was just changed until its TTL lapses. On a revoke that is
+/// a credential that stays accepted fleet-wide, which is why this is a
+/// counter of its own rather than a label on the lookup family: a
+/// failed lookup is a cache miss the store covers for, and this is not.
+///
+/// There is deliberately no `ok` counterpart. The question an alert asks
+/// here is "did any invalidation fail", not "what fraction", and a
+/// success series on a path that runs once per admin mutation buys
+/// nothing a `sbproxy_key_operations_total` rate does not already give.
+pub fn record_key_cache_invalidation_failure(scope: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_key_cache_invalidation_failures_total",
+            "Keystore cache-tier invalidations that did not reach the shared tier or its peers, by scope (key or all)",
+            &["scope"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        counter.with_label_values(&[scope]).inc();
+    }
+}
+
 /// Observe one bound-credential resolution on
 /// `sbproxy_credential_resolution_duration_seconds{cache, outcome}`
 /// (WOR-2572).

@@ -28,7 +28,15 @@
 //! change takes effect on the next request without a reload. Responses never
 //! carry a hash, an envelope, or plaintext (apart from the one-time minted
 //! token on create).
+//!
+//! When that invalidation cannot reach the shared cache tier, the mutation
+//! still landed but the rest of the fleet has not heard about it. The 2xx
+//! response then carries a `cache_propagation` object saying so, and
+//! `sbproxy_key_cache_invalidation_failures_total` counts it. Reporting a
+//! clean revoke while every peer keeps accepting the key is the failure this
+//! exists to prevent.
 
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -44,9 +52,73 @@ use sbproxy_keystore::KeyPolicyCasResult;
 
 type Resp = (u16, &'static str, String);
 
+thread_local! {
+    /// Set by [`invalidate`] when a cache-tier invalidation did not
+    /// propagate; drained by [`dispatch`] into the response body.
+    ///
+    /// A thread-local rather than a return value because twelve handlers
+    /// call `invalidate` and each builds its own response. Threading a
+    /// `Result` through all of them puts the reporting back in the hands
+    /// of whichever handler someone writes next, which is exactly how the
+    /// failure went unreported in the first place; folding it in at the
+    /// one dispatch seam covers every route in this module, including the
+    /// ones that do not exist yet.
+    ///
+    /// Same-thread by construction: `dispatch` is synchronous and
+    /// `block_on_keystore` runs its future on a scoped thread it joins
+    /// before returning, so nothing here crosses a thread or an await.
+    static PROPAGATION_FAILURE: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
 /// Route entry point. Returns `Some(response)` for paths this module owns and
 /// `None` so the caller can fall through to the rest of the admin dispatcher.
 pub fn dispatch(method: &str, path: &str, body: Option<&str>) -> Option<Resp> {
+    // Cleared on the way in as well as drained on the way out: another
+    // admin surface on this thread (`admin_cache`'s evict routes) also
+    // invalidates, and a leftover flag would attach its failure to the
+    // next unrelated key mutation.
+    PROPAGATION_FAILURE.with(|slot| *slot.borrow_mut() = None);
+    let resp = route(method, path, body)?;
+    Some(with_propagation_warning(resp))
+}
+
+/// Fold a failed cache-tier invalidation into an otherwise successful
+/// response.
+///
+/// Not a 5xx: the store write landed, and telling the operator the revoke
+/// failed when it did not would send them to re-run a mutation that is
+/// already applied. What is true is narrower. The record changed here and
+/// the shared tier was not told, so peer replicas keep answering with the
+/// previous record until their TTL lapses. The body says that; the counter
+/// makes it alertable without anyone parsing response bodies.
+fn with_propagation_warning(resp: Resp) -> Resp {
+    let Some(detail) = PROPAGATION_FAILURE.with(|slot| slot.borrow_mut().take()) else {
+        return resp;
+    };
+    let (status, content_type, body) = resp;
+    if !(200..300).contains(&status) {
+        return (status, content_type, body);
+    }
+    let Ok(serde_json::Value::Object(mut map)) = serde_json::from_str::<serde_json::Value>(&body)
+    else {
+        return (status, content_type, body);
+    };
+    map.insert(
+        "cache_propagation".to_string(),
+        json!({
+            "status": "failed",
+            "detail": detail,
+            "effect": "other replicas may serve the previous record until their cache TTL lapses",
+        }),
+    );
+    (
+        status,
+        content_type,
+        serde_json::Value::Object(map).to_string(),
+    )
+}
+
+fn route(method: &str, path: &str, body: Option<&str>) -> Option<Resp> {
     if path == "/admin/keys" {
         return Some(if method.eq_ignore_ascii_case("GET") {
             list_keys()
@@ -2243,7 +2315,23 @@ fn store_credential(plane: &KeyPlane, rec: CredentialRecord) -> Result<(), Strin
 fn invalidate(plane: &KeyPlane, id: &str) {
     let cache = plane.cache().clone();
     let owned = id.to_string();
-    block_on_keystore(async move { cache.invalidate(&owned).await });
+    if let Err(error) = block_on_keystore(async move { cache.invalidate(&owned).await }) {
+        // L1 was dropped regardless; what failed is the shared tier and the
+        // announcement to peers. Recorded on three surfaces because each
+        // answers a different question: the log for the operator reading
+        // this replica, the counter for the alert, and the slot for the
+        // response body so the caller who asked for the revoke is told.
+        tracing::warn!(
+            key_id = %id,
+            %error,
+            "keystore cache-tier invalidation did not propagate; peer replicas will \
+             serve the previous record until their cache TTL lapses"
+        );
+        sbproxy_observe::metrics::record_key_cache_invalidation_failure("key");
+        PROPAGATION_FAILURE.with(|slot| {
+            *slot.borrow_mut() = Some(format!("{error:#}"));
+        });
+    }
     // A credential's resolved secret is cached separately from its record, so
     // a rotation has to drop both on the same signal or the old secret keeps
     // going upstream until the TTL lapses.

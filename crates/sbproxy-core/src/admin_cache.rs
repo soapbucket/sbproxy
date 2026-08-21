@@ -169,19 +169,47 @@ fn key_policy_evict(body: Option<&str>) -> Resp {
     match parsed.get("id").and_then(|v| v.as_str()) {
         Some(id) => {
             let owned = id.to_string();
-            crate::key_plane::block_on_keystore(async move { cache.invalidate(&owned).await });
-            (
-                200,
-                "application/json",
-                json!({ "evicted": id }).to_string(),
-            )
+            let outcome =
+                crate::key_plane::block_on_keystore(async move { cache.invalidate(&owned).await });
+            evict_response(json!({ "evicted": id }), outcome, "key")
         }
         None => {
-            crate::key_plane::block_on_keystore(async move { cache.invalidate_all().await });
+            let outcome =
+                crate::key_plane::block_on_keystore(async move { cache.invalidate_all().await });
+            evict_response(json!({ "evicted": "all" }), outcome, "all")
+        }
+    }
+}
+
+/// Turn an eviction outcome into a response.
+///
+/// An eviction that could not reach the shared tier is a 502, not a 200.
+/// Unlike a key mutation, nothing else about this request landed: the whole
+/// operation is "make the shared tier forget this", and an operator who
+/// called it because a key was leaked needs to know it did not happen rather
+/// than read a success and move on.
+fn evict_response(
+    body: serde_json::Value,
+    outcome: anyhow::Result<()>,
+    scope: &'static str,
+) -> Resp {
+    match outcome {
+        Ok(()) => (200, "application/json", body.to_string()),
+        Err(error) => {
+            tracing::warn!(
+                %scope,
+                %error,
+                "admin cache eviction did not reach the shared keystore cache tier"
+            );
+            sbproxy_observe::metrics::record_key_cache_invalidation_failure(scope);
             (
-                200,
+                502,
                 "application/json",
-                json!({ "evicted": "all" }).to_string(),
+                json!({
+                    "error": format!("eviction did not reach the shared cache tier: {error:#}"),
+                    "local_cache_cleared": true,
+                })
+                .to_string(),
             )
         }
     }

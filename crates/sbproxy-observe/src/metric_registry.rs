@@ -2189,6 +2189,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_key_cache_invalidation_failures_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_key_cache_invalidation_failure"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        registry: Registry::Default,
+        labels: &["scope"],
+        description: "Keystore cache-tier invalidations that did not reach the shared tier or its peers, by scope (key or all).",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_key_lookup_cache_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_key_lookup_cache"),

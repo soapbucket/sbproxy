@@ -362,12 +362,34 @@ impl CacheTier for RedisCacheTier {
         }
     }
 
-    async fn invalidate(&self, id: &str) {
-        if let Ok(mut c) = self.link.conn().await {
-            let _: Result<i64, _> = c.del(format!("{CACHE_KEY_PREFIX}{id}")).await;
-            let _: Result<i64, _> = c.del(format!("{CACHE_CRED_PREFIX}{id}")).await;
-            let _: Result<i64, _> = c.publish(INVALIDATE_CHANNEL, id).await;
-        }
+    /// Delete both of this id's shared entries and announce the drop.
+    ///
+    /// Every step is checked and the first failure is returned. This is the
+    /// revocation path: a `del` that did not run leaves the shared L2 still
+    /// answering with the revoked record, and a `publish` that did not go
+    /// out leaves every peer's L1 holding it. Neither is a cache miss the
+    /// store can cover for, which is why this is the one part of the tier
+    /// that does not swallow its errors.
+    async fn invalidate(&self, id: &str) -> Result<()> {
+        // `conn()` already names the redacted DSN in its own error.
+        let mut c = self
+            .link
+            .conn()
+            .await
+            .context("reach the shared cache tier to invalidate an id")?;
+        let _: i64 = c
+            .del(format!("{CACHE_KEY_PREFIX}{id}"))
+            .await
+            .context("delete the shared key-cache entry")?;
+        let _: i64 = c
+            .del(format!("{CACHE_CRED_PREFIX}{id}"))
+            .await
+            .context("delete the shared credential-cache entry")?;
+        let _: i64 = c
+            .publish(INVALIDATE_CHANNEL, id)
+            .await
+            .context("announce the invalidation to peer replicas")?;
+        Ok(())
     }
 
     /// Delete every entry this tier owns, then announce the drop to peers.
@@ -383,14 +405,21 @@ impl CacheTier for RedisCacheTier {
     /// gives no snapshot guarantee: an entry written after the cursor passed
     /// its slot survives, which is correct, since it was written after the
     /// invalidation and describes a later state.
-    async fn invalidate_all(&self) {
-        let Ok(mut c) = self.link.conn().await else {
-            return;
-        };
+    async fn invalidate_all(&self) -> Result<()> {
+        let mut c = self
+            .link
+            .conn()
+            .await
+            .context("reach the shared cache tier to purge it")?;
         let pattern = format!("{CACHE_PREFIX}*");
         let mut cursor: u64 = 0;
+        // A partial purge is still worth announcing, so a failure mid-scan
+        // is carried past the publish rather than returned from inside the
+        // loop: peers drop their L1 copies either way, and the caller still
+        // learns the shared tier was not fully cleared.
+        let mut scan_failure: Option<anyhow::Error> = None;
         loop {
-            let scanned: Result<(u64, Vec<String>), _> = redis::cmd("SCAN")
+            let scanned: std::result::Result<(u64, Vec<String>), _> = redis::cmd("SCAN")
                 .arg(cursor)
                 .arg("MATCH")
                 .arg(&pattern)
@@ -398,21 +427,37 @@ impl CacheTier for RedisCacheTier {
                 .arg(CACHE_SCAN_COUNT)
                 .query_async(&mut c)
                 .await;
-            let Ok((next, keys)) = scanned else {
-                // Best effort, like every other method on this tier: the
-                // publish below still reaches peers, and the store stays
-                // the source of truth.
-                break;
+            let (next, keys) = match scanned {
+                Ok(page) => page,
+                Err(error) => {
+                    scan_failure =
+                        Some(anyhow::Error::new(error).context("scan the shared cache prefix"));
+                    break;
+                }
             };
             if !keys.is_empty() {
-                let _: Result<i64, _> = c.del(keys).await;
+                let deleted: std::result::Result<i64, _> = c.del(keys).await;
+                if let Err(error) = deleted {
+                    scan_failure = Some(
+                        anyhow::Error::new(error).context("delete a page of shared cache entries"),
+                    );
+                    break;
+                }
             }
             if next == 0 {
                 break;
             }
             cursor = next;
         }
-        let _: Result<i64, _> = c.publish(INVALIDATE_CHANNEL, INVALIDATE_ALL).await;
+        let published: std::result::Result<i64, _> =
+            c.publish(INVALIDATE_CHANNEL, INVALIDATE_ALL).await;
+        match (scan_failure, published) {
+            (Some(error), _) => Err(error),
+            (None, Err(error)) => {
+                Err(anyhow::Error::new(error).context("announce the cache purge to peer replicas"))
+            }
+            (None, Ok(_)) => Ok(()),
+        }
     }
 }
 
@@ -643,11 +688,13 @@ mod tests {
             None
         }
         async fn put_credential(&self, _: &CredentialRecord, _: Duration) {}
-        async fn invalidate(&self, _: &str) {
+        async fn invalidate(&self, _: &str) -> Result<()> {
             self.record();
+            Ok(())
         }
-        async fn invalidate_all(&self) {
+        async fn invalidate_all(&self) -> Result<()> {
             self.record();
+            Ok(())
         }
     }
 
@@ -799,7 +846,9 @@ mod tests {
         let cached = KeyRecord::new("tier-test", "h", ts());
         tier.put_key(&cached, Duration::from_secs(30)).await;
         assert!(tier.get_key("tier-test").await.is_some());
-        tier.invalidate("tier-test").await;
+        tier.invalidate("tier-test")
+            .await
+            .expect("live redis invalidate");
         assert!(tier.get_key("tier-test").await.is_none());
 
         // Touch the unused config import so the test file exercises it.
