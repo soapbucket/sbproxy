@@ -107,7 +107,7 @@ pub struct CatalogDataPosture {
     ///
     /// Informational, and deliberately not an input to the routing
     /// eligibility filter: it says an arrangement is available to go
-    /// and sign, not that this deployment holds one. Four catalog
+    /// and sign, not that this deployment holds one. Five catalog
     /// entries offer one and retain by default, so treating this flag
     /// as a held posture would let `require_zdr` route to a stock
     /// retaining account. Declaring that a specific deployment
@@ -474,19 +474,20 @@ mod tests {
     ///
     /// These assertions read `>= 43` until WOR-2627. A floor is true of
     /// every count above it, so the suite agreed with the catalog at 43,
-    /// at 72, and with `MIGRATION.md`'s claim of "90+" at the same time,
+    /// at 70, and with `MIGRATION.md`'s claim of "90+" at the same time,
     /// and none of the three could be wrong as far as any test here was
     /// concerned. `scripts/check-doc-drift.sh` derives the same number
     /// from the YAML and holds the prose to it, so a provider added
     /// without updating this constant fails here, and one added without
     /// updating the docs fails there.
-    const CATALOG_PROVIDERS: usize = 72;
+    const CATALOG_PROVIDERS: usize = 70;
 
     /// Wire-format split of the catalog, as `docs/providers.md`,
-    /// `docs/features.md`, and `docs/ai-gateway.md` all publish it: 66
+    /// `docs/features.md`, and `docs/ai-gateway.md` all publish it: 63
     /// OpenAI-format passthroughs, three in-tree translators (Anthropic,
-    /// Gemini, Bedrock), three custom-format entries.
-    const CATALOG_FORMAT_SPLIT: (usize, usize, usize, usize, usize) = (66, 1, 1, 1, 3);
+    /// Gemini, Bedrock), four custom-format entries (SageMaker, Oracle,
+    /// Watsonx, Writer).
+    const CATALOG_FORMAT_SPLIT: (usize, usize, usize, usize, usize) = (63, 1, 1, 1, 4);
 
     /// The checked-in plain-text catalog.
     ///
@@ -689,22 +690,35 @@ mod tests {
     #[test]
     fn declared_catalog_postures_parse_into_provider_info() {
         // Vendors whose published terms declare no prompt storage.
-        let bedrock = get_provider_info("bedrock").unwrap();
-        assert!(!bedrock.data_posture.retains_data);
-        assert!(bedrock.data_posture.zdr_available);
+        for name in ["perplexity", "cerebras"] {
+            let info = get_provider_info(name).unwrap();
+            assert!(
+                !info.data_posture.retains_data,
+                "{name} publishes no-retention terms"
+            );
+            assert!(info.data_posture.zdr_available, "{name} is zero-retention");
+        }
 
         // Vendors that retain by default but offer a ZDR arrangement.
         // Offering one is not holding one: these entries stay outside a
         // `require_zdr` candidate set until an operator declares the
         // agreement on their own provider entry.
-        for name in ["openai", "anthropic", "azure", "vertex"] {
+        //
+        // Bedrock belongs here rather than above: AWS calls zero data
+        // retention the platform default, but its abuse-detection page
+        // carves out named models whose classifier-flagged traffic is
+        // retained up to 30 days with no opt-in, and the model name
+        // passes straight through from the caller.
+        for name in ["openai", "anthropic", "azure", "bedrock", "vertex"] {
             let info = get_provider_info(name).unwrap();
             assert!(info.data_posture.retains_data, "{name} retains by default");
             assert!(info.data_posture.zdr_available, "{name} offers ZDR");
         }
 
         // Local engines keep the prompt on the operator's own host.
-        for name in ["ollama", "vllm", "tgi", "lmstudio", "llamacpp"] {
+        for name in [
+            "ollama", "vllm", "sglang", "localai", "tgi", "lmstudio", "llamacpp",
+        ] {
             let info = get_provider_info(name).unwrap();
             assert!(!info.data_posture.retains_data, "{name} is local");
             assert!(info.data_posture.zdr_available, "{name} is local");

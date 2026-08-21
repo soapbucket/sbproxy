@@ -1,5 +1,5 @@
 # SBproxy Features Hub
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 SBproxy is a high-performance reverse proxy and AI gateway built on Cloudflare's Pingora framework. It unifies traditional API proxying, AI model routing, Agent-to-Agent (A2A) communication, Model Context Protocol (MCP) tool integration, and Agent-specific workflows into a single binary.
 
@@ -45,7 +45,7 @@ Dynamically emit OpenAPI specs for your routes, and validate incoming traffic ag
 
 ## 2. AI: Advanced Model Gateway
 
-The `ai_proxy` action turns SBproxy into an OpenAI-compatible API gateway routing requests across a 72-provider catalog (66 entries speak the OpenAI wire shape; Anthropic, Gemini, and Bedrock get in-tree protocol translation; 3 are custom-shape entries) and over 200 models.
+The `ai_proxy` action turns SBproxy into an OpenAI-compatible API gateway routing requests across a 70-provider catalog (63 entries speak the OpenAI wire shape; Anthropic, Gemini, and Bedrock get in-tree protocol translation; 4 are custom-shape entries) and over 200 models.
 
 ### Provider Integration & Model Routing
 Send standard chat completion requests to the proxy, and it routes them based on the model name. You can configure multiple providers and utilize fallback chains to ensure high availability.
@@ -143,7 +143,7 @@ An origin's `action:` decides what serves the request, and forward rules can pic
 * **`grpc`** passes gRPC through on HTTP/2 for every RPC cardinality, unary through bidirectional streaming, with opt-in gRPC-Web translation for browser clients and descriptor-driven REST-to-gRPC transcoding routes. Both translation modes are unary or server-streaming only, and a body-reading policy on the origin stalls streaming calls. Docs: [routing.md](routing.md#grpc-limits).
 * **`graphql`** proxies GraphQL with a query-depth cap, an introspection toggle, and optional query validation before anything reaches the upstream. Docs: [routing.md](routing.md).
 * **`storage`** serves objects from S3, Google Cloud Storage, Azure Blob, or a local directory. Example: [Storage Action](../examples/storage-action/).
-* **`ai_proxy`** is the AI gateway in one action: the OpenAI-compatible surface, the 72-provider catalog, model aliases, LLM-aware routing, guardrails, budgets, semantic caching, and local model hosting. Section 2 above tours it; [ai-gateway.md](ai-gateway.md) is the reference.
+* **`ai_proxy`** is the AI gateway in one action: the OpenAI-compatible surface, the 70-provider catalog, model aliases, LLM-aware routing, guardrails, budgets, semantic caching, and local model hosting. Section 2 above tours it; [ai-gateway.md](ai-gateway.md) is the reference.
 * **`mcp`** is the MCP gateway: federates real MCP servers, OpenAPI-derived tools, and config-defined local tools behind one endpoint, with RBAC, tool versioning, quotas, and content filters. Section 3 above tours it; [mcp.md](mcp.md) and [mcp-compose.md](mcp-compose.md) are the references.
 * **`a2a`** proxies agent-to-agent JSON-RPC with envelope trust rules, delegation-depth caps, cycle detection, and caller and callee lists. Docs: [a2a-gateway.md](a2a-gateway.md).
 

@@ -1,10 +1,10 @@
 # Taking SBproxy on-call: metrics, logs, and your first incident
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 ![Terminal recording: traffic flows through three origins, a dead upstream returns 502, the fallback origin serves a degraded 200, and the failure shows up in /metrics and the JSON access log](assets/use-case-production-ops.gif)
 
-The gateway works on your laptop, and now someone wants it in production, which means someone (probably you) gets paged when it misbehaves at 3am. Before that page fires you want to know what the process exposes: which numbers move when an upstream dies, where the log line for a failed request lands, and what the gateway does on its own while you are still finding your glasses. SBproxy's pitch is "Call any model. Serve your own. Govern both.", and the operational half of that promise is that the same Apache-2.0 binary that routes to 72 providers or serves weights on your own GPUs also ships the metrics endpoint, the structured access log, the health probes, and the self-healing behavior this page walks through. Everything an on-call shift needs was already in the process you deployed; this page is about learning where it all is before the pager teaches you.
+The gateway works on your laptop, and now someone wants it in production, which means someone (probably you) gets paged when it misbehaves at 3am. Before that page fires you want to know what the process exposes: which numbers move when an upstream dies, where the log line for a failed request lands, and what the gateway does on its own while you are still finding your glasses. SBproxy's pitch is "Call any model. Serve your own. Govern both.", and the operational half of that promise is that the same Apache-2.0 binary that routes to 70 providers or serves weights on your own GPUs also ships the metrics endpoint, the structured access log, the health probes, and the self-healing behavior this page walks through. Everything an on-call shift needs was already in the process you deployed; this page is about learning where it all is before the pager teaches you.
 
 ## What you will build
 

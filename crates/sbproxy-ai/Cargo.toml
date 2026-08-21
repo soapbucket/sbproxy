@@ -40,6 +40,12 @@ sbproxy-classifier-client.workspace = true
 # metering crate now, generic over the payload. sbproxy-meter has no workspace
 # dependencies at all, so this stays acyclic by construction.
 sbproxy-meter.workspace = true
+# WOR-2648: `SecretString` for the AWS access key, secret key, session
+# token, and external ID an `aws_sigv4:` block carries. Its Debug and
+# Display both render `[REDACTED]` and it zeroes on drop, which a bare
+# String does not. Acyclic: sbproxy-vault depends only on
+# sbproxy-observe, which this crate already pulls in above.
+sbproxy-vault.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true
@@ -100,6 +106,26 @@ object_store = { workspace = true }
 # serde_yaml is already in the workspace via the OSS config crate.
 flate2 = "1"
 serde_yaml.workspace = true
+
+# WOR-2648: AWS SigV4 request signing for Bedrock and SageMaker, which
+# do not accept a bearer token. `aws-sigv4` is the AWS-maintained
+# canonicalizer and signer, already in the lockfile as a transitive
+# dependency of the SDK sbproxy-vault uses, so this promotes an existing
+# resolution rather than adding a new one; hand-rolling the canonical
+# request is exactly the kind of "close enough" that fails as an
+# authentication error rather than as a visible bug. `aws-config` brings
+# the standard credential provider chain (env, profile, EKS web
+# identity, ECS task role, EC2 instance profile) and the STS
+# `AssumeRoleProvider`; `aws-credential-types` is the `Credentials`
+# type the two exchange, whose Debug already redacts the secret key.
+#
+# The feature list matches crates/sbproxy-vault/Cargo.toml exactly so
+# the workspace resolves one copy: `default-https-client` routes through
+# smithy's hyper-rustls 0.23 stack rather than the legacy `rustls`
+# feature's vulnerable rustls-webpki 0.101.
+aws-config = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
+aws-credential-types = { version = "1" }
+aws-sigv4 = { version = "1" }
 
 # Pre-request token estimation for fail-fast TPM enforcement (WOR-232).
 # Ships the cl100k_base and o200k_base BPEs used by GPT-4, GPT-4o, and

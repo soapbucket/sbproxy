@@ -1521,6 +1521,15 @@ const fn default_measured_per() -> u64 {
 /// [`Self::Receipt`] alone. An operator reselling metered capacity
 /// wants [`Self::Both`], because they have to answer to a buyer and a
 /// supplier at once.
+///
+/// This build implements the receipt half only. `compile_config`
+/// refuses [`Self::Claim`] and [`Self::Both`], at the proxy block and
+/// at a per-origin override alike, because nothing writes a claim
+/// before a call is served, nothing reads
+/// [`AttestationConfig::queue`], and no ceiling is computed for
+/// [`AttestationConfig::enforcement_mode`] to act on. Both variants
+/// stay in the vocabulary so the refusal can name what is missing
+/// instead of reporting an unknown value.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
 )]
@@ -1530,11 +1539,15 @@ pub enum AttestationRole {
     /// not mention the block gets.
     #[default]
     Off,
-    /// Assert what a call is going to cost, before it is served.
+    /// Assert what a call is going to cost, before it is served. Not
+    /// implemented in this build: a config that names it is refused at
+    /// compile.
     Claim,
     /// Record what a call actually consumed, after it is served.
     Receipt,
-    /// Both halves. The posture for reselling metered capacity.
+    /// Both halves. The posture for reselling metered capacity. Not
+    /// implemented in this build either, because the claim half is not:
+    /// a config that names it is refused at compile.
     Both,
 }
 
@@ -1646,6 +1659,11 @@ impl AttestationBillableConfig {
 /// A claim is written when the call starts and settled when it
 /// finishes, and the gap between those is where a crash loses money.
 /// The queue is that gap made durable.
+///
+/// Nothing writes this queue today. The claim half is not implemented
+/// in this build and [`AttestationRole::Claim`] is refused at config
+/// compile, so the block is validated and its path resolved, and no
+/// file or directory is created for it.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AttestationQueueConfig {
@@ -1859,6 +1877,10 @@ pub struct AttestationConfig {
     /// [`Self::failure_mode`]: a control can reasonably observe while it
     /// is being tuned and still need to fail closed when its backend
     /// disappears.
+    ///
+    /// The only verdict attestation reaches is a claim measured against
+    /// an agreement's ceiling, and the claim half is not implemented in
+    /// this build, so this key records a posture nothing acts on yet.
     pub enforcement_mode: EnforcementMode,
     /// Which existing signing identity signs receipts, as the config
     /// path that declares it. The only accepted value today is
