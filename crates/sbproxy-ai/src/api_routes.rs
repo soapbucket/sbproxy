@@ -1234,22 +1234,6 @@ mod tests {
         }
     }
 
-    /// The two entries the ticket named, pinned by name so a regression
-    /// reads as itself rather than as a sweep index.
-    #[test]
-    fn bedrock_hides_embeddings_and_vertex_publishes_them() {
-        use crate::handler::AiSurface;
-
-        assert!(!provider_supports_surface(
-            "bedrock",
-            &AiSurface::Embeddings
-        ));
-        assert!(!surface_capability_names(&typed_provider("bedrock")).contains(&"embeddings"));
-
-        assert!(provider_supports_surface("vertex", &AiSurface::Embeddings));
-        assert!(surface_capability_names(&typed_provider("vertex")).contains(&"embeddings"));
-    }
-
     /// An account-scoped surface is not a per-model capability, and
     /// neither is an unclassified path. Publishing `files` or `unknown`
     /// on a model entry would invite exactly the misreading this whole
