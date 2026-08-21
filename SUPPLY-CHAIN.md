@@ -1,6 +1,6 @@
 # SBproxy Supply Chain
 
-*Last modified: 2026-08-08*
+*Last modified: 2026-08-20*
 
 The long-form companion to `SECURITY.md`, intended for security teams, procurement reviewers, and anyone whose job is to answer the question "can we trust this binary?"
 
@@ -230,7 +230,7 @@ The admin dashboard is the one npm surface, and it is a build-time input rather 
 - **Patch and minor security updates** to direct dependencies are automated via Renovate (configured in `.github/renovate.json`), reviewed and merged by maintainers within 7 business days, and shipped in the next patch release.
 - **Major version bumps** to direct dependencies are done deliberately, with manual review, and are not auto-applied.
 - **Transitive dependencies** are pinned via `Cargo.lock`. They update only when a direct dependency's `Cargo.toml` declares it.
-- **Renovate's own configuration** is reviewed in PR like any other change. SHA-pinning of GitHub Actions is enforced via `helpers:pinGitHubActionDigests`.
+- **Renovate's own configuration** is reviewed in PR like any other change. It extends `helpers:pinGitHubActionDigests` and sets `pinDigests` for `github-actions`, but that preset has produced nothing so far: every action reference in this repository is still a tag or a branch, not a digest. Treat it as configured rather than enforced, and see 6.1.
 
 ### 4.3 Vendor and audit posture
 
@@ -302,9 +302,9 @@ We make a graded set of claims here. We are honest about which are stronger.
 
 ### 6.1 What we guarantee today
 
-- **Fixed toolchain channel** via `dtolnay/rust-toolchain` (`stable`) in CI, with the minimum supported version declared in `Cargo.toml` (`rust-version`). Two builders on the same channel build against the same compiler release. An exact, workspace-wide version pin is not committed today; see 6.2.
+- **An exact toolchain version**, committed as `rust-toolchain.toml` at the repository root. rustup honors that file for every cargo invocation inside a checkout, and CI installs the version it names instead of resolving a channel at build time, so raising the compiler is a reviewable commit rather than something that happens on its own. The minimum supported version is declared separately in `Cargo.toml` (`rust-version`) and proven by its own lane. One lane is outside this; see 6.2.
 - **Pinned dependency graph** via committed `Cargo.lock` and the `--locked` flag. Two builders see the same crate versions and the same transitive resolution.
-- **Pinned action versions** via SHA. Two builders see the same workflow logic.
+- **Declared action versions**, with the caveats spelled out. Most third-party GitHub Actions here carry a major-version tag such as `actions/checkout@v5`. Five references are looser than that and name a branch or a moving alias instead: `dtolnay/rust-toolchain` at `@master` (three call sites) and at `@stable` (one), and `taiki-e/install-action@nextest`. No action reference in this repository is a commit SHA. This bullet previously claimed SHA pinning outright, which was never true of this repository, and section 4 still says the same thing in different words; both are corrected here. A major-version tag moves and a branch moves further, so two builders on different days can see different action code. Moving these references to commit SHAs is open work, and it is the weakest link in the list above.
 - **`-Cstrip=symbols`** to remove debug symbols and reduce sources of nondeterminism in the binary.
 
 This means: if you build from the same source, with the same toolchain, on a similar host, you should produce a binary whose SBOM matches ours and whose dependency graph matches ours exactly. The SBOM is the practical reproducibility artifact for most buyer audits.
@@ -312,7 +312,9 @@ This means: if you build from the same source, with the same toolchain, on a sim
 ### 6.2 What we do not yet guarantee
 
 - **Bit-for-bit identical binaries** across builders. Achieving this requires removing every source of nondeterminism (timestamp embeds, file ordering, codegen unit nondeterminism). It is a multi-week project. We have not done it yet. The `reproducible build probe` workflow now builds the release binary twice on independent GitHub-hosted runners and uploads the SHA-256 comparison report as an artifact, but the probe is informational until the diff reaches zero.
-- **An exact pinned toolchain version** across every lane. `rust-toolchain.toml` at the repository root now pins one version, and every lane routed through `.github/actions/rust-setup` builds on it. Eleven `dtolnay/rust-toolchain@stable` references across eight other workflows still resolve their compiler at run time, so the guarantee does not hold everywhere yet. Nightly is no longer part of the picture: the fuzz harnesses were the only lane that needed it, and they no longer run in CI at all. Converging the remaining lanes onto the pinned toolchain is part of the bit-for-bit work above.
+- **One compiler across the three release legs.** Nearly every CI lane resolves its toolchain from `rust-toolchain.toml`, through `.github/actions/pinned-toolchain` or through `.github/actions/rust-setup`, which calls it. Two lanes are deliberately elsewhere. `msrv.yml` resolves from `rust-version` in `Cargo.toml`, which is the floor it exists to prove. `perf-regression.yml` reads the same root file but inline, because it checks the repository out into subdirectories where a local action path does not resolve.
+
+  The release build is the one that matters for shipped bytes, and it is the gap. Its macOS leg still installs the `stable` channel, so the darwin_arm64 tarball is compiled by whichever stable release is current on the day of the tag. Its two Linux legs run inside a `rust:<version>-bookworm` container whose image pins a different version from the root file, but that container pin has two things working against it, both documented in the workflow: a `RUSTUP_TOOLCHAIN` value intended for the macOS leg is applied to all three, and the checked-out workspace inside the container carries `rust-toolchain.toml`, which rustup honors ahead of the image's default. Which compiler actually produces the Linux binaries has not been observed since either of those landed, because no tag has been cut since. We would rather write that down than imply a guarantee we have not checked. Converging the three legs changes which compiler produces shipped bytes, so it needs a real tag build to verify, and it is part of the bit-for-bit work above. Nightly is no longer part of the picture: the fuzz harnesses were the only lane that needed it, and they no longer run in CI at all.
 
 If your security policy requires bit-for-bit reproducibility today, talk to us. We will work with you on a bridge: independent rebuild from a tagged source, SBOM and dependency-graph comparison, and a written attestation that the dependency surface matches.
 

@@ -87,7 +87,48 @@ jobs:
           docker-images: false
           swap-storage: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Every other lane reaches the pin through
+      # ./.github/actions/pinned-toolchain. This one cannot: both
+      # checkouts land in subdirectories, so nothing is checked out at
+      # the workspace root and a local `uses: ./...` has no action.yml
+      # to resolve against. Read the candidate's pin inline instead,
+      # the way msrv.yml reads the floor out of Cargo.toml, and keep
+      # the two in step by hand. Adding a third checkout at the root
+      # just to reach the composite would cost a clone and put a second
+      # copy of the tree in the workspace for no other reason.
+      #
+      # The candidate's, specifically, because that is the toolchain
+      # the pull request declares.
+      #
+      # Be clear about what this does and does not buy. It only decides
+      # the compiler for a checkout that carries no pin of its own,
+      # which now means a base ref older than the commit that added the
+      # file. Both checkouts normally have one, and rustup honors each
+      # directory's file ahead of the default this step sets, so the two
+      # legs use whatever each of them declares. On the one pull request
+      # where that matters most, the one that raises the pin, the
+      # candidate builds on the new compiler and the baseline on the
+      # old, and the regression gate attributes the compiler's delta to
+      # the change. Nothing here separates those. Pinning both legs to
+      # one compiler would mean forcing RUSTUP_TOOLCHAIN on both bench
+      # steps, which is a decision about what this lane is measuring,
+      # not a drive-by fix.
+      - name: read the pinned toolchain
+        id: toolchain
+        run: |
+          set -euo pipefail
+          pin="candidate-src/rust-toolchain.toml"
+          channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$pin" | head -n1)"
+          if [ -z "$channel" ]; then
+            echo "::error::no channel found in $pin; every Rust lane resolves its compiler from that file"
+            exit 1
+          fi
+          echo "pinned toolchain: $channel"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
 
       # Two cache scopes: candidate and baseline. Sharing the cache
       # would let the second build trample the first's lockfile state
