@@ -2430,7 +2430,28 @@ origins:
 |-------|------|---------|-------------|
 | `type` | string | required | Must be `basic_auth` |
 | `users` | list | required | Username/password pairs |
-| `realm` | string | | Optional realm shown in the `WWW-Authenticate` challenge |
+| `realm` | string | `restricted` | Realm sent in the `WWW-Authenticate` challenge on a 401 |
+
+A denied request gets the challenge, which is what makes a browser
+prompt and tells a scripted client which scheme to retry with:
+
+```bash
+$ curl -i -H 'Host: admin.example.com' http://localhost:8080/
+HTTP/1.1 401 Unauthorized
+www-authenticate: Basic realm="Admin Panel"
+content-type: application/json
+
+{"error":"unauthorized"}
+```
+
+Both the missing-credential and the wrong-password cases challenge.
+`realm` is optional in config only; RFC 9110 section 11.6.1 requires the
+parameter on the wire, so an origin that sets none is challenged as
+`Basic realm="restricted"`. A quote or backslash in the realm is escaped
+into the quoted string rather than being allowed to end it.
+
+An `error_pages` entry or `problem_details` on the origin replaces the
+body above and leaves the challenge header in place.
 
 ### bearer
 

@@ -2095,19 +2095,51 @@ async fn send_response(
     content_type: &str,
     body: &[u8],
 ) -> Result<()> {
-    let mut header = pingora_http::ResponseHeader::build(status, Some(2)).map_err(|e| {
-        Error::because(
-            ErrorType::InternalError,
-            "failed to build response header",
-            e,
-        )
-    })?;
+    send_response_with_extra_headers(session, status, content_type, body, &[]).await
+}
+
+/// [`send_response`] plus caller-supplied response headers appended
+/// after the framing ones.
+///
+/// Header names and values are copied verbatim. An entry the header
+/// builder refuses is skipped with a warning rather than failing the
+/// whole response, so one malformed challenge from a third-party auth
+/// provider cannot turn a 401 into a dropped connection.
+///
+/// Named `_extra_` rather than mirroring `request_phase`'s own
+/// `send_response_with_headers`: that one is a separate, stricter
+/// helper for the introspect 401, and `request_phase` glob-imports this
+/// module, so two identical names would shadow.
+async fn send_response_with_extra_headers(
+    session: &mut Session,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    extra_headers: &[(String, String)],
+) -> Result<()> {
+    let mut header = pingora_http::ResponseHeader::build(status, Some(2 + extra_headers.len()))
+        .map_err(|e| {
+            Error::because(
+                ErrorType::InternalError,
+                "failed to build response header",
+                e,
+            )
+        })?;
     header
         .insert_header("content-type", content_type)
         .map_err(|e| Error::because(ErrorType::InternalError, "failed to set content-type", e))?;
     header
         .insert_header("content-length", body.len().to_string())
         .map_err(|e| Error::because(ErrorType::InternalError, "failed to set content-length", e))?;
+    for (name, value) in extra_headers {
+        if let Err(e) = header.append_header(name.clone(), value) {
+            warn!(
+                header_name = %name,
+                error = %e,
+                "error response carried an invalid header; skipping",
+            );
+        }
+    }
     // WOR-2295: see `e2e_harness_token` above. The e2e harness's
     // readiness probe hits precisely this path on a freshly booted
     // proxy (its Host header matches no configured origin), so this
@@ -2250,6 +2282,13 @@ async fn send_error_with_extra_headers(
 /// When multiple custom pages match a status and the client expresses
 /// no concrete preference, JSON is preferred, then HTML, then the
 /// first authored entry.
+///
+/// `extra_headers` are appended to whichever body wins. Every branch
+/// gets them because a challenge and a body are independent choices:
+/// authoring an `error_pages` 401 must not cost the origin its
+/// `WWW-Authenticate` header, which is what a body-only emitter would
+/// do (WOR-2525).
+#[allow(clippy::too_many_arguments)]
 async fn send_error_with_pages(
     session: &mut Session,
     status: u16,
@@ -2257,6 +2296,7 @@ async fn send_error_with_pages(
     error_pages: Option<&[sbproxy_config::ErrorPageEntry]>,
     problem_details: Option<&sbproxy_config::ProblemDetailsConfig>,
     request_path: &str,
+    extra_headers: &[(String, String)],
 ) -> Result<()> {
     if let Some(pages) = error_pages {
         let candidates: Vec<&sbproxy_config::ErrorPageEntry> =
@@ -2282,7 +2322,14 @@ async fn send_error_with_pages(
                 chosen.body.clone()
             };
 
-            return send_response(session, status, &chosen.content_type, body.as_bytes()).await;
+            return send_response_with_extra_headers(
+                session,
+                status,
+                &chosen.content_type,
+                body.as_bytes(),
+                extra_headers,
+            )
+            .await;
         }
     }
 
@@ -2290,13 +2337,28 @@ async fn send_error_with_pages(
     if let Some(pd) = problem_details {
         if pd.enabled {
             let body = render_problem_details(status, message, pd, request_path);
-            return send_response(session, status, "application/problem+json", body.as_bytes())
-                .await;
+            return send_response_with_extra_headers(
+                session,
+                status,
+                "application/problem+json",
+                body.as_bytes(),
+                extra_headers,
+            )
+            .await;
         }
     }
 
-    // No matching error page, no problem-details: plain-text default.
-    send_error(session, status, message).await
+    // No matching error page, no problem-details: the plain JSON
+    // default, still carrying the challenge.
+    let body = error_json_body(message);
+    send_response_with_extra_headers(
+        session,
+        status,
+        "application/json",
+        body.as_bytes(),
+        extra_headers,
+    )
+    .await
 }
 
 /// Render an RFC 9457 `application/problem+json` body. The `type` field
@@ -2894,7 +2956,20 @@ async fn check_auth_with_tls_outcome(
                 )
             }
             None => (
-                AuthResult::Deny(401, "unauthorized".to_string()),
+                // WOR-2525: a Basic 401 without `WWW-Authenticate` is
+                // not a Basic denial, it is an opaque one. RFC 9110
+                // section 11.6.1 requires the challenge, and until this
+                // arm carried it the origin's configured `realm` was
+                // parsed and then dropped: no browser prompted and no
+                // client learned which scheme to retry with. In an
+                // `any_of` composition `check_any_of_auth`'s merge loop
+                // reads the header off this variant, so the challenge
+                // joins the composite 401 too.
+                AuthResult::DenyWithHeaders(
+                    401,
+                    "unauthorized".to_string(),
+                    vec![("WWW-Authenticate".to_string(), a.challenge())],
+                ),
                 None,
                 if headers.contains_key(http::header::AUTHORIZATION) {
                     AuthTrustOutcome::InvalidProof

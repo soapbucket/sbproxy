@@ -2,8 +2,9 @@
 # HTTP Basic authentication.
 #
 # Two users, plain passwords, custom realm. Useful for quick admin panels and
-# small internal tools. Missing or wrong credentials get a 401 with a
-# WWW-Authenticate challenge before test.sbproxy.dev is contacted.
+# small internal tools. Missing or wrong credentials get a 401 carrying
+# WWW-Authenticate: Basic realm="sbproxy demo" before test.sbproxy.dev is
+# contacted, which is what makes a browser prompt for credentials.
 #
 # Run:
 #   make run CONFIG=examples/auth-basic/sb.yml

@@ -3359,6 +3359,7 @@ pub(super) async fn request_filter(
                         origin.error_pages.as_deref(),
                         origin.problem_details.as_ref(),
                         &path,
+                        &[],
                     )
                     .await?;
                     return Ok(true);
@@ -3547,6 +3548,7 @@ pub(super) async fn request_filter(
                         origin.error_pages.as_deref(),
                         origin.problem_details.as_ref(),
                         &path,
+                        &[],
                     )
                     .await?;
                     return Ok(true);
@@ -3586,7 +3588,24 @@ pub(super) async fn request_filter(
                             .get("host")
                             .and_then(|v| v.to_str().ok()),
                     );
-                    send_error_with_extra_headers(session, status, msg, &augmented).await?;
+                    // WOR-2525: route through the same body chooser the
+                    // bare `Deny` arm uses. A denial that carries a
+                    // challenge is still a denial, so an origin that
+                    // authored an `error_pages` 401 or turned on
+                    // `problem_details` must get that body here too;
+                    // `send_error_with_extra_headers` would have
+                    // silently replaced both with `{"error": ...}`.
+                    let path = session.req_header().uri.path().to_string();
+                    send_error_with_pages(
+                        session,
+                        status,
+                        msg,
+                        origin.error_pages.as_deref(),
+                        origin.problem_details.as_ref(),
+                        &path,
+                        &augmented,
+                    )
+                    .await?;
                     return Ok(true);
                 }
                 AuthResult::DigestChallenge(challenge) => {
