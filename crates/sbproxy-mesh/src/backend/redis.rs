@@ -257,7 +257,20 @@ impl RedisBackend {
     /// EXPIRE-equivalent. The trait surface lacks a standalone TTL
     /// reset, so this re-puts the current value through `EphemeralKv`
     /// to attach the new TTL. No-op when the key is absent.
+    ///
+    /// A zero `ttl_secs` is refused rather than guessed at. Two
+    /// conventions collide on it: Redis `EXPIRE key 0` deletes the key,
+    /// while `Self::set` in this same file reads `0` as "no expiry".
+    /// Picking one silently would make the other caller wrong, and
+    /// `EphemeralKv::put` refuses a zero TTL anyway, so this fails with
+    /// a message that names the ambiguity instead.
     pub async fn expire(&self, key: &str, ttl_secs: u64) -> Result<()> {
+        if ttl_secs == 0 {
+            anyhow::bail!(
+                "storage EXPIRE for key '{key}' needs a non-zero ttl; \
+                 use delete to remove the key or set with ttl 0 to make it durable"
+            );
+        }
         let Some(value) =
             self.persistent.get(key).await.with_context(|| {
                 format!("storage GET (for EXPIRE refresh) failed for key '{key}'")
@@ -441,6 +454,36 @@ mod tests {
         let b = mock_backend();
         b.expire("nope", 30).await.expect("noop ok");
         assert_eq!(b.get("nope").await.expect("still missing"), None);
+    }
+
+    /// `expire` with a zero TTL is refused, and refused before it reads
+    /// the durable copy, so it cannot half-apply.
+    ///
+    /// Without the guard the zero flowed into `EphemeralKv::put` as
+    /// `Duration::ZERO`, which the Redis backend silently rounded up to
+    /// a one-second lifetime: the opposite of what Redis `EXPIRE key 0`
+    /// means, and different again from what `set(key, value, 0)` means
+    /// two functions up in this same file.
+    #[tokio::test]
+    async fn expire_refuses_a_zero_ttl_without_touching_the_value() {
+        let persistent = Arc::new(MockPersistentKv::new());
+        let ephemeral = Arc::new(MockEphemeralKv::new());
+        let set = Arc::new(MockSetKv::new());
+        let b = RedisBackend::from_traits(persistent.clone(), ephemeral.clone(), set);
+        b.set("k", b"v", 0).await.expect("durable seed");
+
+        let err = b.expire("k", 0).await.expect_err("a zero ttl is refused");
+        assert!(
+            err.to_string().contains("non-zero ttl"),
+            "expected the ambiguity named in the error, got: {err}"
+        );
+        // The durable copy is untouched and nothing landed in the
+        // ephemeral store, so a caller can retry with a real TTL.
+        assert_eq!(
+            persistent.get("k").await.expect("p"),
+            Some(Bytes::from_static(b"v"))
+        );
+        assert_eq!(ephemeral.get("k").await.expect("e"), None);
     }
 
     // Integration test (requires live Redis at REDIS_URL). Exercises the
