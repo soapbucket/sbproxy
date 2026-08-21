@@ -33,6 +33,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use reqwest::header::{HeaderName, HeaderValue};
 use sbproxy_httpkit::OutboundClientBuilder;
+use sbproxy_security::url_redact::redacted_url;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
@@ -309,7 +310,7 @@ pub struct ExternalGuardrailConfig {
 
 impl std::fmt::Debug for ExternalGuardrailConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let url = self.url.as_deref().map(sanitized_debug_url);
+        let url = self.url.as_deref().map(redacted_url);
         formatter
             .debug_struct("ExternalGuardrailConfig")
             .field("name", &self.name)
@@ -340,18 +341,6 @@ impl std::fmt::Debug for ExternalGuardrailConfig {
             .field("prepared", &self.prepared.get().is_some())
             .finish()
     }
-}
-
-fn sanitized_debug_url(value: &str) -> String {
-    let Ok(mut url) = url::Url::parse(value) else {
-        return "[INVALID URL]".to_string();
-    };
-    let _ = url.set_password(None);
-    let _ = url.set_username("");
-    url.set_path("/");
-    url.set_query(None);
-    url.set_fragment(None);
-    url.to_string()
 }
 
 fn default_timeout_ms() -> u64 {
@@ -1362,7 +1351,10 @@ mod tests {
         .unwrap();
 
         let debug = format!("{cfg:?}");
-        assert!(debug.contains("https://guard.example.test/"));
+        // The shared helper renders the origin, so there is no trailing
+        // slash to match on: everything past the authority is dropped.
+        assert!(debug.contains("https://guard.example.test"));
+        assert!(!debug.contains("guard.example.test/"));
         for secret in [
             "webhook-user",
             "webhook-password",

@@ -14,6 +14,12 @@
 //! `Location` back through [`evaluate_hop`], bounded by
 //! [`MAX_REDIRECT_HOPS`]. Refusals are counted through
 //! [`record_egress_refused`].
+//!
+//! [`crate::governed_egress`] is that whole contract assembled: one
+//! bounded loop that authorizes, pins, re-authorizes each hop, and
+//! decides what a request may carry across an origin boundary. Reach
+//! for it rather than writing the loop again; the primitives here are
+//! what it is built from.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -201,6 +207,35 @@ impl EgressAuthorizer {
         Self { config }
     }
 
+    /// Every purpose this authorizer carries an allowlist for.
+    ///
+    /// The registry [`install_configured_gate`] writes is keyed by
+    /// purpose and [`Self::authorize`] looks a purpose up by exact key,
+    /// so an authorizer has to be filed under every purpose it answers
+    /// for or the reader that asks for the one it was not filed under
+    /// gets `None` and runs ungated. One `egress:` sub-block can
+    /// compile to more than one purpose: `usage_sinks:` builds a single
+    /// allowlist under both [`EgressPurpose::UsageSink`] and
+    /// [`EgressPurpose::Webhook`], because the sinks underneath it
+    /// authorize under two different, pre-existing purposes.
+    ///
+    /// The arming code reads that set off the value here rather than
+    /// naming it a second time, which is the whole point of this
+    /// method. When it was named twice the two copies disagreed: the
+    /// compiler produced the `Webhook` entry and the installer filed
+    /// only `UsageSink`, so `configured_gate(Webhook)` answered `None`
+    /// for every config ever written and the `events:` webhook sink
+    /// dialed with no allowlist while three docs said otherwise
+    /// (WOR-2612).
+    ///
+    /// Sorted by [`EgressPurpose::as_label`] so the order does not
+    /// depend on a `HashMap`'s iteration.
+    pub fn purposes(&self) -> Vec<EgressPurpose> {
+        let mut purposes: Vec<EgressPurpose> = self.config.purposes.keys().copied().collect();
+        purposes.sort_by_key(|purpose| purpose.as_label());
+        purposes
+    }
+
     /// Authorize `url` for `purpose`, pinning resolved addresses via `resolver`.
     ///
     /// Default deny: unlisted purpose or host is rejected.
@@ -351,13 +386,23 @@ impl EgressAuthorizer {
     }
 }
 
-fn resolve_redirect_url(base: &Url, location: &str) -> Result<Url, EgressDenied> {
+/// `pub(crate)`: [`crate::governed_egress`] applies the cross-origin
+/// credential rule before it calls [`evaluate_hop`], so it has to reach
+/// the same absolute URL from the same raw `Location` value. A second
+/// copy of the base-join would be a second answer to "where does this
+/// redirect actually point", which is the last question in this module
+/// that should have two.
+pub(crate) fn resolve_redirect_url(base: &Url, location: &str) -> Result<Url, EgressDenied> {
     Url::parse(location)
         .or_else(|_| base.join(location))
         .map_err(|_| EgressDenied::InvalidUrl)
 }
 
-fn is_cross_origin(from: &Url, to: &Url) -> bool {
+/// `pub(crate)` for the same reason as [`resolve_redirect_url`]: the
+/// governed loop decides what a request may carry across an origin
+/// boundary and has to agree with [`evaluate_hop`] about where that
+/// boundary is.
+pub(crate) fn is_cross_origin(from: &Url, to: &Url) -> bool {
     let from_host = from.host_str().unwrap_or("");
     let to_host = to.host_str().unwrap_or("");
     let from_port = from.port_or_known_default();
@@ -381,6 +426,16 @@ pub struct RedirectDecision {
 }
 
 /// Contract for a governed HTTP client.
+///
+/// The transport-agnostic statement of the rules;
+/// [`crate::governed_egress::GovernedEgress`] is the reqwest-backed
+/// implementation, and is where a new consumer should start. Two call
+/// sites route through it today, the MCP run-as-user token exchange and
+/// the `events:` webhook sink; three others still carry their own
+/// [`evaluate_hop`] loop and are listed in
+/// [`crate::governed_egress`]'s module docs. This trait stays because
+/// it states the rules without naming an HTTP library, which is what an
+/// out-of-tree transport would implement against.
 ///
 /// Implementors must:
 /// - never auto-follow redirects;
@@ -1017,6 +1072,13 @@ fn configured_gates() -> &'static std::sync::Mutex<HashMap<EgressPurpose, Egress
 /// installed, so a reload that drops the purpose's `egress.*` sub-block
 /// returns it to the legacy ungated contract instead of pinning the last
 /// configured allowlist forever.
+///
+/// The map is keyed by exact purpose and has no fallback, so one
+/// `egress:` sub-block that compiles an allowlist for several purposes
+/// needs one call per purpose. Do not spell that list out at the call
+/// site: read it off the value with [`EgressAuthorizer::purposes`],
+/// which is the only copy of it that cannot drift from what the
+/// compiler actually built (WOR-2612).
 pub fn install_configured_gate(purpose: EgressPurpose, authorizer: Option<EgressAuthorizer>) {
     let mut gates = match configured_gates().lock() {
         Ok(guard) => guard,
@@ -1038,6 +1100,14 @@ pub fn install_configured_gate(purpose: EgressPurpose, authorizer: Option<Egress
 /// never been installed), which every consumer treats as the legacy
 /// ungated contract: dispatch proceeds and the sighting is stamped
 /// [`EgressSightingStatus::Ungated`], never `Allowed`.
+///
+/// Which makes a purpose no production path ever installs read exactly
+/// like a purpose no operator armed, forever and for every config. Read
+/// a purpose here only if some production path installs it;
+/// `arm_egress_gates_from_config` in `sbproxy_core::server::lifecycle`
+/// is the one seam that does, and
+/// `every_purpose_the_compiled_egress_section_arms_is_reachable_in_the_registry`
+/// beside it is what keeps the two sides in step.
 pub fn configured_gate(purpose: EgressPurpose) -> Option<EgressAuthorizer> {
     let gates = match configured_gates().lock() {
         Ok(guard) => guard,

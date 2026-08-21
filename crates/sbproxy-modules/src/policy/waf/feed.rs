@@ -629,6 +629,11 @@ impl WafFeedSubscriber {
             .build()
             .expect("WAF feed client builder failed; cannot enforce the request timeout");
 
+        // Rendered once outside the loop: the feed URL is operator config
+        // and can carry a token in its path or query, and this line fires
+        // on every failed poll (WOR-2629).
+        let feed_origin = sbproxy_security::url_redact::redacted_url(&url);
+
         loop {
             let after = self.last_good_version.lock().clone();
             match self.fetch_http_once(&client, &url, after.as_deref()).await {
@@ -636,10 +641,15 @@ impl WafFeedSubscriber {
                 Ok(FetchOutcome::NotModified) => {
                     tracing::trace!("WAF feed: 304 Not Modified");
                 }
-                Err(e) => {
+                // `fetch_error`, not `e`: `fetch_http_once` puts its own
+                // `.context(..)` on every transport failure, so the
+                // non-alternate Display here is that context and not a
+                // `reqwest::Error`'s, which would end with the feed URL.
+                // The name is what says so at the log site (WOR-2629).
+                Err(fetch_error) => {
                     tracing::warn!(
-                        url = %url,
-                        error = %e,
+                        url = %feed_origin,
+                        error = %fetch_error,
                         "WAF feed: HTTP fetch failed; keeping last-good"
                     );
                     if !self.config.fallback_to_static {
@@ -716,13 +726,21 @@ impl WafFeedSubscriber {
         // `last_id` advances as new entries arrive. We start at `$` so
         // the consumer only sees entries published *after* the
         // subscriber starts. The static cache feeds the cold-start gap.
+        // Origin and database index only: `redis_url` is a DSN and carries
+        // its password inline, and this line fires on every reconnect
+        // (WOR-2640). The path is kept because for a Redis DSN it is the
+        // database index, which is the one case `redacted_url_with_path`
+        // exists for; the field below is named `redis_url` rather than
+        // `url` so that stays legible at the log site and to the guard.
+        let redis_origin = sbproxy_security::url_redact::redacted_url_with_path(&url);
+
         let mut last_id = "$".to_string();
         loop {
             match self.run_redis_iter(&url, &stream, &mut last_id).await {
                 Ok(()) => {}
                 Err(e) => {
                     tracing::warn!(
-                        url = %url,
+                        redis_url = %redis_origin,
                         stream = %stream,
                         error = %e,
                         "WAF feed: Redis loop error; reconnecting"

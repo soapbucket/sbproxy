@@ -3541,8 +3541,10 @@ async fn run_local_http_call_with_resolver(
     // or log line: the rendered URL's path and query can carry a
     // resolved `${VAR}` config secret or caller arguments, while the
     // scheme/host/port is exactly what the egress inventory already
-    // records for this dial (WOR-2489 review).
-    let dest_label = dest.url.origin().ascii_serialization();
+    // records for this dial (WOR-2489 review). WOR-2640 moved the
+    // rendering to the shared helper, which unlike `Url::origin` does
+    // not collapse a non-special scheme to the literal "null".
+    let dest_label = sbproxy_security::url_redact::redacted_url(dest.url.as_str());
 
     let retry = call.retry.clone().unwrap_or_default();
     let request_timeout = call.timeout.unwrap_or(DEFAULT_LOCAL_HTTP_REQUEST_TIMEOUT);

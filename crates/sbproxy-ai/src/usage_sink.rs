@@ -294,6 +294,13 @@ fn sink_client() -> reqwest::Client {
 /// are attributed to the tenant whose event was being shipped, because
 /// in a multi-tenant deployment a refusal on one tenant's traffic is
 /// not the same signal as a refusal on everyone's.
+///
+/// The `String` in the error position is what every caller logs, so it
+/// is a rendered summary rather than a `reqwest::Error`'s own `Display`.
+/// That `Display` ends with `" for url ({url})"`, and a usage sink URL is
+/// operator configuration: a Slack-shaped collector keeps its whole
+/// secret in the path, and Langfuse and Datadog collectors are routinely
+/// given a token in the query string (WOR-2629).
 async fn send_sink_post(
     client: &reqwest::Client,
     egress: Option<&EgressAuthorizer>,
@@ -309,7 +316,7 @@ async fn send_sink_post(
         let resp = client
             .execute(request)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| sbproxy_httpkit::request_error_summary(&error))?;
         if !resp.status().is_redirection() {
             return Ok(resp);
         }
@@ -444,7 +451,7 @@ impl UsageSink for WebhookSink {
                     return;
                 }
             };
-            if let Err(e) = send_sink_post(
+            if let Err(summary) = send_sink_post(
                 &client,
                 egress.as_ref(),
                 EgressPurpose::Webhook,
@@ -454,7 +461,11 @@ impl UsageSink for WebhookSink {
             )
             .await
             {
-                tracing::warn!(error = %e, "usage sink: webhook POST failed");
+                // `summary`, not `e`: `send_sink_post` renders the
+                // failure through `request_error_summary`, and the name
+                // says at the log site that this is not a raw
+                // `reqwest::Error` Display carrying the collector URL.
+                tracing::warn!(error = %summary, "usage sink: webhook POST failed");
             }
         });
     }
@@ -686,7 +697,7 @@ impl UsageSink for LangfuseSink {
                     return;
                 }
             };
-            if let Err(e) = send_sink_post(
+            if let Err(summary) = send_sink_post(
                 &client,
                 egress.as_ref(),
                 EgressPurpose::UsageSink,
@@ -696,7 +707,11 @@ impl UsageSink for LangfuseSink {
             )
             .await
             {
-                tracing::warn!(error = %e, "usage sink: langfuse POST failed");
+                // `summary`, not `e`: `send_sink_post` renders the
+                // failure through `request_error_summary`, and the name
+                // says at the log site that this is not a raw
+                // `reqwest::Error` Display carrying the collector URL.
+                tracing::warn!(error = %summary, "usage sink: langfuse POST failed");
             }
         });
     }
@@ -811,7 +826,7 @@ impl UsageSink for DatadogSink {
                     return;
                 }
             };
-            if let Err(e) = send_sink_post(
+            if let Err(summary) = send_sink_post(
                 &client,
                 egress.as_ref(),
                 EgressPurpose::UsageSink,
@@ -821,7 +836,11 @@ impl UsageSink for DatadogSink {
             )
             .await
             {
-                tracing::warn!(error = %e, "usage sink: datadog POST failed");
+                // `summary`, not `e`: `send_sink_post` renders the
+                // failure through `request_error_summary`, and the name
+                // says at the log site that this is not a raw
+                // `reqwest::Error` Display carrying the collector URL.
+                tracing::warn!(error = %summary, "usage sink: datadog POST failed");
             }
         });
     }

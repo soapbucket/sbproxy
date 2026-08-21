@@ -1,6 +1,6 @@
 # Gateway API controller
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 `sbproxy-k8s-controller` watches `gateway.networking.k8s.io/v1` resources and renders them into a single `sb.yml` the data plane reads. You write `Gateway` and `HTTPRoute` objects; it writes the config file.
 
@@ -218,6 +218,12 @@ A listener can be `Accepted: True` and `Programmed: False` at the same time. Tha
 A route attached to Gateways from several implementations keeps everyone's status. The controller reads the existing `status.parents`, carries forward every entry whose `controllerName` is not its own byte for byte, and appends its own.
 
 ## Behavior worth knowing before you rely on it
+
+### The config file is replaced, never rewritten in place
+
+Each reconcile writes the rendered document to a temporary file in the same directory, flushes it to disk, renames it over `sb.yml`, and syncs the directory. The rename is the atomic step. A data plane reading the file during a publish sees either the previous complete document or the new one, and a controller pod killed mid-publish leaves the previous document byte for byte intact rather than a truncated one the proxy cannot boot on.
+
+Two limits are worth knowing. The guarantee is the filesystem's: a rename is atomic within one filesystem, which is why the temporary is written beside `sb.yml` rather than in `/tmp`, and on an NFS-backed `PersistentVolume` both the rename and the `fsync` are the server's promise rather than the kernel's. And a mode you set on the published file is carried across each publish, so `chmod 640 sb.yml` on the shared volume survives the next reconcile.
 
 ### One process, one HTTP port
 

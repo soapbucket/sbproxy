@@ -5,6 +5,7 @@
 //! `use super::*` re-imports the parent module's private items and
 //! `use` aliases, so the moved code needs no rewiring.
 
+use super::downstream_body::{buffered_body_limit, read_capped_request_body, BufferedPolicyGate};
 use super::*;
 use crate::key_plane::key_store_entrypoint;
 #[cfg(test)]
@@ -572,16 +573,6 @@ fn upstream_response_is_successful_stream(status: u16, content_type: Option<&str
                 media_type.eq_ignore_ascii_case("text/event-stream")
                     || media_type.eq_ignore_ascii_case("application/x-ndjson")
             })
-}
-
-const DEFAULT_BUFFERED_AI_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024;
-const MAX_BUFFERED_AI_RESPONSE_BODY_BYTES: usize = 1024 * 1024 * 1024;
-
-fn buffered_ai_response_body_limit(configured: Option<usize>) -> usize {
-    configured
-        .filter(|maximum| *maximum > 0)
-        .unwrap_or(DEFAULT_BUFFERED_AI_RESPONSE_BODY_BYTES)
-        .min(MAX_BUFFERED_AI_RESPONSE_BODY_BYTES)
 }
 
 /// Compare the canonical request captured immediately after native inbound
@@ -5563,12 +5554,19 @@ pub(super) async fn handle_ai_proxy(
             method,
             http::Method::PUT | http::Method::PATCH
         ) {
-            let body_bytes = {
-                let mut buf = bytes::BytesMut::new();
-                while let Some(chunk) = session.read_request_body().await? {
-                    buf.extend_from_slice(&chunk);
-                }
-                buf.freeze()
+            // Capped on the way in for the same reason the POST path is
+            // (WOR-2616): this action answers from `request_filter`, so
+            // `request_body_filter`'s streaming cap never runs behind it.
+            let Some(body_bytes) = read_capped_request_body(
+                session,
+                ctx,
+                buffered_body_limit(config.max_body_size),
+                "AI request body too large",
+                BufferedPolicyGate::Ignore,
+            )
+            .await?
+            else {
+                return Ok(());
             };
             if body_bytes.is_empty() {
                 (None, Vec::new())
@@ -5913,12 +5911,23 @@ pub(super) async fn handle_ai_proxy(
     // then fails with a spurious 400 (WOR-795 body-buffering fix). The AI
     // dispatch builds its own upstream request, so draining here does not
     // affect forwarding.
-    let body_bytes = {
-        let mut buf = bytes::BytesMut::new();
-        while let Some(chunk) = session.read_request_body().await? {
-            buf.extend_from_slice(&chunk);
-        }
-        buf.freeze()
+    //
+    // `max_body_size` is the cap, applied while the body arrives rather
+    // than once it is all in memory, and it applies whether or not an
+    // operator configured one (WOR-2616). This sits ahead of provider
+    // dispatch, guardrails, idempotency capture, and the multipart
+    // branch, so a refusal contacts no upstream and writes no cache or
+    // idempotency record by construction rather than by extra guards.
+    let Some(body_bytes) = read_capped_request_body(
+        session,
+        ctx,
+        buffered_body_limit(config.max_body_size),
+        "AI request body too large",
+        BufferedPolicyGate::Ignore,
+    )
+    .await?
+    else {
+        return Ok(());
     };
 
     // WOR-229: stash the native body so the dispatcher can
@@ -6202,11 +6211,10 @@ pub(super) async fn handle_ai_proxy(
                 surface_label,
             );
         }
-        let maximum = config
-            .max_body_size
-            .filter(|maximum| *maximum > 0)
-            .unwrap_or(64 * 1024 * 1024)
-            .min(1024 * 1024 * 1024);
+        // The cap the inbound read already applied. The model-rewrite
+        // below can grow the multipart body, so it is bounded against
+        // the same number rather than a second inlined copy of it.
+        let maximum = buffered_body_limit(config.max_body_size);
         let mut forwarded_body = body_bytes.clone();
         let mut requested_model =
             crate::model_plane::multipart_model(body_bytes.as_ref(), &request_content_type)
@@ -10723,11 +10731,7 @@ pub(super) async fn handle_ai_proxy(
                                 .get("region")
                                 .cloned()
                                 .or_else(|| ctx.request_geo.clone());
-                            let maximum = config
-                                .max_body_size
-                                .filter(|maximum| *maximum > 0)
-                                .unwrap_or(64 * 1024 * 1024)
-                                .min(1024 * 1024 * 1024);
+                            let maximum = buffered_body_limit(config.max_body_size);
                             let managed = crate::server::model_host::distributed_managed_upstream(
                                 crate::server::model_host::ManagedDistributedRequest {
                                     origin: &origin,
@@ -11293,7 +11297,7 @@ pub(super) async fn handle_ai_proxy(
                     last_format,
                     hostname,
                     None,
-                    Some(buffered_ai_response_body_limit(config.max_body_size)),
+                    Some(buffered_body_limit(config.max_body_size)),
                     recorder,
                     router_sink,
                     Some(ctx),
@@ -12099,8 +12103,32 @@ pub(super) async fn read_capped_response_body(
         Some(c) if c > 0 => c,
         _ => {
             return resp.bytes().await.map_err(|e| {
-                warn!(error = %e, "AI proxy: failed to read upstream response body");
-                Error::because(ErrorType::ReadError, "failed to read upstream response", e)
+                // Not `error = %e`: a reqwest Display ends with
+                // `" for url ({url})"` for every error that carries one,
+                // and some providers carry the API key in that URL's
+                // query string (WOR-2629).
+                //
+                // The cause handed to `Error::because` needs the same
+                // treatment, and for the same reason. pingora's own
+                // `Display` writes `" cause: {c}"` for a non-pingora
+                // cause, and pingora-proxy logs the error it gets back
+                // out of `request_filter`, so the reqwest Display reaches
+                // a second log line this one cannot see. `without_url`
+                // is what keeps the URL off both.
+                //
+                // Which reqwest errors carry a URL is reqwest's business
+                // and it changes: 0.12 attaches it on the send path and
+                // not on this read path, and its successor attaches it
+                // here too. `without_url` holds the property whichever
+                // is resolved, which is the point of calling it on a
+                // path where today it happens to be a no-op.
+                let summary = sbproxy_httpkit::request_error_summary(&e);
+                warn!(error = %summary, "AI proxy: failed to read upstream response body");
+                Error::because(
+                    ErrorType::ReadError,
+                    "failed to read upstream response",
+                    e.without_url(),
+                )
             });
         }
     };
@@ -12121,8 +12149,13 @@ pub(super) async fn read_capped_response_body(
     let mut buf = bytes::BytesMut::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| {
-            warn!(error = %e, "AI proxy: failed to read upstream response body");
-            Error::because(ErrorType::ReadError, "failed to read upstream response", e)
+            let summary = sbproxy_httpkit::request_error_summary(&e);
+            warn!(error = %summary, "AI proxy: failed to read upstream response body");
+            Error::because(
+                ErrorType::ReadError,
+                "failed to read upstream response",
+                e.without_url(),
+            )
         })?;
         if buf.len().saturating_add(chunk.len()) > cap {
             warn!(
@@ -16759,30 +16792,75 @@ mod external_guardrail_context_tests {
         body: Vec<u8>,
         extra_headers: &[(&str, &str)],
     ) -> (Session, DownstreamClient) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind downstream fixture");
-        let address = listener.local_addr().expect("downstream address");
-        let method = method.to_string();
-        let path = path.to_string();
-        let content_type = content_type.to_string();
         let extra = extra_headers
             .iter()
             .map(|(name, value)| format!("{name}: {value}\r\n"))
             .collect::<String>();
+        let mut wire = format!(
+            "{method} {path} HTTP/1.1\r\nHost: ai.test\r\ncontent-type: {content_type}\r\nIdempotency-Key: guardrail-test\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        wire.extend_from_slice(&body);
+        downstream_wire_session(wire).await
+    }
+
+    /// A downstream request whose body arrives chunked, so it declares
+    /// no `Content-Length` at all.
+    ///
+    /// The declared-length refusal and the streaming refusal are
+    /// separate code paths, and a `request_limit` policy only ever sees
+    /// the first: a client that frames its upload chunked tells the
+    /// gateway nothing about its size up front.
+    async fn downstream_chunked_session(
+        method: &str,
+        path: &str,
+        content_type: &str,
+        chunks: &[Vec<u8>],
+    ) -> (Session, DownstreamClient) {
+        let mut wire = format!(
+            "{method} {path} HTTP/1.1\r\nHost: ai.test\r\ncontent-type: {content_type}\r\nIdempotency-Key: guardrail-test\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        for chunk in chunks {
+            wire.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            wire.extend_from_slice(chunk);
+            wire.extend_from_slice(b"\r\n");
+        }
+        wire.extend_from_slice(b"0\r\n\r\n");
+        downstream_wire_session(wire).await
+    }
+
+    /// Close a session the way pingora closes one after a generated
+    /// response: read whatever the client still has in flight first.
+    ///
+    /// A refusal answers without ever reading the request body, and a
+    /// socket dropped with bytes still in its receive queue closes with
+    /// an RST rather than a FIN. The RST discards the response the
+    /// gateway already wrote, so the client fixture sees a 413 whose
+    /// body never arrived and the test fails on a race it cannot win.
+    /// Production does not have that problem: pingora drains the
+    /// downstream body before closing on a generated response. This
+    /// harness calls `handle_ai_proxy` directly, so the drain has to
+    /// happen here or the refusal tests are flaky by construction.
+    async fn drain_and_close(mut session: Session) {
+        let drain = async { while let Ok(Some(_)) = session.read_request_body().await {} };
+        // Bounded: a body the session will not give up must not turn a
+        // failed assertion into a hung test.
+        let _ = tokio::time::timeout(Duration::from_secs(2), drain).await;
+        drop(session);
+    }
+
+    async fn downstream_wire_session(wire: Vec<u8>) -> (Session, DownstreamClient) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind downstream fixture");
+        let address = listener.local_addr().expect("downstream address");
         let mut client = DownstreamClient::new(tokio::spawn(async move {
             let mut stream = tokio::net::TcpStream::connect(address)
                 .await
                 .expect("connect downstream fixture");
-            let request = format!(
-                "{method} {path} HTTP/1.1\r\nHost: ai.test\r\ncontent-type: {content_type}\r\nIdempotency-Key: guardrail-test\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n",
-                body.len()
-            );
-            stream
-                .write_all(request.as_bytes())
-                .await
-                .expect("write request headers");
-            stream.write_all(&body).await.expect("write request body");
+            stream.write_all(&wire).await.expect("write request");
             // Half-close after the request. An early policy refusal never
             // reads the body, and a close with unread data in the socket
             // buffer is what turns the server's FIN into an RST; the RST
@@ -16900,6 +16978,69 @@ mod external_guardrail_context_tests {
         upstream_bytes_fixture_with_status(body, content_type, 200).await
     }
 
+    /// Read one whole request off `stream` before answering it.
+    ///
+    /// Not cosmetic. A fixture that answers with bytes still sitting
+    /// unread in its receive queue turns its own close into an RST, and
+    /// the RST arrives at the gateway between the response headers and
+    /// the response body: the relay's body read then fails with
+    /// `ConnectionReset` and the test sees a transport error instead of
+    /// the 200 the upstream actually wrote. The old single 4096-byte
+    /// read was under every request any test sent until one carried a
+    /// body larger than that (WOR-2616's inside-the-cap forward).
+    async fn drain_upstream_request(stream: &mut tokio::net::TcpStream) {
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let read = match stream.read(&mut chunk).await {
+                Ok(0) => return,
+                Ok(read) => read,
+                Err(_) => return,
+            };
+            request.extend_from_slice(&chunk[..read]);
+            let Some(headers_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..headers_end]);
+            let chunked = headers.lines().any(|line| {
+                line.split_once(':').is_some_and(|(name, value)| {
+                    name.eq_ignore_ascii_case("transfer-encoding")
+                        && value.to_ascii_lowercase().contains("chunked")
+                })
+            });
+            if chunked {
+                // Chunked uploads end with the zero-length chunk; a
+                // fixture that stopped at the headers would leave the
+                // whole body unread.
+                while !request.ends_with(b"0\r\n\r\n") {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => request.extend_from_slice(&chunk[..read]),
+                    }
+                }
+                return;
+            }
+            let declared = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            let expected = headers_end + 4 + declared;
+            while request.len() < expected {
+                match stream.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => request.extend_from_slice(&chunk[..read]),
+                }
+            }
+            return;
+        }
+    }
+
     async fn upstream_bytes_fixture_with_status(
         body: Vec<u8>,
         content_type: Option<&'static str>,
@@ -16914,11 +17055,7 @@ mod external_guardrail_context_tests {
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept upstream request");
             observed.fetch_add(1, Ordering::SeqCst);
-            let mut request = [0_u8; 4096];
-            let _ = stream
-                .read(&mut request)
-                .await
-                .expect("read upstream request");
+            drain_upstream_request(&mut stream).await;
             let content_type_header = content_type
                 .map(|content_type| format!("content-type: {content_type}\r\n"))
                 .unwrap_or_default();
@@ -17879,6 +18016,205 @@ origins:
         assert_eq!(response_json(&response), upstream_error);
         assert_single_body_aware_provider_diagnostic(&warnings, "openai", 400);
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    // --- WOR-2616: the AI gateway's inbound body cap ---
+
+    /// The OpenAI fixture config with an explicit inbound body cap.
+    fn capped_proxy_config(
+        upstream_url: &str,
+        max_body_size: usize,
+    ) -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }],
+            "max_body_size": max_body_size
+        }))
+        .expect("capped proxy config")
+    }
+
+    /// A syntactically valid chat request padded to `bytes` or so, so a
+    /// body that clears the cap still parses and reaches the upstream.
+    fn padded_chat_request(bytes: usize) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "x".repeat(bytes)}]
+        }))
+        .expect("padded request JSON")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ai_post_refuses_a_chunked_body_past_max_body_size() {
+        // Chunked framing declares no `Content-Length`, so nothing the
+        // admission phase can read says how big this is. Before
+        // WOR-2616 the POST drain buffered all of it and the request
+        // reached the provider; `request_body_filter`'s streaming cap
+        // never ran because the AI action answers from `request_filter`.
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture(
+            serde_json::to_vec(&serde_json::json!({
+                "id": "chatcmpl-1",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+            }))
+            .expect("upstream JSON"),
+            "application/json",
+        )
+        .await;
+        let config = capped_proxy_config(&upstream_url, 1024);
+        let payload = padded_chat_request(4096);
+        let chunks = payload
+            .chunks(512)
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<Vec<u8>>>();
+        let (mut session, client) =
+            downstream_chunked_session("POST", "/v1/chat/completions", "application/json", &chunks)
+                .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("an oversize body is a refusal, not a transport error");
+        drain_and_close(session).await;
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 413"), "{response:?}");
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            0,
+            "a refused body must not reach the provider"
+        );
+        assert_eq!(context.response_status, Some(413));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ai_post_refuses_an_oversize_declared_length_before_reading() {
+        // The honest client hears no before it sends the bytes.
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture(
+            serde_json::to_vec(&serde_json::json!({"id": "chatcmpl-1"})).expect("upstream JSON"),
+            "application/json",
+        )
+        .await;
+        let config = capped_proxy_config(&upstream_url, 1024);
+        let (mut session, client) = downstream_bytes_session(
+            "/v1/chat/completions",
+            "application/json",
+            padded_chat_request(4096),
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("an oversize declared length is a refusal");
+        drain_and_close(session).await;
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 413"), "{response:?}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ai_put_refuses_a_chunked_body_past_max_body_size() {
+        // The method-aware branch drains its own body separately from
+        // the POST path, so it needs its own proof.
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture(
+            serde_json::to_vec(&serde_json::json!({"id": "file-1"})).expect("upstream JSON"),
+            "application/json",
+        )
+        .await;
+        let config = capped_proxy_config(&upstream_url, 1024);
+        // Valid JSON on purpose: without the cap this parses, dispatches,
+        // and the fixture below counts the hit.
+        let (mut session, client) = downstream_chunked_session(
+            "PUT",
+            "/v1/files/file-1",
+            "application/json",
+            &[padded_chat_request(4096)],
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("an oversize body is a refusal, not a transport error");
+        drain_and_close(session).await;
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 413"), "{response:?}");
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            0,
+            "a refused body must not reach the provider"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ai_post_still_forwards_a_chunked_body_inside_the_cap() {
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture(
+            serde_json::to_vec(&serde_json::json!({
+                "id": "chatcmpl-1",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+            }))
+            .expect("upstream JSON"),
+            "application/json",
+        )
+        .await;
+        let config = capped_proxy_config(&upstream_url, 65_536);
+        let payload = padded_chat_request(4096);
+        let chunks = payload
+            .chunks(512)
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<Vec<u8>>>();
+        let (mut session, client) =
+            downstream_chunked_session("POST", "/v1/chat/completions", "application/json", &chunks)
+                .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("a body inside the cap dispatches");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            context.request_body_bytes,
+            payload.len() as u64,
+            "the access log's bytes_in must count what the gateway read"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -22060,11 +22396,10 @@ mod request_policy_tests {
 mod compression_selection_tests {
     use super::{
         ai_policy_input_tokens_est, ai_policy_prompt_fingerprint, bind_compression_selection,
-        buffered_ai_response_body_limit, compression_header_value,
-        compression_selection_bypasses_cache, compression_selection_outcome,
-        native_bypass_body_changed, native_bypass_is_safe, resolve_compression_selection_intent,
-        upstream_response_is_successful_stream, CompressionSelectionError,
-        CompressionSelectionSource, ResolvedRequestKey,
+        buffered_body_limit, compression_header_value, compression_selection_bypasses_cache,
+        compression_selection_outcome, native_bypass_body_changed, native_bypass_is_safe,
+        resolve_compression_selection_intent, upstream_response_is_successful_stream,
+        CompressionSelectionError, CompressionSelectionSource, ResolvedRequestKey,
     };
     use http::{HeaderMap, HeaderValue};
     use sbproxy_ai::compression::CompressionSelector;
@@ -22359,13 +22694,10 @@ mod compression_selection_tests {
 
     #[test]
     fn buffered_stream_fallback_always_has_a_bounded_body_limit() {
-        assert_eq!(buffered_ai_response_body_limit(None), 64 * 1024 * 1024);
-        assert_eq!(buffered_ai_response_body_limit(Some(0)), 64 * 1024 * 1024);
-        assert_eq!(buffered_ai_response_body_limit(Some(1024)), 1024);
-        assert_eq!(
-            buffered_ai_response_body_limit(Some(usize::MAX)),
-            1024 * 1024 * 1024
-        );
+        assert_eq!(buffered_body_limit(None), 64 * 1024 * 1024);
+        assert_eq!(buffered_body_limit(Some(0)), 64 * 1024 * 1024);
+        assert_eq!(buffered_body_limit(Some(1024)), 1024);
+        assert_eq!(buffered_body_limit(Some(usize::MAX)), 1024 * 1024 * 1024);
     }
 
     #[test]
@@ -24824,6 +25156,173 @@ mod served_model_rewrite_tests {
         assert!(
             mcp_inject_denial_first_seen(rev_b, "acme", "gw-typo"),
             "a hot reload re-arms the latch for the same reference"
+        );
+    }
+}
+
+#[cfg(test)]
+mod upstream_body_error_redaction_tests {
+    use pingora_error::{Error, ErrorType};
+
+    use super::read_capped_response_body;
+
+    /// An upstream that promises a body and then hangs up, so the body
+    /// read fails. The provider path puts an API key in that URL's query
+    /// on several providers, which is why anything that renders the URL
+    /// on this path is a leak and not just noise.
+    ///
+    /// Note what this fixture does *not* prove, because the sibling test
+    /// below used to claim it did: the error reqwest hands back here
+    /// carries no URL. `Response::bytes` maps its failure through
+    /// `error::decode`, which leaves `url` unset, so a reqwest 0.12
+    /// body-read error renders as `error decoding response body` and
+    /// nothing more. See [`an_unstripped_cause_is_rendered_by_pingora_and_would_leak`]
+    /// for why `without_url` is still the thing that has to be there.
+    async fn truncated_upstream() -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback listener binds");
+        let port = listener
+            .local_addr()
+            .expect("the listener has an addr")
+            .port();
+        let server = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut scratch = [0u8; 1024];
+                let _ = socket.read(&mut scratch).await;
+                // Content-Length promises 4096 bytes; four are sent and
+                // the connection closes, so the body read errors.
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\nabcd")
+                    .await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (
+            format!("http://127.0.0.1:{port}/v1/messages?api-key=query-secret"),
+            server,
+        )
+    }
+
+    /// The `warn!` was redacted first and the pingora cause was not, which
+    /// is not redaction: pingora's `Display` writes `" cause: {c}"` for a
+    /// non-pingora cause, and pingora-proxy logs the error it gets back
+    /// out of `request_filter`. So the URL reached a second log line the
+    /// first fix could not see.
+    #[tokio::test]
+    async fn a_body_read_failure_never_carries_the_upstream_url_into_the_cause() {
+        let (url, server) = truncated_upstream().await;
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .send()
+            .await
+            .expect("the stub upstream answers with headers");
+
+        let err = read_capped_response_body(resp, None)
+            .await
+            .expect_err("a truncated body is a read failure");
+        server.abort();
+
+        let rendered = format!("{err}");
+        assert!(
+            !rendered.contains("query-secret"),
+            "the query string reached the pingora cause chain: {rendered}"
+        );
+        assert!(
+            !rendered.contains("127.0.0.1"),
+            "the upstream origin reached the pingora cause chain: {rendered}"
+        );
+        assert!(
+            rendered.contains("failed to read upstream response"),
+            "the context was lost along with the url: {rendered}"
+        );
+    }
+
+    /// A `reqwest::Error` that does carry its request URL.
+    ///
+    /// reqwest attaches the URL on its send path and not on its read
+    /// path: `async_impl::client` calls `with_url` on a connect, TLS, or
+    /// timeout failure, while `Response::bytes` goes through
+    /// `error::decode` and leaves it unset. Both are the same
+    /// `reqwest::Error` type reaching the same `Error::because` call, so
+    /// a refused connect is the honest way to get one with a URL in it.
+    async fn url_bearing_send_error() -> reqwest::Error {
+        // Bind to learn a free port, then release it, so the connect is
+        // refused immediately rather than left hanging on a port that
+        // might belong to something else.
+        let port = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("a loopback listener binds");
+            listener
+                .local_addr()
+                .expect("the listener has an addr")
+                .port()
+        };
+        reqwest::Client::new()
+            .get(format!(
+                "http://127.0.0.1:{port}/v1/messages?api-key=query-secret"
+            ))
+            .send()
+            .await
+            .expect_err("nothing is listening on a released port")
+    }
+
+    /// The half this pins is pingora's, not reqwest's: a cause that has
+    /// not been stripped is rendered verbatim into the error text, so any
+    /// cause carrying a URL reaches the second log line pingora-proxy
+    /// writes when `request_filter` hands this error back.
+    ///
+    /// It builds that cause from a send failure rather than from
+    /// [`truncated_upstream`]'s read failure, because reqwest 0.12 does
+    /// not attach the URL to a read failure. The strip is not thereby
+    /// pointless: `without_url` is applied to whatever reqwest returns,
+    /// reqwest's own successor attaches the URL to the read path too
+    /// (`do_bytes` calls `with_url`, and 0.13 is already in this
+    /// workspace's dependency graph), and the send-shaped error pinned
+    /// here is the same type reaching the same `Error::because`. Making
+    /// the guarantee hold by construction rather than by knowing which
+    /// reqwest variant is in the tree is the whole point of the call.
+    #[tokio::test]
+    async fn an_unstripped_cause_is_rendered_by_pingora_and_would_leak() {
+        let raw = url_bearing_send_error().await;
+        assert!(
+            format!("{raw}").contains("query-secret"),
+            "the premise changed: a reqwest Display no longer carries its url"
+        );
+
+        let leaked = format!(
+            "{}",
+            Error::because(
+                ErrorType::ReadError,
+                "failed to read upstream response",
+                raw
+            )
+        );
+        assert!(
+            leaked.contains("query-secret"),
+            "pingora stopped rendering the cause; the strip is now untested: {leaked}"
+        );
+
+        // And the strip is what closes it: the same error, stripped, is
+        // rendered by the same pingora call without the URL.
+        let stripped = format!(
+            "{}",
+            Error::because(
+                ErrorType::ReadError,
+                "failed to read upstream response",
+                url_bearing_send_error().await.without_url()
+            )
+        );
+        assert!(
+            !stripped.contains("query-secret"),
+            "without_url stopped removing the url: {stripped}"
+        );
+        assert!(
+            stripped.contains("failed to read upstream response"),
+            "the context was lost along with the url: {stripped}"
         );
     }
 }

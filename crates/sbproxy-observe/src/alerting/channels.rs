@@ -11,6 +11,8 @@
 //! derived from the rule identity plus labels, so repeated fires of the
 //! same rule group into one incident and a `resolved` alert closes it.
 
+use sbproxy_httpkit::request_error_summary;
+use sbproxy_security::url_redact::redacted_url;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -447,9 +449,18 @@ async fn deliver_json(
         .header("Content-Type", "application/json")
         .header("User-Agent", format!("sbproxy/{}", version()))
         .json(&body);
+    // Origin only. A Slack incoming-webhook URL keeps its whole secret
+    // in the path, so the target is named by scheme, host, and port at
+    // every one of these three sites (WOR-2629).
+    let webhook_origin = redacted_url(&url);
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
-            tracing::debug!(target: "alerting", url = %url, kind = %kind, "alert delivered");
+            tracing::debug!(
+                target: "alerting",
+                url = %webhook_origin,
+                kind = %kind,
+                "alert delivered"
+            );
             Ok(())
         }
         Ok(resp) => {
@@ -457,7 +468,7 @@ async fn deliver_json(
             let status = resp.status();
             tracing::warn!(
                 target: "alerting",
-                url = %url,
+                url = %webhook_origin,
                 kind = %kind,
                 status = %status,
                 "alert delivery non-success"
@@ -466,14 +477,15 @@ async fn deliver_json(
         }
         Err(e) => {
             crate::metrics::record_telemetry_dropped(kind, "delivery_failed");
+            let summary = request_error_summary(&e);
             tracing::warn!(
                 target: "alerting",
-                url = %url,
+                url = %webhook_origin,
                 kind = %kind,
-                error = %e,
+                error = %summary,
                 "alert delivery failed"
             );
-            Err(request_error_summary(&e))
+            Err(summary)
         }
     }
 }
@@ -555,32 +567,37 @@ async fn deliver_alert(
         req = req.header(name.as_str(), value.as_str());
     }
 
+    let webhook_origin = redacted_url(&url);
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
-            tracing::debug!(url = %url, "alerting: webhook delivered");
+            tracing::debug!(url = %webhook_origin, "alerting: webhook delivered");
             Ok(())
         }
         Ok(resp) => {
             crate::metrics::record_telemetry_dropped(WEBHOOK_DROP_KIND, "http_error");
             let status = resp.status();
-            tracing::warn!(url = %url, status = %status, "alerting: webhook non-success");
+            tracing::warn!(
+                url = %webhook_origin,
+                status = %status,
+                "alerting: webhook non-success"
+            );
             Err(format!("HTTP {}", status.as_u16()))
         }
         Err(e) => {
             crate::metrics::record_telemetry_dropped(WEBHOOK_DROP_KIND, "delivery_failed");
-            tracing::warn!(url = %url, error = %e, "alerting: webhook delivery failed");
-            Err(request_error_summary(&e))
+            // `error = %e` here wrote the whole webhook URL: a
+            // `reqwest::Error` Display ends with " for url ({url})", and
+            // for this receiver the path is the credential. The summary
+            // was already being computed for the returned Err and is now
+            // what the log line carries too (WOR-2629).
+            let summary = request_error_summary(&e);
+            tracing::warn!(
+                url = %webhook_origin,
+                error = %summary,
+                "alerting: webhook delivery failed"
+            );
+            Err(summary)
         }
-    }
-}
-
-fn request_error_summary(error: &reqwest::Error) -> String {
-    if error.is_timeout() {
-        "request timed out".to_string()
-    } else if error.is_connect() {
-        "connection failed".to_string()
-    } else {
-        "request failed".to_string()
     }
 }
 

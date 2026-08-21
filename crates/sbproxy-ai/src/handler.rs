@@ -106,6 +106,22 @@ pub struct AiHandlerConfig {
     #[serde(default)]
     pub model_aliases: Vec<crate::model_alias::ModelAlias>,
     /// Maximum request body size in bytes accepted by the gateway.
+    ///
+    /// Checked while the body arrives rather than once it is all in
+    /// memory. A declared `Content-Length` over the cap is refused
+    /// before the first read; a chunked upload that declares nothing is
+    /// refused on the chunk that crosses the line. Both answer `413`
+    /// from the request phase, so no provider is contacted and nothing
+    /// reaches the response cache or the idempotency store.
+    ///
+    /// The same number bounds the buffered upstream response the relay
+    /// holds in memory, and the multipart body a governed model
+    /// rewrite produces.
+    ///
+    /// Unset means 64 MiB, not unlimited. An AI request body has to be
+    /// held whole before it can be parsed, routed, and scanned, so a
+    /// deployment that configured no cap still has one; `0` reads as
+    /// unset, and anything above 1 GiB is clamped to 1 GiB.
     #[serde(default)]
     pub max_body_size: Option<usize>,
     /// Optional input/output guardrails pipeline.

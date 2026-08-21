@@ -14,12 +14,19 @@ description = "Storage abstraction (ephemeral KV, persistent KV, set, pub/sub) w
 
 [features]
 default = ["redis"]
-# Redis backend (RedisStore) and its async deps.
-redis = ["dep:redis", "dep:futures"]
+# Redis backend (RedisStore) and its async deps, plus the shared URL
+# redactor the DSN error paths run through.
+redis = ["dep:redis", "dep:futures", "dep:sbproxy-security"]
 # In-memory test doubles for trait-driven tests in downstream crates.
 mock = []
 
 [dependencies]
+# Shared URL redactor, so a DSN password cannot reach a StorageError
+# string (WOR-2640). sbproxy-security depends on no workspace crate, so
+# this edge cannot become a cycle. Optional and enabled by `redis`,
+# which is the only backend that has a DSN to redact.
+sbproxy-security = { workspace = true, optional = true }
+
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

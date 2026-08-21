@@ -467,7 +467,13 @@ pub struct LdapAuthProvider {
 /// Serde shape for [`LdapAuthProvider::from_config`]. Kept separate so
 /// validation runs after deserialization and every refusal names the
 /// offending field.
+///
+/// WOR-2181: unknown keys are refused, so `tls_verfiy: false` fails
+/// the config instead of leaving verification on while the operator
+/// believes they turned it off. `type:` is stripped by
+/// `crate::auth::provider_config_from_value` before this parses.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawLdapConfig {
     url: String,
     base_dn: String,
@@ -499,8 +505,9 @@ impl LdapAuthProvider {
     /// * `base_dn` must be non-empty; `uid_attribute` must be a valid
     ///   LDAP attribute descriptor (RFC 4512 section 2.5) so the
     ///   composed DN stays well-formed.
+    /// * Unknown keys are refused (WOR-2181).
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
-        let raw: RawLdapConfig = serde_json::from_value(value)?;
+        let raw: RawLdapConfig = crate::auth::provider_config_from_value(value)?;
 
         let parsed = url::Url::parse(&raw.url)
             .map_err(|e| anyhow::anyhow!("ldap_auth: invalid url: {e}"))?;

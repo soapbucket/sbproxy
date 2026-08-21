@@ -20,6 +20,10 @@ tls-fingerprint = []
 [dependencies]
 sbproxy-config.workspace = true
 sbproxy-platform.workspace = true
+# Shared URL redactor for the object-store cert backend, whose URL an
+# operator can write credentials into (WOR-2640). No cycle:
+# sbproxy-security depends on no workspace crate.
+sbproxy-security.workspace = true
 
 # Hex encoding for JA3/JA4 outputs.
 hex.workspace = true

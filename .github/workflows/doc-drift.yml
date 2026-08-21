@@ -11,6 +11,16 @@ on:
       - 'docs/**'
       - 'llms.txt'
       - 'README.md'
+      # The three targets below were policed by the script and had no
+      # trigger, so a PR touching only one of them never ran the lane.
+      # MIGRATION.md is the page WOR-2627 found still claiming "90+".
+      - 'MIGRATION.md'
+      - 'SECURITY.md'
+      - 'CLAUDE.md'
+      # The provider count is now read from the catalog, so a PR that
+      # adds a provider and updates no prose is exactly the PR this
+      # lane has to run on.
+      - 'crates/sbproxy-ai/data/**'
       - 'schemas/sb-config.schema.json'
       - 'scripts/check-doc-drift.sh'
       - '.github/workflows/release.yml'

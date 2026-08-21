@@ -118,6 +118,10 @@ rag-full = [
 [dependencies]
 sbproxy-plugin.workspace = true
 sbproxy-util.workspace = true
+# `request_error_summary`: every outbound webhook, mirror, and OIDC
+# call in this crate logs a reqwest failure, and that error's Display
+# ends with " for url ({url})" (WOR-2629).
+sbproxy-httpkit.workspace = true
 sbproxy-config.workspace = true
 sbproxy-tls.workspace = true
 sbproxy-modules.workspace = true
