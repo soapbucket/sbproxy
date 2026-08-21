@@ -48,6 +48,10 @@ pub struct OutlierDetectorConfig {
 
     /// How long an ejected endpoint stays out of the pool before being
     /// re-admitted and probed again.  Default: 30 s.
+    ///
+    /// Ejection restarts the endpoint's measurement window, so the traffic
+    /// that decides whether it stays in the pool after re-admission is only
+    /// the traffic it served after re-admission.
     pub ejection_duration_secs: u64,
 }
 
@@ -182,6 +186,16 @@ impl OutlierDetector {
                 let re_admit_at = now + Duration::from_secs(self.config.ejection_duration_secs);
                 ejected_map.insert(endpoint.clone(), re_admit_at);
                 newly_ejected.push(endpoint.clone());
+                // Start the endpoint on a clean window at the moment of
+                // ejection. The cooldown exists so traffic can probe whether
+                // the endpoint recovered, and a probe graded against the
+                // failures that caused the ejection is not a probe: a
+                // recovered endpoint serving four clean requests and one
+                // unrelated 5xx would still read as over threshold and be
+                // ejected again, on repeat, until `window_secs` expired. The
+                // operator configured `ejection_duration_secs`, so that is
+                // what the ejection has to last.
+                *stats = EndpointStats::new();
             }
         }
 
@@ -371,6 +385,43 @@ mod tests {
         assert!(
             second.is_empty(),
             "already-ejected endpoint should not appear again"
+        );
+    }
+
+    #[test]
+    fn a_re_admitted_endpoint_is_graded_only_on_post_ejection_traffic() {
+        // The seam: `check_ejections` inserting into `ejected` while leaving
+        // `stats` alone. The pre-ejection failures kept counting against the
+        // endpoint for the rest of `window_secs`, so a healthy endpoint was
+        // re-ejected on its first later error and the operator's 30 s
+        // ejection behaved as a 5 minute one.
+        let detector = OutlierDetector::new(OutlierDetectorConfig {
+            threshold: 0.5,
+            window_secs: 300,
+            min_requests: 5,
+            ejection_duration_secs: 0,
+        });
+
+        for _ in 0..5 {
+            detector.record_failure("probe-me");
+        }
+        assert_eq!(detector.check_ejections(), vec!["probe-me".to_string()]);
+        assert!(
+            !detector.is_ejected("probe-me"),
+            "ejection_duration_secs = 0 re-admits on the next lookup"
+        );
+
+        // Post-recovery traffic: 1 failure in 5 is a 20 % error rate, well
+        // under the configured 50 % threshold.
+        for _ in 0..4 {
+            detector.record_success("probe-me");
+        }
+        detector.record_failure("probe-me");
+
+        assert!(
+            detector.check_ejections().is_empty(),
+            "a recovered endpoint at 20 % errors must not be re-ejected on \
+             failures the ejection already accounted for"
         );
     }
 

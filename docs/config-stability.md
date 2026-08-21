@@ -386,6 +386,78 @@ OpenAPI tool calls, never its token endpoint.
 **What to do before upgrading.** Add every MCP token endpoint host to
 `egress.token_exchange.hosts` alongside the non-MCP ones already there.
 
+### Circuit breakers now admit one probe at a time in half-open
+
+**Who this reaches.** Any config with a `circuit_breaker:` block on a
+`load_balancer` action, an AI router with circuit breaking enabled, or the AI
+crawl-control HTTP ledger client. A config with no breaker configured is
+unaffected.
+
+**What changes.** Half-open admitted every request that arrived. At high
+concurrency that meant the full request rate was pointed back at the upstream
+the instant `open_duration_secs` lapsed, before any of those requests had
+returned a verdict, once per open duration for as long as the upstream stayed
+down. Half-open now hands out one probe slot at a time: the request that takes
+it goes through, everything else is refused as if the breaker were still open,
+and the slot returns when that probe reports success or failure. A probe whose
+caller never reports an outcome is written off after one more open duration, so
+the breaker cannot get stuck refusing.
+
+**What an operator sees when it bites.** Fewer requests reach a recovering
+upstream, and recovery takes `success_threshold` sequential probes rather than
+one concurrent burst. On a load balancer the breaker is one narrowing stage
+among several and stays advisory: when it filters out every target in the pool,
+the request is still routed rather than failed, so a single-target pool behaves
+as before.
+
+**What to do before upgrading.** Nothing, unless you were relying on a
+recovering upstream absorbing a burst. If your upstream needs more than one
+concurrent probe to warm up, raise `success_threshold` rather than expecting
+concurrency.
+
+### Outlier ejection restarts the endpoint's measurement window
+
+**Who this reaches.** Any config with an `outlier_detection:` block whose
+`window_secs` is longer than its `ejection_duration_secs`, which is the
+default shape (60 s window, 30 s ejection).
+
+**What changes.** The failures that caused an ejection kept counting against
+the endpoint after it was re-admitted, until `window_secs` expired from the
+original window start. A re-admitted endpoint was therefore graded on
+pre-ejection traffic and was usually re-ejected on its first later error, so a
+configured 30 s ejection behaved as a `window_secs`-long one. Ejection now
+zeroes the endpoint's counters and starts a fresh window, so the post-ejection
+probe is graded only on post-ejection traffic.
+
+**What an operator sees when it bites.** Endpoints come back into the pool at
+the cooldown you configured instead of at the end of the window, and a healthy
+endpoint that takes one unrelated 5xx after re-admission stays in the pool.
+Endpoints that are genuinely still broken are re-ejected after `min_requests`
+fresh requests rather than immediately.
+
+**What to do before upgrading.** If you were leaning on the old behavior to
+keep a bad endpoint out for the length of the window, set
+`ejection_duration_secs` to the duration you actually want.
+
+### There is no PROXY protocol configuration key
+
+**Who this reaches.** Anyone deploying behind an AWS NLB, HAProxy, or another
+load balancer configured to send a PROXY protocol preamble.
+
+**What changes.** Nothing in the product. What changes is the claim:
+`comparison.md` listed PROXY protocol v1 as supported. It is not. A v1 parser
+exists in the source tree, no listener calls it, and no configuration key
+enables it. The comparison table now says so.
+
+**What an operator sees when it bites.** Every connection fails. The
+`PROXY TCP4 ...\r\n` line is handed to the HTTP parser as the request line and
+returns 400, and the client address that reaches the access log, the WAF, and
+the IP-filter policy is the load balancer's rather than the client's.
+
+**What to do before upgrading.** Turn PROXY protocol off on the load balancer
+in front of SBproxy and pass the client address in a header
+(`X-Forwarded-For`) instead.
+
 ---
 
 ## Selected field stability reference

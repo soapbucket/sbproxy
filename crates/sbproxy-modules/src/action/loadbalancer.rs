@@ -221,11 +221,18 @@ fn default_health_healthy_threshold() -> u32 {
 /// Distinct from outlier detection (which ejects on a sliding-window
 /// error rate): the circuit breaker is a formal state machine that
 /// opens after `failure_threshold` consecutive failures, rejects all
-/// traffic for `open_duration_secs`, then admits a small number of
-/// probe requests in `HalfOpen`; on `success_threshold` consecutive
-/// successes it closes, otherwise it re-opens. One breaker is held
-/// per target, so a flaky target is isolated without taking down
+/// traffic for `open_duration_secs`, then admits one probe request at a
+/// time in `HalfOpen` while refusing the rest; on `success_threshold`
+/// consecutive successes it closes, otherwise it re-opens. One breaker
+/// is held per target, so a flaky target is isolated without taking down
 /// the rest of the pool.
+///
+/// The breaker is one narrowing stage among several, and it is advisory:
+/// when every target in the pool is filtered out, the load balancer
+/// falls back to the unfiltered pool rather than failing the request. A
+/// single-target pool therefore keeps receiving traffic through an open
+/// breaker; the breaker earns its keep by steering away from a bad
+/// target while a good one is left.
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct CircuitBreakerConfig {
     /// Consecutive failures (5xx, connect/timeout) before tripping.
