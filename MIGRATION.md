@@ -1,6 +1,6 @@
 # Migrating from v0.1.x (Go) to v1.0 (Rust)
 
-*Last modified: 2026-07-28*
+*Last modified: 2026-08-21*
 
 SBproxy v1.0 replaces the Go implementation with a Rust rewrite built on Cloudflare's Pingora. This document covers what changes for operators upgrading from a v0.1.x Go binary to a v1.0 Rust binary.
 
