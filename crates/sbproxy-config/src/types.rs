@@ -4584,9 +4584,11 @@ pub struct LuaScriptingConfig {
 ///   `Error::MemoryError`, which is far cheaper than letting a
 ///   runaway script OOM the proxy process.
 /// * `allow_patterns` gates the Lua pattern API (`string.find`,
-///   `string.match`, `string.gmatch`). The pattern engine has known
-///   pathological inputs that can lock a worker, so operators who do
-///   not need patterns can drop them entirely.
+///   `string.match`, `string.gmatch`, `string.gsub`). The pattern
+///   engine has known pathological inputs that can lock a worker, and
+///   `max_execution_ms` cannot preempt one because the matcher runs
+///   inside the C string library where the interrupt never fires. So
+///   operators who do not need patterns can drop them entirely.
 ///
 /// The on-the-wire field uses `max_memory_mb` (megabytes) because
 /// that is the unit operators reason about; the engine converts to
@@ -4603,8 +4605,11 @@ pub struct LuaSandboxConfig {
     #[serde(default = "default_lua_max_memory_mb")]
     pub max_memory_mb: usize,
     /// Whether to expose the Lua pattern API (`string.find`,
-    /// `string.match`, `string.gmatch`). Default: `true` for back
-    /// compatibility; flip to `false` to disable pattern matching.
+    /// `string.match`, `string.gmatch`, `string.gsub`). Those four are
+    /// the whole pattern-taking surface of the `string` table; the
+    /// rest of it (`upper`, `len`, `sub`, `rep`, and the others) stays
+    /// available either way. Default: `true` for back compatibility;
+    /// flip to `false` to disable pattern matching.
     #[serde(default = "default_lua_allow_patterns")]
     pub allow_patterns: bool,
 }
