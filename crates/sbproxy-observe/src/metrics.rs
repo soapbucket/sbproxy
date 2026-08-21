@@ -6063,8 +6063,10 @@ pub fn record_key_policy_stored_rejection(reason: &str) {
 /// Record a reconcile outcome on
 /// `sbproxy_operator_reconcile_total{kind, result}` and the matching
 /// duration histogram. `result` is one of `ok`, `conflict`,
-/// `backend_error`, `crd_invalid`. Buckets cover 1ms..60s (the
-/// reconcile envelope including server-side apply round-trips).
+/// `backend_error`, `crd_invalid`, or `fenced` (the replica could no
+/// longer prove it holds the leader lease and abandoned the pass
+/// without writing). Buckets cover 1ms..60s (the reconcile envelope
+/// including server-side apply round-trips).
 pub fn record_operator_reconcile(kind: &'static str, result: &'static str, duration_secs: f64) {
     use prometheus::{
         register_histogram_vec, register_int_counter_vec, HistogramVec, IntCounterVec,
@@ -7878,6 +7880,7 @@ mod tests {
         record_operator_reconcile("sbproxy", "conflict", 0.001);
         record_operator_reconcile("sbproxyconfig", "backend_error", 2.5);
         record_operator_reconcile("sbproxy", "crd_invalid", 0.005);
+        record_operator_reconcile("sbproxy", "fenced", 0.0);
         let out = metrics().render();
         assert!(
             out.contains("sbproxy_operator_reconcile_total"),
@@ -7887,7 +7890,7 @@ mod tests {
             out.contains("sbproxy_operator_reconcile_duration_seconds_bucket"),
             "operator reconcile duration buckets missing"
         );
-        for result in ["ok", "conflict", "backend_error", "crd_invalid"] {
+        for result in ["ok", "conflict", "backend_error", "crd_invalid", "fenced"] {
             assert!(
                 out.contains(&format!("result=\"{result}\"")),
                 "result={result} label missing"

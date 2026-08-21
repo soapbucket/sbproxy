@@ -1094,6 +1094,35 @@ pub fn check_acme_storage_for_replicas(sbproxy: &SBProxy, config_yaml: &str) -> 
     ))
 }
 
+// --- Status patches ---
+//
+// The `SBProxy` status carries two hashes because a reconcile pass has two
+// interesting moments and operators ask about both. Keeping the two patch
+// bodies here, named for the moment each belongs to, is what stops the
+// "rolled out" claim from drifting back to the top of the pass: the early
+// call site has no way to spell `configHash`.
+
+/// Status patch for the point in the pass where the config has been read,
+/// rendered, and validated, and nothing has been applied yet.
+///
+/// Deliberately does not carry `configHash` and does not clear `lastError`.
+/// Both are documented as end-of-rollout signals: an operator who sees
+/// `configHash: H1` with an empty `lastError` reads that as "the pods are on
+/// H1". Writing them here made a 403 on the very next ConfigMap patch report
+/// a completed rollout while every pod kept serving the previous config.
+pub fn observed_status_patch(config_hash: &str) -> serde_json::Value {
+    serde_json::json!({ "status": { "observedConfigHash": config_hash } })
+}
+
+/// Status patch for the point where the ConfigMap, Service, and workload have
+/// all been applied, or every pod has accepted a hot reload.
+///
+/// This is the only producer of `configHash`, and the only place `lastError`
+/// is cleared.
+pub fn rolled_out_status_patch(config_hash: &str) -> serde_json::Value {
+    serde_json::json!({ "status": { "configHash": config_hash, "lastError": "" } })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1738,5 +1767,50 @@ mod tests {
         // A document that does not parse belongs to validate_config_yaml,
         // which reports it with the parser's own message.
         assert!(check_acme_storage_for_replicas(&sbp, "origins:\n  x: [unterminated").is_ok());
+    }
+
+    // --- Status patches ---
+
+    #[test]
+    fn the_pre_apply_status_patch_cannot_claim_a_rollout() {
+        // The failure this prevents: validation passes, the ConfigMap apply
+        // then 403s, and `kubectl get sbproxy demo -o yaml` shows
+        // `configHash: H1` with an empty `lastError`, which the CRD documents
+        // as "the rollout happened". The pods are still on H0.
+        let patch = observed_status_patch("H1");
+        let status = patch.get("status").expect("a status patch");
+
+        assert_eq!(
+            status.get("observedConfigHash").and_then(|v| v.as_str()),
+            Some("H1"),
+            "the pre-apply write says the operator has seen H1"
+        );
+        assert!(
+            status.get("configHash").is_none(),
+            "configHash is the rolled-out signal and must not be written before \
+             anything is applied"
+        );
+        assert!(
+            status.get("lastError").is_none(),
+            "a merge patch with lastError: \"\" clears a real error before the \
+             pass that would have fixed it has run"
+        );
+    }
+
+    #[test]
+    fn the_post_apply_status_patch_stamps_the_hash_and_clears_the_error() {
+        let patch = rolled_out_status_patch("H1");
+        let status = patch.get("status").expect("a status patch");
+
+        assert_eq!(
+            status.get("configHash").and_then(|v| v.as_str()),
+            Some("H1")
+        );
+        assert_eq!(status.get("lastError").and_then(|v| v.as_str()), Some(""));
+        assert!(
+            status.get("observedConfigHash").is_none(),
+            "the pre-apply write already recorded it; re-writing it here would \
+             hide a pass that stamped one and not the other"
+        );
     }
 }

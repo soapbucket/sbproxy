@@ -166,17 +166,31 @@ pub struct ResourceRequirements {
     pub limits: std::collections::BTreeMap<String, String>,
 }
 
-/// Status reported by the operator. Currently records the last reconciled
-/// config hash so operators can confirm a rollout happened.
+/// Status reported by the operator, so `kubectl get sbproxy -o yaml` answers
+/// two different questions: what the operator has seen, and what is actually
+/// running.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SBProxyStatus {
-    /// Hash of the last `SBProxyConfig.spec.config` rolled out. Empty if the
-    /// referenced config has never been resolved.
+    /// Hash of the `SBProxyConfig.spec.config` that is running on the pods.
+    /// Written only after the ConfigMap, Service, and workload have all been
+    /// applied, or after every pod has accepted a hot reload. Empty until the
+    /// first rollout completes. When this trails `observedConfigHash`, a
+    /// rollout is in progress or is failing; check `lastError`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub config_hash: String,
 
-    /// Last error observed during reconcile, if any. Cleared on successful runs.
+    /// Hash of the `SBProxyConfig.spec.config` the operator most recently
+    /// read and validated. Written before anything is applied, so it says
+    /// only that the operator has seen this config, never that it reached the
+    /// pods.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub observed_config_hash: String,
+
+    /// Last error observed during reconcile, if any. Cleared only once a
+    /// rollout completes, so an empty value and a `configHash` that matches
+    /// `observedConfigHash` together mean the fleet is on the config you
+    /// applied.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub last_error: String,
 }
