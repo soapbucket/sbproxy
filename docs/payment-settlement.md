@@ -1,6 +1,6 @@
 # Payment settlement
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 `proxy.payments` is how SBproxy charges for a request and proves it was
 paid. It is Apache-2.0, it is off unless you configure it, and it holds

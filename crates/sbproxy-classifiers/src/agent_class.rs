@@ -324,14 +324,41 @@ struct CatalogFile {
 /// the same test. A warning whose condition only the loader knows drifts
 /// away from whatever a test asserts about it.
 ///
-/// Deliberately a substring test and nothing cleverer. It sees a `(?i)`
-/// anywhere in the pattern and cannot tell a flag that covers the whole
-/// expression from one scoped to a group, and it does not know that a
-/// pattern built only from character classes is already case-insensitive.
-/// It reports the shape operators get wrong, a bare literal, and stays
+/// It reads the flag letters of every inline `(?flags)` or `(?flags:` group
+/// rather than searching for the literal `(?i)`, because `(?si)` and `(?im)`
+/// set the same flag and an operator who wrote one of those should not be
+/// told at every boot to add a flag they already have. A `-` ends the run,
+/// so `(?-i)` is not mistaken for turning the flag on, and any letter that
+/// is not an inline flag ends it too, so the `i` in `(?P<id>...)` is a group
+/// name rather than a flag.
+///
+/// Deliberately nothing cleverer than that. It cannot tell a flag scoped to
+/// a group from one covering the whole expression, and it does not know that
+/// a pattern built only from character classes needs no flag at all. It
+/// reports the shape operators actually get wrong, a bare literal, and stays
 /// quiet about the rest.
 fn pattern_is_case_sensitive(pattern: &str) -> bool {
-    !pattern.contains("(?i")
+    let bytes = pattern.as_bytes();
+    let mut index = 0;
+    while index + 1 < bytes.len() {
+        if bytes[index] != b'(' || bytes[index + 1] != b'?' {
+            index += 1;
+            continue;
+        }
+        let mut cursor = index + 2;
+        while cursor < bytes.len() {
+            match bytes[cursor] {
+                b'i' => return false,
+                // The rest of the regex crate's inline flag letters. Anything
+                // else, including `)`, `:` and the `-` that starts the unset
+                // half, ends the run.
+                b'm' | b's' | b'u' | b'U' | b'x' | b'R' => cursor += 1,
+                _ => break,
+            }
+        }
+        index += 2;
+    }
+    true
 }
 
 impl AgentClassCatalog {
@@ -667,6 +694,21 @@ mod tests {
         // Scoped flags count too: the check cannot tell how far the flag
         // reaches, and says so rather than guessing.
         assert!(!pattern_is_case_sensitive("Acme-((?i)crawler)"));
+
+        // Every spelling of the flag, because a warning that fires on a
+        // pattern which already has it is a warning operators mute. `(?i)`
+        // is not the only way to write it and a substring test for that
+        // exact string calls three of these case-sensitive.
+        assert!(!pattern_is_case_sensitive("(?si)Acme-Crawler"));
+        assert!(!pattern_is_case_sensitive("(?im)Acme-Crawler"));
+        assert!(!pattern_is_case_sensitive("(?i-u)Acme-Crawler"));
+        assert!(!pattern_is_case_sensitive("(?i:Acme-Crawler)"));
+
+        // And the two shapes that look like the flag and are not. `(?-i)`
+        // turns it off, and the `i` in a capture-group name is a name.
+        assert!(pattern_is_case_sensitive("(?-i)Acme-Crawler"));
+        assert!(pattern_is_case_sensitive("(?P<id>Acme-Crawler)"));
+        assert!(pattern_is_case_sensitive("(?:Acme-Crawler)"));
     }
 
     #[test]

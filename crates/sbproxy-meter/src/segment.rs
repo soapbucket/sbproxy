@@ -162,8 +162,16 @@ pub struct ChainSegment {
     /// request" from "this node restarted onto a different chain": the
     /// first leaves the hash alone, the second changes it.
     pub head_hash: String,
-    /// Distinct claims this node has folded, counting every claim once no
-    /// matter how many attempts it took.
+    /// Claims this node counted, one per claim rather than one per attempt.
+    ///
+    /// The fold that makes that true reads a bounded window of recent claim
+    /// ids (`CLAIM_FOLD_WINDOW` in this module), so it holds for every
+    /// retry that arrives while its claim is still in flight, which is
+    /// every retry a request can produce. An attempt that somehow arrived
+    /// after tens of thousands of other claims had gone through the node
+    /// would be counted as a second claim; the window is sized so that
+    /// cannot happen inside a request's lifetime, and the direction of the
+    /// error is over-counting rather than under-counting.
     pub claims: u64,
     /// The node's running unit totals, in a deterministic order.
     pub totals: Vec<UnitTotal>,

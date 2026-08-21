@@ -1,6 +1,6 @@
 # Attested metering
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 ![A metered request cuts a signed receipt, the chain verifies, one tampered entry on disk breaks it, and the verifier names the broken sequence number](assets/metering-verify.gif)
 
