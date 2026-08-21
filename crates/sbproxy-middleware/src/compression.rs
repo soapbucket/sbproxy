@@ -31,13 +31,46 @@ impl Encoding {
             Encoding::Identity => "identity",
         }
     }
+
+    /// Map a `compression.algorithms` token onto the codec it names.
+    ///
+    /// `None` for anything this proxy cannot produce. The config compiler
+    /// refuses an unknown token at load (see
+    /// `sbproxy_config::COMPRESSION_ALGORITHM_TOKENS`), so reaching `None`
+    /// here means a caller built a `CompressionConfig` in code rather than
+    /// from YAML.
+    fn from_token(token: &str) -> Option<Encoding> {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "zstd" => Some(Encoding::Zstd),
+            "br" => Some(Encoding::Brotli),
+            "gzip" => Some(Encoding::Gzip),
+            _ => None,
+        }
+    }
 }
 
-/// Select the best encoding based on `Accept-Encoding` header and config.
+/// Preference order used when `compression.algorithms` is empty: best
+/// ratio first. A non-empty list is the operator's own order and is
+/// walked as authored instead.
+const DEFAULT_PREFERENCE: [Encoding; 3] = [Encoding::Zstd, Encoding::Brotli, Encoding::Gzip];
+
+/// Select the response encoding from the `Accept-Encoding` header and the
+/// origin's compression config.
 ///
-/// Preference order when multiple algorithms are acceptable: zstd > br > gzip.
-/// Returns [`Encoding::Identity`] when compression is disabled, the client does
-/// not accept any configured algorithm, or `accept_encoding` is absent.
+/// `compression.algorithms` is a priority order, not a membership set: the
+/// list is walked in declaration order and the first codec the client
+/// accepts wins, so `algorithms: [gzip, br]` serves gzip to a client that
+/// accepts both. An empty list means the operator expressed no preference
+/// and falls back to the best-ratio-first ladder zstd > br > gzip.
+///
+/// Client qvalues are read as accept-or-refuse only, per RFC 9110 §12.5.3:
+/// `q=0` is an explicit refusal of that coding and removes it from
+/// consideration. A non-zero qvalue does not reorder the server-side
+/// preference above, which RFC 9110 leaves to the server.
+///
+/// Returns [`Encoding::Identity`] when compression is disabled,
+/// `accept_encoding` is absent, or the client accepts none of the
+/// configured codecs.
 pub fn negotiate_encoding(config: &CompressionConfig, accept_encoding: Option<&str>) -> Encoding {
     if !config.enabled {
         return Encoding::Identity;
@@ -47,34 +80,89 @@ pub fn negotiate_encoding(config: &CompressionConfig, accept_encoding: Option<&s
         Some(s) if !s.is_empty() => s,
         _ => return Encoding::Identity,
     };
+    let acceptable = AcceptEncoding::parse(accept);
 
-    let algo_allowed = |name: &str| -> bool {
-        config.algorithms.is_empty() || config.algorithms.iter().any(|a| a == name)
-    };
-
-    // Check in preference order: zstd > br > gzip
-    // We do a simple substring check per token. A production implementation
-    // would parse quality values, but this is sufficient for Phase 2.
-    if algo_allowed("zstd") && accepts(accept, "zstd") {
-        Encoding::Zstd
-    } else if algo_allowed("br") && accepts(accept, "br") {
-        Encoding::Brotli
-    } else if algo_allowed("gzip") && accepts(accept, "gzip") {
-        Encoding::Gzip
-    } else {
-        Encoding::Identity
+    if config.algorithms.is_empty() {
+        return DEFAULT_PREFERENCE
+            .into_iter()
+            .find(|enc| acceptable.accepts(enc.as_str()))
+            .unwrap_or(Encoding::Identity);
     }
+
+    config
+        .algorithms
+        .iter()
+        // A token naming no codec this proxy can produce is refused at
+        // config load; skipping it here keeps a directly-constructed
+        // config from disabling the codecs listed either side of it.
+        .filter_map(|name| Encoding::from_token(name.as_str()))
+        .find(|enc| acceptable.accepts(enc.as_str()))
+        .unwrap_or(Encoding::Identity)
 }
 
-/// Check whether the Accept-Encoding header value contains a given token.
+/// A parsed `Accept-Encoding` header.
 ///
-/// Handles comma-separated values and avoids false substring matches
-/// (e.g. "br" should not match inside "brotli-custom").
-fn accepts(accept_encoding: &str, token: &str) -> bool {
-    accept_encoding.split(',').any(|part| {
-        let part = part.split(';').next().unwrap_or("").trim();
-        part.eq_ignore_ascii_case(token) || part == "*"
-    })
+/// The qvalue has to be read rather than trimmed off: RFC 9110 §12.5.3
+/// gives `q=0` the meaning "not acceptable", so `gzip;q=0` is a refusal of
+/// gzip and `identity;q=1, *;q=0` (the standard "send me nothing I did not
+/// name" opt-out) refuses every coding the header does not list.
+struct AcceptEncoding<'a> {
+    /// `(coding, qvalue)` for every explicitly named coding, in header
+    /// order. Codings are compared case-insensitively.
+    codings: Vec<(&'a str, f32)>,
+    /// qvalue attached to `*`, when the header carries one.
+    wildcard: Option<f32>,
+}
+
+impl<'a> AcceptEncoding<'a> {
+    fn parse(header: &'a str) -> Self {
+        let mut codings = Vec::new();
+        let mut wildcard = None;
+        for element in header.split(',') {
+            let mut parts = element.split(';');
+            let coding = parts.next().unwrap_or("").trim();
+            if coding.is_empty() {
+                continue;
+            }
+            let mut q = 1.0f32;
+            for param in parts {
+                let param = param.trim();
+                let Some(value) = param.split_once('=').and_then(|(name, value)| {
+                    name.trim().eq_ignore_ascii_case("q").then_some(value)
+                }) else {
+                    continue;
+                };
+                // An unparseable qvalue reads as the default 1.0 rather
+                // than as a refusal: a malformed parameter must not
+                // silently switch compression off for that client.
+                q = value.trim().parse::<f32>().unwrap_or(1.0);
+                break;
+            }
+            if coding == "*" {
+                wildcard = Some(q);
+            } else {
+                codings.push((coding, q));
+            }
+        }
+        Self { codings, wildcard }
+    }
+
+    /// Whether the client will accept `token`.
+    ///
+    /// An explicitly named coding decides on its own qvalue; `*` stands in
+    /// only for codings the header does not name, which is what makes
+    /// `identity;q=1, *;q=0` a refusal and `gzip, *;q=0` a gzip-only
+    /// request.
+    fn accepts(&self, token: &str) -> bool {
+        if let Some((_, q)) = self
+            .codings
+            .iter()
+            .find(|(coding, _)| coding.eq_ignore_ascii_case(token))
+        {
+            return *q > 0.0;
+        }
+        self.wildcard.is_some_and(|q| q > 0.0)
+    }
 }
 
 /// Default content-type prefixes that should not be re-compressed.
@@ -309,6 +397,140 @@ mod tests {
         assert_eq!(
             negotiate_encoding(&enabled_config(), Some("  gzip , br ")),
             Encoding::Brotli
+        );
+    }
+
+    // --- Configured order is a priority order (H30) ---
+
+    fn config_with(algorithms: &[&str]) -> CompressionConfig {
+        CompressionConfig {
+            enabled: true,
+            algorithms: algorithms.iter().map(|a| (*a).to_string()).collect(),
+            min_size: 0,
+            level: None,
+        }
+    }
+
+    #[test]
+    fn configured_order_is_honoured_over_the_default_ladder() {
+        // The operator's CDN caches gzip, so gzip is listed first. The
+        // client accepts everything. Before the fix the list was a
+        // membership set and the hardcoded zstd > br > gzip ladder picked
+        // Brotli regardless of what the operator wrote.
+        assert_eq!(
+            negotiate_encoding(&config_with(&["gzip", "br"]), Some("gzip, br, zstd")),
+            Encoding::Gzip
+        );
+        assert_eq!(
+            negotiate_encoding(&config_with(&["gzip", "zstd"]), Some("gzip, br, zstd")),
+            Encoding::Gzip
+        );
+        // Reversing the authored order reverses the selection, which is
+        // what makes this a priority order rather than a set.
+        assert_eq!(
+            negotiate_encoding(&config_with(&["br", "gzip"]), Some("gzip, br, zstd")),
+            Encoding::Brotli
+        );
+    }
+
+    #[test]
+    fn configured_order_falls_through_to_the_next_entry_the_client_accepts() {
+        // First choice unacceptable to this client, second choice serves.
+        assert_eq!(
+            negotiate_encoding(&config_with(&["zstd", "gzip"]), Some("gzip")),
+            Encoding::Gzip
+        );
+    }
+
+    #[test]
+    fn empty_algorithms_uses_the_best_ratio_ladder() {
+        assert_eq!(
+            negotiate_encoding(&config_with(&[]), Some("gzip, br, zstd")),
+            Encoding::Zstd
+        );
+    }
+
+    #[test]
+    fn every_configured_token_maps_to_a_codec_and_back() {
+        // The compiler refuses a token outside
+        // `COMPRESSION_ALGORITHM_TOKENS`, so that list and this crate's
+        // token mapping have to name the same codecs. Pinned here because
+        // this is the only crate that can see both.
+        for token in sbproxy_config::COMPRESSION_ALGORITHM_TOKENS {
+            let encoding = Encoding::from_token(token)
+                .unwrap_or_else(|| panic!("config accepts `{token}` but no codec produces it"));
+            assert_eq!(encoding.as_str(), token);
+        }
+        for encoding in DEFAULT_PREFERENCE {
+            assert!(
+                sbproxy_config::COMPRESSION_ALGORITHM_TOKENS.contains(&encoding.as_str()),
+                "{} is negotiable but the config compiler refuses the token",
+                encoding.as_str()
+            );
+        }
+    }
+
+    // --- qvalues are refusals, not decoration (H33) ---
+
+    #[test]
+    fn q_zero_on_a_named_coding_is_a_refusal() {
+        // RFC 9110 §12.5.3: `q=0` means "not acceptable". Before the fix
+        // the parser trimmed at `;` and read this as plain `gzip`.
+        assert_eq!(
+            negotiate_encoding(&config_with(&["gzip"]), Some("gzip;q=0")),
+            Encoding::Identity
+        );
+        // The refusal is per coding: br is still on the table.
+        assert_eq!(
+            negotiate_encoding(&enabled_config(), Some("gzip;q=0, br")),
+            Encoding::Brotli
+        );
+    }
+
+    #[test]
+    fn wildcard_q_zero_refuses_everything_not_named() {
+        // The standard opt-out a client that can decode nothing sends.
+        assert_eq!(
+            negotiate_encoding(&enabled_config(), Some("identity;q=1, *;q=0")),
+            Encoding::Identity
+        );
+        assert_eq!(
+            negotiate_encoding(&enabled_config(), Some("*;q=0")),
+            Encoding::Identity
+        );
+    }
+
+    #[test]
+    fn a_named_coding_outranks_the_wildcard() {
+        // `*` stands in only for codings the header does not name, so an
+        // explicit `gzip` survives a `*;q=0` and zstd does not.
+        assert_eq!(
+            negotiate_encoding(&enabled_config(), Some("gzip, *;q=0")),
+            Encoding::Gzip
+        );
+        // And the inverse: a named refusal is not undone by a permissive
+        // wildcard.
+        assert_eq!(
+            negotiate_encoding(&config_with(&["zstd"]), Some("zstd;q=0, *")),
+            Encoding::Identity
+        );
+    }
+
+    #[test]
+    fn a_nonzero_qvalue_still_accepts() {
+        assert_eq!(
+            negotiate_encoding(&config_with(&["gzip"]), Some("gzip;q=0.001")),
+            Encoding::Gzip
+        );
+        // A malformed qvalue must not read as a refusal.
+        assert_eq!(
+            negotiate_encoding(&config_with(&["gzip"]), Some("gzip;q=banana")),
+            Encoding::Gzip
+        );
+        // Parameter names are case-insensitive.
+        assert_eq!(
+            negotiate_encoding(&config_with(&["gzip"]), Some("gzip;Q=0")),
+            Encoding::Identity
         );
     }
 

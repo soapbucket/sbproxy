@@ -21,11 +21,12 @@ use crate::snapshot::{CompiledConfig, CompiledEgressGates, CompiledOrigin};
 use crate::types::{
     AttestationBillableConfig, AttestationConfig, AttestationLedgerConfig,
     AttestationMeasuredConfig, AttestationOriginHeaderConfig, AttestationQueueConfig,
-    AttestationRole, AttestationRouteWeightConfig, AuditConfig, AuditSinkKind, ConfigFile,
-    ConnectionPoolConfig, EgressPurposeConfig, EgressTopLevelConfig, EnforcementMode,
-    EventSinkKind, EventsConfig, FailureMode, L2CacheConfig, L2CacheParams,
+    AttestationRole, AttestationRouteWeightConfig, AuditConfig, AuditSinkKind, CompressionConfig,
+    ConfigFile, ConnectionPoolConfig, CorsConfig, EgressPurposeConfig, EgressTopLevelConfig,
+    EnforcementMode, EventSinkKind, EventsConfig, FailureMode, L2CacheConfig, L2CacheParams,
     OriginAttestationConfig, RawOriginConfig, UpstreamTimeouts, UpstreamTimeoutsConfig,
-    WebBotAuthConfig, ATTESTATION_SIGN_WITH_WEB_BOT_AUTH, DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS,
+    WebBotAuthConfig, ATTESTATION_SIGN_WITH_WEB_BOT_AUTH, COMPRESSION_ALGORITHM_TOKENS,
+    DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS,
     DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS, DEFAULT_UPSTREAM_READ_TIMEOUT_MS,
     DEFAULT_UPSTREAM_TOTAL_CONNECT_TIMEOUT_MS, DEFAULT_UPSTREAM_WRITE_TIMEOUT_MS,
     MAX_ATTESTATION_QUEUE_ENTRIES,
@@ -3540,13 +3541,58 @@ fn validate_origin_host_key(hostname: &str) -> Result<()> {
     Ok(())
 }
 
+/// Refuse a `cors:` block the CORS middleware would answer with silence.
+///
+/// `allowed_origins: ["*"]` plus `allow_credentials: true` is the pair
+/// browsers reject outright. The middleware has always refused to emit any
+/// header for it, but only at request time, which turned a config mistake
+/// into a browser app that fails with no server-side error and a warn line
+/// per request. The predicate is
+/// [`CorsConfig::wildcard_with_credentials`], shared with the runtime
+/// guard so this refusal cannot drift narrower than that one.
+fn validate_origin_cors(hostname: &str, cors: &CorsConfig) -> Result<()> {
+    if cors.wildcard_with_credentials() {
+        anyhow::bail!(
+            "origin {hostname}: cors.allowed_origins contains `*` and cors.allow_credentials is \
+             true. Browsers refuse that pair per the Fetch standard, so the proxy emits no CORS \
+             headers at all for it and the browser app breaks with nothing in the response \
+             saying why. Pick one: list the origins you mean in `allowed_origins`, or drop \
+             `allow_credentials`."
+        );
+    }
+    Ok(())
+}
+
+/// Refuse a `compression.algorithms` entry that names no codec.
+///
+/// An unrecognised name used to make every codec unnegotiable for the
+/// origin, so `algorithms: [deflate]` served every response uncompressed
+/// with no load-time error and nothing in the logs or metrics separating
+/// it from a client that advertised no encodings at all.
+fn validate_origin_compression(hostname: &str, compression: &CompressionConfig) -> Result<()> {
+    for entry in &compression.algorithms {
+        let token = entry.trim().to_ascii_lowercase();
+        if !COMPRESSION_ALGORITHM_TOKENS.contains(&token.as_str()) {
+            let supported = COMPRESSION_ALGORITHM_TOKENS.join(", ");
+            anyhow::bail!(
+                "origin {hostname}: compression.algorithms contains `{entry}`, which names no \
+                 codec this proxy can produce. Supported entries are: {supported}. The list is \
+                 a priority order, so the first entry the client accepts is the one served."
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Compile a single origin from its raw config.
 ///
 /// # Errors
 ///
 /// Returns an error if any of the origin's configured modules (action,
 /// auth, policy, or transform) names an unknown type or has invalid
-/// parameters, or if a referenced module cannot be built.
+/// parameters, if a referenced module cannot be built, or if its `cors:`
+/// or `compression:` block carries a setting the runtime would have to
+/// ignore.
 pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<CompiledOrigin> {
     // Before any work: reject the keys that would otherwise be accepted
     // into a snapshot that does not honor them (WOR-2310).
@@ -4128,6 +4174,17 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         &mut config.expose_openapi,
         action_type,
     )?;
+
+    // Middleware blocks whose only previous defence was a runtime no-op.
+    // Both run here, on the way into the compiled origin, so a broken
+    // setting is a load-time error rather than a silently disabled
+    // feature nothing reports.
+    if let Some(cors) = config.cors.as_ref() {
+        validate_origin_cors(hostname, cors)?;
+    }
+    if let Some(compression) = config.compression.as_ref() {
+        validate_origin_compression(hostname, compression)?;
+    }
 
     let mut compiled = CompiledOrigin {
         hostname: CompactString::new(hostname),
@@ -6589,6 +6646,93 @@ origins:
             msg.contains("typo-corp") && msg.contains("not declared"),
             "unhelpful error: {msg}"
         );
+    }
+
+    /// `allowed_origins: ["*"]` with `allow_credentials: true` used to
+    /// pass `sbproxy validate` and then emit zero CORS headers plus one
+    /// warn line per request, forever. It fails the load now.
+    #[test]
+    fn compile_origin_rejects_cors_wildcard_with_credentials() {
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3000
+    cors:
+      allowed_origins:
+        - "*"
+      allow_credentials: true
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("wildcard plus credentials must fail compile");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("allow_credentials") && msg.contains("api.example.com"),
+            "unhelpful error: {msg}"
+        );
+    }
+
+    /// The same wildcard without credentials is a legitimate public API
+    /// and still compiles, so the refusal is no wider than its claim.
+    #[test]
+    fn compile_origin_accepts_cors_wildcard_without_credentials() {
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3000
+    cors:
+      allowed_origins:
+        - "*"
+"#;
+        compile_config(yaml).expect("wildcard alone is a valid public-API CORS policy");
+    }
+
+    /// An algorithm name naming no codec used to disable compression for
+    /// the whole origin in silence.
+    #[test]
+    fn compile_origin_rejects_unknown_compression_algorithm() {
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3000
+    compression:
+      enabled: true
+      algorithms:
+        - deflate
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("an unknown codec name must fail compile");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("deflate") && msg.contains("gzip"),
+            "the error must name the bad entry and the supported set: {msg}"
+        );
+    }
+
+    /// Every supported token, in any case, still compiles.
+    #[test]
+    fn compile_origin_accepts_every_supported_compression_algorithm() {
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3000
+    compression:
+      enabled: true
+      algorithms:
+        - GZIP
+        - br
+        - zstd
+"#;
+        compile_config(yaml).expect("the documented codec tokens must compile");
     }
 
     /// A `timeouts:` block resolves onto the compiled origin as concrete

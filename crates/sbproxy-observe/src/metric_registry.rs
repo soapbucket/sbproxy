@@ -1921,6 +1921,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_cors_refusals_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_cors_refusal"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["reason"],
+        description: "Responses the CORS middleware refused to add headers to, by reason.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_credential_resolution_duration_seconds",
         kind: MetricKind::Histogram,
         writer: Writer::Recorder("record_credential_resolution"),

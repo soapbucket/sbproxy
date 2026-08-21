@@ -4581,7 +4581,14 @@ pub fn record_rate_limit_decision(policy: &str, result: &'static str) {
 
 /// Record an idempotency-cache outcome on
 /// `sbproxy_idempotency_cache_results_total{backend, result}`. `result`
-/// is one of `hit`, `miss`, `conflict`, `not_applicable`.
+/// is one of `hit`, `miss`, `conflict`, `not_applicable`, or `error`.
+/// `backend` is the cache implementation that answered (`memory` or
+/// `kv`), so a broken shared store is visible next to a cold local one.
+///
+/// `error` is a store-side read or write failure. It is counted in
+/// addition to the `miss` the lookup degrades into, so `miss` stays the
+/// denominator for lookups and `error` is the numerator for "the cache
+/// is not working".
 pub fn record_idempotency_cache_result(backend: &'static str, result: &'static str) {
     use prometheus::{register_int_counter_vec, IntCounterVec};
     use std::sync::OnceLock;
@@ -4615,6 +4622,27 @@ pub fn record_idempotency_cache_duration(backend: &'static str, duration_secs: f
         .expect("idempotency cache duration histogram registers")
     });
     hist.with_label_values(&[backend]).observe(duration_secs);
+}
+
+/// Record a CORS response the middleware refused to decorate on
+/// `sbproxy_cors_refusals_total{reason}`.
+///
+/// The refusal used to be visible only as a `tracing::warn!` per request,
+/// which is a log flood on a busy origin and nothing at all on a
+/// dashboard. `reason` is a closed string from the middleware.
+pub fn record_cors_refusal(reason: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_cors_refusals_total",
+            "Responses the CORS middleware refused to add headers to, by reason",
+            &["reason"],
+        )
+        .expect("cors refusal counter registers")
+    });
+    counter.with_label_values(&[reason]).inc();
 }
 
 // --- body size + compression metrics --------------------------------------
@@ -7442,31 +7470,59 @@ mod tests {
 
     #[test]
     fn record_idempotency_cache_result_emits_counter() {
-        record_idempotency_cache_result("default", "hit");
-        record_idempotency_cache_result("default", "miss");
-        record_idempotency_cache_result("default", "conflict");
-        record_idempotency_cache_result("default", "not_applicable");
+        record_idempotency_cache_result("memory", "hit");
+        record_idempotency_cache_result("memory", "miss");
+        record_idempotency_cache_result("memory", "conflict");
+        record_idempotency_cache_result("memory", "not_applicable");
+        record_idempotency_cache_result("kv", "error");
         let out = metrics().render();
         assert!(
             out.contains("sbproxy_idempotency_cache_results_total"),
             "idempotency results counter missing from render"
         );
-        for result in ["hit", "miss", "conflict", "not_applicable"] {
+        for result in ["hit", "miss", "conflict", "not_applicable", "error"] {
             assert!(
                 out.contains(&format!("result=\"{result}\"")),
                 "result={result} label missing"
+            );
+        }
+        // The backend dimension used to be the constant "default", so a
+        // dashboard could not tell a broken redis from a cold memory
+        // cache. Both real backends have to appear.
+        for backend in ["memory", "kv"] {
+            assert!(
+                out.contains(&format!("backend=\"{backend}\"")),
+                "backend={backend} label missing"
             );
         }
     }
 
     #[test]
     fn record_idempotency_cache_duration_emits_histogram() {
-        record_idempotency_cache_duration("default", 0.0005);
-        record_idempotency_cache_duration("default", 0.02);
+        record_idempotency_cache_duration("kv", 0.0005);
+        record_idempotency_cache_duration("kv", 0.02);
         let out = metrics().render();
         assert!(
             out.contains("sbproxy_idempotency_cache_duration_seconds_bucket"),
             "idempotency duration buckets missing"
+        );
+        assert!(
+            out.contains("backend=\"kv\""),
+            "backend label must carry the real backend"
+        );
+    }
+
+    #[test]
+    fn record_cors_refusal_emits_counter() {
+        record_cors_refusal("wildcard_with_credentials");
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_cors_refusals_total"),
+            "cors refusal counter missing from render"
+        );
+        assert!(
+            out.contains("reason=\"wildcard_with_credentials\""),
+            "reason label missing"
         );
     }
 

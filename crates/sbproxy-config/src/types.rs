@@ -8155,6 +8155,20 @@ pub struct CorsConfig {
     pub enable: Option<bool>,
 }
 
+impl CorsConfig {
+    /// Whether this block asks for `allowed_origins: ["*"]` together with
+    /// `allow_credentials: true`.
+    ///
+    /// Browsers refuse that pair per the Fetch standard, so the proxy
+    /// refuses it too: the config compiler fails the load and the CORS
+    /// middleware emits no headers if it ever sees one anyway. Both sides
+    /// call this one predicate so the load-time refusal cannot end up
+    /// narrower than the runtime one.
+    pub fn wildcard_with_credentials(&self) -> bool {
+        self.allow_credentials && self.allowed_origins.iter().any(|o| o == "*")
+    }
+}
+
 /// HSTS configuration.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -8174,6 +8188,13 @@ fn default_hsts_max_age() -> u64 {
     31_536_000
 }
 
+/// Codec tokens `compression.algorithms` accepts, in the order the
+/// negotiator falls back to when an origin lists none.
+///
+/// Anything outside this list fails config load rather than quietly
+/// disabling compression for the origin.
+pub const COMPRESSION_ALGORITHM_TOKENS: [&str; 3] = ["zstd", "br", "gzip"];
+
 /// Compression configuration.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -8181,7 +8202,12 @@ pub struct CompressionConfig {
     /// Master switch for response compression. Alias: `enable`.
     #[serde(default = "default_true", alias = "enable")]
     pub enabled: bool,
-    /// Allowed algorithms in priority order (e.g. `["br", "gzip"]`).
+    /// Allowed algorithms in priority order (e.g. `["br", "gzip"]`). The
+    /// first entry the client's `Accept-Encoding` accepts is the one
+    /// served, so list your preferred codec first. Valid entries are
+    /// `zstd`, `br`, and `gzip`; any other name fails config load. Leave
+    /// the list empty to take the built-in order, best ratio first:
+    /// `zstd`, then `br`, then `gzip`.
     #[serde(default)]
     pub algorithms: Vec<String>,
     /// Minimum response size, in bytes, before compression is applied.

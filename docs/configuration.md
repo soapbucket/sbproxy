@@ -4814,9 +4814,23 @@ origins:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | true | Master switch. Alias: `enable`. |
-| `algorithms` | list | | Allowed algorithms in priority order (e.g. `["br", "gzip"]`) |
+| `algorithms` | list | | Allowed algorithms in priority order (e.g. `["br", "gzip"]`). Valid entries are `zstd`, `br`, and `gzip`; anything else fails config load. |
 | `min_size` | int | 0 | Minimum response size in bytes before compression is applied |
 | `level` | int | | Encoder effort, clamped into the negotiated algorithm's range (gzip 0-9, brotli 0-11, zstd 1-22). Unset keeps each library's default. |
+
+`algorithms` is a priority order, not a set. The list is walked as
+authored and the first entry the client's `Accept-Encoding` accepts is
+the one served, so `algorithms: [gzip, br]` sends gzip to a browser that
+accepts both, which is what you want when something downstream caches on
+`Content-Encoding`. Leave the list empty to take the built-in order,
+best ratio first: `zstd`, then `br`, then `gzip`.
+
+Client quality values are honored as refusals per RFC 9110 §12.5.3.
+`Accept-Encoding: gzip;q=0` means gzip is not acceptable to that client
+and the proxy will not send it, and the standard opt-out
+`Accept-Encoding: identity;q=1, *;q=0` gets an uncompressed response.
+A `*` stands in only for codings the header does not name on its own, so
+`gzip, *;q=0` is a gzip-only request.
 
 ---
 
@@ -5183,7 +5197,9 @@ retries. The middleware reads the `Idempotency-Key` request header,
 hashes the request body, and:
 
 - **First call** under a given key: forwards the request upstream and
-  caches the response under `(workspace, key)` keyed by the body hash.
+  caches the response under `(tenant, origin, key)` keyed by the body
+  hash. Two origins never see each other's entries, including on the
+  `redis` backend where they share one store.
 - **Replay** with the same key + same body: returns the cached
   response with `x-sbproxy-idempotency: HIT`. The upstream is not
   contacted.
@@ -6687,13 +6703,27 @@ A legacy `enable` flag (alias `enabled`) still parses, and the runtime has never
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `allowed_origins` | list | | Allowed origins (use `["*"]` for any). Alias: `allow_origins`. |
+| `allowed_origins` | list | | Allowed origins (use `["*"]` for any). Alias: `allow_origins`. An empty list is deny-all. |
 | `allowed_methods` | list | standard methods | Allowed HTTP methods. Alias: `allow_methods`. |
 | `allowed_headers` | list | standard headers | Allowed request headers. Alias: `allow_headers`. |
 | `expose_headers` | list | | Headers exposed to the browser |
 | `max_age` | int | | Preflight cache duration in seconds |
-| `allow_credentials` | bool | false | Allow credentials (cookies, auth headers) |
+| `allow_credentials` | bool | false | Allow credentials (cookies, auth headers). Refused at config load in combination with `allowed_origins: ["*"]`. |
 | `enable` | bool | unset | Legacy flag, alias `enabled`. Parsed but ignored at runtime. |
+
+`allowed_origins: ["*"]` together with `allow_credentials: true` fails
+config load. Browsers reject that pair per the Fetch standard, so the
+proxy has always refused to emit any CORS header for it; refusing the
+config instead means you find out at `sbproxy validate` rather than from
+a browser console. Name the origins you mean, or drop
+`allow_credentials`.
+
+A preflight is an `OPTIONS` request carrying
+`Access-Control-Request-Method`, which is what the Fetch standard
+defines it as. A plain `OPTIONS` that carries only `Origin` is a normal
+request and reaches the upstream, so an API that implements `OPTIONS`
+itself (a discovery endpoint returning `Allow:`, or WebDAV) keeps
+working when a `cors:` block is added in front of it.
 
 ---
 

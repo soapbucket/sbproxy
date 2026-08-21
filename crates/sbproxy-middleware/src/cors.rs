@@ -6,9 +6,22 @@
 use http::{HeaderMap, HeaderValue, Method};
 use sbproxy_config::CorsConfig;
 
-/// Check if the request is a CORS preflight (OPTIONS with Origin header).
+/// Check whether the request is a CORS preflight.
+///
+/// The Fetch standard defines a preflight as an `OPTIONS` request that
+/// carries `Access-Control-Request-Method`. `Origin` alone is not enough:
+/// it rides on every cross-origin request of every method, so treating
+/// `OPTIONS` + `Origin` as a preflight made the proxy answer 204 to any
+/// plain `OPTIONS` from a browser and deleted the upstream's own
+/// `OPTIONS` handler (a REST discovery endpoint returning `Allow:`, or
+/// anything WebDAV) the moment a `cors:` block was added.
+///
+/// Both headers are required here, so a plain `OPTIONS` falls through to
+/// the normal request path and reaches the upstream.
 pub fn is_preflight(method: &Method, headers: &HeaderMap) -> bool {
-    method == Method::OPTIONS && headers.contains_key("origin")
+    method == Method::OPTIONS
+        && headers.contains_key("origin")
+        && headers.contains_key("access-control-request-method")
 }
 
 /// Apply CORS headers to a response based on the config and request origin.
@@ -24,10 +37,15 @@ pub fn is_preflight(method: &Method, headers: &HeaderMap) -> bool {
 ///   anyone. Operators who genuinely want to permit any origin must set
 ///   `allowed_origins: ["*"]` explicitly.
 /// - **Wildcard plus credentials is refused.** When `allowed_origins` is
-///   `["*"]` and `allow_credentials` is `true`, no CORS headers are emitted
-///   and a `tracing::warn!` is logged. Browsers reject this combination per
-///   the Fetch spec; refusing it at the proxy layer prevents the proxy from
-///   appearing to authorise something the browser will then strip.
+///   `["*"]` and `allow_credentials` is `true`, no CORS headers are emitted.
+///   Browsers reject this combination per the Fetch spec; refusing it at the
+///   proxy layer prevents the proxy from appearing to authorise something the
+///   browser will then strip. The config compiler now fails the load on the
+///   same pair, so this guard only fires for a `CorsConfig` built in code.
+///   It logs once per process and counts every refusal on
+///   `sbproxy_cors_refusals_total{reason}`, because the previous per-request
+///   `warn!` put one line per request into the log for as long as the config
+///   stayed live.
 pub fn apply_cors_headers(
     config: &CorsConfig,
     request_origin: Option<&str>,
@@ -46,11 +64,16 @@ pub fn apply_cors_headers(
     let has_wildcard = config.allowed_origins.iter().any(|o| o == "*");
 
     // Wildcard + credentials is a config error: browsers reject it and
-    // the proxy must not pretend to allow it.
-    if has_wildcard && config.allow_credentials {
-        tracing::warn!(
-            "CORS misconfiguration: allowed_origins=[\"*\"] cannot be combined with allow_credentials=true; refusing to emit CORS headers"
-        );
+    // the proxy must not pretend to allow it. Same predicate the compiler
+    // refuses the config with, so the two cannot drift apart.
+    if config.wildcard_with_credentials() {
+        sbproxy_observe::metrics::record_cors_refusal("wildcard_with_credentials");
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "CORS misconfiguration: allowed_origins=[\"*\"] cannot be combined with allow_credentials=true; refusing to emit CORS headers. Logged once per process; every occurrence is counted on sbproxy_cors_refusals_total"
+            );
+        });
         return;
     }
 
@@ -90,20 +113,20 @@ pub fn apply_cors_headers(
     }
 }
 
-/// Validate a CORS configuration at config-load time.
+/// Validate a CORS configuration before it reaches the request path.
 ///
 /// Returns an error when the configuration combines unsafe options that
 /// the runtime would otherwise silently refuse. Currently this rejects
 /// `allowed_origins: ["*"]` together with `allow_credentials: true`.
 ///
-/// Operators load configs through `sbproxy-config`; the compiler should
-/// invoke this function on every `CorsConfig` it sees so that obviously
-/// broken settings surface as load-time errors instead of silent runtime
-/// no-ops. The runtime path in [`apply_cors_headers`] still defends
-/// against the same combination as a belt-and-suspenders check.
+/// A config loaded from YAML never reaches here: `sbproxy-config`'s
+/// compiler fails the load on the same combination, using the same
+/// [`CorsConfig::wildcard_with_credentials`] predicate this function and
+/// [`apply_cors_headers`] call, so the three cannot drift apart. This
+/// entry point remains for a caller that assembles a `CorsConfig` in code
+/// (an embedder, a test) and wants the same answer before serving with it.
 pub fn validate_cors_config(config: &CorsConfig) -> Result<(), String> {
-    let has_wildcard = config.allowed_origins.iter().any(|o| o == "*");
-    if has_wildcard && config.allow_credentials {
+    if config.wildcard_with_credentials() {
         return Err(
             "CORS allowed_origins=[\"*\"] cannot be combined with allow_credentials=true"
                 .to_string(),
@@ -114,12 +137,24 @@ pub fn validate_cors_config(config: &CorsConfig) -> Result<(), String> {
 
 /// Build CORS preflight response headers.
 ///
-/// Returns a complete set of headers suitable for a 204 No Content preflight response.
+/// Returns a complete set of headers suitable for a 204 No Content
+/// preflight response.
+///
+/// When the request origin is not allowed (or the config is the refused
+/// wildcard-plus-credentials pair), [`apply_cors_headers`] produces no
+/// `Access-Control-Allow-Origin` and this function stops there: the
+/// method, header, and max-age lines are the answer to a question the
+/// caller was not allowed to ask, and emitting them anyway let any caller
+/// read the configured method and header allowlists off the 204.
 pub fn preflight_headers(config: &CorsConfig, request_origin: Option<&str>) -> HeaderMap {
     let mut headers = HeaderMap::new();
 
     // Start with the common CORS headers
     apply_cors_headers(config, request_origin, &mut headers);
+
+    if !headers.contains_key("access-control-allow-origin") {
+        return headers;
+    }
 
     // Access-Control-Allow-Methods
     if !config.allowed_methods.is_empty() {
@@ -166,11 +201,20 @@ mod tests {
 
     // --- Preflight Detection ---
 
-    #[test]
-    fn test_is_preflight_true() {
+    /// The two headers the Fetch standard requires on a preflight.
+    fn preflight_request_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert("origin", HeaderValue::from_static("https://example.com"));
-        assert!(is_preflight(&Method::OPTIONS, &headers));
+        headers.insert(
+            "access-control-request-method",
+            HeaderValue::from_static("POST"),
+        );
+        headers
+    }
+
+    #[test]
+    fn test_is_preflight_true() {
+        assert!(is_preflight(&Method::OPTIONS, &preflight_request_headers()));
     }
 
     #[test]
@@ -181,10 +225,49 @@ mod tests {
 
     #[test]
     fn test_is_preflight_false_wrong_method() {
-        let mut headers = HeaderMap::new();
-        headers.insert("origin", HeaderValue::from_static("https://example.com"));
+        let headers = preflight_request_headers();
         assert!(!is_preflight(&Method::GET, &headers));
         assert!(!is_preflight(&Method::POST, &headers));
+    }
+
+    #[test]
+    fn plain_options_with_only_origin_is_not_a_preflight() {
+        // The upstream-endpoint-deletion case: a browser page on an
+        // allowed origin calling fetch('/v1/orders', {method: 'OPTIONS'}).
+        // `Origin` rides on every cross-origin request, so treating it as
+        // a preflight meant the proxy answered 204 and the upstream's own
+        // OPTIONS handler (Allow:, a capability document, WebDAV) never
+        // ran. Only `Access-Control-Request-Method` marks a preflight.
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", HeaderValue::from_static("https://example.com"));
+        assert!(
+            !is_preflight(&Method::OPTIONS, &headers),
+            "a plain OPTIONS must reach the upstream"
+        );
+    }
+
+    #[test]
+    fn options_with_the_request_method_header_is_a_preflight() {
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", HeaderValue::from_static("https://example.com"));
+        headers.insert(
+            "access-control-request-method",
+            HeaderValue::from_static("DELETE"),
+        );
+        assert!(is_preflight(&Method::OPTIONS, &headers));
+    }
+
+    #[test]
+    fn access_control_request_method_without_origin_is_not_a_preflight() {
+        // A real preflight always carries both. One without `Origin` is
+        // not a browser preflight, so it goes to the upstream rather than
+        // collecting a 204 from the proxy.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "access-control-request-method",
+            HeaderValue::from_static("POST"),
+        );
+        assert!(!is_preflight(&Method::OPTIONS, &headers));
     }
 
     // --- Origin Matching ---
@@ -474,5 +557,38 @@ mod tests {
         // Should include the standard CORS headers too
         assert!(headers.get("access-control-allow-origin").is_some());
         assert!(headers.get("access-control-allow-credentials").is_some());
+    }
+
+    #[test]
+    fn preflight_for_a_disallowed_origin_leaks_no_allowlist() {
+        // `apply_cors_headers` produced nothing for this origin, so the
+        // 204 must not go on to publish the configured method and header
+        // allowlists to a caller that was refused.
+        let config = sample_config();
+        let headers = preflight_headers(&config, Some("https://evil.example"));
+
+        assert!(headers.get("access-control-allow-origin").is_none());
+        assert!(
+            headers.get("access-control-allow-methods").is_none(),
+            "a refused preflight must not publish the method allowlist"
+        );
+        assert!(
+            headers.get("access-control-allow-headers").is_none(),
+            "a refused preflight must not publish the header allowlist"
+        );
+        assert!(headers.get("access-control-max-age").is_none());
+        assert!(headers.is_empty(), "got: {headers:?}");
+    }
+
+    #[test]
+    fn preflight_under_wildcard_plus_credentials_leaks_no_allowlist() {
+        // The refused-config path reaches the same early return.
+        let config = CorsConfig {
+            allowed_origins: vec!["*".into()],
+            allow_credentials: true,
+            ..sample_config()
+        };
+        let headers = preflight_headers(&config, Some("https://anything.example"));
+        assert!(headers.is_empty(), "got: {headers:?}");
     }
 }
