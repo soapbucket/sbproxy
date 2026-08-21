@@ -589,7 +589,17 @@ The three shapes that refuse:
 | `data.sbproxy.allow.reason` | `data.sbproxy.allow` | Defining something under the rule's path defines the rule's path. |
 | `data.sbproxy` set to a scalar | `data.sbproxy.allow` | A non-object above a rule leaves the rule nowhere to resolve. |
 
-A partial rule (`limits[method] := ...`) is compared by the part of its path that is fixed, so `data.sbproxy.limits` collides with it and `data.sbproxy.limits.GET` does too. A function that takes parameters (`permitted(method)`) is not stored under `data` and cannot be shadowed.
+A partial rule (`limits[method] := ...`) is the one shape the check cannot compare precisely. When the rule produces a `GET` key, Rego indexes `data.sbproxy.limits.GET`, one segment deeper than anything the source names, so which base keys collide depends on values the rule computes per request. Load time sees only `data.sbproxy.limits`, and three outcomes follow from what sits there:
+
+| Base data at `data.sbproxy.limits` | Result |
+|---|---|
+| Absent, or an empty object | Loads. An empty object holds no key that can beat a computed one. |
+| An object with any key | Refused. Every key the base document carries wins over the rule's, and load time cannot tell a key the rule produces from one it never will. |
+| A scalar | Refused. No key the rule produces has anywhere to land; Regorus otherwise reports this mid evaluation as `previous value is not an object`. |
+
+The middle row refuses configs that would have worked. Base data of `{sbproxy: {limits: {POST: "no"}}}` beside a rule that only ever produces `GET` merges cleanly in Rego, and it now refuses at load. The trade is deliberate: being wrong the other way is silent, shows up as a rule that stopped contributing its key, and fails open, while this refusal arrives at boot and is fixed by moving the table. The message for this shape says the base keys win rather than saying the rule never evaluates, because the second claim is not one the check can make.
+
+A function that takes parameters (`permitted(method)`) is not stored under `data` and cannot be shadowed. A function with no parameters (`audit_enabled()`) is stored under `data` and is shadowed exactly like a rule.
 
 What still loads is a sibling: an object at `data.sbproxy` holding keys no rule produces, like `data.sbproxy.roles` next to an `allow` rule, merges with the rules beneath it and is the intended way to carry a table inside the package namespace. Keeping the table at the top level, the way `data.allowed_methods` does above, avoids the question entirely.
 
