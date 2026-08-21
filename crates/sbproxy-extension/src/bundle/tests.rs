@@ -518,36 +518,76 @@ fn proxy_wasm_filter_config_passes_a_reference_shaped_value_through_unresolved()
     assert_eq!(filter.type_name(), "fixture_proxy_filter");
 }
 
-/// WOR-2289: loading a candidate registers its hooks' `secret_vars`/
-/// `masked_vars` names with the process-wide log redactor
-/// (`sbproxy_observe::logging::set_bundle_secret_field_names`), and the
-/// public inventory never carries the attachment config a var's value
-/// would appear in.
-#[test]
-fn loading_a_candidate_registers_its_secret_vars_with_the_log_redactor() {
-    sbproxy_observe::logging::set_bundle_secret_field_names(Vec::new());
-    let temp = TempDir::new().unwrap();
+/// Build a candidate whose single policy hook declares `hmac_key` as a
+/// `secret_var`, so its redactor names are non-empty.
+fn secret_var_registry(temp: &TempDir) -> Arc<DynamicBundleRegistry> {
     let schema_manifest = manifest("redactor-bundle", "policy", "redactor_policy", None).replace(
         "    export: run\n",
         "    export: run\n    config_schema:\n      type: object\n      properties:\n        hmac_key:\n          type: string\n    secret_vars: [hmac_key]\n",
     );
     write_bundle(temp.path(), "redactor", &schema_manifest, VALID_JAVASCRIPT);
+    DynamicBundleRegistry::load(&local_config(temp.path()), temp.path(), &BTreeSet::new()).unwrap()
+}
 
-    let registry =
-        DynamicBundleRegistry::load(&local_config(temp.path()), temp.path(), &BTreeSet::new())
-            .unwrap();
+/// WOR-2289: a candidate carries its hooks' `secret_vars`/`masked_vars`
+/// names for the process-wide log redactor, and the public inventory
+/// never carries the attachment config a var's value would appear in.
+#[test]
+fn loading_a_candidate_collects_its_secret_vars_for_the_log_redactor() {
+    let temp = TempDir::new().unwrap();
+    let registry = secret_var_registry(&temp);
 
-    let registered = sbproxy_observe::logging::bundle_secret_field_names();
-    assert!(
-        registered.iter().any(|name| name == "hmac_key"),
-        "{registered:?}"
-    );
+    let names = registry.secret_field_names();
+    assert!(names.iter().any(|name| name == "hmac_key"), "{names:?}");
 
     let rendered = serde_json::to_string(registry.inventory()).unwrap();
     assert!(
         !rendered.contains("hmac_key"),
         "public inventory must never carry attachment config: {rendered}"
     );
+}
+
+/// The redactor denylist belongs to the registry that is *serving*, not
+/// to the last one that happened to be built.
+///
+/// Loading used to call `set_bundle_secret_field_names` from
+/// `Candidate::finish`, so every validate-only load reprogrammed the
+/// live redactor: a `/config/publish` dry run carrying no `extensions:`
+/// block installed an empty denylist and the config still serving began
+/// emitting its own `secret_vars` in cleartext. This asserts the
+/// clobber is gone at the loader seam. Whoever adopts a pipeline is
+/// responsible for installing the names, which `sbproxy-core`'s
+/// `reload::load_pipeline` does and its own test covers.
+#[test]
+fn loading_an_empty_candidate_leaves_the_live_redactor_untouched() {
+    sbproxy_observe::logging::set_bundle_secret_field_names(vec!["hmac_key".to_owned()]);
+
+    // The shape a validate-only publish takes: a config with no
+    // `extensions:` block at all, loaded and then dropped.
+    let empty = TempDir::new().unwrap();
+    let candidate = DynamicBundleRegistry::load(
+        &ExtensionBundlesConfig::default(),
+        empty.path(),
+        &BTreeSet::new(),
+    )
+    .unwrap();
+    assert!(candidate.secret_field_names().is_empty());
+    drop(candidate);
+
+    let live = sbproxy_observe::logging::bundle_secret_field_names();
+    assert!(
+        live.iter().any(|name| name == "hmac_key"),
+        "a dropped candidate must not disarm the serving config's redactor: {live:?}"
+    );
+
+    // A bundle-bearing candidate must not install either.
+    let temp = TempDir::new().unwrap();
+    sbproxy_observe::logging::set_bundle_secret_field_names(Vec::new());
+    let registry = secret_var_registry(&temp);
+    let live = sbproxy_observe::logging::bundle_secret_field_names();
+    assert!(live.is_empty(), "candidate construction is not adoption");
+    let names = registry.secret_field_names();
+    assert!(names.iter().any(|name| name == "hmac_key"), "{names:?}");
 
     sbproxy_observe::logging::set_bundle_secret_field_names(Vec::new());
 }

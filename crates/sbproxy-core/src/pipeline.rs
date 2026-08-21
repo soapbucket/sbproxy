@@ -2114,7 +2114,6 @@ fn bind_zone_identity(pipeline: &CompiledPipeline) {
 
 impl CompiledPipeline {
     /// Dynamic bundle registry pinned to this pipeline generation.
-    #[allow(dead_code)]
     pub(crate) fn extension_registry(&self) -> &Arc<DynamicBundleRegistry> {
         &self.extension_registry
     }
