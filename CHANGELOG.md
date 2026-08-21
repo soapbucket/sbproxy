@@ -379,6 +379,68 @@ the next version cut.
   post-modifier seam, since the modified request is the one the
   contract holds.
 
+### Security
+
+- **`hmac_auth` now binds a signature to the body it covers.** A
+  signature covering `content-digest` was checked against the empty body
+  the authentication phase can offer, not against the bytes the client
+  sent. The check was inverted rather than weak: a client sending the
+  true digest of its body was refused, while one declaring the empty-body
+  digest `sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:` was
+  admitted and could then send any body at all. Because covering
+  `content-digest` could not work, deployments signed `("@method"
+  "@target-uri")` and nothing else, so a request captured off the wire
+  replayed with an attacker-chosen body until its `created` timestamp
+  left the `clock_skew_seconds` window. An attacker could not forge a
+  signature, change the method or the route, or extend the window; they
+  substituted the body of a request someone else signed.
+
+  Verification now defers the digest half to the request body filter and
+  completes it against the complete pre-transform body, the same
+  two-step contract `bot_auth` uses, answering `401` on a mismatch.
+  Covering `content-digest` works, so `required_components` can require
+  it and mean it. Two consequences worth knowing before you upgrade: a
+  body-covering signature now caps the request at the 8 MiB request-body
+  buffer and a larger body answers `413`, and the `401` body for a
+  mismatch changed from `bot_auth: content-digest body mismatch` to
+  `signature: content-digest body mismatch`, since either provider can
+  raise it. See the `hmac_auth` section of
+  [docs/configuration.md](docs/configuration.md).
+
+- **`ldap_auth` bounds what it dials.** Authentication runs before an
+  origin's `policies:`, so no `rate_limit` or `ddos` policy could cap the
+  directory bind: anyone able to send an `Authorization: Basic` header
+  drove one bind per request, which made the gateway a 1:1 amplifier
+  pointed at the directory and offered account lockout for any guessable
+  username. Three bounds now run before the dial, none of which caches a
+  success: a 30 second refused-credential cache keyed on a salted
+  SHA-256 of the exact username and password, a per-username failed-bind
+  budget of 5 per 60 seconds that then throttles to one bind per 12
+  seconds, and a cap of 32 binds in flight. The budget throttles rather
+  than blocks on purpose, so nobody can spend a username's budget with
+  wrong guesses and lock its owner out; a throttled request answers
+  `503`, not `401`, because the directory was never consulted. An
+  attacker cycling *distinct* usernames is still bounded only by what
+  runs in front of the origin.
+
+- **Refused LDAP binds and refused JWE algorithms are visible in release
+  builds.** Both logged at `debug`, which the release profile's
+  `release_max_level_info` compiles out, so the shipped binary recorded
+  nothing for a refused credential while the documentation promised the
+  log named the offending algorithm. Raised to `info`. A failed
+  `content-digest` body binding now logs at `warn` at all three refusal
+  sites; it previously logged at `debug` in one and nowhere in the other
+  two. No credential is logged at any of them.
+
+### Fixed, plan-time validation
+
+- **`ldap_auth` and its `ldap` alias validate clean.** Both were missing
+  from the OSS auth catalogue, so `sbproxy validate` reported that the
+  type "is not in the OSS catalog (will fail at runtime)" on every LDAP
+  config, including this repository's own `examples/auth-ldap/sb.yml`,
+  which was false. The same omission stopped both names being reserved
+  against a bundle hook claiming them.
+
 ## [1.13.0] - 2026-08-18
 
 ### Security
