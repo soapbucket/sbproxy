@@ -25,12 +25,15 @@
 //! Cache backends:
 //!
 //! - `InMemoryIdempotencyCache` for tests and single-instance
-//!   deployments.
+//!   deployments. Allocated once per origin, so its keyspace is
+//!   origin-local by construction.
 //! - `KvIdempotencyCache` for Redis-backed deployments. It wraps any
 //!   `sbproxy_platform::storage::KVStore` impl, which keeps the OSS
 //!   build redis-client-agnostic (the platform crate already pulls
 //!   in the redis driver behind a feature flag and exposes the
-//!   resulting blobs through the unified `KVStore` trait).
+//!   resulting blobs through the unified `KVStore` trait). One store
+//!   serves the whole cluster, so this backend namespaces every key on
+//!   the owning origin's tenant and origin id.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -115,9 +118,16 @@ impl IdempotencyOutcome {
 
 /// Cache backend trait.
 ///
-/// Implementations are scoped per `(workspace_id, key)` so two
-/// workspaces using the same idempotency key never collide. The
-/// `put` call is responsible for honouring the embedded
+/// Every implementation is scoped so that two callers reaching different
+/// origins with the same idempotency key never read each other's entries.
+/// How that scoping is achieved differs by backend and is the
+/// implementation's responsibility, not the caller's:
+/// [`InMemoryIdempotencyCache`] is allocated per origin and additionally
+/// keys on `workspace_id`, while [`KvIdempotencyCache`] shares one store
+/// across the whole cluster and folds the origin's identity into every
+/// storage key.
+///
+/// The `put` call is responsible for honouring the embedded
 /// `expires_at_unix` field; backends that support native TTLs SHOULD
 /// use them, but the middleware also re-checks expiry on every read
 /// so a backend without TTLs (in-memory in tests) stays correct.
@@ -128,6 +138,15 @@ pub trait IdempotencyCache: Send + Sync {
 
     /// Persist a captured response under `(workspace_id, key)`.
     fn put(&self, workspace_id: &str, key: &str, response: CachedResponse);
+
+    /// Short, closed-set name of this backend, used as the `backend`
+    /// label on the idempotency metrics.
+    ///
+    /// The label was the literal `"default"` at every recording site, so
+    /// a deployment running one origin on `memory` and another on `redis`
+    /// rendered both as one series and an unreachable Redis was
+    /// indistinguishable from normal cold traffic.
+    fn backend_label(&self) -> &'static str;
 }
 
 // --- Body hashing ---
@@ -174,8 +193,9 @@ pub fn check_request(
     headers: &HeaderMap,
     body: &[u8],
 ) -> IdempotencyOutcome {
+    let backend = cache.backend_label();
     let Some(key) = extract_idempotency_key(headers) else {
-        sbproxy_observe::metrics::record_idempotency_cache_result("default", "not_applicable");
+        sbproxy_observe::metrics::record_idempotency_cache_result(backend, "not_applicable");
         return IdempotencyOutcome::NotApplicable;
     };
 
@@ -183,18 +203,18 @@ pub fn check_request(
     let start = std::time::Instant::now();
     let lookup = cache.get(workspace_id, &key);
     let elapsed = start.elapsed().as_secs_f64();
-    sbproxy_observe::metrics::record_idempotency_cache_duration("default", elapsed);
+    sbproxy_observe::metrics::record_idempotency_cache_duration(backend, elapsed);
 
     if let Some(existing) = lookup {
         if existing.request_body_hash == body_hash {
-            sbproxy_observe::metrics::record_idempotency_cache_result("default", "hit");
+            sbproxy_observe::metrics::record_idempotency_cache_result(backend, "hit");
             return IdempotencyOutcome::CacheHit(existing);
         }
-        sbproxy_observe::metrics::record_idempotency_cache_result("default", "conflict");
+        sbproxy_observe::metrics::record_idempotency_cache_result(backend, "conflict");
         return IdempotencyOutcome::Conflict;
     }
 
-    sbproxy_observe::metrics::record_idempotency_cache_result("default", "miss");
+    sbproxy_observe::metrics::record_idempotency_cache_result(backend, "miss");
     IdempotencyOutcome::Miss { key, body_hash }
 }
 
@@ -338,6 +358,10 @@ impl IdempotencyCache for InMemoryIdempotencyCache {
             .lock()
             .put((workspace_id.to_string(), key.to_string()), response);
     }
+
+    fn backend_label(&self) -> &'static str {
+        "memory"
+    }
 }
 
 // --- KVStore-backed cache (Redis or any other backend) ---
@@ -347,40 +371,92 @@ impl IdempotencyCache for InMemoryIdempotencyCache {
 /// `sbproxy-platform`); in single-instance deployments operators may
 /// point this at the embedded redb store.
 ///
-/// The keyspace is `sbproxy:idem:<workspace_id>:<key>` so multiple
-/// workspaces using the same key never collide.
+/// Unlike [`InMemoryIdempotencyCache`], which is allocated once per
+/// origin, this backend wraps the single cluster-wide `proxy.l2_store`
+/// that every origin on every node shares. Isolation therefore has to be
+/// in the key: the storage key carries the owning origin's tenant and
+/// origin id, supplied at construction, ahead of the workspace id and the
+/// caller-supplied `Idempotency-Key`.
+///
+/// Every segment is length-delimited (`<len>:<bytes>`) rather than merely
+/// joined with `:`, because both the operator-supplied ids and the
+/// client-supplied key may contain a colon. Without the length prefix,
+/// tenant `a:b` with key `c` and tenant `a` with key `b:c` produce the
+/// same string, which is a cross-tenant read for anyone who can pick
+/// their own `Idempotency-Key`.
 pub struct KvIdempotencyCache {
     store: Arc<dyn KVStore>,
     ttl_secs: u64,
+    /// Precomputed `sbproxy:idem:<len>:<tenant>:<len>:<origin>` prefix.
+    /// Built once so the request path only appends.
+    key_prefix: String,
+}
+
+/// Append one length-delimited segment to a storage key.
+///
+/// The length prefix is what makes the boundary unambiguous when a
+/// segment contains the separator; see [`KvIdempotencyCache`].
+fn push_key_segment(out: &mut String, segment: &str) {
+    use std::fmt::Write as _;
+    // Writing to a String is infallible; the Result exists only to
+    // satisfy the trait.
+    let _ = write!(out, ":{}:{segment}", segment.len());
 }
 
 impl KvIdempotencyCache {
-    /// Build a new cache wrapping `store`.
+    /// Build a new cache wrapping `store` for one origin.
+    ///
+    /// `tenant_id` and `origin_id` come from the compiled origin and
+    /// namespace every key this instance writes, so two origins sharing
+    /// one Redis cannot read or overwrite each other's entries.
     ///
     /// `ttl_secs` is the value passed to `put_with_ttl`; backends
     /// without TTL support fall back to plain `put` and rely on the
     /// per-row `expires_at_unix` timestamp.
-    pub fn new(store: Arc<dyn KVStore>, ttl_secs: u64) -> Self {
+    pub fn new(store: Arc<dyn KVStore>, ttl_secs: u64, tenant_id: &str, origin_id: &str) -> Self {
         let ttl = if ttl_secs == 0 {
             DEFAULT_TTL_SECS
         } else {
             ttl_secs
         };
+        let mut key_prefix = String::from("sbproxy:idem");
+        push_key_segment(&mut key_prefix, tenant_id);
+        push_key_segment(&mut key_prefix, origin_id);
         Self {
             store,
             ttl_secs: ttl,
+            key_prefix,
         }
     }
 
-    fn build_key(workspace_id: &str, key: &str) -> String {
-        format!("sbproxy:idem:{workspace_id}:{key}")
+    fn build_key(&self, workspace_id: &str, key: &str) -> String {
+        let mut out =
+            String::with_capacity(self.key_prefix.len() + workspace_id.len() + key.len() + 16);
+        out.push_str(&self.key_prefix);
+        push_key_segment(&mut out, workspace_id);
+        push_key_segment(&mut out, key);
+        out
     }
 }
 
 impl IdempotencyCache for KvIdempotencyCache {
     fn get(&self, workspace_id: &str, key: &str) -> Option<CachedResponse> {
-        let storage_key = Self::build_key(workspace_id, key);
-        let raw = self.store.get(storage_key.as_bytes()).ok()??;
+        let storage_key = self.build_key(workspace_id, key);
+        let raw = match self.store.get(storage_key.as_bytes()) {
+            Ok(raw) => raw?,
+            Err(_) => {
+                // A store-side failure degrades to a miss so the request
+                // still flows, but it is counted separately: folded into
+                // `miss` it was indistinguishable from normal cold
+                // traffic, and an unreachable Redis meant every request
+                // silently re-executed against the upstream.
+                sbproxy_observe::metrics::record_idempotency_cache_result(
+                    self.backend_label(),
+                    "error",
+                );
+                return None;
+            }
+        };
         let parsed: CachedResponse = serde_json::from_slice(&raw).ok()?;
         if parsed.expires_at_unix <= now_unix() {
             // Best-effort eviction: ignore errors because the
@@ -392,7 +468,7 @@ impl IdempotencyCache for KvIdempotencyCache {
     }
 
     fn put(&self, workspace_id: &str, key: &str, response: CachedResponse) {
-        let storage_key = Self::build_key(workspace_id, key);
+        let storage_key = self.build_key(workspace_id, key);
         let Ok(payload) = serde_json::to_vec(&response) else {
             return;
         };
@@ -402,9 +478,19 @@ impl IdempotencyCache for KvIdempotencyCache {
             .store
             .put_with_ttl(storage_key.as_bytes(), &payload, self.ttl_secs)
             .is_err()
+            && self.store.put(storage_key.as_bytes(), &payload).is_err()
         {
-            let _ = self.store.put(storage_key.as_bytes(), &payload);
+            // Both paths failed: the response was never persisted, so the
+            // retry this entry exists for will re-execute upstream.
+            sbproxy_observe::metrics::record_idempotency_cache_result(
+                self.backend_label(),
+                "error",
+            );
         }
+    }
+
+    fn backend_label(&self) -> &'static str {
+        "kv"
     }
 }
 
@@ -621,6 +707,120 @@ mod tests {
         let json = serde_json::to_vec(&resp).unwrap();
         let back: CachedResponse = serde_json::from_slice(&json).unwrap();
         assert_eq!(resp, back);
+    }
+
+    /// One store standing in for the single cluster-wide
+    /// `proxy.l2_store` that every redis-backed origin shares. The point
+    /// of the tests below is which key each origin writes into it, so an
+    /// in-process map is enough.
+    fn shared_store() -> Arc<sbproxy_platform::storage::MemoryKVStore> {
+        Arc::new(sbproxy_platform::storage::MemoryKVStore::new(0))
+    }
+
+    fn kv_cache(
+        store: &Arc<sbproxy_platform::storage::MemoryKVStore>,
+        tenant: &str,
+        origin: &str,
+    ) -> KvIdempotencyCache {
+        KvIdempotencyCache::new(
+            Arc::clone(store) as Arc<dyn KVStore>,
+            DEFAULT_TTL_SECS,
+            tenant,
+            origin,
+        )
+    }
+
+    #[test]
+    fn kv_backend_isolates_two_origins_sharing_one_store() {
+        // The shape the redis backend actually ships in: both origins
+        // wrap the single cluster `proxy.l2_store`. Tenant A POSTs with
+        // `Idempotency-Key: order-1234`; tenant B then sends the same key
+        // and the same bytes to a different origin and must reach its own
+        // upstream rather than replay A's response.
+        let store = shared_store();
+        let tenant_a = kv_cache(&store, "tenant-a", "a.example.com");
+        let tenant_b = kv_cache(&store, "tenant-b", "b.example.com");
+        let headers = h(&[("Idempotency-Key", "order-1234")]);
+        let body = b"{\"amt\":10}";
+
+        let IdempotencyOutcome::Miss { key, body_hash } =
+            check_request(&tenant_a, "", &headers, body)
+        else {
+            panic!("expected Miss for tenant A");
+        };
+        record_response(
+            &tenant_a,
+            "",
+            &key,
+            RecordedResponse {
+                status: 200,
+                headers: vec![],
+                body: b"tenant-a-order".to_vec(),
+                body_hash,
+                ttl_secs: 60,
+            },
+        );
+
+        // Same key, same bytes, different origin: a miss, not a replay.
+        match check_request(&tenant_b, "", &headers, body) {
+            IdempotencyOutcome::Miss { .. } => {}
+            other => panic!("tenant B must not read tenant A's entry, got {other:?}"),
+        }
+
+        // And a differing body is tenant B's own miss, not a 409 for a
+        // key it never used.
+        match check_request(&tenant_b, "", &headers, b"{\"amt\":99}") {
+            IdempotencyOutcome::Miss { .. } => {}
+            other => panic!("tenant B must not inherit tenant A's conflict, got {other:?}"),
+        }
+
+        // Tenant A still replays its own entry, so the namespacing did
+        // not simply break the cache.
+        assert!(check_request(&tenant_a, "", &headers, body).is_cache_hit());
+    }
+
+    #[test]
+    fn kv_key_segments_cannot_straddle_the_separator() {
+        // Length-delimited segments: without them, tenant `a:b` origin
+        // `c` and tenant `a` origin `b:c` build the same prefix, and a
+        // caller who picks their own `Idempotency-Key` can walk into
+        // another namespace by embedding a colon.
+        let store = shared_store();
+        let straddling = kv_cache(&store, "a:b", "c");
+        let honest = kv_cache(&store, "a", "b:c");
+        let headers = h(&[("Idempotency-Key", "k")]);
+
+        let IdempotencyOutcome::Miss { key, body_hash } =
+            check_request(&straddling, "", &headers, b"x")
+        else {
+            panic!("expected Miss");
+        };
+        record_response(
+            &straddling,
+            "",
+            &key,
+            RecordedResponse {
+                status: 200,
+                headers: vec![],
+                body: b"secret".to_vec(),
+                body_hash,
+                ttl_secs: 60,
+            },
+        );
+
+        match check_request(&honest, "", &headers, b"x") {
+            IdempotencyOutcome::Miss { .. } => {}
+            other => panic!("colon-shifted ids must not collide, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backend_label_names_the_real_backend() {
+        // The `backend` metric label was the literal "default" at every
+        // recording site, so the two backends rendered as one series.
+        let store = shared_store();
+        assert_eq!(InMemoryIdempotencyCache::new().backend_label(), "memory");
+        assert_eq!(kv_cache(&store, "t", "o").backend_label(), "kv");
     }
 
     #[test]
