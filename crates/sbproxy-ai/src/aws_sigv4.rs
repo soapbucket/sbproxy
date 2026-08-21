@@ -1374,16 +1374,25 @@ Signature=39f3b56128bdae161b422f03928bdfee8bd6befbd13672d138b6fb3f6d76e2c4";
             access_key_id: Some(DOC_ACCESS_KEY_ID.to_string()),
             secret_access_key: Some(secret),
             session_token: Some(ConfigSecret(SecretString::new(SESSION_TOKEN))),
-            external_id: Some(ConfigSecret(SecretString::new("external"))),
+            // A sentinel that cannot appear in a field name. "external"
+            // could not do this job: it is a substring of `external_id`,
+            // so the assertion fired on the label rather than the value
+            // and the test failed while the redaction was working.
+            external_id: Some(ConfigSecret(SecretString::new("sentinel-xid-value"))),
             ..AwsCredentialsConfig::default()
         };
         let rendered = format!("{credentials:?}");
         assert!(
             !rendered.contains(DOC_SECRET_ACCESS_KEY)
                 && !rendered.contains(SESSION_TOKEN)
-                && !rendered.contains("external"),
+                && !rendered.contains("sentinel-xid-value"),
             "credential values must not survive a Debug render: {rendered}"
         );
+        // The access key id is deliberately NOT redacted: SigV4 puts it in
+        // the `Authorization` header of every signed request in plaintext,
+        // so it is an identifier rather than a secret, and hiding it would
+        // cost the diagnostic that says which key failed.
+        assert!(rendered.contains(DOC_ACCESS_KEY_ID));
     }
 
     #[test]

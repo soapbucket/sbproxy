@@ -474,19 +474,20 @@ mod tests {
     ///
     /// These assertions read `>= 43` until WOR-2627. A floor is true of
     /// every count above it, so the suite agreed with the catalog at 43,
-    /// at 72, and with `MIGRATION.md`'s claim of "90+" at the same time,
+    /// at 70, and with `MIGRATION.md`'s claim of "90+" at the same time,
     /// and none of the three could be wrong as far as any test here was
     /// concerned. `scripts/check-doc-drift.sh` derives the same number
     /// from the YAML and holds the prose to it, so a provider added
     /// without updating this constant fails here, and one added without
     /// updating the docs fails there.
-    const CATALOG_PROVIDERS: usize = 72;
+    const CATALOG_PROVIDERS: usize = 70;
 
     /// Wire-format split of the catalog, as `docs/providers.md`,
-    /// `docs/features.md`, and `docs/ai-gateway.md` all publish it: 66
+    /// `docs/features.md`, and `docs/ai-gateway.md` all publish it: 63
     /// OpenAI-format passthroughs, three in-tree translators (Anthropic,
-    /// Gemini, Bedrock), three custom-format entries.
-    const CATALOG_FORMAT_SPLIT: (usize, usize, usize, usize, usize) = (66, 1, 1, 1, 3);
+    /// Gemini, Bedrock), four custom-format entries (SageMaker, Oracle,
+    /// Watsonx, Writer).
+    const CATALOG_FORMAT_SPLIT: (usize, usize, usize, usize, usize) = (63, 1, 1, 1, 4);
 
     /// The checked-in plain-text catalog.
     ///
