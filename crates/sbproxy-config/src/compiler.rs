@@ -4175,7 +4175,7 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         action_type,
     )?;
 
-    // Middleware blocks whose only previous defence was a runtime no-op.
+    // Middleware blocks whose only previous defense was a runtime no-op.
     // Both run here, on the way into the compiled origin, so a broken
     // setting is a load-time error rather than a silently disabled
     // feature nothing reports.

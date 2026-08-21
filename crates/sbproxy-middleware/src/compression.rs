@@ -412,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_order_is_honoured_over_the_default_ladder() {
+    fn configured_order_is_honored_over_the_default_ladder() {
         // The operator's CDN caches gzip, so gzip is listed first. The
         // client accepts everything. Before the fix the list was a
         // membership set and the hardcoded zstd > br > gzip ladder picked

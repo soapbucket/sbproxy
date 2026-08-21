@@ -1134,7 +1134,7 @@ fn derived_component(
 /// seconds in the future and at most `skew` seconds in the past.
 ///
 /// The past half used to be missing entirely, and the timestamp window
-/// is the only replay defence a Web Bot Auth signature has: `nonce` is
+/// is the only replay defense a Web Bot Auth signature has: `nonce` is
 /// optional in the profile, `required_components` can require a
 /// component but never a parameter, and `bot_auth`'s nonce store is
 /// never wired by any caller in this tree. A captured `Signature-Input`
@@ -1475,10 +1475,10 @@ mod tests {
     /// inside the verifier's freshness window.
     ///
     /// Signatures in these tests are computed at run time, so a live
-    /// `created` costs nothing. The two fixtures that cannot move (the
+    /// `created` costs nothing. The one fixture that cannot move is the
     /// ECDSA known-answer vector, whose signature is a published
-    /// constant over a base containing `created=1700000000`) widen the
-    /// skew instead and say so where they do it.
+    /// constant over a base containing `created=1700000000`; it widens
+    /// the skew instead and says so where it does.
     fn now_unix() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
