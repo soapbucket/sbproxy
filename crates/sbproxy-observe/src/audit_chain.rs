@@ -803,6 +803,385 @@ pub fn verify_admin_audit_chain(
     sbproxy_meter::ledger::verify_ledger::<AdminActionAuditEntry>(path, verifying_key)
 }
 
+// --- WOR-2579: reading the chains back ---
+//
+// `sbproxy audit verify` is the auditor's read: a separate process, a
+// copy of the file, no proxy involved, and no bound on anything. What
+// follows is the operator's read, served from the running proxy to the
+// admin console, and it differs in exactly two ways. It keeps only a
+// window of records rather than the file, and it caps how large a single
+// record it will look at. Everything else is the same walk, through the
+// same `sbproxy_meter::ledger` function, because a viewer that verified
+// with one code path and displayed with another would eventually show a
+// record no walk had checked.
+
+/// The four chained channels, in the order the console lists them.
+///
+/// Public so the admin route validates `?channel=` against this list
+/// rather than a second copy of the same four strings. Each entry is the
+/// same word the chain labels itself with internally, which is also what a
+/// record's `channel` field carries in the response.
+pub const AUDIT_CHAIN_CHANNELS: [&str; 4] = ["security", "config", "key", "admin"];
+
+/// Default page size for [`read_audit_chain`] when a caller asks for none.
+pub const DEFAULT_AUDIT_CHAIN_LIMIT: usize = 100;
+
+/// Largest page [`read_audit_chain`] will serve, whatever a caller asks
+/// for. The page is the memory bound: the walk streams the file and holds
+/// this many records at most, so the cap is what keeps a chain of any size
+/// from being a way to make the proxy allocate.
+pub const MAX_AUDIT_CHAIN_LIMIT: usize = 500;
+
+/// Largest single chained record the viewer will read: 1 MiB.
+///
+/// No writer of ours produces one anywhere near this, so hitting it means
+/// the file is not what we wrote. Stopping there and reporting it as a
+/// verification failure is the honest answer for a bounded reader; the
+/// unbounded authority for a file in that state is `sbproxy audit verify`,
+/// which passes `None` for this bound and reads whatever is there.
+const VIEWER_MAX_RECORD_BYTES: usize = 1024 * 1024;
+
+/// The acting identity a chained record names, for the viewer's `actor`
+/// filter and column.
+///
+/// A trait with four hand-written impls rather than a lookup into the
+/// serialized JSON, because the field differs per channel and the compiler
+/// should be the thing that notices when one is renamed. A JSON probe for
+/// `"actor"` would keep compiling and quietly start matching nothing,
+/// which on a filter over an audit trail reads as "this operator did
+/// nothing" rather than as a bug.
+trait ChainViewerRow {
+    /// Who acted, when the record names anybody.
+    fn viewer_actor(&self) -> Option<&str>;
+}
+
+/// The security channel records refusals of requests, which have no
+/// operator: the acting identity is the client the proxy refused.
+impl ChainViewerRow for SecurityAuditEntry {
+    fn viewer_actor(&self) -> Option<&str> {
+        self.client_ip.as_deref()
+    }
+}
+
+/// Absent on a file-watcher or mesh-broadcast reload, which no operator
+/// asked for. That is a real answer rather than a gap: those rows show a
+/// blank actor and an `actor=` filter does not match them.
+impl ChainViewerRow for ConfigAuditEntry {
+    fn viewer_actor(&self) -> Option<&str> {
+        self.actor.as_deref()
+    }
+}
+
+/// The principal that mutated the key or credential.
+impl ChainViewerRow for KeyAuditChainEntry {
+    fn viewer_actor(&self) -> Option<&str> {
+        self.actor.as_deref()
+    }
+}
+
+/// The console operator whose action this is.
+impl ChainViewerRow for AdminActionAuditEntry {
+    fn viewer_actor(&self) -> Option<&str> {
+        self.actor.as_deref()
+    }
+}
+
+/// One chained record, verified, as the viewer serves it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AuditChainRecord {
+    /// Which chain it came off: `security`, `config`, `key`, or `admin`.
+    pub channel: &'static str,
+    /// Its position in that chain. Only comparable within one channel.
+    pub seq: u64,
+    /// The chained RFC 3339 timestamp. Inside the hashed bytes, so it is
+    /// as tamper-evident as the payload.
+    pub recorded_at: String,
+    /// Who acted, when the record names anybody: the operator on the
+    /// config, key, and admin channels, and the client IP on the security
+    /// channel, which has no operator.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    /// The chained payload, verbatim. Not a projection of it: the record
+    /// is already secret-free by construction on all four channels, and
+    /// re-editing it here would mean an operator reading a record the
+    /// chain cannot prove they were shown.
+    pub event: serde_json::Value,
+}
+
+/// What a caller wants out of one chain.
+///
+/// Every field narrows; none widens. A default query is "the newest
+/// [`DEFAULT_AUDIT_CHAIN_LIMIT`] records", and adding a filter can only
+/// return fewer.
+#[derive(Debug, Clone, Default)]
+pub struct AuditChainQuery {
+    /// Exact match on the record's acting identity, per channel. Exact
+    /// rather than substring: an audit filter that matched `root` against
+    /// `rootkit` would answer a question nobody asked.
+    pub actor: Option<String>,
+    /// Lower bound on `recorded_at`, unix milliseconds, inclusive.
+    pub since_ms: Option<i64>,
+    /// Upper bound on `recorded_at`, unix milliseconds, inclusive.
+    pub until_ms: Option<i64>,
+    /// Page cursor: only records below this sequence number.
+    pub before_seq: Option<u64>,
+    /// Page size, clamped into `1..=`[`MAX_AUDIT_CHAIN_LIMIT`].
+    pub limit: usize,
+}
+
+/// One channel's answer: what the walk found, and what it proved.
+///
+/// The verification fields are not optional decoration on the records.
+/// A caller that renders `records` without `ok` is showing a page it has
+/// no basis for, which is the failure mode this whole surface exists to
+/// avoid.
+#[derive(Debug, Clone)]
+pub struct AuditChainRead {
+    /// The channel walked.
+    pub channel: &'static str,
+    /// The file it walked.
+    pub path: String,
+    /// The `kid` this chain signs under.
+    pub key_id: String,
+    /// Records committed to the chain when the read started.
+    pub chain_entries: u64,
+    /// Records the walk verified. Below `chain_entries` when the walk
+    /// stopped early or when the file has lost records this process
+    /// wrote, which is itself a failure; above it when an append landed
+    /// while the walk was running, which is not.
+    pub verified_entries: u64,
+    /// Whether every link and every signature held.
+    pub ok: bool,
+    /// The first sequence that failed, when `ok` is false.
+    pub broken_seq: Option<u64>,
+    /// Why it failed, when `ok` is false.
+    pub reason: Option<String>,
+    /// Records matching the filters across the verified prefix.
+    pub total_matched: u64,
+    /// Cursor for the next older page, when one exists.
+    pub next_before_seq: Option<u64>,
+    /// The page, newest first.
+    pub records: Vec<AuditChainRecord>,
+    /// Set when the file could not be read at all, in which case nothing
+    /// above it was verified and `ok` is false.
+    pub error: Option<String>,
+}
+
+impl AuditChainRead {
+    /// A channel whose file could not be opened. `ok` is false, because
+    /// "we could not check" and "we checked and it was fine" are not the
+    /// same answer and only one of them may render as a clean chain.
+    fn unreadable(channel: &'static str, path: String, key_id: String, error: String) -> Self {
+        Self {
+            channel,
+            path,
+            key_id,
+            chain_entries: 0,
+            verified_entries: 0,
+            ok: false,
+            broken_seq: None,
+            reason: None,
+            total_matched: 0,
+            next_before_seq: None,
+            records: Vec::new(),
+            error: Some(error),
+        }
+    }
+}
+
+/// Parse one RFC 3339 timestamp into unix milliseconds.
+///
+/// Public so the admin route can reject a malformed `since=` with a `400`
+/// naming the parameter, using the same parser that will later compare it
+/// against a record, rather than a second one that might disagree.
+pub fn parse_chain_timestamp(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value.trim())
+        .ok()
+        .map(|at| at.timestamp_millis())
+}
+
+impl<P: LedgerPayload> AuditChain<P> {
+    /// Walk this chain and return one page of it, verified.
+    fn read_window(&self, query: &AuditChainQuery) -> AuditChainRead
+    where
+        P: ChainViewerRow,
+    {
+        let channel = self.channel.label();
+        let path = self.path.display().to_string();
+        let Some(verifying_key) = self.ledger.verifying_key() else {
+            // Unreachable: `AuditChain::open` always passes a seed. Handled
+            // rather than asserted because the alternative is a walk that
+            // silently checks hash links only and still reports `ok: true`,
+            // and a signature nobody checked must never render as verified.
+            return AuditChainRead {
+                ok: false,
+                reason: Some(
+                    "this chain has no verifying key, so no signature was checked".to_string(),
+                ),
+                ..AuditChainRead::unreadable(
+                    channel,
+                    path,
+                    self.key_id.clone(),
+                    "no verifying key".to_string(),
+                )
+            };
+        };
+        let (chain_entries, _head) = self.ledger.head();
+        let limit = query.limit.clamp(1, MAX_AUDIT_CHAIN_LIMIT);
+
+        // The window is the memory bound: at most `limit` records are held
+        // however long the file is, because the oldest is dropped as soon
+        // as a newer one arrives to replace it.
+        let mut window: std::collections::VecDeque<AuditChainRecord> =
+            std::collections::VecDeque::with_capacity(limit);
+        let mut total_matched: u64 = 0;
+
+        let verdict = sbproxy_meter::ledger::verify_ledger_visiting::<P>(
+            &self.path,
+            Some(&verifying_key),
+            Some(VIEWER_MAX_RECORD_BYTES),
+            &mut |entry| {
+                if query.before_seq.is_some_and(|before| entry.seq >= before) {
+                    return;
+                }
+                let actor = entry.event.viewer_actor();
+                if query
+                    .actor
+                    .as_deref()
+                    .is_some_and(|wanted| actor != Some(wanted))
+                {
+                    return;
+                }
+                if query.since_ms.is_some() || query.until_ms.is_some() {
+                    // A record whose own timestamp will not parse cannot be
+                    // placed inside or outside a range, so a time filter
+                    // excludes it rather than guessing. It still counts
+                    // toward the chain and still breaks verification if the
+                    // bytes were touched; only this filter cannot speak to
+                    // it.
+                    let Some(at) = parse_chain_timestamp(&entry.recorded_at) else {
+                        return;
+                    };
+                    if query.since_ms.is_some_and(|since| at < since) {
+                        return;
+                    }
+                    if query.until_ms.is_some_and(|until| at > until) {
+                        return;
+                    }
+                }
+                total_matched += 1;
+                if window.len() == limit {
+                    window.pop_front();
+                }
+                window.push_back(AuditChainRecord {
+                    channel,
+                    seq: entry.seq,
+                    recorded_at: entry.recorded_at.clone(),
+                    actor: actor.map(str::to_string),
+                    event: serde_json::to_value(&entry.event).unwrap_or_else(|error| {
+                        serde_json::json!({
+                            "error": format!("this record could not be rendered: {error}"),
+                        })
+                    }),
+                });
+            },
+        );
+
+        match verdict {
+            Ok(result) => {
+                // Newest first: the walk runs oldest to newest, and the
+                // deque kept the tail of it.
+                let records: Vec<AuditChainRecord> = window.into_iter().rev().collect();
+                let next_before_seq = if total_matched > records.len() as u64 {
+                    records.last().map(|record| record.seq)
+                } else {
+                    None
+                };
+                // A file somebody truncated reads as a short, clean
+                // chain. Every link in what is left still holds, because
+                // the walk has nothing to check the file against except
+                // itself, so the most obvious tamper there is - delete
+                // the tail, or the whole trail - is the one a link check
+                // alone cannot see.
+                //
+                // `chain_entries` is the missing comparison. It counts
+                // records this process wrote and flushed, so a walk that
+                // finds fewer is reading a file that lost some of them.
+                // Only ever short: an append landing between the head
+                // read above and the end of the walk makes the walk's
+                // count larger, which is the ordinary case on a live
+                // chain and not a finding.
+                let missing = chain_entries.saturating_sub(result.entries);
+                let truncated = result.ok && missing > 0;
+                AuditChainRead {
+                    channel,
+                    path,
+                    key_id: self.key_id.clone(),
+                    chain_entries,
+                    verified_entries: result.entries,
+                    ok: result.ok && !truncated,
+                    broken_seq: result.broken_seq.or(truncated.then_some(result.entries)),
+                    reason: result.reason.or_else(|| {
+                        truncated.then(|| {
+                            format!(
+                                "this process wrote {chain_entries} records to this chain and \
+                                 the file holds {}: {missing} are missing from it",
+                                result.entries
+                            )
+                        })
+                    }),
+                    total_matched,
+                    next_before_seq,
+                    records,
+                    error: None,
+                }
+            }
+            // The file could not be read at all. Whatever the walk had
+            // gathered before that is dropped along with the claim it was
+            // gathered under: a half-read file has no verified prefix.
+            Err(error) => {
+                AuditChainRead::unreadable(channel, path, self.key_id.clone(), error.to_string())
+            }
+        }
+    }
+}
+
+/// Whether `channel` has a chain installed on this process.
+///
+/// Separate from [`read_audit_chain`] because "is this channel on" is a
+/// question the viewer answers for all four channels on every request,
+/// including the three it was not asked to walk, and walking a file to
+/// find out would make a filtered read cost the same as an unfiltered
+/// one. An unknown channel name is `false`.
+pub fn audit_chain_installed(channel: &str) -> bool {
+    match channel {
+        "security" => CHAIN.get().is_some(),
+        "config" => CONFIG_CHAIN.get().is_some(),
+        "key" => KEY_CHAIN.get().is_some(),
+        "admin" => ADMIN_CHAIN.get().is_some(),
+        _ => false,
+    }
+}
+
+/// Read one page of an installed chain, verifying it on the way.
+///
+/// `None` means this deployment has no chain on that channel, which is the
+/// default and is not an error: the caller renders it as "not configured".
+/// `Some` always carries a verdict, including the verdict "this file could
+/// not be read".
+///
+/// An unknown `channel` is also `None`. Callers that need to tell the two
+/// apart validate against [`AUDIT_CHAIN_CHANNELS`] first.
+pub fn read_audit_chain(channel: &str, query: &AuditChainQuery) -> Option<AuditChainRead> {
+    match channel {
+        "security" => CHAIN.get().map(|chain| chain.0.read_window(query)),
+        "config" => CONFIG_CHAIN.get().map(|chain| chain.0.read_window(query)),
+        "key" => KEY_CHAIN.get().map(|chain| chain.0.read_window(query)),
+        "admin" => ADMIN_CHAIN.get().map(|chain| chain.0.read_window(query)),
+        _ => None,
+    }
+}
+
 // --- WOR-2478: the key-audit fingerprint key ---
 //
 // A key/credential mutation's before/after values must never reach the
@@ -1889,5 +2268,362 @@ mod tests {
 
         let empty = fingerprint_key_audit_snapshot(None);
         assert!(empty.is_empty(), "no snapshot, no fingerprints");
+    }
+
+    // --- WOR-2579: the console viewer's bounded read ---
+
+    /// A denial from a named client, so the viewer's actor filter has
+    /// something to be exact about.
+    fn denial_from(reason: &str, ip: &str) -> SecurityAuditEntry {
+        SecurityAuditEntry::policy_violation(
+            "waf",
+            reason,
+            403,
+            Some("api.example.com".to_string()),
+            Some(ip.parse().expect("a test IP parses")),
+            Some(format!("req-{reason}")),
+            Some("GET".to_string()),
+        )
+    }
+
+    /// A page is the newest window, newest first, and the cursor walks
+    /// strictly backwards through the rest without repeating a record or
+    /// skipping one.
+    #[test]
+    fn the_viewer_pages_a_chain_backwards_without_gaps() {
+        let path = temp_path("viewer-page");
+        let _ = std::fs::remove_file(&path);
+        let chain = open_chain(&path, &seed(0x41));
+        for index in 0..5 {
+            chain.append(&denial_from(&format!("page-{index}"), "203.0.113.7"));
+        }
+
+        let first = chain.0.read_window(&AuditChainQuery {
+            limit: 2,
+            ..AuditChainQuery::default()
+        });
+        assert!(first.ok, "an untouched chain verifies: {first:?}");
+        assert_eq!(first.channel, "security");
+        assert_eq!(first.chain_entries, 5);
+        assert_eq!(first.verified_entries, 5, "the walk reads the whole file");
+        assert_eq!(first.total_matched, 5);
+        let seqs: Vec<u64> = first.records.iter().map(|record| record.seq).collect();
+        assert_eq!(seqs, vec![4, 3], "newest first: {seqs:?}");
+        assert_eq!(first.next_before_seq, Some(3));
+
+        let second = chain.0.read_window(&AuditChainQuery {
+            limit: 2,
+            before_seq: first.next_before_seq,
+            ..AuditChainQuery::default()
+        });
+        let seqs: Vec<u64> = second.records.iter().map(|record| record.seq).collect();
+        assert_eq!(seqs, vec![2, 1], "the cursor is exclusive: {seqs:?}");
+        assert_eq!(
+            second.total_matched, 3,
+            "the cursor narrows the count too, or the last page never ends"
+        );
+        assert_eq!(second.next_before_seq, Some(1));
+
+        let last = chain.0.read_window(&AuditChainQuery {
+            limit: 2,
+            before_seq: Some(1),
+            ..AuditChainQuery::default()
+        });
+        let seqs: Vec<u64> = last.records.iter().map(|record| record.seq).collect();
+        assert_eq!(seqs, vec![0], "{seqs:?}");
+        assert_eq!(last.next_before_seq, None, "the walk back ends");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The actor filter is an exact match. One that matched
+    /// `203.0.113.7` against `203.0.113.70` would answer a question
+    /// nobody asked, on a surface where the answer is evidence.
+    #[test]
+    fn the_viewer_actor_filter_is_exact_not_a_prefix() {
+        let path = temp_path("viewer-actor");
+        let _ = std::fs::remove_file(&path);
+        let chain = open_chain(&path, &seed(0x42));
+        chain.append(&denial_from("short", "203.0.113.7"));
+        chain.append(&denial_from("long", "203.0.113.70"));
+
+        let read = chain.0.read_window(&AuditChainQuery {
+            actor: Some("203.0.113.7".to_string()),
+            limit: 10,
+            ..AuditChainQuery::default()
+        });
+
+        assert!(read.ok, "{read:?}");
+        assert_eq!(read.total_matched, 1, "only the exact actor: {read:?}");
+        assert_eq!(read.records.len(), 1);
+        assert_eq!(read.records[0].actor.as_deref(), Some("203.0.113.7"));
+        assert_eq!(read.records[0].event["reason"], "short");
+        assert_eq!(
+            read.verified_entries, 2,
+            "a filter narrows the page, never the walk: {read:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The acting identity is read per channel: the config chain names
+    /// the operator who asked for the reload, and a reload nobody asked
+    /// for names nobody rather than borrowing a field from elsewhere.
+    #[test]
+    fn the_viewer_reads_the_actor_per_channel() {
+        let path = temp_path("viewer-config-actor");
+        let _ = std::fs::remove_file(&path);
+        let chain = open_config_chain(&path, &seed(0x43));
+        chain.append(&config_change("api"));
+        chain.append(&ConfigAuditEntry::new(
+            "watcher",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        let read = chain.0.read_window(&AuditChainQuery {
+            limit: 10,
+            ..AuditChainQuery::default()
+        });
+        assert!(read.ok, "{read:?}");
+        assert_eq!(read.channel, "config");
+        let actors: Vec<Option<&str>> = read
+            .records
+            .iter()
+            .map(|record| record.actor.as_deref())
+            .collect();
+        assert_eq!(
+            actors,
+            vec![None, Some("ops@example.com")],
+            "newest first, and a watcher reload names nobody: {actors:?}"
+        );
+
+        let named = chain.0.read_window(&AuditChainQuery {
+            actor: Some("ops@example.com".to_string()),
+            limit: 10,
+            ..AuditChainQuery::default()
+        });
+        assert_eq!(
+            named.total_matched, 1,
+            "a blank actor is not matched by a named filter: {named:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The time filter narrows and never widens, and an empty page is
+    /// still a verified one: excluding every record must not read as a
+    /// chain that failed, nor as one nobody checked.
+    #[test]
+    fn the_viewer_time_filter_narrows_and_never_widens() {
+        let path = temp_path("viewer-time");
+        let _ = std::fs::remove_file(&path);
+        let chain = open_chain(&path, &seed(0x44));
+        for index in 0..3 {
+            chain.append(&denial_from(&format!("when-{index}"), "203.0.113.7"));
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let day = 24 * 60 * 60 * 1000;
+
+        let around = chain.0.read_window(&AuditChainQuery {
+            since_ms: Some(now - day),
+            until_ms: Some(now + day),
+            limit: 10,
+            ..AuditChainQuery::default()
+        });
+        assert_eq!(
+            around.total_matched, 3,
+            "a range around now keeps all three"
+        );
+
+        let tomorrow = chain.0.read_window(&AuditChainQuery {
+            since_ms: Some(now + day),
+            limit: 10,
+            ..AuditChainQuery::default()
+        });
+        assert_eq!(tomorrow.total_matched, 0, "nothing was recorded tomorrow");
+        assert!(tomorrow.records.is_empty());
+        assert!(tomorrow.ok, "an empty page is a verified one: {tomorrow:?}");
+        assert_eq!(tomorrow.verified_entries, 3);
+
+        let yesterday = chain.0.read_window(&AuditChainQuery {
+            until_ms: Some(now - day),
+            limit: 10,
+            ..AuditChainQuery::default()
+        });
+        assert_eq!(yesterday.total_matched, 0, "nor yesterday");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The page size is clamped at both ends whatever a caller asks for.
+    /// The window is the memory bound, so it is not negotiable.
+    #[test]
+    fn the_viewer_clamps_the_page_size() {
+        let path = temp_path("viewer-limit");
+        let _ = std::fs::remove_file(&path);
+        let chain = open_chain(&path, &seed(0x45));
+        for index in 0..3 {
+            chain.append(&denial_from(&format!("clamp-{index}"), "203.0.113.7"));
+        }
+
+        let zero = chain.0.read_window(&AuditChainQuery {
+            limit: 0,
+            ..AuditChainQuery::default()
+        });
+        assert_eq!(zero.records.len(), 1, "zero clamps up to one");
+        assert_eq!(
+            zero.total_matched, 3,
+            "the clamp is on the page, not on the count"
+        );
+
+        let huge = chain.0.read_window(&AuditChainQuery {
+            limit: MAX_AUDIT_CHAIN_LIMIT.saturating_mul(100),
+            ..AuditChainQuery::default()
+        });
+        assert_eq!(huge.records.len(), 3, "there are only three to serve");
+        assert!(huge.ok, "{huge:?}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A chain whose file has gone reports the failure rather than a
+    /// clean verdict. "We could not check" and "we checked and it held"
+    /// must never render the same way.
+    #[test]
+    fn the_viewer_never_reads_a_missing_chain_file_as_verified() {
+        let path = temp_path("viewer-missing");
+        let _ = std::fs::remove_file(&path);
+        let chain = open_chain(&path, &seed(0x46));
+        chain.append(&denial_from("gone", "203.0.113.7"));
+        std::fs::remove_file(&path).expect("the chain file is removable");
+
+        let read = chain.0.read_window(&AuditChainQuery {
+            limit: 10,
+            ..AuditChainQuery::default()
+        });
+
+        assert!(
+            !read.ok,
+            "an unreadable file is not a verified one: {read:?}"
+        );
+        assert!(read.error.is_some(), "and it says so: {read:?}");
+        assert!(read.records.is_empty(), "{read:?}");
+        assert_eq!(read.verified_entries, 0);
+    }
+
+    /// A break stops the page as well as the verdict: nothing after a
+    /// tampered record is served, because nothing proved it.
+    #[test]
+    fn the_viewer_serves_only_the_verified_prefix() {
+        let path = temp_path("viewer-break");
+        let _ = std::fs::remove_file(&path);
+        let chain = open_chain(&path, &seed(0x47));
+        for index in 0..4 {
+            chain.append(&denial_from(&format!("prefix-{index}"), "203.0.113.7"));
+        }
+        let content = std::fs::read_to_string(&path).expect("chain is readable");
+        let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+        lines[2] = lines[2].replace("\"reason\":\"prefix-2\"", "\"reason\":\"allowed\"");
+        assert!(lines[2].contains("allowed"), "the edit landed");
+        std::fs::write(&path, lines.join("\n") + "\n").expect("chain is writable");
+
+        let read = chain.0.read_window(&AuditChainQuery {
+            limit: 10,
+            ..AuditChainQuery::default()
+        });
+
+        assert!(!read.ok, "{read:?}");
+        assert_eq!(read.broken_seq, Some(2));
+        let seqs: Vec<u64> = read.records.iter().map(|record| record.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![1, 0],
+            "nothing past the break is served: {seqs:?}"
+        );
+        assert_eq!(read.verified_entries, 2);
+        assert_eq!(read.chain_entries, 4, "the file still claims four");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A file that lost records this process wrote never reads as
+    /// verified, even though what is left of it verifies perfectly on
+    /// its own terms. Truncating a trail is the most obvious tamper
+    /// there is and the one a link check alone cannot see.
+    #[test]
+    fn a_truncated_chain_file_never_reads_as_verified() {
+        let path = temp_path("viewer-truncated");
+        let _ = std::fs::remove_file(&path);
+        let chain = open_chain(&path, &seed(0x48));
+        for index in 0..4 {
+            chain.append(&denial_from(&format!("cut-{index}"), "203.0.113.7"));
+        }
+        let content = std::fs::read_to_string(&path).expect("chain is readable");
+        let kept: Vec<&str> = content.lines().take(2).collect();
+        std::fs::write(&path, kept.join("\n") + "\n").expect("chain is writable");
+
+        // The walk on its own is satisfied: two records, linked, signed.
+        let bare = verify_security_audit_chain(&path, None).expect("file is readable");
+        assert!(
+            bare.ok,
+            "a truncated prefix verifies on its own terms: {bare:?}"
+        );
+
+        let read = chain.0.read_window(&AuditChainQuery {
+            limit: 10,
+            ..AuditChainQuery::default()
+        });
+
+        assert!(
+            !read.ok,
+            "but the viewer knows four records were written: {read:?}"
+        );
+        assert_eq!(read.chain_entries, 4);
+        assert_eq!(read.verified_entries, 2);
+        assert_eq!(
+            read.broken_seq,
+            Some(2),
+            "named at the first record that is gone: {read:?}"
+        );
+        assert!(
+            read.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("missing"),
+            "and the verdict says what happened: {read:?}"
+        );
+        // What survived is still evidence, and is still served.
+        let seqs: Vec<u64> = read.records.iter().map(|record| record.seq).collect();
+        assert_eq!(seqs, vec![1, 0], "{seqs:?}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `read_audit_chain` answers `None` for a channel with no chain and
+    /// for a name that is not a channel at all, and
+    /// `audit_chain_installed` agrees with it. The two are separate
+    /// functions and the console asks both on every request, so a
+    /// disagreement would render a configured chain as "off".
+    #[test]
+    fn an_uninstalled_or_unknown_channel_is_reported_the_same_way() {
+        for name in ["not-a-channel", ""] {
+            assert!(
+                !audit_chain_installed(name),
+                "{name} is not a channel at all"
+            );
+            assert!(
+                read_audit_chain(name, &AuditChainQuery::default()).is_none(),
+                "{name} has nothing to read"
+            );
+        }
+        for name in AUDIT_CHAIN_CHANNELS {
+            assert_eq!(
+                audit_chain_installed(name),
+                read_audit_chain(name, &AuditChainQuery::default()).is_some(),
+                "{name}: installed and readable must be the same answer"
+            );
+        }
     }
 }

@@ -84,6 +84,8 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_acme_renewal_duration_seconds` | Histogram | `stable` | `beta` | `result` | ACME renewal full-flow duration, by outcome. |
 | `sbproxy_acme_renewals_total` | Counter | `stable` | `beta` | `result` | ACME certificate renewal attempts, by outcome. |
 | `sbproxy_active_connections` | Gauge | `stable` | `stable` | none | Current active connections. |
+| `sbproxy_admin_request_export_rows_total` | Counter | `stable` | `beta` | `format` | Rows written by admin request-log exports, by format. |
+| `sbproxy_admin_request_exports_total` | Counter | `stable` | `beta` | `format` | Admin request-log exports served, by format. |
 | `sbproxy_agent_budget_decisions_total` | Counter | `stable` | `beta` | `agent_id`, `outcome` | agent_budget policy verdicts, labeled by agent and outcome. |
 | `sbproxy_agent_detect_inference_seconds` | Histogram | `stable` | `stable` | none | Agent-detect scorer inference latency in seconds. |
 | `sbproxy_agent_detect_score` | Histogram | `stable` | `stable` | none | Agent-detect scorer output score, scaled 0-100. |
@@ -163,6 +165,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_ai_usage_parse_miss_total` | Counter | `stable` | `beta` | `provider`, `surface` | 2xx AI responses on a token surface that carried no parseable usage block (budget debited from an estimate). |
 | `sbproxy_ai_wasted_cost_dollars_total` | Counter | `stable` | `beta` | `kind`, `provider`, `model`, `surface`, `project`, `feature`, `team`, `agent_type`, `environment` | Estimated USD cost of AI spend classified as wasted. |
 | `sbproxy_ai_wasted_tokens_total` | Counter | `stable` | `beta` | `kind`, `provider`, `model`, `surface`, `project`, `feature`, `team`, `agent_type`, `environment` | AI tokens classified as wasted, by waste class. |
+| `sbproxy_audit_chain_read_total` | Counter | `stable` | `beta` | `channel`, `outcome` | Audit-chain read attempts, by verification outcome (verified, broken, unreadable, denied). |
 | `sbproxy_audit_emit_duration_seconds` | Histogram | `stable` | `beta` | `channel`, `outcome` | Wall-clock latency of one audit-channel emission. |
 | `sbproxy_audit_write_failures_total` | Counter | `stable` | `beta` | `channel` | Audit emissions that did not reach a sink they were promised, by audit channel; healthy systems read 0. |
 | `sbproxy_auth_results_total` | Counter | `stable` | `stable` | `origin`, `auth_type`, `result` | Auth check results. |
@@ -322,6 +325,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_redis_kv_connections_total` | Counter | `stable` | `beta` | `result` | Redis KV connection attempts by result. |
 | `sbproxy_redis_kv_operation_duration_seconds` | Histogram | `stable` | `beta` | `operation` | Redis KV operation duration in seconds. |
 | `sbproxy_redis_kv_operation_errors_total` | Counter | `stable` | `beta` | `operation`, `reason` | Redis KV operation failures by operation and reason. |
+| `sbproxy_request_body_drain_timeout_total` | Counter | `stable` | `beta` | none | Times the post-response drain of a client's request body hit its bound and the connection was closed with bytes unread. |
 | `sbproxy_request_duration_seconds` | Histogram | `stable` | `stable` | `hostname` | Request latency. |
 | `sbproxy_requests_total` | Counter | `stable` | `stable` | `hostname`, `method`, `status`, `agent_id`, `agent_class`, `agent_vendor`, `payment_rail`, `content_shape` | Total HTTP requests. |
 | `sbproxy_response_body_bytes` | Histogram | `stable` | `beta` | `direction` | Response body size, by compression direction. |

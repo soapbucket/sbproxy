@@ -778,11 +778,20 @@ pub(super) async fn handle_action(
                 .map_err(|e| {
                     Error::because(ErrorType::InternalError, "failed to set content-type", e)
                 })?;
-            header
-                .insert_header("content-length", body_bytes.len().to_string())
-                .map_err(|e| {
-                    Error::because(ErrorType::InternalError, "failed to set content-length", e)
-                })?;
+            // WOR-2599: same 204/304 carve-out the mock arm takes. RFC 9110
+            // section 8.6 forbids `Content-Length` on a 204, Pingora writes
+            // no body for either status, and an intermediary that frames a
+            // 204 by its declared length would eat the head of whatever
+            // came next on the connection. This arm has declared a length
+            // unconditionally since it was written; the two arms would
+            // otherwise disagree on a rule that applies to both.
+            if !matches!(effective_status, 204 | 304) {
+                header
+                    .insert_header("content-length", body_bytes.len().to_string())
+                    .map_err(|e| {
+                        Error::because(ErrorType::InternalError, "failed to set content-length", e)
+                    })?;
+            }
             for (k, v) in &s.headers {
                 if cel_header_removals
                     .iter()
@@ -958,7 +967,27 @@ pub(super) async fn handle_action(
                 return serve_generated_transform_failure(session, ctx, transform_outcome).await;
             }
             let body = transform_outcome.body;
-            let num_headers = 1 + m.headers.len();
+            // WOR-2599: without a declared length Pingora frames the body
+            // close-delimited, so the only end-of-body signal is the
+            // connection dying and a client cannot tell a finished body
+            // from a killed one. That is why the mock path broke at 70 KB
+            // while the static arm, which has always declared its length,
+            // survived to a megabyte. `body` is final here: the transform
+            // walk above has already run, and `apply_generated_response_phases`
+            // below only takes it by reference.
+            //
+            // 204 and 304 are the exception. RFC 9110 section 8.6 forbids
+            // `Content-Length` on a 204, Pingora writes no body for either
+            // status, and neither is close-delimited, so there is nothing
+            // to frame and a length would only be a lie. A mocked
+            // `DELETE -> 204` is an ordinary thing to configure, and
+            // `body` defaults to JSON `null` rather than to nothing, so
+            // this is reachable without the operator writing a body at
+            // all. HEAD is deliberately not in this set: Pingora suppresses
+            // the body there too, but RFC 9110 section 9.3.2 wants the
+            // length the equivalent GET would have carried.
+            let declares_length = !matches!(m.status, 204 | 304);
+            let num_headers = 1 + usize::from(declares_length) + m.headers.len();
             let mut header = pingora_http::ResponseHeader::build(m.status, Some(num_headers))
                 .map_err(|e| {
                     Error::because(ErrorType::InternalError, "failed to build mock header", e)
@@ -988,6 +1017,21 @@ pub(super) async fn handle_action(
                     }
                 }
             }
+            // Framing goes on last, after the operator headers and the CEL
+            // mutations, because `insert_header` replaces where
+            // `append_header` accumulates: a CEL `append` of
+            // `content-length` would otherwise leave two values, which
+            // Pingora refuses to reconcile and answers by falling back to
+            // exactly the close-delimited framing this is here to remove.
+            // Writing it last means sbproxy always owns the one value that
+            // describes the bytes it is about to send.
+            if declares_length {
+                header
+                    .insert_header("content-length", body.len().to_string())
+                    .map_err(|e| {
+                        Error::because(ErrorType::InternalError, "failed to set content-length", e)
+                    })?;
+            }
             // WOR-2496: response-phase policies and cookies apply to the
             // generated response exactly as they would to a proxied one.
             apply_generated_response_phases(session, ctx, pipeline, origin_idx, &mut header, &body);
@@ -1009,13 +1053,24 @@ pub(super) async fn handle_action(
             // Stamp the status for the access log and metrics, mirroring
             // the static and mock arms (WOR-1782).
             ctx.response_status = Some(200);
-            let mut header = pingora_http::ResponseHeader::build(200, Some(2)).map_err(|e| {
+            let mut header = pingora_http::ResponseHeader::build(200, Some(3)).map_err(|e| {
                 Error::because(ErrorType::InternalError, "failed to build beacon header", e)
             })?;
             header
                 .insert_header("content-type", "image/gif")
                 .map_err(|e| {
                     Error::because(ErrorType::InternalError, "failed to set content-type", e)
+                })?;
+            // WOR-2599: the third generated-body arm that never declared a
+            // length, and the same close-delimited framing follows from it.
+            // The pixel is 43 bytes so it can never reach the large-body
+            // race the mock arm hit, but every beacon request was still
+            // burning a whole TCP connection to signal end-of-body, on the
+            // one endpoint a page is likely to hit repeatedly.
+            header
+                .insert_header("content-length", GIF_1X1.len().to_string())
+                .map_err(|e| {
+                    Error::because(ErrorType::InternalError, "failed to set content-length", e)
                 })?;
             header
                 .insert_header("cache-control", "no-cache, no-store")

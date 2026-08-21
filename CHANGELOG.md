@@ -12,6 +12,101 @@ the next version cut.
 
 ### Added
 
+- **Routing decision traces: `GET /api/routing-decisions` and the
+  admin console's Routing decisions view.** Every routed request
+  (AI dispatch or a load-balanced origin) now records a per-request
+  decision trace: the strategy or operator plan that decided, the
+  ordered candidates it weighed, the winner, the reason, the fallback
+  chain actually traversed, and timing. The record's open `detail`
+  map is additive by design so later explanatory columns land as
+  keys, not schema changes. Bounded in-memory ring sharing
+  `proxy.admin.max_log_entries` with the request log; server-side
+  filters by origin, strategy, model (either side of a substitution),
+  provider, and time range. See the routing-decisions sections of
+  [docs/admin-api-reference.md](docs/admin-api-reference.md) and
+  [docs/admin-ui.md](docs/admin-ui.md).
+
+- **Reporting: multi-dimension spend aggregation and raw export on
+  the request log, with shareable filtered views.**
+  `GET /api/requests/report` aggregates the same filtered ring that
+  `GET /api/requests` serves into one row per composite group:
+  `group_by` takes any mix of `model`, `api_key_id`, `tenant`, and
+  `user` simultaneously, and each row carries request count, tokens
+  in/out, and estimated cost. `GET /api/requests/export` downloads
+  the filtered rows as CSV or JSONL, bounded by the ring cap and
+  hardened against spreadsheet formula injection. Every export is an
+  audited admin action (`export_request_log`, naming the format, the
+  row count, and which filter dimensions were set) and increments the
+  new `sbproxy_admin_request_exports_total{format}` and
+  `sbproxy_admin_request_export_rows_total{format}` counters, so every
+  export is recorded and alertable. That record covers the export
+  route, not every bulk read: `GET /api/requests?limit=<max>` returns
+  the same rows under the same cap with no record and no counter, so a
+  detection built on `export_request_log` alone covers the download
+  button rather than the whole read surface. The response is bounded
+  by the ring cap but materialized rather than streamed, because the
+  admin dispatcher answers with a whole body; what the row-at-a-time
+  encoding avoids is a second copy, not the response itself.
+  All three routes share one filter surface, which gains exact
+  `model`, `tenant`, and `user` filters, refuses a malformed `status`,
+  `offset`, or `limit` with a `400` instead of ignoring it, and treats
+  an empty filter value as "rows with nothing there", so the report's
+  unattributed group drills through to its own rows like any other. The admin console's new
+  Reports view drives them and serializes filter and grouping state
+  into URL query params, so a filtered report is a shareable link.
+  See the reporting sections of
+  [docs/admin-api-reference.md](docs/admin-api-reference.md) and
+  [docs/admin-ui.md](docs/admin-ui.md), and the worked example in
+  [examples/admin-reporting/](examples/admin-reporting/).
+
+- **Audit chain viewer: `GET /api/audit/chain` and the console's
+  Audit view.** The four tamper-evident audit chains
+  (`audit.path`, `audit.config_path`, `audit.key_path`,
+  `audit.admin_path`) were CLI-only reads until now. The new route
+  reads the chained files themselves with channel, actor, and
+  time-range filters plus cursor paging, re-verifying every hash link
+  and Ed25519 signature as it reads; reads are windowed (streamed one
+  record at a time, never a whole-file load) and a verification
+  failure is served in the response with the first broken sequence
+  and reason, alongside the records that verified. A truncated or
+  deleted chain file is reported as a failure too: what is left of a
+  truncated file links and signs perfectly, so the read compares the
+  walk against the number of records **this process** wrote to that
+  chain, which means it catches a truncation the running proxy
+  outlived and not one that survived a restart. The console's
+  Audit view renders the four channel cards, the merged entry table,
+  and a failure banner. GET-only, readable by the `read_only` role;
+  a login narrowed with `proxy.admin.operators[].tenant` is refused,
+  because the chains are deployment-wide and a per-tenant slice of an
+  audit trail reads as "nothing else happened". Read access is wider
+  than the bounded ring at `GET /api/audit/events` on two axes, both
+  stated in [docs/audit-log.md](docs/audit-log.md): history is the
+  whole chain rather than the last `max_audit_events` records, and
+  each entry carries the chained payload verbatim rather than the
+  ring's `detail` projection. No secrets cross either way; a
+  deployment that wants the trail narrower turns the channel's chain
+  path off or fronts the admin port. Every call is itself
+  recorded on the admin channel (`read_audit_chain`, or
+  `read_audit_chain_denied` on the refusal). See the audit-chain
+  sections of [docs/audit-log.md](docs/audit-log.md),
+  [docs/admin-api-reference.md](docs/admin-api-reference.md), and
+  [docs/admin-ui.md](docs/admin-ui.md).
+
+- **New metric `sbproxy_audit_chain_read_total{channel, outcome}`.**
+  One increment per chain walked per viewer read, with an `outcome`
+  of `verified`, `broken`, or `unreadable`; a refusal increments all
+  four channels with `denied`, because it refuses all four. A broken
+  chain that only a person looking at the console can see is a finding
+  nobody is on call for, and a tenant-scoped operator probing a
+  deployment-wide security surface is one whose only other record sits
+  inside the chain that operator was refused. Both leave the page:
+  alert on
+  `increase(sbproxy_audit_chain_read_total{outcome!="verified"}[15m]) > 0`.
+  That rule does not cover a chain file truncated at the tail and read
+  after a restart: the boot re-baselines on what is left, every link
+  and signature holds, and the read is `verified`. Pre-restart records
+  are covered by `sbproxy audit verify` against an offsite copy.
+
 - **Temporary, auto-expiring budget overrides on dynamic keys.** `POST
   /admin/keys/{id}/budget-override` raises a governed key's effective
   budget on top of its base caps (`max_tokens_increase`,
@@ -329,6 +424,35 @@ the next version cut.
   `info`, uncapped and unredacted. Messages now pass through the secret
   redactor, are truncated at 512 bytes, and at most eight events are
   emitted per evaluation with one summary line for the remainder.
+
+- **A large request body no longer costs the client the response
+  sbproxy already wrote.** Any response the proxy generates itself goes
+  out before the client's body has been read: `type: mock`,
+  `type: static`, `type: echo`, `type: beacon`, every policy denial,
+  and the 502 for an upstream that could not be reached. The socket
+  therefore still held unread bytes when the session ended, and closing
+  a socket in that state makes the kernel send a TCP RST rather than a
+  FIN, which discards whatever the peer had buffered but not yet read,
+  the response included. Clients saw a reset connection instead of
+  their 200, 403, or 502. The proxy now reads and discards the rest of
+  the body before closing, bounded at five seconds the way nginx bounds
+  `lingering_close`; the response still goes out immediately and only
+  the teardown waits. Hitting the bound increments the new
+  `sbproxy_request_body_drain_timeout_total`. One consequence worth
+  knowing: a client that sends `Expect: 100-continue`, receives the
+  final response instead of a 100, and then correctly sends no body now
+  holds its connection for that bound rather than being closed at once.
+
+- **`type: mock` and `type: beacon` responses declare
+  `Content-Length`.** Without it the body was close-delimited, so the
+  only end-of-body signal was the connection closing: a client could
+  not tell a complete body from a killed one, and every mock or beacon
+  response burned a connection even when it advertised `keep-alive`.
+  That missing header is why the reset above surfaced on the mock path
+  from roughly 70 KB while `type: static`, which has always declared
+  its length, survived to a megabyte. Neither arm declares a length on
+  204 or 304, where RFC 9110 section 8.6 forbids it; `type: static` no
+  longer does either.
 
 - **Prompts admin page "Add version" now sends the field the backend
   expects.** The form built a `content` key while

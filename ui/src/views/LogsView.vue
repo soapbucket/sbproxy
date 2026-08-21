@@ -18,6 +18,7 @@ import {
   timestampMillis,
   timestampOf,
 } from "../lib/request-observability";
+import { replayQueryFor } from "../lib/replay";
 import PageHeader from "../components/PageHeader.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import ErrorState from "../components/ErrorState.vue";
@@ -391,6 +392,16 @@ function detailFields(request: RequestLog): DetailField[] {
     .forEach(([key, value]) => push(`Property: ${key}`, value));
   return fields;
 }
+
+// WOR-2580: an AI-dispatched row can replay into the playground. The
+// handoff carries only what the ring retains (request id, origin,
+// model, minted key); the playground reads the redacted content
+// sample itself, through the same audited endpoint as the button
+// below. Admin-gated because the governed dispatch route refuses
+// read_only operators.
+function canReplay(request: RequestLog): boolean {
+  return replayQueryFor(request) !== null;
+}
 </script>
 
 <template>
@@ -710,6 +721,15 @@ function detailFields(request: RequestLog): DetailField[] {
                     No additional fields on this legacy row.
                   </p>
                 </div>
+                <div v-if="isAdmin && canReplay(request)" class="detail-actions">
+                  <RouterLink
+                    class="sb-btn sb-btn--sm"
+                    :to="{ name: 'playground', query: replayQueryFor(request) ?? undefined }"
+                    @click.stop
+                  >
+                    Replay in playground
+                  </RouterLink>
+                </div>
                 <div
                   v-if="isAdmin && request.request_id"
                   class="content-capture"
@@ -952,6 +972,9 @@ function detailFields(request: RequestLog): DetailField[] {
 }
 .no-detail {
   margin: 4px 0;
+}
+.detail-actions {
+  margin: 4px 0 8px;
 }
 @media (max-width: 720px) {
   .column-picker__menu {

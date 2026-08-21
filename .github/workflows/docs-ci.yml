@@ -86,7 +86,7 @@ jobs:
           fail: false
 
       - name: install rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/pinned-toolchain
 
       - name: install nextest
         uses: taiki-e/install-action@nextest

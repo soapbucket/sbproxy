@@ -46,7 +46,14 @@ jobs:
           docker-images: false
           swap-storage: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      # A lane that answers "do two independent builds of this commit
+      # produce the same bytes" cannot resolve its compiler from a
+      # channel that moves. Two legs started on either side of a stable
+      # release would differ for a reason that has nothing to do with
+      # the source, and a rerun of an old tag would answer a different
+      # question than the original run did. The pin makes the compiler
+      # a property of the commit, which is what the probe assumes.
+      - uses: ./.github/actions/pinned-toolchain
 
       - uses: Swatinem/rust-cache@v2
         with:

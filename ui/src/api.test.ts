@@ -241,6 +241,83 @@ describe("request observability contracts", () => {
       expect.objectContaining({ method: "GET" }),
     );
   });
+
+  // WOR-2578: the report and the export ride the same filter surface
+  // as the snapshot, so one filter state describes all three.
+  it("builds the multi-dimension report path from the shared filter surface", async () => {
+    const fetchMock = stubFetch(
+      '{"schema_version":1,"group_by":["model"],"rows":[],"totals":{"requests":0,"tokens_in":0,"tokens_out":0,"cost_usd_micros":0}}',
+    );
+
+    await api.requestsReport(["model", "api_key_id", "tenant", "user"], {
+      model: "claude-sonnet-4",
+      tenant: "acme",
+      user: "dev@acme.test",
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/requests/report?model=claude-sonnet-4&tenant=acme&user=dev%40acme.test&group_by=model%2Capi_key_id%2Ctenant%2Cuser",
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+
+  it("builds export URLs that carry the current filtered view", () => {
+    expect(api.requestsExportUrl("csv", { model: "gpt-5", tenant: "acme" })).toBe(
+      "/api/requests/export?model=gpt-5&tenant=acme&format=csv",
+    );
+    expect(api.requestsExportUrl("jsonl")).toBe("/api/requests/export?format=jsonl");
+  });
+
+  it("fetches the export through the client so failures reach the error path", async () => {
+    const fetchMock = stubFetch("timestamp,origin\n2026-08-20T00:00:00Z,ai.local\n");
+
+    const body = await api.requestsExport("csv", { tenant: "acme" });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/requests/export?tenant=acme&format=csv",
+      expect.objectContaining({ method: "GET" }),
+    );
+    expect(body).toContain("ai.local");
+  });
+
+  it("throws an ApiError carrying the server body when the export is refused", async () => {
+    stubFetch('{"error":"Unauthorized"}', 401);
+
+    // The bare <a download> this replaced saved that body as
+    // `requests.csv` with nothing on screen.
+    await expect(api.requestsExport("csv")).rejects.toBeInstanceOf(ApiError);
+  });
+});
+
+describe("api.routingDecisions (WOR-2575)", () => {
+  it("builds the snake_case server-side filter query", async () => {
+    const fetchMock = stubFetch("[]");
+
+    await api.routingDecisions({
+      origin: "ai-gateway",
+      strategy: "fallback_chain",
+      provider: "anthropic",
+      model: "gpt-5",
+      since: "2026-08-20T10:30:00+00:00",
+      limit: 50,
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/routing-decisions?origin=ai-gateway&strategy=fallback_chain&provider=anthropic&model=gpt-5&since=2026-08-20T10%3A30%3A00%2B00%3A00&limit=50",
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+
+  it("omits the query string entirely when nothing is filtered", async () => {
+    const fetchMock = stubFetch("[]");
+
+    await api.routingDecisions();
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/routing-decisions",
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
 });
 
 describe("extension inventory contract", () => {
@@ -422,6 +499,47 @@ describe("alert operations contracts", () => {
         headers: expect.objectContaining({ "X-CSRF-Token": "csrf-alert-test" }),
         body: JSON.stringify({ channel_index: 3 }),
       }),
+    );
+  });
+});
+
+describe("api.auditChain (WOR-2579)", () => {
+  it("builds the snake_case chain query with the paging cursor", async () => {
+    const fetchMock = stubFetch('{"channels":[],"entries":[]}');
+
+    await api.auditChain({
+      channel: "security",
+      actor: "203.0.113.9",
+      since: "2026-08-20T10:30:00.000Z",
+      beforeSeq: 42,
+      limit: 50,
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/audit/chain?channel=security&actor=203.0.113.9&since=2026-08-20T10%3A30%3A00.000Z&before_seq=42&limit=50",
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+
+  it("keeps a zero cursor: seq 0 is a real position, not a missing one", async () => {
+    const fetchMock = stubFetch('{"channels":[],"entries":[]}');
+
+    await api.auditChain({ channel: "admin", beforeSeq: 0 });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/audit/chain?channel=admin&before_seq=0",
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+
+  it("omits the query string entirely when nothing is filtered", async () => {
+    const fetchMock = stubFetch('{"channels":[],"entries":[]}');
+
+    await api.auditChain();
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/audit/chain",
+      expect.objectContaining({ method: "GET" }),
     );
   });
 });
