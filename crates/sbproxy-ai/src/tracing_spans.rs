@@ -508,6 +508,12 @@ pub mod error_type {
     pub const UPSTREAM_5XX: &str = "upstream_5xx";
     /// The upstream request or response stream timed out.
     pub const TIMEOUT: &str = "timeout";
+    /// The gateway refused the request before dispatch because the
+    /// caller's own input was unusable: a malformed header value, or a
+    /// demand the surface cannot honor. Distinct from
+    /// [`BUDGET_EXCEEDED`], which is the gateway declining a
+    /// well-formed request on spend grounds.
+    pub const INVALID_REQUEST: &str = "invalid_request";
 }
 
 /// Mark an AI span as failed (WOR-1231).
@@ -1154,6 +1160,11 @@ mod tests {
         assert_eq!(error_type::BUDGET_EXCEEDED, "budget_exceeded");
         assert_eq!(error_type::UPSTREAM_5XX, "upstream_5xx");
         assert_eq!(error_type::TIMEOUT, "timeout");
+        assert_eq!(error_type::PROVIDER_ERROR, "provider_error");
+        // WOR-2559: the class the gateway uses when the caller's own
+        // input was unusable, kept distinct from BUDGET_EXCEEDED so a
+        // mistyped header does not alert as an exhausted budget.
+        assert_eq!(error_type::INVALID_REQUEST, "invalid_request");
     }
 
     /// WOR-1228: prompt / completion content lands on the OpenInference

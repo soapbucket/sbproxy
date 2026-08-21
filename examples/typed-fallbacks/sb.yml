@@ -1,0 +1,113 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# AI gateway: typed fallback triggers.
+#
+# The generic fallback chain answers "the provider is down, try the next
+# one". Two failure classes deserve a different next hop, and each gets
+# its own list:
+#
+#   context_window_fallbacks:  the prompt's pre-flight token estimate
+#     overflows the primary model's context window, so reroute to a
+#     provider serving a larger-window model, before anything dispatches.
+#   content_policy_fallbacks:  the provider refused on content-policy /
+#     safety grounds, so reroute the refusal to a more permissive
+#     provider instead of returning it.
+#
+# Each list names providers from this action's `providers:` (unknown
+# names fail config load). A typed list takes over the untried tail of
+# the attempt order when its trigger fires; configuring one trigger does
+# not change how the other failure class is handled.
+#
+# This example is fully self-contained: the "providers" are two local
+# sbproxy mock fixtures, so no API keys are needed. In production, point
+# the providers at real upstreams and keep the same fallback lists.
+#
+# Run (three processes):
+#   make run CONFIG=examples/typed-fallbacks/upstream-strict.yml &
+#   make run CONFIG=examples/typed-fallbacks/upstream-permissive.yml &
+#   make run CONFIG=examples/typed-fallbacks/sb.yml
+#
+# See README.md for the scenario walkthrough (oversized prompt, refusal
+# reroute, per-class cooldown) and the admin view of each decision.
+
+proxy:
+  http_bind_port: 8080
+
+  # The routing decision view: GET /api/requests on this port shows
+  # `failover_trigger` (context_window | content_policy | generic) for
+  # every rerouted request.
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: admin
+
+origins:
+  # Scenario 1: context-window reroute. `small` serves gpt-4 (8,192-token
+  # window); `big-window` maps gpt-4 to gpt-4-turbo (128,000 tokens). A
+  # prompt whose estimate exceeds 8,192 tokens skips `small` entirely.
+  "window.local":
+    action:
+      type: ai_proxy
+      routing:
+        strategy: fallback_chain
+      context_window_fallbacks: [big-window]
+      providers:
+        - name: small
+          provider_type: openai
+          api_key: "demo"
+          base_url: http://127.0.0.1:8092
+          allow_private_base_url: true
+          priority: 1
+          models: [gpt-4]
+        - name: big-window
+          provider_type: openai
+          api_key: "demo"
+          base_url: http://127.0.0.1:8092
+          allow_private_base_url: true
+          priority: 2
+          models: [gpt-4]
+          # The larger-context model this provider actually dispatches.
+          model_map:
+            gpt-4: gpt-4-turbo
+
+  # Scenario 2: content-policy reroute. `strict` refuses everything (the
+  # 8091 fixture); the typed list aims the refusal straight at
+  # `permissive`, skipping `backup`, the generic next-in-order.
+  "policy.local":
+    action:
+      type: ai_proxy
+      routing:
+        strategy: fallback_chain
+      content_policy_fallbacks: [permissive]
+      resilience:
+        # Per-error-class counts share the same failure classification.
+        # A refusal never retries in place (it would only fail again);
+        # after one refusal the refusing provider is held out of
+        # rotation for 60s, so the next request goes straight to the
+        # provider that can answer.
+        retry_policy:
+          content_policy: 0
+        cooldown_policy:
+          content_policy: 60
+      providers:
+        - name: strict
+          provider_type: openai
+          api_key: "demo"
+          base_url: http://127.0.0.1:8091
+          allow_private_base_url: true
+          priority: 1
+          models: [gpt-4]
+        - name: backup
+          provider_type: openai
+          api_key: "demo"
+          base_url: http://127.0.0.1:8092
+          allow_private_base_url: true
+          priority: 2
+          models: [gpt-4]
+        - name: permissive
+          provider_type: openai
+          api_key: "demo"
+          base_url: http://127.0.0.1:8092
+          allow_private_base_url: true
+          priority: 3
+          models: [gpt-4]

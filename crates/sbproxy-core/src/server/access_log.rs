@@ -721,6 +721,12 @@ pub(super) fn emit_access_log(
         license_token_id: None,
         cap_token_id: None,
         upstream_host: None,
+        // WOR-2328: the zone-locality verdict travels on the access
+        // log as well as the admin ring, because the admin ring is an
+        // in-memory buffer that `admin.enabled` defaults off, and a
+        // shipped log line is what an operator already has a pipeline
+        // for. Absent when the stage stood down.
+        zone_locality: ctx.admin_zone_locality.map(str::to_string),
         request_headers,
         response_headers,
     };
@@ -929,6 +935,12 @@ pub(super) struct AccessLogContext {
     pub(super) cap_token_id: Option<String>,
     /// Resolved upstream host the request was proxied to.
     pub(super) upstream_host: Option<String>,
+    /// WOR-2328: how the zone-locality stage shaped the load-balancer
+    /// selection, from `ctx.admin_zone_locality`. `local` or
+    /// `spilled`; `None` (and so absent from the line, not empty) when
+    /// the stage did not engage or the request never reached a load
+    /// balancer.
+    pub(super) zone_locality: Option<String>,
     /// Captured request headers (lowercased keys, truncated and
     /// optionally PII-redacted values). Empty when capture is off or
     /// no allowlisted header was present on the request.
@@ -1002,6 +1014,7 @@ impl AccessLogContext {
             license_token_id: None,
             cap_token_id: None,
             upstream_host: None,
+            zone_locality: None,
             request_headers: std::collections::BTreeMap::new(),
             response_headers: std::collections::BTreeMap::new(),
         }
@@ -1069,6 +1082,14 @@ pub(super) fn ai_outcome_label(
             // credential, the configured fleet simply had no provider
             // meeting the required data-handling posture.
             "data_posture_block" => "data_posture_block",
+            // WOR-2559: a per-request price-ceiling refusal returns
+            // 402, and the status arm below reads 402 as
+            // `budget_exceeded`, the label an exhausted tenant spend
+            // budget carries. Without its own value an operator paging
+            // on a blown budget is woken by every request an authored
+            // ceiling trimmed, and a real exhaustion on a
+            // ceiling-enabled origin cannot be told apart from them.
+            "price_ceiling_block" => "price_ceiling_block",
             "refusal" => "refusal",
             _ => "other",
         };
@@ -1230,6 +1251,7 @@ pub(super) fn emit_access_log_entry(
         license_token_id: context.license_token_id,
         cap_token_id: context.cap_token_id,
         upstream_host: context.upstream_host,
+        zone_locality: context.zone_locality,
         request_headers: context.request_headers,
         response_headers: context.response_headers,
     };
@@ -1409,6 +1431,34 @@ mod run_identity_tests {
         assert!(line.get("a2a_context_id").is_none());
         assert!(line.get("a2a_identity_verified").is_none());
     }
+
+    /// WOR-2328: `ZoneLocality::as_str`'s rustdoc named the access log
+    /// as a consumer of the verdict while the access log carried no
+    /// zone field at all, so an operator who configured shipping for
+    /// it found a column that never arrives.
+    #[test]
+    fn a_cross_zone_spill_reaches_the_access_log() {
+        let mut context = AccessLogContext::empty();
+        context.zone_locality = Some("spilled".to_string());
+
+        let line = emit(context);
+
+        assert_eq!(line["zone_locality"], "spilled");
+    }
+
+    /// The stage stands down on most traffic (no proxy zone, an
+    /// unlabeled pool, a pool under `min_pool_size`, or no load
+    /// balancer at all). Those lines carry no column rather than an
+    /// empty one, because `zone_locality: ""` reads as a verdict and
+    /// there was none.
+    #[test]
+    fn a_request_the_locality_stage_never_touched_carries_no_zone_column() {
+        let line = emit(AccessLogContext::empty());
+        assert!(
+            line.get("zone_locality").is_none(),
+            "an absent verdict must be absent, not empty: {line}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1481,6 +1531,16 @@ mod outcome_tests {
         assert_eq!(
             ai_outcome_label(403, Some("policy_route_blocked"), false),
             "policy_block"
+        );
+        // WOR-2559: 402 alone means `budget_exceeded`, so the ceiling
+        // refusal has to override the status or it is indistinguishable
+        // from an exhausted spend budget on the attributed-outcome
+        // series.
+        assert_eq!(ai_outcome_label(402, None, false), "budget_exceeded");
+        assert_eq!(
+            ai_outcome_label(402, Some("price_ceiling_block"), false),
+            "price_ceiling_block",
+            "a per-request price ceiling must not read as an exhausted tenant budget"
         );
         // An unknown override degrades to `other` rather than leaking an
         // unbounded label.

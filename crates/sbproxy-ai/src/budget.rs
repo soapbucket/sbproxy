@@ -1075,6 +1075,176 @@ pub fn cheapest_model(candidates: &[String]) -> Option<String> {
     best.map(|(_, name)| name.clone())
 }
 
+// --- Per-request price ceiling (WOR-2559) ---
+
+/// Completion-token allowance the price-ceiling estimate assumes when a
+/// request declares no output cap (`max_tokens`, `max_completion_tokens`,
+/// or `max_output_tokens`). About a page of text: large enough that an
+/// output-priced frontier model cannot slip under a tight ceiling on a
+/// short prompt alone, small enough that ordinary requests are not
+/// refused for output they will never produce. Callers who want an exact
+/// gate declare their output cap.
+pub const PRICE_CEILING_DEFAULT_COMPLETION_TOKENS: u64 = 1024;
+
+/// Pre-dispatch cost estimate for the per-request price ceiling
+/// (WOR-2559). Resolves the model's price through the same layers cost
+/// accounting bills with ([`estimate_cost`]'s resolution: config
+/// `model_prices`, then the rate card, then the built-in catalog) and
+/// applies the same pessimistic $5/$5 fallback when no layer knows the
+/// model, so the ceiling can never consult a second price table and an
+/// unpriced model reads as expensive, not free. Unlike [`estimate_cost`]
+/// this does not emit the per-request price-source metric, because it
+/// runs once per routing candidate rather than once per billed request.
+/// The whole prompt is priced at the input rate: pre-dispatch, cache
+/// hits are unknown, and no phantom discount is the conservative read.
+#[must_use]
+pub fn estimate_ceiling_cost(
+    model: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+) -> (f64, PriceSource) {
+    let (price, source) =
+        resolve_price(model).unwrap_or((ModelPrice::tokens(5.0, 5.0), PriceSource::Fallback));
+    let estimate = ((prompt_tokens as f64) * price.input_per_million
+        + (completion_tokens as f64) * price.output_per_million)
+        / 1_000_000.0;
+    (estimate, source)
+}
+
+/// A routing candidate excluded by the per-request price ceiling
+/// (WOR-2559), carrying the resolved price behind the decision so a
+/// fail-closed refusal can show the caller what each candidate would
+/// have cost rather than leaving it to guesswork.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PriceCeilingExclusion {
+    /// Configured provider name of the excluded candidate.
+    pub provider: String,
+    /// The model this provider would have dispatched (after its
+    /// `model_map` rename), which is the model the estimate priced.
+    pub model: String,
+    /// Estimated USD cost of this request on this candidate.
+    pub estimated_cost_usd: f64,
+    /// Which price layer produced the estimate (`config`, `rate_card`,
+    /// `catalog`, or `fallback`), mirroring [`PriceSource::label`].
+    pub price_source: String,
+}
+
+/// Result of applying the price ceiling to a candidate set: the
+/// candidates that stay routable, in their original order, and one
+/// [`PriceCeilingExclusion`] per candidate the ceiling dropped. Used
+/// for both candidate sets a request can be routed over, the provider
+/// order and a confidence cascade's tier list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PriceCeilingPartition {
+    /// Indices into the candidate set whose estimate is at or under the
+    /// ceiling: provider indices from [`partition_by_price_ceiling`],
+    /// tier indices from [`partition_cascade_tiers_by_price_ceiling`].
+    pub kept: Vec<usize>,
+    /// Candidates whose estimate exceeded the ceiling.
+    pub excluded: Vec<PriceCeilingExclusion>,
+}
+
+/// Split a routing candidate set against a per-request price ceiling
+/// (WOR-2559). Each candidate is priced against the model it would
+/// actually dispatch: the requested model after that provider's
+/// `model_map` rename, or the provider's `default_model` when the
+/// request named none. A candidate estimated at exactly the ceiling is
+/// kept; only a strictly higher estimate excludes. Order is preserved
+/// so strategy selection over the kept set behaves as if the excluded
+/// candidates had never been configured.
+#[must_use]
+pub fn partition_by_price_ceiling(
+    ceiling_usd: f64,
+    candidates: &[usize],
+    providers: &[crate::provider::ProviderConfig],
+    requested_model: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+) -> PriceCeilingPartition {
+    let mut kept = Vec::new();
+    let mut excluded = Vec::new();
+    for &index in candidates {
+        // Candidates are indices into `providers` by construction; an
+        // out-of-range index cannot dispatch, so dropping it (rather
+        // than keeping an unpriceable candidate) is the closed failure.
+        let Some(provider) = providers.get(index) else {
+            continue;
+        };
+        let model = if requested_model.is_empty() {
+            provider
+                .default_model
+                .as_ref()
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default()
+        } else {
+            provider.map_model(requested_model)
+        };
+        let (estimated_cost_usd, source) =
+            estimate_ceiling_cost(&model, prompt_tokens, completion_tokens);
+        if estimated_cost_usd <= ceiling_usd {
+            kept.push(index);
+        } else {
+            excluded.push(PriceCeilingExclusion {
+                provider: provider.name.as_str().to_string(),
+                model,
+                estimated_cost_usd,
+                price_source: source.label().to_string(),
+            });
+        }
+    }
+    PriceCeilingPartition { kept, excluded }
+}
+
+/// Split a confidence-cascade tier list against a per-request price
+/// ceiling (WOR-2559).
+///
+/// The cascade executor does not route over the candidate set
+/// [`partition_by_price_ceiling`] narrows: each tier names its own
+/// provider and its own model, and the tier's model is authoritative
+/// (the executor writes it into the request body, then remaps it
+/// through that provider's `model_map`). So the tier list is a second
+/// candidate set, and a ceiling that filtered only the first would let
+/// a cascade origin dispatch to a tier it had already excluded.
+///
+/// `kept` holds tier indices in their configured order. A tier naming a
+/// provider that is not configured is kept rather than excluded: it
+/// cannot dispatch either way, and the executor's own miss handling
+/// (skip and warn) should stay exactly as it was.
+#[must_use]
+pub fn partition_cascade_tiers_by_price_ceiling(
+    ceiling_usd: f64,
+    tiers: &[crate::routing::CascadeTier],
+    providers: &[crate::provider::ProviderConfig],
+    prompt_tokens: u64,
+    completion_tokens: u64,
+) -> PriceCeilingPartition {
+    let mut kept = Vec::new();
+    let mut excluded = Vec::new();
+    for (index, tier) in tiers.iter().enumerate() {
+        let Some(provider) = providers
+            .iter()
+            .find(|provider| provider.name.as_str() == tier.provider_id)
+        else {
+            kept.push(index);
+            continue;
+        };
+        let model = provider.map_model(&tier.model);
+        let (estimated_cost_usd, source) =
+            estimate_ceiling_cost(&model, prompt_tokens, completion_tokens);
+        if estimated_cost_usd <= ceiling_usd {
+            kept.push(index);
+        } else {
+            excluded.push(PriceCeilingExclusion {
+                provider: tier.provider_id.clone(),
+                model,
+                estimated_cost_usd,
+                price_source: source.label().to_string(),
+            });
+        }
+    }
+    PriceCeilingPartition { kept, excluded }
+}
+
 // --- Surface-aware billing events (Phase 8) ---
 
 /// Per-surface usage record carried by an [`AiBillingEvent`].
@@ -2903,5 +3073,228 @@ mod tests {
         assert!(tracker
             .check_limit(&daily, &mini_key, &OnExceedAction::Block)
             .is_none());
+    }
+
+    // --- WOR-2559: per-request price ceiling ---
+
+    /// A provider built through serde so these tests do not have to name
+    /// every `ProviderConfig` field (and break on each new one).
+    fn ceiling_provider(value: serde_json::Value) -> crate::provider::ProviderConfig {
+        serde_json::from_value(value).expect("test provider config deserializes")
+    }
+
+    /// Install a two-model operator price table so the partition tests
+    /// are deterministic regardless of the built-in catalog's numbers.
+    /// Callers must hold `PRICE_TABLE_TEST_LOCK`.
+    fn install_ceiling_test_prices() {
+        let mut table = PriceTable::new();
+        // 1000 prompt + 1000 completion tokens => $0.0015.
+        table.insert(
+            "ceiling-cheap-model",
+            ModelPrice::tokens(0.5, 1.0),
+            PriceSource::Config,
+        );
+        // 1000 prompt + 1000 completion tokens => $0.0125.
+        table.insert(
+            "ceiling-pricey-model",
+            ModelPrice::tokens(2.5, 10.0),
+            PriceSource::Config,
+        );
+        set_price_table(table);
+    }
+
+    #[test]
+    fn price_ceiling_partition_excludes_over_ceiling_candidates() {
+        let _guard = PRICE_TABLE_TEST_LOCK.lock().unwrap();
+        install_ceiling_test_prices();
+        let providers = vec![
+            ceiling_provider(serde_json::json!({ "name": "cheap" })),
+            ceiling_provider(serde_json::json!({
+                "name": "pricey",
+                "model_map": { "ceiling-cheap-model": "ceiling-pricey-model" }
+            })),
+        ];
+        let partition = partition_by_price_ceiling(
+            0.01,
+            &[0, 1],
+            &providers,
+            "ceiling-cheap-model",
+            1000,
+            1000,
+        );
+        assert_eq!(
+            partition.kept,
+            vec![0],
+            "the cheap candidate stays routable"
+        );
+        assert_eq!(partition.excluded.len(), 1);
+        let excluded = &partition.excluded[0];
+        assert_eq!(excluded.provider, "pricey");
+        assert_eq!(
+            excluded.model, "ceiling-pricey-model",
+            "the exclusion prices the model the provider would dispatch, per its model_map"
+        );
+        assert!((excluded.estimated_cost_usd - 0.0125).abs() < 1e-9);
+        assert_eq!(excluded.price_source, "config");
+    }
+
+    #[test]
+    fn price_ceiling_partition_all_over_returns_empty_kept_with_resolved_prices() {
+        let _guard = PRICE_TABLE_TEST_LOCK.lock().unwrap();
+        install_ceiling_test_prices();
+        let providers = vec![
+            ceiling_provider(serde_json::json!({ "name": "a" })),
+            ceiling_provider(serde_json::json!({ "name": "b" })),
+        ];
+        let partition = partition_by_price_ceiling(
+            0.001,
+            &[0, 1],
+            &providers,
+            "ceiling-pricey-model",
+            1000,
+            1000,
+        );
+        assert!(
+            partition.kept.is_empty(),
+            "every candidate is over the ceiling, so nothing may dispatch"
+        );
+        assert_eq!(partition.excluded.len(), 2, "every exclusion is reported");
+        for (excluded, name) in partition.excluded.iter().zip(["a", "b"]) {
+            assert_eq!(excluded.provider, name);
+            assert!(
+                (excluded.estimated_cost_usd - 0.0125).abs() < 1e-9,
+                "each exclusion carries the candidate's resolved price for the error body"
+            );
+        }
+    }
+
+    #[test]
+    fn price_ceiling_partition_generous_ceiling_keeps_order_and_excludes_nothing() {
+        let _guard = PRICE_TABLE_TEST_LOCK.lock().unwrap();
+        install_ceiling_test_prices();
+        let providers = vec![
+            ceiling_provider(serde_json::json!({ "name": "a" })),
+            ceiling_provider(serde_json::json!({ "name": "b" })),
+            ceiling_provider(serde_json::json!({ "name": "c" })),
+        ];
+        let partition = partition_by_price_ceiling(
+            100.0,
+            &[2, 0, 1],
+            &providers,
+            "ceiling-pricey-model",
+            1000,
+            1000,
+        );
+        assert_eq!(
+            partition.kept,
+            vec![2, 0, 1],
+            "an under-ceiling set passes through in its original order"
+        );
+        assert!(partition.excluded.is_empty());
+    }
+
+    #[test]
+    fn price_ceiling_estimate_uses_the_cost_trackers_price_resolution() {
+        let _guard = PRICE_TABLE_TEST_LOCK.lock().unwrap();
+        install_ceiling_test_prices();
+        // Same resolved layers as billing: the ceiling estimate for a
+        // priced model equals what the cost tracker would charge for the
+        // same token volumes (no second price table).
+        let (estimate, source) = estimate_ceiling_cost("ceiling-pricey-model", 1000, 500);
+        assert!((estimate - estimate_cost("ceiling-pricey-model", 1000, 500)).abs() < 1e-12);
+        assert_eq!(source, PriceSource::Config);
+        // An unpriced model gets the cost tracker's pessimistic $5/$5
+        // fallback, not a free pass under the ceiling.
+        let (unknown, unknown_source) =
+            estimate_ceiling_cost("ceiling-model-nobody-prices", 1000, 1000);
+        assert!((unknown - estimate_cost("ceiling-model-nobody-prices", 1000, 1000)).abs() < 1e-12);
+        assert_eq!(unknown_source, PriceSource::Fallback);
+        assert!(
+            (unknown - 0.01).abs() < 1e-9,
+            "$5/$5 per million at 2000 tokens"
+        );
+    }
+
+    fn ceiling_tier(provider_id: &str, model: &str) -> crate::routing::CascadeTier {
+        serde_json::from_value(serde_json::json!({
+            "provider_id": provider_id,
+            "model": model,
+            "quality_threshold": 0.5
+        }))
+        .expect("test cascade tier deserializes")
+    }
+
+    #[test]
+    fn cascade_tiers_are_priced_on_the_model_the_tier_names_not_the_request_model() {
+        let _guard = PRICE_TABLE_TEST_LOCK.lock().unwrap();
+        install_ceiling_test_prices();
+        let providers = vec![
+            ceiling_provider(serde_json::json!({ "name": "one" })),
+            ceiling_provider(serde_json::json!({ "name": "two" })),
+        ];
+        let tiers = vec![
+            ceiling_tier("one", "ceiling-pricey-model"),
+            ceiling_tier("two", "ceiling-cheap-model"),
+        ];
+        let partition =
+            partition_cascade_tiers_by_price_ceiling(0.01, &tiers, &providers, 1000, 1000);
+        assert_eq!(partition.kept, vec![1], "only the cheap tier survives");
+        assert_eq!(partition.excluded.len(), 1);
+        assert_eq!(partition.excluded[0].provider, "one");
+        assert_eq!(partition.excluded[0].model, "ceiling-pricey-model");
+        assert!((partition.excluded[0].estimated_cost_usd - 0.0125).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_cascade_tier_is_priced_through_its_providers_model_map() {
+        let _guard = PRICE_TABLE_TEST_LOCK.lock().unwrap();
+        install_ceiling_test_prices();
+        // The tier names the cheap model, but this provider renames it to
+        // the expensive one, and the rename is what dispatches.
+        let providers = vec![ceiling_provider(serde_json::json!({
+            "name": "one",
+            "model_map": { "ceiling-cheap-model": "ceiling-pricey-model" }
+        }))];
+        let tiers = vec![ceiling_tier("one", "ceiling-cheap-model")];
+        let partition =
+            partition_cascade_tiers_by_price_ceiling(0.01, &tiers, &providers, 1000, 1000);
+        assert!(partition.kept.is_empty());
+        assert_eq!(partition.excluded[0].model, "ceiling-pricey-model");
+    }
+
+    #[test]
+    fn a_tier_naming_no_configured_provider_is_left_to_the_cascade_executor() {
+        let _guard = PRICE_TABLE_TEST_LOCK.lock().unwrap();
+        install_ceiling_test_prices();
+        let providers = vec![ceiling_provider(serde_json::json!({ "name": "one" }))];
+        let tiers = vec![
+            ceiling_tier("typo", "ceiling-pricey-model"),
+            ceiling_tier("one", "ceiling-cheap-model"),
+        ];
+        let partition =
+            partition_cascade_tiers_by_price_ceiling(0.01, &tiers, &providers, 1000, 1000);
+        assert_eq!(
+            partition.kept,
+            vec![0, 1],
+            "an unroutable tier cannot dispatch either way, so the executor's own \
+             skip-and-warn handling stays exactly as it was"
+        );
+        assert!(partition.excluded.is_empty());
+    }
+
+    #[test]
+    fn an_unpriced_cascade_tier_takes_the_pessimistic_fallback() {
+        let _guard = PRICE_TABLE_TEST_LOCK.lock().unwrap();
+        install_ceiling_test_prices();
+        let providers = vec![ceiling_provider(serde_json::json!({ "name": "one" }))];
+        let tiers = vec![ceiling_tier("one", "ceiling-model-nobody-prices")];
+        let partition =
+            partition_cascade_tiers_by_price_ceiling(0.001, &tiers, &providers, 1000, 1000);
+        assert!(
+            partition.kept.is_empty(),
+            "an unknown model must read as expensive, never as free"
+        );
+        assert_eq!(partition.excluded[0].price_source, "fallback");
+        assert!((partition.excluded[0].estimated_cost_usd - 0.01).abs() < 1e-9);
     }
 }
