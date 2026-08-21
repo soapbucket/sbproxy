@@ -134,6 +134,7 @@ fn export_example_env_dummies_once() {
         ("OPENROUTER_API_KEY", "sk-or-test-dummy"),
         ("GEMINI_API_KEY", "test-dummy-gemini"),
         ("GROQ_API_KEY", "gsk-test-dummy"),
+        ("MISTRAL_API_KEY", "mistral-test-dummy"),
         ("TEAM_FRONTEND_KEY", "team-frontend-dummy"),
         ("TEAM_DATA_KEY", "team-data-dummy"),
         ("VAULT_TOKEN_SHARED", "vault-shared-dummy"),

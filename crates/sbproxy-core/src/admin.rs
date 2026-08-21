@@ -1113,6 +1113,99 @@ fn handle_owasp_api_pack() -> (u16, &'static str, String) {
     )
 }
 
+// --- AI provider data posture (WOR-2557) ---
+
+/// `GET /admin/ai-data-posture`: per AI origin, each provider's
+/// declared data-handling posture next to its wire format and auth
+/// header, plus the live effective eligible-provider set under the
+/// origin's `data_posture:` requirement.
+///
+/// Read off the live compiled pipeline, so a hot reload updates it
+/// without a restart. The same computed-state pattern
+/// `GET /admin/owasp-api-pack` uses: an operator reads what the
+/// configuration *does*, not only what it says. An origin with no
+/// `ai_proxy` action is absent from `origins` entirely; a config with
+/// no AI origin returns `{"origins":{}}`.
+///
+/// `catalog` records what the vendor's published data-processing terms
+/// say about a stock account, not the result of auditing one;
+/// `effective` folds in the operator's per-entry `data_posture:`
+/// declaration and the locally-served special case, and is what the
+/// routing filter actually evaluates.
+fn handle_ai_data_posture() -> (u16, &'static str, String) {
+    use sbproxy_modules::Action;
+    let pipeline = crate::reload::current_pipeline();
+    let mut origins = serde_json::Map::new();
+    for (idx, action) in pipeline.actions.iter().enumerate() {
+        let Action::AiProxy(ai) = action else {
+            continue;
+        };
+        let Some(origin) = pipeline.config.origins.get(idx) else {
+            continue;
+        };
+        let requirement = ai.config.data_posture.as_ref();
+        let constraint =
+            sbproxy_ai::data_posture::DataPostureConstraint::from_parts(requirement, false, false);
+        let mut eligible: Vec<&str> = Vec::new();
+        let mut excluded: Vec<&str> = Vec::new();
+        let providers: Vec<serde_json::Value> = ai
+            .config
+            .providers
+            .iter()
+            .map(|provider| {
+                let effective = sbproxy_ai::data_posture::effective_data_posture(provider);
+                let catalog =
+                    sbproxy_ai::providers::get_provider_info(provider.effective_provider_type());
+                let is_eligible = constraint
+                    .as_ref()
+                    .is_none_or(|constraint| constraint.provider_eligible(provider));
+                if provider.enabled {
+                    if is_eligible {
+                        eligible.push(provider.name.as_str());
+                    } else {
+                        excluded.push(provider.name.as_str());
+                    }
+                }
+                serde_json::json!({
+                    "name": provider.name.as_str(),
+                    "provider_type": provider.effective_provider_type(),
+                    "enabled": provider.enabled,
+                    "format": sbproxy_ai::client::provider_format(provider),
+                    "auth_header": catalog.as_ref().map(|info| info.auth_header.clone()),
+                    "catalog": catalog.as_ref().map(|info| serde_json::json!({
+                        "retains_data": info.data_posture.retains_data,
+                        "zdr_available": info.data_posture.zdr_available,
+                        "data_region": info.data_posture.data_region,
+                    })),
+                    "effective": {
+                        "retains_data": effective.retains_data,
+                        "zdr": effective.zdr,
+                    },
+                    "eligible": is_eligible,
+                })
+            })
+            .collect();
+        origins.insert(
+            origin.hostname.to_string(),
+            serde_json::json!({
+                "requirement": requirement.map(|block| serde_json::json!({
+                    "require_zdr": block.require_zdr,
+                    "allow_data_collection": block.allow_data_collection,
+                })),
+                "constraint": constraint.as_ref().map(|c| c.describe()),
+                "eligible_providers": eligible,
+                "excluded_providers": excluded,
+                "providers": providers,
+            }),
+        );
+    }
+    (
+        200,
+        "application/json",
+        serde_json::json!({ "origins": origins }).to_string(),
+    )
+}
+
 // --- OpenAPI rendering ---
 
 /// Render the live pipeline's OpenAPI document as JSON or YAML.
@@ -3300,6 +3393,20 @@ pub fn handle_admin_request(
     if path_only == "/admin/owasp-api-pack" {
         if method.eq_ignore_ascii_case("GET") {
             return handle_owasp_api_pack();
+        }
+        return (
+            405,
+            "application/json",
+            r#"{"error":"method not allowed"}"#.to_string(),
+        );
+    }
+    // WOR-2557: each AI origin's declared provider data posture and the
+    // live effective eligible-provider set under its `data_posture:`
+    // requirement. Read-only; same operator-auth gate as every route
+    // past this point.
+    if path_only == "/admin/ai-data-posture" {
+        if method.eq_ignore_ascii_case("GET") {
+            return handle_ai_data_posture();
         }
         return (
             405,
@@ -9035,6 +9142,101 @@ origins:
         let compiled = sbproxy_config::compile_config(yaml).expect("test config compiles");
         let pipeline = CompiledPipeline::from_config(compiled).expect("pipeline compiles");
         crate::reload::load_pipeline(pipeline);
+    }
+
+    // --- WOR-2557: GET /admin/ai-data-posture -----------------------
+
+    /// One test, not two, because `install_test_pipeline` writes the
+    /// process-global live pipeline: a sibling test that installs a
+    /// different one races this one's reads under the default parallel
+    /// runner. The auth and method assertions need a pipeline installed
+    /// anyway, so they ride along on this one.
+    #[test]
+    fn ai_data_posture_endpoint_reports_static_posture_and_the_live_eligible_set() {
+        install_test_pipeline(
+            r#"
+origins:
+  ai.example.com:
+    action:
+      type: ai_proxy
+      data_posture:
+        require_zdr: true
+      providers:
+        - name: openai
+          api_key: "k"
+          data_posture:
+            zdr: true
+        - name: mistral
+          api_key: "k"
+  plain.example.com:
+    action:
+      type: proxy
+      url: https://upstream.example.com
+"#,
+        );
+        let state = make_state();
+
+        // Unauthenticated callers see nothing, and the route is GET-only.
+        let (status, _, body) =
+            handle_admin_request("GET", "/admin/ai-data-posture", &state, None, None);
+        assert_eq!(status, 401, "got body: {body}");
+        let auth = basic_auth("admin", "secret");
+        for method in ["POST", "PUT", "DELETE"] {
+            let (status, _, _) =
+                handle_admin_request(method, "/admin/ai-data-posture", &state, Some(&auth), None);
+            assert_eq!(status, 405, "{method} must not be routed");
+        }
+
+        let (status, _, body) =
+            handle_admin_request("GET", "/admin/ai-data-posture", &state, Some(&auth), None);
+        assert_eq!(status, 200, "got body: {body}");
+        let doc: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        let origins = doc["origins"].as_object().expect("origins object");
+        assert!(
+            !origins.contains_key("plain.example.com"),
+            "a non-AI origin is absent entirely: {body}"
+        );
+        let ai = origins
+            .get("ai.example.com")
+            .unwrap_or_else(|| panic!("the AI origin must be reported: {body}"));
+        assert_eq!(ai["constraint"], "require_zdr");
+        assert_eq!(
+            ai["eligible_providers"],
+            serde_json::json!(["openai"]),
+            "the live effective eligible set, not just the accepted config: {body}"
+        );
+        assert_eq!(ai["excluded_providers"], serde_json::json!(["mistral"]));
+        let row = |name: &str| -> serde_json::Value {
+            ai["providers"]
+                .as_array()
+                .expect("providers array")
+                .iter()
+                .find(|p| p["name"] == name)
+                .unwrap_or_else(|| panic!("{name} row missing: {body}"))
+                .clone()
+        };
+        // The static declaration sits next to the wire format and auth
+        // header, and is distinct from the effective posture the filter
+        // evaluates.
+        let mistral = row("mistral");
+        assert_eq!(mistral["format"], "openai");
+        assert_eq!(mistral["auth_header"], "Authorization");
+        assert_eq!(mistral["catalog"]["zdr_available"], false);
+        assert_eq!(mistral["effective"]["zdr"], false);
+        assert_eq!(mistral["eligible"], false);
+        let openai = row("openai");
+        assert_eq!(
+            openai["catalog"]["zdr_available"], true,
+            "the catalog records that the vendor offers ZDR"
+        );
+        assert_eq!(
+            openai["effective"]["retains_data"], false,
+            "the operator declaration overrides the catalog's stock-account retention"
+        );
+        assert_eq!(
+            openai["eligible"], true,
+            "offering ZDR is not holding it; the operator declaration is what qualifies openai"
+        );
     }
 
     #[test]

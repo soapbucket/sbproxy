@@ -1062,6 +1062,13 @@ pub(super) fn ai_outcome_label(
             "content_filter" => "content_filter",
             "budget_exceeded" => "budget_exceeded",
             "policy_block" | "policy_route_blocked" => "policy_block",
+            // WOR-2557: a data-posture refusal returns 403 with no
+            // provider attempted, which the status arm below reads as
+            // `gateway_auth_denied`. That is actively misleading during
+            // an incident: nothing was wrong with the caller's
+            // credential, the configured fleet simply had no provider
+            // meeting the required data-handling posture.
+            "data_posture_block" => "data_posture_block",
             "refusal" => "refusal",
             _ => "other",
         };
@@ -1438,6 +1445,11 @@ mod outcome_tests {
         assert_eq!(ai_outcome_label(101, None, false), "ok");
         assert_eq!(ai_outcome_label(402, None, false), "budget_exceeded");
         assert_eq!(ai_outcome_label(401, None, false), "gateway_auth_denied");
+        assert_eq!(
+            ai_outcome_label(403, Some("data_posture_block"), false),
+            "data_posture_block",
+            "a posture refusal must not read as a credential problem"
+        );
         assert_eq!(ai_outcome_label(403, None, true), "upstream_auth_denied");
         assert_eq!(ai_outcome_label(429, None, false), "rate_limited");
         assert_eq!(ai_outcome_label(504, None, true), "timeout");

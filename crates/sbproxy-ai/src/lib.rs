@@ -15,6 +15,7 @@ pub mod compression;
 pub mod concurrency;
 pub mod context_window;
 pub mod cost_quality;
+pub mod data_posture;
 pub mod degradation;
 pub mod effective_key_policy;
 pub mod external_guardrail;

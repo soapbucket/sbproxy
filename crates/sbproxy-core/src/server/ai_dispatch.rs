@@ -1233,26 +1233,79 @@ pub(super) async fn realtime_budget_gate(
     let native_provider = (ctx.inbound_key_mode == crate::context::InboundKeyMode::Native)
         .then_some(ctx.native_key_provider.as_deref())
         .flatten();
-    let provider = config.providers.iter().find(|provider| {
-        provider.enabled
-            && sbproxy_ai::api_routes::provider_supports_realtime(provider)
-            && sbproxy_ai::routing::provider_allowed_by_policy(
-                provider.name.as_str(),
-                allowed_providers,
-                blocked_providers,
-            )
-            && native_provider.is_none_or(|native| provider_matches_native_key(provider, native))
-            && final_model.as_deref().is_none_or(|model| {
-                provider.models.is_empty()
-                    || provider.models.iter().any(|candidate| *candidate == model)
-            })
-    });
-    let Some(provider) = provider else {
+    // WOR-2557: the data-posture constraint gates realtime sessions the
+    // same way it gates the HTTP dispatch candidate set; a realtime
+    // prompt is no less retained by an upstream than a chat one.
+    let posture_constraint = sbproxy_ai::data_posture::DataPostureConstraint::from_parts(
+        config.data_posture.as_ref(),
+        request_header_flag(session, "x-sbproxy-require-zdr"),
+        request_header_flag(session, "x-sbproxy-disallow-data-collection"),
+    );
+    let eligible = |respect_posture: bool| {
+        config.providers.iter().find(|provider| {
+            provider.enabled
+                && sbproxy_ai::api_routes::provider_supports_realtime(provider)
+                && sbproxy_ai::routing::provider_allowed_by_policy(
+                    provider.name.as_str(),
+                    allowed_providers,
+                    blocked_providers,
+                )
+                && (!respect_posture
+                    || posture_constraint
+                        .as_ref()
+                        .is_none_or(|constraint| constraint.provider_eligible(provider)))
+                && native_provider
+                    .is_none_or(|native| provider_matches_native_key(provider, native))
+                && final_model.as_deref().is_none_or(|model| {
+                    provider.models.is_empty()
+                        || provider.models.iter().any(|candidate| *candidate == model)
+                })
+        })
+    };
+    let Some(provider) = eligible(true) else {
+        if let Some(constraint) = posture_constraint.as_ref() {
+            if eligible(false).is_some() {
+                let excluded = sbproxy_ai::data_posture::posture_excluded_provider_names(
+                    constraint,
+                    &config.providers,
+                );
+                record_posture_refusal(
+                    constraint,
+                    &excluded,
+                    session.req_header().method.as_str(),
+                    ctx,
+                );
+                return Err((
+                    403,
+                    sbproxy_ai::data_posture::posture_refusal_message(constraint, &excluded),
+                ));
+            }
+        }
         return Err((
             403,
             "no realtime AI provider satisfies this credential policy".to_string(),
         ));
     };
+
+    // WOR-2557: an admitted session that had providers taken off its
+    // set is a filter event, exactly as on the HTTP path, and
+    // `ai-gateway.md` promises every narrowing is counted. Recording
+    // only the refusal would let a fleet that quietly lost half its
+    // providers to posture read as unaffected right up until the day
+    // the last eligible one goes down.
+    if let Some(constraint) = posture_constraint.as_ref() {
+        let excluded = sbproxy_ai::data_posture::posture_excluded_provider_names(
+            constraint,
+            &config.providers,
+        );
+        if !excluded.is_empty() {
+            sbproxy_ai::ai_metrics::record_data_posture_filter(
+                constraint.label(),
+                "filtered",
+                ctx.tenant_id.as_str(),
+            );
+        }
+    }
 
     Ok(RealtimeAdmission {
         budget_gate,
@@ -2572,6 +2625,304 @@ fn provider_allowed_for_request(
         && sbproxy_ai::routing::provider_allowed_by_policy(provider.name.as_str(), allowed, blocked)
 }
 
+/// True when the request carries header `name` with value `true` or `1`.
+fn request_header_flag(session: &Session, name: &str) -> bool {
+    session
+        .req_header()
+        .headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+        .unwrap_or(false)
+}
+
+/// Whether any enabled provider passes the credential provider policy
+/// alone. The empty-set refusal sites probe this with the
+/// without-posture blocked list to decide whether the data-posture
+/// constraint (WOR-2557), rather than the credential policy, emptied
+/// the candidate set. A pure predicate on purpose: probing through the
+/// router would advance strategy cursors.
+fn any_policy_eligible_provider(
+    providers: &[sbproxy_ai::ProviderConfig],
+    allowed: &[String],
+    blocked: &[String],
+) -> bool {
+    providers
+        .iter()
+        .any(|provider| provider_allowed_for_request(provider, allowed, blocked))
+}
+
+/// Whether a candidate would survive with the data-posture exclusion
+/// lifted, asked over the same narrowing the caller has already applied.
+///
+/// WOR-2557: the refusal answers a blame question, "did posture empty
+/// this set or was it already empty", and
+/// [`any_policy_eligible_provider`] answers it correctly only where the
+/// credential policy is the whole narrowing. Once an alias or a
+/// `models:` list has narrowed the set, it does not: a model whose only
+/// provider the credential policy blocks leaves nothing, and any
+/// unrelated posture exclusion elsewhere in the fleet would then take
+/// the blame for a 403 it did not cause.
+///
+/// This repeats that narrowing against the pre-posture blocked list
+/// rather than sharing the construction with it. The duplication is
+/// deliberate and bounded: the value decides only which refusal an
+/// already-refused request reads, never whether a request is refused,
+/// so a drift here costs an operator a misleading message and can never
+/// admit traffic. Pass `None` for a narrowing the caller has not
+/// applied at the point it asks.
+fn any_candidate_without_posture(
+    providers: &[sbproxy_ai::ProviderConfig],
+    allowed: &[String],
+    blocked_without_posture: &[String],
+    alias_provider: Option<&str>,
+    model: Option<&str>,
+) -> bool {
+    let mut order: Vec<usize> = providers
+        .iter()
+        .enumerate()
+        .filter(|(_, provider)| {
+            provider_allowed_for_request(provider, allowed, blocked_without_posture)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    if !retain_alias_pinned_providers(&mut order, providers, alias_provider) {
+        return false;
+    }
+    if let Some(model) = model {
+        if let Some(eligible) = model_eligible_providers(&order, providers, model) {
+            order = eligible;
+        }
+    }
+    !order.is_empty()
+}
+
+/// WOR-2557: record one fail-closed data-posture refusal on every
+/// surface that represents refusals.
+///
+/// Every refusing path goes through here (the HTTP surfaces via
+/// [`posture_refusal_body`], and the realtime admission gate, which
+/// answers with its own transport-level error rather than a JSON body)
+/// so an operator sees the same records whichever surface closed. The
+/// full set, mirroring [`mark_guardrail_block`]:
+///
+/// - `ctx.ai_outcome`, so the closed `outcome` label on
+///   `sbproxy_ai_requests_attributed_total`, the gateway-decision
+///   rejection `reason`, and the durable usage rollups all read
+///   `data_posture_block` rather than the misleading
+///   `gateway_auth_denied` a bare 403 would classify as.
+/// - `ctx.deny_reason`, so a metered call bills as `policy_blocked`
+///   (the proxy refused it; no origin did any work), not `origin_4xx`.
+/// - the admin ring's explainability column.
+/// - the `refused` outcome on `sbproxy_ai_data_posture_filter_total`.
+/// - a `security_audit` entry (`event_type: data_posture`), which is
+///   the typed SIEM half: one call emits the `security_audit` warn
+///   line, the admin audit ring row, the tamper-evident chain append
+///   when `audit.sink: chain` is on, and the `policy_denied` event on
+///   a configured `events:` sink, the same funnel the multipart
+///   surface refusal (WOR-2472) uses.
+/// - the `ai.data_posture.refusal` structured warn line.
+fn record_posture_refusal(
+    constraint: &sbproxy_ai::data_posture::DataPostureConstraint,
+    posture_excluded: &[String],
+    method: &str,
+    ctx: &mut crate::context::RequestContext,
+) {
+    ctx.ai_outcome = Some("data_posture_block".to_string());
+    ctx.record_policy_decision("data_posture", "deny");
+    ctx.deny_reason = Some(format!("data_posture: {}", constraint.describe()));
+    sbproxy_ai::ai_metrics::record_data_posture_filter(
+        constraint.label(),
+        "refused",
+        ctx.tenant_id.as_str(),
+    );
+    sbproxy_observe::SecurityAuditEntry::policy_violation(
+        "data_posture",
+        sbproxy_ai::data_posture::posture_refusal_message(constraint, posture_excluded),
+        403,
+        Some(ctx.hostname.to_string()),
+        ctx.client_ip,
+        Some(ctx.request_id.to_string()),
+        Some(method.to_string()),
+    )
+    .with_tenant_id(ctx.tenant_id.as_str())
+    .with_key_context(
+        ctx.native_key_provider.clone(),
+        ctx.inbound_key_mode.as_str(),
+    )
+    .with_api_key_id(ctx.accountable_key_id())
+    .emit();
+    tracing::warn!(
+        event = "ai.data_posture.refusal",
+        constraint = %constraint.describe(),
+        excluded = %sbproxy_ai::data_posture::bounded_exclusion_list(posture_excluded),
+        excluded_count = posture_excluded.len(),
+        "AI proxy: no provider satisfies the data-posture constraint; failing closed"
+    );
+}
+
+/// WOR-2557: the typed fail-closed refusal for a candidate set the
+/// data-posture constraint emptied.
+///
+/// `eligible_without_posture` is the caller's site-specific probe of
+/// the same eligibility question with the without-posture blocked
+/// list: `true` means the request would have had a candidate if not
+/// for the posture constraint, so the refusal names the constraint
+/// and the excluded providers instead of the site's generic error.
+/// `method` is the request method, carried onto the security-audit
+/// record beside the hostname and request id. Returns `None` when
+/// posture is not the cause, leaving the caller's own error in place.
+fn posture_refusal_body(
+    posture_constraint: Option<&sbproxy_ai::data_posture::DataPostureConstraint>,
+    posture_excluded: &[String],
+    eligible_without_posture: bool,
+    method: &str,
+    ctx: &mut crate::context::RequestContext,
+) -> Option<bytes::Bytes> {
+    let constraint = posture_constraint?;
+    if posture_excluded.is_empty() || !eligible_without_posture {
+        return None;
+    }
+    let request_id = ctx.request_id.to_string();
+    record_posture_refusal(constraint, posture_excluded, method, ctx);
+    Some(
+        ErrorEnvelope::new(
+            "no_posture_eligible_provider",
+            &sbproxy_ai::data_posture::posture_refusal_message(constraint, posture_excluded),
+        )
+        .request_id(&request_id)
+        .to_bytes(),
+    )
+}
+
+#[cfg(test)]
+mod posture_refusal_tests {
+    use super::*;
+
+    fn require_zdr() -> sbproxy_ai::data_posture::DataPostureConstraint {
+        sbproxy_ai::data_posture::DataPostureConstraint {
+            require_zdr: true,
+            deny_data_collection: false,
+        }
+    }
+
+    fn refused_count(constraint: &str, tenant: &str) -> f64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "sbproxy_ai_data_posture_filter_total")
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        let labelled = |name: &str, want: &str| {
+                            metric
+                                .get_label()
+                                .iter()
+                                .any(|label| label.name() == name && label.value() == want)
+                        };
+                        labelled("constraint", constraint)
+                            && labelled("outcome", "refused")
+                            && labelled("tenant", tenant)
+                    })
+                    .map(|metric| metric.get_counter().value())
+                    .sum()
+            })
+            .unwrap_or_default()
+    }
+
+    /// WOR-2557: the fail-closed refusal seam. Every HTTP selection path
+    /// that finds its candidate set emptied funnels through
+    /// [`posture_refusal_body`], so this is the one place to prove the
+    /// refusal is represented on every surface a refusal must reach:
+    /// the typed error body, the access-log outcome label, the metering
+    /// deny reason, the admin ring's explainability column, the posture
+    /// counter, and the security-audit channel (whose bridge is what
+    /// reaches a configured `events:` sink as `policy_denied`).
+    #[test]
+    fn posture_refusal_body_stamps_every_refusal_surface() {
+        let mut ctx = crate::context::RequestContext::new();
+        ctx.tenant_id = "posture-refusal-test-tenant".into();
+        ctx.request_id = "posture-refusal-test-rid".into();
+        let excluded = vec!["mistral".to_string(), "groq".to_string()];
+        let before = refused_count("require_zdr", "posture-refusal-test-tenant");
+
+        let body = posture_refusal_body(Some(&require_zdr()), &excluded, true, "POST", &mut ctx)
+            .expect("an emptied set with posture as the cause must refuse");
+
+        let text = String::from_utf8(body.to_vec()).expect("utf8 body");
+        assert!(
+            text.contains("no_posture_eligible_provider"),
+            "the refusal is typed: {text}"
+        );
+        assert!(
+            text.contains("require_zdr") && text.contains("mistral") && text.contains("groq"),
+            "the refusal names the constraint and the excluded providers: {text}"
+        );
+        assert_eq!(
+            ctx.ai_outcome.as_deref(),
+            Some("data_posture_block"),
+            "the closed outcome label; a bare 403 would misread as gateway_auth_denied"
+        );
+        assert_eq!(
+            ctx.deny_reason.as_deref(),
+            Some("data_posture: require_zdr"),
+            "metering must classify this as policy_blocked, never origin_4xx"
+        );
+        assert!(
+            ctx.policy_decisions
+                .iter()
+                .any(|d| d == "data_posture:deny"),
+            "the admin ring explainability column carries the deny: {:?}",
+            ctx.policy_decisions
+        );
+        assert!(
+            refused_count("require_zdr", "posture-refusal-test-tenant") > before,
+            "a refusal that is not counted is a refusal an operator cannot alert on"
+        );
+        let audited = sbproxy_observe::audit_ring::recent_audit_events(
+            64,
+            Some("security"),
+            Some("data_posture"),
+            None,
+        );
+        assert!(
+            audited
+                .iter()
+                .any(|event| event.request_id.as_deref() == Some("posture-refusal-test-rid")),
+            "the refusal must land on the security-audit channel, which is what \
+             reaches an `events:` sink as policy_denied"
+        );
+    }
+
+    #[test]
+    fn posture_refusal_body_declines_when_posture_is_not_the_cause() {
+        let excluded = vec!["mistral".to_string()];
+
+        // No active constraint: never posture's refusal to make.
+        let mut ctx = crate::context::RequestContext::new();
+        assert!(posture_refusal_body(None, &excluded, true, "POST", &mut ctx).is_none());
+        assert_eq!(ctx.ai_outcome, None);
+
+        // The constraint excluded nothing, so it did not empty the set.
+        let mut ctx = crate::context::RequestContext::new();
+        assert!(posture_refusal_body(Some(&require_zdr()), &[], true, "POST", &mut ctx).is_none());
+        assert_eq!(ctx.ai_outcome, None);
+
+        // The set was empty even without the posture exclusions: the
+        // credential policy or the enabled switch owns the error, and
+        // labeling it a posture refusal would send an operator to the
+        // wrong knob.
+        let mut ctx = crate::context::RequestContext::new();
+        assert!(
+            posture_refusal_body(Some(&require_zdr()), &excluded, false, "POST", &mut ctx)
+                .is_none()
+        );
+        assert_eq!(ctx.ai_outcome, None);
+        assert_eq!(ctx.deny_reason, None);
+    }
+}
+
 fn any_allowed_provider_supports_surface(
     providers: &[sbproxy_ai::ProviderConfig],
     surface: &sbproxy_ai::handler::AiSurface,
@@ -3797,6 +4148,60 @@ pub(super) async fn handle_ai_proxy(
     } else {
         policy_allowed_providers.as_slice()
     };
+    // WOR-2557: provider eligibility by declared data-handling posture,
+    // the OpenRouter `provider.zdr` / `data_collection` equivalent. The
+    // constraint is the union of the origin's `data_posture:` block and
+    // the per-request opt-in headers (most restrictive wins). Ineligible
+    // providers are folded into the effective blocked list here, before
+    // any selection path runs, so every consumer of the credential
+    // policy lists downstream of this point (the surface-capability
+    // gate, model and management listings, GET dispatch, the failover
+    // candidate order, cascade, race, and shadow dispatch) applies the
+    // same exclusion by construction rather than by per-site review.
+    // `blocked_without_posture` keeps the credential-only list so the
+    // empty-set refusal sites can name the posture constraint when it,
+    // and not the credential policy, is what emptied the set.
+    let posture_constraint = sbproxy_ai::data_posture::DataPostureConstraint::from_parts(
+        config.data_posture.as_ref(),
+        request_header_flag(session, "x-sbproxy-require-zdr"),
+        request_header_flag(session, "x-sbproxy-disallow-data-collection"),
+    );
+    let posture_excluded: Vec<String> = posture_constraint
+        .as_ref()
+        .map(|constraint| {
+            sbproxy_ai::data_posture::posture_excluded_provider_names(constraint, &config.providers)
+        })
+        .unwrap_or_default();
+    let blocked_without_posture = blocked_providers;
+    let posture_extended_blocked: Vec<String>;
+    let blocked_providers: &[String] = match posture_constraint.as_ref() {
+        Some(constraint) if !posture_excluded.is_empty() => {
+            // The narrowing itself is the expected outcome of the
+            // configuration, so the per-request record is the metric
+            // (`outcome="filtered"`) plus a debug-level line, not an
+            // info-level log line on the hot path. The fail-closed
+            // refusal below is the actionable event and logs at warn.
+            sbproxy_ai::ai_metrics::record_data_posture_filter(
+                constraint.label(),
+                "filtered",
+                ctx.tenant_id.as_str(),
+            );
+            tracing::debug!(
+                event = "ai.data_posture.filter",
+                constraint = %constraint.describe(),
+                excluded = %sbproxy_ai::data_posture::bounded_exclusion_list(&posture_excluded),
+                excluded_count = posture_excluded.len(),
+                "AI proxy: data-posture constraint narrowed the provider candidate set"
+            );
+            posture_extended_blocked = blocked_providers
+                .iter()
+                .chain(posture_excluded.iter())
+                .cloned()
+                .collect();
+            posture_extended_blocked.as_slice()
+        }
+        _ => blocked_providers,
+    };
     let allowed_models = resolved_request_vk
         .as_ref()
         .map(ResolvedRequestKey::allowed_models)
@@ -3849,6 +4254,25 @@ pub(super) async fn handle_ai_proxy(
             blocked_providers,
         );
         if !any_supports {
+            // WOR-2557: when a posture-eligible provider would have
+            // supported this surface, the honest refusal names the
+            // posture constraint rather than claiming the surface has
+            // no provider at all.
+            if let Some(body) = posture_refusal_body(
+                posture_constraint.as_ref(),
+                &posture_excluded,
+                any_allowed_provider_supports_surface(
+                    &config.providers,
+                    &surface,
+                    allowed_providers,
+                    blocked_without_posture,
+                ),
+                &method_str,
+                ctx,
+            ) {
+                send_response(session, 403, "application/json", &body).await?;
+                return Ok(());
+            }
             warn!(
                 ai.surface = surface_label,
                 method = %method_str,
@@ -4003,12 +4427,33 @@ pub(super) async fn handle_ai_proxy(
             .await?;
             return Ok(());
         }
-        let provider_idx = router
-            .select_with_policy(&config.providers, allowed_providers, blocked_providers)
-            .ok_or_else(|| {
+        let provider_idx = match router.select_with_policy(
+            &config.providers,
+            allowed_providers,
+            blocked_providers,
+        ) {
+            Some(idx) => idx,
+            None => {
+                // WOR-2557: name the posture constraint when it, not the
+                // credential policy or the enabled switch, emptied the set.
+                if let Some(body) = posture_refusal_body(
+                    posture_constraint.as_ref(),
+                    &posture_excluded,
+                    any_policy_eligible_provider(
+                        &config.providers,
+                        allowed_providers,
+                        blocked_without_posture,
+                    ),
+                    &method_str,
+                    ctx,
+                ) {
+                    send_response(session, 403, "application/json", &body).await?;
+                    return Ok(());
+                }
                 warn!("AI proxy: no enabled providers");
-                Error::new(ErrorType::HTTPStatus(502))
-            })?;
+                return Err(Error::new(ErrorType::HTTPStatus(502)));
+            }
+        };
         let mut resolved_provider = config.providers[provider_idx].clone();
         apply_native_provider_credential(&mut resolved_provider, native_api_key.as_deref());
         let provider = &resolved_provider;
@@ -4343,12 +4788,32 @@ pub(super) async fn handle_ai_proxy(
                 provider_candidates = eligible;
             }
         }
-        let provider_idx = router
-            .select_with_candidates(&config.providers, &provider_candidates)
-            .ok_or_else(|| {
-                warn!("AI proxy: no enabled provider satisfies method-aware policy");
-                Error::new(ErrorType::HTTPStatus(502))
-            })?;
+        let provider_idx =
+            match router.select_with_candidates(&config.providers, &provider_candidates) {
+                Some(idx) => idx,
+                None => {
+                    // WOR-2557: name the posture constraint when it emptied
+                    // the method-aware candidate set.
+                    if let Some(body) = posture_refusal_body(
+                        posture_constraint.as_ref(),
+                        &posture_excluded,
+                        any_candidate_without_posture(
+                            &config.providers,
+                            allowed_providers,
+                            blocked_without_posture,
+                            alias_provider.as_deref(),
+                            effective_model.as_deref(),
+                        ),
+                        &method_str,
+                        ctx,
+                    ) {
+                        send_response(session, 403, "application/json", &body).await?;
+                        return Ok(());
+                    }
+                    warn!("AI proxy: no enabled provider satisfies method-aware policy");
+                    return Err(Error::new(ErrorType::HTTPStatus(502)));
+                }
+            };
         let mut resolved_provider = config.providers[provider_idx].clone();
         apply_native_provider_credential(&mut resolved_provider, native_api_key.as_deref());
         let provider = &resolved_provider;
@@ -4938,6 +5403,23 @@ pub(super) async fn handle_ai_proxy(
         // `Router::routable_candidate_indices` (WOR-2233).
         provider_order = router.routable_candidate_indices(&config.providers, &provider_order);
         if provider_order.is_empty() {
+            // WOR-2557: name the posture constraint when it emptied the set.
+            if let Some(body) = posture_refusal_body(
+                posture_constraint.as_ref(),
+                &posture_excluded,
+                any_candidate_without_posture(
+                    &config.providers,
+                    allowed_providers,
+                    blocked_without_posture,
+                    alias_provider.as_deref(),
+                    requested_model.as_deref(),
+                ),
+                &method_str,
+                ctx,
+            ) {
+                send_response(session, 403, "application/json", &body).await?;
+                return Ok(());
+            }
             send_error(session, 503, "no healthy eligible AI provider").await?;
             return Ok(());
         }
@@ -7626,7 +8108,10 @@ pub(super) async fn handle_ai_proxy(
 
     // Credential provider policy constrains the entire candidate set, not
     // only primary selection. Every strategy below, including fallback,
-    // cascade, and race, derives from this filtered order.
+    // cascade, and race, derives from this filtered order. The blocked
+    // list already carries the data-posture exclusions (WOR-2557), so
+    // the posture constraint filters here before any strategy sees the
+    // candidate set.
     if !allowed_providers.is_empty() || !blocked_providers.is_empty() {
         provider_order.retain(|&index| {
             sbproxy_ai::routing::provider_allowed_by_policy(
@@ -7636,6 +8121,22 @@ pub(super) async fn handle_ai_proxy(
             )
         });
         if provider_order.is_empty() {
+            // WOR-2557: name the posture constraint when it, not the
+            // credential policy, emptied the set.
+            if let Some(body) = posture_refusal_body(
+                posture_constraint.as_ref(),
+                &posture_excluded,
+                any_policy_eligible_provider(
+                    &config.providers,
+                    allowed_providers,
+                    blocked_without_posture,
+                ),
+                &method_str,
+                ctx,
+            ) {
+                send_response(session, 403, "application/json", &body).await?;
+                return Ok(());
+            }
             send_error(
                 session,
                 403,
@@ -7722,6 +8223,23 @@ pub(super) async fn handle_ai_proxy(
     // revived case it selects nothing and the order stands as authored.
     provider_order = router.routable_candidate_indices(&config.providers, &provider_order);
     if provider_order.is_empty() {
+        // WOR-2557: name the posture constraint when it emptied the set.
+        if let Some(body) = posture_refusal_body(
+            posture_constraint.as_ref(),
+            &posture_excluded,
+            any_candidate_without_posture(
+                &config.providers,
+                allowed_providers,
+                blocked_without_posture,
+                alias_provider.as_deref(),
+                Some(model.as_str()),
+            ),
+            &method_str,
+            ctx,
+        ) {
+            send_response(session, 403, "application/json", &body).await?;
+            return Ok(());
+        }
         send_error(session, 503, "no healthy eligible AI provider").await?;
         return Ok(());
     }
@@ -7904,6 +8422,48 @@ pub(super) async fn handle_ai_proxy(
         .filter(|_| !disallow_training && !has_managed_local)
     {
         if !is_stream {
+            // WOR-2557: the cascade executor does not route over
+            // `provider_order`; each tier names its own provider, and a
+            // tier whose provider the posture exclusion put on the
+            // blocked list is skipped inside the executor. Every tier
+            // being skipped is fail-closed already (the cascade
+            // exhausts and returns 502) but tells the operator nothing,
+            // so refuse first with the same typed message the ordinary
+            // selection paths use. A cascade with at least one eligible
+            // tier proceeds and the excluded tiers are skipped there.
+            if let Some(constraint) = posture_constraint.as_ref() {
+                if sbproxy_ai::data_posture::cascade_tiers_all_posture_excluded(
+                    constraint,
+                    &cascade_cfg.tiers,
+                    &config.providers,
+                ) {
+                    // Posture is only the honest cause when some tier
+                    // names a provider the credential policy alone would
+                    // have allowed; otherwise the tier list is simply
+                    // wrong and the cascade's own diagnostic is the
+                    // truthful one.
+                    let tier_eligible_without_posture = cascade_cfg.tiers.iter().any(|tier| {
+                        config.providers.iter().any(|provider| {
+                            provider.name == tier.provider_id
+                                && provider_allowed_for_request(
+                                    provider,
+                                    allowed_providers,
+                                    blocked_without_posture,
+                                )
+                        })
+                    });
+                    if let Some(body) = posture_refusal_body(
+                        posture_constraint.as_ref(),
+                        &posture_excluded,
+                        tier_eligible_without_posture,
+                        &method_str,
+                        ctx,
+                    ) {
+                        send_response(session, 403, "application/json", &body).await?;
+                        return Ok(());
+                    }
+                }
+            }
             let cascade_quota_reservation = format!("{}:quota-pool:cascade", ctx.request_id);
             let outcome = AI_CLIENT
                 .load()

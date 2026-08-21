@@ -1,6 +1,6 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-20*
 
 ![the same OpenAI-shape request answered by OpenAI, Claude, and Gemini, switched only by Host header](assets/ai-gateway.gif)
 
@@ -128,6 +128,102 @@ A request for `gpt-4o-mini` reaches OpenAI, one for `claude-haiku-4-5` reaches A
 - A provider with an **empty** `models` list is a wildcard and stays eligible for every model (point one provider, such as `openrouter`, at many vendors this way).
 - If **no** provider declares the requested model, the model name passes straight through to the configured providers unchanged, so you still reach the 200+ models a provider serves without enumerating each one.
 - When more than one provider qualifies (an enumerated match plus a wildcard, say), the `routing.strategy` below picks among them.
+
+## Provider data posture
+
+Every entry in the provider catalog declares a data-handling posture: whether the vendor's API retains prompt data on a stock account under its published data-processing terms (`retains_data`), and whether the vendor sells a zero-data-retention arrangement at all (`zdr_available`). An origin, or a single request, can then require a posture, and the requirement is a hard eligibility filter over the provider candidate set, applied before any routing strategy runs. A request left with no eligible provider is refused, with the constraint and the excluded providers named, rather than falling back to a provider that does not meet it.
+
+Offering an arrangement is not holding one. `zdr_available` never satisfies `require_zdr` on its own: OpenAI, Anthropic, Azure OpenAI, and Vertex all offer a zero-data-retention agreement and all retain by default, so reading the catalog flag as a held posture would route a `require_zdr` request straight to a stock retaining account. The flag is there so you know an agreement is available to go and sign; declaring that your deployment holds one is a line in your own config (`data_posture.zdr: true` on the provider entry). What does satisfy `require_zdr` without any declaration from you is a provider whose stock terms already store nothing (Bedrock) and a model you serve yourself (`serve:`, `managed_model`), where the prompt never leaves the deployment.
+
+Like the rest of the catalog, the posture fields record what each vendor's published terms say, not the result of auditing an account (the same honesty rule [providers.md](providers.md) states for base URLs and auth headers). Entries with no published commitment carry the pessimistic default, `retains_data: true, zdr_available: false`, so a constrained origin fails closed on an unknown posture rather than optimistically routing to it.
+
+```mermaid
+flowchart TD
+    A[AI request arrives] --> B{"Posture constraint?\norigin data_posture block or\nx-sbproxy-require-zdr /\nx-sbproxy-disallow-data-collection header"}
+    B -->|no| E["Candidate set unchanged"]
+    B -->|yes| C["Resolve each provider's effective posture:\nprovider entry data_posture override wins;\nelse serve/managed_model: ZDR by construction;\nelse catalog retains_data (zdr = not retained);\nelse pessimistic default"]
+    C --> D["Drop ineligible providers\nfrom the candidate set"]
+    D --> F{Any provider left?}
+    F -->|yes| E
+    E --> G["Routing strategy picks among\nthe eligible candidates"]
+    F -->|no| H["403 no_posture_eligible_provider:\nnames the constraint and the\nexcluded providers"]
+```
+
+### Configuration
+
+```yaml
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      data_posture:
+        require_zdr: true          # only ZDR-postured providers are eligible
+        allow_data_collection: true # set false to exclude retaining providers
+      routing:
+        strategy: fallback_chain
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          priority: 1
+          # The catalog records that OpenAI offers ZDR; whether this
+          # deployment operates under such an agreement is the
+          # operator's declaration, made here.
+          data_posture:
+            zdr: true
+        - name: mistral
+          api_key: ${MISTRAL_API_KEY}
+          priority: 2
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `data_posture.require_zdr` (action) | bool | `false` | Only providers whose effective posture is zero-data-retention stay eligible. |
+| `data_posture.allow_data_collection` (action) | bool | `true` | When `false`, providers whose effective posture retains prompt data are excluded. |
+| `data_posture.zdr` (provider entry) | bool | unset | Operator declaration that this destination operates under a ZDR agreement, which is what makes a vendor that retains by default `require_zdr`-eligible. Unless `retains_data` is set too, it implies `retains_data: false`. |
+| `data_posture.retains_data` (provider entry) | bool | unset | Operator override of the catalog's retention declaration, in either direction. The two keys imply each other the way the catalog does: `retains_data: false` alone declares a destination that stores nothing, which is a ZDR posture, and `retains_data: true` alone withdraws ZDR eligibility the catalog would have granted. Set `zdr:` explicitly to say otherwise. |
+
+A request can tighten (never relax) the origin's constraint with the headers `x-sbproxy-require-zdr: true` and `x-sbproxy-disallow-data-collection: true`; the most restrictive union wins. The effective posture of each configured provider resolves in order: a locally served (`serve:`) or `managed_model` provider is zero-data-retention by construction because the prompt never leaves the deployment; otherwise the provider entry's `data_posture:` override wins; otherwise the catalog entry for the provider type; otherwise the pessimistic default. Operators shipping a custom catalog via `proxy.ai_providers_file` declare postures the same way the embedded catalog does.
+
+The filter runs where the credential `allowed_providers` / `blocked_providers` policy runs, ahead of every selection path: model listing, surface-capability checks, primary selection under every routing strategy, fallback order, race fan-out, shadow dispatch, and the semantic cache's embedding call all see only the eligible set. With the config above, the fallback chain serves from `openai` and `mistral` is not a fallback, because it was never a candidate.
+
+Two paths deserve naming because a narrower filter would miss them. `/v1/messages` and `/v1/responses` are rewritten into the canonical chat body before routing, so an Anthropic-SDK or Responses-API caller is gated exactly like a Chat Completions one. And a confidence cascade does not route over the candidate order at all: each tier names its own provider, so tiers are filtered by name, an ineligible tier is skipped, and a cascade whose every tier is ineligible is refused with the same message rather than exhausting into a generic dispatch failure.
+
+### When nothing qualifies
+
+A `data_posture:` block whose own requirement excludes every provider the origin configures is refused at config load, naming the key. A strict block over a fleet that can never satisfy it is not a strict policy, it is a blackholed origin that boots green and then denies everything it is sent. The shipped example validates clean because its `openai` entry declares the ZDR agreement the block requires; delete that `data_posture:` override and nothing satisfies the constraint any more:
+
+```console
+$ sbproxy validate examples/zdr-routing/sb.yml
+validate: config 'examples/zdr-routing/sb.yml' compiled, but a module failed to construct (this would fail at boot):
+ai `data_posture` (require_zdr) excludes every configured provider (openai, mistral), so this origin could never route a request. Declare the posture you hold on a provider entry (`data_posture.zdr: true` for a signed zero-data-retention agreement, or `data_posture.retains_data: false`), add a provider that satisfies the constraint, or relax the block. The provider catalog records what each vendor's published terms say about a stock account, not what your own agreement says. To constrain a single request instead of the whole origin, send `x-sbproxy-require-zdr: true` or `x-sbproxy-disallow-data-collection: true`.
+```
+
+A constraint that arrives per request is not knowable at load, so that case stays a runtime refusal. The request fails closed, no upstream is contacted, and the body names the constraint and the excluded providers:
+
+```console
+$ curl -is http://127.0.0.1:8080/v1/chat/completions \
+    -H 'Host: ai-any.local' \
+    -H 'x-sbproxy-require-zdr: true' \
+    -H 'Content-Type: application/json' \
+    -d '{"model": "mistral-small-latest", "messages": [{"role": "user", "content": "hi"}]}'
+HTTP/1.1 403 Forbidden
+content-type: application/json
+content-length: 217
+Date: Fri, 21 Aug 2026 01:59:36 GMT
+Connection: keep-alive
+
+{"error":{"message":"no eligible provider under the data-handling posture constraint (require_zdr); excluded by posture: mistral","request_id":"01a0220b87a57f328f0a89069877266d","type":"no_posture_eligible_provider"}}
+```
+
+Long exclusion lists are bounded at eight names plus a count, so a large fleet cannot balloon an error body or a log record.
+
+### Reading the effective set
+
+`GET /admin/ai-data-posture` reports each AI origin's providers with their declared posture next to the wire format and auth header, plus the eligible and excluded sets the filter computes right now. It reads the live pipeline, so a hot reload updates it without a restart. See [admin-api-reference.md](admin-api-reference.md#get-adminai-data-posture) for the full shape, and [`examples/zdr-routing/`](../examples/zdr-routing/) for a captured response.
+
+Each narrowing and each refusal is counted on `sbproxy_ai_data_posture_filter_total{constraint, outcome}` (`outcome="filtered"` when the set narrowed, `outcome="refused"` on the fail-closed path). A refusal is represented everywhere the gateway's other refusals are, not only in a log line: it writes a `security_audit` record (`event_type: data_posture`, carrying the hostname, request id, tenant, and resolved key id), which is the same channel WAF and rate-limit denials use, so it reaches a configured [`events:` sink](events.md) as a `policy_denied` event, appears in the admin audit feed, and lands on the tamper-evident chain when `audit.sink: chain` is on. The request's `sbproxy_ai_requests_attributed_total` series and the `sbproxy_ai_gateway_decisions_total` rejection reason carry the closed `outcome="data_posture_block"` label (a bare 403 would otherwise misread as `gateway_auth_denied`), the durable spend rollups count it as blocked rather than errored, a metered call bills as `policy_blocked` rather than `origin_4xx`, and the structured `ai.data_posture.refusal` warning names the constraint and a bounded excluded-provider list. The per-request narrowing detail (`ai.data_posture.filter`) is a debug-level diagnostic; in production, read the metric's `filtered` series to see which origins are narrowing and how much of their configured fleet the constraint is already removing.
+
+Posture composes with the per-request training opt-out: `x-sbproxy-disallow-prompt-training` filters on the provider entry's `no_prompt_training` declaration (may the vendor train on the prompt), while `data_posture` filters on retention (does the vendor store it at all). A provider can legitimately be non-training yet retaining, so declare the two independently. The runnable pair is [`examples/zdr-routing/`](../examples/zdr-routing/): a ZDR-only origin that serves from the declared provider, plus a strict origin whose refusal names the constraint.
 
 ## Routing strategies
 
@@ -2355,8 +2451,9 @@ The proxy exposes aggregate AI usage as Prometheus metrics. The `/metrics` endpo
 | `sbproxy_ai_tokens_attributed_total` | Counter | `origin`, `provider`, `model`, `surface`, `direction`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id`, `agent_id` | Per-attribution token spend. `sum by (tenant_id, model)` for multi-tenant multi-model token volume; `sum by (agent_id)` for per-agent volume |
 | `sbproxy_ai_cost_dollars_attributed_total` | Counter | same as above minus `direction` | Per-attribution USD spend. `sum by (api_key_id)` for per-credential chargeback, `sum by (agent_id)` for per-agent chargeback. `agent_id` is empty unless a verified agent identity resolved; see [Cost per agent](#cost-per-agent) |
 | `sbproxy_ai_request_duration_attributed_seconds` | Histogram | `provider`, `model`, `surface`, `tenant_id`, `api_key_id` | Model latency sliceable per tenant / credential / model. `histogram_quantile(0.95, sum by (le, tenant_id, model) (rate(..._bucket[5m])))` |
-| `sbproxy_ai_requests_attributed_total` | Counter | `origin`, `provider`, `model`, `surface`, `tenant_id`, `api_key_id`, `outcome` | One row per request with a closed `outcome` label (`ok`, `guardrail_block`, `content_filter`, `budget_exceeded`, `rate_limited`, `timeout`, `upstream_5xx`, `gateway_auth_denied`, `upstream_auth_denied`, `policy_block`, `refusal`, `client_error`, `other`). `sum by (tenant_id, outcome)` answers value-vs-waste |
+| `sbproxy_ai_requests_attributed_total` | Counter | `origin`, `provider`, `model`, `surface`, `tenant_id`, `api_key_id`, `outcome` | One row per request with a closed `outcome` label (`ok`, `guardrail_block`, `content_filter`, `budget_exceeded`, `rate_limited`, `timeout`, `upstream_5xx`, `gateway_auth_denied`, `upstream_auth_denied`, `policy_block`, `data_posture_block`, `refusal`, `client_error`, `other`). `sum by (tenant_id, outcome)` answers value-vs-waste |
 | `sbproxy_ai_gateway_decisions_total` | Counter | `decision`, `reason` | One terminal admission decision per AI request. `decision="rejected"` counts requests refused before provider dispatch, with the bounded outcome in `reason`; admitted requests use `reason="none"`. This is the numerator and denominator for gateway rejection-rate panels and alerts |
+| `sbproxy_ai_data_posture_filter_total` | Counter | `constraint`, `outcome`, `tenant` | Requests whose provider candidate set the data-posture constraint narrowed (`outcome="filtered"`) or refused outright (`outcome="refused"`). See [Provider data posture](#provider-data-posture) |
 | `sbproxy_ai_failovers_total` | Counter | `from_provider`, `to_provider`, `reason` | Provider failover events |
 | `sbproxy_ai_guardrail_blocks_total` | Counter | `category` | Guardrail block events (pii, injection, jailbreak, etc.) |
 | `sbproxy_ai_safety_guardrail_verdicts_total` | Counter | `guardrail`, `class`, `backend`, `verdict` | Toxicity, jailbreak, and content-safety evaluations, including whether keyword or classifier mode produced the verdict |

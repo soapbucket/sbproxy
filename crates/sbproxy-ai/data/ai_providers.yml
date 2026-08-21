@@ -15,6 +15,21 @@
 #   - format          : wire format - openai|anthropic|google|bedrock|custom
 #   - supports_streaming
 #   - supports_embeddings
+#   - data_posture    : declared data-handling posture, per the vendor's
+#       published data-processing terms (a catalog claim, not an audit):
+#         retains_data : prompt data sent to a stock account is retained
+#                        (e.g. an abuse-monitoring window). Default true.
+#         zdr_available: the vendor offers a zero-data-retention
+#                        arrangement. Default false. Whether a given
+#                        deployment operates under one is declared per
+#                        provider entry in sb.yml (`data_posture.zdr`),
+#                        not here.
+#         data_region  : optional vendor-declared processing region;
+#                        reserved for zone/locality-aware selection and
+#                        not consulted by the posture filter.
+#       Entries with no vendor commitment carry the pessimistic default
+#       spelled out, so a posture-constrained deployment fails closed
+#       rather than optimistically routing to an unknown posture.
 #
 # Adding providers: append an entry below; the registry will pick it up
 # automatically on next startup. Replacing the embedded set entirely:
@@ -30,6 +45,12 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: true
+    # API inputs/outputs are not used for training by default but are
+    # retained up to 30 days for abuse monitoring; zero data retention
+    # is offered for approved use cases (OpenAI API data-usage policy).
+    data_posture:
+      retains_data: true
+      zdr_available: true
 
   - name: anthropic
     display_name: Anthropic
@@ -39,6 +60,12 @@ providers:
     format: anthropic
     supports_streaming: true
     supports_embeddings: false
+    # API data is not used for training by default and is retained for
+    # a limited trust-and-safety window; zero-data-retention agreements
+    # are offered commercially (Anthropic commercial terms).
+    data_posture:
+      retains_data: true
+      zdr_available: true
 
   - name: gemini
     display_name: Google Gemini
@@ -52,6 +79,9 @@ providers:
     format: google
     supports_streaming: true
     supports_embeddings: true
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: azure
     display_name: Azure OpenAI
@@ -62,6 +92,12 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: true
+    # Prompts and completions are stored up to 30 days for abuse
+    # monitoring; approved subscriptions can disable that storage via
+    # modified abuse monitoring (Azure OpenAI data-privacy note).
+    data_posture:
+      retains_data: true
+      zdr_available: true
 
   - name: bedrock
     display_name: AWS Bedrock
@@ -72,6 +108,12 @@ providers:
     format: bedrock
     supports_streaming: true
     supports_embeddings: true
+    # AWS states Bedrock does not store or log prompts and completions
+    # and does not use them to train models (Bedrock data-protection
+    # documentation).
+    data_posture:
+      retains_data: false
+      zdr_available: true
 
   # --- Tier 2: Dedicated AI providers ---
   - name: cohere
@@ -82,6 +124,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: true
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: mistral
     display_name: Mistral AI
@@ -91,6 +136,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: true
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: deepseek
     display_name: DeepSeek
@@ -100,6 +148,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: xai
     display_name: xAI
@@ -110,6 +161,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: true
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: perplexity
     display_name: Perplexity
@@ -119,6 +173,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   # --- Tier 3: Inference platforms ---
   - name: groq
@@ -129,6 +186,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: together
     display_name: Together AI
@@ -139,6 +199,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: true
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: fireworks
     display_name: Fireworks AI
@@ -149,6 +212,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: true
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: openrouter
     display_name: OpenRouter
@@ -158,6 +224,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   # --- Tier 4: Self-hosted / local ---
   - name: ollama
@@ -168,6 +237,11 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: true
+    # Local engine: the default base URL keeps prompts on the
+    # operator's own host.
+    data_posture:
+      retains_data: false
+      zdr_available: true
 
   - name: vllm
     display_name: vLLM
@@ -177,6 +251,11 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    # Local engine: the default base URL keeps prompts on the
+    # operator's own host.
+    data_posture:
+      retains_data: false
+      zdr_available: true
 
   - name: tgi
     display_name: Hugging Face Text Generation Inference
@@ -187,6 +266,11 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    # Local engine: the default base URL keeps prompts on the
+    # operator's own host.
+    data_posture:
+      retains_data: false
+      zdr_available: true
 
   - name: lmstudio
     display_name: LM Studio
@@ -197,6 +281,11 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: true
+    # Local engine: the default base URL keeps prompts on the
+    # operator's own host.
+    data_posture:
+      retains_data: false
+      zdr_available: true
 
   - name: llamacpp
     display_name: llama.cpp server
@@ -207,6 +296,11 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    # Local engine: the default base URL keeps prompts on the
+    # operator's own host.
+    data_posture:
+      retains_data: false
+      zdr_available: true
 
   # --- Tier 5: Enterprise cloud platforms ---
   - name: sagemaker
@@ -218,6 +312,9 @@ providers:
     format: custom
     supports_streaming: true
     supports_embeddings: true
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: databricks
     display_name: Databricks
@@ -227,6 +324,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: true
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: oracle
     display_name: Oracle Cloud GenAI
@@ -237,6 +337,9 @@ providers:
     format: custom
     supports_streaming: true
     supports_embeddings: true
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: watsonx
     display_name: IBM Watsonx
@@ -247,6 +350,9 @@ providers:
     format: custom
     supports_streaming: true
     supports_embeddings: true
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   # --- Tier 6: Inference platforms (OpenAI-compatible) ---
   - name: anyscale
@@ -257,6 +363,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: true
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: cerebras
     display_name: Cerebras Inference
@@ -266,6 +375,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: nvidia
     display_name: NVIDIA NIM
@@ -276,6 +388,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: true
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: hyperbolic
     display_name: Hyperbolic
@@ -285,6 +400,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: lepton
     display_name: Lepton AI
@@ -294,6 +412,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: deepinfra
     display_name: DeepInfra
@@ -303,6 +424,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: true
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: novita
     display_name: Novita AI
@@ -312,6 +436,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: sambanova
     display_name: SambaNova Cloud
@@ -321,6 +448,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: siliconflow
     display_name: SiliconFlow
@@ -330,6 +460,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: true
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   # --- Tier 7: Regional and language-specialised providers ---
   - name: moonshot
@@ -341,6 +474,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: dashscope
     display_name: Alibaba DashScope (Qwen)
@@ -351,6 +487,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: true
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: zhipu
     display_name: Zhipu AI (GLM)
@@ -361,6 +500,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: true
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   # --- Tier 8: OpenAI-compatible inference platforms (Phase 1) ---
   - name: cloudflare
@@ -372,6 +514,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: true
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: vertex
     display_name: Google Vertex AI
@@ -382,6 +527,12 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    # Customer data is not used to train foundation models; cached
+    # inputs and abuse logging can be disabled for zero-retention
+    # configurations (Google Cloud Vertex AI data-governance docs).
+    data_posture:
+      retains_data: true
+      zdr_available: true
 
   - name: runpod
     display_name: RunPod Serverless
@@ -391,6 +542,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: crusoe
     display_name: Crusoe Cloud Inference
@@ -400,6 +554,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: featherless
     display_name: Featherless AI
@@ -409,6 +566,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: true
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: reka
     display_name: Reka AI
@@ -418,6 +578,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   # --- Tier 9: Embeddings-only providers ---
   - name: voyage
@@ -430,6 +593,9 @@ providers:
     supports_streaming: false
     supports_embeddings: true
     supports_chat: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: jina
     display_name: Jina AI
@@ -440,6 +606,9 @@ providers:
     supports_streaming: false
     supports_embeddings: true
     supports_chat: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   # --- Tier 10: Aggregators and gateways (OpenAI-compatible) ---
   - name: huggingface
@@ -451,6 +620,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: github_models
     display_name: GitHub Models
@@ -461,6 +633,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: true
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: vercel
     display_name: Vercel AI Gateway
@@ -471,6 +646,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   # --- Tier 11: Inference platforms (OpenAI-compatible) ---
   - name: nebius
@@ -482,6 +660,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: true
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: baseten
     display_name: Baseten Model APIs
@@ -491,6 +672,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: lambda
     display_name: Lambda Inference API
@@ -501,6 +685,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: friendliai
     display_name: FriendliAI Serverless
@@ -511,6 +698,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: scaleway
     display_name: Scaleway Generative APIs
@@ -520,6 +710,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: true
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: nscale
     display_name: Nscale Serverless Inference
@@ -529,6 +722,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: digitalocean
     display_name: DigitalOcean Gradient Inference
@@ -539,6 +735,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: true
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: ovhcloud
     display_name: OVHcloud AI Endpoints
@@ -549,6 +748,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: true
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: inferencenet
     display_name: Inference.net
@@ -559,6 +761,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: true
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: kluster
     display_name: kluster.ai
@@ -569,6 +774,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: openpipe
     display_name: OpenPipe
@@ -578,6 +786,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   # --- Tier 12: Model labs (OpenAI-compatible) ---
   - name: writer
@@ -589,6 +800,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: upstage
     display_name: Upstage (Solar)
@@ -599,6 +813,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: alephalpha
     display_name: Aleph Alpha
@@ -609,6 +826,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: minimax
     display_name: MiniMax
@@ -618,6 +838,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   # --- Tier 13: Regional providers (OpenAI-compatible) ---
   - name: volcengine
@@ -629,6 +852,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: true
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: hunyuan
     display_name: Tencent Hunyuan
@@ -639,6 +865,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: qianfan
     display_name: Baidu Qianfan (ERNIE)
@@ -649,6 +878,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: true
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: stepfun
     display_name: StepFun
@@ -659,6 +891,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   # --- Tier 14: Embeddings and rerank ---
   - name: mixedbread
@@ -671,6 +906,9 @@ providers:
     supports_streaming: false
     supports_embeddings: true
     supports_chat: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   # --- Tier 15: Enterprise cloud platforms (Phase 2) ---
   - name: azure_foundry
@@ -682,6 +920,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: true
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: snowflake
     display_name: Snowflake Cortex
@@ -692,6 +933,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   # --- Tier 16: Model labs and inference platforms (Phase 2) ---
   - name: ai21
@@ -703,6 +947,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: clarifai
     display_name: Clarifai
@@ -712,6 +959,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: inception
     display_name: Inception Labs (Mercury)
@@ -722,6 +972,9 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   - name: sarvam
     display_name: Sarvam AI
@@ -731,3 +984,6 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false

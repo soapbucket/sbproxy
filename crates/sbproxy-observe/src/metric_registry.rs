@@ -838,6 +838,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_ai_data_posture_filter_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_data_posture_filter"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["constraint", "outcome", "tenant"],
+        description: "AI requests whose provider candidate set the data-posture constraint narrowed (outcome filtered) or refused outright (outcome refused), by resolved tenant.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_ai_failovers_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_failover"),
@@ -4100,7 +4111,7 @@ pub fn run_scoped_label_gaps(
 pub fn render_markdown() -> String {
     let mut out = String::from(
         "# Metrics stability\n\
-         *Last modified: 2026-08-18*\n\n\
+         *Last modified: 2026-08-21*\n\n\
          *Generated from the executable metric registry. Do not hand-edit; run \
          `cargo run -q -p sbproxy-observe --bin generate-metrics-stability > \
          docs/metrics-stability.md`.*\n\n\

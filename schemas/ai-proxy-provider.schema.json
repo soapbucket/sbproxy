@@ -155,6 +155,17 @@
       "default": false,
       "type": "boolean"
     },
+    "data_posture": {
+      "description": "Operator override of this destination's declared data-handling posture, consulted by the `data_posture:` routing eligibility filter. The provider catalog supplies the vendor default from its published terms; this block declares what holds for this deployment, for example `zdr: true` on an entry whose account has a signed zero-data-retention agreement. That declaration is the only thing that makes a vendor which retains by default eligible for `require_zdr`. Unset keeps the catalog's declaration. See `sbproxy_ai::data_posture`.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/DataPostureOverride"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "serve": {
       "description": "WOR-1652: optional local model-serving block. When set, the gateway itself hosts the models (pull weights, fit an engine to the GPU, supervise it) and registers them as local providers ahead of any cloud fallback, instead of proxying `base_url` to an already-running server. `None` keeps the proxy-only behavior. The lifecycle half (spawn/evict) ships in phases of the model-host epic; this field is the config surface it reads.",
       "anyOf": [
@@ -168,6 +179,28 @@
     }
   },
   "definitions": {
+    "DataPostureOverride": {
+      "description": "Operator posture declaration on one provider entry, overriding the catalog's per-vendor default.\n\nThe catalog records what a vendor's published terms say about a stock account. A specific deployment can differ in both directions: an operator with a signed ZDR agreement declares `zdr: true` on their entry; an operator pointing an `openai`-typed entry at a retaining third-party endpoint declares `retains_data: true`.",
+      "type": "object",
+      "properties": {
+        "retains_data": {
+          "description": "Override the catalog's `retains_data` declaration for this entry. Unset keeps the catalog value, except that setting `zdr: true` alone implies `false`.",
+          "default": null,
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "zdr": {
+          "description": "Declare that this deployment operates under a zero-data-retention arrangement with the vendor. This is what makes a provider whose stock terms retain prompt data eligible for `require_zdr`; the catalog's `zdr_available` records only that the vendor sells such an arrangement, never that you hold one. Unset falls back to the catalog's retention declaration (a vendor that stores nothing on a stock account is zero data retention as it stands).",
+          "default": null,
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
     "ModelHostConfig": {
       "description": "The `serve:` block: the local models plus host-wide policy.",
       "type": "object",

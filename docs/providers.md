@@ -1,5 +1,5 @@
 # Supported providers
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-20*
 
 SBproxy ships native adapters for 72 LLM providers behind one OpenAI-compatible API. The 72 breaks down as: 66 entries that speak the OpenAI wire format and pass through unchanged, 3 with in-tree request and response translators (Anthropic, Gemini, Bedrock), and 3 `Custom`-format entries (SageMaker, Oracle, Watsonx) that pass through in their native shape with no translation. You bring your own key per provider, and the `model` field passes straight through to the upstream, so the gateway reaches 200+ models (and whatever a provider ships next) without enumerating them.
 
@@ -107,6 +107,25 @@ Override `base_url` to use a region other than us-south for watsonx, or to point
 [^sigv4]: SBproxy does not compute AWS SigV4 signatures. Bedrock and SageMaker requests must arrive already signed, by your AWS SDK, a signing sidecar, or other operator tooling; the gateway forwards the signed `Authorization` header verbatim. Gateways that sign for you do so by holding your AWS access keys; SBproxy holds no AWS credentials on this path.
 
 [^ollama]: Ollama allows blank API keys; SBproxy forwards an empty Bearer token if `api_key` is unset.
+
+## Declared data-handling posture
+
+Every catalog entry also declares a `data_posture` block: `retains_data` (does the vendor's API retain prompt data on a stock account, for example an abuse-monitoring window) and `zdr_available` (does the vendor sell a zero-data-retention arrangement at all). The same honesty rule as the rest of this page applies: these record what each vendor's published data-processing terms say, not the result of auditing an account, and vendors change terms on their own schedule. The `data_posture:` block on an `ai_proxy` action turns these declarations into a hard routing eligibility filter; see [ai-gateway.md](ai-gateway.md#provider-data-posture).
+
+`zdr_available` is informational and is deliberately not an input to that filter. It tells you an agreement exists to go and sign, not that your account holds one, and four of the entries below offer one while retaining by default. Declaring what your own deployment holds is a line in your config (`data_posture.zdr: true` on the provider entry).
+
+The entries with a non-pessimistic declaration:
+
+| Name | `retains_data` | `zdr_available` | Basis |
+|------|----------------|-----------------|-------|
+| `openai` | `true` | `true` | Abuse-monitoring retention up to 30 days; ZDR offered for approved use cases (OpenAI API data-usage policy). |
+| `anthropic` | `true` | `true` | Limited trust-and-safety retention; ZDR agreements offered commercially (Anthropic commercial terms). |
+| `azure` | `true` | `true` | Abuse-monitoring storage up to 30 days; approved subscriptions can disable it (Azure OpenAI data-privacy note). |
+| `bedrock` | `false` | `true` | AWS states Bedrock does not store or log prompts and completions (Bedrock data-protection documentation). |
+| `vertex` | `true` | `true` | No training on customer data; caching and abuse logging can be disabled for zero-retention configurations (Vertex AI data-governance docs). |
+| `ollama`, `vllm`, `tgi`, `lmstudio`, `llamacpp` | `false` | `true` | Local engines; the default base URL keeps prompts on the operator's own host. |
+
+The four entries with `retains_data: true, zdr_available: true` retain on a stock account, so they satisfy `require_zdr` only once you declare the agreement you hold. The six with `retains_data: false` store nothing to begin with and satisfy it as they stand. Every other entry carries the pessimistic default, `retains_data: true, zdr_available: false`, spelled out in the YAML: with no published commitment recorded, a posture-constrained origin fails closed rather than optimistically routing there. If your own agreement with a vendor differs (a signed ZDR addendum, say), declare it on your provider entry with `data_posture.zdr: true` / `data_posture.retains_data: false`, or ship a corrected catalog via `proxy.ai_providers_file`. A locally served (`serve:`) or `managed_model` provider is treated as zero-data-retention by construction.
 
 ## Configuring a provider
 

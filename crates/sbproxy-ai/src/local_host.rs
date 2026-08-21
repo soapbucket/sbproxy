@@ -170,6 +170,7 @@ mod tests {
             disable_forwarded_host_header: false,
             allow_private_base_url: false,
             no_prompt_training: false,
+            data_posture: None,
             serve: None,
         };
         p.serve = Some(serve);

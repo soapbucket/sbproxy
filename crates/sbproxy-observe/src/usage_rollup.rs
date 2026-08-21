@@ -118,7 +118,8 @@ impl RollupOutcome {
             | "rate_limited"
             | "auth_denied"
             | "gateway_auth_denied"
-            | "policy_block" => Self::Blocked,
+            | "policy_block"
+            | "data_posture_block" => Self::Blocked,
             _ => Self::Error,
         }
     }
@@ -1349,6 +1350,10 @@ mod tests {
             "auth_denied",
             "gateway_auth_denied",
             "policy_block",
+            // WOR-2557: a data-posture refusal is the gateway declining
+            // to route, not an upstream error, so it partitions with
+            // the other intentional blocks in spend reporting.
+            "data_posture_block",
         ] {
             assert_eq!(
                 RollupOutcome::from_outcome_label(blocked),

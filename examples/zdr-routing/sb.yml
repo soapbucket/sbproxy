@@ -1,0 +1,100 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# AI gateway: ZDR-only provider routing by data-handling posture.
+#
+# The `data_posture` block on an ai_proxy action is a hard eligibility
+# filter over the provider candidate set, applied before any routing
+# strategy runs. With `require_zdr: true`, only providers whose
+# effective posture declares zero data retention are eligible:
+#
+#   - `ai.local` routes to the `openai` entry because this deployment
+#     declares a signed ZDR agreement on it (`data_posture.zdr: true`).
+#     The `mistral` entry is excluded: the catalog records no
+#     zero-data-retention commitment for it, so it stays ineligible
+#     until the operator declares otherwise.
+#   - `ai-any.local` sets no posture of its own, so it routes to
+#     `mistral` normally. A caller that sends
+#     `x-sbproxy-require-zdr: true` tightens that one request, finds
+#     nothing eligible, and is refused with the constraint and the
+#     excluded provider named. Fail closed, never silently reroute.
+#
+# An origin whose own `data_posture` block excludes every provider it
+# configures is refused at config load, naming the key: a strict block
+# over a fleet that can never satisfy it is a blackholed origin, not a
+# policy. Try it by deleting the `data_posture:` override from the
+# `openai` entry below and running `sbproxy validate`.
+#
+# Setup:
+#   export OPENAI_API_KEY=sk-...
+#   export MISTRAL_API_KEY=...
+#   make run CONFIG=examples/zdr-routing/sb.yml
+#
+# Test (served by the ZDR-declared provider):
+#   curl http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai.local' \
+#     -H 'Content-Type: application/json' \
+#     -d '{
+#       "model": "gpt-4o-mini",
+#       "messages": [{"role": "user", "content": "What is 2+2?"}]
+#     }'
+#
+#   # Refused with the constraint and exclusions named (expect 403):
+#   curl -is http://127.0.0.1:8080/v1/chat/completions \
+#     -H 'Host: ai-any.local' \
+#     -H 'x-sbproxy-require-zdr: true' \
+#     -H 'Content-Type: application/json' \
+#     -d '{
+#       "model": "mistral-small-latest",
+#       "messages": [{"role": "user", "content": "hi"}]
+#     }'
+#
+#   # Who is eligible right now, read off the live pipeline:
+#   curl -su admin:changeme http://127.0.0.1:9090/admin/ai-data-posture
+
+proxy:
+  http_bind_port: 8080
+  # So `GET /admin/ai-data-posture` can be read locally. Loopback-only.
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: ${SBPROXY_ADMIN_PASSWORD:-changeme}
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      data_posture:
+        require_zdr: true
+      routing: fallback_chain
+
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          priority: 1
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+          # The catalog records only that OpenAI offers a ZDR
+          # arrangement; whether this deployment has one is the
+          # operator's declaration. This entry declares it.
+          data_posture:
+            zdr: true
+        - name: mistral
+          api_key: ${MISTRAL_API_KEY}
+          priority: 2
+          default_model: mistral-small-latest
+          models:
+            - mistral-small-latest
+
+  # No posture block, so this origin routes to `mistral` unchanged.
+  # The constraint arrives per request instead, from the caller's
+  # `x-sbproxy-require-zdr` header, and nothing here satisfies it.
+  "ai-any.local":
+    action:
+      type: ai_proxy
+      providers:
+        - name: mistral
+          api_key: ${MISTRAL_API_KEY}
+          default_model: mistral-small-latest
+          models:
+            - mistral-small-latest

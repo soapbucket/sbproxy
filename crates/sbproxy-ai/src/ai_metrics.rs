@@ -703,6 +703,47 @@ pub fn record_surface_latency(surface: &str, method: &str, duration_secs: f64) {
         .observe(duration_secs);
 }
 
+/// Requests whose provider candidate set the data-handling posture
+/// constraint narrowed or refused (WOR-2557).
+///
+/// `constraint` is the closed [`crate::data_posture::DataPostureConstraint::label`]
+/// set (three values); `outcome` is `filtered` (the set narrowed and the
+/// request proceeded on the eligible remainder) or `refused` (the
+/// exclusion left no eligible provider and the request failed closed).
+/// A refused request increments both outcomes: the narrowing happened,
+/// and then nothing remained.
+///
+/// All three labels are closed sets. `tenant` is the origin's resolved
+/// tenant, which is drawn from the declared `proxy.tenants[]` list and
+/// is `__default__` in a single-tenant deployment; no client-derived
+/// value reaches a label here.
+static AI_DATA_POSTURE_FILTER: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_data_posture_filter_total",
+            "AI requests whose provider candidate set the data-posture constraint narrowed or refused"
+        ),
+        &["constraint", "outcome", "tenant"]
+    )
+    .unwrap()
+});
+
+/// Record a data-posture candidate-set narrowing or refusal.
+///
+/// An empty `tenant` is recorded as `__default__` rather than as an
+/// empty label value, so a single-tenant deployment still produces one
+/// readable series instead of a blank one.
+pub fn record_data_posture_filter(constraint: &str, outcome: &str, tenant: &str) {
+    let tenant = if tenant.is_empty() {
+        "__default__"
+    } else {
+        tenant
+    };
+    AI_DATA_POSTURE_FILTER
+        .with_label_values(&[constraint, outcome, tenant])
+        .inc();
+}
+
 /// Counter for requests that bypassed the hub round-trip because the
 /// client and upstream provider speak the same wire format. The
 /// `inbound_format` label matches the values stamped on
@@ -1458,8 +1499,9 @@ static AI_COST_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
 /// budget block / upstream error". The `outcome` label is a small
 /// closed set (`ok`, `guardrail_block`, `content_filter`,
 /// `budget_exceeded`, `rate_limited`, `timeout`, `upstream_5xx`,
-/// `gateway_auth_denied`, `upstream_auth_denied`, `policy_block`, `refusal`,
-/// `client_error`, `other`) so cardinality stays bounded.
+/// `gateway_auth_denied`, `upstream_auth_denied`, `policy_block`,
+/// `data_posture_block`, `refusal`, `client_error`, `other`) so
+/// cardinality stays bounded.
 static AI_OUTCOMES_ATTRIBUTED: LazyLock<CounterVec> = LazyLock::new(|| {
     register_counter_vec!(
         Opts::new(
@@ -2178,6 +2220,40 @@ mod tests {
         );
         record_rag_latency("total", "stage-guard-provider", 0.1);
         assert_eq!(sample_count(), before + 1);
+    }
+
+    #[test]
+    fn test_record_data_posture_filter() {
+        record_data_posture_filter("require_zdr", "filtered", "acme");
+        record_data_posture_filter("require_zdr", "refused", "acme");
+        record_data_posture_filter("deny_data_collection", "filtered", "");
+
+        let families = prometheus::gather();
+        let family = families
+            .iter()
+            .find(|f| f.name() == "sbproxy_ai_data_posture_filter_total")
+            .expect("sbproxy_ai_data_posture_filter_total should be registered");
+        let outcomes: Vec<&str> = family
+            .get_metric()
+            .iter()
+            .flat_map(|m| m.get_label())
+            .filter(|l| l.name() == "outcome")
+            .map(|l| l.value())
+            .collect();
+        assert!(outcomes.contains(&"filtered"));
+        assert!(outcomes.contains(&"refused"));
+        let tenants: Vec<&str> = family
+            .get_metric()
+            .iter()
+            .flat_map(|m| m.get_label())
+            .filter(|l| l.name() == "tenant")
+            .map(|l| l.value())
+            .collect();
+        assert!(
+            tenants.contains(&"__default__"),
+            "an empty tenant becomes the single-tenant default, never a blank label"
+        );
+        assert!(tenants.contains(&"acme"));
     }
 
     #[test]

@@ -26,6 +26,45 @@ the next version cut.
   section of [docs/configuration.md](docs/configuration.md) and
   [examples/auth-hmac/](examples/auth-hmac/).
 
+- **Provider eligibility by data-handling posture (ZDR /
+  data-retention allow-deny).** Every provider-catalog entry now
+  declares a `data_posture` block (`retains_data`, `zdr_available`,
+  optional `data_region`), seeded for all 72 entries from each
+  vendor's published data-processing terms and pessimistic where no
+  commitment is published. A `data_posture:` block on an `ai_proxy`
+  action (`require_zdr`, `allow_data_collection`), or the per-request
+  `x-sbproxy-require-zdr` / `x-sbproxy-disallow-data-collection`
+  headers, gates provider eligibility as a hard candidate-set filter
+  ahead of every routing strategy, fallback order, cascade tier, race
+  fan-out, shadow dispatch, model listing, realtime session
+  admission, and the semantic cache's embedding call. `/v1/messages`
+  and `/v1/responses` are gated identically, because both reach
+  routing as the canonical chat body. A request left with no eligible
+  provider fails closed with a `no_posture_eligible_provider` error
+  naming the constraint and the excluded providers, and an origin
+  whose own block excludes every provider it configures is refused at
+  config load rather than left to deny every request at runtime.
+
+  A vendor offering a zero-data-retention agreement is not the same as
+  your account holding one, so the catalog's `zdr_available` is
+  informational and never satisfies `require_zdr` by itself: what
+  qualifies without any declaration from you is a vendor whose stock
+  terms store nothing, and a model you serve yourself. Declaring the
+  agreement you hold is a line on the provider entry
+  (`data_posture.zdr: true`). Narrowings and refusals are counted on
+  `sbproxy_ai_data_posture_filter_total`, and a refusal is represented
+  on every surface the gateway's other refusals reach: the closed
+  `data_posture_block` outcome on
+  `sbproxy_ai_requests_attributed_total` and the gateway-decision
+  rejection reason (not the misleading `gateway_auth_denied` a bare
+  403 reads as), a `security_audit` record that lands on `events:`
+  sinks as `policy_denied`, the `policy_blocked` billing outcome for
+  metered calls, and the structured `ai.data_posture.refusal` warning.
+  `GET /admin/ai-data-posture` reports every AI origin's declared
+  postures and its live effective eligible set. See the provider data
+  posture section of [docs/ai-gateway.md](docs/ai-gateway.md) and
+  [examples/zdr-routing/](examples/zdr-routing/).
+
 ### Changed, and worth checking before you upgrade
 
 - **`transport: stdio` MCP servers now run as one supervised

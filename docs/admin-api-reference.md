@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-20*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
@@ -27,7 +27,7 @@ built-in dashboard over this same API, see [admin-ui.md](admin-ui.md).
 - [API keys and credentials](#api-keys-and-credentials) - full virtual-key and upstream-credential lifecycle
 - [Read routes](#read-routes-authenticated) - request log + stream, extension inventory, alerts, health, spend, attested-metering, audit, egress inventory, rate-limit budget, UI settings, OpenAPI
 - [AI compression session state](#ai-compression-session-state)
-- [Config and control routes](#config-and-control-routes-authenticated) - reload, drift, config read/write, config history, log level, the owasp_api_top10 pack manifest
+- [Config and control routes](#config-and-control-routes-authenticated) - reload, drift, config read/write, config history, log level, the owasp_api_top10 pack manifest, AI provider data posture
 - [Model host admin](#model-host-admin) - catalog, deployments, lifecycle, artifact cache
 - [Cache admin](#cache-admin) - response cache and key-policy cache
 - [Cluster control plane](#cluster-control-plane) - status, deployments, enrollment, replicated state
@@ -1628,6 +1628,68 @@ entirely. A config with no pack anywhere returns `200 {"origins":{}}`.
 | `items[].state` | string | `enforced`, `report_only`, `needs_operator_input`, `operator_authored`, or `not_covered`. See [owasp-api-top10.md](owasp-api-top10.md#the-states-briefly) for what each means. |
 | `items[].reason` | string | One sentence or more, safe to show an operator verbatim. |
 | `items[].synthesized` | array of strings | Config `type` strings the pack added to this origin's `policies:` or `transforms:` for this item. Empty when the pack added nothing (an operator back-off, a `not_covered` item, or a gap named in `reason`). |
+
+Read-only operators may call this; it has no write path.
+
+| Status | When |
+|---|---|
+| `200` | Always, once authenticated. |
+| `401` | Missing or invalid credentials. |
+| `405` | Any method other than `GET`. |
+
+---
+
+### `GET /admin/ai-data-posture`
+
+Per AI origin, each provider's declared data-handling posture next to
+its wire format and auth header, plus the effective eligible-provider
+set the `data_posture:` filter computes right now (see
+[ai-gateway.md](ai-gateway.md#provider-data-posture)). Read off the
+live compiled pipeline, so a hot reload updates it without a restart.
+
+An origin with no `ai_proxy` action is absent from `origins` entirely.
+A config with no AI origin returns `200 {"origins":{}}`.
+
+```json
+{
+  "origins": {
+    "ai.local": {
+      "constraint": "require_zdr",
+      "eligible_providers": ["openai"],
+      "excluded_providers": ["mistral"],
+      "providers": [
+        {
+          "auth_header": "Authorization",
+          "catalog": {"data_region": null, "retains_data": true, "zdr_available": true},
+          "effective": {"retains_data": false, "zdr": true},
+          "eligible": true,
+          "enabled": true,
+          "format": "openai",
+          "name": "openai",
+          "provider_type": "openai"
+        }
+      ],
+      "requirement": {"allow_data_collection": true, "require_zdr": true}
+    }
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `origins.<hostname>.requirement` | object or null | The origin's `data_posture:` block as configured, or `null` when it declares none. |
+| `origins.<hostname>.constraint` | string or null | The active constraint in config spelling (`require_zdr`, `allow_data_collection: false`, or both), or `null` when the block constrains nothing. Per-request headers are not reflected here; they apply to one request. |
+| `origins.<hostname>.eligible_providers` | array of strings | Enabled providers that satisfy the constraint, in declaration order. Equals every enabled provider when there is no constraint. |
+| `origins.<hostname>.excluded_providers` | array of strings | Enabled providers the constraint excludes, in declaration order. |
+| `origins.<hostname>.providers[]` | array of objects | One row per configured provider, in declaration order, disabled ones included. |
+| `providers[].name` | string | The provider entry's name. |
+| `providers[].provider_type` | string | Its effective provider type (the catalog key), which is `provider_type` when set and otherwise the name. |
+| `providers[].enabled` | bool | Whether the entry is enabled. A disabled entry is never a candidate and is absent from both name lists. |
+| `providers[].format` | string | Wire format family: `openai`, `anthropic`, `google`, `bedrock`, or `custom`. |
+| `providers[].auth_header` | string or null | The catalog's auth header for this provider type. `null` for a type not in the catalog. |
+| `providers[].catalog` | object or null | The catalog's declaration for this provider type: `retains_data`, `zdr_available`, `data_region`. Records what the vendor's published terms say about a stock account, not the result of auditing one. `null` for a type not in the catalog. |
+| `providers[].effective` | object | What this deployment holds after the operator's `data_posture:` override and the locally-served special case: `retains_data`, `zdr`. This is what the filter evaluates. |
+| `providers[].eligible` | bool | Whether this entry satisfies the origin's constraint. `true` for every entry when there is none. |
 
 Read-only operators may call this; it has no write path.
 

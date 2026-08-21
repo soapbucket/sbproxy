@@ -112,6 +112,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_ai_cost_dollars_attributed_total` | Counter | `stable` | `stable` | `origin`, `provider`, `model`, `surface`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id`, `agent_id` | AI cost in USD, partitioned by attribution tag. |
 | `sbproxy_ai_cost_saved_micros_total` | Counter | `stable` | `beta` | `tenant`, `origin`, `model` | Micro-USD avoided by a semantic-cache hit. |
 | `sbproxy_ai_cost_usd_micros_total` | Counter | `stable` | `beta` | `provider`, `model`, `tenant_id` | Derived AI request cost in micro-USD. |
+| `sbproxy_ai_data_posture_filter_total` | Counter | `stable` | `beta` | `constraint`, `outcome`, `tenant` | AI requests whose provider candidate set the data-posture constraint narrowed (outcome filtered) or refused outright (outcome refused), by resolved tenant. |
 | `sbproxy_ai_failovers_total` | Counter | `stable` | `beta` | `from_provider`, `to_provider`, `reason` | Provider failover events. |
 | `sbproxy_ai_gateway_decisions_total` | Counter | `stable` | `beta` | `decision`, `reason` | AI gateway admission decisions, including pre-provider rejections. |
 | `sbproxy_ai_guardrail_blocks_total` | Counter | `stable` | `stable` | `category` | Guardrail block events. |

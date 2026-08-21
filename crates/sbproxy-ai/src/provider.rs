@@ -90,6 +90,17 @@ pub struct ProviderConfig {
     /// routed only to providers marked here. Defaults to `false`.
     #[serde(default)]
     pub no_prompt_training: bool,
+    /// Operator override of this destination's declared data-handling
+    /// posture, consulted by the `data_posture:` routing eligibility
+    /// filter. The provider catalog supplies the vendor default from
+    /// its published terms; this block declares what holds for this
+    /// deployment, for example `zdr: true` on an entry whose account
+    /// has a signed zero-data-retention agreement. That declaration is
+    /// the only thing that makes a vendor which retains by default
+    /// eligible for `require_zdr`. Unset keeps the catalog's
+    /// declaration. See `sbproxy_ai::data_posture`.
+    #[serde(default)]
+    pub data_posture: Option<crate::data_posture::DataPostureOverride>,
     /// WOR-1652: optional local model-serving block. When set, the
     /// gateway itself hosts the models (pull weights, fit an engine to
     /// the GPU, supervise it) and registers them as local providers
@@ -321,6 +332,7 @@ mod tests {
             disable_forwarded_host_header: false,
             allow_private_base_url: false,
             no_prompt_training: false,
+            data_posture: None,
             serve: None,
         }
     }

@@ -1,6 +1,6 @@
 # SBproxy events
 
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-20*
 
 SBproxy hands a SIEM three different things, and this page is the map of how they fit together: typed proxy events (the `events:` block, a closed set of thirteen), decision-audit records (`observability.log.decision_audit`, eighteen pipeline decisions normalized to OCSF), and four audit channels that write to their own tracing targets (`security_audit`, `config_audit`, `key_audit`, and the admin action ring). Two of those four, `security_audit` and `config_audit`, can additionally be hash-chained and Ed25519-signed for tamper evidence.
 
@@ -37,7 +37,7 @@ all.
 | `request_completed` | The request finished without an error. | Yes |
 | `request_error` | The request terminated with an error. | Yes |
 | `auth_denied` | Authentication rejected the request. | Yes |
-| `policy_denied` | A policy (rate limit, IP filter, WAF, request limit) blocked the request, or an HTTP framing violation was refused. | Yes |
+| `policy_denied` | A policy (rate limit, IP filter, WAF, request limit, AI data-posture routing) blocked the request, or an HTTP framing violation was refused. | Yes |
 | `egress_refused` | An outbound dial (AI provider, MCP OAuth token exchange, model artifact fetch, telemetry sink, ...) was refused by egress authorization. | Yes |
 | `provider_selected` | An AI request failed over to a different provider. | Yes, on the transition only |
 | `budget_exceeded` | An AI spend or quota budget was exhausted and the request was blocked. | Yes, on the deny only |

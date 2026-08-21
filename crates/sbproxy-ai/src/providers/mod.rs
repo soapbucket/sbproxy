@@ -70,10 +70,68 @@ pub struct ProviderInfo {
     /// fail closed at validation time instead of 404ing at runtime.
     #[serde(default = "default_true")]
     pub supports_chat: bool,
+    /// Declared data-handling posture of the vendor's API, per its
+    /// published data-processing terms. Consulted by the routing
+    /// eligibility filter (`data_posture:` on an `ai_proxy` action and
+    /// the per-request posture headers); see
+    /// [`crate::data_posture`]. An entry that declares nothing gets
+    /// the pessimistic default.
+    #[serde(default)]
+    pub data_posture: CatalogDataPosture,
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// Declared data-handling posture of one catalog entry.
+///
+/// Like every other catalog field, this records what the vendor's
+/// published data-processing terms say about a stock API account, not
+/// the result of auditing one. The default is pessimistic
+/// (`retains_data: true`, `zdr_available: false`): a provider that
+/// declares nothing is treated as retaining prompt data with no
+/// zero-data-retention arrangement on offer, matching the catalog's
+/// cost-fallback precedent of guessing conservative rather than
+/// optimistic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogDataPosture {
+    /// Whether prompt data sent to a stock account is retained by the
+    /// vendor (for example a 30-day abuse-monitoring window), per its
+    /// published terms. Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub retains_data: bool,
+    /// Whether the vendor offers a zero-data-retention arrangement
+    /// (an agreement or account setting under which prompts are not
+    /// stored). Defaults to `false`.
+    ///
+    /// Informational, and deliberately not an input to the routing
+    /// eligibility filter: it says an arrangement is available to go
+    /// and sign, not that this deployment holds one. Four catalog
+    /// entries offer one and retain by default, so treating this flag
+    /// as a held posture would let `require_zdr` route to a stock
+    /// retaining account. Declaring that a specific deployment
+    /// operates under such an arrangement is the operator's job, per
+    /// provider entry (`data_posture.zdr: true`); see
+    /// [`crate::data_posture::effective_data_posture`].
+    #[serde(default)]
+    pub zdr_available: bool,
+    /// Optional vendor-declared processing region (for example `us`,
+    /// `eu`). Not consulted by the posture filter; reserved for the
+    /// zone/locality-aware selection work so that ticket reuses this
+    /// field rather than declaring a second region concept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_region: Option<String>,
+}
+
+impl Default for CatalogDataPosture {
+    fn default() -> Self {
+        Self {
+            retains_data: true,
+            zdr_available: false,
+            data_region: None,
+        }
+    }
 }
 
 /// Wire format family used by a provider's API.
@@ -119,6 +177,8 @@ struct YamlProvider {
     supports_embeddings: bool,
     #[serde(default = "default_true")]
     supports_chat: bool,
+    #[serde(default)]
+    data_posture: CatalogDataPosture,
 }
 
 #[derive(Debug, Deserialize)]
@@ -345,6 +405,7 @@ fn build_registry(override_path: Option<&Path>) -> anyhow::Result<Registry> {
             supports_streaming: entry.supports_streaming,
             supports_embeddings: entry.supports_embeddings,
             supports_chat: entry.supports_chat,
+            data_posture: entry.data_posture,
         };
         let idx = providers.len();
         providers.push(info);
@@ -482,6 +543,84 @@ mod tests {
                 info.default_base_url
             );
         }
+    }
+
+    #[test]
+    fn every_embedded_entry_declares_a_data_posture() {
+        // The WOR-2557 acceptance line: the posture fields are seeded
+        // for the full catalog. Parsing proves each entry either
+        // declares a block or picks up the pessimistic default; this
+        // asserts the declaration is explicit in the shipped YAML so a
+        // new entry cannot land without stating its posture.
+        let yaml = decompress_embedded().expect("embedded gzip valid");
+        let raw: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("yaml parses");
+        let entries = raw
+            .get("providers")
+            .and_then(|v| v.as_sequence())
+            .expect("providers sequence");
+        for entry in entries {
+            let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            assert!(
+                entry.get("data_posture").is_some(),
+                "catalog entry {name} must declare a data_posture block"
+            );
+        }
+    }
+
+    #[test]
+    fn posture_defaults_are_pessimistic_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bare.yml");
+        std::fs::write(
+            &path,
+            r#"providers:
+  - name: bare
+    display_name: Bare Provider
+    default_base_url: https://bare.example.com
+    auth_header: Authorization
+    format: openai
+"#,
+        )
+        .unwrap();
+        let registry = build_registry(Some(&path)).unwrap();
+        assert_eq!(
+            registry.providers[0].data_posture,
+            CatalogDataPosture {
+                retains_data: true,
+                zdr_available: false,
+                data_region: None,
+            }
+        );
+    }
+
+    #[test]
+    fn declared_catalog_postures_parse_into_provider_info() {
+        // Vendors whose published terms declare no prompt storage.
+        let bedrock = get_provider_info("bedrock").unwrap();
+        assert!(!bedrock.data_posture.retains_data);
+        assert!(bedrock.data_posture.zdr_available);
+
+        // Vendors that retain by default but offer a ZDR arrangement.
+        // Offering one is not holding one: these entries stay outside a
+        // `require_zdr` candidate set until an operator declares the
+        // agreement on their own provider entry.
+        for name in ["openai", "anthropic", "azure", "vertex"] {
+            let info = get_provider_info(name).unwrap();
+            assert!(info.data_posture.retains_data, "{name} retains by default");
+            assert!(info.data_posture.zdr_available, "{name} offers ZDR");
+        }
+
+        // Local engines keep the prompt on the operator's own host.
+        for name in ["ollama", "vllm", "tgi", "lmstudio", "llamacpp"] {
+            let info = get_provider_info(name).unwrap();
+            assert!(!info.data_posture.retains_data, "{name} is local");
+            assert!(info.data_posture.zdr_available, "{name} is local");
+        }
+
+        // An entry with no vendor commitment stays pessimistic.
+        let openrouter = get_provider_info("openrouter").unwrap();
+        assert!(openrouter.data_posture.retains_data);
+        assert!(!openrouter.data_posture.zdr_available);
     }
 
     #[test]

@@ -55,6 +55,18 @@ pub struct AiHandlerConfig {
     /// Strategy used to select a provider for each request.
     #[serde(default = "default_strategy", deserialize_with = "deserialize_routing")]
     pub routing: RoutingStrategy,
+    /// Data-handling posture requirement gating provider eligibility.
+    ///
+    /// Evaluated as a hard candidate-set filter before any routing
+    /// strategy runs, and composed with the per-request
+    /// `x-sbproxy-require-zdr` / `x-sbproxy-disallow-data-collection`
+    /// headers (most restrictive wins). A request left with no
+    /// eligible provider fails closed with an error naming the
+    /// constraint and the excluded providers. `None` (the default)
+    /// leaves every provider eligible. See
+    /// [`crate::data_posture`].
+    #[serde(default)]
+    pub data_posture: Option<crate::data_posture::DataPostureRequirement>,
     /// Optional allow-list of model names; empty means allow all.
     #[serde(default)]
     pub allowed_models: Vec<ModelId>,
@@ -1382,6 +1394,19 @@ impl AiHandlerConfig {
         // Warm the index here rather than on the first request, so the
         // whole alias plane is resolved at config load.
         let _ = config.model_alias_registry();
+        // WOR-2557: a `data_posture:` block whose own requirement
+        // excludes every provider the origin configures is a blackholed
+        // origin, not a strict one: it boots green and then refuses
+        // every request it is ever sent. Refuse it here, naming the key
+        // and the excluded providers, rather than leaving the operator
+        // to discover it from production traffic. Runs after the
+        // serve-derived provider lists above so a locally served entry
+        // (zero-data-retention by construction) counts as eligible.
+        crate::data_posture::validate_posture_requirement(
+            config.data_posture.as_ref(),
+            &config.providers,
+        )
+        .map_err(|error| anyhow::anyhow!("ai {error}"))?;
         if let Some(compression) = &mut config.compression {
             compression.apply_state_defaults();
             compression.validate(&config.providers)?;
@@ -2031,6 +2056,7 @@ mod tests {
         let config = AiHandlerConfig {
             providers: Vec::new(),
             routing: RoutingStrategy::RoundRobin,
+            data_posture: None,
             allowed_models: Vec::new(),
             blocked_models: Vec::new(),
             max_body_size: None,
@@ -2078,6 +2104,7 @@ mod tests {
         let config = AiHandlerConfig {
             providers: Vec::new(),
             routing: RoutingStrategy::RoundRobin,
+            data_posture: None,
             allowed_models: Vec::new(),
             blocked_models: vec!["gpt-4".into()],
             max_body_size: None,
@@ -2125,6 +2152,7 @@ mod tests {
         let config = AiHandlerConfig {
             providers: Vec::new(),
             routing: RoutingStrategy::RoundRobin,
+            data_posture: None,
             allowed_models: vec!["gpt-4".into(), "gpt-3.5-turbo".into()],
             blocked_models: Vec::new(),
             max_body_size: None,
@@ -2173,6 +2201,7 @@ mod tests {
         let config = AiHandlerConfig {
             providers: Vec::new(),
             routing: RoutingStrategy::RoundRobin,
+            data_posture: None,
             allowed_models: vec!["gpt-4".into()],
             blocked_models: vec!["gpt-4".into()],
             max_body_size: None,
@@ -2929,6 +2958,45 @@ mod tests {
             err.contains("openai"),
             "error suggests the canonical name: {err}"
         );
+    }
+
+    #[test]
+    fn from_config_rejects_a_posture_that_excludes_every_provider() {
+        // WOR-2557: an origin whose own `data_posture:` block leaves no
+        // eligible provider is a blackhole, not a strict policy. It is
+        // refused at compile with the key named, rather than booting
+        // green and refusing every request it is ever sent.
+        let err = AiHandlerConfig::from_config(serde_json::json!({
+            "data_posture": {"require_zdr": true},
+            "providers": [
+                {"name": "mistral", "api_key": "k"},
+                {"name": "groq", "api_key": "k"}
+            ]
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("`data_posture`"), "error names the key: {err}");
+        assert!(
+            err.contains("require_zdr") && err.contains("mistral") && err.contains("groq"),
+            "error names the constraint and the excluded providers: {err}"
+        );
+    }
+
+    #[test]
+    fn from_config_accepts_a_posture_one_provider_satisfies() {
+        // The same block compiles once one entry declares the posture the
+        // deployment actually holds. Compiled in validation mode so this
+        // test does not install a price table into the process-global
+        // that `a_validation_compile_does_not_install_the_candidate_price_table`
+        // is asserting on; the posture check runs on both paths.
+        AiHandlerConfig::from_config_for_validation(serde_json::json!({
+            "data_posture": {"require_zdr": true},
+            "providers": [
+                {"name": "mistral", "api_key": "k"},
+                {"name": "openai", "api_key": "k", "data_posture": {"zdr": true}}
+            ]
+        }))
+        .expect("a posture with one eligible provider compiles");
     }
 
     #[test]
