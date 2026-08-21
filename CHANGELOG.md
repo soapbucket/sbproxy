@@ -473,6 +473,40 @@ the next version cut.
   which none of the body-phase refusals did, and log on the
   `sbproxy::content_digest` target with a `reason` naming the outcome.
   See [docs/content-digest.md](docs/content-digest.md).
+- **`prompt_injection_v2`: the URI and header scan now honors
+  `block_body` and `block_content_type`.** The policy can block from
+  four places. Three of them (the buffered request body, the `ai_proxy`
+  prompt segments, and A2A message parts) wrote the operator's
+  configured rejection body and media type to the wire. The fourth, the
+  synchronous scan of the request line and non-auth headers, denied
+  through the generic policy renderer instead: it wrapped the body in a
+  fixed `{"error": "<block_body>"}` envelope and always answered
+  `Content-Type: application/json`. `block_content_type` was ignored
+  outright on that path, and a `block_body` that was already JSON came
+  back double-encoded as a string inside an `error` field, so
+  enforcement depended on which internal path happened to run. All four
+  paths now serve `block_body` verbatim with `block_content_type`. If
+  you pre-wrapped `block_body` to work around this, unwrap it. Each
+  block increments the new
+  `sbproxy_prompt_injection_blocks_total{scan_path,tenant}` counter, so
+  the four paths can be compared rather than merged.
+
+- **`security_headers`: a configured `content_security_policy` is no
+  longer silently dropped.** Setting both a `headers:` array and a
+  `content_security_policy` block emitted the array and no CSP at all
+  whenever `enable_nonce` was false and no `dynamic_routes` were set:
+  no error, no warning, just responses with no CSP. The two now merge,
+  with the `content_security_policy` block as the single source of
+  truth for that header and `headers:` supplying everything else. Two
+  siblings of the same bug went with it: `report_only` and `report_uri`
+  were consulted only on the nonce path, so a policy asking for
+  report-only monitoring was emitted as an enforcing one, and a CSP
+  block whose `policy` string was empty emitted nothing. Authoring a
+  CSP in both places at once is now refused at config compile rather
+  than resolved quietly, and a `headers:` array that supersedes legacy
+  flat fields logs which ones it is dropping. Emitted policies are
+  counted by
+  `sbproxy_security_headers_csp_emitted_total{mode,tenant}`.
 
 - **Prompts admin page "Add version" now sends the field the backend
   expects.** The form built a `content` key while

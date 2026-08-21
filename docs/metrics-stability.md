@@ -317,6 +317,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_policy_evaluation_duration_seconds` | Histogram | `stable` | `beta` | `origin`, `verdict` | Wall-clock latency of one full policy-chain evaluation. |
 | `sbproxy_policy_panic_total` | Counter | `stable` | `beta` | `policy` | Policy enforcer panics contained on the serving path, by policy type. |
 | `sbproxy_policy_triggers_total` | Counter | `stable` | `stable` | `origin`, `policy_type`, `action`, `agent_id`, `agent_class` | Policy enforcement results. |
+| `sbproxy_prompt_injection_blocks_total` | Counter | `stable` | `beta` | `scan_path`, `tenant` | Requests blocked by the prompt_injection_v2 policy, by scan path (header_scan, body_scan, ai_body, a2a). |
 | `sbproxy_projection_render_failures_total` | Counter | `stable` | `alpha` | `projection` | Well-known projection render failures, by projection. |
 | `sbproxy_rate_limit_cluster_peer_denials_total` | Counter | `stable` | `alpha` | none | Mesh rate-limit denials that needed peer counts, so the approximation is observable. |
 | `sbproxy_rate_limit_decisions_total` | Counter | `stable` | `alpha` | `policy`, `result` | Rate-limit middleware decisions, by policy and outcome. |
@@ -339,6 +340,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_deprecated_requests_total` | Counter | `stable` | `beta` | `origin`, `route`, `past_sunset`, `outcome` | Requests that resolved to a deprecated route, by request Host, matched announcement, whether the hit landed after the announced sunset, and whether it was served or refused with 410. |
 | `sbproxy_semantic_cache_results_total` | Counter | `stable` | `beta` | `tenant`, `origin`, `source`, `result` | Semantic-cache hit/miss/error counts. |
 | `sbproxy_serve_lane_admissions_total` | Counter | `config_only` (nothing emits this yet) | `alpha` | `priority`, `decision` | Served-lane admission gate decisions by priority lane. |
+| `sbproxy_security_headers_csp_emitted_total` | Counter | `stable` | `beta` | `mode`, `tenant` | Content-Security-Policy headers emitted by the security_headers policy, by mode (enforce, report_only). |
 | `sbproxy_silent_degradations_total` | Counter | `config_only` (nothing emits this yet) | `alpha` | `op` | Best-effort operations that failed and were previously dropped silently, by op. |
 | `sbproxy_sink_install_failures_total` | Counter | `stable` | `beta` | none | Failed installs of the process-wide telemetry sink dispatcher. |
 | `sbproxy_synthetic_probe_failures_total` | Counter | `stable` | `beta` | `reason` | Synthetic readiness probe failures by reason. |

@@ -3406,7 +3406,9 @@ policies:
         value: strict-origin-when-cross-origin
       - name: Permissions-Policy
         value: "camera=(), microphone=(), geolocation=()"
-    # Optional: detailed CSP block for nonce / dynamic routes only.
+    # Optional: the Content-Security-Policy, set here rather than as a
+    # `headers:` entry when you want a nonce, report-only mode, a report
+    # URI, or per-route overrides.
     content_security_policy:
       policy: "default-src 'self'; script-src 'self' https://cdn.example.com"
       enable_nonce: false
@@ -3414,13 +3416,17 @@ policies:
       report_uri: ""
 ```
 
-`headers` is a list of `{name, value}` pairs for any response header (HSTS, Cross-Origin-*, COEP/COOP/CORP, Referrer-Policy, Permissions-Policy, and so on). The optional `content_security_policy` block is for advanced CSP behavior only: per-request nonce injection, report-only mode, per-route overrides. For a plain CSP without nonce or dynamic routes, add a `Content-Security-Policy` entry to `headers` directly.
+`headers` is a list of `{name, value}` pairs for any response header (HSTS, Cross-Origin-*, COEP/COOP/CORP, Referrer-Policy, Permissions-Policy, and so on). The optional `content_security_policy` block sets the Content-Security-Policy and adds what a `{name, value}` pair cannot express: per-request nonce injection, report-only mode, a report URI, and per-route overrides.
+
+The two compose. A `content_security_policy` block ships alongside a `headers` array, and every knob on it applies whether or not `enable_nonce` is set. Set the CSP in one place or the other, not both: the block is the single source of truth for that header, and a config that also puts a `Content-Security-Policy` entry in `headers` is refused at compile rather than having one of them dropped quietly. A plain static policy is fine either way, as a `headers` entry or as `content_security_policy: "default-src 'self'"`.
+
+Each emitted policy increments `sbproxy_security_headers_csp_emitted_total`, labeled by `mode` (`enforce` or `report_only`) and tenant. If you configured a CSP and that series sits at zero, the header is not reaching browsers.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `type` | string | required | Must be `security_headers`. |
-| `headers` | list | `[]` | Canonical `{name, value}` pairs to inject. Takes precedence over the legacy flat fields below. |
-| `content_security_policy` | string or object | | CSP. Either a plain policy string or an object (see below). |
+| `headers` | list | `[]` | Canonical `{name, value}` pairs to inject. Supersedes the legacy flat fields below, which are logged as dropped when both are set. Composes with `content_security_policy`. |
+| `content_security_policy` | string or object | | CSP. Either a plain policy string or an object (see below). Composes with `headers`; setting the CSP in both places is refused. |
 | `x_frame_options` | string | | Legacy flat shortcut. Deprecated. |
 | `x_content_type_options` | string | | Legacy flat shortcut. Deprecated. |
 | `x_xss_protection` | string | | Legacy flat shortcut. Deprecated. |
@@ -3432,9 +3438,9 @@ When `content_security_policy` is an object, it accepts:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `policy` | string | `""` | The CSP policy string. |
+| `policy` | string | `""` | The CSP policy string. Required unless `dynamic_routes` is set: a block that can emit no header is refused at compile. |
 | `enable_nonce` | bool | false | When true, generate a per-request nonce and inject it into `script-src` / `style-src` directives. |
-| `report_only` | bool | false | When true, emit `Content-Security-Policy-Report-Only` instead of `Content-Security-Policy`. |
+| `report_only` | bool | false | When true, emit `Content-Security-Policy-Report-Only` instead of `Content-Security-Policy`. Applies whether or not `enable_nonce` is set. |
 | `report_uri` | string | `""` | Appended to the policy as `; report-uri <uri>` when set. |
 | `dynamic_routes` | map | `{}` | Per-route CSP overrides keyed by URL path. Exact key match wins, then longest matching prefix. |
 

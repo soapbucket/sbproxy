@@ -1506,6 +1506,30 @@ pub struct RequestContext {
     /// verbatim instead of falling through to the generic
     /// `send_error` template.
     pub a2a_denial_body: Option<String>,
+    /// Verbatim deny payload: `(policy_type, body, content_type)`.
+    ///
+    /// A header-phase policy that denies returns only
+    /// `PolicyDecision::Deny { status, message }`, and the generic
+    /// renderer wraps that message in `{"error": ...}` and stamps
+    /// `application/json`. For a policy whose config lets the operator
+    /// choose the rejection body and its media type, that wrapping is a
+    /// silent override of what they configured, and it double-encodes a
+    /// body that was already JSON (WOR-2530).
+    ///
+    /// A policy that sets this slot gets its bytes written verbatim with
+    /// the content type it asked for. Leaving it `None` keeps the generic
+    /// `{"error": ...}` envelope, which is the right default for policies
+    /// with no configurable body.
+    ///
+    /// The first element names the policy that owns the payload, and the
+    /// renderer writes it only when that name matches the policy the
+    /// denial is attributed to. `check_policies` short-circuits on the
+    /// first denying enforcer, so today a payload and the denial it
+    /// belongs to are always set together. The owner tag is what keeps
+    /// that an invariant of the data rather than of the call order: a
+    /// future policy that sets a payload and then does not deny cannot
+    /// have its body served under someone else's refusal.
+    pub deny_payload: Option<(&'static str, String, String)>,
     /// WOR-2139: the A2A `contextId` this hop carried, already capped to
     /// the span-attribute identifier limit.
     ///
@@ -1940,6 +1964,7 @@ impl RequestContext {
             headless_signal: None,
             a2a: None,
             a2a_denial_body: None,
+            deny_payload: None,
             a2a_context_id: None,
             flags: crate::sb_flags::RequestFlags::default(),
             policy_response_headers: Vec::new(),
