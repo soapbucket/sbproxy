@@ -79,6 +79,29 @@ omits worker identity, engine ports, and private endpoints. It does not call an
 ordinary provider's native model-list endpoint or reproduce provider-specific
 model metadata.
 
+Each entry's `capabilities` array names the surfaces this gateway will forward
+for that model and that the provider catalog records the vendor as exposing.
+Both halves have to agree. The first is the same per-provider surface matrix
+that decides whether a request is served or answered with 501, so nothing named
+here comes back 501. The second keeps a listing from claiming an endpoint on a
+vendor's behalf just because its wire format implies one. Whether the upstream
+then answers 200 is the upstream's business.
+
+So the array is never wider than the 501 gate, and it is often narrower. Every
+provider with `format: openai` is forwarded the whole OpenAI path set, but its
+listing names only what the catalog knows that vendor serves: a DeepSeek model
+lists `chat_completions`, `messages`, `responses`, and `streaming`, and not
+`image_generation`. Absence is not a refusal. The request is still forwarded and
+the upstream decides. Where several providers serve one public model name, a
+capability appears when at least one of them has it.
+
+The names are the surface labels from
+[Supported endpoints](#supported-endpoints), narrowed to the ones a caller
+reaches by naming a model, plus `streaming`. Account-scoped surfaces (`models`,
+`files`, `batches`, `assistants`, `threads`, `fine_tuning`) belong to the
+provider rather than to any one model, so they are left out. `GET /model/info`
+and `GET /model_group/info` carry the same array.
+
 Successful completions add `x-sbproxy-logical-model` and an allowlisted
 `x-sbproxy-route-class` of `local`, `peer`, or `external`. Managed availability
 and cold-start failures that expose a public reason use an OpenAI-style
@@ -2184,13 +2207,17 @@ Every inbound request to an `action: ai_proxy` origin is classified into an `AiS
 
 Provider capability is the source of truth for which surfaces a configured provider can serve. The matrix lives in `crates/sbproxy-ai/src/api_routes.rs::provider_supports_surface` and keys on the provider type: the entry's `provider_type`, falling back to `name` when no type is set. A custom-named entry such as `name: team-openai` with `provider_type: openai` therefore keeps the full OpenAI surface set; the display name never narrows or widens capability. When no configured provider supports the requested surface, the proxy returns **501 Not Implemented** before any upstream call. The universal surfaces are chat completions, Anthropic Messages, OpenAI Responses, and models. Unknown surfaces fall through to the existing dispatch and 404 at the upstream.
 
+This matrix is a permission, not an advertisement. It answers on the wire format, so every entry with `format: openai` is forwarded the whole OpenAI path set; narrowing that would 501 an aggregator that does serve the surface. The model listings (`GET /v1/models`, `GET /model/info`, `GET /model_group/info`) publish the intersection of this matrix with the provider catalog's `supports_streaming`, `supports_embeddings`, and `supports_chat` keys in `crates/sbproxy-ai/data/ai_providers.yml`. A published `capabilities` array can therefore never name a surface this gate refuses, and can be narrower than the gate in two ways: the catalog may carry no per-vendor claim for the surface, and the array is a union across the providers serving that one model while the gate scans every allowed provider on the origin.
+
+The `Providers (today)` column below is the advertised set: which entries name each surface in a model listing, and what a reader should expect to see. The gate is wider than this column, in the safe direction.
+
 | Surface label | Method(s) | Path(s) | Providers (today) |
 |---|---|---|---|
-| `chat_completions` | POST | `/v1/chat/completions` | All |
-| `messages` | POST | `/v1/messages` | All |
-| `responses` | POST | `/v1/responses` | All, with stateless boundaries (see "Responses API boundaries" below) |
-| `models` | GET | `/v1/models`, `/v1/models/{id}` | All |
-| `embeddings` | POST | `/v1/embeddings` | OpenAI, Gemini, Cohere |
+| `chat_completions` | POST | `/v1/chat/completions` | All, except the `supports_chat: false` entries (Voyage, Jina, Mixedbread) |
+| `messages` | POST | `/v1/messages` | Same as `chat_completions`; the gateway translates down to it |
+| `responses` | POST | `/v1/responses` | Same as `chat_completions`, with stateless boundaries (see "Responses API boundaries" below) |
+| `models` | GET | `/v1/models`, `/v1/models/{id}` | All (account-scoped, so never in a model's `capabilities`) |
+| `embeddings` | POST | `/v1/embeddings` | The 32 entries with `supports_embeddings: true` on the `openai` or `google` formats (OpenAI, Gemini, Vertex, Cohere, Azure, Mistral, and 26 more). Bedrock and the `Custom` formats carry the flag but are not forwarded |
 | `assistants` | POST, GET, DELETE | `/v1/assistants[/{id}[/files[/{file_id}]]]` | OpenAI |
 | `threads` | POST, GET, DELETE | `/v1/threads[/{id}[/messages[/{id}] \| /runs[/{id}[/cancel]]]]`, `/v1/threads/runs` | OpenAI |
 | `batches` | POST, GET | `/v1/batches[/{id}[/cancel]]` | OpenAI |
@@ -2207,14 +2234,14 @@ Provider capability is the source of truth for which surfaces a configured provi
 
 ### Response shape contract
 
-"Supported" in the table above means the gateway accepts the surface and routes it. It does NOT mean the gateway normalizes the response. Per-surface translation behavior:
+Being named in the table above means the gateway accepts the surface, routes it, and advertises it on a model listing. It does NOT mean the gateway normalizes the response, and it is not the full set of what gets forwarded: the wire-format matrix admits more (see above). Per-surface translation behavior:
 
 | Surface | Response shape |
 |---|---|
 | `chat_completions` | normalized to / from the OpenAI shape on Anthropic and Google (gemini) formats; passthrough on OpenAI-compatible upstreams |
 | `messages`, `responses` | accepted in their native client shapes and governed through the chat hub. Successful generations return in the shape the client used. Provider error envelopes keep the provider's status and body. A safe Anthropic-to-Anthropic request can use the native bypass described below. |
 | `models` | `GET /v1/models` and `GET /models` are served locally for every AI origin as an OpenAI `{"object": "list", "data": [...]}` logical listing. Other model endpoints use the ordinary GET dispatch path and have no unified response shape. |
-| everything else | passthrough on the providers listed in the table; clients see the upstream's native response shape |
+| everything else | passthrough wherever the wire-format matrix forwards it; clients see the upstream's native response shape |
 
 The local list contract is deliberate: it gives clients one topology-free
 discovery shape across ordinary and managed providers without pretending to

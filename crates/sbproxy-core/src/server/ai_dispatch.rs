@@ -2933,58 +2933,9 @@ fn any_allowed_provider_supports_surface(
             && sbproxy_ai::api_routes::provider_supports_surface_for_modality(
                 provider,
                 surface,
-                served_provider_modality(provider, surface),
+                sbproxy_ai::api_routes::served_provider_modality(provider),
             )
     })
-}
-
-/// The modality of a locally served (`serve:`) provider that could handle
-/// `surface`, or `None` for a non-served provider (WOR-1908). A served
-/// provider is not in the provider catalog, so without this it would
-/// blanket-501 a non-chat surface even while serving an embedder. The
-/// served model's task comes from the built-in catalog (the certified
-/// catalog an embedding model is added to); an operator's custom-catalog
-/// modality is not resolved on this pre-dispatch path and keeps the
-/// chat-only default.
-fn served_provider_modality(
-    provider: &sbproxy_ai::ProviderConfig,
-    surface: &sbproxy_ai::handler::AiSurface,
-) -> Option<sbproxy_model_host::Modality> {
-    // Only the non-universal surfaces need a modality answer; chat/models
-    // are already universal, so skip the catalog work for them.
-    if matches!(
-        surface,
-        sbproxy_ai::handler::AiSurface::ChatCompletions
-            | sbproxy_ai::handler::AiSurface::Models
-            | sbproxy_ai::handler::AiSurface::Messages
-            | sbproxy_ai::handler::AiSurface::Responses
-    ) {
-        return None;
-    }
-    let serve = provider.serve.as_ref()?;
-    let catalog = builtin_catalog();
-    // A served provider hosts one or more models; report the first served
-    // model whose modality is non-chat, so its surface becomes legal. An
-    // explicit `modality:` on the serve entry wins (the only way to declare
-    // it for a raw `hf:` reference, which has no catalog entry); otherwise
-    // fall back to the certified catalog entry's modality.
-    serve
-        .models
-        .iter()
-        .filter_map(|entry| {
-            entry
-                .modality
-                .or_else(|| catalog.get(&entry.model).map(|model| model.modality))
-        })
-        .find(|modality| !modality.uses_kv_cache())
-}
-
-/// The certified built-in catalog, parsed once. Used by the surface gate
-/// to resolve a served model's modality without re-parsing the embedded
-/// YAML per request.
-fn builtin_catalog() -> &'static sbproxy_model_host::Catalog {
-    static BUILTIN: std::sync::OnceLock<sbproxy_model_host::Catalog> = std::sync::OnceLock::new();
-    BUILTIN.get_or_init(sbproxy_model_host::Catalog::builtin)
 }
 
 fn has_allowed_openai_passthrough(
@@ -5485,27 +5436,18 @@ pub(super) async fn handle_ai_proxy(
         // engine is spawned, and `effective_base_url` would fall back to
         // a localhost default, which on a stock config is this gateway's
         // own data plane (a request loop ending in a confusing 502).
-        // Answer the models listing from the serve config, and reject
-        // any other GET with a clear not-ready error instead of dialing
+        // Reject the GET with a clear not-ready error instead of dialing
         // the fallback.
+        //
+        // WOR-2647: this used to answer `/v1/models` and `/models` from
+        // the serve config with a third listing shape, one that carried
+        // no capability names at all. It was unreachable: the models
+        // branch at the top of this GET arm matches the same two paths
+        // (on the same unmutated `path`, which `Uri::path` returns
+        // without a query string) and returns unconditionally, so a
+        // served provider's models already come back from
+        // `logical_model_listing`, which does publish capabilities.
         if provider.serve.is_some() {
-            if matches!(path.trim_end_matches('/'), "/v1/models" | "/models") {
-                let data: Vec<_> = provider
-                    .models
-                    .iter()
-                    .map(|m| {
-                        serde_json::json!({
-                            "id": m.as_str(),
-                            "object": "model",
-                            "owned_by": provider.name.as_str(),
-                        })
-                    })
-                    .collect();
-                let body = serde_json::json!({ "object": "list", "data": data });
-                let bytes = serde_json::to_vec(&body).unwrap_or_default();
-                send_response(session, 200, "application/json", &bytes).await?;
-                return Ok(());
-            }
             let message = format!(
                 "provider {} serves its model locally; `GET {}` has no upstream \
                  to forward to. The engine starts on the first completion request.",
@@ -21579,6 +21521,22 @@ fn ai_management_response(
 /// `/model_group/info`, and the `/health[/readiness|/liveliness|/liveness]`
 /// aliases. Returns `None` for any other path so the caller falls through to
 /// normal handling.
+///
+/// WOR-2647: the two model surfaces carry the same `capabilities` array
+/// `/v1/models` does, from the same
+/// [`sbproxy_ai::api_routes::surface_capability_names`]. Three places
+/// that publish per-model facts and derive them three ways is how one of
+/// them goes stale; one derivation is what keeps a listing from
+/// advertising a surface the request path refuses.
+///
+/// A `/model_group/info` group is the union across its deployments,
+/// matching the 501 gate, which admits a surface when any eligible
+/// provider handles it. Each deployment's array is already a subset of
+/// that gate, so the union is too.
+/// `model_group_info_unions_capabilities_across_deployments` pins the
+/// union against last-wins with two entries whose arrays are disjoint;
+/// a fixture of two openai deployments cannot, because both operands
+/// are equal.
 fn ai_management_response_with_policy(
     path: &str,
     config: &sbproxy_ai::handler::AiHandlerConfig,
@@ -21608,6 +21566,7 @@ fn ai_management_response_with_policy(
                     .provider_type
                     .clone()
                     .unwrap_or_else(|| p.name.to_string());
+                let capabilities = sbproxy_ai::api_routes::surface_capability_names(p);
                 for m in p
                     .models
                     .iter()
@@ -21616,37 +21575,40 @@ fn ai_management_response_with_policy(
                     data.push(serde_json::json!({
                         "model_name": m.as_str(),
                         "litellm_provider": provider,
+                        "capabilities": &capabilities,
                     }));
                 }
             }
             Some(serde_json::json!({ "data": data }))
         }
         "/model_group/info" => {
-            use std::collections::BTreeMap;
-            let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            use std::collections::{BTreeMap, BTreeSet};
+            type Group = (Vec<String>, BTreeSet<&'static str>);
+            let mut groups: BTreeMap<String, Group> = BTreeMap::new();
             for p in config
                 .providers
                 .iter()
                 .filter(|provider| provider_allowed(provider))
             {
+                let capabilities = sbproxy_ai::api_routes::surface_capability_names(p);
                 for m in p
                     .models
                     .iter()
                     .filter(|model| model_allowed(model.as_str()))
                 {
-                    groups
-                        .entry(m.as_str().to_string())
-                        .or_default()
-                        .push(p.name.to_string());
+                    let group = groups.entry(m.as_str().to_string()).or_default();
+                    group.0.push(p.name.to_string());
+                    group.1.extend(capabilities.iter().copied());
                 }
             }
             let data: Vec<_> = groups
                 .into_iter()
-                .map(|(model_group, providers)| {
+                .map(|(model_group, (providers, capabilities))| {
                     serde_json::json!({
                         "model_group": model_group,
                         "num_deployments": providers.len(),
                         "providers": providers,
+                        "capabilities": capabilities,
                     })
                 })
                 .collect();
@@ -22127,7 +22089,11 @@ mod model_routing_tests {
             resp["data"],
             serde_json::json!([{
                 "model_name": "claude-haiku-4-5",
-                "litellm_provider": "anthropic"
+                "litellm_provider": "anthropic",
+                // WOR-2647: the same array `/v1/models` publishes, from
+                // the surface matrix the dispatch path enforces. No
+                // `embeddings`: anthropic's non-universal surfaces 501.
+                "capabilities": ["chat_completions", "messages", "responses", "streaming"]
             }])
         );
     }
@@ -22155,7 +22121,54 @@ mod model_routing_tests {
             serde_json::json!([{
                 "model_group": "claude-haiku-4-5",
                 "num_deployments": 1,
-                "providers": ["anthropic"]
+                "providers": ["anthropic"],
+                // WOR-2647: union across the group's deployments, which
+                // is one anthropic entry here.
+                "capabilities": ["chat_completions", "messages", "responses", "streaming"]
+            }])
+        );
+    }
+
+    /// WOR-2647: a group's array is the union across its deployments,
+    /// not whichever one the loop visited last.
+    ///
+    /// The two entries are chosen to be disjoint so the union is
+    /// neither of them: `voyage` is embeddings-only (`supports_chat:
+    /// false`, so no chat, messages, responses or streaming) and
+    /// `anthropic` serves the chat surfaces and no embeddings.
+    /// Replacing the `extend` with an assignment fails here; a
+    /// two-openai fixture would not, because both operands are equal.
+    #[test]
+    fn model_group_info_unions_capabilities_across_deployments() {
+        let cfg: sbproxy_ai::handler::AiHandlerConfig = serde_json::from_value(serde_json::json!({
+            "providers": [
+                {"name": "embedder", "api_key": "k", "provider_type": "voyage", "models": ["shared"]},
+                {"name": "chat", "api_key": "k", "provider_type": "anthropic", "models": ["shared"]}
+            ]
+        }))
+        .expect("AiHandlerConfig fixture");
+
+        // Each deployment on its own, so the union below is visibly
+        // wider than either operand rather than asserted in a vacuum.
+        assert_eq!(
+            sbproxy_ai::api_routes::surface_capability_names(&cfg.providers[0]),
+            ["embeddings"]
+        );
+        assert_eq!(
+            sbproxy_ai::api_routes::surface_capability_names(&cfg.providers[1]),
+            ["chat_completions", "messages", "responses", "streaming"]
+        );
+
+        let resp = super::ai_management_response("/model_group/info", &cfg).unwrap();
+        assert_eq!(
+            resp["data"],
+            serde_json::json!([{
+                "model_group": "shared",
+                "num_deployments": 2,
+                "providers": ["embedder", "chat"],
+                "capabilities": [
+                    "chat_completions", "embeddings", "messages", "responses", "streaming"
+                ]
             }])
         );
     }

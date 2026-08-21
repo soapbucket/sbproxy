@@ -13,8 +13,22 @@
 #   - auth_header     : HTTP header carrying the API key
 #   - auth_prefix     : prefix prepended to the key (e.g. "Bearer ")
 #   - format          : wire format - openai|anthropic|google|bedrock|custom
-#   - supports_streaming
-#   - supports_embeddings
+#   - supports_streaming / supports_embeddings / supports_chat
+#       Per-vendor claims about the vendor's own API. Nothing in the
+#       request path reads them: whether the gateway forwards a surface
+#       or answers 501 comes from the wire-format matrix in
+#       `sbproxy_ai::api_routes` (`provider_supports_surface`).
+#       What they do decide is what a model listing advertises.
+#       `GET /v1/models` publishes the intersection of the two, so a
+#       listing can never name a surface the gateway would refuse, and
+#       never claims on a vendor's behalf that it serves something the
+#       catalog has no record of (WOR-2647). Setting one to `false`
+#       narrows the listing and changes nothing about what is forwarded;
+#       setting one to `true` widens the listing only where the matrix
+#       already agrees. `bedrock` keeps `supports_embeddings: true`
+#       because Titan does embed, through the native InvokeModel shape
+#       rather than the `/v1/embeddings` the gateway forwards, and the
+#       matrix is what keeps that off the listing.
 #   - data_posture    : declared data-handling posture, per the vendor's
 #       published data-processing terms (a catalog claim, not an audit):
 #         retains_data : prompt data sent to a stock account is retained
@@ -526,7 +540,11 @@ providers:
     auth_prefix: "Bearer "
     format: openai
     supports_streaming: true
-    supports_embeddings: false
+    # Vertex's OpenAI-compatible endpoint serves embeddings and the
+    # gateway forwards them unchanged, so the surface matrix says yes.
+    # This said `false` until WOR-2647, which is why a vertex model
+    # listing hid a surface the gateway does serve.
+    supports_embeddings: true
     # Customer data is not used to train foundation models; cached
     # inputs and abuse logging can be disabled for zero-retention
     # configurations (Google Cloud Vertex AI data-governance docs).

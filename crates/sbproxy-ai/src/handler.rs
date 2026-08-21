@@ -1756,6 +1756,77 @@ impl AiSurface {
         }
     }
 
+    /// Every classified surface, in declaration order.
+    ///
+    /// The capability matrix in [`crate::api_routes`] and the model
+    /// listing both need to iterate the whole surface set: the matrix
+    /// tests to prove the documented contract holds for every cell, and
+    /// [`crate::api_routes::surface_capability_names`] to decide which
+    /// surfaces a listing may name. This array is the production copy
+    /// both use, so a surface the dispatch path classifies cannot be
+    /// invisible to the listing that describes it (WOR-2647).
+    ///
+    /// Writing the length into the type checks the literal only against
+    /// itself, so the array on its own cannot notice a twentieth
+    /// variant. The private `position` function below is the
+    /// enforcement: its match is exhaustive, so a new variant fails to
+    /// compile there, and the `const` block after this `impl` checks
+    /// the two lists against each other at compile time.
+    pub const ALL: [AiSurface; 19] = [
+        AiSurface::ChatCompletions,
+        AiSurface::Models,
+        AiSurface::Embeddings,
+        AiSurface::Assistants,
+        AiSurface::Threads,
+        AiSurface::Batches,
+        AiSurface::FineTuning,
+        AiSurface::Files,
+        AiSurface::Realtime,
+        AiSurface::ImageGeneration,
+        AiSurface::ImageEdits,
+        AiSurface::ImageVariations,
+        AiSurface::AudioTranscription,
+        AiSurface::AudioSpeech,
+        AiSurface::Moderations,
+        AiSurface::Reranking,
+        AiSurface::Messages,
+        AiSurface::Responses,
+        AiSurface::Unknown,
+    ];
+
+    /// Where `surface` sits in [`Self::ALL`].
+    ///
+    /// This is the compile-time tie between the enum and the array.
+    /// The match is exhaustive, so a new variant is an `E0004`
+    /// "non-exhaustive patterns" error here rather than a quietly
+    /// shorter sweep and a surface missing from every published
+    /// listing. The `const` block after this `impl` then checks that
+    /// the index each arm names is where the variant actually sits
+    /// (WOR-2647).
+    const fn position(surface: &AiSurface) -> usize {
+        match *surface {
+            AiSurface::ChatCompletions => 0,
+            AiSurface::Models => 1,
+            AiSurface::Embeddings => 2,
+            AiSurface::Assistants => 3,
+            AiSurface::Threads => 4,
+            AiSurface::Batches => 5,
+            AiSurface::FineTuning => 6,
+            AiSurface::Files => 7,
+            AiSurface::Realtime => 8,
+            AiSurface::ImageGeneration => 9,
+            AiSurface::ImageEdits => 10,
+            AiSurface::ImageVariations => 11,
+            AiSurface::AudioTranscription => 12,
+            AiSurface::AudioSpeech => 13,
+            AiSurface::Moderations => 14,
+            AiSurface::Reranking => 15,
+            AiSurface::Messages => 16,
+            AiSurface::Responses => 17,
+            AiSurface::Unknown => 18,
+        }
+    }
+
     /// Whether this surface legitimately carries a `multipart/form-data`
     /// request body. The OpenAI-compatible API takes multipart on image
     /// edits, image variations, audio transcription/translation, and file
@@ -1846,6 +1917,31 @@ impl AiSurface {
         )
     }
 }
+
+// [`AiSurface::ALL`] and `AiSurface::position` are one list written
+// twice, so they are checked against each other at compile time rather
+// than in a test somebody has to remember to run (WOR-2647).
+//
+// The loop rejects a reorder, a duplicate index, and a variant dropped
+// from the array. The discriminant check rejects a variant added
+// anywhere above `Unknown` without the array growing to match:
+// `Unknown` is the last variant, so its discriminant is one less than
+// the variant count, and a fieldless enum casts to that discriminant.
+// Adding a variant fails in `position` first, which is exhaustive.
+const _: () = {
+    let mut index = 0;
+    while index < AiSurface::ALL.len() {
+        assert!(
+            AiSurface::position(&AiSurface::ALL[index]) == index,
+            "AiSurface::ALL and AiSurface::position name different orders"
+        );
+        index += 1;
+    }
+    assert!(
+        AiSurface::Unknown as usize == AiSurface::ALL.len() - 1,
+        "an AiSurface variant is missing from AiSurface::ALL"
+    );
+};
 
 /// Extract the surface-specific input-text field from a parsed JSON
 /// body, suitable for running through input guardrails or PII
