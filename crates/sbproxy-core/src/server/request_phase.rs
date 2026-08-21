@@ -7243,7 +7243,7 @@ mod cache_key_audit_tests {
     use sbproxy_observe::decision::DecisionEvent;
 
     /// Refuses the lookup and says why, so the plan arm runs and the
-    /// reason is something an assertion can recognise.
+    /// reason is something an assertion can recognize.
     const KEY_EVENT_ORIGIN: &str = r#"
 origins:
   "api.audit.test":
