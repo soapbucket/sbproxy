@@ -740,7 +740,22 @@ resilience:
     content_policy: 0  # never retry a refusal in place
 ```
 
+A sibling `cooldown_policy` maps the same failure classes to provider cooldowns: a classified failure of a mapped class removes that provider from candidate rotation for the configured seconds (a `429` can park a provider for 30s; a dead credential can stop eating the first attempt on every request). Both policies default to current behavior when unset.
+
 The same block hosts the legacy `llm_aware.context_compress` shorthand, which maps to stateless `window_fit` when no explicit compression policy is present, and `content_policy_fallback`, which routes a refusal to the next provider in priority order. The failure-cause table and hedged-request behavior are in [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md). Ordered summary, query selection, token pruning, retrieval shaping, and final fitting are documented in [AI context compression](ai-context-compression.md).
+
+### Typed fallback triggers
+
+The fallback chain is generic: any retryable failure advances to the next provider in priority order. Two failure classes deserve a different next hop, and each gets its own list as a sibling of `routing:` on the action:
+
+```yaml
+routing:
+  strategy: fallback_chain
+context_window_fallbacks: [big-window]   # prompt overflows the model's window
+content_policy_fallbacks: [permissive]   # provider refused on safety grounds
+```
+
+Each list names providers from the same action's `providers:` (a name matching nothing fails config load). An oversized prompt is caught by the pre-flight token estimate and rerouted to a larger-window provider before anything dispatches, so streaming requests participate too; a content-policy refusal reroutes to the aimed list instead of whatever the chain had queued next. The trigger that fired (`context_window`, `content_policy`, or `generic`) is visible on `sbproxy_ai_failovers_total{reason}` and as `failover_trigger` on the admin console's request log. Full decision-path diagram, scope notes, and the per-class retry and cooldown interplay are in [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md#typed-fallback-triggers); the runnable, credential-free walkthrough is [examples/typed-fallbacks](../examples/typed-fallbacks/).
 
 ## Shadow eval
 
@@ -2247,7 +2262,7 @@ in [AI context compression](ai-context-compression.md).
 
 There is no `context_overflow:` key. An earlier version of this page described one as parsed and ignored, which was an invitation to write it and wait for it to start working. A config that carries it now fails to compile, with an error naming what to use instead.
 
-Fitting an oversized prompt to the model's window is what the compression pipeline above does. Add a `window_fit` lever under `compression.levers`, or set `resilience.llm_aware.context_compress: true` for the one-lever shorthand. Nothing reroutes an oversized prompt to a model with a larger window on its own. If that is the behavior you want, order the larger model first in the provider list, or point a model alias at it.
+Fitting an oversized prompt to the model's window is what the compression pipeline above does. Add a `window_fit` lever under `compression.levers`, or set `resilience.llm_aware.context_compress: true` for the one-lever shorthand. To reroute an oversized prompt to a model with a larger window instead, name that provider in [`context_window_fallbacks:`](#typed-fallback-triggers); the two compose, with compression running first and the reroute firing only when the prompt still does not fit.
 
 ## Stored prompts and offline optimization
 
@@ -2999,7 +3014,8 @@ To help you get started with the AI gateway, we provide several runnable example
 | [`ai-gemini-direct`](../examples/ai-gemini-direct/) | Direct integration with Google Gemini. | Add a provider named `gemini` (or set `provider_type: gemini`) with a Gemini API key. | Seamless integration with Gemini models without client SDK changes. |
 | [`ai-model-group`](../examples/ai-model-group/) | Model pooling. | List multiple providers that declare the same model name in `models`; there is no separate `model_group` key. | The routing strategy load-balances requests for that model name across every declaring provider. |
 | [`ai-streaming`](../examples/ai-streaming/) | Streaming LLM completions. | Send requests with `stream: true`. | SBproxy streams Server-Sent Events (SSE) securely back to the client. |
-| [`ai-routing-fallback`](../examples/ai-routing-fallback/) | High-availability failover. | Set `routing.strategy: fallback_chain` and give each provider a `priority`; there is no separate `fallbacks:` key. | Transport failures and retryable 5xx responses from the primary provider fail over to the next provider in priority order. |
+| [`ai-routing-fallback`](../examples/ai-routing-fallback/) | High-availability failover. | Set `routing.strategy: fallback_chain` and give each provider a `priority`; there is no separate generic `fallbacks:` key. | Transport failures and retryable 5xx responses from the primary provider fail over to the next provider in priority order. |
+| [`typed-fallbacks`](../examples/typed-fallbacks/) | Typed fallback triggers. | Set `context_window_fallbacks:` and/or `content_policy_fallbacks:` as siblings of `routing:`, each naming providers. | An oversized prompt reroutes to a larger-window model before dispatch; a content-policy refusal reroutes to a more permissive provider; the admin request log names the trigger that fired. |
 | [`ai-cost-optimized`](../examples/ai-cost-optimized/) | Cost-optimized routing. | Set `routing.strategy: cost_optimized` and a per-provider `weight`. | Traffic is routed to the provider scoring lowest on `in_flight_requests * 1000 + weight`. |
 | [`ai-attribution-tags`](../examples/ai-attribution-tags/) | Request tagging for cost attribution. | Set `credentials[].attrs.tags` in config, or send `SB-Attr-*` headers (for example `SB-Attr-Project`) per request. | Emitted metrics and logs include the tags for fine-grained cost allocation. |
 

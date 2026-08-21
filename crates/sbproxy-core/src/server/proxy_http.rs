@@ -7848,6 +7848,7 @@ impl ProxyHttp for SbProxy {
                 failover_engaged: ctx.admin_failover_engaged(),
                 failover_from: ctx.admin_failover_from.clone(),
                 failover_to: ctx.admin_failover_to.clone(),
+                failover_trigger: ctx.admin_failover_trigger.clone(),
                 load_balancer_strategy: ctx.admin_load_balancer_strategy.clone(),
                 load_balancer_target: ctx.admin_load_balancer_target.clone(),
                 zone_locality: ctx.admin_zone_locality.map(str::to_string),

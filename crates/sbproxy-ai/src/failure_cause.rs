@@ -186,6 +186,74 @@ impl RetryPolicy {
     }
 }
 
+/// Per-error-class cooldown durations (WOR-2556), the cooldown half of
+/// the LiteLLM `RetryPolicy` / `AllowedFailsPolicy` split. Where
+/// [`RetryPolicy`] decides whether the *same request* gets another
+/// attempt, this decides whether the *provider* keeps taking new
+/// requests: a class with a configured duration removes the failing
+/// provider from candidate rotation for that many seconds after a
+/// failure of that class.
+///
+/// A `None` for a class means failures of that class never trigger a
+/// cooldown (the default, which preserves current behavior exactly). An
+/// explicit `0` is the same as `None` and is accepted so an operator can
+/// switch a class off without deleting the line.
+///
+/// The cooldown is advisory in the same sense as the circuit breaker and
+/// outlier ejection: when every candidate is cooling down, the router
+/// hands back the unfiltered set rather than manufacturing an outage
+/// (see `Router::routable_candidate_indices`).
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CooldownPolicy {
+    /// Cooldown seconds after a timeout.
+    #[serde(default)]
+    pub timeout: Option<u64>,
+    /// Cooldown seconds after a rate limit. The most common entry: a
+    /// `429` is a statement about the provider's capacity, not about
+    /// the request, so backing the whole pool off it helps.
+    #[serde(default)]
+    pub rate_limit: Option<u64>,
+    /// Cooldown seconds after a server error.
+    #[serde(default)]
+    pub server_error: Option<u64>,
+    /// Cooldown seconds after a content-policy refusal. Usually unset:
+    /// a refusal is about the prompt, not the provider's health.
+    #[serde(default)]
+    pub content_policy: Option<u64>,
+    /// Cooldown seconds after an auth failure. A misconfigured key
+    /// fails every request, so a long value here stops a dead
+    /// credential from eating an attempt on every request.
+    #[serde(default)]
+    pub auth: Option<u64>,
+    /// Cooldown seconds after a malformed request. Usually unset.
+    #[serde(default)]
+    pub bad_request: Option<u64>,
+    /// Cooldown seconds after a context-window overflow. Usually unset:
+    /// the prompt is the problem, and the typed
+    /// `context_window_fallbacks` reroute is the aimed tool.
+    #[serde(default)]
+    pub context_window: Option<u64>,
+}
+
+impl CooldownPolicy {
+    /// The configured cooldown for a cause, if any. Explicit zeros
+    /// normalize to `None` so callers only see actionable durations.
+    pub fn cooldown_secs_for(&self, cause: FailureCause) -> Option<u64> {
+        let secs = match cause {
+            FailureCause::Timeout => self.timeout,
+            FailureCause::RateLimit => self.rate_limit,
+            FailureCause::ServerError => self.server_error,
+            FailureCause::ContentPolicy => self.content_policy,
+            FailureCause::Auth => self.auth,
+            FailureCause::BadRequest => self.bad_request,
+            FailureCause::ContextWindowExceeded => self.context_window,
+            FailureCause::Unknown => None,
+        };
+        secs.filter(|&s| s > 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,6 +308,31 @@ mod tests {
         assert!(!FailureCause::BadRequest.is_retryable_default());
         assert!(!FailureCause::ContextWindowExceeded.is_retryable_default());
         assert!(!FailureCause::ContentPolicy.is_retryable_default());
+    }
+
+    #[test]
+    fn cooldown_policy_maps_causes_and_normalizes_zero() {
+        let policy: CooldownPolicy =
+            serde_json::from_str(r#"{"rate_limit": 30, "auth": 300, "content_policy": 0}"#)
+                .unwrap();
+        assert_eq!(policy.cooldown_secs_for(FailureCause::RateLimit), Some(30));
+        assert_eq!(policy.cooldown_secs_for(FailureCause::Auth), Some(300));
+        // Explicit 0 means "no cooldown for this class", same as unset.
+        assert_eq!(policy.cooldown_secs_for(FailureCause::ContentPolicy), None);
+        assert_eq!(policy.cooldown_secs_for(FailureCause::ServerError), None);
+        assert_eq!(policy.cooldown_secs_for(FailureCause::Unknown), None);
+    }
+
+    #[test]
+    fn cooldown_policy_refuses_unknown_fields() {
+        // deny_unknown_fields: a typo must fail the config load, not
+        // silently disable the class it was meant to configure.
+        let error = serde_json::from_str::<CooldownPolicy>(r#"{"rate_limits": 30}"#)
+            .expect_err("a misspelled class must be refused");
+        assert!(
+            error.to_string().contains("rate_limits"),
+            "the error names the unknown key: {error}"
+        );
     }
 
     #[test]

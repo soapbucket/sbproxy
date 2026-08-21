@@ -1,0 +1,23 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Credential-free fixture for examples/typed-fallbacks/: a "strict"
+# upstream that refuses every request with an OpenAI-shaped
+# content-policy error, so the gateway's content_policy_fallbacks
+# reroute has something real to classify.
+#
+# Run:
+#   make run CONFIG=examples/typed-fallbacks/upstream-strict.yml
+
+proxy:
+  http_bind_port: 8091
+
+origins:
+  "127.0.0.1":
+    action:
+      type: mock
+      status: 400
+      content_type: application/json
+      body:
+        error:
+          message: "Your request was rejected by our safety system."
+          type: content_policy_violation
+          code: content_policy_violation

@@ -2026,6 +2026,9 @@ export interface RequestLog {
   failover_engaged?: boolean;
   failover_from?: string;
   failover_to?: string;
+  // WOR-2556: which typed trigger drove an AI reroute, when one did.
+  // Closed vocabulary: "context_window" | "content_policy" | "generic".
+  failover_trigger?: string;
   load_balancer_strategy?: string;
   load_balancer_target?: string;
   /** WOR-2328 zone-locality verdict for the selected target:
