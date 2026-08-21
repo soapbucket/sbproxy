@@ -1129,41 +1129,102 @@ fn collect_vary_headers(
     out
 }
 
+/// Digest the caller a response-cache entry belongs to.
+///
+/// The credential identity is the one `semantic_credential_identity`
+/// already builds for the semantic cache, deliberately rather than a
+/// second selection order: two caches that disagree about who a caller
+/// is would eventually disagree about which of them is right. The
+/// `Cookie` header is folded in on top of it because an
+/// upstream-managed session runs no auth provider at all, so every
+/// caller in one resolves to the same anonymous principal.
+///
+/// Returns the empty string for a request presenting neither, which is
+/// the key uncredentialed traffic had before this existed.
+fn request_caller_identity(
+    req: &pingora_http::RequestHeader,
+    principal: &sbproxy_plugin::Principal,
+) -> String {
+    // A nested item rather than a closure: the borrow this returns comes
+    // from `req` and not from `name`, and a closure has one inferred
+    // signature for both.
+    fn header<'a>(req: &'a pingora_http::RequestHeader, name: &str) -> Option<&'a str> {
+        req.headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+    }
+    // `proxy-authorization` is a credential the same way `authorization`
+    // is, and the semantic-cache selection does not look at it.
+    let authorization = header(req, "authorization").or_else(|| header(req, "proxy-authorization"));
+    let credential = sbproxy_ai::semantic_cache::semantic_credential_identity(
+        principal.api_key_id(),
+        principal.source.as_str(),
+        principal.sub.as_str(),
+        authorization,
+    );
+    // The sentinel is compared by name rather than by its spelling, and
+    // it is flattened to the empty string here rather than recognized
+    // in `sbproxy-cache`, which has no dependency on the crate that
+    // owns it. A rename over there is then a compile error here instead
+    // of a cache that silently stops distinguishing anonymous traffic.
+    let resolved = if credential == sbproxy_ai::semantic_cache::SEMANTIC_ANONYMOUS_CREDENTIAL {
+        ""
+    } else {
+        credential.as_str()
+    };
+    sbproxy_cache::caller_identity(resolved, header(req, "cookie"))
+}
+
 /// Build the canonical response-cache key for a request.
 ///
 /// `workspace` is the empty string in OSS / single-tenant mode; the
-/// enterprise crate populates it. `config_fp` is the serving origin's
+/// enterprise crate populates it. `tenant` is the serving origin's
+/// resolved tenant. `config_fp` is the serving origin's
 /// [`cache_config_fingerprint`]. The result is the colon-delimited
 /// shape documented at the top of `sbproxy_cache::response`.
 ///
 /// [`cache_config_fingerprint`]: sbproxy_config::CompiledOrigin::cache_config_fingerprint
 fn build_response_cache_key(
     workspace: &str,
+    tenant: &str,
     hostname: &str,
     req: &pingora_http::RequestHeader,
+    principal: &sbproxy_plugin::Principal,
     cfg: &sbproxy_config::ResponseCacheConfig,
     config_fp: &str,
 ) -> String {
-    build_response_cache_key_with_plan(workspace, hostname, req, cfg, config_fp, None)
+    build_response_cache_key_with_plan(
+        workspace, tenant, hostname, req, principal, cfg, config_fp, None,
+    )
 }
 
 /// As [`build_response_cache_key`], with an optional `cache.key` plan
 /// folded in.
 ///
-/// The plan reaches **only** the vary fingerprint, the last segment of
-/// `<workspace>:<hostname>:<method>:<path>:<query>:<vary>`. Every
-/// preceding segment is stamped by the host from values the request
+/// The plan reaches **only** the vary fingerprint of
+/// `v2:<workspace>:<tenant>:<hostname>:<method>:<path>:<identity>:<query>:<vary>:<config>`.
+/// Every other field is stamped by the host from values the request
 /// resolved to, whatever the event returns.
 ///
 /// That is the whole poisoning defense, and it is structural rather than
 /// advisory: a key policy that omits a dimension it should have included
 /// serves one tenant's response to another, so there is deliberately no
-/// document a policy can return that reaches the workspace prefix. It
-/// can narrow a key by adding dimensions; it cannot widen one.
+/// document a policy can return that reaches the tenant, hostname, or
+/// identity fields. It can narrow a key by adding dimensions; it cannot
+/// widen one.
+// Eight parameters, one over the threshold, and the eighth is the plan
+// this function exists to fold in. Bundling the other seven into a
+// struct would move the key's field list away from the code that
+// renders it, which is the same reason `compute_cache_key` keeps its
+// list flat.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_response_cache_key_with_plan(
     workspace: &str,
+    tenant: &str,
     hostname: &str,
     req: &pingora_http::RequestHeader,
+    principal: &sbproxy_plugin::Principal,
     cfg: &sbproxy_config::ResponseCacheConfig,
     config_fp: &str,
     plan: Option<&sbproxy_cache::cache_event::CacheKeyPlan>,
@@ -1171,8 +1232,31 @@ pub(crate) fn build_response_cache_key_with_plan(
     let method = req.method.as_str();
     let path = req.uri.path();
     let query = req.uri.query();
+    let identity = request_caller_identity(req, principal);
     let mode = query_mode_from_config(&cfg.query_normalize);
-    let mut vary = collect_vary_headers(req, &cfg.vary);
+    // The host's own vary pair goes first, ahead of both the operator's
+    // `vary:` and any plan, because the proxy forwards `Accept-Encoding`
+    // and an upstream that compresses answers two differently
+    // negotiating callers with different bytes. Bucketed rather than
+    // taken raw so the dozen spellings of one capability set stay one
+    // entry; see `sbproxy_cache::negotiated_encoding_bucket`. An
+    // operator who also lists `accept-encoding` in `vary:` gets both,
+    // which is redundant and harmless: it can only narrow.
+    //
+    // Prepending rather than appending keeps the operator's own entries
+    // in their configured relative order, which
+    // `the_operators_static_vary_order_is_not_reordered_by_a_plan`
+    // pins.
+    let mut vary = Vec::with_capacity(cfg.vary.len() + 1);
+    vary.push((
+        "accept-encoding".to_owned(),
+        sbproxy_cache::negotiated_encoding_bucket(
+            req.headers
+                .get("accept-encoding")
+                .and_then(|value| value.to_str().ok()),
+        ),
+    ));
+    vary.extend(collect_vary_headers(req, &cfg.vary));
     if let Some(plan) = plan {
         // Added to the configured `vary:`, never replacing it: an
         // operator's static dimensions stay in the key whatever the
@@ -1214,7 +1298,7 @@ pub(crate) fn build_response_cache_key_with_plan(
         ));
     }
     sbproxy_cache::compute_cache_key(
-        workspace, hostname, method, path, query, &mode, &vary, config_fp,
+        workspace, tenant, hostname, method, path, &identity, query, &mode, &vary, config_fp,
     )
 }
 

@@ -14,6 +14,7 @@ export SB_NODE_ID=node-a SB_ZONE=local-a
 export SB_HTTP_PORT=8081 SB_ADMIN_PORT=9091
 export SB_GOSSIP_PORT=17946 SB_TRANSPORT_PORT=18946 SB_MODEL_PORT=19443
 export SB_SEED=127.0.0.1:17947 SB_STATE_DIR=./state/node-a
+export SB_MODEL_CACHE_DIR="$HOME/.cache/sbproxy-models"
 sbproxy -f examples/model-cluster-symmetric/sb.yml
 ```
 
@@ -25,6 +26,7 @@ export SB_NODE_ID=node-b SB_ZONE=local-b
 export SB_HTTP_PORT=8082 SB_ADMIN_PORT=9092
 export SB_GOSSIP_PORT=17947 SB_TRANSPORT_PORT=18947 SB_MODEL_PORT=19444
 export SB_SEED=127.0.0.1:17946 SB_STATE_DIR=./state/node-b
+export SB_MODEL_CACHE_DIR="$HOME/.cache/sbproxy-models"
 sbproxy -f examples/model-cluster-symmetric/sb.yml
 ```
 

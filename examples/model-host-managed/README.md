@@ -1,6 +1,6 @@
 # Managed local model
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-21*
 
 This example runs the built-in pinned Qwen bootstrap artifact through the
 canonical single-node model host. `proxy.model_host` owns the deployment;
@@ -9,26 +9,28 @@ loopback hostnames.
 
 ## Validate and pre-pull
 
-Set a real admin password before loading the file:
+Set a real admin password before loading the file, and point the weight cache
+somewhere this user can write. The config defaults to the service path
+`/var/lib/sbproxy/models`, which an ordinary user cannot create:
 
 ```bash
 export SB_ADMIN_PASSWORD="$(openssl rand -hex 32)"
+export SB_MODEL_CACHE_DIR="$HOME/.cache/sbproxy-models"
 sbproxy validate examples/model-host-managed/sb.yml
 sbproxy models pull -f examples/model-host-managed/sb.yml --format json
 ```
 
 The pull command selects the canonical deployment, uses its exact variant and
-engine, writes to `./.cache/sbproxy-models`, and applies the configured cache
+engine, writes to `$SB_MODEL_CACHE_DIR`, and applies the configured cache
 budget. It verifies the artifact but starts no engine.
 
-**Known issue:** `model_host.cache.directory` in `sb.yml` is the relative
-path `./.cache/sbproxy-models`, as shown above. `validate` and `models pull`
-both accept it and complete cleanly, but `serve` currently fails at engine
-launch with `artifact_not_ready: verified snapshot path must be absolute`,
-because the resolved snapshot path is never canonicalized before the engine
-driver's absolute-path check runs. Point `model_host.cache.directory` at an
-absolute path (e.g. `/var/lib/sbproxy/models` or an exported
-`${SB_STATE_DIR}`-style variable) to work around it until this is fixed.
+That variable has to expand to an absolute path, and so does any value written
+into `model_host.cache.directory` directly: `validate`, `models pull`, and
+`serve` each refuse a relative one by name. The engine subprocess this cache
+feeds is launched with its own working directory and requires an absolute
+snapshot path, so a relative value used to survive the whole download and then
+fail at engine launch with `artifact_not_ready: verified snapshot path must be
+absolute`.
 
 ## Start the gateway
 
@@ -37,8 +39,7 @@ sbproxy serve -f examples/model-host-managed/sb.yml
 ```
 
 Startup prepares the artifact, provisions the pinned llama.cpp engine, and
-warms `local-qwen` before publishing the request pipeline. See the known
-issue above if this fails immediately with `artifact_not_ready`.
+warms `local-qwen` before publishing the request pipeline.
 
 Send a completion from another terminal:
 

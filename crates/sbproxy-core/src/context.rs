@@ -982,6 +982,20 @@ pub struct RequestContext {
     /// from the origin's `compression.min_size`. The body filter consults
     /// this on end-of-stream and falls back to identity when the buffered
     /// body comes in below the floor.
+    ///
+    /// That fallback is unsound and is a known open defect, left as it
+    /// stands because fixing it is a compression change rather than a
+    /// cache one: `response_filter` has already inserted
+    /// `Content-Encoding` by then and a committed header cannot be
+    /// withdrawn, so a body that lands under the floor ships a coding
+    /// label over bytes that do not carry it. It bites an origin that
+    /// sets a non-zero `min_size` (the default is 0) and either answers
+    /// chunked, where the advertise-time check has no length to test, or
+    /// runs a transform that shrinks the body afterwards. The fix is to
+    /// let the floor decide only whether to *advertise*, and to deliver
+    /// whatever was advertised. The response cache is not exposed to it:
+    /// `strip_proxy_added_content_coding` keeps the label out of a stored
+    /// entry either way.
     pub compression_min_size: usize,
     /// Effort setting handed to the encoder, from the origin's
     /// `compression.level`. `None` keeps each library's default; a set
