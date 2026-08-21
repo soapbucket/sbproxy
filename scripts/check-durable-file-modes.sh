@@ -42,7 +42,35 @@ GUARDED_CRATES=(
   crates/sbproxy-meter
   crates/sbproxy-billing
   crates/sbproxy-ai
+  crates/sbproxy-keystore
 )
+
+# Individual files outside the guarded crates that still own durable,
+# sensitive output.
+#
+# sbproxy-core is deliberately not guarded whole. It creates directories
+# for extension bundles and writes a throwaway probe file to decide
+# whether a state directory is writable, and neither is a secret; a
+# blanket rule there would be mostly exemptions, and an exemption list
+# longer than the rule stops being read.
+#
+# What that means this script cannot see: a NEW durable secret sink added
+# to sbproxy-core, or to any crate not listed above, is invisible to it.
+# The rule is only as wide as these two lists, and widening them is part
+# of adding a sink, not a follow-up.
+GUARDED_FILES=(
+  # The key plane creates the directory holding the redb database of
+  # encrypted upstream credentials.
+  "crates/sbproxy-core/src/key_plane.rs"
+)
+
+# Embedded databases create their own files. redb's `Database::create`
+# and rusqlite's `Connection::open*` both call `File::create` inside the
+# library, at `0o666` masked by the umask, so Rule A cannot see them:
+# the guarded crate never names a std file API at all. The only thing a
+# caller can do is create the file owner-only first and let the library
+# open what is already there.
+DB_CONSTRUCTORS='Database::create\(|Connection::open(_with_flags)?\('
 
 # The helper every guarded site must reach instead.
 HELPER="crates/sbproxy-util/src/secure_fs.rs"
@@ -86,6 +114,34 @@ scan_guarded_file() {
     found=1
   done < <(production_region "$file" |
     grep -E 'File::create\(|OpenOptions::new\(\)|create_dir_all\(' || true)
+  return "$found"
+}
+
+# Rule C: a path handed to an embedded database constructor must be
+# pre-created owner-only, and the pre-creation must come first.
+#
+# The ordering is checked by line number within the production region.
+# What this does NOT prove is that the two calls name the same path: a
+# file that calls `ensure_file_owner_only` on one path and opens a
+# database at another passes. Proving that needs dataflow this script
+# does not have, so the narrower claim is the honest one.
+scan_db_constructors() {
+  local file="$1" body found=0 ensure_line db_line
+  body="$(production_region "$file")"
+
+  grep -qE "$DB_CONSTRUCTORS" <<<"$body" || return 0
+
+  db_line="$(grep -nE "$DB_CONSTRUCTORS" <<<"$body" | head -1 | cut -d: -f1)"
+  ensure_line="$(grep -n 'ensure_file_owner_only(' <<<"$body" | head -1 | cut -d: -f1)"
+
+  if [ -z "$ensure_line" ]; then
+    echo "$file: hands a path to an embedded database constructor without creating it owner-only first; the library calls File::create at 0o666 masked by the umask" >&2
+    found=1
+  elif [ "$ensure_line" -ge "$db_line" ]; then
+    echo "$file: creates the database before making it owner-only, which leaves it world-readable in between" >&2
+    found=1
+  fi
+
   return "$found"
 }
 
@@ -147,7 +203,24 @@ run_check() {
         printf '%s\n' "$hits" >&2
         failures=1
       fi
+      if ! hits="$(scan_db_constructors "$file" 2>&1)"; then
+        printf '%s\n' "$hits" >&2
+        failures=1
+      fi
     done < <(find "$root/$crate/src" -name '*.rs' -type f | sort)
+  done
+
+  for relative in "${GUARDED_FILES[@]}"; do
+    file="$root/$relative"
+    [ -f "$file" ] || { echo "$relative is guarded but missing" >&2; failures=1; continue; }
+    if ! hits="$(scan_guarded_file "$file" 2>&1)"; then
+      printf '%s\n' "$hits" >&2
+      failures=1
+    fi
+    if ! hits="$(scan_db_constructors "$file" 2>&1)"; then
+      printf '%s\n' "$hits" >&2
+      failures=1
+    fi
   done
 
   if [ "$failures" -ne 0 ]; then
@@ -266,11 +339,56 @@ EOF
 
   expect "the shipped helper passes" 0 scan_helper "$ROOT_DIR/$HELPER"
 
+  # Rule C: an embedded database creates its own file, so Rule A's std
+  # patterns never fire and only this rule stands between the ledger and
+  # a 0o644 default.
+  cat >"$scratch/bad/redb.rs" <<'EOF'
+fn open(path: &Path) -> anyhow::Result<Database> {
+    let database = Database::create(path)?;
+    Ok(database)
+}
+EOF
+  expect "an unprotected redb create is refused" 1 scan_db_constructors "$scratch/bad/redb.rs"
+
+  cat >"$scratch/bad/redb_ordered.rs" <<'EOF'
+fn open(path: &Path) -> anyhow::Result<Database> {
+    sbproxy_util::secure_fs::ensure_file_owner_only(path)?;
+    let database = Database::create(path)?;
+    Ok(database)
+}
+EOF
+  expect "a pre-created redb file passes" 0 scan_db_constructors "$scratch/bad/redb_ordered.rs"
+
+  cat >"$scratch/bad/redb_late.rs" <<'EOF'
+fn open(path: &Path) -> anyhow::Result<Database> {
+    let database = Database::create(path)?;
+    sbproxy_util::secure_fs::ensure_file_owner_only(path)?;
+    Ok(database)
+}
+EOF
+  expect "tightening after the create is refused" 1 scan_db_constructors "$scratch/bad/redb_late.rs"
+
+  cat >"$scratch/bad/sqlite.rs" <<'EOF'
+fn open(path: &Path) -> anyhow::Result<Connection> {
+    let connection = Connection::open_with_flags(path, flags)?;
+    Ok(connection)
+}
+EOF
+  expect "an unprotected sqlite open is refused" 1 scan_db_constructors "$scratch/bad/sqlite.rs"
+
+  cat >"$scratch/bad/nodb.rs" <<'EOF'
+fn helper(path: &Path) -> anyhow::Result<()> {
+    sbproxy_util::secure_fs::open_append_owner_only(path)?;
+    Ok(())
+}
+EOF
+  expect "a file with no database constructor is not judged" 0 scan_db_constructors "$scratch/bad/nodb.rs"
+
   if [ "$failures" -ne 0 ]; then
     echo "self-test failed: the detector is narrower than the enforcer" >&2
     return 1
   fi
-  echo "self-test passed: 7 fixtures"
+  echo "self-test passed: 12 fixtures"
   return 0
 }
 
