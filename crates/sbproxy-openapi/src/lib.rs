@@ -15,17 +15,50 @@
 //! | Forward rule `exact` matcher                  | `paths` key                                   |
 //! | Forward rule `prefix` matcher                 | `paths` key + `x-sbproxy-prefix-match: true`  |
 //! | Forward rule `regex` matcher                  | `x-sbproxy-regex-path` extension only         |
-//! | `CompiledOrigin.allowed_methods`              | `Operation` per method                        |
+//! | `allowed_methods` entry OpenAPI 3.0 can name  | `Operation` per method                        |
+//! | `allowed_methods` entry it cannot             | `x-sbproxy-unrepresentable-methods`, one entry per method and host |
+//! | `CompiledOrigin.hostname`, per operation      | `servers[]` on the operation                  |
+//! | Matcher `header` / `query` / `body` / `method` / `when` | `x-sbproxy-match` extension, shape only |
 //! | Rule-level `parameters`                       | `parameters[]` per operation                  |
 //! | `CompiledOrigin.auth_config`                  | `securitySchemes` + `security`                |
 //! | `CompiledOrigin.response_cache.*_status`      | `responses` keys                              |
 //! | `CompiledOrigin.error_pages`                  | `responses` keys                              |
 //! | `CompiledOrigin.cors`                         | `x-sbproxy-cors` extension                    |
 //! | `deprecation:` block (rule, else origin)      | `deprecated: true` + `x-sbproxy-sunset` / `x-sbproxy-successor` |
+//! | Two rules on one path and method              | first wins + `x-sbproxy-alternate-operations` + `x-sbproxy-collisions` |
 //!
-//! Plugin-extensible auth types we don't recognise round-trip into an
+//! Plugin-extensible auth types we don't recognize round-trip into an
 //! `x-sbproxy-auth-type` extension and skip the `security` requirement so
 //! the doc still validates.
+//!
+//! # Fidelity
+//!
+//! The document is a contract, so it says less rather than saying
+//! something untrue. Two cases would otherwise make it lie. An
+//! `allowed_methods` entry OpenAPI 3.0 has no Path Item field for
+//! (`CONNECT`, `PROPFIND`, a custom token) is listed under
+//! `x-sbproxy-unrepresentable-methods` instead of being folded onto a
+//! verb the gateway would answer with a 405. Two forward rules that
+//! resolve to the same path and method keep whichever the config
+//! declares first, which within one origin is also the rule the runtime
+//! matches first, and park the loser under the path item's
+//! `x-sbproxy-alternate-operations` with a summary in the top-level
+//! `x-sbproxy-collisions` array rather than overwriting it.
+//!
+//! # What this document does not carry
+//!
+//! Every byte here is public. `/.well-known/openapi.json` is served
+//! without authentication to anyone who can reach the port, so nothing
+//! the operator would not hand a stranger goes into it. That rules out
+//! matcher values: a shared-secret routing header, an internal query
+//! token, and the text of a `when:` predicate naming internal
+//! infrastructure are all config, not contract.
+//! `x-sbproxy-match` therefore publishes the field a rule looks at and
+//! the comparison it performs, never what the comparison is against, and
+//! nothing that reverses to the value goes in its place. The
+//! `match_shape` helper carries the reasoning, including why the
+//! discriminator that keeps two such rules apart is a counter rather
+//! than a digest.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -33,12 +66,72 @@
 use sbproxy_config::{CompiledConfig, RawForwardRule};
 use serde_json::{json, Map, Value};
 
+/// The verbs an origin with an empty `allowed_methods` is described as
+/// serving.
+///
+/// Seven, not the eight OpenAPI names: an empty allowlist installs no
+/// method check at all, so the honest answer is "whatever the upstream
+/// takes" and any list is a guess. This one under-describes such an
+/// origin rather than publishing a `trace` operation nobody asked for.
+const DEFAULT_METHODS: [&str; 7] = ["get", "post", "put", "patch", "delete", "head", "options"];
+
+/// A place where the emitted document could not say what the config says.
+///
+/// Emission never resolves one of these by guessing, so the document is
+/// not wrong; what the document cannot do is get an operator's
+/// attention. Every case here is a property of the config rather than of
+/// a request, so a config-reload path can log the whole list once and be
+/// done.
+///
+/// That is why [`build`] itself stays silent. It runs on every fetch of
+/// `/.well-known/openapi.json`, an unauthenticated endpoint, so a warn
+/// in there is a log-flood primitive any client can pull. Reload runs
+/// once per config change and can afford to say all of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmissionWarning {
+    /// Stable token naming the case, suitable as a log field:
+    /// `collision`, `shadowed-annotation`, or `unrepresentable-method`.
+    pub kind: &'static str,
+    /// The `paths` key the problem sits on.
+    pub path: String,
+    /// One sentence saying what the document could not express and what
+    /// it published instead.
+    pub detail: String,
+}
+
+impl std::fmt::Display for EmissionWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} at {}: {}", self.kind, self.path, self.detail)
+    }
+}
+
 /// Build an OpenAPI 3.0 document from a compiled config snapshot.
 ///
 /// When `host_filter` is `Some(host)`, only origins whose hostname matches
 /// the filter are emitted - used by the per-host `/.well-known/openapi.json`
 /// endpoint. When `None`, every configured origin is included.
 pub fn build(snapshot: &CompiledConfig, host_filter: Option<&str>) -> Value {
+    build_document(snapshot, host_filter).0
+}
+
+/// Everything a config reload would want to warn about in one pass over
+/// the whole snapshot.
+///
+/// Same walk [`build`] does, over every origin rather than one host,
+/// discarding the document and keeping the diagnostics. Sharing the walk
+/// is the point: a separate scan could disagree with what the document
+/// actually published, and then the warning would be the wrong shape of
+/// wrong.
+///
+/// Empty means the document says everything the config says.
+pub fn emission_warnings(snapshot: &CompiledConfig) -> Vec<EmissionWarning> {
+    build_document(snapshot, None).1
+}
+
+fn build_document(
+    snapshot: &CompiledConfig,
+    host_filter: Option<&str>,
+) -> (Value, Vec<EmissionWarning>) {
     // --- Top-level info ---
     let mut spec = Map::new();
     spec.insert("openapi".to_string(), Value::String("3.0.3".to_string()));
@@ -73,6 +166,20 @@ pub fn build(snapshot: &CompiledConfig, host_filter: Option<&str>) -> Value {
     // --- Paths + per-origin securitySchemes ---
     let mut paths = Map::new();
     let mut security_schemes = Map::new();
+    // Operations and path-level annotations that lost a first-wins
+    // contest. Collected across every origin and published whole, so an
+    // operator reads the losses off the document instead of diffing it
+    // against the config that produced it.
+    let mut collisions: Vec<Value> = Vec::new();
+    // The same losses, plus the unrepresentable verbs, in the form a
+    // reload-time caller logs. Never published.
+    let mut warnings: Vec<EmissionWarning> = Vec::new();
+    // Distinct condition sets seen under each published match shape, in
+    // first-appearance order. The index into one of these vectors is
+    // what `x-sbproxy-match` publishes as `variant`; the fingerprints
+    // themselves carry matcher values and never leave this function.
+    let mut variants: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
 
     for origin in &snapshot.origins {
         if let Some(h) = host_filter {
@@ -115,16 +222,31 @@ pub fn build(snapshot: &CompiledConfig, host_filter: Option<&str>) -> Value {
             }
         });
 
-        // Methods to emit per path. Empty allowlist = every standard verb.
-        let methods: Vec<&str> = if origin.allowed_methods.is_empty() {
-            vec!["get", "post", "put", "patch", "delete", "head", "options"]
+        // Methods to emit per path, split into the ones OpenAPI 3.0 can
+        // name and the ones it cannot. A non-empty allowlist is the
+        // exact set the request path enforces with a 405, so it maps
+        // across verbatim.
+        let mut methods: Vec<&str> = Vec::new();
+        let mut unrepresentable: Vec<String> = Vec::new();
+        if origin.allowed_methods.is_empty() {
+            methods.extend(DEFAULT_METHODS);
         } else {
-            origin
-                .allowed_methods
-                .iter()
-                .map(|m| http_method_to_lowercase(m))
-                .collect()
-        };
+            for method in &origin.allowed_methods {
+                match openapi_path_item_verb(method) {
+                    Some(verb) => {
+                        if !methods.contains(&verb) {
+                            methods.push(verb);
+                        }
+                    }
+                    None => {
+                        let token = method.as_str();
+                        if !unrepresentable.iter().any(|m| m.as_str() == token) {
+                            unrepresentable.push(token.to_string());
+                        }
+                    }
+                }
+            }
+        }
 
         // Walk forward rules. Each rule's matchers become path keys; the
         // rule's parameters apply to every operation under those paths.
@@ -155,12 +277,92 @@ pub fn build(snapshot: &CompiledConfig, host_filter: Option<&str>) -> Value {
                     None => continue,
                 };
                 let path_item = paths
-                    .entry(path_key)
+                    .entry(path_key.as_str())
                     .or_insert_with(|| Value::Object(Map::new()));
                 let path_obj = path_item.as_object_mut().expect("path item is object");
                 for (k, v) in extensions {
-                    path_obj.insert(k, v);
+                    // First wins here too. Two matchers can resolve to
+                    // one path key (two regexes whose synthetic keys
+                    // collapse together), and a later one silently
+                    // rewriting the earlier one's annotation would make
+                    // the key describe a rule it did not come from.
+                    match path_obj.get(&k).cloned() {
+                        Some(kept) if kept != v => {
+                            warnings.push(EmissionWarning {
+                                kind: "shadowed-annotation",
+                                path: path_key.clone(),
+                                detail: format!(
+                                    "{k} describes the first rule on this key; a later rule's \
+                                     value for it was not published"
+                                ),
+                            });
+                            collisions.push(json!({
+                                "path": path_key,
+                                "extension": k,
+                                "kept": kept,
+                                "dropped": v,
+                            }));
+                        }
+                        Some(_) => {}
+                        None => {
+                            path_obj.insert(k, v);
+                        }
+                    }
                 }
+
+                // Verbs this origin serves that the path item has no
+                // field for. Several origins can share a path key, and
+                // only one of them may serve the verb, so each entry
+                // names the host it came from the way the operations do.
+                // A bare list would have the all-hosts document claiming
+                // a verb against a host that answers it with a 405,
+                // which is the same lie the split set out to remove.
+                if !unrepresentable.is_empty() {
+                    let listed = path_obj
+                        .entry("x-sbproxy-unrepresentable-methods")
+                        .or_insert_with(|| Value::Array(Vec::new()));
+                    if let Some(list) = listed.as_array_mut() {
+                        for token in &unrepresentable {
+                            let entry = json!({
+                                "method": token,
+                                "servers": [{ "url": format!("https://{}", origin.hostname) }],
+                            });
+                            if !list.contains(&entry) {
+                                list.push(entry);
+                                warnings.push(EmissionWarning {
+                                    kind: "unrepresentable-method",
+                                    path: path_key.clone(),
+                                    detail: format!(
+                                        "{} serves {token}, which OpenAPI 3.0 has no path item \
+                                         field for; it is listed under \
+                                         x-sbproxy-unrepresentable-methods and has no operation",
+                                        origin.hostname
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // One matcher, one set of conditions, however many
+                // methods hang off it. The shape is what gets published;
+                // the fingerprint stays here and only decides which
+                // `variant` number the shape carries.
+                let conditions = match_shape(matcher).map(|mut shape| {
+                    let shape_key = Value::Object(shape.clone()).to_string();
+                    let fingerprint = match_fingerprint(matcher);
+                    let seen = variants.entry(shape_key).or_default();
+                    let already = seen.iter().position(|f| *f == fingerprint);
+                    let index = match already {
+                        Some(index) => index,
+                        None => {
+                            seen.push(fingerprint);
+                            seen.len() - 1
+                        }
+                    };
+                    shape.insert("variant".to_string(), Value::from(index + 1));
+                    Value::Object(shape)
+                });
 
                 for method in &methods {
                     let mut op = Map::new();
@@ -180,6 +382,18 @@ pub fn build(snapshot: &CompiledConfig, host_filter: Option<&str>) -> Value {
                             &rule.origin.id,
                         )),
                     );
+                    // The all-hosts document flattens every origin into
+                    // one `paths` map, so the top-level `servers` list
+                    // reads as though every host serves every path.
+                    // Scoping the operation to its own origin says which
+                    // one actually does, in OpenAPI's own vocabulary.
+                    op.insert(
+                        "servers".to_string(),
+                        json!([{ "url": format!("https://{}", origin.hostname) }]),
+                    );
+                    if let Some(conditions) = &conditions {
+                        op.insert("x-sbproxy-match".to_string(), conditions.clone());
+                    }
                     if !rule.parameters.is_empty() {
                         op.insert(
                             "parameters".to_string(),
@@ -209,13 +423,34 @@ pub fn build(snapshot: &CompiledConfig, host_filter: Option<&str>) -> Value {
                             );
                         }
                     }
-                    path_obj.insert((*method).to_string(), Value::Object(op));
+                    insert_operation(
+                        path_obj,
+                        &path_key,
+                        method,
+                        Value::Object(op),
+                        &mut collisions,
+                        &mut warnings,
+                    );
                 }
             }
         }
 
         // CORS captured as an extension since OpenAPI 3.0 has no native
         // vocabulary for it.
+        //
+        // Unresolved, and deliberately left alone here rather than
+        // quietly narrowed: this serializes the whole block, and
+        // `allowed_origins` is a list an operator can fill with internal
+        // hostnames. A browser only ever learns the one entry that
+        // matched its own `Origin`, so publishing the list on an
+        // unauthenticated endpoint hands over names a caller would
+        // otherwise have to guess. That is weaker than the matcher
+        // values `match_shape` withholds (names, not secrets) and it
+        // predates the fidelity work, so changing it is its own change
+        // with its own compatibility question for consumers already
+        // reading the extension. Anything new added to this block should
+        // be weighed against that, not waved through because CORS is
+        // already here.
         if let Some(cors) = &origin.cors {
             spec.entry("x-sbproxy-cors")
                 .or_insert_with(|| Value::Object(Map::new()));
@@ -232,6 +467,9 @@ pub fn build(snapshot: &CompiledConfig, host_filter: Option<&str>) -> Value {
     }
 
     spec.insert("paths".to_string(), Value::Object(paths));
+    if !collisions.is_empty() {
+        spec.insert("x-sbproxy-collisions".to_string(), Value::Array(collisions));
+    }
     if !security_schemes.is_empty() {
         let mut components = Map::new();
         components.insert(
@@ -241,7 +479,7 @@ pub fn build(snapshot: &CompiledConfig, host_filter: Option<&str>) -> Value {
         spec.insert("components".to_string(), Value::Object(components));
     }
 
-    Value::Object(spec)
+    (Value::Object(spec), warnings)
 }
 
 /// Render a built spec as pretty-printed JSON.
@@ -264,8 +502,17 @@ fn snapshot_version(_snapshot: &CompiledConfig) -> String {
     "1.0.0".to_string()
 }
 
-fn http_method_to_lowercase(method: &http::Method) -> &'static str {
-    match *method {
+/// The Path Item Object field an HTTP method lands in, if it has one.
+///
+/// OpenAPI 3.0 fixes eight operation fields on a Path Item, and that is
+/// the whole set. `CONNECT`, `PROPFIND`, and any other token
+/// `http::Method` accepts have no field, so they return `None`. The
+/// caller reports those rather than folding them onto a verb: the
+/// request path enforces `allowed_methods` exactly, with a 405 for
+/// anything outside it, so an emitted `get` for a `PROPFIND`-only origin
+/// published a method the gateway refuses and hid the one it serves.
+fn openapi_path_item_verb(method: &http::Method) -> Option<&'static str> {
+    Some(match *method {
         http::Method::GET => "get",
         http::Method::POST => "post",
         http::Method::PUT => "put",
@@ -274,10 +521,208 @@ fn http_method_to_lowercase(method: &http::Method) -> &'static str {
         http::Method::HEAD => "head",
         http::Method::OPTIONS => "options",
         http::Method::TRACE => "trace",
-        // Unknown verb: fall through to GET so the doc stays valid; the
-        // operationId still encodes the origin/rule for traceability.
-        _ => "get",
+        _ => return None,
+    })
+}
+
+/// Place one operation on a path item, keeping the first that claims a
+/// method.
+///
+/// Several rules can resolve to the same path and method: two origins in
+/// an all-hosts document, or two rules on one origin separated by a
+/// header, query, body, or `when` condition that OpenAPI has no field
+/// for. Config order settles it instead of letting the last writer take
+/// the key, which within one origin is the rule the runtime matches
+/// first. A byte-identical repeat is a no-op. Anything else keeps
+/// the incumbent, parks the loser under `x-sbproxy-alternate-operations`
+/// so the operation is still readable, and records the pair in
+/// `collisions` so a reader does not have to diff two operation objects
+/// to find out what happened.
+fn insert_operation(
+    path_obj: &mut Map<String, Value>,
+    path_key: &str,
+    method: &str,
+    op: Value,
+    collisions: &mut Vec<Value>,
+    warnings: &mut Vec<EmissionWarning>,
+) {
+    if !path_obj.contains_key(method) {
+        path_obj.insert(method.to_string(), op);
+        return;
     }
+    if path_obj.get(method) == Some(&op) {
+        // The same operation reached this key twice. Nothing was lost,
+        // so there is nothing to report.
+        return;
+    }
+    let kept_id = path_obj
+        .get(method)
+        .and_then(|kept| kept.get("operationId"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let dropped_id = op.get("operationId").cloned().unwrap_or(Value::Null);
+    warnings.push(EmissionWarning {
+        kind: "collision",
+        path: path_key.to_string(),
+        detail: format!(
+            "two forward rules resolve to {method}; {} holds the operation and {} is published \
+             under x-sbproxy-alternate-operations, where standard tooling will not read it",
+            kept_id.as_str().unwrap_or("an unnamed operation"),
+            dropped_id.as_str().unwrap_or("an unnamed operation"),
+        ),
+    });
+    collisions.push(json!({
+        "path": path_key,
+        "method": method,
+        "emitted": kept_id,
+        "alternate": dropped_id,
+    }));
+    let alternates = path_obj
+        .entry("x-sbproxy-alternate-operations")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Some(list) = alternates.as_array_mut() {
+        list.push(op);
+    }
+}
+
+/// What a matcher looks at and how it compares, with none of the values
+/// it compares against.
+///
+/// OpenAPI 3.0 can express a path and a method and nothing else about
+/// routing, so two rules on one path that differ only in a header, a
+/// query parameter, a JSON body field, a method restriction, or a CEL
+/// predicate would emit as one operation. The document has to say
+/// something about those conditions or the collision logic cannot tell a
+/// genuine duplicate from a second rule worth keeping.
+///
+/// What it must not say is the value. `/.well-known/openapi.json` is
+/// unauthenticated, and operators route on shared-secret headers,
+/// internal query tokens, body fields carrying customer identifiers, and
+/// `when:` predicates that name internal hosts. Publishing
+/// `{"header": {"name": "x-partner-token", "value": "the real token"}}`
+/// hands the routing credential to anyone who can fetch the spec, which
+/// is the whole internet. So the extension carries the field name and
+/// the comparison kind (`exact`, `prefix`, `present`) and stops there.
+/// A `when:` predicate reduces to the single fact that one applies.
+///
+/// Methods are the exception, carried verbatim. Config load refuses a
+/// `method:` entry that is not a valid HTTP method token, so the field
+/// structurally cannot hold operator text, and the verbs are the
+/// document's own vocabulary already.
+///
+/// Shape alone is not enough to keep two rules apart, because two rules
+/// that differ only in a header value have the same shape. The caller
+/// closes that with `variant`, a counter over the distinct condition
+/// sets seen under one shape, in first-appearance order. Equal variants
+/// mean equal conditions, different variants mean different ones, and
+/// that is the entire bit `insert_operation` needs.
+///
+/// The counter is scoped to one built document, so the same rule can
+/// hold `variant: 1` in its host's document and `variant: 2` in the
+/// all-hosts one, where an earlier origin claimed the first number for a
+/// different value. Comparing variants across two documents says
+/// nothing; comparing them inside one is the whole contract.
+///
+/// A truncated digest of the value would be the other way to number
+/// them, and it is rejected deliberately. It is stable under insertion,
+/// which a counter is not, but it is also an offline oracle: anyone
+/// holding the document can confirm a guessed token without ever sending
+/// a request, at whatever rate their hardware allows and with no
+/// rate limit or log line in the way. That is the disclosure this
+/// function exists to prevent, only slower. A counter says two values
+/// differ and says nothing whatever about either one.
+fn match_shape(matcher: &sbproxy_config::ForwardRuleMatcher) -> Option<Map<String, Value>> {
+    let mut shape = Map::new();
+    if let Some(header) = &matcher.header {
+        shape.insert(
+            "header".to_string(),
+            json!({
+                "name": header.name,
+                "compare": comparison(header.value.as_deref(), header.prefix.as_deref()),
+            }),
+        );
+    }
+    if let Some(query) = &matcher.query {
+        shape.insert(
+            "query".to_string(),
+            json!({
+                "name": query.name,
+                "compare": comparison(query.value.as_deref(), None),
+            }),
+        );
+    }
+    if let Some(body) = &matcher.body {
+        shape.insert(
+            "body".to_string(),
+            json!({
+                "pointer": body.pointer,
+                "compare": comparison(body.value.as_deref(), body.prefix.as_deref()),
+            }),
+        );
+    }
+    if let Some(method) = &matcher.method {
+        shape.insert("method".to_string(), condition_json(method));
+    }
+    if matcher.when.is_some() {
+        shape.insert("when".to_string(), Value::String("cel".to_string()));
+    }
+    if shape.is_empty() {
+        None
+    } else {
+        Some(shape)
+    }
+}
+
+/// Which comparison a matcher performs, given its two optional operands.
+///
+/// `value` wins over `prefix` here because it wins in the matcher: both
+/// `HeaderMatcher` and `BodyMatcher` document `prefix` as ignored when
+/// `value` is set. Neither one set means the rule fires on presence.
+fn comparison(value: Option<&str>, prefix: Option<&str>) -> &'static str {
+    match (value, prefix) {
+        (Some(_), _) => "exact",
+        (None, Some(_)) => "prefix",
+        (None, None) => "present",
+    }
+}
+
+/// The matcher's full condition set, values included, as one string.
+///
+/// This never reaches the document. It is the key the caller counts
+/// distinct values under, so it has to see everything two rules could
+/// differ by, including every part `match_shape` withholds. Two rules
+/// with an identical fingerprint are the same route written twice and
+/// dedupe; two rules with different fingerprints get different `variant`
+/// numbers and stay two operations.
+fn match_fingerprint(matcher: &sbproxy_config::ForwardRuleMatcher) -> String {
+    let mut fields = Map::new();
+    if let Some(header) = &matcher.header {
+        fields.insert("header".to_string(), condition_json(header));
+    }
+    if let Some(query) = &matcher.query {
+        fields.insert("query".to_string(), condition_json(query));
+    }
+    if let Some(body) = &matcher.body {
+        fields.insert("body".to_string(), condition_json(body));
+    }
+    if let Some(method) = &matcher.method {
+        fields.insert("method".to_string(), condition_json(method));
+    }
+    if let Some(when) = &matcher.when {
+        fields.insert("when".to_string(), Value::String(when.clone()));
+    }
+    Value::Object(fields).to_string()
+}
+
+/// One matcher condition as JSON, or `null` if it will not serialize.
+///
+/// A matcher that cannot serialize is a hand-built snapshot rather than
+/// anything config compilation produces. `null` keeps the caller
+/// deterministic without inventing a value; two such matchers then
+/// fingerprint alike and dedupe, which under-reports rather than
+/// over-reports.
+fn condition_json<T: serde::Serialize>(value: &T) -> Value {
+    serde_json::to_value(value).unwrap_or(Value::Null)
 }
 
 fn operation_id(origin_id: &str, method: &str, rule_origin_id: &Option<String>) -> String {
@@ -421,6 +866,18 @@ fn map_auth(auth: &Value, scheme_name: &str) -> Option<Value> {
     // for additional auth types (SAML, biscuit, oauth_introspection,
     // ext_authz, full OAuth authorization-code flow) are provided by
     // out-of-tree mappers registered through the inventory hook above.
+    //
+    // Everything these arms read is client-facing on purpose, and that
+    // is the rule for anything added here. This document is served
+    // unauthenticated on `/.well-known/openapi.json`, so a field only
+    // earns its place if a caller cannot use the API without it: the
+    // `api_keys` header name is the header the caller has to send, and
+    // OAuth's `tokenUrl` is the endpoint it has to call for a token,
+    // which the OpenAPI flow object requires anyway. No arm reads a key,
+    // a secret, a client id, or an introspection credential, and none
+    // should start. If a future auth type needs one of those to be
+    // described, describe the shape and leave the value in the config,
+    // the way `match_shape` does for matchers.
     Some(match auth_type {
         "oauth_client_creds" => {
             let token_url = auth
@@ -816,6 +1273,504 @@ mod tests {
         let spec = build(&snap, None);
         let op = &spec["paths"]["/users/{id}"]["get"];
         assert!(op.get("deprecated").is_none(), "got {op}");
+    }
+
+    // --- WOR-2617: verbs OpenAPI 3.0 cannot name ---
+
+    fn propfind() -> http::Method {
+        http::Method::from_bytes(b"PROPFIND").expect("PROPFIND is a valid method token")
+    }
+
+    #[test]
+    fn an_unrepresentable_verb_is_never_emitted_as_a_get_operation() {
+        // `allowed_methods: [CONNECT, PROPFIND]` is the exact set the
+        // request path enforces, with a 405 for everything else. Folding
+        // both onto `get` published a method the gateway refuses, hid the
+        // two it serves, and collapsed them onto one key so only the
+        // second survived.
+        let mut snap = make_minimal_snapshot();
+        snap.origins[0].allowed_methods = smallvec::smallvec![http::Method::CONNECT, propfind()];
+        let spec = build(&snap, None);
+
+        let path = &spec["paths"]["/users/{id}"];
+        assert!(path.get("get").is_none(), "got {path}");
+        assert!(path.get("post").is_none(), "got {path}");
+        // Each entry names the host that serves the verb, the way the
+        // operations name theirs.
+        assert_eq!(
+            path["x-sbproxy-unrepresentable-methods"],
+            serde_json::json!([
+                { "method": "CONNECT", "servers": [{ "url": "https://api.example.com" }] },
+                { "method": "PROPFIND", "servers": [{ "url": "https://api.example.com" }] },
+            ])
+        );
+        // Nothing but the note: the path exists, and the document does
+        // not invent an operation to describe it.
+        assert_eq!(
+            path.as_object().expect("path item object").len(),
+            1,
+            "got {path}"
+        );
+    }
+
+    #[test]
+    fn a_representable_verb_survives_beside_an_unrepresentable_one() {
+        // The repeated GET also pins the dedupe: one operation, not two
+        // writes to the same key.
+        let mut snap = make_minimal_snapshot();
+        snap.origins[0].allowed_methods =
+            smallvec::smallvec![http::Method::GET, propfind(), http::Method::GET];
+        let spec = build(&snap, None);
+
+        let path = &spec["paths"]["/users/{id}"];
+        assert!(path["get"].is_object());
+        assert!(path.get("post").is_none(), "got {path}");
+        assert_eq!(
+            path["x-sbproxy-unrepresentable-methods"],
+            serde_json::json!([
+                { "method": "PROPFIND", "servers": [{ "url": "https://api.example.com" }] },
+            ])
+        );
+        assert!(
+            spec.get("x-sbproxy-collisions").is_none(),
+            "a repeated verb is not a collision; got {spec}"
+        );
+    }
+
+    #[test]
+    fn an_unrepresentable_verb_names_only_the_host_that_serves_it() {
+        // Two origins share `/docs`. Only one of them allows PROPFIND,
+        // and a bare list of verbs on the shared path item would have the
+        // all-hosts document claiming PROPFIND against the host that
+        // answers it with a 405.
+        let mut snap = make_minimal_snapshot();
+        snap.origins[0].allowed_methods = smallvec::smallvec![propfind()];
+        snap.origins[0].forward_rules = vec![serde_json::json!({
+            "rules": [{ "path": { "exact": "/docs" } }],
+            "origin": { "id": "api-docs", "action": { "type": "proxy", "url": "http://127.0.0.1/" } }
+        })];
+
+        let mut other = empty_origin("web.example.com", "web");
+        other.allowed_methods = smallvec::smallvec![http::Method::GET];
+        other.forward_rules = vec![serde_json::json!({
+            "rules": [{ "path": { "exact": "/docs" } }],
+            "origin": { "id": "web-docs", "action": { "type": "proxy", "url": "http://127.0.0.1/" } }
+        })];
+        snap.host_map
+            .insert(compact_str::CompactString::new("web.example.com"), 1);
+        snap.origins.push(other);
+
+        let spec = build(&snap, None);
+        let path = &spec["paths"]["/docs"];
+        assert_eq!(
+            path["x-sbproxy-unrepresentable-methods"],
+            serde_json::json!([
+                { "method": "PROPFIND", "servers": [{ "url": "https://api.example.com" }] },
+            ]),
+            "the verb belongs to api.example.com alone; got {path}"
+        );
+        // The other host's operation sits on the same path item, which is
+        // exactly the ambiguity the attribution resolves.
+        assert_eq!(path["get"]["servers"][0]["url"], "https://web.example.com");
+
+        let warnings = emission_warnings(&snap);
+        assert_eq!(warnings.len(), 1, "got {warnings:?}");
+        assert_eq!(warnings[0].kind, "unrepresentable-method");
+        assert_eq!(warnings[0].path, "/docs");
+        assert!(
+            warnings[0].detail.contains("api.example.com")
+                && warnings[0].detail.contains("PROPFIND"),
+            "a reload-time warn has to name the host and the verb; got {}",
+            warnings[0]
+        );
+    }
+
+    // --- WOR-2618: two rules resolving to one path and method ---
+
+    #[test]
+    fn two_hosts_sharing_path_and_method_keep_both_operations() {
+        // The all-hosts document flattens every origin into one `paths`
+        // map, so the later origin used to overwrite the earlier one's
+        // operation and the document described one of two routes while
+        // still listing both servers.
+        let mut snap = make_minimal_snapshot();
+        snap.origins[0].allowed_methods = smallvec::smallvec![http::Method::GET];
+        snap.origins[0].forward_rules = vec![serde_json::json!({
+            "rules": [{ "path": { "exact": "/users" } }],
+            "origin": { "id": "api-users", "action": { "type": "proxy", "url": "http://127.0.0.1/" } }
+        })];
+
+        let mut other = empty_origin("web.example.com", "web");
+        other.allowed_methods = smallvec::smallvec![http::Method::GET];
+        other.auth_config = Some(serde_json::json!({ "type": "basic_auth" }));
+        other.forward_rules = vec![serde_json::json!({
+            "rules": [{ "path": { "exact": "/users" } }],
+            "origin": { "id": "web-users", "action": { "type": "proxy", "url": "http://127.0.0.1/" } }
+        })];
+        snap.host_map
+            .insert(compact_str::CompactString::new("web.example.com"), 1);
+        snap.origins.push(other);
+
+        let spec = build(&snap, None);
+        let path = &spec["paths"]["/users"];
+
+        // First in config order keeps the key. These two hosts never
+        // compete at request time; the shared key is the all-hosts
+        // document flattening them, which is why each operation names
+        // the origin that serves it.
+        assert_eq!(path["get"]["operationId"], "api_get_api-users");
+        assert_eq!(path["get"]["servers"][0]["url"], "https://api.example.com");
+
+        let alternates = path["x-sbproxy-alternate-operations"]
+            .as_array()
+            .expect("alternate operations array");
+        assert_eq!(alternates.len(), 1, "got {path}");
+        assert_eq!(alternates[0]["operationId"], "web_get_web-users");
+        assert_eq!(
+            alternates[0]["servers"][0]["url"],
+            "https://web.example.com"
+        );
+
+        let collisions = spec["x-sbproxy-collisions"]
+            .as_array()
+            .expect("collisions array");
+        assert_eq!(collisions.len(), 1, "got {spec}");
+        assert_eq!(collisions[0]["path"], "/users");
+        assert_eq!(collisions[0]["method"], "get");
+        assert_eq!(collisions[0]["emitted"], "api_get_api-users");
+        assert_eq!(collisions[0]["alternate"], "web_get_web-users");
+
+        // The same loss, in the form a config reload logs once.
+        let warnings = emission_warnings(&snap);
+        assert_eq!(warnings.len(), 1, "got {warnings:?}");
+        assert_eq!(warnings[0].kind, "collision");
+        assert_eq!(warnings[0].path, "/users");
+        assert!(
+            warnings[0].detail.contains("api_get_api-users")
+                && warnings[0].detail.contains("web_get_web-users"),
+            "the warn has to name both operations; got {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn two_rules_separated_by_a_header_condition_stay_distinguishable() {
+        // Both rules name the same child origin id, so without
+        // `x-sbproxy-match` the two operations are byte-identical, the
+        // conditioned one dedupes away, and the document shows one route
+        // where the gateway routes two.
+        let mut snap = make_minimal_snapshot();
+        snap.origins[0].allowed_methods = smallvec::smallvec![http::Method::GET];
+        snap.origins[0].forward_rules = vec![
+            serde_json::json!({
+                "rules": [{
+                    "path": { "exact": "/users" },
+                    "header": { "name": "x-beta", "value": "1" }
+                }],
+                "origin": { "id": "users", "action": { "type": "proxy", "url": "http://127.0.0.1/" } }
+            }),
+            serde_json::json!({
+                "rules": [{ "path": { "exact": "/users" } }],
+                "origin": { "id": "users", "action": { "type": "proxy", "url": "http://127.0.0.1/" } }
+            }),
+        ];
+
+        let spec = build(&snap, None);
+        let path = &spec["paths"]["/users"];
+        assert_eq!(
+            path["get"]["x-sbproxy-match"],
+            serde_json::json!({
+                "header": { "name": "x-beta", "compare": "exact" },
+                "variant": 1,
+            }),
+            "the field and the comparison, never the value it compares against"
+        );
+
+        let alternates = path["x-sbproxy-alternate-operations"]
+            .as_array()
+            .expect("alternate operations array");
+        assert_eq!(alternates.len(), 1, "got {path}");
+        assert!(
+            alternates[0].get("x-sbproxy-match").is_none(),
+            "the unconditioned rule is the alternate; got {}",
+            alternates[0]
+        );
+    }
+
+    // --- The document is unauthenticated, so matcher values stay out ---
+
+    #[test]
+    fn no_matcher_value_reaches_the_emitted_document() {
+        // `/.well-known/openapi.json` needs no credential, so every
+        // matcher value in this config is a value handed to anyone who
+        // can reach the port: a routing shared secret, an internal query
+        // token, a customer identifier in the body, and a CEL predicate
+        // naming an internal host.
+        let mut snap = make_minimal_snapshot();
+        snap.origins[0].expose_openapi = true;
+        snap.origins[0].allowed_methods = smallvec::smallvec![http::Method::GET];
+        snap.origins[0].forward_rules = vec![
+            serde_json::json!({
+                "rules": [{
+                    "path": { "exact": "/partner" },
+                    "header": { "name": "x-partner-token", "value": "sk-live-9f3ab2" }
+                }],
+                "origin": { "id": "partner", "action": { "type": "proxy", "url": "http://127.0.0.1/" } }
+            }),
+            serde_json::json!({
+                "rules": [{
+                    "path": { "exact": "/bearer" },
+                    "header": { "name": "authorization", "prefix": "Bearer sk-live-abc" }
+                }],
+                "origin": { "id": "bearer", "action": { "type": "proxy", "url": "http://127.0.0.1/" } }
+            }),
+            serde_json::json!({
+                "rules": [{
+                    "path": { "exact": "/internal" },
+                    "query": { "name": "access", "value": "qtok-77c1" },
+                    "body": { "pointer": "/account", "prefix": "acct-secret" },
+                    "when": "request.headers['x-src'] == 'vault.internal.corp'"
+                }],
+                "origin": { "id": "internal", "action": { "type": "proxy", "url": "http://127.0.0.1/" } }
+            }),
+        ];
+
+        let spec = build(&snap, Some("api.example.com"));
+        let rendered = render_json(&spec).expect("spec renders");
+        for secret in [
+            "sk-live-9f3ab2",
+            "Bearer sk-live-abc",
+            "sk-live-abc",
+            "qtok-77c1",
+            "acct-secret",
+            "vault.internal.corp",
+            "request.headers",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "the public document carries {secret}:\n{rendered}"
+            );
+        }
+
+        // The shape is still there, which is what makes two conditioned
+        // rules on one path tellable apart.
+        assert_eq!(
+            spec["paths"]["/partner"]["get"]["x-sbproxy-match"],
+            serde_json::json!({
+                "header": { "name": "x-partner-token", "compare": "exact" },
+                "variant": 1,
+            })
+        );
+        assert_eq!(
+            spec["paths"]["/bearer"]["get"]["x-sbproxy-match"]["header"]["compare"],
+            "prefix"
+        );
+        assert_eq!(
+            spec["paths"]["/internal"]["get"]["x-sbproxy-match"],
+            serde_json::json!({
+                "query": { "name": "access", "compare": "exact" },
+                "body": { "pointer": "/account", "compare": "prefix" },
+                "when": "cel",
+                "variant": 1,
+            }),
+            "a `when:` predicate reduces to the fact that one applies"
+        );
+    }
+
+    #[test]
+    fn two_rules_differing_only_in_a_header_value_stay_two_operations() {
+        // Withholding the value must not cost the document the
+        // distinction. These two rules share a path, a method, a child
+        // origin id, and a header name, so shape alone would make them
+        // byte-identical, the second would read as a duplicate, and the
+        // gateway would route two ways where the document showed one.
+        let mut snap = make_minimal_snapshot();
+        snap.origins[0].allowed_methods = smallvec::smallvec![http::Method::GET];
+        let rule = |value: &str| {
+            serde_json::json!({
+                "rules": [{
+                    "path": { "exact": "/tenant" },
+                    "header": { "name": "x-tenant", "value": value }
+                }],
+                "origin": { "id": "tenant", "action": { "type": "proxy", "url": "http://127.0.0.1/" } }
+            })
+        };
+        snap.origins[0].forward_rules = vec![rule("tenant-a"), rule("tenant-b")];
+
+        let spec = build(&snap, None);
+        let path = &spec["paths"]["/tenant"];
+        assert_eq!(path["get"]["x-sbproxy-match"]["variant"], 1);
+
+        let alternates = path["x-sbproxy-alternate-operations"]
+            .as_array()
+            .expect("two rules, two operations");
+        assert_eq!(alternates.len(), 1, "got {path}");
+        assert_eq!(
+            alternates[0]["x-sbproxy-match"]["variant"], 2,
+            "different values, different variant; got {}",
+            alternates[0]
+        );
+        assert_eq!(
+            alternates[0]["x-sbproxy-match"]["header"]["name"], "x-tenant",
+            "same shape, which is the point"
+        );
+        assert!(
+            spec["x-sbproxy-collisions"].is_array(),
+            "the second rule is reported, not swallowed; got {spec}"
+        );
+        // And still no values.
+        let rendered = render_json(&spec).expect("spec renders");
+        assert!(!rendered.contains("tenant-a"), "got {rendered}");
+        assert!(!rendered.contains("tenant-b"), "got {rendered}");
+    }
+
+    #[test]
+    fn the_variant_counter_is_scoped_to_one_document() {
+        // Two origins, two paths, one shape, two values. The counter runs
+        // across the whole document, so the second origin's rule is
+        // variant 2 in the all-hosts document and variant 1 in its own
+        // host's, which is the caveat the doc states and the reason a
+        // variant is only comparable inside one document.
+        let mut snap = make_minimal_snapshot();
+        snap.origins[0].allowed_methods = smallvec::smallvec![http::Method::GET];
+        snap.origins[0].forward_rules = vec![serde_json::json!({
+            "rules": [{
+                "path": { "exact": "/a" },
+                "header": { "name": "x-tenant", "value": "tenant-a" }
+            }],
+            "origin": { "id": "a", "action": { "type": "proxy", "url": "http://127.0.0.1/" } }
+        })];
+
+        let mut other = empty_origin("web.example.com", "web");
+        other.allowed_methods = smallvec::smallvec![http::Method::GET];
+        other.forward_rules = vec![serde_json::json!({
+            "rules": [{
+                "path": { "exact": "/b" },
+                "header": { "name": "x-tenant", "value": "tenant-b" }
+            }],
+            "origin": { "id": "b", "action": { "type": "proxy", "url": "http://127.0.0.1/" } }
+        })];
+        snap.host_map
+            .insert(compact_str::CompactString::new("web.example.com"), 1);
+        snap.origins.push(other);
+
+        let all = build(&snap, None);
+        assert_eq!(all["paths"]["/a"]["get"]["x-sbproxy-match"]["variant"], 1);
+        assert_eq!(all["paths"]["/b"]["get"]["x-sbproxy-match"]["variant"], 2);
+
+        let web = build(&snap, Some("web.example.com"));
+        assert_eq!(web["paths"]["/b"]["get"]["x-sbproxy-match"]["variant"], 1);
+        assert!(web["paths"].get("/a").is_none(), "got {web}");
+    }
+
+    #[test]
+    fn two_regex_matchers_on_one_synthetic_key_keep_the_first_pattern() {
+        // The synthetic key rewrites `/` to `_`, so these two patterns
+        // land on the same path key. The later one used to retitle the
+        // earlier one's extension, leaving the key annotated with a
+        // pattern it did not come from.
+        let mut snap = make_minimal_snapshot();
+        snap.origins[0].allowed_methods = smallvec::smallvec![http::Method::GET];
+        snap.origins[0].forward_rules = vec![serde_json::json!({
+            "rules": [
+                { "path": { "regex": "^/v1/items" } },
+                { "path": { "regex": "^_v1_items" } }
+            ],
+            "origin": { "id": "items", "action": { "type": "proxy", "url": "http://127.0.0.1/" } }
+        })];
+
+        let spec = build(&snap, None);
+        let path = &spec["paths"]["/__regex__/^_v1_items"];
+        assert_eq!(path["x-sbproxy-regex-path"], "^/v1/items");
+
+        let collisions = spec["x-sbproxy-collisions"]
+            .as_array()
+            .expect("collisions array");
+        assert_eq!(collisions.len(), 1, "got {spec}");
+        assert_eq!(collisions[0]["extension"], "x-sbproxy-regex-path");
+        assert_eq!(collisions[0]["kept"], "^/v1/items");
+        assert_eq!(collisions[0]["dropped"], "^_v1_items");
+
+        let warnings = emission_warnings(&snap);
+        assert_eq!(warnings.len(), 1, "got {warnings:?}");
+        assert_eq!(warnings[0].kind, "shadowed-annotation");
+        assert!(
+            warnings[0].detail.contains("x-sbproxy-regex-path"),
+            "got {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn an_identical_repeat_of_one_operation_is_not_a_collision() {
+        // The repeated rule carries a condition, so this also pins the
+        // other half of the variant rule: same condition set, same
+        // variant, therefore one operation. Only a difference in the
+        // withheld value is allowed to split them.
+        let mut snap = make_minimal_snapshot();
+        snap.origins[0].allowed_methods = smallvec::smallvec![http::Method::GET];
+        let rule = serde_json::json!({
+            "rules": [{
+                "path": { "exact": "/health" },
+                "header": { "name": "x-probe", "value": "1" }
+            }],
+            "origin": { "id": "healthcheck", "action": { "type": "proxy", "url": "http://127.0.0.1/" } }
+        });
+        snap.origins[0].forward_rules = vec![rule.clone(), rule];
+
+        let spec = build(&snap, None);
+        let path = &spec["paths"]["/health"];
+        assert!(path["get"].is_object());
+        assert_eq!(
+            path["get"]["x-sbproxy-match"],
+            serde_json::json!({
+                "header": { "name": "x-probe", "compare": "exact" },
+                "variant": 1,
+            }),
+            "the repeat reuses the first variant rather than claiming a second"
+        );
+        assert!(
+            path.get("x-sbproxy-alternate-operations").is_none(),
+            "got {path}"
+        );
+        assert!(spec.get("x-sbproxy-collisions").is_none(), "got {spec}");
+        assert!(emission_warnings(&snap).is_empty());
+    }
+
+    #[test]
+    fn a_config_with_no_conflicts_carries_no_diagnostics() {
+        // The diagnostics are additive. A config that emitted a clean
+        // document before still emits one, carries none of the new
+        // annotations, and produces nothing for a reload to warn about.
+        // What it does gain is the per-operation `servers` entry, which
+        // is what stops the all-hosts document reading as though every
+        // host serves every path.
+        let snap = make_minimal_snapshot();
+        let spec = build(&snap, None);
+        assert!(spec.get("x-sbproxy-collisions").is_none(), "got {spec}");
+        assert!(emission_warnings(&snap).is_empty());
+        for key in ["/users/{id}", "/health"] {
+            let path = &spec["paths"][key];
+            assert!(path["get"].is_object(), "got {path}");
+            assert!(path["post"].is_object(), "got {path}");
+            assert_eq!(
+                path["get"]["servers"],
+                serde_json::json!([{ "url": "https://api.example.com" }]),
+                "got {path}"
+            );
+            assert!(
+                path.get("x-sbproxy-alternate-operations").is_none(),
+                "got {path}"
+            );
+            assert!(
+                path.get("x-sbproxy-unrepresentable-methods").is_none(),
+                "got {path}"
+            );
+            assert!(
+                path["get"].get("x-sbproxy-match").is_none(),
+                "no matcher conditions to report; got {path}"
+            );
+        }
     }
 
     #[test]
