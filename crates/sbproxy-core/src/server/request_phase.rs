@@ -54,34 +54,69 @@ pub(crate) fn arm_deferred_body_digest_binding(
     ctx.validate_request_body = true;
 }
 
-struct ConcurrentLimitDenialResponse {
+/// A denial whose body and content type the policy configured, rather
+/// than the generic `{"error": ...}` envelope the dispatcher renders.
+struct ConfiguredDenialResponse {
     status: u16,
-    content_type: &'static str,
+    content_type: String,
     body: String,
 }
 
-fn take_concurrent_limit_denial_response(
+/// Pull the configured rejection envelope for policies that park one
+/// on the context during the header phase.
+///
+/// Two policies do this today and for the same reason: the
+/// `PolicyEnforcer` decision carries a status and a message but no
+/// body or content type, so a policy with an operator-configured
+/// `error_body` has nowhere else to put it.
+///
+/// * `concurrent_limit` parks a body.
+/// * `content_digest` parks `(owner, body, content_type)` in the
+///   shared `deny_payload` slot (WOR-2528), because moving its
+///   `on_missing: require` refusal out of the body filter and into
+///   the header phase had to keep `error_body` and
+///   `error_content_type` working exactly as they did before the
+///   move. It is consumed here, ahead of the status-keyed envelope
+///   branches, so a `missing_status` that collides with one of them
+///   (402, say) still serves the operator's body rather than that
+///   branch's.
+fn take_configured_denial_response(
     ctx: &mut RequestContext,
     status: u16,
     message: &str,
     policy_type: &str,
-) -> Option<ConcurrentLimitDenialResponse> {
-    if policy_type != "concurrent_limit" {
-        return None;
+) -> Option<ConfiguredDenialResponse> {
+    match policy_type {
+        "concurrent_limit" => {
+            let body = ctx
+                .concurrent_limit_denial_body
+                .take()
+                .unwrap_or_else(|| error_json_body(message));
+            Some(ConfiguredDenialResponse {
+                status,
+                content_type: "application/json".to_string(),
+                body,
+            })
+        }
+        "content_digest" => match ctx.deny_payload.take() {
+            Some(("content_digest", body, content_type)) => Some(ConfiguredDenialResponse {
+                status,
+                content_type,
+                body,
+            }),
+            other => {
+                // Someone else's payload: put it back for the
+                // owner-checked renderer at the end of the deny arm.
+                ctx.deny_payload = other;
+                None
+            }
+        },
+        _ => None,
     }
-    let body = ctx
-        .concurrent_limit_denial_body
-        .take()
-        .unwrap_or_else(|| error_json_body(message));
-    Some(ConcurrentLimitDenialResponse {
-        status,
-        content_type: "application/json",
-        body,
-    })
 }
 
 #[cfg(test)]
-mod concurrent_limit_denial_response_tests {
+mod configured_denial_response_tests {
     use super::*;
 
     #[test]
@@ -91,7 +126,7 @@ mod concurrent_limit_denial_response_tests {
         ctx.concurrent_limit_denial_body = Some(configured.to_string());
 
         let response =
-            take_concurrent_limit_denial_response(&mut ctx, 529, configured, "concurrent_limit")
+            take_configured_denial_response(&mut ctx, 529, configured, "concurrent_limit")
                 .expect("concurrent-limit response");
 
         assert_eq!(response.status, 529);
@@ -104,7 +139,7 @@ mod concurrent_limit_denial_response_tests {
     fn default_message_keeps_the_generic_json_envelope() {
         let mut ctx = RequestContext::new();
 
-        let response = take_concurrent_limit_denial_response(
+        let response = take_configured_denial_response(
             &mut ctx,
             503,
             "too many concurrent requests",
@@ -117,6 +152,62 @@ mod concurrent_limit_denial_response_tests {
         assert_eq!(
             response.body,
             "{\"error\":\"too many concurrent requests\"}"
+        );
+    }
+
+    #[test]
+    fn content_digest_envelope_carries_its_own_content_type() {
+        // WOR-2528: the header-phase refusal has to emit the
+        // operator's `error_body` and `error_content_type`, not the
+        // generic JSON envelope the dispatcher would otherwise render.
+        let mut ctx = RequestContext::new();
+        ctx.deny_payload = Some((
+            "content_digest",
+            "digest required".to_string(),
+            "text/plain".to_string(),
+        ));
+
+        let response = take_configured_denial_response(
+            &mut ctx,
+            428,
+            "Content-Digest header required but absent",
+            "content_digest",
+        )
+        .expect("content-digest response");
+
+        assert_eq!(response.status, 428);
+        assert_eq!(response.content_type, "text/plain");
+        assert_eq!(response.body, "digest required");
+        assert!(ctx.deny_payload.is_none());
+    }
+
+    #[test]
+    fn content_digest_without_a_parked_envelope_falls_through() {
+        // A `content_digest` denial that did not come from the
+        // header-phase check leaves the slot empty; the dispatcher's
+        // generic envelope must still be used rather than an empty body.
+        let mut ctx = RequestContext::new();
+        assert!(take_configured_denial_response(&mut ctx, 400, "nope", "content_digest").is_none());
+    }
+
+    #[test]
+    fn unrelated_policies_are_untouched() {
+        let mut ctx = RequestContext::new();
+        assert!(take_configured_denial_response(&mut ctx, 403, "nope", "waf").is_none());
+    }
+
+    #[test]
+    fn a_mismatched_owners_payload_survives_for_the_late_renderer() {
+        let mut ctx = RequestContext::new();
+        ctx.deny_payload = Some((
+            "prompt_injection_v2",
+            "body".to_string(),
+            "text/plain".to_string(),
+        ));
+        assert!(take_configured_denial_response(&mut ctx, 400, "nope", "content_digest").is_none());
+        assert!(
+            ctx.deny_payload.is_some(),
+            "a payload owned by another policy must stay parked for the deny_payload renderer"
         );
     }
 }
@@ -3887,13 +3978,12 @@ pub(super) async fn request_filter(
             )
             .with_api_key_id(ctx.accountable_key_id())
             .emit();
-            if let Some(response) =
-                take_concurrent_limit_denial_response(ctx, status, &msg, policy_type)
+            if let Some(response) = take_configured_denial_response(ctx, status, &msg, policy_type)
             {
                 send_response(
                     session,
                     response.status,
-                    response.content_type,
+                    &response.content_type,
                     response.body.as_bytes(),
                 )
                 .await?;

@@ -2,21 +2,40 @@
 //!
 //! Verifies an inbound `Content-Digest:` (or, since PR2, the
 //! `Repr-Digest:`) header against the SHA-256 or SHA-512 of the
-//! request body before forwarding to upstream. On mismatch, malformed
-//! header, or unsupported algorithm, the proxy rejects with a
-//! configurable HTTP status (default 400). Optional pass-through when
-//! the header is absent: `on_missing: skip` is for origins that mix
-//! integrity-required and integrity-optional traffic;
+//! request body. On mismatch, malformed header, or unsupported
+//! algorithm, the proxy rejects with a configurable HTTP status
+//! (default 400) and the upstream never sees the body. Optional
+//! pass-through when the header is absent: `on_missing: skip` is for
+//! origins that mix integrity-required and integrity-optional traffic;
 //! `on_missing: require` (the default) is the safer posture for
 //! integrity-critical inboxes (webhook receivers, agent endpoints).
 //!
-//! The check itself runs in `request_body_filter` once the body is
-//! fully buffered (the policy is paired with a `ContentDigestEnforcer`
-//! that sets `ctx.validate_request_body = true`). The parser /
-//! verifier surface comes from [`sbproxy_middleware::digest`], which
-//! has been in tree for the egress-signer work and is tested against
-//! the RFC 9530 §2 canonical vector. This policy is the body-filter
-//! glue that turns those primitives into a per-origin reject path.
+//! ## Where each decision runs
+//!
+//! The policy has two decisions in it and they are not decidable at
+//! the same time, so `ContentDigestEnforcer` splits them.
+//!
+//! * **Header absent.** Settled in the header phase, before the proxy
+//!   picks an upstream peer. `on_missing: require` refuses there and
+//!   the upstream is never dialed.
+//! * **Header present.** Whether it matches needs the body, so the
+//!   enforcer sets `ctx.validate_request_body = true` and
+//!   `request_body_filter` runs the comparison once the body is
+//!   buffered. That phase runs after the upstream connection is
+//!   established, which is inherent to deciding on the body: the
+//!   bytes never reach the upstream, but the dial has happened.
+//!
+//! WOR-2528 is why the split exists. Both decisions used to run in the
+//! body filter, so a request the proxy had already decided to refuse
+//! from its headers still paid for an upstream dial, and against an
+//! upstream that was slow or unreachable the client got the upstream's
+//! failure instead of the policy's verdict.
+//!
+//! The parser / verifier surface comes from
+//! [`sbproxy_middleware::digest`], which has been in tree for the
+//! egress-signer work and is tested against the RFC 9530 §2 canonical
+//! vector. This policy turns those primitives into a per-origin reject
+//! path.
 //!
 //! ## PR2 additions (WOR-805 follow-ups)
 //!
@@ -54,6 +73,9 @@ pub enum OnMissing {
     /// Reject with `missing_status` (default). The safer posture for
     /// integrity-critical surfaces: a request without a digest cannot
     /// be verified, so we refuse it.
+    ///
+    /// Refused in the header phase, before the upstream is dialed:
+    /// nothing about this verdict depends on the body.
     #[default]
     Require,
     /// Allow the request through. Opt-in for origins that mix
@@ -114,6 +136,11 @@ pub enum VerifyOutcome {
     Skipped,
     /// Header absent and `on_missing == Require`. Reject with
     /// `missing_status`.
+    ///
+    /// Normally produced by the header-phase check in
+    /// `ContentDigestEnforcer` rather than by the body filter, which
+    /// keeps the branch as a fallback for any path that reaches body
+    /// verification without having run the enforcer.
     MissingRequired,
     /// Header present but the parser could not decode it (malformed
     /// structured-fields dictionary, missing colon-wrapping, etc.).

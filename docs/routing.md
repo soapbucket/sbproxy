@@ -1,5 +1,5 @@
 # Routing and traffic management
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-20*
 
 How SBproxy decides which upstream serves a request: hostname matching, forward rules, load balancing, protocol-specific actions, failover, and the extension point for custom selection logic. This page is the hub; [configuration.md](configuration.md) is the field-by-field source of truth for every block below.
 
@@ -104,10 +104,22 @@ Registering a new strategy is a Rust `inventory::submit!` call in an out-of-tree
 Beyond plain HTTP `proxy`, dedicated actions route other transports through the same origin/policy/transform pipeline:
 
 - **WebSocket** (`type: websocket`): proxies `ws://`/`wss://`. `max_message_size` closes the tunnel on an oversized message in either direction, and `subprotocols` allowlists `Sec-WebSocket-Protocol` negotiation; see [websocket.md](websocket.md) for what runs before and after the upgrade. Runnable at [`examples/websocket-proxy/`](../examples/websocket-proxy/).
-- **gRPC** (`type: grpc`): proxies `grpc://`/`grpcs://`, with `grpc_web: true` letting browser gRPC-Web clients reach a native gRPC upstream, and optional REST-to-gRPC `transcode` bindings from an OpenAPI-style HTTP route to a unary gRPC call. Runnable at [`examples/grpc-h2c/`](../examples/grpc-h2c/).
+- **gRPC** (`type: grpc`): proxies `grpc://`/`grpcs://`, with `grpc_web: true` letting browser gRPC-Web clients reach a native gRPC upstream, and optional REST-to-gRPC `transcode` bindings from an OpenAPI-style HTTP route to a unary gRPC call. Plain passthrough is byte-transparent and carries every RPC cardinality, unary through bidirectional streaming; the two translation modes are narrower, and one policy composition is a trap. See [gRPC limits](#grpc-limits) below. Runnable at [`examples/grpc-h2c/`](../examples/grpc-h2c/).
 - **GraphQL** (`type: graphql`): transparent by default; setting `max_depth`, `allow_introspection: false`, or `validate_queries: true` turns on fail-closed parsing (syntax only, not schema-aware) ahead of the upstream, including a 64 KiB validated-body limit and whole-batch rejection. Runnable at [`examples/graphql-gateway/`](../examples/graphql-gateway/).
 
 Field tables for each: [configuration.md#websocket](configuration.md#websocket), [configuration.md#grpc](configuration.md#grpc), [configuration.md#graphql](configuration.md#graphql). WebSocket and GraphQL also have their own dedicated pages, [websocket.md](websocket.md) and [graphql.md](graphql.md), covering upgrade semantics, validation placement, and honest limits in more depth than the field tables alone.
+
+### gRPC limits
+
+**Plain passthrough carries every cardinality.** The proxy forces HTTP/2 upstream and does not touch the length-prefixed frames, so unary, server-streaming, client-streaming, and bidirectional-streaming calls all pass through unchanged. Server reflection, which is itself a bidirectional-streaming RPC, works.
+
+**gRPC-Web translation is unary and server-streaming only.** `grpc_web: true` buffers the whole gRPC-Web request before forwarding it, so a client-streaming or bidirectional call over gRPC-Web has no path through. Browser gRPC-Web clients cannot do client-streaming anyway, so this matches what the wire format offers.
+
+**`transcode` routes are unary only.** A REST route binds to one gRPC method and one request message. A streaming method behind a transcode route returns only its first response frame.
+
+**A body-reading policy turns off streaming for the whole origin.** `content_digest`, `request_validator`, `openapi_validation`, `body_threat_protection`, and body-aware `prompt_injection_v2` all need the complete request body, so the proxy holds every request chunk until the client half-closes. A unary call half-closes immediately and is unaffected. A streaming call does not: it waits for a response that cannot arrive until it stops sending, and the call stalls until the client's deadline expires. Nothing refuses this composition at config load today, and the symptom reads like an upstream fault. Attach body-reading policies to the HTTP origins that need them, not to a `grpc` origin that carries streaming methods.
+
+**No HTTP/3.** gRPC requires HTTP/2 end to end. There is no HTTP/3 listener for the `grpc` action to answer on: the `http3` config block is recognized, but enabling it is refused at config compile, and no current build boots a listener.
 
 ## Routing AI traffic
 

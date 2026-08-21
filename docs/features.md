@@ -140,7 +140,7 @@ An origin's `action:` decides what serves the request, and forward rules can pic
 * **`beacon`** answers with a one-pixel transparent GIF, so an analytics or tracking pixel needs no upstream at all.
 * **`noop`** accepts the request and returns an empty 200. A placeholder for scaffolding a config before its real action lands.
 * **`websocket`** proxies WebSocket upgrades, with subprotocol negotiation, message-size limits, and host override; auth and policies run before the upgrade like on any other action. Docs: [websocket.md](websocket.md).
-* **`grpc`** passes gRPC through on HTTP/2, with opt-in gRPC-Web translation for browser clients and descriptor-driven REST-to-gRPC transcoding routes. Docs: [routing.md](routing.md).
+* **`grpc`** passes gRPC through on HTTP/2 for every RPC cardinality, unary through bidirectional streaming, with opt-in gRPC-Web translation for browser clients and descriptor-driven REST-to-gRPC transcoding routes. Both translation modes are unary or server-streaming only, and a body-reading policy on the origin stalls streaming calls. Docs: [routing.md](routing.md#grpc-limits).
 * **`graphql`** proxies GraphQL with a query-depth cap, an introspection toggle, and optional query validation before anything reaches the upstream. Docs: [routing.md](routing.md).
 * **`storage`** serves objects from S3, Google Cloud Storage, Azure Blob, or a local directory. Example: [Storage Action](../examples/storage-action/).
 * **`ai_proxy`** is the AI gateway in one action: the OpenAI-compatible surface, the 72-provider catalog, model aliases, LLM-aware routing, guardrails, budgets, semantic caching, and local model hosting. Section 2 above tours it; [ai-gateway.md](ai-gateway.md) is the reference.

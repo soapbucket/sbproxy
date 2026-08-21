@@ -454,6 +454,25 @@ the next version cut.
   204 or 304, where RFC 9110 section 8.6 forbids it; `type: static` no
   longer does either.
 
+- **`content_digest`'s `on_missing: require` refuses before the
+  upstream is dialed.** The missing-header check ran in
+  `request_body_filter`, which Pingora reaches only after
+  `upstream_peer` has selected a peer and the connection is up. The
+  verdict was never wrong, only late, and late is an availability
+  problem: every refusal paid for a full upstream dial and held the
+  connection slot for it, and pointed at an upstream that was slow or
+  unreachable the client got the upstream's failure instead of the
+  policy's. Against an unreachable upstream the proxy answered `502`
+  rather than the configured `400`. Nothing about that verdict depends
+  on the body, so it now runs in the header phase: the upstream is
+  never dialed, `missing_status`, `error_body`, and
+  `error_content_type` are honored exactly as before, and
+  `on_missing: skip` still falls through to the body filter unchanged.
+  Digest refusals from either phase now increment
+  `sbproxy_policy_triggers_total{policy_type="content_digest",action="deny"}`,
+  which none of the body-phase refusals did, and log on the
+  `sbproxy::content_digest` target with a `reason` naming the outcome.
+  See [docs/content-digest.md](docs/content-digest.md).
 - **`prompt_injection_v2`: the URI and header scan now honors
   `block_body` and `block_content_type`.** The policy can block from
   four places. Three of them (the buffered request body, the `ai_proxy`
@@ -635,6 +654,22 @@ the next version cut.
   config, including this repository's own `examples/auth-ldap/sb.yml`,
   which was false. The same omission stopped both names being reserved
   against a bundle hook claiming them.
+
+### Documentation
+
+- **gRPC streaming support is described accurately.**
+  `examples/grpc-h2c/README.md` reported that server reflection
+  (`list`) came back as a garbled framing error through the proxy and
+  steered readers away from it. Rechecked against a grpc-go server
+  with reflection registered: `list` works, `grpcurl describe` returns
+  byte-identical output through the proxy and straight at the
+  upstream, and bidirectional streaming round-trips every message.
+  New end-to-end coverage pins all of it; there was none before. A new
+  [gRPC limits](docs/routing.md#grpc-limits) section records what is
+  genuinely narrower, including one composition worth avoiding: a
+  body-reading policy on a `grpc` origin needs the complete request
+  body, so it stalls every streaming RPC on that origin while leaving
+  unary calls working.
 
 ## [1.13.0] - 2026-08-18
 

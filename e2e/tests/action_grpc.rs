@@ -13,6 +13,13 @@
 //! flag the proxy parses the preface as a malformed HTTP/1.1 request
 //! and tears the connection down with `FRAME_SIZE_ERROR`.
 
+// `tonic::Status` is 176 bytes, over `result_large_err`'s threshold,
+// and the bidi drivers below hand it back to the caller so the test
+// can compare the proxied status against the direct one. Boxing it
+// would only obscure the comparison. The generated `echo_pb` module
+// carries the same allow for the same type.
+#![allow(clippy::result_large_err)]
+
 use std::net::TcpListener as StdTcpListener;
 use std::time::Duration;
 
@@ -95,6 +102,55 @@ impl Echo for EchoSvc {
         ];
         let stream = futures_util::stream::iter(items);
         Ok(tonic::Response::new(Box::pin(stream)))
+    }
+
+    type HelloBidiStream = EchoStream;
+
+    async fn hello_bidi(
+        &self,
+        request: tonic::Request<tonic::Streaming<EchoRequest>>,
+    ) -> Result<tonic::Response<Self::HelloBidiStream>, tonic::Status> {
+        use futures_util::StreamExt as _;
+        // One response per request, emitted as the request arrives.
+        // Mapping the inbound stream (rather than draining it first)
+        // is what makes this genuinely full-duplex: the server never
+        // waits for the client to half-close.
+        let inbound = request.into_inner();
+        let outbound = inbound.map(|item| {
+            item.map(|req| EchoResponse {
+                message: format!("echo:{}", req.message),
+            })
+        });
+        Ok(tonic::Response::new(Box::pin(outbound)))
+    }
+
+    type HelloBidiServerFirstStream = EchoStream;
+
+    async fn hello_bidi_server_first(
+        &self,
+        _request: tonic::Request<tonic::Streaming<EchoRequest>>,
+    ) -> Result<tonic::Response<Self::HelloBidiServerFirstStream>, tonic::Status> {
+        // Deliberately drop the inbound stream without reading it and
+        // answer immediately. The client is still writing, so the
+        // HTTP/2 server tears down the request half under it.
+        Err(tonic::Status::unimplemented(
+            "server first: not implemented",
+        ))
+    }
+
+    type HelloBidiOneShotStream = EchoStream;
+
+    async fn hello_bidi_one_shot(
+        &self,
+        _request: tonic::Request<tonic::Streaming<EchoRequest>>,
+    ) -> Result<tonic::Response<Self::HelloBidiOneShotStream>, tonic::Status> {
+        // One reply, then done, without draining the request stream.
+        let items: Vec<Result<EchoResponse, tonic::Status>> = vec![Ok(EchoResponse {
+            message: "one-shot".into(),
+        })];
+        Ok(tonic::Response::new(Box::pin(futures_util::stream::iter(
+            items,
+        ))))
     }
 }
 
@@ -200,5 +256,251 @@ fn grpc_unary_preserves_payload_with_multibyte_chars() {
             .await
             .expect("rpc");
         assert_eq!(resp.into_inner().message, payload);
+    });
+}
+
+// ---------------------------------------------------------------
+// WOR-2524: bidirectional streaming through the `grpc` action.
+//
+// `examples/grpc-h2c/README.md` recorded the symptom before this
+// test existed: grpcurl's `list` (server reflection, which is a
+// bidi-streaming RPC) came back as a garbled framing error while
+// unary calls on the same origin were fine. A bidi RPC is the one
+// shape where the proxy has to keep both halves of an HTTP/2 stream
+// moving at once, so it is the one shape a request/response proxy
+// can get structurally wrong.
+//
+// This test drives a real interleaved bidi stream: send one message,
+// read its reply, then send the next. Nothing about it is a unit
+// test over a framing helper; every byte crosses the proxy.
+// ---------------------------------------------------------------
+
+/// Build a request stream fed by an mpsc channel so the test can
+/// interleave sends and receives. `futures_util::stream::unfold` over
+/// the receiver avoids pulling in `tokio-stream`'s `sync` feature for
+/// one wrapper type.
+fn channel_request_stream(
+    rx: tokio::sync::mpsc::Receiver<EchoRequest>,
+) -> impl futures_util::Stream<Item = EchoRequest> {
+    futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    })
+}
+
+#[test]
+fn grpc_bidi_streaming_round_trips_every_message() {
+    let rt = tokio::runtime::Runtime::new().expect("rt");
+    rt.block_on(async {
+        use futures_util::StreamExt as _;
+
+        let upstream_url = spawn_echo_grpc_server().await;
+        let harness = ProxyHarness::start_with_yaml(&grpc_config(&upstream_url)).expect("start");
+
+        let proxy_endpoint = tonic::transport::Endpoint::from_shared(harness.base_url())
+            .expect("endpoint")
+            .origin("http://grpc.localhost".parse().expect("authority parse"))
+            .timeout(Duration::from_secs(10));
+        let channel = proxy_endpoint.connect().await.expect("grpc connect");
+        let mut client = EchoClient::new(channel);
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<EchoRequest>(8);
+        let response = client
+            .hello_bidi(channel_request_stream(rx))
+            .await
+            .expect("bidi rpc must open through the proxy");
+        let mut inbound = response.into_inner();
+
+        // Interleave: one send, one receive, four times over. A proxy
+        // that holds the request body until end-of-stream deadlocks
+        // here; a proxy that re-frames the body returns garbage or a
+        // decode error.
+        for i in 0..4u32 {
+            let payload = format!("msg-{i}");
+            tx.send(EchoRequest {
+                message: payload.clone(),
+            })
+            .await
+            .expect("send request message");
+
+            let received = tokio::time::timeout(Duration::from_secs(5), inbound.next())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("bidi reply {i} never arrived: the proxy is not full-duplex")
+                })
+                .unwrap_or_else(|| panic!("bidi stream ended early at message {i}"))
+                .unwrap_or_else(|e| panic!("bidi reply {i} failed to decode: {e}"));
+            assert_eq!(
+                received.message,
+                format!("echo:{payload}"),
+                "message {i} must survive the proxy byte for byte"
+            );
+        }
+
+        // Half-close the request stream and confirm the server closes
+        // the response stream cleanly, with the gRPC status intact.
+        drop(tx);
+        let tail = tokio::time::timeout(Duration::from_secs(5), inbound.next())
+            .await
+            .expect("stream close must not hang");
+        assert!(
+            tail.is_none(),
+            "stream should end cleanly after half-close; got {tail:?}"
+        );
+    });
+}
+
+/// Drive a bidi RPC whose server answers without ever draining the
+/// request stream, while the client keeps writing. Returns whatever
+/// the client observes on the response half.
+///
+/// `direct` selects the upstream address so the same driver can be
+/// pointed at the gRPC server with no proxy in the path, which is how
+/// the test establishes what the correct answer is before asserting
+/// on the proxied one.
+async fn drive_server_first(
+    endpoint_url: String,
+    authority: Option<&str>,
+) -> Result<Vec<String>, tonic::Status> {
+    use futures_util::StreamExt as _;
+
+    let mut endpoint = tonic::transport::Endpoint::from_shared(endpoint_url)
+        .expect("endpoint")
+        .timeout(Duration::from_secs(10));
+    if let Some(a) = authority {
+        endpoint = endpoint.origin(format!("http://{a}").parse().expect("authority parse"));
+    }
+    let channel = endpoint.connect().await.expect("grpc connect");
+    let mut client = EchoClient::new(channel);
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<EchoRequest>(8);
+    // Keep writing for as long as the peer accepts it. The point of
+    // the shape is that the client's request half is still open when
+    // the server finishes.
+    tokio::spawn(async move {
+        for i in 0..64u32 {
+            if tx
+                .send(EchoRequest {
+                    message: format!("keep-writing-{i}"),
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+
+    let response = client
+        .hello_bidi_server_first(channel_request_stream(rx))
+        .await?;
+    let mut inbound = response.into_inner();
+    let mut seen = Vec::new();
+    while let Some(item) = inbound.next().await {
+        seen.push(item?.message);
+    }
+    Ok(seen)
+}
+
+#[test]
+fn grpc_bidi_server_first_reply_survives_the_proxy() {
+    // WOR-2524. `examples/grpc-h2c/README.md` reported grpcurl's
+    // reflection `list` coming back garbled through the proxy while
+    // unary calls were fine. Reflection is bidi-streaming, and the
+    // version-probe flow ends with the server answering UNIMPLEMENTED
+    // while the client is still writing. That is the shape here.
+    //
+    // The assertion is a comparison, not a guess: the same RPC is
+    // driven once straight at the gRPC server and once through the
+    // proxy, and the proxy has to produce the same gRPC status.
+    let rt = tokio::runtime::Runtime::new().expect("rt");
+    rt.block_on(async {
+        let upstream_url = spawn_echo_grpc_server().await;
+        let direct_url = upstream_url.replacen("grpc://", "http://", 1);
+        let harness = ProxyHarness::start_with_yaml(&grpc_config(&upstream_url)).expect("start");
+
+        let direct = drive_server_first(direct_url, None).await;
+        let direct_status = direct.expect_err("the server answers UNIMPLEMENTED");
+        assert_eq!(
+            direct_status.code(),
+            tonic::Code::Unimplemented,
+            "sanity: talking straight to the upstream yields UNIMPLEMENTED, got {direct_status:?}"
+        );
+
+        let proxied = drive_server_first(harness.base_url(), Some("grpc.localhost")).await;
+        let proxied_status = proxied.expect_err("the proxy must not turn this into a success");
+        assert_eq!(
+            proxied_status.code(),
+            tonic::Code::Unimplemented,
+            "the proxy must forward the upstream's gRPC status, not replace it. \
+             direct={:?} / proxied={:?}: {}",
+            direct_status.code(),
+            proxied_status.code(),
+            proxied_status.message()
+        );
+        assert_eq!(
+            proxied_status.message(),
+            direct_status.message(),
+            "the grpc-message must survive the proxy"
+        );
+    });
+}
+
+#[test]
+fn grpc_bidi_one_shot_reply_survives_the_proxy() {
+    // The success-path twin of the test above: the server emits one
+    // message and completes while the client is still writing.
+    let rt = tokio::runtime::Runtime::new().expect("rt");
+    rt.block_on(async {
+        use futures_util::StreamExt as _;
+
+        let upstream_url = spawn_echo_grpc_server().await;
+        let harness = ProxyHarness::start_with_yaml(&grpc_config(&upstream_url)).expect("start");
+
+        let channel = tonic::transport::Endpoint::from_shared(harness.base_url())
+            .expect("endpoint")
+            .origin("http://grpc.localhost".parse().expect("authority parse"))
+            .timeout(Duration::from_secs(10))
+            .connect()
+            .await
+            .expect("grpc connect");
+        let mut client = EchoClient::new(channel);
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<EchoRequest>(8);
+        tokio::spawn(async move {
+            for i in 0..64u32 {
+                if tx
+                    .send(EchoRequest {
+                        message: format!("keep-writing-{i}"),
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        let response = client
+            .hello_bidi_one_shot(channel_request_stream(rx))
+            .await
+            .expect("one-shot bidi rpc must open through the proxy");
+        let mut inbound = response.into_inner();
+
+        let first = tokio::time::timeout(Duration::from_secs(5), inbound.next())
+            .await
+            .expect("reply must not hang")
+            .expect("stream must carry one message")
+            .expect("reply must decode");
+        assert_eq!(first.message, "one-shot");
+
+        let tail = tokio::time::timeout(Duration::from_secs(5), inbound.next())
+            .await
+            .expect("stream close must not hang");
+        assert!(
+            tail.is_none(),
+            "the stream must end cleanly after the single reply; got {tail:?}"
+        );
     });
 }

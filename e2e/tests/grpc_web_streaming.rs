@@ -100,6 +100,38 @@ impl Echo for EchoSvc {
         let stream = futures_util::stream::iter(items);
         Ok(tonic::Response::new(Box::pin(stream)))
     }
+
+    // WOR-2524 added three bidi RPCs to the shared proto so
+    // `action_grpc.rs` could drive a real bidirectional stream through
+    // the proxy. Every `Echo` impl in the suite has to satisfy the
+    // trait; this file does not exercise them, so they answer
+    // UNIMPLEMENTED rather than pretending to work.
+    type HelloBidiStream = EchoStream;
+
+    async fn hello_bidi(
+        &self,
+        _request: tonic::Request<tonic::Streaming<EchoRequest>>,
+    ) -> Result<tonic::Response<Self::HelloBidiStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not exercised by this test"))
+    }
+
+    type HelloBidiServerFirstStream = EchoStream;
+
+    async fn hello_bidi_server_first(
+        &self,
+        _request: tonic::Request<tonic::Streaming<EchoRequest>>,
+    ) -> Result<tonic::Response<Self::HelloBidiServerFirstStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not exercised by this test"))
+    }
+
+    type HelloBidiOneShotStream = EchoStream;
+
+    async fn hello_bidi_one_shot(
+        &self,
+        _request: tonic::Request<tonic::Streaming<EchoRequest>>,
+    ) -> Result<tonic::Response<Self::HelloBidiOneShotStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not exercised by this test"))
+    }
 }
 
 fn spawn_echo_grpc_server() -> String {
