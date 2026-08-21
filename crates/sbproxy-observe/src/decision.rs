@@ -119,12 +119,13 @@ pub enum DecisionEvent {
     ///
     /// Distinct from [`Self::AiFailure`], which is an upstream fact.
     /// This one is the proxy's own decision, taken at the inbound
-    /// native-format shim: an MCP tool block that would have asked the
-    /// provider to contact an MCP server behind the gateway's back, a
-    /// stateful-join reference the gateway cannot honor, an unresolved
-    /// stored-prompt object, a body that is not JSON. Without it the
-    /// only trace of a governance-bypass attempt was a bare 400, which
-    /// is metrically indistinguishable from a typo.
+    /// native-format shim or the stored-prompt resolver: an MCP tool
+    /// block that would have asked the provider to contact an MCP
+    /// server behind the gateway's back, a stateful-join reference the
+    /// gateway cannot honor, a stored-prompt reference nothing holds, a
+    /// body that is not JSON. Without it the only trace of a
+    /// governance-bypass attempt was a bare 400, which is metrically
+    /// indistinguishable from a typo.
     AiAdmission,
     /// A transform rewrote a response.
     Transform,
@@ -1029,9 +1030,10 @@ pub struct DecisionDetails {
     ///
     /// The same closed vocabulary
     /// `sbproxy_ai_surface_requests_total` is labelled by (`messages`,
-    /// `responses`, `chat`, ...), so a rule can join a refusal record to
-    /// the surface's own request rate. Proxy-authored: it comes from the
-    /// matched route, never from the body.
+    /// `responses`, `chat_completions`, ...), so a rule can join a
+    /// refusal record to the surface's own request rate.
+    /// Proxy-authored: it is classified from the request path, never
+    /// read out of the body.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub surface: Option<String>,
 }

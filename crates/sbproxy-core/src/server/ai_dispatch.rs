@@ -870,49 +870,54 @@ fn unambiguous_default_model(config: &AiHandlerConfig) -> Option<String> {
 mod default_model_tests {
     use super::unambiguous_default_model;
 
-    fn config(providers: serde_json::Value) -> sbproxy_ai::AiHandlerConfig {
-        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
-            "providers": providers
-        }))
-        .expect("AI handler config fixture")
+    /// One origin, described as `(provider name, default_model, enabled)`.
+    ///
+    /// `provider_type` is pinned to `openai` on every entry because
+    /// `from_config` refuses a provider whose catalog key is unknown and
+    /// which carries no `base_url`, and these fixtures deliberately have
+    /// neither a real vendor nor an upstream.
+    fn config(providers: &[(&str, Option<&str>, bool)]) -> sbproxy_ai::AiHandlerConfig {
+        let providers: Vec<serde_json::Value> = providers
+            .iter()
+            .map(|(name, default_model, enabled)| {
+                let mut provider = serde_json::json!({
+                    "name": name,
+                    "provider_type": "openai",
+                    "api_key": "fixture-key",
+                    "enabled": enabled,
+                });
+                if let Some(model) = default_model {
+                    provider["default_model"] = serde_json::Value::String((*model).to_owned());
+                }
+                provider
+            })
+            .collect();
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({ "providers": providers }))
+            .expect("AI handler config fixture")
     }
 
     #[test]
     fn one_provider_naming_a_default_supplies_it() {
-        let config = config(serde_json::json!([
-            {"name": "openai", "api_key": "x", "default_model": "gpt-4o"}
-        ]));
-        assert_eq!(
-            unambiguous_default_model(&config).as_deref(),
-            Some("gpt-4o")
-        );
+        let config = config(&[("openai", Some("gpt-4o"), true)]);
+        assert_eq!(unambiguous_default_model(&config).as_deref(), Some("gpt-4o"));
     }
 
     #[test]
     fn providers_agreeing_on_a_default_supply_it() {
-        let config = config(serde_json::json!([
-            {"name": "openai", "api_key": "x", "default_model": "gpt-4o"},
-            {"name": "azure", "api_key": "x", "default_model": "gpt-4o"}
-        ]));
-        assert_eq!(
-            unambiguous_default_model(&config).as_deref(),
-            Some("gpt-4o")
-        );
+        let config = config(&[
+            ("openai", Some("gpt-4o"), true),
+            ("azure", Some("gpt-4o"), true),
+        ]);
+        assert_eq!(unambiguous_default_model(&config).as_deref(), Some("gpt-4o"));
     }
 
     #[test]
     fn a_provider_naming_nothing_abstains_rather_than_disagreeing() {
         // The common shape: one provider carries the default and the
-        // rest say nothing. Treating an absent value as a disagreement
-        // would make the feature unusable on any multi-provider origin.
-        let config = config(serde_json::json!([
-            {"name": "openai", "api_key": "x"},
-            {"name": "azure", "api_key": "x", "default_model": "gpt-4o"}
-        ]));
-        assert_eq!(
-            unambiguous_default_model(&config).as_deref(),
-            Some("gpt-4o")
-        );
+        // rest say nothing. Reading an absent value as a disagreement
+        // would make the field unusable on any multi-provider origin.
+        let config = config(&[("openai", None, true), ("azure", Some("gpt-4o"), true)]);
+        assert_eq!(unambiguous_default_model(&config).as_deref(), Some("gpt-4o"));
     }
 
     #[test]
@@ -920,10 +925,10 @@ mod default_model_tests {
         // Picking the first would route a modelless request to whichever
         // provider happens to be listed first, which is not a decision
         // the operator made.
-        let config = config(serde_json::json!([
-            {"name": "openai", "api_key": "x", "default_model": "gpt-4o"},
-            {"name": "anthropic", "api_key": "x", "default_model": "claude-haiku-4-5"}
-        ]));
+        let config = config(&[
+            ("openai", Some("gpt-4o"), true),
+            ("azure", Some("gpt-4o-mini"), true),
+        ]);
         assert_eq!(unambiguous_default_model(&config), None);
     }
 
@@ -932,21 +937,16 @@ mod default_model_tests {
         // A request can never land on a disabled provider, so its
         // default cannot be the one the operator meant, and letting it
         // vote would turn an unambiguous origin ambiguous.
-        let config = config(serde_json::json!([
-            {"name": "openai", "api_key": "x", "default_model": "gpt-4o"},
-            {"name": "retired", "api_key": "x", "default_model": "gpt-3.5", "enabled": false}
-        ]));
-        assert_eq!(
-            unambiguous_default_model(&config).as_deref(),
-            Some("gpt-4o")
-        );
+        let config = config(&[
+            ("openai", Some("gpt-4o"), true),
+            ("retired", Some("gpt-4o-mini"), false),
+        ]);
+        assert_eq!(unambiguous_default_model(&config).as_deref(), Some("gpt-4o"));
     }
 
     #[test]
     fn no_provider_naming_one_supplies_nothing() {
-        let config = config(serde_json::json!([
-            {"name": "openai", "api_key": "x"}
-        ]));
+        let config = config(&[("openai", None, true)]);
         assert_eq!(unambiguous_default_model(&config), None);
     }
 }
