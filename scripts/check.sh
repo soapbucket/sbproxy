@@ -276,6 +276,7 @@ batch_pub_item_ratchet() {
   bash "$ROOT/scripts/check-pub-item-ratchet.sh"
 }
 
+# CI: ci.yml test lane, "no new unwrap/expect/panic in production code".
 # Each of these ends the process on a path a caller cannot catch, which in a
 # proxy means a dropped request rather than an error a client can act on.
 # Clippy's equivalent lints cannot express this: the lint lane runs with
@@ -286,7 +287,7 @@ batch_unwrap_ratchet() {
   bash "$ROOT/scripts/check-unwrap-ratchet.sh"
 }
 
-# CI: docs-ci.yml, "spec citation hygiene".
+# CI: ci.yml guards lane and docs-ci.yml, "spec citation hygiene".
 batch_spec_citations() {
   bash "$ROOT/scripts/check-spec-citations.sh"
 }
@@ -306,10 +307,9 @@ batch_notice_coverage() {
   bash "$ROOT/scripts/check-notice.sh"
 }
 
+# CI: ci.yml lint lane, "no hand-rolled secret-reference parsing".
 # WOR-2287: guardrail for the WOR-2282 secret-resolver convergence. Pure
-# python source scan, no CI job of its own yet (not currently mirrored in
-# .github/workflows/ci.yml), so this local gate is presently the only
-# place it runs. Refuses a hand-rolled env:/file:/provider-URI scheme
+# python source scan. Refuses a hand-rolled env:/file:/provider-URI scheme
 # match outside crates/sbproxy-vault/src/, and a secret-shaped function
 # whose fallback hands a parameter back unchanged without first calling a
 # reference-shape guard -- the bug class WOR-2283 fixed.
@@ -317,12 +317,14 @@ batch_secret_resolver_drift() {
   python3 "$ROOT/scripts/check-secret-resolver-drift.py"
 }
 
-# CI: doc-drift.yml. Guards the provider-count, routing-strategy, and
+# CI: ci.yml guards lane and doc-drift.yml, "doc drift (counts and
+# stale claims)". Guards the provider-count, routing-strategy, and
 # unimplemented-feature claims in user-facing docs.
 batch_doc_drift() {
   bash "$ROOT/scripts/check-doc-drift.sh"
 }
 
+# CI: ci.yml guards lane, "no committed merge-conflict markers".
 # A merge that commits its own conflict markers ships corrupted files;
 # one reached main's CHANGELOG on 2026-08-19 through a gate that never
 # looked. Scan every tracked text surface a merge can mangle. The
@@ -336,6 +338,17 @@ batch_conflict_markers() {
   printf 'no conflict markers in tracked files\n'
 }
 
+# CI: ci.yml guards lane, "changelog entries are fragments, not
+# CHANGELOG.md edits" (WOR-2108). Refuses a malformed fragment, any
+# hand-written content under `## [Unreleased]`, and a commit that edits
+# CHANGELOG.md without touching docs/.changes/ in the same diff. The
+# diff half needs a merge base, and the script itself degrades to the
+# parser and placeholder halves (saying so) when it is not run inside a
+# git work tree, so there is nothing to branch on here.
+batch_changelog_fragments() {
+  python3 "$ROOT/scripts/changelog-fragments.py" --check
+}
+
 run_batch "read-only source and doc scans" \
   batch_tracker_placeholders "no internal tracker placeholders" \
   batch_pub_item_ratchet "pub items whose only consumer is a test (ratchet)" \
@@ -345,7 +358,8 @@ run_batch "read-only source and doc scans" \
   batch_notice_coverage "NOTICE covers Apache-2.0-only crates" \
   batch_secret_resolver_drift "secret-resolver drift (no new ad-hoc secret parsers)" \
   batch_doc_drift "doc drift" \
-  batch_conflict_markers "no committed merge-conflict markers"
+  batch_conflict_markers "no committed merge-conflict markers" \
+  batch_changelog_fragments "changelog entries are fragments, not CHANGELOG.md edits"
 
 # Serial: regen-llms-full.sh --check rebuilds the corpus into a temp
 # file when the branch carries it, and this phase can record a skip.
@@ -382,9 +396,12 @@ fi
 # Serial: each self-test builds and tears down a mktemp sandbox.
 # These helpers steer the gate around expensive or destructive work, so run
 # their branch tests before any Cargo build or CI-equivalent cleanup.
+# CI: ci.yml lint lane, "gate helper self-tests"; the changelog fixtures
+# run in the guards lane instead, beside the gate they arm.
 step "gate helper self-tests"
 bash "$ROOT/scripts/tests/workspace_bin_test.sh"
 bash "$ROOT/scripts/tests/runner_disk_test.sh"
+bash "$ROOT/scripts/tests/changelog_fragments_test.sh"
 python3 "$ROOT/scripts/lib/cert_record.py" --self-test
 python3 "$ROOT/scripts/tests/test_cert_record.py"
 python3 "$ROOT/scripts/lib/notice_coverage.py" --self-test
@@ -393,7 +410,8 @@ python3 "$ROOT/scripts/tests/test_notice_coverage.py"
 # Serial: the test_doc_generators module binds listeners and has
 # leaked one on port 18091 before; nothing that opens a port runs
 # concurrently with anything else in this gate.
-# CI: docs-ci.yml, "generated tapes and GIF wiring are current", which
+# CI: ci.yml guards lane and docs-ci.yml, "generated tapes and GIF
+# wiring are current", which
 # is `make tapes-check`. That target is three commands, the last of
 # which is the whole scripts.tests.test_doc_generators module. This gate
 # used to run a single class out of that module, so five of the six test
@@ -425,7 +443,8 @@ batch_doc_assets() {
   PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/check-doc-assets.py"
 }
 
-# CI: docs-ci.yml, "documentation configs match canonical examples".
+# CI: ci.yml guards lane and docs-ci.yml, "documentation configs
+# match canonical examples".
 # The `every_oss_example_compiles` half of that CI step is covered by
 # the workspace test lane below; do not add a `-p sbproxy-config`
 # invocation here, because a narrow package selection resolves a
@@ -434,17 +453,18 @@ batch_doc_configs() {
   PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/sync-doc-configs.py" --check
 }
 
-# Not a CI lane, because there isn't one. examples/README.md is generated
-# by gen-examples-catalog.py, which has supported --check since it was
-# written, and nothing has ever called it: not CI, not this gate, not the
-# Makefile. It had silently drifted by two rows on main. A generated file
-# with a drift checker nobody invokes is the same failure as having no
-# checker at all.
+# CI: ci.yml guards lane, "examples catalog is current".
+# examples/README.md is generated by gen-examples-catalog.py, which has
+# supported --check since it was written, and for a long stretch nothing
+# called it: not CI, not this gate, not the Makefile. It had silently
+# drifted by two rows on main. A generated file with a drift checker
+# nobody invokes is the same failure as having no checker at all.
 batch_examples_catalog() {
   PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/gen-examples-catalog.py" --check
 }
 
-# CI: review-evidence.yml runs the same fixtures before it parses a body.
+# CI: ci.yml guards lane, "review-evidence parser fixtures";
+# review-evidence.yml also runs them before it parses a body.
 # The parser reads attacker-controlled text and decides whether a PR
 # carries review evidence, so a regression that loosened it would read
 # green in exactly the place the gate is supposed to be strict. The
@@ -461,6 +481,8 @@ run_batch "generator --check drift scans" \
 
 # Serial: the opt-in replay path spawns fixture and proxy processes on
 # real ports, and the phase records a skip on the default path.
+# CI: ci.yml guards lane runs the structural half on every pull request;
+# release-checks.yml replays the commands on tags and nightly.
 # Captures are the output blocks a doc shows under a CAPTURE marker. The
 # structural half runs here always: every marker has a block, and no
 # block is empty. Both are cheap and both have caught real defects, since

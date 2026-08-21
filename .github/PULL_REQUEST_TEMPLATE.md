@@ -30,7 +30,7 @@ cargo test --workspace --locked
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes
 - [ ] `cargo test --workspace --locked` passes
 - [ ] Relevant docs under `docs/` updated (or no docs change needed)
-- [ ] CHANGELOG.md `## Unreleased` entry added if user-visible
+- [ ] Change fragment added if user-visible (`python3 scripts/changelog-fragments.py --new <type> '<message>'`; do not edit CHANGELOG.md)
 - [ ] No new unsafe blocks (or justified inline)
 - [ ] No new dependencies (or noted in PR description with rationale)
 - [ ] Adversarial review run against `.github/code-review-rubric.md`, findings and dispositions recorded below

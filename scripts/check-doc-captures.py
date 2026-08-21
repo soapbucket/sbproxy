@@ -160,6 +160,55 @@ MANIFEST: dict[str, dict] = {
     },
 }
 
+# Pages that show command output and are deliberately NOT in the manifest
+# above.
+#
+# Written down because the alternative is worse than silence: an
+# unreplayed page looks exactly like a page nobody has got to yet, so the
+# next person sweeping for gaps re-derives the same reasoning and, if
+# they are unlucky, lands the flaky gate the note exists to prevent.
+#
+# `examples/health-and-budget-gauges/README.md`
+#     Timing-dependent by design, and the timing is the subject. The
+#     walkthrough says "scrape right after startup, before the dead
+#     target's third consecutive probe failure", then scrapes again
+#     after it, to show one gauge crossing from 0 to 2. The harness has
+#     no way to hold that window open: it would have to land a capture
+#     inside a roughly four-second startup race, on a loaded CI runner,
+#     to read the first block's value. Forcing it in buys a flaky gate,
+#     which is worth less than no gate because a lane people rerun until
+#     it passes stops being read at all. The page's blocks also
+#     interleave `$` prompts with their output, so there is no
+#     output-only block to put after a marker.
+#
+#     The remedies are real but neither is a manifest entry: teach the
+#     harness to freeze a probe clock, or rewrite the walkthrough so it
+#     stops demonstrating the transition it exists to demonstrate. If
+#     you are here because you noticed the page is unreplayed, that is
+#     on purpose; the same note is in the page itself.
+#
+# `docs/admin-ui.md`
+#     Nothing on the page is command output. It is prose plus
+#     screenshots (see `scripts/capture-admin-screenshots.mjs`) and
+#     copy-paste blocks: a build recipe, a URL template, a config
+#     fragment, and a three-terminal mesh launch. Its one real captured
+#     response is keyed by a request id minted at run time by the drive
+#     call above it, and reaching it needs `capture_content` on the
+#     origin AND `allow_content_capture` on the key, so replaying it
+#     means shell-substituting an id out of a previous call rather than
+#     running the command the page prints. Covering this page is a
+#     screenshot problem, not a manifest entry.
+EXEMPT_DOCS: dict[str, str] = {
+    "docs/admin-ui.md": (
+        "nothing on the page is command output: prose, screenshots, and "
+        "copy-paste blocks, plus one response keyed by a run-time request id"
+    ),
+    "examples/health-and-budget-gauges/README.md": (
+        "timing-dependent: the walkthrough scrapes inside the window before a "
+        "probe's third consecutive failure, which no replay can hold open"
+    ),
+}
+
 
 @dataclass
 class Capture:
@@ -505,6 +554,35 @@ STACK_STARTERS = {
 }
 
 
+def check_exemptions() -> list[str]:
+    """Hold the exemption list to the same standard as the manifest.
+
+    An exemption is a claim about a document, and a claim nothing checks
+    rots the same way a number in a doc does. Two ways it can go wrong,
+    both silent otherwise: the document is renamed or deleted and the
+    note now describes nothing, or somebody adds a marker to an exempt
+    page, at which point the file says two contradictory things and the
+    reader has to guess which is current.
+    """
+    errors: list[str] = []
+    for rel, reason in sorted(EXEMPT_DOCS.items()):
+        path = ROOT / rel
+        if not path.exists():
+            errors.append(f"{rel} is exempt but does not exist; drop the entry")
+            continue
+        if not reason.strip():
+            errors.append(f"{rel} is exempt with no reason given")
+        if _has_marker(path):
+            errors.append(
+                f"{rel} is exempt but carries a CAPTURE marker; "
+                "put it in MANIFEST or drop the marker"
+            )
+    for rel in MANIFEST:
+        if rel in EXEMPT_DOCS:
+            errors.append(f"{rel} is in both MANIFEST and EXEMPT_DOCS")
+    return errors
+
+
 def section_for(capture: Capture, doc_config: dict) -> dict:
     """The manifest section governing one capture.
 
@@ -685,6 +763,10 @@ def main() -> int:
             }
         )
 
+    exempt_errors = check_exemptions()
+    for error in exempt_errors:
+        print(f"capture exemption: {error}", file=sys.stderr)
+
     if args.list:
         total = 0
         for path in docs:
@@ -693,7 +775,9 @@ def main() -> int:
                 rel = display_path(path)
                 print(f"{rel}:{capture.line}: {capture.command}")
         print(f"\n{total} capture(s) in {len(docs)} document(s)")
-        return 0
+        for rel, reason in sorted(EXEMPT_DOCS.items()):
+            print(f"exempt: {rel}: {reason}")
+        return 1 if exempt_errors else 0
 
     raw_binary = args.binary or os.environ.get("SBPROXY_CAPTURE_BIN")
     binary: Path | None
@@ -741,8 +825,8 @@ def main() -> int:
         )
 
     if args.update:
-        return 0
-    return 1 if failures else 0
+        return 1 if exempt_errors else 0
+    return 1 if (failures or exempt_errors) else 0
 
 
 if __name__ == "__main__":
