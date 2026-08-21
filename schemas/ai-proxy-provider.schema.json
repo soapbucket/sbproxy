@@ -178,7 +178,7 @@
       ]
     },
     "aws_sigv4": {
-      "description": "WOR-2648: sign this provider's requests with AWS Signature Version 4 instead of forwarding a static credential. Required by Bedrock and SageMaker, which do not accept a bearer token. Presence of this block is what selects the signer, so a provider entry either sets `api_key` or sets this, never both. `region` is required and is the credential scope; it is never inferred from `base_url`, matching the AWS SDKs, where an endpoint override leaves the signing region alone. When `base_url` is unset, `region` also fills the `{region}` placeholder in the provider catalog's default endpoint. See `sbproxy_ai::aws_sigv4`.",
+      "description": "Sign this provider's requests with AWS Signature Version 4 instead of forwarding a static credential. Required by Bedrock and SageMaker, which do not accept a bearer token. Presence of this block is what selects the signer, so a provider entry either sets `api_key` or sets this, never both. `region` is required and is the credential scope; it is never inferred from `base_url`, matching the AWS SDKs, where an endpoint override leaves the signing region alone. When `base_url` is unset, `region` also fills the `{region}` placeholder in the provider catalog's default endpoint. See `sbproxy_ai::aws_sigv4`.",
       "anyOf": [
         {
           "$ref": "#/definitions/AwsSigV4Config"

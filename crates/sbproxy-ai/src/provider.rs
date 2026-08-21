@@ -110,7 +110,7 @@ pub struct ProviderConfig {
     /// epic; this field is the config surface it reads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serve: Option<sbproxy_model_host::ModelHostConfig>,
-    /// WOR-2648: sign this provider's requests with AWS Signature
+    /// Sign this provider's requests with AWS Signature
     /// Version 4 instead of forwarding a static credential. Required
     /// by Bedrock and SageMaker, which do not accept a bearer token.
     /// Presence of this block is what selects the signer, so a
@@ -122,11 +122,14 @@ pub struct ProviderConfig {
     /// placeholder in the provider catalog's default endpoint. See
     /// `sbproxy_ai::aws_sigv4`.
     #[serde(default)]
-    /// Boxed deliberately. `AwsSigV4Config` is 256 bytes and almost
-    /// every entry leaves it unset, so inlining it grew every
-    /// `ProviderConfig` by 50% and, with it, every async state machine
-    /// that holds one across an await. That was enough to overflow the
-    /// Pingora proxy thread's stack on the AI request path.
+    // Boxed deliberately, and a plain comment rather than rustdoc
+    // because this rustdoc ships as the operator-facing schema
+    // description and an operator does not care where the bytes live.
+    // `AwsSigV4Config` is 256 bytes and almost every entry leaves it
+    // unset, so inlining it grew every `ProviderConfig` by 50% and,
+    // with it, every async state machine holding one across an await.
+    // That was enough to overflow the Pingora worker thread's stack on
+    // the AI request path.
     pub aws_sigv4: Option<Box<crate::aws_sigv4::AwsSigV4Config>>,
 }
 
