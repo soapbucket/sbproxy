@@ -119,7 +119,7 @@ Field tables for each: [configuration.md#websocket](configuration.md#websocket),
 
 **A body-reading policy turns off streaming for the whole origin.** `content_digest`, `request_validator`, `openapi_validation`, `body_threat_protection`, and body-aware `prompt_injection_v2` all need the complete request body, so the proxy holds every request chunk until the client half-closes. A unary call half-closes immediately and is unaffected. A streaming call does not: it waits for a response that cannot arrive until it stops sending, and the call stalls until the client's deadline expires. Nothing refuses this composition at config load today, and the symptom reads like an upstream fault. Attach body-reading policies to the HTTP origins that need them, not to a `grpc` origin that carries streaming methods.
 
-**No HTTP/3.** gRPC requires HTTP/2 end to end; the `grpc` action returns 501 on the HTTP/3 listener.
+**No HTTP/3.** gRPC requires HTTP/2 end to end. There is no HTTP/3 listener for the `grpc` action to answer on: the `http3` config block is recognized, but enabling it is refused at config compile, and no current build boots a listener.
 
 ## Routing AI traffic
 

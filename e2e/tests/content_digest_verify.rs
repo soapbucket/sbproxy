@@ -449,13 +449,14 @@ fn missing_header_with_skip_is_forwarded() {
 /// A digest-required origin pointed at TEST-NET-1 (RFC 5737 §3),
 /// reserved for documentation and routed nowhere.
 ///
-/// What the connect does depends on the host's routing table: this
-/// machine answers "no route" in about 15 ms, a machine that silently
-/// drops the SYN waits out the connect timeout instead. Either way the
-/// dial is one the proxy had no business making, so the test asserts
-/// on the two things that do not vary: the client gets the policy's
-/// verdict rather than the upstream's failure, and it gets it without
-/// waiting on a network round trip.
+/// No dial ever happens for this address, on either side of the fix:
+/// 192.0.2.0/24 is in the SSRF guard's blocked documentation ranges,
+/// so the pre-fix proxy refused it at `upstream_peer` with a 502
+/// after the policy had deferred to the body filter. What this test
+/// pins is therefore the verdict alone: the policy's own 400 must
+/// reach the client, not a 502 minted on the way toward an upstream
+/// the proxy was never going to talk to. Timing proves nothing here,
+/// so no timing is asserted.
 fn config_require_unreachable_upstream() -> String {
     r#"
 proxy:
@@ -536,12 +537,6 @@ fn missing_header_with_require_answers_without_the_upstream() {
             "the refusal must not wait on the upstream: request failed after {elapsed:?} with {e}"
         )
     });
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "a header-phase refusal must not pay for an upstream dial; \
-         took {elapsed:?} and answered {}",
-        resp.status
-    );
     assert_eq!(
         resp.status, 400,
         "the policy's own verdict must reach the client, not the upstream's failure; \
@@ -556,7 +551,7 @@ fn missing_header_with_require_answers_without_the_upstream() {
 }
 
 #[test]
-fn missing_header_with_require_honours_configured_error_body() {
+fn missing_header_with_require_honors_configured_error_body() {
     // The header-phase refusal is a different code path from the
     // body-phase one it replaces, so the operator-configured
     // `error_body` / `error_content_type` have to survive the move.

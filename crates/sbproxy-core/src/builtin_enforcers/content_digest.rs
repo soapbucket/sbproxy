@@ -97,11 +97,15 @@ impl PolicyEnforcer for ContentDigestEnforcer {
                 }
             };
             if let Some(c) = ctx.downcast_mut::<RequestContext>() {
-                // The decision below carries a status and a message.
-                // The operator's configured `error_body` and
-                // `error_content_type` ride on the context instead so
-                // the response phase can emit them byte for byte.
-                c.content_digest_denial = Some((body, content_type));
+                // The decision below carries a status and a message
+                // but not the operator's `error_body` /
+                // `error_content_type` (WOR-2528: the refusal moved
+                // from the body filter to the header phase, and both
+                // knobs had to survive the move). They ride the
+                // owner-tagged `deny_payload` slot so the response
+                // phase can emit them byte for byte, and only under
+                // this policy's own refusal.
+                c.deny_payload = Some(("content_digest", body, content_type));
                 // Without this the dispatcher labels the refusal with
                 // the generic `plugin` fallback: the metric, the audit
                 // entry, and the lookup that emits the configured
@@ -193,7 +197,8 @@ mod tests {
             "the refusal has to carry its own label or the dispatcher counts it as `plugin` \
              and drops the configured envelope"
         );
-        let (body, content_type) = ctx.content_digest_denial.expect("envelope parked on ctx");
+        let (owner, body, content_type) = ctx.deny_payload.expect("envelope parked on ctx");
+        assert_eq!(owner, "content_digest");
         assert!(body.contains("Content-Digest header required but absent"));
         assert_eq!(content_type, "application/json");
     }
@@ -207,7 +212,7 @@ mod tests {
         .await;
         assert!(matches!(decision, PolicyDecision::Allow));
         assert!(ctx.validate_request_body);
-        assert!(ctx.content_digest_denial.is_none());
+        assert!(ctx.deny_payload.is_none());
     }
 
     #[tokio::test]
@@ -262,8 +267,12 @@ mod tests {
             other => panic!("expected deny, got {other:?}"),
         }
         assert_eq!(
-            ctx.content_digest_denial,
-            Some(("digest required".to_string(), "text/plain".to_string()))
+            ctx.deny_payload,
+            Some((
+                "content_digest",
+                "digest required".to_string(),
+                "text/plain".to_string()
+            ))
         );
         assert_eq!(ctx.deny_policy_type, Some("content_digest"));
     }

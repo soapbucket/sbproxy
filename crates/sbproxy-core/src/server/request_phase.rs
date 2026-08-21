@@ -71,10 +71,15 @@ struct ConfiguredDenialResponse {
 /// `error_body` has nowhere else to put it.
 ///
 /// * `concurrent_limit` parks a body.
-/// * `content_digest` parks a body and a content type (WOR-2528),
-///   because moving its `on_missing: require` refusal out of the body
-///   filter and into the header phase had to keep `error_body` and
-///   `error_content_type` working exactly as they did before the move.
+/// * `content_digest` parks `(owner, body, content_type)` in the
+///   shared `deny_payload` slot (WOR-2528), because moving its
+///   `on_missing: require` refusal out of the body filter and into
+///   the header phase had to keep `error_body` and
+///   `error_content_type` working exactly as they did before the
+///   move. It is consumed here, ahead of the status-keyed envelope
+///   branches, so a `missing_status` that collides with one of them
+///   (402, say) still serves the operator's body rather than that
+///   branch's.
 fn take_configured_denial_response(
     ctx: &mut RequestContext,
     status: u16,
@@ -93,14 +98,19 @@ fn take_configured_denial_response(
                 body,
             })
         }
-        "content_digest" => {
-            let (body, content_type) = ctx.content_digest_denial.take()?;
-            Some(ConfiguredDenialResponse {
+        "content_digest" => match ctx.deny_payload.take() {
+            Some(("content_digest", body, content_type)) => Some(ConfiguredDenialResponse {
                 status,
                 content_type,
                 body,
-            })
-        }
+            }),
+            other => {
+                // Someone else's payload: put it back for the
+                // owner-checked renderer at the end of the deny arm.
+                ctx.deny_payload = other;
+                None
+            }
+        },
         _ => None,
     }
 }
@@ -151,7 +161,11 @@ mod configured_denial_response_tests {
         // operator's `error_body` and `error_content_type`, not the
         // generic JSON envelope the dispatcher would otherwise render.
         let mut ctx = RequestContext::new();
-        ctx.content_digest_denial = Some(("digest required".to_string(), "text/plain".to_string()));
+        ctx.deny_payload = Some((
+            "content_digest",
+            "digest required".to_string(),
+            "text/plain".to_string(),
+        ));
 
         let response = take_configured_denial_response(
             &mut ctx,
@@ -164,7 +178,7 @@ mod configured_denial_response_tests {
         assert_eq!(response.status, 428);
         assert_eq!(response.content_type, "text/plain");
         assert_eq!(response.body, "digest required");
-        assert!(ctx.content_digest_denial.is_none());
+        assert!(ctx.deny_payload.is_none());
     }
 
     #[test]
@@ -180,6 +194,21 @@ mod configured_denial_response_tests {
     fn unrelated_policies_are_untouched() {
         let mut ctx = RequestContext::new();
         assert!(take_configured_denial_response(&mut ctx, 403, "nope", "waf").is_none());
+    }
+
+    #[test]
+    fn a_mismatched_owners_payload_survives_for_the_late_renderer() {
+        let mut ctx = RequestContext::new();
+        ctx.deny_payload = Some((
+            "prompt_injection_v2",
+            "body".to_string(),
+            "text/plain".to_string(),
+        ));
+        assert!(take_configured_denial_response(&mut ctx, 400, "nope", "content_digest").is_none());
+        assert!(
+            ctx.deny_payload.is_some(),
+            "a payload owned by another policy must stay parked for the deny_payload renderer"
+        );
     }
 }
 

@@ -703,6 +703,10 @@ fn emit_graphql_validated_request_body(
 /// holding costs nothing on the wire: `proxy_h1::send_body_to_upstream`
 /// and `proxy_h2::send_body_to2` each return early when the slot holds
 /// an empty chunk and the stream has not ended.
+fn hold_request_body_chunk(body: &mut Option<Bytes>) {
+    *body = Some(Bytes::new());
+}
+
 /// Stable one-word label for a `content_digest` refusal, for the log
 /// line and the deny reason.
 ///
@@ -723,10 +727,6 @@ fn content_digest_outcome_label(
         Outcome::UnsupportedAlgorithm => "unsupported_algorithm",
         Outcome::Mismatch => "mismatch",
     }
-}
-
-fn hold_request_body_chunk(body: &mut Option<Bytes>) {
-    *body = Some(Bytes::new());
 }
 
 /// The transform that forbids skipping when the body outgrows the
@@ -5837,6 +5837,32 @@ impl ProxyHttp for SbProxy {
                                             ctx.deny_reason =
                                                 Some("content_digest: body_over_cap".to_string());
                                         }
+                                        // The header-phase refusal rides the shared
+                                        // policy-deny path and gets its
+                                        // SecurityAuditEntry there; the body-phase
+                                        // refusals emit their own or the SIEM never
+                                        // sees the tampered-body case this policy
+                                        // exists for.
+                                        sbproxy_observe::SecurityAuditEntry::policy_violation(
+                                            "content_digest",
+                                            format!(
+                                                "body_over_cap: received {}, cap {}",
+                                                representation_body.len(),
+                                                cd.max_body_bytes
+                                            ),
+                                            413,
+                                            Some(ctx.hostname.to_string()),
+                                            ctx.client_ip,
+                                            Some(ctx.request_id.to_string()),
+                                            Some(session.req_header().method.as_str().to_string()),
+                                        )
+                                        .with_tenant_id(ctx.tenant_id.to_string())
+                                        .with_key_context(
+                                            ctx.native_key_provider.clone(),
+                                            ctx.inbound_key_mode.as_str(),
+                                        )
+                                        .with_api_key_id(ctx.accountable_key_id())
+                                        .emit();
                                         failed =
                                             Some((413, body_str, "application/json".to_string()));
                                         break;
@@ -5911,6 +5937,23 @@ impl ProxyHttp for SbProxy {
                                             ctx.deny_reason =
                                                 Some(format!("content_digest: {reason}"));
                                         }
+                                        // Same SIEM parity as the over-cap refusal above.
+                                        sbproxy_observe::SecurityAuditEntry::policy_violation(
+                                            "content_digest",
+                                            reason,
+                                            envelope.0,
+                                            Some(ctx.hostname.to_string()),
+                                            ctx.client_ip,
+                                            Some(ctx.request_id.to_string()),
+                                            Some(session.req_header().method.as_str().to_string()),
+                                        )
+                                        .with_tenant_id(ctx.tenant_id.to_string())
+                                        .with_key_context(
+                                            ctx.native_key_provider.clone(),
+                                            ctx.inbound_key_mode.as_str(),
+                                        )
+                                        .with_api_key_id(ctx.accountable_key_id())
+                                        .emit();
                                         failed = Some(envelope);
                                         break;
                                     }
