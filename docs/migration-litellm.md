@@ -1,10 +1,10 @@
 # Migrating from LiteLLM
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 ![The importer translating a LiteLLM config, then a completion served through the migrated result](assets/migrate-litellm.gif)
 
-This guide moves a LiteLLM proxy deployment to SBproxy in an afternoon. Your OpenAI-format clients keep working unchanged; you translate the config once and point traffic at the new port. What replaces the Python service is the "Call any model. Serve your own. Govern both." binary: a single Apache-2.0 executable that routes to 72 providers, can serve the weights on your own GPUs, and works as a general reverse proxy at the same time, so the LLM gateway and the edge in front of it no longer have to be separate processes.
+This guide moves a LiteLLM proxy deployment to SBproxy in an afternoon. Your OpenAI-format clients keep working unchanged; you translate the config once and point traffic at the new port. What replaces the Python service is the "Call any model. Serve your own. Govern both." binary: a single Apache-2.0 executable that routes to 70 providers, can serve the weights on your own GPUs, and works as a general reverse proxy at the same time, so the LLM gateway and the edge in front of it no longer have to be separate processes.
 
 ## TL;DR
 
