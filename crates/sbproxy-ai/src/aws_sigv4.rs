@@ -667,7 +667,7 @@ impl AwsSigV4Signer {
     /// # Errors
     ///
     /// See [`AwsSigV4Error`].
-    pub async fn sign_request_at(
+    pub(crate) async fn sign_request_at(
         &self,
         request: &mut reqwest::Request,
         at: SystemTime,
@@ -776,7 +776,7 @@ impl AwsSigV4Signer {
     /// proves the clock was inside AWS's window, and a 5xx says nothing
     /// about authentication. `round_trip` is the elapsed time of the
     /// exchange, used to place the server's `Date` at the midpoint.
-    pub fn record_response_timing(
+    pub(crate) fn record_response_timing(
         &self,
         status: reqwest::StatusCode,
         headers: &reqwest::header::HeaderMap,
