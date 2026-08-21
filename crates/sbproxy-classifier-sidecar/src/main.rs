@@ -496,7 +496,7 @@ impl SidecarService {
     /// later that sheds load without the operator being able to see it.
     fn refuse(&self, rpc: &'static str, reason: RefusalReason, status: Status) -> Status {
         let total = self.refusals.record(reason);
-        if total == 1 || total % REFUSAL_LOG_INTERVAL == 0 {
+        if total == 1 || total.is_multiple_of(REFUSAL_LOG_INTERVAL) {
             tracing::warn!(
                 rpc,
                 reason = reason.as_str(),
