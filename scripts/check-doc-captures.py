@@ -100,6 +100,31 @@ MANIFEST: dict[str, dict] = {
             {"stack": "usage_bridge", "fresh_each": False, "settle_ms": 4000},
         ],
     },
+    "examples/temp-budget-override/README.md": {
+        # One ordered walkthrough, one stack (WOR-2561): spend accrues
+        # across blocks and the grant's 60-second TTL is the subject, so
+        # a fresh stack per block would reset the counters and a
+        # re-ordered replay would find the raise already lapsed.
+        "sections": [{"stack": "temp_budget_override", "fresh_each": False}],
+    },
+    "examples/transform-json-schema/README.md": {
+        # One walkthrough, one stack, no fixture: both origins are static
+        # actions, so the proxy alone is the whole stack. Marked because
+        # this page spent an unknown stretch documenting the opposite of
+        # what the code did: it recorded the generated-body fail-open as
+        # a permanent "known limitation", and no lane could tell. The
+        # example sweeps only compile the config, and the json_schema
+        # e2e case uses `type: proxy`, so the one shape that rotted was
+        # the one nothing replayed.
+        "sections": [{"stack": "transform_json_schema", "fresh_each": False}],
+    },
+    "examples/api-deprecation/README.md": {
+        # One walkthrough, one stack, no fixture: every origin in the
+        # config is a static action, so the proxy alone is the whole
+        # stack. Shared across the page because the metrics capture
+        # reads the counters the earlier per-route captures produced.
+        "sections": [{"stack": "api_deprecation", "fresh_each": False}],
+    },
     "docs/payment-settlement.md": {
         # This page is two halves with opposite needs, which is why
         # freshness is per section rather than per document.
@@ -199,6 +224,13 @@ NORMALIZERS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\bsbu-[0-9a-f]{8,}-[0-9a-f]{8,}"), "sbu-<USAGE>"),
     (re.compile(r"\b[0-9a-f]{32}\b"), "<HEX32>"),
     (re.compile(r"\b[0-9A-HJKMNP-TV-Z]{26}\b"), "<ULID>"),
+    # RFC 3339 instants: grant/expiry/created/updated stamps and audit
+    # timestamps move every run (WOR-2561's budget-override walkthrough
+    # shows several per block).
+    (
+        re.compile(r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})"),
+        "<RFC3339>",
+    ),
     (re.compile(r"\b17[0-9]{11}\b"), "<EPOCH_MS>"),
     (re.compile(r"\b1[0-9]{9}\b"), "<EPOCH_S>"),
     (re.compile(r"lnbcrt[0-9a-z]{20,}"), "lnbcrt<INVOICE>"),
@@ -389,9 +421,87 @@ def start_usage_bridge_stack(binary: Path, logs: Path) -> Stack | None:
     return stack
 
 
+def start_temp_budget_override_stack(binary: Path, logs: Path) -> Stack | None:
+    """OpenAI-shaped fixture plus the proxy with a fresh key store.
+
+    The store file is removed first so the seeded key boots with its full
+    base budget: accrued spend from a previous replay would refuse the
+    walkthrough's first request, which the page shows being admitted.
+    """
+    Path("/tmp/sbproxy-temp-budget-override.redb").unlink(missing_ok=True)
+    stack = Stack()
+    fixture_log = (logs / "temp-budget-override-fixture.log").open("w")
+    stack.procs.append(
+        subprocess.Popen(
+            [sys.executable, "examples/temp-budget-override/fixture.py"],
+            cwd=ROOT,
+            stdout=fixture_log,
+            stderr=subprocess.STDOUT,
+        )
+    )
+    time.sleep(3)
+    proxy_log = (logs / "temp-budget-override-proxy.log").open("w")
+    stack.procs.append(
+        subprocess.Popen(
+            [str(binary), "serve", "-f", "examples/temp-budget-override/sb.yml"],
+            cwd=ROOT,
+            stdout=proxy_log,
+            stderr=subprocess.STDOUT,
+            env={
+                **os.environ,
+                "SBPROXY_KEY_PEPPER": "doc-capture-pepper",
+                "SBPROXY_KEY_MASTER": "doc-capture-master",
+            },
+        )
+    )
+    if not _wait_for_http("http://127.0.0.1:8080/metrics", stack.procs):
+        stack.stop()
+        return None
+    return stack
+
+
+def start_api_deprecation_stack(binary: Path, logs: Path) -> Stack | None:
+    """Just the proxy: the example's origins are all static actions."""
+    stack = Stack()
+    proxy_log = (logs / "api-deprecation-proxy.log").open("w")
+    stack.procs.append(
+        subprocess.Popen(
+            [str(binary), "serve", "-f", "examples/api-deprecation/sb.yml"],
+            cwd=ROOT,
+            stdout=proxy_log,
+            stderr=subprocess.STDOUT,
+        )
+    )
+    if not _wait_for_http("http://127.0.0.1:8080/metrics", stack.procs):
+        stack.stop()
+        return None
+    return stack
+
+
+def start_transform_json_schema_stack(binary: Path, logs: Path) -> Stack | None:
+    """Just the proxy: both origins are static actions."""
+    stack = Stack()
+    proxy_log = (logs / "transform-json-schema-proxy.log").open("w")
+    stack.procs.append(
+        subprocess.Popen(
+            [str(binary), "serve", "-f", "examples/transform-json-schema/sb.yml"],
+            cwd=ROOT,
+            stdout=proxy_log,
+            stderr=subprocess.STDOUT,
+        )
+    )
+    if not _wait_for_http("http://127.0.0.1:8080/metrics", stack.procs):
+        stack.stop()
+        return None
+    return stack
+
+
 STACK_STARTERS = {
     "settlement": start_settlement_stack,
     "usage_bridge": start_usage_bridge_stack,
+    "temp_budget_override": start_temp_budget_override_stack,
+    "api_deprecation": start_api_deprecation_stack,
+    "transform_json_schema": start_transform_json_schema_stack,
 }
 
 

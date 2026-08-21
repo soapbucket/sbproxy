@@ -41,13 +41,35 @@ use crate::providers::ProviderFormat;
 /// borrowed body. This keeps the common OpenAI / Custom formats
 /// clone-free on the per-attempt path; only the native translators,
 /// which need an owned tree, clone.
+///
+/// The one field the OpenAI arm does not pass through is `top_k`. The
+/// canonical body is the OpenAI Chat Completions shape with three
+/// documented divergences (see `format::types`), and `top_k` is the
+/// only divergence that reaches the wire: OpenAI has no such argument
+/// and `api.openai.com` answers an unrecognized one with a 400. Every
+/// other arm resolves the divergence by mapping the field (Anthropic
+/// takes it natively, Gemini re-homes it to `generationConfig.topK`,
+/// Bedrock drops it because Converse has no top-level equivalent);
+/// the OpenAI arm resolves it by
+/// dropping it, which is also what this path did before `top_k` was
+/// honored end to end. `Custom` keeps its lossless relay contract and
+/// forwards whatever the operator's own translator expects.
 pub fn translate_request(
     format: ProviderFormat,
     path: &str,
     body: &serde_json::Value,
 ) -> (Option<serde_json::Value>, String) {
     match format {
-        ProviderFormat::OpenAi => (None, path.to_string()),
+        ProviderFormat::OpenAi => {
+            if body.get("top_k").is_some() {
+                let mut owned = body.clone();
+                if let Some(obj) = owned.as_object_mut() {
+                    obj.remove("top_k");
+                }
+                return (Some(owned), path.to_string());
+            }
+            (None, path.to_string())
+        }
         ProviderFormat::Anthropic => {
             let (b, p) = anthropic::request_to_native(body.clone(), path);
             (Some(b), p)
@@ -121,6 +143,162 @@ pub fn translate_success_response_bytes(
 /// before enabling SSE relay against a translated provider.
 pub fn requires_translation(format: ProviderFormat) -> bool {
     !matches!(format, ProviderFormat::OpenAi)
+}
+
+#[cfg(test)]
+mod upstream_body_tests {
+    //! Seam tests for the fields the hub honors but the OpenAI Chat
+    //! wire shape cannot carry verbatim.
+    //!
+    //! The canonical body is not the upstream body. `tool_choice` and
+    //! `top_k` are parsed on `/v1/messages`, emitted into the canonical
+    //! chat shape, and then have to survive one more translation before
+    //! they reach a provider. These tests drive that second leg by
+    //! name, because asserting on the canonical body alone let a
+    //! `"tool_choice": "required"` reach Anthropic (which requires an
+    //! object) and a `top_k` reach `api.openai.com` (which rejects
+    //! unrecognized arguments).
+    use super::*;
+    use serde_json::{json, Value};
+
+    /// Run an Anthropic Messages inbound body through the inbound shim
+    /// and then through one provider translator, returning the body
+    /// the gateway would actually send upstream.
+    fn upstream_body(format: ProviderFormat, inbound: Value) -> Value {
+        let canonical = crate::format::anthropic_messages::translate_anthropic_request_to_openai(
+            inbound.to_string().as_bytes(),
+            "test.sbproxy.dev",
+            None,
+        )
+        .expect("inbound Anthropic body parses");
+        let canonical: Value = serde_json::from_slice(&canonical).expect("canonical body is JSON");
+        let (translated, _path) = translate_request(format, "/v1/chat/completions", &canonical);
+        translated.unwrap_or(canonical)
+    }
+
+    fn messages_request(tool_choice: Value) -> Value {
+        json!({
+            "model": "claude-3-5-sonnet",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "what is the weather"}],
+            "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}],
+            "tool_choice": tool_choice,
+        })
+    }
+
+    #[test]
+    fn anthropic_upstream_receives_tool_choice_in_its_native_object_shape() {
+        for (inbound, expected) in [
+            (json!({"type": "any"}), json!({"type": "any"})),
+            (json!({"type": "none"}), json!({"type": "none"})),
+            (
+                json!({"type": "tool", "name": "get_weather"}),
+                json!({"type": "tool", "name": "get_weather"}),
+            ),
+        ] {
+            let out = upstream_body(ProviderFormat::Anthropic, messages_request(inbound.clone()));
+            assert_eq!(
+                out["tool_choice"], expected,
+                "Anthropic rejects a string tool_choice with a 400; sent {inbound}"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_upstream_omits_tool_choice_for_auto() {
+        let out = upstream_body(
+            ProviderFormat::Anthropic,
+            messages_request(json!({"type": "auto"})),
+        );
+        assert!(
+            out.get("tool_choice").is_none(),
+            "auto is the provider default and needs no field: {out}"
+        );
+    }
+
+    #[test]
+    fn gemini_upstream_receives_tool_choice_as_function_calling_config() {
+        let out = upstream_body(
+            ProviderFormat::Google,
+            messages_request(json!({"type": "any"})),
+        );
+        assert!(
+            out.get("tool_choice").is_none(),
+            "Gemini rejects an unknown top-level name with a 400: {out}"
+        );
+        assert_eq!(out["toolConfig"]["functionCallingConfig"]["mode"], "ANY");
+
+        let forced = upstream_body(
+            ProviderFormat::Google,
+            messages_request(json!({"type": "tool", "name": "get_weather"})),
+        );
+        assert_eq!(forced["toolConfig"]["functionCallingConfig"]["mode"], "ANY");
+        assert_eq!(
+            forced["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"],
+            json!(["get_weather"])
+        );
+
+        let disabled = upstream_body(
+            ProviderFormat::Google,
+            messages_request(json!({"type": "none"})),
+        );
+        assert_eq!(
+            disabled["toolConfig"]["functionCallingConfig"]["mode"],
+            "NONE"
+        );
+    }
+
+    #[test]
+    fn openai_format_upstreams_never_receive_top_k() {
+        // `top_k` is a documented hub divergence from the OpenAI Chat
+        // wire schema. api.openai.com answers an unrecognized argument
+        // with a 400, so the OpenAI arm resolves the divergence by
+        // dropping the field rather than forwarding it.
+        let inbound = json!({
+            "model": "claude-3-5-sonnet",
+            "max_tokens": 100,
+            "top_k": 40,
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let out = upstream_body(ProviderFormat::OpenAi, inbound);
+        assert!(
+            out.get("top_k").is_none(),
+            "top_k is not an OpenAI Chat Completions argument: {out}"
+        );
+        assert_eq!(out["max_tokens"], 100, "the rest of the body is untouched");
+    }
+
+    #[test]
+    fn native_upstreams_still_receive_top_k() {
+        let inbound = json!({
+            "model": "claude-3-5-sonnet",
+            "max_tokens": 100,
+            "top_k": 40,
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        assert_eq!(
+            upstream_body(ProviderFormat::Anthropic, inbound.clone())["top_k"],
+            40,
+            "Anthropic accepts top_k natively"
+        );
+        assert_eq!(
+            upstream_body(ProviderFormat::Google, inbound)["generationConfig"]["topK"],
+            40,
+            "Gemini re-homes top_k under generationConfig"
+        );
+    }
+
+    #[test]
+    fn a_body_without_top_k_is_still_forwarded_by_reference() {
+        let body = json!({"model": "gpt-4o", "messages": []});
+        let (translated, path) =
+            translate_request(ProviderFormat::OpenAi, "/v1/chat/completions", &body);
+        assert!(
+            translated.is_none(),
+            "the OpenAI pass-through must stay clone-free when there is nothing to strip"
+        );
+        assert_eq!(path, "/v1/chat/completions");
+    }
 }
 
 #[cfg(test)]

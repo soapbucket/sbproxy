@@ -194,7 +194,7 @@
       ]
     },
     "events": {
-      "description": "Where typed proxy events go. Absent, or present with the default `sink: none`, means the thirteen event types stay in-process and nothing leaves the proxy.",
+      "description": "Where typed proxy events go. Absent, or present with the default `sink: none`, means the eighteen event types stay in-process and nothing leaves the proxy.",
       "default": null,
       "anyOf": [
         {
@@ -8005,6 +8005,18 @@
             }
           ]
         },
+        "deprecation": {
+          "description": "RFC 9745 / RFC 8594 API deprecation announcement for the whole origin. Matching responses carry `Deprecation`, `Sunset`, and the `successor-version` / `deprecation` Link relations per what is configured; `/.well-known/openapi.json` marks the origin's operations `deprecated: true`. A forward rule's own `deprecation:` block overrides this one for the requests it matches. See [`DeprecationConfig`].",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DeprecationConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "traffic_capture": {
           "description": "Refused at config compile. Nothing ever read this block, and because it is an untyped value nothing ever validated it either: a typo inside it was indistinguishable from a correct setting. Live request mirroring is [`MirrorConfig`] under `mirror`.\n\nRetained as a parseable field so the failure names the replacement rather than reading as an unknown key.",
           "default": null
@@ -9009,6 +9021,18 @@
           "items": {
             "$ref": "#/definitions/Parameter"
           }
+        },
+        "deprecation": {
+          "description": "RFC 9745 / RFC 8594 API deprecation announcement scoped to the requests this rule matches. Overrides the origin-level `deprecation:` block for them, so `/v1/*` can be deprecated while `/v2/*` on the same origin is not. See [`DeprecationConfig`].",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DeprecationConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false
@@ -9358,6 +9382,90 @@
           "type": "string",
           "enum": [
             "header"
+          ]
+        }
+      ]
+    },
+    "DeprecationConfig": {
+      "description": "API deprecation announcement for an origin or a forward rule.\n\nWhen present, matching responses carry the standard deprecation headers: `Deprecation` (RFC 9745, an RFC 9651 structured-field Date such as `@1767225599`), `Sunset` (RFC 8594, an HTTP-date), and the `successor-version` (RFC 5829) and `deprecation` (RFC 9745) Link relations. A block at origin scope covers every route the origin serves; a block on a forward rule covers only requests that rule matches and overrides the origin block for them.\n\nSpecs: <https://www.rfc-editor.org/rfc/rfc9745.html>, <https://www.rfc-editor.org/rfc/rfc8594.html>, <https://www.rfc-editor.org/rfc/rfc5829.html>.",
+      "type": "object",
+      "properties": {
+        "deprecated": {
+          "description": "When the resource is (or will be) deprecated. A date (`2026-09-01`) or RFC 3339 timestamp (`2026-09-01T00:00:00Z`) emits `Deprecation: @<unix>`; past and future instants are both valid per RFC 9745. A bare `true` marks the route deprecated for OpenAPI emission and metrics but emits no `Deprecation` header, because RFC 9745 requires a Date value (the draft-era literal `true` did not survive into the RFC); config compile warns and suggests a date. `false` is refused: remove the block instead.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DeprecatedStamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sunset": {
+          "description": "When the resource is expected to become unresponsive. A date or RFC 3339 timestamp; emits `Sunset: <HTTP-date>` per RFC 8594. Config compile refuses a sunset earlier than `deprecated` (RFC 9745 section 3: the Sunset timestamp MUST NOT be earlier than the Deprecation one).",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "successor": {
+          "description": "URL of the successor version of this resource. Emits `Link: <url>; rel=\"successor-version\"` (RFC 5829).",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "link": {
+          "description": "URL of human-readable deprecation documentation. Emits `Link: <url>; rel=\"deprecation\"` (RFC 9745).",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "after_sunset": {
+          "description": "What happens to requests after the `sunset` instant passes. `serve` (the default) keeps handling them with the headers attached; `gone` refuses them with `410 Gone` and a JSON body naming the successor. Requires `sunset` to be set.",
+          "default": "serve",
+          "allOf": [
+            {
+              "$ref": "#/definitions/AfterSunset"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "DeprecatedStamp": {
+      "description": "The `deprecated:` field of a [`DeprecationConfig`]: either a bare boolean or a date / RFC 3339 timestamp string.",
+      "anyOf": [
+        {
+          "description": "Bare `true` (deprecated, no announced instant) or `false` (refused at config compile).",
+          "type": "boolean"
+        },
+        {
+          "description": "The deprecation instant: `YYYY-MM-DD` (midnight UTC) or an RFC 3339 timestamp.",
+          "type": "string"
+        }
+      ]
+    },
+    "AfterSunset": {
+      "description": "Post-sunset posture for a [`DeprecationConfig`].",
+      "oneOf": [
+        {
+          "description": "Keep serving requests, headers attached. The default, so a forgotten config never takes an API down by surprise.",
+          "type": "string",
+          "enum": [
+            "serve"
+          ]
+        },
+        {
+          "description": "Refuse requests with `410 Gone` once the sunset instant passes.",
+          "type": "string",
+          "enum": [
+            "gone"
           ]
         }
       ]
@@ -11252,7 +11360,7 @@
           ]
         },
         "types": {
-          "description": "Which of the thirteen event types to deliver. Empty or absent means all of them.\n\nNames are the snake_case wire names (`policy_denied`, `auth_denied`, `config_reloaded`, ...). An unrecognized name is refused with the accepted list rather than skipped, so a typo cannot present as a sink that is working and quiet.",
+          "description": "Which of the eighteen event types to deliver. Empty or absent means all of them.\n\nNames are the snake_case wire names (`policy_denied`, `auth_denied`, `config_reloaded`, ...). An unrecognized name is refused with the accepted list rather than skipped, so a typo cannot present as a sink that is working and quiet.",
           "default": [],
           "type": "array",
           "items": {

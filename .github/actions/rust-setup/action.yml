@@ -1,8 +1,8 @@
 # Shared Rust + system-package setup for SBproxy CI lanes.
 #
 # Bundles the four steps every Rust job in this repo otherwise
-# repeats: disk cleanup, stable toolchain, rust-cache, and the apt
-# packages the workspace's transitive deps need. Centralising them
+# repeats: disk cleanup, the pinned toolchain, rust-cache, and the apt
+# packages the workspace's transitive deps need. Centralizing them
 # means future runner-image churn (clang headers, protoc location,
 # disk policy) is fixed once instead of in every workflow.
 #
@@ -19,7 +19,7 @@
 # stays a setup primitive, not a workflow.
 
 name: rust-setup
-description: Stable Rust toolchain, rust-cache, and system packages for SBproxy CI.
+description: Pinned Rust toolchain, rust-cache, and system packages for SBproxy CI.
 
 inputs:
   cache-key:
@@ -58,8 +58,14 @@ runs:
       shell: bash
       run: bash "${{ github.action_path }}/reclaim-disk.sh"
 
-    - name: install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+    # rust-toolchain.toml is the single source of truth for the version,
+    # but dtolnay/rust-toolchain does not read it. The parse and the
+    # install both live in ./.github/actions/pinned-toolchain, which the
+    # lanes that own their own cache scope call directly. Delegating
+    # rather than keeping a second copy here is the point: two copies
+    # drift, and the copy CI believes would be the one nobody edits.
+    - name: install the pinned Rust toolchain
+      uses: ./.github/actions/pinned-toolchain
       with:
         components: ${{ inputs.components }}
 

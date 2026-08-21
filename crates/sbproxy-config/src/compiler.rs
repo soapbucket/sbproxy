@@ -3980,6 +3980,31 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
 
     let token_bytes_ratio = config.token_bytes_ratio;
 
+    // --- WOR-2565: compile the deprecation announcement blocks ---
+    //
+    // The origin-scope block compiles onto the snapshot; each forward
+    // rule's block is compiled here for validation only (an unparseable
+    // date, a sunset before the deprecation instant, or a `gone`
+    // posture with no sunset refuses the whole config now rather than
+    // at first request), and the runtime pipeline compiler re-runs the
+    // same function on the rule JSON to build the per-rule form.
+    let deprecation = config
+        .deprecation
+        .as_ref()
+        .map(|raw| {
+            let scope = format!("origin {hostname}");
+            crate::types::warn_dateless_deprecated(raw, &scope);
+            crate::types::compile_deprecation(raw, &scope)
+        })
+        .transpose()?;
+    for (rule_idx, rule) in config.forward_rules.iter().enumerate() {
+        if let Some(raw) = rule.deprecation.as_ref() {
+            let scope = format!("forward rule {rule_idx} on origin {hostname}");
+            crate::types::warn_dateless_deprecated(raw, &scope);
+            crate::types::compile_deprecation(raw, &scope)?;
+        }
+    }
+
     // --- WOR-193: validate agent_skills entries at config-load ---
     //
     // Reject unknown `type:` discriminators eagerly so a typo cannot
@@ -4126,6 +4151,8 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         error_pages: config.error_pages,
         problem_details: config.problem_details,
         proxy_status: config.proxy_status,
+        // WOR-2565: compiled origin-scope deprecation announcement.
+        deprecation,
         message_signatures: config.message_signatures,
         olp: config.olp,
         web_bot_auth_publish: config.web_bot_auth_publish,
@@ -9606,6 +9633,165 @@ origins:
         );
     }
 
+    // --- WOR-2565: deprecation block compilation ---
+
+    fn dep_yaml(block: &str) -> String {
+        format!(
+            r#"
+origins:
+  dep.example.com:
+    deprecation:
+{block}
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+"#
+        )
+    }
+
+    #[test]
+    fn deprecation_full_block_compiles_with_precomputed_headers() {
+        let yaml = dep_yaml(
+            "      deprecated: 2026-09-01\n      sunset: 2026-12-31T23:59:59Z\n      successor: https://api.example.com/v2/\n      link: https://developer.example.com/deprecation\n",
+        );
+        let compiled = compile_config(&yaml).expect("compile");
+        let origin = compiled.resolve_origin("dep.example.com").unwrap();
+        let dep = origin.deprecation.as_ref().expect("block compiles");
+        assert_eq!(dep.deprecation_header.as_deref(), Some("@1788220800"));
+        assert_eq!(
+            dep.sunset_header.as_deref(),
+            Some("Thu, 31 Dec 2026 23:59:59 GMT")
+        );
+        assert_eq!(
+            dep.successor.as_deref(),
+            Some("https://api.example.com/v2/")
+        );
+        assert!(!dep.gone_after_sunset, "serve is the default posture");
+    }
+
+    #[test]
+    fn deprecation_sunset_before_deprecated_fails_config_load() {
+        // RFC 9745 section 3: the Sunset timestamp MUST NOT be earlier
+        // than the Deprecation one.
+        let yaml = dep_yaml("      deprecated: 2026-09-01\n      sunset: 2026-08-31\n");
+        let err = match compile_config(&yaml) {
+            Ok(_) => panic!("compile must reject sunset earlier than deprecated"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("RFC 9745") && err.contains("dep.example.com"),
+            "error must name the rule and the origin; got: {err}"
+        );
+    }
+
+    #[test]
+    fn deprecation_unparseable_date_fails_config_load() {
+        let yaml = dep_yaml("      deprecated: next tuesday\n");
+        let err = match compile_config(&yaml) {
+            Ok(_) => panic!("compile must reject an unparseable date"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("RFC 3339") && err.contains("next tuesday"),
+            "error must name the accepted formats and the bad value; got: {err}"
+        );
+    }
+
+    #[test]
+    fn deprecation_bare_true_compiles_and_emits_no_deprecation_header() {
+        // RFC 9745 requires a Date value; the draft-era literal `true`
+        // did not survive into the RFC. The flag still compiles (it
+        // drives spec emission and metrics), announces no instant, and
+        // a configured sunset still emits.
+        let yaml = dep_yaml("      deprecated: true\n      sunset: 2027-01-01\n");
+        let compiled = compile_config(&yaml).expect("bare `true` must compile");
+        let origin = compiled.resolve_origin("dep.example.com").unwrap();
+        let dep = origin.deprecation.as_ref().expect("block compiles");
+        assert_eq!(dep.deprecation_header, None);
+        assert_eq!(dep.deprecated_at, None);
+        assert_eq!(
+            dep.sunset_header.as_deref(),
+            Some("Fri, 01 Jan 2027 00:00:00 GMT")
+        );
+    }
+
+    #[test]
+    fn deprecation_false_fails_config_load() {
+        let yaml = dep_yaml("      deprecated: false\n");
+        let err = match compile_config(&yaml) {
+            Ok(_) => panic!("compile must reject `deprecated: false`"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("remove the `deprecation:` block"),
+            "error must say what to do instead; got: {err}"
+        );
+    }
+
+    #[test]
+    fn deprecation_gone_without_sunset_fails_config_load() {
+        let yaml = dep_yaml("      deprecated: 2026-09-01\n      after_sunset: gone\n");
+        let err = match compile_config(&yaml) {
+            Ok(_) => panic!("compile must reject `gone` with no sunset"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("after_sunset") && err.contains("never take effect"),
+            "error must explain the dead posture; got: {err}"
+        );
+    }
+
+    #[test]
+    fn deprecation_empty_block_fails_config_load() {
+        let yaml = dep_yaml("      successor: https://api.example.com/v2/\n");
+        let err = match compile_config(&yaml) {
+            Ok(_) => panic!("compile must reject a block announcing nothing"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("neither `deprecated` nor `sunset`"),
+            "error must name the missing fields; got: {err}"
+        );
+    }
+
+    #[test]
+    fn forward_rule_deprecation_is_validated_at_config_compile() {
+        // The per-rule block must refuse at compile time too, not at
+        // first request through the runtime pipeline compiler.
+        let yaml = r#"
+origins:
+  dep.example.com:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    forward_rules:
+      - rules:
+          - path:
+              prefix: /v1/
+        deprecation:
+          deprecated: 2026-09-01
+          sunset: 2020-01-01
+        origin:
+          action:
+            type: static
+            status_code: 200
+            content_type: text/plain
+            body: "v1"
+"#;
+        let err = match compile_config(yaml) {
+            Ok(_) => panic!("compile must reject the rule's bad sunset"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("forward rule 0") && err.contains("RFC 9745"),
+            "error must name the rule and the reason; got: {err}"
+        );
+    }
+
     // --- Wave 4 / G4.5: Content-Signal closed-enum validation ---
 
     #[test]
@@ -10343,6 +10529,34 @@ origins:
         assert!(
             message.contains("mcp_governance_decision") && message.contains("policy_denied"),
             "and lists what is accepted: {message}"
+        );
+    }
+
+    /// WOR-2571: the five key-lifecycle kinds resolve through the same
+    /// `EventType::from_name` path as every other name, so this pins
+    /// the config boundary accepting them rather than trusting the
+    /// enum change alone. A regression here would refuse a correct
+    /// `events.types:` at compile time, which is the loudest possible
+    /// failure, but only if someone has a config that names them; this
+    /// test is that config.
+    #[test]
+    fn events_types_accept_the_key_lifecycle_kinds() {
+        let compiled = compile_config(&events_yaml(
+            "  sink: file\n  path: /var/log/sbproxy/events.ndjson\n  types:\n    \
+             - key_minted\n    - key_revoked\n    - key_rotated\n    - key_blocked\n    \
+             - credential_resolved",
+        ))
+        .expect("the key-lifecycle event names must be accepted");
+        let events = compiled.events.expect("events block survives compilation");
+        assert_eq!(
+            events.types,
+            vec![
+                "key_minted",
+                "key_revoked",
+                "key_rotated",
+                "key_blocked",
+                "credential_resolved"
+            ]
         );
     }
 

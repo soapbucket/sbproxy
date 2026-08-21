@@ -1,6 +1,6 @@
 # WAF options
 
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-20*
 
 ![A request denied by the WAF baseline inside a layered ip_filter -> ddos -> waf -> dlp stack](assets/waf-layered.gif)
 
@@ -73,7 +73,14 @@ would be a mistake, so here is the specific list.
 argument, and the one place in the proxy that calls it passes nothing. No
 multipart, no JSON, no XML, no form-encoded bodies. A payload in a POST
 body is invisible to this WAF. The `dlp` policy and the AI-gateway
-guardrails have their own body story; the WAF does not.
+guardrails have their own body story; the WAF does not. The
+`body_threat_protection` policy
+([api-security.md](api-security.md#structural-body-threat-limits)) covers the
+*structural* slice of this gap: JSON/XML nesting depth, container and string
+limits, and an XML DTD refusal. Those are shape limits with no rule engine
+behind them; they do not make the WAF's signature rules body-aware, and
+reading "structural body limits shipped" as "body inspection shipped" would
+repeat the mistake this section exists to prevent.
 
 **Normalization is one percent-decode and a plus-to-space swap.** That is
 the whole transformation pipeline. There is no null-byte stripping, no

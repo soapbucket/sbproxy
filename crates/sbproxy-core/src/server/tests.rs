@@ -192,6 +192,8 @@ fn swr_revalidation_uses_the_matching_forward_action_and_vary_headers() {
             .unwrap(),
             request_modifiers: Vec::new(),
             parameters: Vec::new(),
+            id: None,
+            deprecation: None,
         }]);
     let mut request =
         pingora_http::RequestHeader::build("GET", b"/forward/resource?view=full", None).unwrap();
@@ -1337,6 +1339,272 @@ async fn hmac_auth_unknown_key_id_is_refused_generically() {
         auth_result_label(&result)
     );
     assert!(principal.is_none());
+}
+
+// --- hmac_auth body binding ---
+//
+// The auth phase verifies the signature headers before the request body
+// has been buffered, so a signature covering `content-digest` cannot be
+// bound to any bytes there: the header value is covered, the bytes it
+// claims to describe are not. `bot_auth` defers that half of the proof
+// to the request body filter, and `hmac_auth` must do the same.
+//
+// These tests replay the production sequence by name rather than
+// asserting on the verifier in isolation, because skipping either of the
+// last two steps is exactly how the defect shipped:
+//
+//   1. `check_auth_decided`                         - auth phase, no body yet
+//   2. `arm_deferred_body_digest_binding`           - is a body proof owed?
+//   3. `trust_tier::verify_and_finalize_body_proof` - request body filter
+
+/// Where a signed request was refused, or that it survived both phases.
+#[derive(Debug, PartialEq, Eq)]
+enum SignedRequestOutcome {
+    /// Both phases accepted: the signature verified and every covered
+    /// `content-digest` matched the bytes that actually arrived.
+    Accepted,
+    /// The auth phase refused before any body was available.
+    RefusedAtAuth(String),
+    /// The auth phase accepted the headers, and the deferred
+    /// `content-digest` binding then failed against the real body.
+    RefusedAtBodyFilter,
+}
+
+/// Run `auth` over `headers` the way the request phase does, then
+/// complete any deferred body binding against the bytes the client
+/// actually sent.
+async fn run_signed_request(
+    auth: &sbproxy_modules::Auth,
+    headers: &http::HeaderMap,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> SignedRequestOutcome {
+    let (result, _principal, _trust, decided_auth_type) =
+        check_auth_decided(auth, headers, None, method, path, test_tenant(), None, None).await;
+    if !matches!(result, AuthResult::Allow { .. }) {
+        return SignedRequestOutcome::RefusedAtAuth(auth_result_label(&result));
+    }
+    let mut ctx = RequestContext::new();
+    crate::server::request_phase::arm_deferred_body_digest_binding(
+        &mut ctx,
+        &decided_auth_type,
+        headers,
+    );
+    if !crate::trust_tier::verify_and_finalize_body_proof(&mut ctx, headers, body) {
+        return SignedRequestOutcome::RefusedAtBodyFilter;
+    }
+    SignedRequestOutcome::Accepted
+}
+
+fn build_hmac_auth_provider_requiring(
+    key_id: &str,
+    secret_hex: &str,
+    required_components: &[&str],
+) -> sbproxy_modules::Auth {
+    let provider = sbproxy_modules::auth::HmacAuth::from_config(serde_json::json!({
+        "keys": [
+            {"key_id": key_id, "secret": secret_hex, "project": "billing"}
+        ],
+        "required_components": required_components,
+    }))
+    .expect("hmac provider builds");
+    sbproxy_modules::Auth::Hmac(provider)
+}
+
+/// Sign `POST <target_uri>` over `components` with a fresh `created`.
+///
+/// `content_digest`, when set, is present as a header on the request the
+/// base is reconstructed from, which is what lets the signature cover
+/// the `content-digest` component. Note that nothing here hashes a body:
+/// the signer commits to a *header value*, which is precisely why the
+/// gateway has to check that value against real bytes later.
+fn hmac_sign_post(
+    secret_hex: &str,
+    key_id: &str,
+    target_uri: &str,
+    components: &[&str],
+    content_digest: Option<&str>,
+) -> (String, String) {
+    use base64::Engine;
+    use hmac::{KeyInit, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = hmac::Hmac<Sha256>;
+
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let covered = components
+        .iter()
+        .map(|c| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let raw_input =
+        format!("sig1=({covered});created={created};keyid=\"{key_id}\";alg=\"hmac-sha256\"");
+    let entry = sbproxy_middleware::signatures::parse_signature_input(&raw_input)
+        .unwrap()
+        .pop()
+        .unwrap()
+        .1;
+    let mut builder = http::Request::builder().method("POST").uri(target_uri);
+    if let Some(digest) = content_digest {
+        builder = builder.header("content-digest", digest);
+    }
+    let req_for_signing = builder.body(bytes::Bytes::new()).unwrap();
+    let base =
+        sbproxy_middleware::signatures::build_signature_base(&req_for_signing, &entry).unwrap();
+    let key_bytes = hex::decode(secret_hex).unwrap();
+    let mut mac = HmacSha256::new_from_slice(&key_bytes).unwrap();
+    mac.update(base.as_bytes());
+    let sig = mac.finalize().into_bytes();
+    let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig);
+    (raw_input, format!("sig1=:{}:", sig_b64))
+}
+
+fn signed_headers(sig_input: &str, sig_value: &str, content_digest: &str) -> http::HeaderMap {
+    let mut headers = http::HeaderMap::new();
+    headers.insert("signature-input", sig_input.parse().unwrap());
+    headers.insert("signature", sig_value.parse().unwrap());
+    headers.insert("content-digest", content_digest.parse().unwrap());
+    headers
+}
+
+fn sha256_digest(body: &[u8]) -> String {
+    sbproxy_middleware::digest::compute_content_digest(
+        sbproxy_middleware::digest::Algorithm::Sha256,
+        body,
+    )
+}
+
+/// A signature captured over one body must not authenticate another.
+///
+/// The client signs `@method`, `@target-uri`, and `content-digest` over
+/// a transfer request. An attacker who captures that request cannot
+/// alter the covered `Content-Digest` header without breaking the
+/// signature, so the substituted body it ships is the one thing the
+/// gateway can still catch, and only if the digest is checked against
+/// the bytes that arrive.
+#[tokio::test]
+async fn hmac_auth_binds_a_body_covering_signature_to_the_body_that_arrives() {
+    const SIGNED_BODY: &[u8] = br#"{"to":"acct-1091","amount":"25.00"}"#;
+    const SUBSTITUTED_BODY: &[u8] = br#"{"to":"acct-9999","amount":"250000.00"}"#;
+
+    let secret_hex = "00112233445566778899aabbccddeeff";
+    let key_id = "svc-billing";
+    let auth = build_hmac_auth_provider(key_id, secret_hex);
+
+    let digest = sha256_digest(SIGNED_BODY);
+    let (sig_input, sig_value) = hmac_sign_post(
+        secret_hex,
+        key_id,
+        "/v1/transfer",
+        &["@method", "@target-uri", "content-digest"],
+        Some(&digest),
+    );
+    let headers = signed_headers(&sig_input, &sig_value, &digest);
+
+    let honest = run_signed_request(&auth, &headers, "POST", "/v1/transfer", SIGNED_BODY).await;
+    let replayed =
+        run_signed_request(&auth, &headers, "POST", "/v1/transfer", SUBSTITUTED_BODY).await;
+
+    assert_eq!(
+        honest,
+        SignedRequestOutcome::Accepted,
+        "a client that signs its body and then sends that body must be admitted \
+         (the same signature replayed over a substituted body was {replayed:?})"
+    );
+    assert_eq!(
+        replayed,
+        SignedRequestOutcome::RefusedAtBodyFilter,
+        "a captured signature must not authenticate a body it never covered"
+    );
+
+    // The same hole with no operator config involved: a signature whose
+    // covered digest is the empty-body one carries a body anyway. This
+    // is the shape that survives a comparison against the empty body the
+    // auth phase can offer, because there the two agree.
+    let empty_digest = sha256_digest(b"");
+    let (empty_input, empty_sig) = hmac_sign_post(
+        secret_hex,
+        key_id,
+        "/v1/transfer",
+        &["@method", "@target-uri", "content-digest"],
+        Some(&empty_digest),
+    );
+    let empty_headers = signed_headers(&empty_input, &empty_sig, &empty_digest);
+    assert_eq!(
+        run_signed_request(
+            &auth,
+            &empty_headers,
+            "POST",
+            "/v1/transfer",
+            SUBSTITUTED_BODY
+        )
+        .await,
+        SignedRequestOutcome::RefusedAtBodyFilter,
+        "a signature covering the empty-body digest must not carry a body"
+    );
+}
+
+/// `content-digest` in `required_components` must mean what the docs say.
+///
+/// The honest client sends the true digest of a real body and is
+/// admitted; a client that declares the empty-body digest and then ships
+/// a body anyway is refused. Comparing the covered digest against the
+/// empty body the auth phase can offer inverts exactly this pair.
+#[tokio::test]
+async fn hmac_auth_required_content_digest_admits_the_true_digest_and_refuses_the_empty_one() {
+    /// RFC 9530 form of SHA-256 over zero bytes. A signature covering
+    /// this value proves nothing about a body that is not empty.
+    const EMPTY_BODY_DIGEST: &str = "sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:";
+    const BODY: &[u8] = br#"{"to":"acct-9999","amount":"250000.00"}"#;
+
+    assert_eq!(
+        sha256_digest(b""),
+        EMPTY_BODY_DIGEST,
+        "pin the constant an attacker would declare"
+    );
+
+    let secret_hex = "00112233445566778899aabbccddeeff";
+    let key_id = "svc-billing";
+    let components = ["@method", "@target-uri", "content-digest"];
+    let auth = build_hmac_auth_provider_requiring(key_id, secret_hex, &components);
+
+    let true_digest = sha256_digest(BODY);
+    let (honest_input, honest_sig) = hmac_sign_post(
+        secret_hex,
+        key_id,
+        "/v1/transfer",
+        &components,
+        Some(&true_digest),
+    );
+    let honest_headers = signed_headers(&honest_input, &honest_sig, &true_digest);
+
+    let (empty_input, empty_sig) = hmac_sign_post(
+        secret_hex,
+        key_id,
+        "/v1/transfer",
+        &components,
+        Some(EMPTY_BODY_DIGEST),
+    );
+    let empty_headers = signed_headers(&empty_input, &empty_sig, EMPTY_BODY_DIGEST);
+
+    let honest = run_signed_request(&auth, &honest_headers, "POST", "/v1/transfer", BODY).await;
+    let declared_empty =
+        run_signed_request(&auth, &empty_headers, "POST", "/v1/transfer", BODY).await;
+
+    assert_eq!(
+        honest,
+        SignedRequestOutcome::Accepted,
+        "requiring content-digest must admit a client sending the true digest \
+         (the empty-body-digest declaration was {declared_empty:?})"
+    );
+    assert_eq!(
+        declared_empty,
+        SignedRequestOutcome::RefusedAtBodyFilter,
+        "declaring the empty-body digest and then sending a body must be refused"
+    );
 }
 
 // --- Auth plugin dispatch tests ---

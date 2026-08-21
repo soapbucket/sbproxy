@@ -1258,6 +1258,8 @@ const MODULE_COVERAGE: &[ModuleCoverage] = &[
     deferred("policy", "agent_class"),
     deferred("policy", "ai_crawl_control"),
     deferred("policy", "assertion"),
+    // WOR-2563: numeric limits only; no secret material in its config.
+    deferred("policy", "body_threat_protection"),
     deferred("policy", "bola"),
     deferred("policy", "concurrent_limit"),
     deferred("policy", "concurrent_limiting"),

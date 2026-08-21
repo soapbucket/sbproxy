@@ -1,6 +1,6 @@
 # OpenAPI schema validation
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-20*
 
 The `openapi_validation` policy loads an OpenAPI 3.0 document at startup and validates each incoming request body against the matching operation's `requestBody` schema. Requests whose path + method are not described in the spec, or whose `Content-Type` has no schema, are passed through untouched, with one exception: when the matched operation declares `requestBody.required: true`, a request whose `Content-Type` matches no schema is rejected rather than passed through.
 
@@ -22,6 +22,7 @@ Use it to:
 | `status` | `400` | Status code returned in `enforce` mode when validation fails. |
 | `error_body` | (auto) | Optional fixed body for the rejection response. Defaults to a JSON object naming the failing JSON pointer. |
 | `error_content_type` | `application/json` | `Content-Type` for the rejection body. |
+| `deprecation_headers` | (off) | Emit RFC 9745 `Deprecation`, RFC 8594 `Sunset`, and the successor / documentation `Link` relations on responses for operations the spec marks `deprecated: true`. The spec flag carries no date, so this block supplies the values: `deprecated`, `sunset`, `successor`, `link`, `after_sunset`, validated exactly like the route-level [`deprecation:` block](configuration.md#api-deprecation-rfc-9745--rfc-8594), which wins over this one when both cover a request. |
 
 ## How requests are matched
 
@@ -161,8 +162,10 @@ Validation runs in `request_body_filter`, which only executes for a request the
 proxy forwards. Pair `openapi_validation` with a `static` action and the policy
 compiles, appears in the verdict stream, and validates nothing: the static
 response is produced before the body is ever read, so every body is accepted.
-The same applies to the other body-reading policies, `content_digest` and
-`request_validator`.
+The same applies to `request_validator`, and to `content_digest` on every branch
+that needs the body. `content_digest`'s one header-phase branch is the exception:
+`on_missing: require` decides from the request headers, so it refuses behind a
+`static` action too.
 
 The example uses a `proxy` action for that reason. If you are testing this
 policy against a stub origin and every malformed body returns success, check

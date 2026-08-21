@@ -87,7 +87,7 @@ pub struct ConfigFile {
     #[serde(default)]
     pub request_events: Option<RequestEventsConfig>,
     /// Where typed proxy events go. Absent, or present with the default
-    /// `sink: none`, means the thirteen event types stay in-process and
+    /// `sink: none`, means the eighteen event types stay in-process and
     /// nothing leaves the proxy.
     #[serde(default)]
     pub events: Option<EventsConfig>,
@@ -699,7 +699,7 @@ pub struct EventsConfig {
     /// any host that can reach the endpoint can forge.
     #[serde(default)]
     pub signing_secret: Option<String>,
-    /// Which of the thirteen event types to deliver. Empty or absent means
+    /// Which of the eighteen event types to deliver. Empty or absent means
     /// all of them.
     ///
     /// Names are the snake_case wire names (`policy_denied`,
@@ -7689,6 +7689,15 @@ pub struct RawOriginConfig {
     /// wide branding (e.g. `acme-edge`).
     #[serde(default)]
     pub proxy_status: Option<ProxyStatusConfig>,
+    /// RFC 9745 / RFC 8594 API deprecation announcement for the whole
+    /// origin. Matching responses carry `Deprecation`, `Sunset`, and
+    /// the `successor-version` / `deprecation` Link relations per what
+    /// is configured; `/.well-known/openapi.json` marks the origin's
+    /// operations `deprecated: true`. A forward rule's own
+    /// `deprecation:` block overrides this one for the requests it
+    /// matches. See [`DeprecationConfig`].
+    #[serde(default)]
+    pub deprecation: Option<DeprecationConfig>,
     /// Refused at config compile. Nothing ever read this block, and
     /// because it is an untyped value nothing ever validated it either:
     /// a typo inside it was indistinguishable from a correct setting.
@@ -8182,6 +8191,13 @@ pub struct RawForwardRule {
     /// context as `path_params` after the matcher captures values.
     #[serde(default)]
     pub parameters: Vec<Parameter>,
+    /// RFC 9745 / RFC 8594 API deprecation announcement scoped to the
+    /// requests this rule matches. Overrides the origin-level
+    /// `deprecation:` block for them, so `/v1/*` can be deprecated
+    /// while `/v2/*` on the same origin is not. See
+    /// [`DeprecationConfig`].
+    #[serde(default)]
+    pub deprecation: Option<DeprecationConfig>,
 }
 
 /// An OpenAPI 3.0 Parameter Object declared on a forward rule.
@@ -9104,6 +9120,240 @@ pub struct ProxyStatusConfig {
     /// (e.g. `acme-edge`, `sbproxy-eu-west-1`).
     #[serde(default)]
     pub identity: Option<String>,
+}
+
+/// API deprecation announcement for an origin or a forward rule.
+///
+/// When present, matching responses carry the standard deprecation
+/// headers: `Deprecation` (RFC 9745, an RFC 9651 structured-field Date
+/// such as `@1767225599`), `Sunset` (RFC 8594, an HTTP-date), and the
+/// `successor-version` (RFC 5829) and `deprecation` (RFC 9745) Link
+/// relations. A block at origin scope covers every route the origin
+/// serves; a block on a forward rule covers only requests that rule
+/// matches and overrides the origin block for them.
+///
+/// Specs: <https://www.rfc-editor.org/rfc/rfc9745.html>,
+/// <https://www.rfc-editor.org/rfc/rfc8594.html>,
+/// <https://www.rfc-editor.org/rfc/rfc5829.html>.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeprecationConfig {
+    /// When the resource is (or will be) deprecated. A date
+    /// (`2026-09-01`) or RFC 3339 timestamp (`2026-09-01T00:00:00Z`)
+    /// emits `Deprecation: @<unix>`; past and future instants are both
+    /// valid per RFC 9745. A bare `true` marks the route deprecated for
+    /// OpenAPI emission and metrics but emits no `Deprecation` header,
+    /// because RFC 9745 requires a Date value (the draft-era literal
+    /// `true` did not survive into the RFC); config compile warns and
+    /// suggests a date. `false` is refused: remove the block instead.
+    #[serde(default)]
+    pub deprecated: Option<DeprecatedStamp>,
+    /// When the resource is expected to become unresponsive. A date or
+    /// RFC 3339 timestamp; emits `Sunset: <HTTP-date>` per RFC 8594.
+    /// Config compile refuses a sunset earlier than `deprecated`
+    /// (RFC 9745 section 3: the Sunset timestamp MUST NOT be earlier
+    /// than the Deprecation one).
+    #[serde(default)]
+    pub sunset: Option<String>,
+    /// URL of the successor version of this resource. Emits
+    /// `Link: <url>; rel="successor-version"` (RFC 5829).
+    #[serde(default)]
+    pub successor: Option<String>,
+    /// URL of human-readable deprecation documentation. Emits
+    /// `Link: <url>; rel="deprecation"` (RFC 9745).
+    #[serde(default)]
+    pub link: Option<String>,
+    /// What happens to requests after the `sunset` instant passes.
+    /// `serve` (the default) keeps handling them with the headers
+    /// attached; `gone` refuses them with `410 Gone` and a JSON body
+    /// naming the successor. Requires `sunset` to be set.
+    #[serde(default)]
+    pub after_sunset: AfterSunset,
+}
+
+/// The `deprecated:` field of a [`DeprecationConfig`]: either a bare
+/// boolean or a date / RFC 3339 timestamp string.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum DeprecatedStamp {
+    /// Bare `true` (deprecated, no announced instant) or `false`
+    /// (refused at config compile).
+    Flag(bool),
+    /// The deprecation instant: `YYYY-MM-DD` (midnight UTC) or an
+    /// RFC 3339 timestamp.
+    Date(String),
+}
+
+/// Post-sunset posture for a [`DeprecationConfig`].
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AfterSunset {
+    /// Keep serving requests, headers attached. The default, so a
+    /// forgotten config never takes an API down by surprise.
+    #[default]
+    Serve,
+    /// Refuse requests with `410 Gone` once the sunset instant passes.
+    Gone,
+}
+
+/// Compiled form of a [`DeprecationConfig`]: instants parsed, header
+/// values precomputed, so the response path stamps strings without
+/// re-formatting per request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledDeprecation {
+    /// Unix seconds of the deprecation instant. `None` for a bare
+    /// `deprecated: true` (or a sunset-only block), which emits no
+    /// `Deprecation` header.
+    pub deprecated_at: Option<i64>,
+    /// Unix seconds of the sunset instant. `None` when no `sunset:`
+    /// is configured.
+    pub sunset_at: Option<i64>,
+    /// Precomputed `Deprecation` header value (`@<unix>`, RFC 9651
+    /// structured-field Date per RFC 9745).
+    pub deprecation_header: Option<String>,
+    /// Precomputed `Sunset` header value (IMF-fixdate per RFC 8594).
+    pub sunset_header: Option<String>,
+    /// Successor-version URL, emitted as
+    /// `Link: <url>; rel="successor-version"`.
+    pub successor: Option<String>,
+    /// Deprecation-documentation URL, emitted as
+    /// `Link: <url>; rel="deprecation"`.
+    pub link: Option<String>,
+    /// When true, requests after the sunset instant get `410 Gone`.
+    pub gone_after_sunset: bool,
+}
+
+/// Parse a config-authored instant: `YYYY-MM-DD` (midnight UTC) or an
+/// RFC 3339 timestamp. Returns unix seconds.
+fn parse_config_instant(field: &str, value: &str) -> anyhow::Result<i64> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Ok(dt.timestamp());
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        let midnight = date
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| anyhow::anyhow!("{field}: {value:?} has no midnight"))?;
+        return Ok(midnight.and_utc().timestamp());
+    }
+    anyhow::bail!(
+        "{field}: {value:?} is not a date (YYYY-MM-DD) or RFC 3339 timestamp (YYYY-MM-DDTHH:MM:SSZ)"
+    )
+}
+
+/// Format unix seconds as an RFC 9110 IMF-fixdate (the `Sunset` wire
+/// form RFC 8594 requires), e.g. `Wed, 31 Dec 2025 23:59:59 GMT`.
+fn format_http_date(unix: i64) -> anyhow::Result<String> {
+    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(unix, 0)
+        .ok_or_else(|| anyhow::anyhow!("timestamp {unix} is out of range for an HTTP-date"))?;
+    Ok(dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+}
+
+/// Refuse Link-relation URLs that would corrupt the header framing.
+fn check_link_url(field: &str, scope: &str, url: &str) -> anyhow::Result<()> {
+    if url.is_empty() || url.contains(['<', '>', '"']) || url.contains(char::is_whitespace) {
+        anyhow::bail!(
+            "deprecation.{field} for {scope} must be a URL without whitespace or angle brackets; got {url:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Compile a [`DeprecationConfig`] block: parse the instants, refuse
+/// the combinations the RFCs rule out, and precompute the header
+/// strings. `scope` names the origin or forward rule in errors.
+///
+/// Refusals, each with a named reason:
+/// - an unparseable `deprecated:` or `sunset:` value,
+/// - `deprecated: false` (remove the block instead),
+/// - a `sunset` earlier than the `deprecated` instant (RFC 9745
+///   section 3 MUST NOT),
+/// - `after_sunset: gone` without a `sunset:` to pass,
+/// - a block that sets neither `deprecated` nor `sunset`.
+///
+/// A bare `deprecated: true` compiles, but emits no `Deprecation`
+/// header because RFC 9745 requires an RFC 9651 Date value and the
+/// draft-era literal `true` did not survive into the RFC. Config
+/// compile pairs this function with [`warn_dateless_deprecated`] so
+/// the operator hears about the dateless form once per load.
+pub fn compile_deprecation(
+    raw: &DeprecationConfig,
+    scope: &str,
+) -> anyhow::Result<CompiledDeprecation> {
+    let deprecated_at = match &raw.deprecated {
+        None => None,
+        Some(DeprecatedStamp::Flag(false)) => {
+            anyhow::bail!(
+                "deprecation.deprecated for {scope} is `false`; remove the `deprecation:` block instead of disabling it in place"
+            );
+        }
+        // The bare flag compiles (it still drives OpenAPI emission and
+        // metrics) but announces no instant; config compile calls
+        // [`warn_dateless_deprecated`] so the operator hears about it
+        // once per load rather than once per spec emission.
+        Some(DeprecatedStamp::Flag(true)) => None,
+        Some(DeprecatedStamp::Date(value)) => Some(parse_config_instant(
+            &format!("deprecation.deprecated for {scope}"),
+            value,
+        )?),
+    };
+
+    let sunset_at = raw
+        .sunset
+        .as_deref()
+        .map(|value| parse_config_instant(&format!("deprecation.sunset for {scope}"), value))
+        .transpose()?;
+
+    if raw.deprecated.is_none() && sunset_at.is_none() {
+        anyhow::bail!(
+            "deprecation block for {scope} sets neither `deprecated` nor `sunset`; nothing would be announced"
+        );
+    }
+    if let (Some(dep), Some(sun)) = (deprecated_at, sunset_at) {
+        if sun < dep {
+            anyhow::bail!(
+                "deprecation.sunset for {scope} is earlier than deprecation.deprecated; RFC 9745 section 3 forbids a Sunset timestamp before the Deprecation one"
+            );
+        }
+    }
+    if raw.after_sunset == AfterSunset::Gone && sunset_at.is_none() {
+        anyhow::bail!(
+            "deprecation.after_sunset for {scope} is `gone` but no `sunset:` is configured; the posture could never take effect"
+        );
+    }
+    if let Some(url) = raw.successor.as_deref() {
+        check_link_url("successor", scope, url)?;
+    }
+    if let Some(url) = raw.link.as_deref() {
+        check_link_url("link", scope, url)?;
+    }
+
+    Ok(CompiledDeprecation {
+        deprecated_at,
+        sunset_at,
+        deprecation_header: deprecated_at.map(|ts| format!("@{ts}")),
+        sunset_header: sunset_at.map(format_http_date).transpose()?,
+        successor: raw.successor.clone(),
+        link: raw.link.clone(),
+        gone_after_sunset: raw.after_sunset == AfterSunset::Gone,
+    })
+}
+
+/// Warn once about a bare `deprecated: true` in a [`DeprecationConfig`].
+///
+/// Called at config compile (never on the emission or request paths,
+/// which re-run [`compile_deprecation`] freely): the dateless form is
+/// legal but emits no `Deprecation` header, because RFC 9745 requires
+/// an RFC 9651 Date value, and an operator who wrote `true` expecting
+/// the draft-era literal deserves to hear why the header is missing.
+pub fn warn_dateless_deprecated(raw: &DeprecationConfig, scope: &str) {
+    if matches!(raw.deprecated, Some(DeprecatedStamp::Flag(true))) {
+        tracing::warn!(
+            scope = %scope,
+            "deprecation.deprecated is a bare `true`: no `Deprecation` header will be emitted, because RFC 9745 requires a date value (`Deprecation: @<unix>`); set a date, e.g. `deprecated: 2026-09-01`"
+        );
+    }
 }
 
 /// Status code spec for an [`ErrorPageEntry`]. Either a single integer

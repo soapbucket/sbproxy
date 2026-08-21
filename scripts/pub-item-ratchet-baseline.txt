@@ -486,3 +486,27 @@
 # of the test-only bucket, even though nothing about its actual
 # callers changed. Lowering to hold it rather than rephrasing the
 # comment to dodge the heuristic.
+
+# 2026-08-20 (WOR-2575): 297 -> 298. No pub item gained or lost a
+# caller. `sbproxy-ai`'s `FailureCause::fallback_trigger` is called
+# only from its own file's tests, as it was before, so it sat in the
+# "never named outside their own file" bucket. WOR-2575's routing
+# decision trace test in `crates/sbproxy-core/src/admin.rs` seeds the
+# open `detail` map with the JSON key `"fallback_trigger"` and asserts
+# on it. That string literal, inside `#[cfg(test)]` and in another
+# crate, is a bare name occurrence, which is all the grep-based
+# scanner needs to move the item into the test-only bucket. The key
+# name is the wire contract the routing-decisions view reads, so it is
+# not renamed to dodge the heuristic; same call as the 2026-08-19
+# entry above.
+
+# 2026-08-21 (WOR-2526): 298 -> 297. `ContentSecurityPolicySpec::
+# requires_per_request_build` is gone. It answered "does this CSP need
+# the per-request build path", and the answer being `false` is exactly
+# what dropped a configured `content_security_policy` whenever a
+# `headers:` array was also set: the caller took the static path, which
+# returns the array verbatim and never reaches the CSP fallback. The
+# CSP is now always built through one function, so the question has no
+# caller and no reason to be askable again. Deleting the predicate is
+# the point rather than a side effect, which is why this lowers rather
+# than gaining a caller.

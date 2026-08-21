@@ -20,12 +20,13 @@ use super::shared_admission::{SharedAdmission, SharedDecision};
 #[cfg(feature = "agent-class")]
 use super::AgentClassEnforcer;
 use super::{
-    A2AEnforcer, AgentBudgetEnforcer, AiCrawlEnforcer, AssertionEnforcer, ConcurrentLimitEnforcer,
-    ContentDigestEnforcer, CsrfEnforcer, DdosEnforcer, DlpEnforcer, ExposedCredsEnforcer,
-    ExpressionEnforcer, HttpFramingEnforcer, IpFilterEnforcer, ObjectAuthzEnforcer,
-    OpenApiValidationEnforcer, PageShieldEnforcer, PromptInjectionV2Enforcer,
-    RateLimitBudgetEnforcer, RateLimitEnforcer, RequestLimitEnforcer, RequestValidatorEnforcer,
-    SecHeadersEnforcer, SemanticConstraintEnforcer, SriEnforcer, WafEnforcer,
+    A2AEnforcer, AgentBudgetEnforcer, AiCrawlEnforcer, AssertionEnforcer,
+    BodyThreatProtectionEnforcer, ConcurrentLimitEnforcer, ContentDigestEnforcer, CsrfEnforcer,
+    DdosEnforcer, DlpEnforcer, ExposedCredsEnforcer, ExpressionEnforcer, HttpFramingEnforcer,
+    IpFilterEnforcer, ObjectAuthzEnforcer, OpenApiValidationEnforcer, PageShieldEnforcer,
+    PromptInjectionV2Enforcer, RateLimitBudgetEnforcer, RateLimitEnforcer, RequestLimitEnforcer,
+    RequestValidatorEnforcer, SecHeadersEnforcer, SemanticConstraintEnforcer, SriEnforcer,
+    WafEnforcer,
 };
 
 /// One compiled policy ready for request-phase dispatch.
@@ -162,6 +163,7 @@ fn compile_one(policy: Policy, metric_policy: &str) -> anyhow::Result<CompiledEn
         Policy::Assertion(p) => builtin(AssertionEnforcer(Arc::new(p))),
         Policy::Waf(p) => builtin(WafEnforcer(Arc::new(p))),
         Policy::RequestValidator(p) => builtin(RequestValidatorEnforcer(Arc::new(p))),
+        Policy::BodyThreatProtection(p) => builtin(BodyThreatProtectionEnforcer(Arc::new(p))),
         Policy::ContentDigest(p) => builtin(ContentDigestEnforcer(Arc::new(p))),
         Policy::ConcurrentLimit(p) => builtin(ConcurrentLimitEnforcer(Arc::new(p))),
         Policy::AiCrawl(p) => builtin(AiCrawlEnforcer(Arc::new(p))),

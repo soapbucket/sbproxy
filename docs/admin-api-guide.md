@@ -1,6 +1,6 @@
 # Admin API guide
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-20*
 
 This is the task-oriented "how do I call it" guide to the embedded admin
 server: enabling it, authenticating, and a curl cookbook for the routes
@@ -395,6 +395,20 @@ curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" \
 
 curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" \
   "${SB_ADMIN_URL}/api/requests?status=500&limit=20" | jq
+
+# Why each request was routed where it was (strategy, candidates,
+# winner, traversed fallback chain):
+curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/api/routing-decisions?strategy=fallback_chain&limit=20" | jq
+
+# Who spent what: aggregate the filtered ring by any mix of model,
+# api_key_id, tenant, and user, all at once:
+curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/api/requests/report?group_by=model,api_key_id,tenant,user" | jq
+
+# Raw export of the same filtered view (CSV or JSONL):
+curl -fsS -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/api/requests/export?format=csv&tenant=acme" -o requests.csv
 ```
 
 **Hot reload after editing `sb.yml` out of band:**

@@ -384,8 +384,12 @@ fn stamp_content_negotiation(
 /// decides it. An `InvariantViolated` is still the host's own bug and
 /// still a 500 either way.
 ///
-/// Both response paths that run transforms consult this, so the two
-/// cannot drift apart.
+/// All three response paths that run transforms consult this, so they
+/// cannot drift apart: the upstream body filter, the plugin-action
+/// response, and the locally generated (`static` / `mock`) body. The
+/// third was added last and is the reason this sentence counts them:
+/// for a while it read "both", and the path that did not consult this
+/// served an invariant violation as a `200`.
 ///
 /// [`TransformError`]: sbproxy_modules::transform::TransformError
 pub(crate) fn transform_error_is_unconditional_500(
@@ -2068,6 +2072,22 @@ async fn send_idempotency_cache_hit(
 /// escaped rather than interpolated into a hand-built JSON string. A
 /// quote or backslash in the message would otherwise break the envelope
 /// or inject sibling fields.
+/// Classify a resolved `security_headers` entry as a CSP emission, and in
+/// which mode.
+///
+/// Both response paths (proxied and generated) call this on every header
+/// the policy resolved so `sbproxy_security_headers_csp_emitted_total`
+/// counts the header that actually reaches the client rather than the one
+/// the config asked for. Those two were not the same thing before
+/// WOR-2526, and the config file could not tell you which you had.
+pub(super) fn csp_emission_mode(name: &str) -> Option<&'static str> {
+    match name {
+        "content-security-policy" => Some("enforce"),
+        "content-security-policy-report-only" => Some("report_only"),
+        _ => None,
+    }
+}
+
 pub(super) fn error_json_body(message: &str) -> String {
     serde_json::json!({ "error": message }).to_string()
 }
@@ -3000,11 +3020,14 @@ async fn check_auth_with_tls_outcome(
             // Synthesize the request shape the RFC 9421 verifier reads
             // method / target-uri / headers from, mirroring bot_auth.
             // The body is empty because auth runs before the body is
-            // buffered; the provider verifies with the safe-by-default
-            // form, so a signature covering `content-digest` on a
-            // body-bearing request fails closed rather than passing
-            // unverified (body-digest binding is the WOR-2518
-            // follow-up).
+            // buffered, so the provider verifies with the deferring form
+            // and the `content-digest` binding is completed against the
+            // real body in the request body filter, armed by
+            // `request_phase::arm_deferred_body_digest_binding`. Handing
+            // these empty bytes to the enforcing form instead compares
+            // the covered digest against zero bytes, which refuses an
+            // honest client and admits one declaring the empty-body
+            // digest.
             let target_uri = match query {
                 Some(q) if !q.is_empty() => format!("{}?{}", path, q),
                 _ => path.to_string(),
@@ -5536,6 +5559,21 @@ fn build_session_cookie(config: &sbproxy_config::SessionConfig, session_id: &str
 
 // --- Response phases for locally generated responses (WOR-2496) ---
 
+/// What the transform walk over a locally generated body produced.
+///
+/// `terminal_failure` is the `failure_posture: closed` outcome: the body
+/// the caller must serve is the substituted error, never the buffer the
+/// refused transform did not get to touch. Mirrors
+/// `PluginActionTransformOutcome`, which carries the same decision for
+/// the plugin-action path.
+pub(crate) struct GeneratedBodyTransformOutcome {
+    /// The bytes to serve.
+    pub(crate) body: Bytes,
+    /// A `closed` transform failed, so the response is a 500 and the
+    /// generated body must not be written.
+    pub(crate) terminal_failure: bool,
+}
+
 /// Apply the origin's transform chain to a locally generated response
 /// body (a `static` or `mock` action's payload) and return the
 /// transformed bytes.
@@ -5543,23 +5581,37 @@ fn build_session_cookie(config: &sbproxy_config::SessionConfig, session_id: &str
 /// Mirrors the walk the static action has always run: each transform
 /// goes through `apply_transform_with_ctx` so the per-request ctx
 /// fields (content shape, markdown projection, canonical URL, CEL
-/// header mutations) behave exactly as they do for an upstream body,
-/// and a failing transform logs a warning and continues rather than
-/// failing the response (generated bodies are operator-authored, so
-/// the closed-transform posture the upstream body filter applies has
-/// nothing untrusted to fail closed against).
+/// header mutations) behave exactly as they do for an upstream body.
+///
+/// A failing transform is routed the same way the proxied path and the
+/// plugin-action path route one, in the same order: first
+/// [`transform_error_is_unconditional_500`], which promotes a host
+/// invariant violation to a 500 whatever the posture says, and only then
+/// the transform's own `failure_posture`. The earlier reasoning for
+/// warning and continuing here was that a generated body is
+/// operator-authored, so there is nothing untrusted to fail closed
+/// against. That does not survive a bundle transform: the untrusted
+/// party is the *transform*, and a redaction transform that faults on a
+/// `static` body ships the exact string it existed to strip. `open`
+/// keeps the warn-and-continue behavior, which is what a `transforms:`
+/// entry defaults to when neither the attachment nor the bundle says
+/// otherwise.
 fn apply_origin_transforms_to_generated_body(
     pipeline: &CompiledPipeline,
     origin_idx: Option<usize>,
     ctx: &mut RequestContext,
     body: Bytes,
     content_type: &str,
-) -> Bytes {
+) -> GeneratedBodyTransformOutcome {
+    let unchanged = |body: Bytes| GeneratedBodyTransformOutcome {
+        body,
+        terminal_failure: false,
+    };
     let Some(idx) = origin_idx else {
-        return body;
+        return unchanged(body);
     };
     if idx >= pipeline.transforms.len() || pipeline.transforms[idx].is_empty() {
-        return body;
+        return unchanged(body);
     }
     let mut buf = bytes::BytesMut::from(&body[..]);
     let ratio = resolved_token_bytes_ratio(Some(&pipeline.config.origins[idx]));
@@ -5575,14 +5627,64 @@ fn apply_origin_transforms_to_generated_body(
         if let Err(e) =
             apply_transform_with_ctx(compiled_transform, &mut buf, Some(content_type), ctx)
         {
+            let transform_name = compiled_transform.transform.transform_type();
+            // Substituting the body before returning is what makes a
+            // refusal safe: the caller serves whatever is in this
+            // buffer, and serving the untransformed generated body
+            // would deliver exactly the bytes the refusal exists to
+            // withhold.
+            let refuse = |ctx: &mut RequestContext| {
+                ctx.transform_error_attribution = Some(transform_name.to_string());
+                GeneratedBodyTransformOutcome {
+                    body: Bytes::from_static(b"{\"error\":\"internal server error\"}"),
+                    terminal_failure: true,
+                }
+            };
+            // The invariant carve-out comes first, ahead of the posture,
+            // the same order `apply_plugin_action_response_transforms`
+            // and the upstream body filter use. A typed `TransformError`
+            // that is not a dynamic bundle hook's own is a host bug, not
+            // a policy outcome, so no posture admits it (WOR-168,
+            // WOR-2268). Consulting the shared predicate rather than
+            // re-deriving the rule here is the point: it is the thing
+            // that keeps the three response paths from drifting.
+            if transform_error_is_unconditional_500(compiled_transform, &e) {
+                tracing::error!(
+                    hostname = %ctx.hostname,
+                    transform = transform_name,
+                    error = %e,
+                    "generated-response transform invariant violated, returning a generic response"
+                );
+                return refuse(ctx);
+            }
+            // Read the resolved posture off the compiled transform, never
+            // the legacy `fail_on_error` wire boolean, the same way the
+            // proxied body filter does.
+            let posture = compiled_transform.failure_posture;
+            if posture == sbproxy_config::FailureMode::Closed {
+                warn!(
+                    hostname = %ctx.hostname,
+                    transform = transform_name,
+                    error = %e,
+                    failure_posture = posture.as_label(),
+                    "generated-response transform failed; response failed by failure_posture"
+                );
+                return refuse(ctx);
+            }
+            // `hostname` is not decoration here: `open` is the default
+            // posture for a `transforms:` entry, so this is the line an
+            // operator actually sees, and a config with many static
+            // origins needs it to say which one dropped a transform.
             warn!(
-                transform = compiled_transform.transform.transform_type(),
+                hostname = %ctx.hostname,
+                transform = transform_name,
                 error = %e,
+                failure_posture = posture.as_label(),
                 "generated-response transform failed, continuing"
             );
         }
     }
-    buf.freeze()
+    unchanged(buf.freeze())
 }
 
 /// Apply the response-phase policy surface to a locally generated
@@ -5604,10 +5706,12 @@ fn apply_origin_transforms_to_generated_body(
 /// 3. plugin-policy response headers accumulated during the request
 ///    phase (`AllowWithHeaders`, appended in chain order)
 /// 4. the CSRF cookie staged by the csrf enforcer
-/// 5. `assertion` policies (the body size is known exactly here, so it
+/// 5. deprecation announcement headers from the route's `deprecation:`
+///    block or a spec-driven `openapi_validation` match (WOR-2565)
+/// 6. `assertion` policies (the body size is known exactly here, so it
 ///    is passed instead of the proxied header-phase's `None`)
-/// 6. session cookie issuance from the origin's `session:` block
-/// 7. the `sri` scan over the final body (observation-only, `text/html`
+/// 7. session cookie issuance from the origin's `session:` block
+/// 8. the `sri` scan over the final body (observation-only, `text/html`
 ///    responses under an enforcing policy, identical logging and
 ///    metrics to the proxied body filter)
 ///
@@ -5652,6 +5756,12 @@ fn apply_generated_response_phases(
                 let path = session.req_header().uri.path();
                 let (headers, nonce) = sec.resolved_headers_for_request(path);
                 for (name, value) in headers {
+                    if let Some(mode) = csp_emission_mode(&name) {
+                        sbproxy_observe::metrics::record_security_headers_csp_emitted(
+                            mode,
+                            ctx.tenant_id.as_ref(),
+                        );
+                    }
                     let _ = header.insert_header(name, &value);
                 }
                 if let Some(n) = nonce {
@@ -5685,7 +5795,30 @@ fn apply_generated_response_phases(
         let _ = header.append_header("set-cookie", cookie);
     }
 
-    // 5. Assertions: observational only, never block or modify. Unlike
+    // 5. WOR-2565: deprecation announcement headers (RFC 9745
+    // `Deprecation`, RFC 8594 `Sunset`, the `successor-version` /
+    // `deprecation` Link relations). Resolved the same way the proxied
+    // response filter resolves them (forward-rule block, origin block,
+    // then a spec-driven `openapi_validation` match), so static, mock,
+    // redirect, and post-sunset 410 responses announce exactly like
+    // proxied ones. Stamped before the assertions so an assertion can
+    // observe them.
+    if let Some(resolved) = deprecation::resolved_deprecation(
+        pipeline,
+        idx,
+        ctx.forward_rule_idx,
+        ctx.openapi_deprecation.as_ref(),
+    ) {
+        for (name, value) in deprecation::response_headers(resolved.config) {
+            if name == "link" {
+                let _ = header.append_header(name, &value);
+            } else {
+                let _ = header.insert_header(name, &value);
+            }
+        }
+    }
+
+    // 6. Assertions: observational only, never block or modify. Unlike
     // the proxied header phase, the full body is in hand, so its size
     // is passed to the CEL context.
     if let Some(policies) = policies {
@@ -5731,7 +5864,7 @@ fn apply_generated_response_phases(
         }
     }
 
-    // 6. Session cookie: issue when the origin configures a `session:`
+    // 7. Session cookie: issue when the origin configures a `session:`
     // block and the client did not already present the cookie.
     {
         let origin = &pipeline.config.origins[idx];
@@ -5757,7 +5890,7 @@ fn apply_generated_response_phases(
         }
     }
 
-    // 7. SRI scan over the final body. Same gate and semantics as the
+    // 8. SRI scan over the final body. Same gate and semantics as the
     // proxied body filter: only under an enforcing policy, only for
     // text/html, observation-only (log + metric, no mutation).
     if let Some(policies) = policies {
@@ -5830,6 +5963,10 @@ pub(crate) mod model_host;
 // --- Non-proxy action handlers ---
 
 mod action_dispatch;
+/// First-class API deprecation: RFC 9745 `Deprecation`, RFC 8594
+/// `Sunset`, the Link relations, the deprecated-usage metric, and the
+/// post-sunset `gone` posture (WOR-2565).
+pub(crate) mod deprecation;
 use action_dispatch::*;
 
 // Dispatch-side glue for the MCP tool rollout plane (versioned
@@ -6069,6 +6206,201 @@ mod wor_2477_panic_containment_tests {
             panic_counter_value(policy_label),
             before + 1.0,
             "sbproxy_policy_panic_total did not rise for the panicking buffered policy"
+        );
+    }
+}
+
+/// A generated (`static` / `mock`) response body goes through the same
+/// origin transform chain a proxied body does, so a transform that
+/// faults there has to reach the same `failure_posture`.
+///
+/// Retrospective review of PR #1153 found it did not: every fault was a
+/// `warn!` and the loop continued with the untransformed buffer, so a
+/// redaction transform declared `closed` shipped the exact bytes it
+/// existed to strip.
+#[cfg(test)]
+mod generated_body_failure_posture_tests {
+    use super::*;
+    use sbproxy_config::FailureMode;
+
+    /// A `static` origin serving a secret-bearing body, with one
+    /// transform whose posture the caller picks. The transform is
+    /// replaced wholesale rather than written into the YAML so the test
+    /// controls the posture and the fault independently of what any
+    /// built-in transform's config validation allows.
+    fn static_origin_pipeline(posture: FailureMode) -> crate::pipeline::CompiledPipeline {
+        let inner =
+            sbproxy_modules::transform::HtmlToMarkdownTransform::from_config(serde_json::json!({}))
+                .expect("default html_to_markdown");
+        static_origin_pipeline_with(
+            posture,
+            sbproxy_modules::transform::Transform::HtmlToMarkdown(inner),
+        )
+    }
+
+    /// The same fixture with the transform itself supplied, so a test
+    /// can pick the *kind* of fault as well as the posture.
+    fn static_origin_pipeline_with(
+        posture: FailureMode,
+        transform: sbproxy_modules::transform::Transform,
+    ) -> crate::pipeline::CompiledPipeline {
+        const YAML: &str = r#"
+origins:
+  "status.example":
+    action:
+      type: static
+      status: 200
+      content_type: text/plain
+      body: "placeholder"
+"#;
+        let config = sbproxy_config::compile_config(YAML).expect("fixture config");
+        let mut pipeline =
+            crate::pipeline::CompiledPipeline::from_config(config).expect("fixture pipeline");
+        pipeline.transforms = vec![vec![sbproxy_modules::transform::CompiledTransform {
+            transform,
+            content_types: Vec::new(),
+            failure_posture: posture,
+            max_body_size: 1024,
+        }]];
+        pipeline
+    }
+
+    /// A linked (not bundle-supplied) transform with a host-side bug.
+    /// `dispatch_plugin` turns the unwind into
+    /// `TransformError::Plugin`, and because the plugin declares no
+    /// posture of its own, `transform_error_is_unconditional_500` says
+    /// no posture may admit it.
+    struct PanickingLinkedTransform;
+
+    impl sbproxy_plugin::TransformHandler for PanickingLinkedTransform {
+        fn transform_type(&self) -> &str {
+            "wor168_panicking_transform"
+        }
+
+        fn apply<'a>(
+            &'a self,
+            _body: &'a mut bytes::BytesMut,
+            _content_type: Option<&'a str>,
+            _ctx: &'a sbproxy_plugin::TransformContext,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = sbproxy_plugin::PluginResult<()>> + Send + 'a>,
+        > {
+            Box::pin(async { panic!("host invariant violated") })
+        }
+    }
+
+    /// Invalid UTF-8 makes `html_to_markdown` fault deterministically
+    /// and synchronously. It stands in for the failure scenario's
+    /// budget-exceeded Rego scrub: what matters is that the transform
+    /// returned an error without touching the body.
+    const SECRET_BODY: &[u8] = b"\xffbuild=abcdef1 key=sk-live-9f2c0a4b";
+
+    #[test]
+    fn a_closed_transform_that_faults_on_a_generated_body_refuses_to_serve_it() {
+        let pipeline = static_origin_pipeline(FailureMode::Closed);
+        let mut ctx = RequestContext::new();
+
+        let outcome = apply_origin_transforms_to_generated_body(
+            &pipeline,
+            Some(0),
+            &mut ctx,
+            Bytes::from_static(SECRET_BODY),
+            "text/plain",
+        );
+
+        assert!(
+            outcome.terminal_failure,
+            "a closed transform's fault must fail the generated response"
+        );
+        assert!(
+            !outcome.body.windows(7).any(|window| window == b"sk-live"),
+            "the untransformed body must not reach the client: {:?}",
+            outcome.body
+        );
+        assert_eq!(
+            ctx.transform_error_attribution.as_deref(),
+            Some("html_to_markdown"),
+            "the refusal must name the transform that caused it"
+        );
+    }
+
+    #[test]
+    fn an_open_transform_that_faults_on_a_generated_body_still_continues() {
+        let pipeline = static_origin_pipeline(FailureMode::Open);
+        let mut ctx = RequestContext::new();
+
+        let outcome = apply_origin_transforms_to_generated_body(
+            &pipeline,
+            Some(0),
+            &mut ctx,
+            Bytes::from_static(SECRET_BODY),
+            "text/plain",
+        );
+
+        assert!(
+            !outcome.terminal_failure,
+            "an open transform's fault admits, exactly as it did before"
+        );
+        assert_eq!(
+            outcome.body.as_ref(),
+            SECRET_BODY,
+            "an open posture passes the untransformed body through unchanged"
+        );
+        assert!(ctx.transform_error_attribution.is_none());
+    }
+
+    /// A typed `TransformError` from a host-side bug is a 500 whatever
+    /// the posture says, because the operator's `open` is a statement
+    /// about the transform's own failures and not about the proxy's.
+    ///
+    /// The upstream body filter and the plugin-action path have both
+    /// held this since WOR-168; the generated-body path was the one that
+    /// did not, so an `open` invariant violation on a `static` origin
+    /// served the untransformed body with a `200` while the identical
+    /// config on a `type: proxy` origin got the 500.
+    #[test]
+    fn an_open_transform_whose_host_invariant_breaks_is_still_a_500_on_a_generated_body() {
+        let pipeline = static_origin_pipeline_with(
+            FailureMode::Open,
+            sbproxy_modules::transform::Transform::Plugin(
+                sbproxy_modules::PluginTransform::linked(Box::new(PanickingLinkedTransform)),
+            ),
+        );
+        let mut ctx = RequestContext::new();
+
+        let outcome = apply_origin_transforms_to_generated_body(
+            &pipeline,
+            Some(0),
+            &mut ctx,
+            Bytes::from_static(SECRET_BODY),
+            "text/plain",
+        );
+
+        assert!(
+            outcome.terminal_failure,
+            "an invariant violation is a 500 under every posture, `open` included"
+        );
+        assert!(
+            !outcome.body.windows(7).any(|window| window == b"sk-live"),
+            "the untransformed body must not reach the client: {:?}",
+            outcome.body
+        );
+        assert_eq!(
+            ctx.transform_error_attribution.as_deref(),
+            Some("wor168_panicking_transform"),
+        );
+    }
+
+    /// The same predicate, asked directly, so the test above cannot go
+    /// green for the wrong reason (an `open` posture that started
+    /// refusing everything would also pass it).
+    #[test]
+    fn an_ordinary_open_transform_fault_is_not_promoted() {
+        let pipeline = static_origin_pipeline(FailureMode::Open);
+        let compiled = &pipeline.transforms[0][0];
+        assert!(
+            !transform_error_is_unconditional_500(compiled, &anyhow::anyhow!("plain failure")),
+            "an untyped failure is the transform's own, and `open` admits it"
         );
     }
 }

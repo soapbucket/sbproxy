@@ -26,7 +26,7 @@ proxy:
     failure_posture: closed
     seed:
       keys:
-        - key_id: seed0001
+        - key_id: a1b2c3d4e5f60789
           secret: demo-secret-please-rotate
           name: seeded-demo-key
           max_requests_per_minute: 60

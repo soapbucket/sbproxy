@@ -495,6 +495,56 @@ pub fn record_price_source(source: &str) {
     AI_PRICE_SOURCE.with_label_values(&[source]).inc();
 }
 
+// --- Inbound-translation lossiness (WOR-2535) ---
+
+static AI_TRANSLATION_DROPPED: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_translation_dropped_total",
+            "Request fields dropped while translating an inbound AI body to the canonical chat shape"
+        ),
+        &["surface", "field"]
+    )
+    .unwrap()
+});
+
+/// Record `count` dropped request fields of one class at an
+/// inbound-translation seam (WOR-2535). `surface` is the inbound
+/// surface label from `AiSurface::label` (`messages`, `responses`), so
+/// the series joins `sbproxy_ai_surface_requests_total` on the same
+/// label values; `field` is the note's bounded `metric_label` class
+/// (`anthropic.messages.content`, `responses.tools`, ...), never the
+/// client-derived detail (see `LossinessNote::metric_label`). Both
+/// still pass the workspace cardinality limiter as a backstop, so a
+/// future call site that leaks an open value demotes to `__other__`
+/// instead of minting unbounded series.
+///
+/// Callers fold their notes per class and pass a count rather than
+/// calling once per note: the note count is bounded only by request
+/// body size, and the limiter round trips plus label allocations of a
+/// per-note loop are a client-reachable cost on the request path
+/// (WOR-2535 review).
+pub fn record_translation_dropped(surface: &str, field: &str, count: u64) {
+    if count == 0 {
+        return;
+    }
+    let metric = "sbproxy_ai_translation_dropped_total";
+    let surface = sbproxy_observe::metrics::sanitize_label_budget(metric, "surface", surface);
+    let field = sbproxy_observe::metrics::sanitize_label_budget(metric, "field", field);
+    AI_TRANSLATION_DROPPED
+        .with_label_values(&[&surface, &field])
+        .inc_by(count as f64);
+}
+
+/// Current value of the translation-drop counter for one label pair,
+/// for asserting deltas in unit tests.
+#[cfg(test)]
+pub(crate) fn translation_dropped_value(surface: &str, field: &str) -> u64 {
+    AI_TRANSLATION_DROPPED
+        .with_label_values(&[surface, field])
+        .get() as u64
+}
+
 // --- Shadow supervisor metrics ---
 
 static AI_SHADOW_INFLIGHT: LazyLock<Gauge> = LazyLock::new(|| {

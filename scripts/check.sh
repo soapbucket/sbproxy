@@ -89,8 +89,9 @@ print_skip_summary() {
   else
     printf '\033[1;33mSKIPPED PHASES (these did NOT run):\033[0m\n'
     printf '%s' "$SKIPPED"
-    printf '\033[1;33mCI runs every one of these. A skip here is a lane you\n'
-    printf 'have not actually checked on this machine.\033[0m\n'
+    printf '\033[1;33mA skip here is a lane you have not actually checked on\n'
+    printf 'this machine. Most of these have a CI lane behind them; do not\n'
+    printf 'assume all of them do.\033[0m\n'
   fi
   printf '\033[1;33m========================================================\033[0m\n'
 }
@@ -443,10 +444,20 @@ batch_examples_catalog() {
   PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/gen-examples-catalog.py" --check
 }
 
+# CI: review-evidence.yml runs the same fixtures before it parses a body.
+# The parser reads attacker-controlled text and decides whether a PR
+# carries review evidence, so a regression that loosened it would read
+# green in exactly the place the gate is supposed to be strict. The
+# fixtures are in-process and take under a second.
+batch_review_evidence() {
+  PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/check-review-evidence.py" --self-test
+}
+
 run_batch "generator --check drift scans" \
   batch_doc_assets "every promised doc asset exists" \
   batch_doc_configs "documentation configs match canonical examples" \
-  batch_examples_catalog "examples catalog is current"
+  batch_examples_catalog "examples catalog is current" \
+  batch_review_evidence "review-evidence parser fixtures"
 
 # Serial: the opt-in replay path spawns fixture and proxy processes on
 # real ports, and the phase records a skip on the default path.

@@ -32,6 +32,28 @@ service Echo {
   // HTTP/2 trailers (after the body), which is the case
   // `response_trailer_filter` is built to remap. (WOR-819)
   rpc HelloStreamError(EchoRequest) returns (stream EchoResponse);
+
+  // Bidirectional-streaming echo: reads a stream of requests and
+  // emits one response per request as that request arrives. This is
+  // the shape the proxy has to keep full-duplex, and the shape
+  // WOR-2524 reported as producing a corrupted length-prefix, so the
+  // e2e drives it with real interleaved traffic rather than sending
+  // every request up front.
+  rpc HelloBidi(stream EchoRequest) returns (stream EchoResponse);
+
+  // Bidirectional streaming where the SERVER finishes first: it never
+  // reads the request stream and terminates the call immediately with
+  // UNIMPLEMENTED. This is the shape gRPC server reflection takes when
+  // a client probes a reflection version the server does not
+  // implement, and it is what makes an HTTP/2 server discard the
+  // request half the client is still writing to.
+  rpc HelloBidiServerFirst(stream EchoRequest) returns (stream EchoResponse);
+
+  // Bidirectional streaming where the server emits one reply and then
+  // completes the response stream without ever draining the request
+  // stream. Same early-close shape as HelloBidiServerFirst, but on the
+  // success path rather than the error path.
+  rpc HelloBidiOneShot(stream EchoRequest) returns (stream EchoResponse);
 }
 
 message EchoRequest {

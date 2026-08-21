@@ -476,7 +476,7 @@ HTTP/3 is not served by this build. The `http3` shape is retained for forward co
 | `port` | int | 9090 | Listen port |
 | `username` | string | "admin" | Top-level admin HTTP Basic username |
 | `password` | string | "changeme" | Top-level admin HTTP Basic password. The default is rejected when the surface is reachable off loopback (see below) |
-| `max_log_entries` | int | 1000 | Recent-request log buffer size |
+| `max_log_entries` | int | 1000 | Recent-request log buffer size; the routing-decisions ring shares this cap |
 | `rate_limit_per_minute` | int | 240 | Admin API requests allowed per client IP per minute; the global cap across all clients is ten times this value. Valid range 1 to 100000; 0 is rejected because the limiter cannot be turned off |
 | `bind` | string | "127.0.0.1" | Bind address; set to `0.0.0.0` or an interface for remote admin. Must be an IP address literal; a value that does not parse is a validation error, not a silent fall back to loopback |
 | `allow_ips` | list | empty | IP / CIDR allowlist; empty keeps the loopback-only default (an empty list denies every non-loopback peer, it does not permit all) |
@@ -1106,6 +1106,7 @@ origins:
 | `error_pages` | list | | Custom error pages matching one status code or an explicit list of status codes. |
 | `problem_details` | object | | RFC 9457 `application/problem+json` default renderer. Composes with `error_pages`. |
 | `proxy_status` | object | | RFC 9209 `Proxy-Status` response-header configuration. |
+| `deprecation` | object | | RFC 9745 `Deprecation` + RFC 8594 `Sunset` announcement for every route this origin serves. Also accepted per forward rule, where it overrides this block. See [API deprecation](#api-deprecation-rfc-9745--rfc-8594). |
 | `traffic_capture` | object | | Not supported. Setting it fails config load. Use `mirror` for live request mirroring. |
 | `message_signatures` | object | | RFC 9421 HTTP message signatures. |
 | `olp` | object | | RSL Open License Protocol token issuer and public-key endpoints. |
@@ -1518,7 +1519,7 @@ action:
 
 ### websocket
 
-Proxy WebSocket connections for real-time applications, chat systems, and streaming APIs. The action forwards the `Upgrade` request through the normal auth/policy/transform pipeline and then relays bytes transparently once the upstream answers `101`; it does not inspect frames after that point. See [websocket.md](websocket.md) for upgrade semantics and which of the two fields below are actually enforced today.
+Proxy WebSocket connections for real-time applications, chat systems, and streaming APIs. The action forwards the `Upgrade` request through the normal auth/policy/transform pipeline, and once the upstream answers `101` it relays bytes in both directions while parsing frame headers on the pipe: it never reads or buffers payload bytes, but it does enforce `max_message_size`, RFC 6455's 125-byte control-frame limit, and the `subprotocols` allowlist. See [websocket.md](websocket.md) for upgrade semantics and the exact enforcement points.
 
 ```yaml
 origins:
@@ -2537,8 +2538,8 @@ use for encrypted tokens: `RSA-OAEP` and `RSA-OAEP-256` key
 unwrap with an RSA private key, and `ECDH-ES` direct key
 agreement with a P-256 EC private key, all with `A256GCM`
 content encryption. Anything else, including the deprecated
-`RSA1_5`, is refused (debug-level logs name the offending
-algorithm).
+`RSA1_5`, is refused. The refusal is logged at `info`, which
+survives the release build, and names the offending algorithm.
 
 Failure handling is deliberately uniform: wrong key, garbage
 ciphertext, an unsupported algorithm, or a tampered tag all
@@ -2630,7 +2631,7 @@ origins:
 | `type` | string | required | Must be `hmac_auth`. |
 | `keys` | list | required | Accepted signing keys, at least one. Each entry needs a unique `key_id` (the RFC 9421 `keyid` the signer advertises) and a `secret`. Entries also accept the per-credential metadata fields (`project`, `user`, `team`, `tags`, `metadata`). |
 | `clock_skew_seconds` | int | 300 | Freshness window for the mandatory `created` signature parameter, applied in both directions. A `created` older than the window is refused as a replay; one further in the future is refused as skewed. |
-| `required_components` | list | `["@method", "@target-uri"]` | Components every accepted signature must cover. The default binds the verb and the path-and-query, so a captured signature cannot be replayed elsewhere. |
+| `required_components` | list | `["@method", "@target-uri"]` | Components every accepted signature must cover. The default binds the verb and the path-and-query, so a captured signature cannot be replayed against a different route. Add `content-digest` to bind the request body as well. |
 
 The `secret` resolves through the secret resolver like every other signing-key field: an inline literal, `${VAR}`, `env:NAME`, `file:PATH`, or a backend URI such as `vault://...`. A reference nothing can resolve refuses to boot rather than becoming the key. Verification failures answer `401` with a `WWW-Authenticate: Signature` challenge that carries no key material, and the failure reason is logged, never returned to the client.
 
@@ -2641,7 +2642,21 @@ Signature-Input: sig1=("@method" "@target-uri");created=1723800000;keyid="svc-bi
 Signature: sig1=:BASE64_HMAC_SHA256_OF_SIGNATURE_BASE:
 ```
 
-On a match the principal's `sub` is the `key_id`, `principal_kind` is `hmac_auth`, and the entry's metadata rides along for per-credential reporting. A signature that covers `content-digest` is checked against the request body available at the auth phase, which is empty, so body-covering signatures on body-bearing requests are refused rather than passed unverified; body-digest binding is a tracked follow-up. See [`examples/auth-hmac/`](../examples/auth-hmac/) for a complete working config with a signing script.
+On a match the principal's `sub` is the `key_id`, `principal_kind` is `hmac_auth`, and the entry's metadata rides along for per-credential reporting.
+
+The default components bind the verb and the route, not the body. A signature over `("@method" "@target-uri")` alone says nothing about the bytes that follow it, so a request captured off the wire can be replayed with a different body until its `created` timestamp falls outside `clock_skew_seconds`. Covering `content-digest` is what closes that:
+
+```text
+Content-Digest: sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:
+Signature-Input: sig1=("@method" "@target-uri" "content-digest");created=1723800000;keyid="svc-billing";alg="hmac-sha256"
+Signature: sig1=:BASE64_HMAC_SHA256_OF_SIGNATURE_BASE:
+```
+
+The check runs in two steps, because authentication happens before the proxy has read the body. The signature base binds the `Content-Digest` header value; the proxy then buffers the request body, hashes it, and answers `401` if the hash and the header disagree. Put `content-digest` in `required_components` to make that binding mandatory, and a signature that omits it is refused before the body is read.
+
+Buffering is what makes the second step possible, so a body-covering signature caps the request at the 8 MiB request-body buffer. A larger body answers `413`. Leave `content-digest` out of the covered components for routes that carry more than that, and accept that those routes are not body-bound.
+
+See [`examples/auth-hmac/`](../examples/auth-hmac/) for a complete working config with a signing script.
 
 ### forward_auth
 
@@ -2707,7 +2722,21 @@ Three behaviors are deliberate:
 - **Directory unreachable fails closed.** A dial failure, TLS failure, or timeout refuses the request with a `503`; wrong credentials get a `401`. An LDAP outage therefore reads as an outage, and requests are never admitted unchecked.
 - **Empty passwords are refused locally.** RFC 4513 defines a name-plus-empty-password simple bind as an *unauthenticated* bind, which many directories answer with success; the proxy refuses it without consulting the directory.
 
-Like `forward_auth`, and unlike the static-credential providers, this adds one network round-trip to the directory per request. Bind results are not cached: a cached bind would keep accepting a password the directory has already revoked or rotated. Budget `timeout_secs` for the directory's real latency.
+Like `forward_auth`, and unlike the static-credential providers, this dials out on the request hot path. That is a latency cost, and it is also an exposure: authentication runs before an origin's `policies:` are evaluated, so a `rate_limit` or `ddos` policy you write for the origin cannot cap what this provider dials. Without a bound of its own, anyone who can send an `Authorization: Basic` header drives one directory bind per HTTP request, which makes the gateway a 1:1 amplifier pointed at your directory and hands an attacker directory-side account lockout for any username they can guess.
+
+Three bounds run before the dial. None of them caches a success, so none extends a credential's life past a revocation or a password change:
+
+| Bound | Value | What it stops |
+|-------|-------|---------------|
+| Refused-credential cache | 30s | A credential the directory already refused is refused locally instead of dialing again. Keyed on a salted hash of the exact username and password, so it can match nothing else. |
+| Per-username failed-bind budget | 5 failures per 60s, then 1 bind per 12s | A username under password guessing drops from as fast as the attacker can send to the budget's rate. A successful bind clears it. Past the budget the directory is still consulted, just less often, so this slows guessing rather than stopping it. |
+| Outbound concurrency cap | 32 binds in flight | A burst cannot hold open an unbounded number of directory connections for `timeout_secs` each. Over the cap, requests are refused as unavailable. |
+
+Only a refusal the directory itself returned spends a budget. An empty password, which is refused locally without dialing, does not.
+
+The budget throttles, it does not block, and that is deliberate. A budget that blocked would let anyone who knows a username spend it with five wrong guesses and have every later request refused, the owner's correct password included, which trades an attack on your directory for an attack on your users. Past the budget a request waits for the next slot instead, and a throttled request answers `503`, not `401`: the proxy has not asked the directory and does not know whether the credential is good, so it does not claim the password was wrong.
+
+Two things these bounds do not do. An attacker who cycles through *distinct* usernames pays one bind per new name, because a per-username budget cannot see across names. And because the throttle still lets failures through at the budget's rate, a determined attacker can still drive a targeted username toward a directory-side lockout, just far more slowly. Neither is fixable here: both need a limit that runs before authentication, which today means a network-level or upstream rate limit in front of the origin. Budget `timeout_secs` for the directory's real latency.
 
 See [examples/auth-ldap/](../examples/auth-ldap/) for a runnable setup, including a local OpenLDAP fixture.
 
@@ -2897,7 +2926,7 @@ The access log records the matched principal's source under the `principal_kind`
 
 Policies are evaluated before the action runs. They enforce rate limits, security rules, and access controls. The `policies` field is a sibling of `action` and is an array of policy objects.
 
-SBproxy ships twenty-seven policy types: `rate_limiting`, `rate_limit_budget`, `ip_filter`, `expression`, `rego`, `waf`, `ddos`, `csrf`, `security_headers`, `request_limit`, `sri`, `assertion`, `request_validator`, `content_digest`, `concurrent_limit`, `ai_crawl_control`, `object_authz`, `exposed_credentials`, `page_shield`, `dlp`, `openapi_validation`, `prompt_injection_v2`, `http_framing`, `agent_class`, `a2a`, `semantic_constraint`, and `agent_budget`. This page documents the most common ones; the rest have their own pages.
+SBproxy ships twenty-eight policy types: `rate_limiting`, `rate_limit_budget`, `ip_filter`, `expression`, `rego`, `waf`, `ddos`, `csrf`, `security_headers`, `request_limit`, `sri`, `assertion`, `request_validator`, `body_threat_protection`, `content_digest`, `concurrent_limit`, `ai_crawl_control`, `object_authz`, `exposed_credentials`, `page_shield`, `dlp`, `openapi_validation`, `prompt_injection_v2`, `http_framing`, `agent_class`, `a2a`, `semantic_constraint`, and `agent_budget`. This page documents the most common ones; the rest have their own pages.
 
 ### rate_limiting
 
@@ -3065,6 +3094,7 @@ policies:
 | `status` | int | 400 | Status returned in `enforce` mode on validation failure. |
 | `error_body` | string | auto | Optional rejection body. Defaults to a JSON object naming the failing JSON pointer. |
 | `error_content_type` | string | `application/json` | `Content-Type` for the rejection body. |
+| `deprecation_headers` | object | off | Emit RFC 9745 / RFC 8594 deprecation headers on responses for operations the loaded spec marks `deprecated: true`. Same fields as the route-level block minus the spec flag: `deprecated`, `sunset`, `successor`, `link`, `after_sunset`. The spec flag carries no date, so this block supplies the values. A route-level `deprecation:` block wins over it. See [API deprecation](#api-deprecation-rfc-9745--rfc-8594). |
 
 OpenAPI path templates compile to anchored regexes at startup; per-operation schemas compile once. The rejection body lists only the offending JSON pointer, not the value itself, to keep the surface area an attacker can probe small.
 
@@ -3378,7 +3408,9 @@ policies:
         value: strict-origin-when-cross-origin
       - name: Permissions-Policy
         value: "camera=(), microphone=(), geolocation=()"
-    # Optional: detailed CSP block for nonce / dynamic routes only.
+    # Optional: the Content-Security-Policy, set here rather than as a
+    # `headers:` entry when you want a nonce, report-only mode, a report
+    # URI, or per-route overrides.
     content_security_policy:
       policy: "default-src 'self'; script-src 'self' https://cdn.example.com"
       enable_nonce: false
@@ -3386,13 +3418,17 @@ policies:
       report_uri: ""
 ```
 
-`headers` is a list of `{name, value}` pairs for any response header (HSTS, Cross-Origin-*, COEP/COOP/CORP, Referrer-Policy, Permissions-Policy, and so on). The optional `content_security_policy` block is for advanced CSP behavior only: per-request nonce injection, report-only mode, per-route overrides. For a plain CSP without nonce or dynamic routes, add a `Content-Security-Policy` entry to `headers` directly.
+`headers` is a list of `{name, value}` pairs for any response header (HSTS, Cross-Origin-*, COEP/COOP/CORP, Referrer-Policy, Permissions-Policy, and so on). The optional `content_security_policy` block sets the Content-Security-Policy and adds what a `{name, value}` pair cannot express: per-request nonce injection, report-only mode, a report URI, and per-route overrides.
+
+The two compose. A `content_security_policy` block ships alongside a `headers` array, and every knob on it applies whether or not `enable_nonce` is set. Set the CSP in one place or the other, not both: the block is the single source of truth for that header, and a config that also puts a `Content-Security-Policy` entry in `headers` is refused at compile rather than having one of them dropped quietly. A plain static policy is fine either way, as a `headers` entry or as `content_security_policy: "default-src 'self'"`.
+
+Each emitted policy increments `sbproxy_security_headers_csp_emitted_total`, labeled by `mode` (`enforce` or `report_only`) and tenant. If you configured a CSP and that series sits at zero, the header is not reaching browsers.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `type` | string | required | Must be `security_headers`. |
-| `headers` | list | `[]` | Canonical `{name, value}` pairs to inject. Takes precedence over the legacy flat fields below. |
-| `content_security_policy` | string or object | | CSP. Either a plain policy string or an object (see below). |
+| `headers` | list | `[]` | Canonical `{name, value}` pairs to inject. Supersedes the legacy flat fields below, which are logged as dropped when both are set. Composes with `content_security_policy`. |
+| `content_security_policy` | string or object | | CSP. Either a plain policy string or an object (see below). Composes with `headers`; setting the CSP in both places is refused. |
 | `x_frame_options` | string | | Legacy flat shortcut. Deprecated. |
 | `x_content_type_options` | string | | Legacy flat shortcut. Deprecated. |
 | `x_xss_protection` | string | | Legacy flat shortcut. Deprecated. |
@@ -3404,9 +3440,9 @@ When `content_security_policy` is an object, it accepts:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `policy` | string | `""` | The CSP policy string. |
+| `policy` | string | `""` | The CSP policy string. Required unless `dynamic_routes` is set: a block that can emit no header is refused at compile. |
 | `enable_nonce` | bool | false | When true, generate a per-request nonce and inject it into `script-src` / `style-src` directives. |
-| `report_only` | bool | false | When true, emit `Content-Security-Policy-Report-Only` instead of `Content-Security-Policy`. |
+| `report_only` | bool | false | When true, emit `Content-Security-Policy-Report-Only` instead of `Content-Security-Policy`. Applies whether or not `enable_nonce` is set. |
 | `report_uri` | string | `""` | Appended to the policy as `; report-uri <uri>` when set. |
 | `dynamic_routes` | map | `{}` | Per-route CSP overrides keyed by URL path. Exact key match wins, then longest matching prefix. |
 
@@ -3445,7 +3481,7 @@ policies:
 
 ### owasp_api_top10 (pack)
 
-Not one of the twenty-seven policy types above. `owasp_api_top10` is a
+Not one of the twenty-eight policy types above. `owasp_api_top10` is a
 pseudo-policy: the compiler reads it before any policy is compiled,
 expands it into the real synthesized policies and transforms named
 below, and removes this entry so it never reaches a policy module's own
@@ -4506,6 +4542,7 @@ The forward rule itself wraps the matcher list and the inline child origin to di
 |-------|------|---------|-------------|
 | `rules` | list | `[]` | Matcher entries. The rule fires when any one matches. |
 | `origin` | object | required | Inline child origin. See below. |
+| `deprecation` | object | | RFC 9745 / RFC 8594 deprecation announcement for the requests this rule matches. Overrides the origin-level block for them. Same fields as [API deprecation](#api-deprecation-rfc-9745--rfc-8594). |
 
 The `origin` object is a full child origin config plus identifying metadata:
 
@@ -4811,6 +4848,10 @@ origins:
 
 Threat protection guards against pathological JSON request bodies. When the request `Content-Type` is `application/json`, the proxy parses the body and checks it against limits on nesting depth, key count, string length, array size, and total body size. A request that exceeds any limit is rejected before it reaches the upstream.
 
+The `body_threat_protection` *policy* ([api-security.md](api-security.md#structural-body-threat-limits)) is the successor surface for this job: it adds XML limits with a DTD refusal, returns a 400 naming the violated limit instead of a blanket 413, and has an observe-only `tap` mode. Prefer the policy for new configs; this origin-level block remains for existing ones.
+
+One knob does not carry over. The policy has no body-size limit of its own, so an origin that sets `json.max_total_size` here and then deletes this block for the policy silently widens its body cap to the proxy's 8 MiB buffering bound. Move the value to `request_limit.max_body_size` before removing `threat_protection:`.
+
 ```yaml
 origins:
   "api.example.com":
@@ -4832,7 +4873,7 @@ origins:
 | `json.max_keys` | int | unlimited | Maximum number of keys in any single object. |
 | `json.max_string_length` | int | unlimited | Maximum length of any single string value. |
 | `json.max_array_size` | int | unlimited | Maximum length of any single array. |
-| `json.max_total_size` | int | `8388608` | Maximum total body size in bytes, enforced while the body streams in and before parsing. A body past the cap is rejected with `413`, so proxy memory for the scan is bounded by the cap. Unset takes the proxy's 8 MiB buffering hard cap; the same bound applies to the body-validation buffer used by `request_validator`, `openapi_validation`, `content_digest`, and body-aware `prompt_injection_v2`. |
+| `json.max_total_size` | int | `8388608` | Maximum total body size in bytes, enforced while the body streams in and before parsing. A body past the cap is rejected with `413`, so proxy memory for the scan is bounded by the cap. Unset takes the proxy's 8 MiB buffering hard cap; the same bound applies to the body-validation buffer used by `request_validator`, `openapi_validation`, `content_digest`, `body_threat_protection`, and body-aware `prompt_injection_v2`. |
 
 ---
 
@@ -4935,6 +4976,101 @@ The renderer covers both error sources:
   `connection_timeout`, `tls_protocol_error`, `connection_terminated`,
   `http_request_error`) so downstream tooling can break down by
   failure mode without scraping the body.
+
+---
+
+## API deprecation (RFC 9745 + RFC 8594)
+
+The `deprecation` block announces that a route is going away, on the
+wire, where clients and SDKs can see it. Responses from a covered route
+carry the standard headers:
+
+- `Deprecation: @1788220800` (RFC 9745, an RFC 9651 structured-field
+  Date; past means "was deprecated", future means "will be")
+- `Sunset: Thu, 31 Dec 2026 23:59:59 GMT` (RFC 8594, when the resource
+  is expected to stop responding)
+- `Link: <url>; rel="successor-version"` (RFC 5829, where to migrate)
+- `Link: <url>; rel="deprecation"` (RFC 9745, human documentation)
+
+The block is accepted at two scopes. On the origin it covers every
+route the origin serves. On a forward rule it covers only requests
+that rule matches and overrides the origin block for them, which is
+how `/v1/*` gets deprecated while `/v2/*` on the same origin stays
+clean. The headers ride proxied and locally generated (`static`,
+`mock`, `redirect`) responses alike.
+
+```yaml
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://backend.internal
+    forward_rules:
+      - rules:
+          - path: { prefix: /v1/ }
+        deprecation:
+          deprecated: 2026-09-01
+          sunset: 2026-12-31T23:59:59Z
+          successor: https://api.example.com/v2/
+          link: https://developer.example.com/deprecation
+          after_sunset: serve        # or: gone
+        origin:
+          id: v1-legacy
+          action: { type: proxy, url: https://legacy.internal }
+      - rules:
+          - path: { prefix: /v2/ }
+        origin:
+          id: v2
+          action: { type: proxy, url: https://backend.internal }
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `deprecated` | date or bool | | When the route is (or will be) deprecated: `2026-09-01` or `2026-09-01T00:00:00Z`. Emits `Deprecation: @<unix>`. A bare `true` marks the route deprecated for OpenAPI emission and metrics but emits no header, because RFC 9745 requires a date value; config load warns and suggests one. `false` fails config load: remove the block instead. |
+| `sunset` | date | | When the route is expected to stop responding. Emits `Sunset: <HTTP-date>`. Must not be earlier than `deprecated`; config load refuses that per RFC 9745. |
+| `successor` | URL | | Where callers migrate to. Emits `Link: <url>; rel="successor-version"`. |
+| `link` | URL | | Human-readable deprecation documentation. Emits `Link: <url>; rel="deprecation"`. |
+| `after_sunset` | string | `serve` | Posture once `sunset` passes. `serve` keeps handling requests with the headers attached. `gone` refuses them with `410 Gone` and a JSON body naming `successor` and `link`, headers still attached. Requires `sunset`. |
+
+At least one of `deprecated` or `sunset` must be set. Dates are
+`YYYY-MM-DD` (midnight UTC) or RFC 3339 timestamps.
+
+Announcing is half the job; the other half is finding who has not
+migrated. Every request that resolves to a deprecated route increments
+
+```
+sbproxy_deprecated_requests_total{origin, route, past_sunset, outcome}
+```
+
+where `rule` is the forward rule's `origin.id` (or its index), the
+OpenAPI path template for a spec-driven match, or empty for a
+whole-origin block, and `past_sunset` flips to `true` once the sunset
+instant passes. A dashboard on that counter is the migration tracker.
+
+Two boundary notes. Header stamping covers proxied responses and the
+locally generated response actions (`static`, `mock`, `echo`,
+`beacon`, `redirect`); `ai_proxy` and `mcp` responses follow the same
+posture those actions have for the rest of the response-phase surface
+and are not stamped, though the counter and the `gone` refusal still
+apply to them. And a response served from the response cache replays
+the headers it was stored with but does not increment the counter,
+because a cache hit answers before the route is resolved; on a cached
+route the counter undercounts by the hit rate.
+
+The announcement also reaches the emitted OpenAPI document: operations
+on a deprecated route are marked `deprecated: true` with
+`x-sbproxy-sunset` and `x-sbproxy-successor` extensions carrying the
+same values as the wire headers. See
+[openapi-emission.md](openapi-emission.md). For the reverse direction,
+emitting headers on operations an uploaded spec already marks
+deprecated, see the `deprecation_headers` sub-block on
+[openapi_validation](#openapi_validation).
+
+Specs: <https://www.rfc-editor.org/rfc/rfc9745.html>,
+<https://www.rfc-editor.org/rfc/rfc8594.html>,
+<https://www.rfc-editor.org/rfc/rfc5829.html>.
+
+See [`examples/api-deprecation/`](https://github.com/soapbucket/sbproxy/tree/main/examples/api-deprecation).
 
 ---
 

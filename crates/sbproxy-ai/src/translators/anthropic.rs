@@ -24,6 +24,12 @@ use serde_json::{json, Map, Value};
 ///     through unchanged.
 ///   * The path is rewritten from `/v1/chat/completions` to
 ///     `/v1/messages`.
+///   * `tool_choice` is rewritten from the OpenAI spelling
+///     (`"none"` / `"auto"` / `"required"` / `{"type": "function",
+///     "function": {"name": ...}}`) into Anthropic's object form
+///     (`{"type": "none" | "auto" | "any" | "tool"}`). Anthropic
+///     rejects a bare string with a 400, so forwarding the canonical
+///     value verbatim broke every forced-tool request.
 ///   * Unsupported OpenAI knobs (`logit_bias`, `n`, `presence_penalty`,
 ///     `frequency_penalty`, `response_format`, `seed`, `user`) are
 ///     dropped. Unknown extensions pass through.
@@ -65,7 +71,19 @@ pub fn request_to_native(body: Value, path: &str) -> (Value, String) {
     obj.entry("max_tokens".to_string())
         .or_insert(Value::Number(1024.into()));
 
-    // 3. Drop OpenAI-only knobs Anthropic rejects with 400.
+    // 3. Rewrite tool_choice into Anthropic's object form. The
+    //    canonical body carries the OpenAI spelling, and Anthropic's
+    //    `/v1/messages` requires an object: a bare `"required"` or
+    //    `"none"` is a 400 `invalid_request_error`, and the nested
+    //    `{"type": "function", "function": {"name": ...}}` shape is
+    //    not one Anthropic recognizes either.
+    if let Some(choice) = obj.remove("tool_choice") {
+        if let Some(native) = anthropic_tool_choice(&choice) {
+            obj.insert("tool_choice".to_string(), native);
+        }
+    }
+
+    // 4. Drop OpenAI-only knobs Anthropic rejects with 400.
     for k in [
         "logit_bias",
         "n",
@@ -78,7 +96,7 @@ pub fn request_to_native(body: Value, path: &str) -> (Value, String) {
         obj.remove(k);
     }
 
-    // 4. Path rewrite. Translator only supports chat completions and
+    // 5. Path rewrite. Translator only supports chat completions and
     //    its native equivalent today.
     let new_path = if path.ends_with("/chat/completions") {
         path.trim_end_matches("/chat/completions")
@@ -90,6 +108,43 @@ pub fn request_to_native(body: Value, path: &str) -> (Value, String) {
     };
 
     (Value::Object(obj), new_path)
+}
+
+/// Map an OpenAI-shaped `tool_choice` onto Anthropic's object form.
+///
+/// `None` means "send nothing": `auto` is Anthropic's default when
+/// tools are offered, and a shape with no Anthropic equivalent is
+/// better omitted than forwarded as a 400. Anthropic's own object
+/// form passes through unchanged so a `/v1/messages` client on an
+/// Anthropic upstream that skips the hub round trip and one that takes
+/// it produce the same upstream body.
+fn anthropic_tool_choice(choice: &Value) -> Option<Value> {
+    if let Some(s) = choice.as_str() {
+        return match s {
+            "none" => Some(json!({"type": "none"})),
+            "required" => Some(json!({"type": "any"})),
+            "auto" => None,
+            _ => None,
+        };
+    }
+    let obj = choice.as_object()?;
+    match obj.get("type").and_then(Value::as_str) {
+        // Already Anthropic-shaped (a native body that reached this
+        // translator without a hub round trip).
+        Some("auto") => None,
+        Some("any") => Some(json!({"type": "any"})),
+        Some("none") => Some(json!({"type": "none"})),
+        Some("tool") => obj
+            .get("name")
+            .and_then(Value::as_str)
+            .map(|name| json!({"type": "tool", "name": name})),
+        Some("function") => obj
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+            .map(|name| json!({"type": "tool", "name": name})),
+        _ => None,
+    }
 }
 
 /// Convert an Anthropic Messages API response back to the OpenAI

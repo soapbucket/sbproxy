@@ -1,6 +1,6 @@
 # SBproxy dynamic key management
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-20*
 
 A virtual key is a live, governed resource, not a line of YAML. With the
 `key_management:` block enabled, you mint, revoke, and rotate inbound keys at
@@ -569,6 +569,123 @@ cache:
 
 See the runnable `examples/ai-dynamic-keys-cluster/` for a two-replica setup.
 
+## Operational metrics
+
+Key management exports four Prometheus families on `/metrics`, modeled on the operational surface Vault publishes at `/v1/sys/metrics?format=prometheus`: operation rates, resolution latency, cache effectiveness, and an audit-write-failure counter whose healthy reading is exactly zero. The fourth is the one that reaches past the key plane: it carries the admin-console action trail on the same family, because the signal is "an audit record did not reach a sink it was promised" regardless of which trail it was. Every label value is a compile-time constant chosen from the real result of the code path it describes. None is operator-supplied, so none passes through the cardinality limiter and the series counts are fixed; the caps live in the [cardinality budget table](observability.md#cardinality-budget).
+
+| Family | Labels | What moves it |
+|---|---|---|
+| `sbproxy_key_operations_total` | `operation` (mint\|update\|delete\|revoke\|block\|unblock\|rotate), `outcome` (ok\|refused\|error) | One increment per admin key-lifecycle call, counted at the dispatch seam from the status class the handler actually returned. `refused` is a 4xx the caller can fix (validation, revision conflict, rotating a revoked key); `error` means the store or governance backend failed. The two are never folded into one value, because a busy console and an outage are different facts. Keys only: `/admin/credentials` mutations are not counted on this family. |
+| `sbproxy_credential_resolution_duration_seconds` | `cache` (hit\|stale\|miss), `outcome` (ok\|refused\|error) | One observation per bound-credential resolution. `hit` is the per-generation resolved-secret cache answering fresh; `stale` is the `proxy.secrets.rotation` grace window serving the last known-good value after the backend failed to answer; `miss` ran the full keystore/vault path. `refused` covers absent, revoked/blocked, and cross-tenant records; `error` is the secret backend failing. |
+| `sbproxy_key_lookup_cache_total` | `kind` (key\|credential), `outcome` (hit\|negative_hit\|tier_hit\|miss\|error) | One increment per lookup through the TTL policy cache described above. `negative_hit` is the known-absent cache answering, reported as itself so a stampede of unknown keys stays visible. |
+| `sbproxy_audit_write_failures_total` | `channel` (key_path\|admin_path) | Key or admin-console audit emissions that did not reach a sink they were promised. The channel's series is touched at 0 on every emission, so an `increase()` alert has a baseline before the first failure; it increments only from the write path's actual result. Any nonzero value means the tamper-evident trail has a hole that cannot be backfilled, and the existing `SBPROXY-AUDIT-WRITE-FAILURE` page alert fires on the same condition across every audit channel. |
+
+Two caches sit on the credential path, and the two ratio metrics deliberately do not share a family, because they answer different capacity questions:
+
+```mermaid
+flowchart LR
+    R[Request with a bound credential] --> RS{Resolved-secret cache fresh?}
+    RS -- "yes: cache=hit" --> H[Present cached header]
+    RS -- no --> TTL{TTL policy cache}
+    TTL -- "hit / negative_hit / tier_hit" --> REC[Credential record]
+    TTL -- miss --> STORE[(Key store)] --> REC
+    TTL -- error --> GRACE{Grace window open?}
+    REC -- absent --> REF["cache=miss, outcome=refused"]
+    REC --> SECRET{Secret material}
+    SECRET -- "plaintext / envelope" --> OK["cache=miss, outcome=ok"]
+    SECRET -- "vault ref" --> VAULT[(Secret backend)]
+    VAULT -- ok --> OK
+    VAULT -- down --> GRACE
+    GRACE -- yes --> STALE["cache=stale, outcome=ok"]
+    GRACE -- no --> ERR["cache=miss, outcome=error"]
+    TTL -.-> C1[sbproxy_key_lookup_cache_total]
+    RS -.-> C2[sbproxy_credential_resolution_duration_seconds]
+```
+
+A falling TTL-cache hit ratio hammers the key store; a falling resolved-secret hit ratio hammers the secret backend. The two PromQL ratios:
+
+```promql
+# TTL policy-cache hit ratio (key + credential record lookups)
+sum(rate(sbproxy_key_lookup_cache_total{outcome=~"hit|negative_hit|tier_hit"}[5m]))
+  / sum(rate(sbproxy_key_lookup_cache_total[5m]))
+
+# Resolved-secret hit ratio (vault round trips avoided)
+sum(rate(sbproxy_credential_resolution_duration_seconds_count{cache="hit",outcome="ok"}[5m]))
+  / sum(rate(sbproxy_credential_resolution_duration_seconds_count{outcome="ok"}[5m]))
+```
+
+What that looks like end to end. This config is the smallest one that exercises the three key-side families (the credential histogram needs a bound credential on an AI route):
+
+```yaml
+proxy:
+  http_bind_port: 8080
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: change-me
+  key_management:
+    enabled: true
+    store:
+      backend: embedded
+      path: /var/lib/sbproxy/keystore.redb
+    crypto:
+      pepper: env:SBPROXY_KEY_PEPPER
+      master_key: env:SBPROXY_KEY_MASTER
+
+origins:
+  "api.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+```
+
+Mint a key, run it through its lifecycle, then ask for one operation that has to be refused, and send three requests carrying a key that was never minted:
+
+```bash
+KEY=$(curl -s -u admin:change-me -X POST -H 'content-type: application/json' \
+  -d '{"name":"analytics-batch"}' http://127.0.0.1:9090/admin/keys \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["key"]["key_id"])')
+
+for action in block unblock rotate revoke; do
+  curl -s -o /dev/null -u admin:change-me -X POST \
+    http://127.0.0.1:9090/admin/keys/$KEY/$action
+done
+
+# Revoked is terminal, so this one is refused (409), not an error.
+curl -s -o /dev/null -u admin:change-me -X POST \
+  http://127.0.0.1:9090/admin/keys/$KEY/rotate
+
+# Three requests carrying a key that does not exist.
+UNKNOWN="sbp_deadbeefdeadbeef_$(python3 -c 'print("0"*64)')"
+for i in 1 2 3; do
+  curl -s -o /dev/null -H 'Host: api.local' -H "x-api-key: $UNKNOWN" \
+    http://127.0.0.1:8080/
+done
+
+curl -s -u admin:change-me http://127.0.0.1:9090/metrics \
+  | grep -E '^sbproxy_(audit_write_failures|key_(operations|lookup_cache))_total' | sort
+```
+
+```text
+sbproxy_audit_write_failures_total{channel="admin_path"} 0
+sbproxy_audit_write_failures_total{channel="key_path"} 0
+sbproxy_key_lookup_cache_total{kind="key",outcome="miss"} 1
+sbproxy_key_lookup_cache_total{kind="key",outcome="negative_hit"} 2
+sbproxy_key_operations_total{operation="block",outcome="ok"} 1
+sbproxy_key_operations_total{operation="mint",outcome="ok"} 1
+sbproxy_key_operations_total{operation="revoke",outcome="ok"} 1
+sbproxy_key_operations_total{operation="rotate",outcome="ok"} 1
+sbproxy_key_operations_total{operation="rotate",outcome="refused"} 1
+sbproxy_key_operations_total{operation="unblock",outcome="ok"} 1
+```
+
+Three things in that output are the whole design. The refused rotate sits on its own series rather than inside `rotate/ok` or `rotate/error`, so a dashboard can show operator mistakes without them reading as an outage. Three requests for one unknown key produced one store lookup and two negative hits, which is the stampede protection working and visible as itself. And both audit channels report an explicit `0` rather than no series at all, so an `increase()` alert has a baseline from the first scrape instead of from the first failure.
+
+The `sbproxy-security` Grafana dashboard (`dashboards/grafana/sbproxy-security.json`) ships a Key Operations rate panel, the resolution p95 with its should-read-zero stale and error series, both hit ratios, and the audit-write-failure counter.
+
+These four families are aggregate counters and histograms, and they are deliberately narrower than the per-event record. A metric tells you that three rotations happened in the last five minutes; it cannot tell you which key, under which tenant, at whose hands. For that, subscribe to the typed lifecycle events described under [the admin API](#the-admin-api), which carry the record id and the acting principal. The two surfaces watch the same seam on purpose, at deliberately different widths: `sbproxy_credential_resolution_duration_seconds{cache="stale"}` counts every grace-window serve, and a `credential_resolved` event with `outcome: stale_served` marks each episode once. Alert on the rate; investigate with the record. The event is not per serve because the grace path does not refresh the cached value's timestamp, so a five-minute window on a busy origin would otherwise put one event on the feed per request, and that feed is shared with `key_revoked`.
+
 ## The security model
 
 Two kinds of secret, two different treatments.
@@ -728,6 +845,8 @@ The plaintext token appears once at mint; list calls only ever show the key_id (
 | `POST /admin/keys/{id}/block` | Mark blocked (reversible) |
 | `POST /admin/keys/{id}/unblock` | Mark active |
 | `POST /admin/keys/{id}/rotate` | Rotate with a grace window |
+| `POST /admin/keys/{id}/budget-override` | Grant a temporary, auto-expiring budget raise |
+| `DELETE /admin/keys/{id}/budget-override` | End an active raise early |
 | `POST /admin/credentials` | Create an upstream credential |
 | `GET /admin/credentials` | List credentials (no secrets) |
 | `GET/PATCH/DELETE /admin/credentials/{id}` | Read, update, delete |
@@ -785,6 +904,32 @@ field leaves it unchanged.
 through the block, unblock, and revoke action routes. Revocation is terminal.
 Those action routes and rotation accept an optional `expected_revision`; PATCH
 always requires it.
+
+### Temporary budget overrides
+
+`POST /admin/keys/{id}/budget-override` raises the key's effective budget
+without touching the base caps, until an expiry the grant names, after
+which the base resumes on its own. The body takes `max_tokens_increase`
+and `max_cost_usd_increase` (at least one, each raising the matching base
+cap), the expiry as either `ttl_secs` or an RFC 3339 `expires_at`, an
+optional `reason`, and an optional `expected_revision`. A raise only lifts
+caps the base budget has: an uncapped axis stays uncapped, and a key with
+no base budget cannot be raised. Regranting replaces the current raise.
+
+While the raise is live, read responses carry three budget fields: the
+untouched `budget`, the `budget_override` (increases, `expires_at`,
+`granted_by`, `granted_at`, `reason`), and the `effective_budget` the
+request path is enforcing. `DELETE /admin/keys/{id}/budget-override` ends
+a raise early; expiry needs no call at all. Three ends of the raise's
+life reach the `key_audit` trail: `budget_override_grant` naming the
+operator who granted it, `budget_override_clear` naming the operator who
+ended a live raise early, and `budget_override_expire` for the
+unattributed, time-driven end an admin read retires. Reconcile every
+raise against `clear` OR `expire`; matching only one of them leaves
+operator-cancelled raises looking like they are still running. The
+override lifecycle,
+the enforcement seam, and the runnable walkthrough are in
+[ai-gateway.md](ai-gateway.md) under "Temporary budget overrides".
 
 ### Server schema and effective-policy preview
 
@@ -901,7 +1046,46 @@ or support bundles.
 Successful key mutations emit a structured `key_audit` event with the operation,
 resource kind, and public record id. The event does not contain a plaintext
 secret or verifier hash. Route that tracing target to a protected audit sink and
-apply normal operational-log access controls. See [Audit log](audit-log.md).
+apply normal operational-log access controls. With `audit.key_path` set, the
+same mutations also land on the tamper-evident key chain, browsable from the
+console's Audit view with per-read verification; see
+[Audit log](audit-log.md#browsing-it-from-the-console).
+
+Mint, revoke, rotate, and block additionally publish typed events on the
+`events:` egress (`key_minted`, `key_revoked`, `key_rotated`, `key_blocked`),
+so a SIEM alerts on a lifecycle change in real time instead of polling the
+admin API, and `credential_resolved` joins them whenever an upstream
+credential's material is actually read. Subscribe with the `events:` block:
+
+```yaml
+events:
+  sink: webhook
+  url: https://siem.example.com/sbproxy
+  signing_secret: secret://local/siem-hmac
+  types:
+    - key_minted
+    - key_revoked
+    - key_rotated
+    - key_blocked
+    - credential_resolved
+```
+
+A mint, rotate, block, revoke sequence lands in the feed as four NDJSON
+lines (file-sink form shown, captured from a real run; timestamps and ids
+will differ):
+
+```json
+{"event_type":"key_minted","hostname":"","tenant_id":"acme","timestamp":1787251963170,"data":{"id":"a7237f88fdd6fb04","op":"create","outcome":"applied","resource":"key"}}
+{"event_type":"key_rotated","hostname":"","tenant_id":"acme","timestamp":1787251963173,"data":{"id":"a7237f88fdd6fb04","op":"rotate","outcome":"applied","resource":"key"}}
+{"event_type":"key_blocked","hostname":"","tenant_id":"acme","timestamp":1787251963173,"data":{"id":"a7237f88fdd6fb04","new_status":"blocked","op":"block","outcome":"applied","prior_status":"active","resource":"key"}}
+{"event_type":"key_revoked","hostname":"","tenant_id":"acme","timestamp":1787251963174,"data":{"id":"a7237f88fdd6fb04","new_status":"revoked","op":"revoke","outcome":"applied","prior_status":"blocked","resource":"key"}}
+```
+
+The payload never carries the plaintext token, a verifier hash, or the
+`key_audit` diff, and that is a property under test rather than a
+convention. [events.md](events.md#key-lifecycle-events-the-dual-record)
+has the full field posture and the dual-record design (chain for tamper
+evidence, typed event for real-time delivery).
 
 ## Live policy
 
@@ -1233,6 +1417,14 @@ survive a reload instead.
 For a self-contained config, declare keys and credentials inline. A seed key
 takes either a `secret` (hashed at boot) or a precomputed `secret_hash`.
 
+Give a seeded key an id in the shape the gateway mints, sixteen lowercase hex
+characters. Nothing validates the field, and a seeded key with any id
+authenticates fine as `sk-<key_id>-<secret>`, but the minted token shape is
+`sbp_<16 hex>_<64 hex>` and a rotated token has to parse back on the inbound
+path. `POST /admin/keys/{id}/rotate` refuses a non-conforming id with a `409`
+rather than hand you a token that authenticates nowhere. Avoid a dash in the
+id for the same family of reasons: the legacy parser splits on the first one.
+
 The `key_management:` block nests under `proxy:`; a top-level `key_management:`
 key is silently dropped with a warning and the feature stays off.
 
@@ -1245,7 +1437,7 @@ proxy:
       master_key: env:SBPROXY_KEY_MASTER
     seed:
       keys:
-        - key_id: ci0001
+        - key_id: a1b2c3d4e5f60789
           secret: rotate-me-in-production
           name: ci-runner
           max_requests_per_minute: 60

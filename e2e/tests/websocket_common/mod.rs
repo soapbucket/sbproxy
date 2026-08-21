@@ -4,6 +4,13 @@
 //! different subset of the helpers.
 
 #![allow(dead_code)]
+// tungstenite fixes the handshake error to a full HTTP response, so every
+// dial helper in this module returns an `Err` whose size is not this file's
+// to shrink, the same reason the callback at `accept_hdr_async` below already
+// carries its own allow. Test support has no hot path, so the width costs
+// nothing that matters here. Module-wide rather than per-signature to keep the
+// footprint to one line: this file is also edited on another branch.
+#![allow(clippy::result_large_err)]
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -264,4 +271,83 @@ pub async fn assert_clean_close(websocket: &mut ClientWebSocket) {
     })
     .await
     .expect("close round-trip timeout");
+}
+
+/// Spawn a WebSocket upstream that echoes exactly one data frame and
+/// then kills its TCP connection with an RST (WOR-2551).
+///
+/// The RST (via `SO_LINGER 0`) rather than a FIN is the point: a clean
+/// EOF can end the tunnel quietly, while a reset surfaces as a read
+/// error inside the proxy and drives its upstream-failure path while
+/// the downstream connection is already speaking WebSocket frames.
+pub async fn spawn_ws_server_aborting_after_first_frame() -> EchoWebSocketServer {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("ws bind");
+    let addr = listener.local_addr().expect("ws addr");
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        let _ = ready_tx.send(());
+        loop {
+            let (stream, peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(error) => {
+                    eprintln!("ws aborting upstream: accept error: {error}");
+                    return;
+                }
+            };
+            tokio::spawn(async move {
+                let websocket = match tokio_tungstenite::accept_async(stream).await {
+                    Ok(websocket) => websocket,
+                    Err(error) => {
+                        eprintln!("ws aborting upstream {peer}: handshake failed: {error}");
+                        return;
+                    }
+                };
+                let (mut tx, mut rx) = websocket.split();
+                while let Some(item) = rx.next().await {
+                    match item {
+                        Ok(message @ (Message::Text(_) | Message::Binary(_))) => {
+                            if let Err(error) = tx.send(message).await {
+                                eprintln!("ws aborting upstream {peer}: echo error: {error}");
+                            }
+                            break;
+                        }
+                        Ok(_) => continue,
+                        Err(error) => {
+                            eprintln!("ws aborting upstream {peer}: read error: {error}");
+                            return;
+                        }
+                    }
+                }
+                // Reunite the halves and die hard: linger(0) turns the
+                // drop below into an RST instead of an orderly FIN, so
+                // the proxy's upstream read fails mid-tunnel. A clean
+                // FIN is not the case under test: it ends the tunnel
+                // quietly and never reaches `fail_to_proxy` at all.
+                //
+                // The deprecation on `set_linger` warns that `SO_LINGER`
+                // blocks the closing thread until the timeout expires.
+                // A ZERO timeout is the one setting that cannot block:
+                // it discards the send buffer and emits the RST
+                // immediately, which is the whole reason it is here.
+                #[allow(deprecated)]
+                if let Ok(websocket) = rx.reunite(tx) {
+                    let stream = websocket.get_ref();
+                    if let Err(error) = stream.set_linger(Some(Duration::ZERO)) {
+                        eprintln!("ws aborting upstream {peer}: set_linger failed: {error}");
+                    }
+                }
+            });
+        }
+    });
+
+    ready_rx
+        .await
+        .expect("ws aborting upstream ready signal dropped before send");
+    EchoWebSocketServer {
+        websocket_url: format!("ws://{addr}"),
+        http_url: format!("http://{addr}"),
+        captured,
+    }
 }

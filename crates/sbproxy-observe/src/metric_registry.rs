@@ -507,6 +507,31 @@ pub const METRICS: &[MetricCapability] = &[
         description: "Current active connections.",
         dead_reason: None,
     },
+    // WOR-2578: the admin request-log export is the one route that
+    // returns the operational log in bulk, so its rate and its volume
+    // are what an operator alerts on for exfiltration.
+    MetricCapability {
+        name: "sbproxy_admin_request_export_rows_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_admin_request_export"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["format"],
+        description: "Rows written by admin request-log exports, by format.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_admin_request_exports_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_admin_request_export"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["format"],
+        description: "Admin request-log exports served, by format.",
+        dead_reason: None,
+    },
     MetricCapability {
         name: "sbproxy_agent_budget_decisions_total",
         kind: MetricKind::Counter,
@@ -1379,6 +1404,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_ai_translation_dropped_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_translation_dropped"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["surface", "field"],
+        description: "Request fields dropped while translating an inbound AI body (Anthropic Messages, OpenAI Responses) to the canonical chat shape, by inbound surface and dropped-field class.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_ai_ttft_seconds",
         kind: MetricKind::Histogram,
         writer: Writer::Recorder("record_ttft"),
@@ -1434,6 +1470,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_audit_chain_read_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_audit_chain_read"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["channel", "outcome"],
+        description: "Audit-chain read attempts, by verification outcome (verified, broken, unreadable, denied).",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_audit_emit_duration_seconds",
         kind: MetricKind::Histogram,
         writer: Writer::Recorder("record_audit_emit_duration"),
@@ -1442,6 +1489,17 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["channel", "outcome"],
         description: "Wall-clock latency of one audit-channel emission.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_audit_write_failures_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_audit_write_outcome"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["channel"],
+        description: "Audit emissions that did not reach a sink they were promised, by audit channel; healthy systems read 0.",
         dead_reason: None,
     },
     MetricCapability {
@@ -1808,6 +1866,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_credential_resolution_duration_seconds",
+        kind: MetricKind::Histogram,
+        writer: Writer::Recorder("record_credential_resolution"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["cache", "outcome"],
+        description: "Wall-clock latency of one bound-credential resolution, by which cache layer answered and the real outcome.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_egress_refused_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_egress_refused"),
@@ -2062,6 +2131,28 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["result"],
         description: "JWKS refreshes triggered by tokens whose kid was absent from the local cache.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_key_lookup_cache_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_key_lookup_cache"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["kind", "outcome"],
+        description: "Keystore TTL-cache lookups, by record kind and which layer answered (hit, negative_hit, tier_hit, miss, error).",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_key_operations_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_key_operation"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["operation", "outcome"],
+        description: "Admin key-lifecycle operations, by operation and by what the handler actually returned (ok, refused, error).",
         dead_reason: None,
     },
     MetricCapability {
@@ -3155,6 +3246,24 @@ pub const METRICS: &[MetricCapability] = &[
     // dropped from a document that still serves, plus the serialize fallbacks
     // in that manifest and in tdmrep, which substitute an empty document that
     // reads as a deliberate "this origin advertises nothing".
+    // WOR-2530. The scan_path label is load-bearing, not decoration. The
+    // policy can deny from four places and three of them wrote the operator's
+    // configured block body and content type while the fourth wrapped the
+    // body in an `{"error": ...}` envelope with a hardcoded
+    // `application/json`. With no label there was one merged series, so
+    // "which path blocked this" was not a question /metrics could answer and
+    // the drift stayed invisible.
+    MetricCapability {
+        name: "sbproxy_prompt_injection_blocks_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_prompt_injection_block"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["scan_path", "tenant"],
+        description: "Requests blocked by the prompt_injection_v2 policy, by scan path (header_scan, body_scan, ai_body, a2a).",
+        dead_reason: None,
+    },
     MetricCapability {
         name: "sbproxy_projection_render_failures_total",
         kind: MetricKind::Counter,
@@ -3241,6 +3350,17 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["operation", "reason"],
         description: "Redis KV operation failures by operation and reason.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_request_body_drain_timeout_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_request_body_drain_timeout"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &[],
+        description: "Times the post-response drain of a client's request body hit its bound and the connection was closed with bytes unread.",
         dead_reason: None,
     },
     MetricCapability {
@@ -3365,6 +3485,26 @@ pub const METRICS: &[MetricCapability] = &[
         description: "Decision events that proceeded without the decision being made.",
         dead_reason: None,
     },
+    // WOR-2565. Zalando rule 188: deprecated-API usage must be
+    // monitored, because the whole point of announcing a deprecation
+    // is enumerating the callers who have not migrated yet. `route`
+    // names which announcement matched (forward-rule id or index,
+    // OpenAPI path template, or empty for a whole-origin block),
+    // `past_sunset` separates stragglers still calling after the
+    // announced retirement instant, and `outcome` separates the ones
+    // still being served from the ones refused with 410, which
+    // `past_sunset` alone cannot do on a config running both postures.
+    MetricCapability {
+        name: "sbproxy_deprecated_requests_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_deprecated_request"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &["origin", "route", "past_sunset", "outcome"],
+        description: "Requests that resolved to a deprecated route, by request Host, matched announcement, whether the hit landed after the announced sunset, and whether it was served or refused with 410.",
+        dead_reason: None,
+    },
     MetricCapability {
         name: "sbproxy_semantic_cache_results_total",
         kind: MetricKind::Counter,
@@ -3394,6 +3534,24 @@ pub const METRICS: &[MetricCapability] = &[
              sbproxy-model-host, out of this lane's file allowlist; wire the decision call \
              there or delete under WOR-1898",
         ),
+    },
+    // WOR-2526. A configured Content-Security-Policy that ships nothing reads
+    // exactly like a working one from the config file, which is how a dropped
+    // CSP survived in a shipped example and in the reference docs. This
+    // counter is the difference between "configured" and "delivered": flat at
+    // zero on an origin whose config sets content_security_policy is the
+    // signal. The mode label carries the second half of that bug, where a
+    // report_only policy was emitted as an enforcing one.
+    MetricCapability {
+        name: "sbproxy_security_headers_csp_emitted_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_security_headers_csp_emitted"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["mode", "tenant"],
+        description: "Content-Security-Policy headers emitted by the security_headers policy, by mode (enforce, report_only).",
+        dead_reason: None,
     },
     MetricCapability {
         name: "sbproxy_silent_degradations_total",
@@ -3440,6 +3598,17 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Proxy,
         labels: &["reason"],
         description: "Synthetic readiness probe failures by reason.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_target_health_state",
+        kind: MetricKind::Gauge,
+        writer: Writer::Recorder("refresh_target_health_gauge"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &["origin", "target"],
+        description: "Per-target tri-state health on LiteLLM's 0/1/2 scale: 0 healthy, 1 degraded (circuit breaker half-open), 2 excluded from selection (probe-unhealthy, outlier-ejected, or breaker open). Sampled at scrape time from the same pipeline walk that renders GET /api/health/targets. `origin` is the configured origin id, not the request Host. `target` is the configured target URL, or the load balancer's own url#index identifier when one origin configures that URL more than once.",
         dead_reason: None,
     },
     MetricCapability {
@@ -3601,6 +3770,17 @@ pub const METRICS: &[MetricCapability] = &[
         description: "WAF persistent (time-boxed) block actions, by lifecycle event and key kind.",
         dead_reason: None,
     },
+    MetricCapability {
+        name: "sbproxy_websocket_teardowns_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_websocket_teardown"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["reason", "direction", "tenant", "origin"],
+        description: "WebSocket upgrades refused or tunnels torn down by the gateway, by closed reason, direction, tenant, and origin. Covers both upgrade surfaces: the `websocket` action and AI realtime.",
+        dead_reason: None,
+    },
 ];
 
 /// Dashboards and alert rules that knowingly read a metric nothing writes.
@@ -3735,12 +3915,29 @@ pub const TENANT_SCOPED_METRICS: &[&str] = &[
     "sbproxy_meter_receipts_total",
     "sbproxy_meter_units_total",
     "sbproxy_policy_audit_events_dropped_total",
+    // WOR-2530. A prompt-injection block is a security verdict about one
+    // tenant's traffic, the same reasoning as the framing and egress
+    // counters above. Merged across tenants it answers "something was
+    // blocked somewhere", which no operator of a multi-tenant deployment
+    // can act on.
+    "sbproxy_prompt_injection_blocks_total",
     "sbproxy_rate_limit_suspend_total",
     "sbproxy_rate_limit_total",
+    // WOR-2526. Whether a browser hardening header actually reached clients
+    // is a per-origin, and therefore per-tenant, question. One merged series
+    // cannot tell an operator which tenant's origins are serving responses
+    // with no CSP.
+    "sbproxy_security_headers_csp_emitted_total",
     "sbproxy_semantic_cache_results_total",
     "sbproxy_usage_bridge_enqueued_total",
     "sbproxy_usage_bridge_gap_total",
     "sbproxy_waf_persistent_blocks_total",
+    // WOR-2552. A websocket enforcement teardown is a security-policy
+    // outcome for one tenant's tunnel traffic, same reasoning as the
+    // WAF and egress counters beside it: merged across tenants it
+    // answers "some tunnel was torn down somewhere", which cannot tell
+    // an operator whose traffic is being refused.
+    "sbproxy_websocket_teardowns_total",
 ];
 
 /// Tenant-scoped families that are known to lack a tenant label today, and

@@ -189,7 +189,13 @@ pub struct ManagedDispatchFailure {
     #[source]
     pub source: ModelPlaneError,
     /// Bounded non-sensitive decision trace.
-    pub trace: ManagedRouteTrace,
+    ///
+    /// Boxed because this failure rides in the `Err` half of a hot
+    /// dispatch `Result`. The trace is the widest thing the error
+    /// carries and it only describes the path that failed, so holding
+    /// it inline made every successful dispatch pay for the explanation
+    /// of a failure that did not happen.
+    pub trace: Box<ManagedRouteTrace>,
 }
 
 /// Try ordered current-generation replicas without ever replaying a body stream.
@@ -218,7 +224,7 @@ pub async fn dispatch_managed_candidates(
     if attempted == 0 {
         return Err(ManagedDispatchFailure {
             source: ModelPlaneError::NoEligibleReplica,
-            trace,
+            trace: Box::new(trace),
         });
     }
 
@@ -263,7 +269,10 @@ pub async fn dispatch_managed_candidates(
                     trace.failovers += 1;
                     continue;
                 }
-                return Err(ManagedDispatchFailure { source, trace });
+                return Err(ManagedDispatchFailure {
+                    source,
+                    trace: Box::new(trace),
+                });
             }
         }
     }

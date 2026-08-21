@@ -4,7 +4,7 @@
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
-lifecycle, the running extension inventory, the request log and its live stream, recent sessions, alert
+lifecycle, the running extension inventory, the request log (with its live stream, report, and export), routing decisions, recent sessions, alert
 operations, per-target health, spend and audit, attested-metering summary/receipts/verify, config read/write and hot reload/drift, the local config-revision
 history ring, model-host catalog and deployment lifecycle, the
 response/semantic/key-policy caches, cluster status and the replicated-state
@@ -25,7 +25,7 @@ built-in dashboard over this same API, see [admin-ui.md](admin-ui.md).
 - [Probe routes](#probe-routes-unauthenticated) (unauthenticated)
 - [Session routes](#session-routes) - login, logout, whoami
 - [API keys and credentials](#api-keys-and-credentials) - full virtual-key and upstream-credential lifecycle
-- [Read routes](#read-routes-authenticated) - request log + stream, extension inventory, alerts, health, spend, attested-metering, audit, egress inventory, rate-limit budget, UI settings, OpenAPI
+- [Read routes](#read-routes-authenticated) - request log + stream + report + export, routing decisions, extension inventory, alerts, health, spend, attested-metering, audit, egress inventory, rate-limit budget, UI settings, OpenAPI
 - [AI compression session state](#ai-compression-session-state)
 - [Config and control routes](#config-and-control-routes-authenticated) - reload, drift, config read/write, config history, log level, the owasp_api_top10 pack manifest, AI provider data posture
 - [Model host admin](#model-host-admin) - catalog, deployments, lifecycle, artifact cache
@@ -276,6 +276,8 @@ the policy model these records drive.
 | POST | `/admin/keys/{id}/block` | Mark blocked (reversible). |
 | POST | `/admin/keys/{id}/unblock` | Mark active. |
 | POST | `/admin/keys/{id}/rotate` | Mint a new secret with a grace-window dual-key transition. |
+| POST | `/admin/keys/{id}/budget-override` | Grant a temporary, auto-expiring raise on the key's base budget. |
+| DELETE | `/admin/keys/{id}/budget-override` | End an active raise early; the base budget resumes immediately. |
 | GET | `/admin/credentials` | List upstream credentials (no secrets). |
 | POST | `/admin/credentials` | Create a credential (`vault_ref` or `secret`, envelope-sealed at rest). |
 | GET | `/admin/credentials/{id}` | Fetch one credential. |
@@ -294,7 +296,7 @@ missing key/credential id is `404`.
 
 ```json
 {
-  "key_id": "key_9f2c...",
+  "key_id": "a1b2c3d4e5f60789",
   "policy_revision": 3,
   "policy_digest": "sha256:...",
   "name": "checkout-service",
@@ -351,7 +353,7 @@ default to the server-read value; `PATCH` requires it explicitly). A
 mismatch returns `409`:
 
 ```json
-{"error": "key policy revision conflict", "key_id": "key_9f2c...", "expected_revision": 2, "current_revision": 3}
+{"error": "key policy revision conflict", "key_id": "a1b2c3d4e5f60789", "expected_revision": 2, "current_revision": 3}
 ```
 
 A `revoked` key is terminal: any further mutation returns
@@ -366,8 +368,49 @@ Mints a fresh secret, keeps the prior hash valid for `grace_secs`
 (both authenticate during the window), and returns:
 
 ```json
-{"token": "sbp_key_9f2c..._<new secret>", "grace_expires_at": "2026-07-01T01:00:00Z", "key": {"...": "..."}}
+{"token": "sbp_a1b2c3d4e5f60789_<new secret>", "grace_expires_at": "2026-07-01T01:00:00Z", "key": {"...": "..."}}
 ```
+
+The key id has to be one the gateway minted: sixteen lowercase hex
+characters, which is what `POST /admin/keys` produces. A key seeded from
+config under `key_management.seed.keys[]` can carry any id its author
+wrote, and a rotated token built from a non-conforming id is not a token
+the inbound resolver can parse. Rotating one returns
+`409 {"error": "key id is not in the minted format ..."}` and changes
+nothing, so the credential in the field keeps working. To replace a
+seeded key, create a new one with `POST /admin/keys`, move callers over,
+then revoke the seeded id.
+
+### `POST /admin/keys/{id}/budget-override`
+
+Body: `{"max_tokens_increase": <optional>, "max_cost_usd_increase":
+<optional>, "ttl_secs": <or expires_at>, "expires_at": <RFC 3339>,
+"reason": <optional>, "expected_revision": <optional>}`. At least one
+increase is required, each must be positive, and each must raise an axis
+the base budget actually caps; exactly one of `ttl_secs` or `expires_at`
+names the expiry, which must be in the future. `reason` is capped at 256
+bytes and a longer one is refused with a 400. The raise applies on top
+of the base budget until then, after which the base resumes with no
+further call. Regranting replaces the current raise. Read responses
+carry `budget` (the base), `budget_override` (increases, `expires_at`,
+`granted_by`, `granted_at`, `reason`), and `effective_budget` while a
+raise is live.
+
+`DELETE` on the same path ends the raise early. It is `404` only when the
+record carries no override at all; a grant that has already lapsed but
+has not yet been retired is still on the record, so `DELETE` clears it
+with a `200` and audits it as an expiry rather than a cancellation. A
+cleanup script that reads `404` as "already expired" will mis-report
+every expiry it races.
+
+Three `key_audit` records cover the lifecycle, and the distinction
+between the last two is the whole point of having both:
+`budget_override_grant` names the operator who granted the raise,
+`budget_override_clear` names the operator who ended one that was still
+live, and `budget_override_expire` is the unattributed time-driven end,
+written when an admin read (or a `DELETE`) first observes a lapsed grant
+and retires it. A reconciliation rule matching only grant and expire
+misses every operator-initiated early clear.
 
 ### `GET /admin/keys/{id}/usage`
 
@@ -533,12 +576,26 @@ Supported query parameters: `status` (exact match), `method`
 (case-insensitive), `path` (substring), `guardrail_action`,
 `guardrail_category`, `cache_status`, `retried`, `property_key`,
 `property_value`, `api_key_id` (exact canonical key id), `key_mode`
-(`none`, `minted`, or `native`), `session_id` (exact ULID), `offset`,
-and `limit` (defaults to and is clamped at
+(`none`, `minted`, or `native`), `session_id` (exact ULID), `model`
+(exact), `tenant` (exact label), `user` (exact resolved end-user id),
+`offset`, and `limit` (defaults to and is clamped at
 `max_log_entries`). `cache_status` accepts the four values listed above.
 `retried` accepts only `true` or `false`. Property matching is exact after
-URL decoding; `property_value` requires `property_key`. No parameters returns
-the newest entries.
+URL decoding; `property_value` requires `property_key`. `status`,
+`offset`, and `limit` must parse as whole numbers when present; a
+malformed one is a `400` rather than an ignored parameter, so a filter
+never silently widens the result. No parameters returns the newest
+entries.
+
+An empty value means "rows with nothing there" rather than "no filter":
+`?user=` selects the rows the report groups under the unattributed
+`""` key, which is the same set on all three routes. Omit the parameter
+entirely to leave the dimension unfiltered.
+
+The same filter set drives [`/api/requests/report`](#get-apirequestsreport)
+and [`/api/requests/export`](#get-apirequestsexport): one parser serves
+all three routes, so a filter that selects rows here selects exactly the
+same rows in the aggregation and the export.
 
 To answer "what did this key do", filter by `api_key_id`; every row a
 governed request produced carries the same canonical id across this
@@ -584,6 +641,502 @@ does not accept query filters. Each event has the same enriched
 ```bash
 curl -N -u "admin:${SB_ADMIN_PASSWORD}" "${SB_ADMIN_URL}/api/requests/stream"
 ```
+
+### `GET /api/requests/report`
+
+Multi-dimension spend and usage aggregation over the same ring
+`GET /api/requests` serves: one row per composite group, so "who spent
+what on which model" is a single call. `group_by` is required and takes
+a comma-separated subset of four dimensions, selectable simultaneously
+rather than one at a time:
+
+| Dimension | Groups on |
+|---|---|
+| `model` | AI model that served the request. |
+| `api_key_id` | Canonical public id of the governing key. |
+| `tenant` | Origin-scoped tenant label. |
+| `user` | Resolved end-user identifier: the human subject behind the call (`X-Sb-User-Id` header, JWT `sub`, or forward-auth user, in that order). |
+
+One parser reads the filter surface for all three request-log routes,
+which is what makes a grouped number drillable: the same query string
+selects the same rows on the snapshot, the report, and the export.
+A row that carries no value on a dimension groups under the empty
+string rather than being dropped, and an empty filter value selects
+that same group, so the unattributed bucket drills through like any
+other. In a deployment that resolves no end user it is usually the
+biggest one.
+
+```mermaid
+flowchart TD
+    A["GET /api/requests*?<filters>"] --> B[Parse the shared filter surface]
+    B -->|bad cache_status, retried, key_mode, status,<br/>offset, limit, or property_value<br/>without property_key| C["400, identical on all three routes"]
+    B -->|filters valid| D{Which route?}
+    D -->|/api/requests| E["Rows, newest first, offset+limit"]
+    D -->|/api/requests/report| F{group_by present,<br/>known, distinct?}
+    D -->|/api/requests/export| G{format is csv,<br/>jsonl, or absent?}
+    F -->|no| H["400: group_by is required and<br/>its dimensions must be distinct"]
+    F -->|yes| I["Fold every matching row into<br/>one accumulator per composite group"]
+    I --> J["rows sorted by spend, plus totals<br/>over the whole filtered set"]
+    G -->|no| K["400: format must be csv or jsonl"]
+    G -->|yes| L["Encode each matching row as it is visited"]
+    L --> M["Audit: export_request_log on the admin chain"]
+    M --> N["sbproxy_admin_request_exports_total and<br/>sbproxy_admin_request_export_rows_total"]
+```
+
+Every `GET /api/requests` filter applies unchanged, so the report always
+aggregates exactly the rows the snapshot would return. A request that
+lacks a dimension (an unkeyed call, an anonymous user) groups under the
+empty string; the admin UI renders that as `(unattributed)`.
+
+The response carries `schema_version`, the echoed `group_by`, a `rows`
+array sorted by spend then request count then group key, and `totals`
+over the whole filtered set. Each row holds the `group` map plus
+`requests`, `tokens_in`, `tokens_out`, and `cost_usd_micros`. `offset`
+and `limit` page the grouped rows (top spenders first); `totals` always
+covers the whole filtered set, so a paged view still reads against the
+true denominators. The result is bounded by construction: there can
+never be more rows than ring entries, and the ring caps at
+`proxy.admin.max_log_entries`.
+
+An unknown, duplicate, missing, or empty `group_by` is a `400`; so is
+any filter value `/api/requests` itself would refuse.
+
+```bash
+curl -s -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/api/requests/report?group_by=flavor"
+```
+
+```json
+{"error":"group_by dimensions are model, api_key_id, tenant, user"}
+```
+
+#### Worked example: who spent what
+
+Config: [`examples/admin-reporting/`](../examples/admin-reporting/), two
+tenants (`acme`, `globex`) over one `ai_proxy` origin each, three
+governed keys, two models, and four named human callers. Every output
+below is captured from that config running against a local
+OpenAI-shaped fixture, driven by the five calls the example's README
+lists.
+
+Group by all four dimensions at once. Nothing else in the admin API
+answers this in one call: `/api/usage/spend` breaks down one dimension
+at a time, so "which human, on which key, on which model" takes four
+queries and a join.
+
+```bash
+curl -s -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/api/requests/report?group_by=model,api_key_id,tenant,user" \
+  | python3 -m json.tool
+```
+
+```json
+{
+    "group_by": [
+        "model",
+        "api_key_id",
+        "tenant",
+        "user"
+    ],
+    "rows": [
+        {
+            "cost_usd_micros": 5250,
+            "group": {
+                "api_key_id": "cfg:4:acme:13:acme.ai.local:acme-platform",
+                "model": "gpt-4o",
+                "tenant": "acme",
+                "user": "ops@acme.test"
+            },
+            "requests": 1,
+            "tokens_in": 900,
+            "tokens_out": 300
+        },
+        {
+            "cost_usd_micros": 84,
+            "group": {
+                "api_key_id": "cfg:4:acme:13:acme.ai.local:acme-platform",
+                "model": "gpt-4o-mini",
+                "tenant": "acme",
+                "user": "dev@acme.test"
+            },
+            "requests": 2,
+            "tokens_in": 240,
+            "tokens_out": 80
+        },
+        {
+            "cost_usd_micros": 42,
+            "group": {
+                "api_key_id": "cfg:4:acme:13:acme.ai.local:acme-research",
+                "model": "gpt-4o-mini",
+                "tenant": "acme",
+                "user": "sci@acme.test"
+            },
+            "requests": 1,
+            "tokens_in": 120,
+            "tokens_out": 40
+        },
+        {
+            "cost_usd_micros": 42,
+            "group": {
+                "api_key_id": "cfg:6:globex:15:globex.ai.local:globex-platform",
+                "model": "gpt-4o-mini",
+                "tenant": "globex",
+                "user": "dev@globex.test"
+            },
+            "requests": 1,
+            "tokens_in": 120,
+            "tokens_out": 40
+        }
+    ],
+    "schema_version": 1,
+    "totals": {
+        "cost_usd_micros": 5418,
+        "requests": 5,
+        "tokens_in": 1380,
+        "tokens_out": 460
+    }
+}
+```
+
+Row one is the answer: one `gpt-4o` call from `ops@acme.test` on the
+`acme-platform` key is 97% of the window's spend, and it cost 125 times
+what a `gpt-4o-mini` call did. Spend-first sorting is why that row is
+first rather than buried under the three cheap ones.
+
+Drop dimensions to widen the grouping. The same five requests by model
+and human only, which is the cut a cost review usually wants:
+
+```bash
+curl -s -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/api/requests/report?group_by=model,user" | python3 -m json.tool
+```
+
+```json
+{
+    "group_by": [
+        "model",
+        "user"
+    ],
+    "rows": [
+        {
+            "cost_usd_micros": 5250,
+            "group": {
+                "model": "gpt-4o",
+                "user": "ops@acme.test"
+            },
+            "requests": 1,
+            "tokens_in": 900,
+            "tokens_out": 300
+        },
+        {
+            "cost_usd_micros": 84,
+            "group": {
+                "model": "gpt-4o-mini",
+                "user": "dev@acme.test"
+            },
+            "requests": 2,
+            "tokens_in": 240,
+            "tokens_out": 80
+        },
+        {
+            "cost_usd_micros": 42,
+            "group": {
+                "model": "gpt-4o-mini",
+                "user": "dev@globex.test"
+            },
+            "requests": 1,
+            "tokens_in": 120,
+            "tokens_out": 40
+        },
+        {
+            "cost_usd_micros": 42,
+            "group": {
+                "model": "gpt-4o-mini",
+                "user": "sci@acme.test"
+            },
+            "requests": 1,
+            "tokens_in": 120,
+            "tokens_out": 40
+        }
+    ],
+    "schema_version": 1,
+    "totals": {
+        "cost_usd_micros": 5418,
+        "requests": 5,
+        "tokens_in": 1380,
+        "tokens_out": 460
+    }
+}
+```
+
+`totals` is identical across both calls, because grouping changes how
+the same filtered set is cut, never which rows are in it. Add a filter
+and `totals` moves with it: `&tenant=acme` reports four requests and
+5376 micro-USD from this window.
+
+### `GET /api/requests/export`
+
+Raw export of the current filtered view, for the spreadsheet or the
+billing pipeline rather than another dashboard. `format` selects the
+encoding:
+
+- `jsonl` (the default): one `RequestLogEntry` JSON object per line,
+  exactly the rows `GET /api/requests` returns, so an export re-reads
+  with any JSON tool. `Content-Type: application/x-ndjson`.
+- `csv`: the same rows flattened under a fixed header of 36 named
+  columns (`timestamp` through `properties`). The `properties` and
+  `policy_decisions` cells carry JSON so the two structured columns
+  survive flattening without loss. `Content-Type: text/csv`.
+
+Every request-log filter applies, plus `offset` and `limit`. `limit`
+defaults to and is clamped at `proxy.admin.max_log_entries`, so no
+export can exceed the bounded ring regardless of what the caller asks
+for. A malformed `status`, `offset`, or `limit` is a `400` rather than
+an ignored parameter, because a dropped filter on this route hands back
+a wider file than the caller asked for and nothing on the file says so.
+
+Rows are encoded one at a time as the ring is read, so the matching set
+is never held twice. The response itself is materialized rather than
+streamed: the admin dispatcher answers with a whole body, so the
+worst-case response is the ring itself (default 1000 rows, a few
+hundred KB). Memory stays bounded by configuration rather than by
+caller behavior, but it is bounded, not zero, and an operator who
+raises `max_log_entries` raises it proportionally, per concurrent
+export. For unbounded durable exports, ship the structured access log
+to your pipeline instead (see [access-log.md](access-log.md)); this
+route exports the operational sample the console is looking at.
+
+Every export is an audited admin action. It writes an
+`export_request_log` record to the admin audit chain and the audit ring
+alongside `inspect_request_content`, naming the operator, the format,
+the row count, and which filter dimensions were set (names only, never
+operator-typed values, so the record stays bounded). It also increments
+`sbproxy_admin_request_exports_total{format}` and
+`sbproxy_admin_request_export_rows_total{format}`, so export rate and
+export volume are both alertable from the day the route ships.
+
+Scope that record correctly before you build a detection on it: it
+covers **this route**, not every bulk read of the log.
+`GET /api/requests?limit=<max_log_entries>` runs the same parser, the
+same filter and the same ring cap, and returns the same rows as a JSON
+array rather than newline-delimited, with no audit record and no
+counter. One query-string edit, same operator, same credential. The
+export is the download button, not the read surface, and auditing every
+`/api/requests` read instead would put a durable chain record on every
+console poll while a row-count threshold would sit one page size away
+from being bypassed. If you need coverage of the whole read surface,
+put it in front of the admin port.
+
+CSV cells that begin with `=`, `+`, `-`, `@`, a tab, or a carriage
+return gain a leading apostrophe before quoting (the OWASP defense
+against CSV formula injection): several columns carry text a data-plane
+caller influenced, such as `path`, `model`, `user_id`, and
+`properties`, and an export opened in a spreadsheet must not execute
+it. Any other `format` value is a `400`. The response sets no
+`Content-Disposition`; name the file client-side (`-o requests.csv`, or
+the admin UI's export links).
+
+#### Worked example: hand over the rows
+
+Same config and same five requests as the report above. CSV, filtered
+to one tenant, header plus the first two rows:
+
+```bash
+curl -s -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/api/requests/export?format=csv&tenant=acme" | head -3
+```
+
+```text
+timestamp,origin,method,path,status,latency_ms,client_ip,request_id,trace_id,session_id,parent_session_id,cache_status,retry_count,failover_engaged,failover_from,failover_to,load_balancer_strategy,load_balancer_target,provider,model,tokens_in,tokens_out,cost_usd_micros,guardrail_category,guardrail_action,api_key_id,key_mode,key_provider,tenant_id,user_id,error_class,config_revision,policy_version,deny_reason,policy_decisions,properties
+2026-08-21T01:11:55.226687+00:00,acme.ai.local,POST,/v1/chat/completions,200,1.887458,127.0.0.1:64696,01a021dfe05874f1b6ba866697bd518b,6531cb754eae46b5ba1b255f2c61eadb,,,disabled,0,false,,,round_robin,openai,openai,gpt-4o-mini,120,40,42,,,cfg:4:acme:13:acme.ai.local:acme-research,minted,,acme,sci@acme.test,,8cb4b33d8ffc,c:8cb4b33d8ffc:ae10235dbb7fdde7,,[],"{""feature"":""literature-scan""}"
+2026-08-21T01:11:55.214716+00:00,acme.ai.local,POST,/v1/chat/completions,200,1.116375,127.0.0.1:64695,01a021dfe04d7b11960a65be634aca3e,c4f486ae935b41fa854201f66422ad16,,,disabled,0,false,,,round_robin,openai,openai,gpt-4o,900,300,5250,,,cfg:4:acme:13:acme.ai.local:acme-platform,minted,,acme,ops@acme.test,,8cb4b33d8ffc,c:8cb4b33d8ffc:cd949575bc0dca2d,,[],"{""feature"":""incident-triage""}"
+```
+
+The `globex` row is absent because the filter removed it, not because
+the export truncated. The last cell shows both structured-column rules
+at once: `properties` is JSON, and RFC 4180 doubles its inner quotes so
+the record still splits into 36 fields.
+
+JSONL, filtered to one human, first line only:
+
+```bash
+curl -s -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/api/requests/export?format=jsonl&user=dev@acme.test" \
+  | head -1 | python3 -m json.tool
+```
+
+```json
+{
+    "timestamp": "2026-08-21T01:11:55.203180+00:00",
+    "origin": "acme.ai.local",
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "status": 200,
+    "latency_ms": 2.8585,
+    "client_ip": "127.0.0.1:64694",
+    "request_id": "01a021dfe0407331a26b80c75e648ba2",
+    "trace_id": "03db4bd210cc4aaab55079b097ccc623",
+    "properties": {
+        "feature": "summarize"
+    },
+    "cache_status": "disabled",
+    "retry_count": 0,
+    "failover_engaged": false,
+    "load_balancer_strategy": "round_robin",
+    "load_balancer_target": "openai",
+    "provider": "openai",
+    "model": "gpt-4o-mini",
+    "tokens_in": 120,
+    "tokens_out": 40,
+    "cost_usd_micros": 42,
+    "api_key_id": "cfg:4:acme:13:acme.ai.local:acme-platform",
+    "key_mode": "minted",
+    "tenant_id": "acme",
+    "user_id": "dev@acme.test",
+    "config_revision": "8cb4b33d8ffc",
+    "policy_version": "c:8cb4b33d8ffc:cd949575bc0dca2d"
+}
+```
+
+That line is byte-identical to the row `GET /api/requests` returns, so
+an export round-trips through any JSON tool without a schema of its
+own. It also carries `request_id`, `trace_id`, `config_revision`, and
+`policy_version`, which is what turns an exported cost row back into
+the specific request, trace, and config generation that produced it.
+
+Reading the metrics after those two exports:
+
+```bash
+curl -s -u "admin:${SB_ADMIN_PASSWORD}" "${SB_ADMIN_URL}/metrics" \
+  | grep admin_request_export
+```
+
+```text
+# HELP sbproxy_admin_request_export_rows_total Rows written by admin request-log exports, by format
+# TYPE sbproxy_admin_request_export_rows_total counter
+sbproxy_admin_request_export_rows_total{format="csv"} 4
+sbproxy_admin_request_export_rows_total{format="jsonl"} 2
+# HELP sbproxy_admin_request_exports_total Admin request-log exports served, by format
+# TYPE sbproxy_admin_request_exports_total counter
+sbproxy_admin_request_exports_total{format="csv"} 1
+sbproxy_admin_request_exports_total{format="jsonl"} 1
+```
+
+Two exports, six rows total, split by format: 4 CSV rows for the
+`tenant=acme` cut and 2 JSONL rows for the `user=dev@acme.test` cut.
+
+### `GET /api/routing-decisions`
+
+Recent routing decisions, newest first: why each routed request went
+where it went. One entry per request that a routing plane actually
+decided (AI dispatch or a load-balanced origin); plain proxied requests
+that never routed record nothing. This is the record behind the admin
+console's [Routing decisions view](admin-ui.md#routing-decisions-routing-decisions).
+
+| Field | Type | Description |
+|---|---|---|
+| `timestamp` | string | RFC 3339 timestamp of request completion. |
+| `origin` | string | Origin name that handled the request. |
+| `request_id` | string | Correlation id shared with the request log, access log, and trace. |
+| `tenant_id` | string | Origin-scoped tenant label (`__default__` when unset). |
+| `strategy` | string | What decided the request: a built-in strategy name (`round_robin`, `fallback_chain`, `cascade`, ...), `ai_routing_policy` when an operator plan dispatched, or the generic load balancer's selection method. |
+| `requested_model` | string | Model the caller asked for, after alias resolution. |
+| `selected_provider` | string | Provider that served (or last attempted) the request. |
+| `selected_model` | string | Model that served the request, when known. |
+| `reason` | string | The routing plane's own reason: an operator plan's `reason` string or the `ai_policy route_to` override note. Absent for built-in strategies. |
+| `candidates` | array | Ordered `{provider, model?}` candidates the router weighed: a plan's tiers, a cascade's tiers, or the strategy's eligible provider order. |
+| `attempted` | array | Providers actually attempted, in dispatch order: the fallback chain as traversed, not as planned. Capped at 16 hops. |
+| `attempts` | number | Provider calls actually made. |
+| `failover_engaged` | boolean | Whether fallback or provider failover engaged. |
+| `failover_from` | string | First provider that handed off, when one did. |
+| `failover_to` | string | Last provider selected by failover, when one was. |
+| `status` | number | HTTP status the request finished with. |
+| `latency_ms` | number | End-to-end request latency in milliseconds. |
+| `detail` | object | Open, additive detail map. Later explanatory columns (typed fallback triggers, data-posture eligibility results, price-ceiling exclusions, semantic-match scores) appear as namespaced keys here rather than as schema changes, so a reader that tolerates unknown keys never breaks. |
+
+Every field except `timestamp`, `origin`, `strategy`, `attempts`,
+`failover_engaged`, `status`, and `latency_ms` is omitted from the wire
+when absent. Treat the shape as additive: new keys may appear in
+`detail` (and, rarely, as new top-level optional fields) without notice.
+
+Query parameters: `origin`, `strategy`, and `provider` (exact),
+`model` (exact, matching the requested or the selected side of a
+substitution), `since` and `until` (RFC 3339, inclusive; a malformed
+value is a `400` naming the parameter), `offset`, and `limit` (both
+defaulting to the ring's own bounds).
+
+A fallback chain whose primary is down produces the trace this route
+exists for. With an `ai_proxy` origin like:
+
+```yaml
+routing:
+  strategy: fallback_chain
+providers:
+  - name: primary-unreachable
+    provider_type: openai
+    base_url: http://127.0.0.1:9/v1   # closed port: simulated outage
+    allow_private_base_url: true
+    priority: 1
+  - name: local-backup
+    provider_type: openai
+    base_url: http://127.0.0.1:18591/v1
+    allow_private_base_url: true
+    priority: 2
+```
+
+one chat completion through the chain records (output captured from a
+live gateway):
+
+```bash
+curl -s -u "admin:${SB_ADMIN_PASSWORD}" \
+  "${SB_ADMIN_URL}/api/routing-decisions?strategy=fallback_chain&limit=1" \
+  | python3 -m json.tool
+```
+
+```json
+[
+    {
+        "timestamp": "2026-08-20T14:03:16.486110+00:00",
+        "origin": "ai.local",
+        "request_id": "01a01f7bb6847ab0870bbc05228649e4",
+        "tenant_id": "__default__",
+        "strategy": "fallback_chain",
+        "requested_model": "demo-model",
+        "selected_provider": "local-backup",
+        "selected_model": "demo-model",
+        "candidates": [
+            {
+                "provider": "primary-unreachable"
+            },
+            {
+                "provider": "local-backup"
+            }
+        ],
+        "attempted": [
+            "primary-unreachable",
+            "local-backup"
+        ],
+        "attempts": 2,
+        "failover_engaged": true,
+        "failover_from": "primary-unreachable",
+        "failover_to": "local-backup",
+        "status": 200,
+        "latency_ms": 2.025167
+    }
+]
+```
+
+The row reads as a sentence: the chain weighed two candidates, the
+primary was attempted and handed off, the backup served the requested
+model, and the whole detour cost two attempts and two milliseconds. An
+`ai_routing_policy` row additionally carries the plan's `reason` and a
+`model` on each candidate tier.
+
+This is a bounded in-memory sample for runtime diagnosis: the ring
+shares the `proxy.admin.max_log_entries` cap (default 1000) with the
+request log and clears on restart. For durable routing history, publish
+the `route.decide` decision audit records to your log pipeline instead
+(see [decision-records.md](decision-records.md)).
 
 ### `GET /api/health`
 
@@ -652,6 +1205,17 @@ longer carries it.
 
 Origins whose action is not `load_balancer` (e.g. `proxy`,
 `ai_proxy`, `static`, `redirect`) are omitted from `origins`.
+
+The same per-target verdict is exported to Prometheus as
+`sbproxy_target_health_state{origin, target}` (0 healthy, 1 degraded
+with the breaker half-open, 2 excluded from selection). Both surfaces
+render from one pipeline walk, so a dashboard on the gauge and a
+`curl` against this endpoint always agree; graph the gauge instead of
+polling this endpoint. The gauge's `target` label is the configured
+URL, or `url#index` matching the `index` field above when one origin
+configures the same URL more than once, so every row here has exactly
+one series and vice versa. See
+[observability.md](observability.md#budget-headroom-and-target-health).
 
 ### `GET /api/stats`
 
@@ -974,9 +1538,72 @@ Query parameters: `limit` (default 100, capped at 1000), `channel`,
 
 This is a bounded in-memory sample for runtime inspection: the ring
 holds the most recent 1,000 events and clears on restart. The durable
-audit trail is whatever your log pipeline or OTel collector ships the
-`security_audit`, `key_audit`, `config_audit`, and
+trail is the tamper-evident chain each channel can opt into, browsable
+at `GET /api/audit/chain` below, or whatever your log pipeline or OTel
+collector ships the `security_audit`, `key_audit`, `config_audit`, and
 `sbproxy::admin::audit` tracing targets to.
+
+### `GET /api/audit/chain`
+
+The tamper-evident chain viewer: reads the chained audit files
+(`audit.path`, `audit.config_path`, `audit.key_path`,
+`audit.admin_path`), re-verifying every hash link and Ed25519 signature
+as it reads. Unlike `/api/audit/events` this is not a sample; it is the
+durable record itself, and every page served has been proved unmodified
+since the proxy wrote it. See
+[audit-log.md](audit-log.md#browsing-it-from-the-console) for the walk's
+mechanics and a captured tamper example.
+
+Query parameters: `channel` (one of `security`, `config`, `key`,
+`admin`; without it the newest window across every enabled channel is
+merged), `actor` (exact match: the operator on the config, key, and
+admin channels, the client IP on the security channel), `since` /
+`until` (RFC 3339, inclusive, against each record's chained
+`recorded_at`), `before_seq` (page cursor, requires `channel`), and
+`limit` (default 100, capped at 500).
+
+The response carries one status object per channel, all four every
+time, plus the merged entry window:
+
+| Field | Type | Description |
+|---|---|---|
+| `channels[].channel` | string | `security`, `config`, `key`, or `admin`. |
+| `channels[].enabled` | bool | Whether this channel's chain file is configured. Channels this request did not walk, whether disabled or excluded by a `channel=` filter, carry only these two fields. |
+| `channels[].path` | string | The chain file the walk read. |
+| `channels[].key_id` | string | The `kid` the chain signs under. |
+| `channels[].chain_entries` | number | Entries committed to the chain at the moment the read started. |
+| `channels[].verified_entries` | number | Entries the walk verified. Fewer than `chain_entries` means the file has lost records the proxy wrote, which is itself reported as `ok: false`; more means an entry was appended while the walk was running, which is not a failure. |
+| `channels[].ok` | bool | Whether every link and signature held. Only present on channels this request walked. |
+| `channels[].broken_seq` | number | First sequence that failed, when `ok` is false. |
+| `channels[].reason` | string | Why that sequence failed, when `ok` is false. |
+| `channels[].total_matched` | number | Entries matching the filters, the `before_seq` cursor included, across the verified prefix. |
+| `channels[].next_before_seq` | number | Cursor for the next older page, when one exists (single-channel reads only). |
+| `channels[].error` | string | The file could not be read at all. Present alongside `ok: false`, never instead of it: "we could not check" and "we checked and it held" must not render the same way. |
+| `entries[]` | array | The window, newest first: `channel`, `seq`, `recorded_at`, `actor`, and the full chained `event` payload. |
+
+A verification failure is a `200` with `ok: false`, never a `500`: the
+break is the finding, and the records before it are still served. Two
+things fail a walk: a record whose digest or signature no longer
+matches, and a file holding fewer records than the proxy wrote to it,
+which is what deleting or truncating a chain looks like from the inside.
+`400` names the offending parameter (unknown `channel`, malformed
+`since` or `until`, `before_seq` without a `channel`).
+
+GET-only, and read-only by construction, so both `admin` and `read_only`
+operators may call it. One operator may not: a login narrowed with
+`proxy.admin.operators[].tenant` gets a `403`, because the chains are
+deployment-wide and a per-tenant slice of an audit trail reads as
+"nothing else happened". Every call is itself recorded on the admin
+channel (`read_audit_chain`, or `read_audit_chain_denied` on the `403`)
+and counted on
+`sbproxy_audit_chain_read_total{channel, outcome}`, whose `outcome` is
+`verified`, `broken`, `unreadable`, or `denied`. Alert on everything
+that is not `verified`: a broken chain only a person looking at the
+console can see is a finding nobody is on call for, and a scoped
+principal reaching repeatedly for a deployment-wide security surface is
+one nobody would otherwise be prompted to go look for, because the only
+other record of it is inside the chain that principal was refused. A
+refusal increments all four channels, since it refuses all four.
 
 ### `GET /api/egress`
 

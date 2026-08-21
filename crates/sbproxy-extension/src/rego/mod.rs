@@ -103,6 +103,34 @@ const EXECUTION_CHECK_INTERVAL: std::num::NonZeroU32 = match std::num::NonZeroU3
     None => unreachable!(),
 };
 
+/// Largest `print()` message written to one log event, in bytes.
+///
+/// A transform hook's input is the complete buffered response body, so
+/// an unbounded print is a copy of every response into whatever
+/// consumes the log. Enough to carry a debugging message; not enough to
+/// carry a payload.
+const MAX_PRINT_MESSAGE_BYTES: usize = 512;
+
+/// Most `print()` events emitted from one evaluation.
+///
+/// A rule can print inside a comprehension, which turns one request into
+/// as many log lines as the input has elements. The remainder is
+/// reported as a single count rather than emitted.
+const MAX_PRINTS_PER_EVALUATION: usize = 8;
+
+/// Truncate a print message to [`MAX_PRINT_MESSAGE_BYTES`] on a char
+/// boundary, returning the message and whether it was shortened.
+fn truncate_print_message(message: &str) -> (&str, bool) {
+    if message.len() <= MAX_PRINT_MESSAGE_BYTES {
+        return (message, false);
+    }
+    let mut end = MAX_PRINT_MESSAGE_BYTES;
+    while end > 0 && !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&message[..end], true)
+}
+
 /// A compiled Rego policy, parsed once at config load.
 ///
 /// Holds the engine with its module already added. Per-request work is
@@ -335,19 +363,41 @@ impl CompiledRego {
     /// error path, since a rule can print before a later line in the
     /// same evaluation faults. `tenant` is the empty string when the
     /// caller has none to attribute the event to.
+    ///
+    /// Bounded and redacted on the way out. A transform hook's input is
+    /// the complete buffered response body, so `print(input.body.body_base64)`
+    /// is a copy of every response into the log, at `info`, on the hot
+    /// path. Each message is passed through the secret redactor and
+    /// truncated to [`MAX_PRINT_MESSAGE_BYTES`], and at most
+    /// [`MAX_PRINTS_PER_EVALUATION`] events are emitted per evaluation
+    /// with one summary line for the remainder.
     fn drain_prints(&mut self, tenant: &str) {
         let Ok(prints) = self.engine.take_prints() else {
             // Only errors when gathering was never enabled, which
             // `compile` always does; nothing to drain either way.
             return;
         };
-        for message in prints {
+        let gathered = prints.len();
+        for message in prints.into_iter().take(MAX_PRINTS_PER_EVALUATION) {
+            let redacted = sbproxy_observe::redact::redact_secrets(&message);
+            let (message, truncated) = truncate_print_message(&redacted);
             tracing::info!(
                 target: "rego_print",
                 site = %self.site,
                 query = %self.query,
                 tenant_id = tenant,
+                truncated,
                 "{message}"
+            );
+        }
+        if gathered > MAX_PRINTS_PER_EVALUATION {
+            tracing::warn!(
+                target: "rego_print",
+                site = %self.site,
+                query = %self.query,
+                tenant_id = tenant,
+                dropped = gathered - MAX_PRINTS_PER_EVALUATION,
+                "rego print output dropped: more print() calls in one evaluation than the cap"
             );
         }
     }
@@ -1273,6 +1323,81 @@ allow if {
             events[0].message.contains("trial or real, always prints"),
             "{:?}",
             events[0]
+        );
+    }
+
+    /// Regorus's `http.send` is a stub returning `Undefined`
+    /// (`regorus-0.11.0/src/builtins/http.rs`), so a bundled Rego module
+    /// has no network primitive. `Engine::new()` is bare: no builtin
+    /// denylist, no strict mode, nothing in this repository that pins
+    /// that stub.
+    ///
+    /// This test is that pin. If it fails, `http.send` now reaches the
+    /// network from inside operator-supplied policy code, and none of
+    /// the calls go through sbproxy's SSRF guard, its grant system, or
+    /// its egress logging.
+    ///
+    /// Deliberately not paired with an exact `=0.11.0` version pin:
+    /// freezing the dependency would trade a silent behavior change for
+    /// silently missing regorus's own security patches, and this test
+    /// catches a patch release that implements the builtin exactly as
+    /// well as it catches a minor bump.
+    #[test]
+    fn http_send_is_not_a_network_primitive_for_bundled_rego() {
+        const PROBE: &str = r#"
+package sbproxy
+
+probe := http.send({"method": "get", "url": "http://127.0.0.1:1/"})
+"#;
+        let mut compiled =
+            CompiledRego::compile("ssrf-pin", PROBE, "data.sbproxy.probe", 1_000, None, false)
+                .expect("the probe module compiles");
+
+        let value = compiled
+            .eval_value(serde_json::json!({}), "")
+            .expect("the probe evaluates");
+
+        assert_eq!(
+            value,
+            serde_json::Value::Null,
+            "regorus implemented `http.send`. Every installed Rego bundle can now make \
+             outbound HTTP calls from inside policy evaluation, and none of them pass \
+             through sbproxy's SSRF guard, its `net:outbound` grants, or its egress \
+             logging. Do not ship this dependency bump: either hold the version, or add \
+             a builtin denylist to `CompiledRego::compile` before it lands. Observed: \
+             {value:?}"
+        );
+    }
+
+    #[test]
+    fn a_print_message_is_truncated_on_a_char_boundary() {
+        // A transform hook's input is the complete response body, so an
+        // unbounded print is a copy of every response into the log.
+        let long = "x".repeat(MAX_PRINT_MESSAGE_BYTES * 4);
+        let (message, truncated) = truncate_print_message(&long);
+        assert!(truncated);
+        assert_eq!(message.len(), MAX_PRINT_MESSAGE_BYTES);
+
+        // A multibyte char straddling the cut must not panic or split.
+        let multibyte = "\u{00e9}".repeat(MAX_PRINT_MESSAGE_BYTES);
+        let (message, truncated) = truncate_print_message(&multibyte);
+        assert!(truncated);
+        assert!(message.len() <= MAX_PRINT_MESSAGE_BYTES);
+        assert!(multibyte.starts_with(message));
+
+        let short = "under the cap";
+        assert_eq!(truncate_print_message(short), (short, false));
+    }
+
+    #[test]
+    fn a_print_message_carrying_a_credential_is_redacted() {
+        let redacted = sbproxy_observe::redact::redact_secrets(
+            "leaking sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA now",
+        );
+        let (message, _) = truncate_print_message(&redacted);
+        assert!(
+            !message.contains("api03-AAAA"),
+            "a print() of a body carrying a credential must not reach the log: {message}"
         );
     }
 }

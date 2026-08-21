@@ -1,5 +1,5 @@
 # Metrics stability
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-20*
 
 *Generated from the executable metric registry. Do not hand-edit; run `cargo run -q -p sbproxy-observe --bin generate-metrics-stability > docs/metrics-stability.md`.*
 
@@ -84,6 +84,8 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_acme_renewal_duration_seconds` | Histogram | `stable` | `beta` | `result` | ACME renewal full-flow duration, by outcome. |
 | `sbproxy_acme_renewals_total` | Counter | `stable` | `beta` | `result` | ACME certificate renewal attempts, by outcome. |
 | `sbproxy_active_connections` | Gauge | `stable` | `stable` | none | Current active connections. |
+| `sbproxy_admin_request_export_rows_total` | Counter | `stable` | `beta` | `format` | Rows written by admin request-log exports, by format. |
+| `sbproxy_admin_request_exports_total` | Counter | `stable` | `beta` | `format` | Admin request-log exports served, by format. |
 | `sbproxy_agent_budget_decisions_total` | Counter | `stable` | `beta` | `agent_id`, `outcome` | agent_budget policy verdicts, labeled by agent and outcome. |
 | `sbproxy_agent_detect_inference_seconds` | Histogram | `stable` | `stable` | none | Agent-detect scorer inference latency in seconds. |
 | `sbproxy_agent_detect_score` | Histogram | `stable` | `stable` | none | Agent-detect scorer output score, scaled 0-100. |
@@ -159,11 +161,14 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_ai_token_estimate_error_ratio` | Histogram | `stable` | `beta` | `model` | Relative error of pre-request token estimate vs upstream usage.prompt_tokens. |
 | `sbproxy_ai_tokens_attributed_total` | Counter | `stable` | `stable` | `origin`, `provider`, `model`, `surface`, `direction`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id`, `agent_id` | AI tokens consumed, partitioned by attribution tag. |
 | `sbproxy_ai_tokens_saved_total` | Counter | `stable` | `beta` | `tenant`, `origin`, `model`, `kind` | Tokens avoided by a semantic-cache hit. |
+| `sbproxy_ai_translation_dropped_total` | Counter | `stable` | `beta` | `surface`, `field` | Request fields dropped while translating an inbound AI body (Anthropic Messages, OpenAI Responses) to the canonical chat shape, by inbound surface and dropped-field class. |
 | `sbproxy_ai_ttft_seconds` | Histogram | `stable` | `stable` | `provider`, `model` | AI streaming time to first token. |
 | `sbproxy_ai_usage_parse_miss_total` | Counter | `stable` | `beta` | `provider`, `surface` | 2xx AI responses on a token surface that carried no parseable usage block (budget debited from an estimate). |
 | `sbproxy_ai_wasted_cost_dollars_total` | Counter | `stable` | `beta` | `kind`, `provider`, `model`, `surface`, `project`, `feature`, `team`, `agent_type`, `environment` | Estimated USD cost of AI spend classified as wasted. |
 | `sbproxy_ai_wasted_tokens_total` | Counter | `stable` | `beta` | `kind`, `provider`, `model`, `surface`, `project`, `feature`, `team`, `agent_type`, `environment` | AI tokens classified as wasted, by waste class. |
+| `sbproxy_audit_chain_read_total` | Counter | `stable` | `beta` | `channel`, `outcome` | Audit-chain read attempts, by verification outcome (verified, broken, unreadable, denied). |
 | `sbproxy_audit_emit_duration_seconds` | Histogram | `stable` | `beta` | `channel`, `outcome` | Wall-clock latency of one audit-channel emission. |
+| `sbproxy_audit_write_failures_total` | Counter | `stable` | `beta` | `channel` | Audit emissions that did not reach a sink they were promised, by audit channel; healthy systems read 0. |
 | `sbproxy_auth_results_total` | Counter | `stable` | `stable` | `origin`, `auth_type`, `result` | Auth check results. |
 | `sbproxy_boilerplate_stripped_bytes_total` | Counter | `stable` | `beta` | `hostname` | Bytes removed by the boilerplate transform, by hostname. |
 | `sbproxy_bot_auth_directory_fetch_failures_total` | Counter | `stable` | `beta` | `url` | Bot-auth hosted key-directory fetches that failed (the verifier serves stale or fails per nonce_policy). |
@@ -195,6 +200,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_config_revision_info` | Gauge | `stable` | `beta` | `revision`, `digest`, `provenance` | Current entry in the config revision ring; always 1, the revision/digest/provenance are the labels. |
 | `sbproxy_config_source_fetch_total` | Counter | `stable` | `beta` | `kind`, `result` | Config source resolutions, by source kind and result. |
 | `sbproxy_config_source_revision_info` | Gauge | `stable` | `beta` | `sha` | Commit the config source resolved to; always 1, the commit is the label. |
+| `sbproxy_credential_resolution_duration_seconds` | Histogram | `stable` | `beta` | `cache`, `outcome` | Wall-clock latency of one bound-credential resolution, by which cache layer answered and the real outcome. |
 | `sbproxy_egress_refused_total` | Counter | `stable` | `beta` | `purpose`, `reason`, `tenant`, `origin` | Outbound dials refused by purpose-scoped egress authorization, by purpose, closed reason, tenant, and origin. |
 | `sbproxy_errors_total` | Counter | `stable` | `beta` | `hostname`, `error_type` | Total errors. |
 | `sbproxy_events_dropped_total` | Counter | `stable` | `beta` | `sink`, `reason` | Proxy events the events: egress did not deliver, by sink (file or webhook) and closed reason. |
@@ -217,6 +223,8 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_judge_cost_usd` | Counter | `stable` | `beta` | `provider` | Judge backend cost per decision in USD. |
 | `sbproxy_judge_latency_seconds` | Histogram | `stable` | `beta` | `provider`, `cached` | Judge backend round-trip latency. |
 | `sbproxy_jwks_unknown_kid_refetch_total` | Counter | `stable` | `beta` | `result` | JWKS refreshes triggered by tokens whose kid was absent from the local cache. |
+| `sbproxy_key_lookup_cache_total` | Counter | `stable` | `beta` | `kind`, `outcome` | Keystore TTL-cache lookups, by record kind and which layer answered (hit, negative_hit, tier_hit, miss, error). |
+| `sbproxy_key_operations_total` | Counter | `stable` | `beta` | `operation`, `outcome` | Admin key-lifecycle operations, by operation and by what the handler actually returned (ok, refused, error). |
 | `sbproxy_key_policy_stored_rejections_total` | Counter | `stable` | `alpha` | `reason` | Stored key records rejected while lowering to an effective policy, by reason. |
 | `sbproxy_key_store_outage_total` | Counter | `stable` | `beta` | `entrypoint`, `posture`, `outcome` | Inbound-key resolutions that could not reach the virtual key store, by entrypoint, configured failure posture, and what the posture decided. |
 | `sbproxy_key_store_unavailable` | Gauge | `stable` | `beta` | `posture` | 1 while the last inbound-key resolution could not reach the virtual key store; the posture label is what that costs. |
@@ -310,6 +318,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_policy_evaluation_duration_seconds` | Histogram | `stable` | `beta` | `origin`, `verdict` | Wall-clock latency of one full policy-chain evaluation. |
 | `sbproxy_policy_panic_total` | Counter | `stable` | `beta` | `policy` | Policy enforcer panics contained on the serving path, by policy type. |
 | `sbproxy_policy_triggers_total` | Counter | `stable` | `stable` | `origin`, `policy_type`, `action`, `agent_id`, `agent_class` | Policy enforcement results. |
+| `sbproxy_prompt_injection_blocks_total` | Counter | `stable` | `beta` | `scan_path`, `tenant` | Requests blocked by the prompt_injection_v2 policy, by scan path (header_scan, body_scan, ai_body, a2a). |
 | `sbproxy_projection_render_failures_total` | Counter | `stable` | `alpha` | `projection` | Well-known projection render failures, by projection. |
 | `sbproxy_rate_limit_cluster_peer_denials_total` | Counter | `stable` | `alpha` | none | Mesh rate-limit denials that needed peer counts, so the approximation is observable. |
 | `sbproxy_rate_limit_decisions_total` | Counter | `stable` | `alpha` | `policy`, `result` | Rate-limit middleware decisions, by policy and outcome. |
@@ -318,6 +327,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_redis_kv_connections_total` | Counter | `stable` | `beta` | `result` | Redis KV connection attempts by result. |
 | `sbproxy_redis_kv_operation_duration_seconds` | Histogram | `stable` | `beta` | `operation` | Redis KV operation duration in seconds. |
 | `sbproxy_redis_kv_operation_errors_total` | Counter | `stable` | `beta` | `operation`, `reason` | Redis KV operation failures by operation and reason. |
+| `sbproxy_request_body_drain_timeout_total` | Counter | `stable` | `beta` | none | Times the post-response drain of a client's request body hit its bound and the connection was closed with bytes unread. |
 | `sbproxy_request_duration_seconds` | Histogram | `stable` | `stable` | `hostname` | Request latency. |
 | `sbproxy_requests_total` | Counter | `stable` | `stable` | `hostname`, `method`, `status`, `agent_id`, `agent_class`, `agent_vendor`, `payment_rail`, `content_shape` | Total HTTP requests. |
 | `sbproxy_response_body_bytes` | Histogram | `stable` | `beta` | `direction` | Response body size, by compression direction. |
@@ -328,11 +338,14 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_decision_event_total` | Counter | `stable` | `alpha` | `event`, `engine`, `outcome`, `origin`, `tenant` | Decision events by pipeline point, engine, and outcome. |
 | `sbproxy_decision_event_duration_seconds` | Histogram | `stable` | `alpha` | `event`, `engine`, `origin` | Decision event evaluation latency. |
 | `sbproxy_decision_event_fail_open_total` | Counter | `stable` | `alpha` | `event`, `engine`, `origin`, `tenant` | Decision events that proceeded without the decision being made. |
+| `sbproxy_deprecated_requests_total` | Counter | `stable` | `beta` | `origin`, `route`, `past_sunset`, `outcome` | Requests that resolved to a deprecated route, by request Host, matched announcement, whether the hit landed after the announced sunset, and whether it was served or refused with 410. |
 | `sbproxy_semantic_cache_results_total` | Counter | `stable` | `beta` | `tenant`, `origin`, `source`, `result` | Semantic-cache hit/miss/error counts. |
 | `sbproxy_serve_lane_admissions_total` | Counter | `config_only` (nothing emits this yet) | `alpha` | `priority`, `decision` | Served-lane admission gate decisions by priority lane. |
+| `sbproxy_security_headers_csp_emitted_total` | Counter | `stable` | `beta` | `mode`, `tenant` | Content-Security-Policy headers emitted by the security_headers policy, by mode (enforce, report_only). |
 | `sbproxy_silent_degradations_total` | Counter | `config_only` (nothing emits this yet) | `alpha` | `op` | Best-effort operations that failed and were previously dropped silently, by op. |
 | `sbproxy_sink_install_failures_total` | Counter | `stable` | `beta` | none | Failed installs of the process-wide telemetry sink dispatcher. |
 | `sbproxy_synthetic_probe_failures_total` | Counter | `stable` | `beta` | `reason` | Synthetic readiness probe failures by reason. |
+| `sbproxy_target_health_state` | Gauge | `stable` | `beta` | `origin`, `target` | Per-target tri-state health on LiteLLM's 0/1/2 scale: 0 healthy, 1 degraded (circuit breaker half-open), 2 excluded from selection (probe-unhealthy, outlier-ejected, or breaker open). Sampled at scrape time from the same pipeline walk that renders GET /api/health/targets. `origin` is the configured origin id, not the request Host. `target` is the configured target URL, or the load balancer's own url#index identifier when one origin configures that URL more than once. |
 | `sbproxy_telemetry_dropped_total` | Counter | `stable` | `beta` | `kind`, `reason` | Telemetry records dropped or sinks that failed to set up, by kind and reason. |
 | `sbproxy_tokens_attributed_total` | Counter | `stable` | `beta` | `project`, `user`, `tag`, `direction` | AI token usage attributed to a credential's project / user / tag. |
 | `sbproxy_transport_duration_seconds` | Histogram | `config_only` (nothing emits this yet) | `alpha` | `protocol`, `result` | Transport-layer request duration, by protocol and outcome. |
@@ -346,3 +359,4 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_usage_bridge_enqueued_total` | Counter | `stable` | `beta` | `tenant_id`, `reporter`, `resource_type`, `result` | Billable units the request path queued for a usage reporter, by tenant, reporter, resource type, and whether the row was new. |
 | `sbproxy_usage_bridge_gap_total` | Counter | `stable` | `beta` | `tenant_id`, `failure_mode` | Billable units that could not be queued for a usage reporter, by tenant and the posture in force. |
 | `sbproxy_waf_persistent_blocks_total` | Counter | `stable` | `beta` | `origin`, `tenant`, `event`, `key_kind` | WAF persistent (time-boxed) block actions, by lifecycle event and key kind. |
+| `sbproxy_websocket_teardowns_total` | Counter | `stable` | `beta` | `reason`, `direction`, `tenant`, `origin` | WebSocket upgrades refused or tunnels torn down by the gateway, by closed reason, direction, tenant, and origin. Covers both upgrade surfaces: the `websocket` action and AI realtime. |

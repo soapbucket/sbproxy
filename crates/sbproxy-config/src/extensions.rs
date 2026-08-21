@@ -966,6 +966,33 @@ impl BundleManifest {
                 if !self.entry.ends_with(".rego") {
                     return invalid("runtime rego entry must end in .rego");
                 }
+                // A Rego hook evaluates on the Regorus interpreter in
+                // this process, with no guest heap and no guest stack to
+                // bound: `memory_mb` and `stack_kb` reach the Wasmtime
+                // store and the JavaScript runtime, and there is nothing
+                // equivalent to hand them to here. Refuse a non-default
+                // value rather than accept a number that reads as a
+                // sandbox bound and does nothing, the same posture
+                // `enforcement_mode: observe` on an ai_routing hook and
+                // a non-closed `failure_posture` on an auth hook already
+                // take. A bundle that never mentions either field keeps
+                // loading; only writing one is refused, which is
+                // precisely the case where an operator believes it
+                // bounds something.
+                if self.sandbox.memory_mb != default_memory_mb() {
+                    return invalid(
+                        "runtime rego does not honor sandbox.memory_mb; a Rego hook has no \
+                         guest heap to bound, and is bounded by sandbox.budget_ms plus \
+                         sandbox.max_buffer_bytes and max_output_bytes. Remove the field",
+                    );
+                }
+                if self.sandbox.stack_kb != default_stack_kb() {
+                    return invalid(
+                        "runtime rego does not honor sandbox.stack_kb; a Rego hook has no \
+                         guest stack to bound, and is bounded by sandbox.budget_ms plus \
+                         sandbox.max_buffer_bytes and max_output_bytes. Remove the field",
+                    );
+                }
                 for hook in &self.hooks {
                     match hook.kind {
                         // A policy hook evaluates the request line,
@@ -1485,6 +1512,31 @@ permissions: []
             manifest.hooks[0].query.as_deref(),
             Some("data.sbproxy.allow")
         );
+    }
+
+    #[test]
+    fn runtime_rego_refuses_the_sandbox_memory_knobs_it_cannot_honor() {
+        // Retrospective review of PR #1153: `sandbox.memory_mb` and
+        // `stack_kb` were documented as bounding a Rego bundle and never
+        // reached `compile_rego_hook`. Regorus's own allocator guards
+        // compile to `Ok(())` unless the `allocator-memory-limits`
+        // feature is on, which this workspace does not enable, so the
+        // number an operator wrote bounded nothing at all.
+        for (field, value) in [("memory_mb", "32"), ("stack_kb", "1024")] {
+            let yaml = replace_once(
+                REGO_POLICY_MANIFEST,
+                "sandbox:\n  budget_ms: 50\n",
+                &format!("sandbox:\n  budget_ms: 50\n  {field}: {value}\n"),
+            );
+            let error = manifest_error(&yaml);
+            assert!(
+                error.contains(field) && error.contains("does not honor"),
+                "a rego manifest setting {field} must be refused, got: {error}"
+            );
+        }
+
+        // Writing nothing keeps loading, which is every shipped bundle.
+        parse_manifest(REGO_POLICY_MANIFEST);
     }
 
     #[test]

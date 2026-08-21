@@ -1440,6 +1440,131 @@ budget:
 
 Window selection, the downgrade-target resolution order, and how a downgrade is tagged in the spend history are in [ai-predictive-budget.md](ai-predictive-budget.md).
 
+### Temporary budget overrides
+
+A governed key's base budget lives on its dynamic key record (see
+[key-management.md](key-management.md)). When a launch day or a load test
+needs more headroom for a few hours, editing that durable limit means
+remembering to put it back. A temporary override raises the effective
+budget instead: it applies on top of the base caps until an expiry you
+choose, then the base resumes on its own. The same mechanic LiteLLM ships
+as `temp_budget_increase` / `temp_budget_expiry`.
+
+```mermaid
+flowchart TD
+    GRANT["Operator grants a raise:\nPOST /admin/keys/{id}/budget-override\nincrease + TTL + reason"] --> STORE["Override persisted on the\nkey record in the store:\nincrease, expiry, grantor"]
+    STORE --> AUDIT1["key_audit: budget_override_grant,\nnaming the grantor"]
+    STORE --> READ{"Budget read\n(request dispatch, preview,\nusage snapshot)"}
+    READ -->|"now < expiry"| RAISED["Effective budget =\nbase caps + increase"]
+    READ -->|"now >= expiry"| BASE["Effective budget =\nbase caps alone"]
+    RESTART["Process restart"] --> READ
+    BASE --> SWEEP["Next admin read retires the\nlapsed grant from the record"]
+    SWEEP --> AUDIT2["key_audit: budget_override_expire\n(time ended it; no actor)"]
+    CLEAR["Operator ends it early:\nDELETE .../budget-override"] --> AUDIT3["key_audit: budget_override_clear\n(naming the operator)"]
+    AUDIT3 --> BASE
+```
+
+Three properties fall out of evaluating the expiry at read time rather
+than running a timer. A restart changes nothing, because the override is
+persisted in the key store and every read re-derives the effective budget
+from it. The revert cannot be forgotten, because there is nothing to
+revert. And the enforcement path, the admin preview, and the usage
+snapshot cannot disagree, because all three read the budget through the
+same seam.
+
+Granting and clearing:
+
+```bash
+# Raise the key's caps by 100k tokens and $50 for one hour.
+curl -u admin:admin -X POST http://127.0.0.1:9090/admin/keys/<key_id>/budget-override \
+  -H 'Content-Type: application/json' \
+  -d '{"max_tokens_increase": 100000, "max_cost_usd_increase": 50.0,
+       "ttl_secs": 3600, "reason": "launch-day spike"}'
+
+# End it early; the base budget resumes immediately.
+curl -u admin:admin -X DELETE http://127.0.0.1:9090/admin/keys/<key_id>/budget-override
+```
+
+The grant body takes `max_tokens_increase` and `max_cost_usd_increase`
+(at least one, each raising the matching base cap), an expiry as either
+`ttl_secs` or an RFC 3339 `expires_at`, and an optional `reason`. A raise
+only lifts caps that exist: an axis the base budget leaves uncapped stays
+uncapped, and a key with no base budget cannot be raised at all. While the
+raise is live, `GET /admin/keys/{id}` shows the untouched `budget`, the
+`budget_override` (increase, expiry, grantor, reason), and the
+`effective_budget` the enforcement path is comparing spend against. The
+console's Keys page renders the same three as a "raised" badge with a
+countdown and a Clear raise action.
+
+Three points in the raise's life land in the `key_audit` trail, and the
+difference between the last two is what makes the trail reconcilable.
+`budget_override_grant` names the operator who granted the raise.
+`budget_override_clear` names the operator who ended a live one early
+through `DELETE`. `budget_override_expire` is the unattributed,
+time-driven end, written when an admin read (or a `DELETE` arriving
+after the fact) first observes the lapsed grant and retires it from the
+record. A compliance rule that reconciles every raise against its
+termination has to match `clear` OR `expire`; matching only `expire`
+leaves every operator-cancelled raise looking like it is still
+running. Overrides are granted at
+runtime only; a key seeded from `key_management.seed` gets its override
+dropped if the seed re-applies on reload, the same as any other runtime
+mutation of a config-sourced record.
+
+The runnable walkthrough, with the refusal at the base cap, the grant, the
+admitted request, and the expiry, is
+[examples/temp-budget-override/](../examples/temp-budget-override/):
+
+<!-- sbproxy-config: examples/temp-budget-override/sb.yml -->
+```yaml
+proxy:
+  http_bind_port: 8080
+
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: admin
+
+  key_management:
+    enabled: true
+    store:
+      backend: embedded
+      path: /tmp/sbproxy-temp-budget-override.redb
+    cache:
+      ttl_secs: 60
+    crypto:
+      pepper: env:SBPROXY_KEY_PEPPER
+      master_key: env:SBPROXY_KEY_MASTER
+    failure_posture: closed
+    seed:
+      keys:
+        - key_id: seed0001
+          secret: demo-secret-please-rotate
+          name: launch-day-demo-key
+          # The base cap the override temporarily raises: 200 total
+          # tokens across the key's lifetime. Small on purpose, so one
+          # fixture request can exhaust it.
+          max_budget_tokens: 200
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          provider_type: openai
+          # The fixture ignores the credential; OpenAI-shaped provider
+          # config carries one. Against the real provider this would be
+          # ${OPENAI_API_KEY}.
+          api_key: ${FIXTURE_API_KEY:-fixture-local-token}
+          base_url: http://127.0.0.1:18080/v1
+          allow_private_base_url: true
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+```
+
 ### Model prices
 
 Cost tracking and cost-based routing need a per-model price. SBproxy ships a built-in catalog of current families (GPT-5 / 4.1 / 4o / o-series, Claude 4.x and 3.x, Gemini 2.x and 1.5); a model the catalog does not know is billed at a deliberately high $5 / $5 per million tokens so a budget cap fires early rather than late. You can supply prices two ways, both layered over the catalog.
@@ -1864,10 +1989,56 @@ What the gateway does not do is hold server-side response state, and it refuses 
 - `previous_response_id` and `conversation` are refused with a 400. Honoring either would return a response that silently lacks the prior turns it references. Resend the full conversation history in `input` instead.
 - `store: true` is refused with a 400, because the response id would never be retrievable from the gateway. `store: false`, or omitting the field, works: the stateless translation persists nothing, which is exactly what it asks for.
 - An `mcp` tool block is refused with a 400. It asks the model provider to contact an MCP server directly, bypassing the gateway's MCP governance (RBAC, sessions, audit, egress inventory). Front the server with a `type: mcp` action and point the client at that origin instead.
-- Every other non-`function` tool block (`file_search`, `web_search_preview`, `code_interpreter`, `image_generation`, and any unrecognized type) is dropped, never forwarded upstream, and logged with a warning naming the dropped type.
-- A `prompt` template reference is dropped and logged the same way; the gateway does not resolve server-side prompt objects, so the request runs on its `input` alone.
+- Every other non-`function` tool block (`file_search`, `web_search_preview`, `code_interpreter`, `image_generation`, and any unrecognized type) is dropped, never forwarded upstream, counted on `sbproxy_ai_translation_dropped_total`, and named in the request's one aggregated `AI proxy: request fields dropped in translation` warn. That warn lists at most eight distinct field labels; past eight, a drop is still counted but no longer named, so the log line cannot grow with the request body.
+- A `prompt` object (`{"id": ..., "version": ..., "variables": ...}`) is served from the gateway's own prompt store: `id` names a stored prompt on the origin, `version` picks a stored version label, and omitting `version` resolves the pinned default. The rendered template is prepended to `instructions` before translation, so it reaches every configured provider, not only OpenAI. An `id` or `version` the store does not hold is a 404 with one generic unknown-reference message, so a caller probing versions cannot tell a missing version from a missing prompt; the precise miss is logged server-side at debug level. A malformed object is a 400, and neither falls through to the raw input. A string-valued `prompt` is not the object form; it is dropped and logged with a warning, unchanged. See "Stored prompts and offline optimization" below.
 
 The refusals are deliberate. A request that references state the gateway does not hold would otherwise succeed while quietly missing context, and that failure is harder to notice than a 400 that names the field and the fix.
+
+#### What translation drops, and how you see it
+
+`/v1/messages` and `/v1/responses` are translated into the canonical chat
+shape, and that shape cannot carry everything either wire format can express.
+Every field the translator reads past without honoring is counted on
+`sbproxy_ai_translation_dropped_total{surface, field}` and named in one
+aggregated warn per request:
+
+```text
+WARN AI proxy: request fields dropped in translation surface="messages" origin="ai.example.com" tenant="acme" dropped=3 fields="anthropic.metadata, anthropic.messages.content.text.cache_control" first_note="metadata dropped: the canonical request does not carry it, so the provider never sees the request metadata (user_id included)"
+```
+
+Grep that message to find them. `surface` uses the same values as
+`sbproxy_ai_surface_requests_total`, so a drop-rate panel divides cleanly:
+
+```promql
+sum by (surface) (rate(sbproxy_ai_translation_dropped_total[5m]))
+  / sum by (surface) (rate(sbproxy_ai_surface_requests_total[5m]))
+```
+
+`field` is a bounded class label (`anthropic.messages.content`,
+`responses.tools`, `responses.text`, ...), never a client-supplied string, so a
+hostile body cannot mint metric series. `origin` and `tenant` ride the warn
+rather than the counter for the same reason. One request emits one warn no
+matter how many fields it dropped, and that warn names at most eight distinct
+field labels, so a large body cannot turn into a log flood.
+
+Two fields go the other way and are now forwarded rather than dropped:
+
+- `tool_choice` on `/v1/messages` and `/v1/responses` is honored end to end,
+  including a forced tool. Each provider translator rewrites it into that
+  provider's spelling: Anthropic gets `{"type": "any"}` or
+  `{"type": "tool", "name": ...}`, Gemini gets
+  `toolConfig.functionCallingConfig`, Bedrock gets `toolConfig.toolChoice`. It
+  used to be parsed and discarded, so a client that demanded a specific tool
+  got whatever the model felt like calling.
+- `top_k` is honored for providers whose wire format has the knob: Anthropic
+  takes it natively and Gemini re-homes it to `generationConfig.topK`. It is
+  removed on the way to an OpenAI-format upstream, because `top_k` is not an
+  OpenAI Chat Completions argument and `api.openai.com` answers an
+  unrecognized one with a 400. Bedrock's Converse shape has no top-level
+  equivalent, so its translator drops it as it always has. An operator
+  fronting an OpenAI-compatible server that does honor `top_k` should give
+  that provider `format: custom`, which relays the body untouched.
+
 
 ### Method coverage
 
@@ -2088,6 +2259,121 @@ the gateway-only `prompt` field, and records the resolved name and version in
 run metadata. Runtime versions are added, replaced, and pinned through the
 authenticated Admin API. Use a new version label when you need immutable
 history.
+
+On `/v1/responses` the same store serves the OpenAI Responses `prompt`
+object. `id` maps onto the stored prompt name, `version` onto a stored
+version label, and omitting `version` resolves the pinned default:
+
+```json
+{
+  "model": "gpt-4.1",
+  "input": "Where should I eat tonight?",
+  "prompt": {"id": "concierge", "version": "2", "variables": {"city": "Berlin"}}
+}
+```
+
+Resolution happens in the dispatcher, before the body is translated for the
+upstream, and it fails closed at every branch:
+
+```mermaid
+flowchart TD
+    A["POST /v1/responses with an object-valued prompt"] --> B{"Shape valid?\nid is a non-empty string,\nno unknown keys,\nvariables are strings"}
+    B -->|no| M["400 prompt error: malformed prompt object"]
+    B -->|yes| C{"Runtime overlay for this\norigin holds the name?"}
+    C -->|yes| E
+    C -->|no| D{"Origin config prompts\nhold the name?"}
+    D -->|no| N["404 prompt error:\nunknown prompt reference"]
+    D -->|yes| E{"Version resolves?\nrequested label, else pinned\ndefault, else highest numeric"}
+    E -->|no| N
+    E -->|yes| F{"Template renders?\nstrict undefined: every\nvariables.* hole must be filled"}
+    F -->|no| O["400 prompt error:\nprompt render failed: ..."]
+    F -->|yes| G["Prepend rendered text to instructions,\nstrip the prompt field,\nrecord name + version in run metadata"]
+    G --> H["Translate to the canonical chat shape"]
+    H --> I["Input guardrails scan the rendered system turn"]
+    I --> J["Route, budget, dispatch to any configured provider"]
+```
+
+The 404 body is the same for a missing prompt and a missing version, so a
+caller probing version labels learns nothing about which ones exist; the
+precise miss is logged server-side at debug level. It does not hide whether a
+prompt exists at all, and it is not meant to: a stored name answers 200 and an
+absent one answers 404. Prompt names are configuration, not secrets. Note that
+the render branch answers 400 rather than 404, which is a second way a resolved
+name is distinguishable from an absent one.
+
+Three requests against the same store, which declares `concierge` with versions
+`1` and `2` and pins `2` as the default:
+
+```bash
+# 1. A stored prompt with a caller variable. The rendered version 2
+#    becomes the system turn; the client never sends the template.
+curl -s http://127.0.0.1:8080/v1/responses \
+  -H 'Host: ai.example.com' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4.1","input":"Where should I eat tonight?",
+       "prompt":{"id":"concierge","variables":{"city":"Berlin"}}}'
+```
+
+```json
+{
+  "id": "resp_01",
+  "object": "response",
+  "status": "completed",
+  "output": [
+    {
+      "type": "message",
+      "id": "resp_01__msg",
+      "role": "assistant",
+      "content": [{"type": "output_text", "text": "Try Markthalle Neun...", "annotations": []}]
+    }
+  ],
+  "usage": {"input_tokens": 41, "output_tokens": 96, "total_tokens": 137}
+}
+```
+
+```bash
+# 2. A name the store does not hold. Same body a wrong version gets.
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/v1/responses \
+  -H 'Host: ai.example.com' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4.1","input":"hi","prompt":{"id":"no-such-prompt"}}'
+```
+
+```text
+404
+```
+
+```json
+{"error": {"message": "prompt error: unknown prompt reference", "type": "invalid_request_error"}}
+```
+
+```bash
+# 3. A stored prompt whose template needs a variable the caller omitted.
+#    Strict undefined refuses rather than rendering an empty hole.
+curl -s http://127.0.0.1:8080/v1/responses \
+  -H 'Host: ai.example.com' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4.1","input":"hi","prompt":{"id":"concierge"}}'
+```
+
+```json
+{"error": {"message": "prompt error: prompt render failed: undefined value (in <string>:1)", "type": "invalid_request_error"}}
+```
+
+Variables must be strings. They fill the template's `variables.*` scope and
+overwrite a same-named static variable on the stored version. That is a trust
+boundary worth stating plainly: the `variables:` an operator declares on a
+version are defaults the caller can rewrite, not values the caller cannot
+touch. A version pinning `variables: {role: "customer"}` whose template says
+`You are talking to a {{ variables.role }}` will say whatever the caller's
+`variables.role` says. Put a constraint that has to hold regardless of the
+caller in the template text, not in `variables:`. The `"prompt": "name@version"`
+string form carries no variables at all, so the same stored version is
+caller-writable on `/v1/responses` and operator-only on
+`/v1/chat/completions`; there is no per-version variable lock today.
+
+A malformed prompt object (a non-string `id`, an unknown key, a typed
+content-part variable) is a 400. The string form above is unchanged.
 
 `sbproxy ai prompt optimize` compiles a shorter static system prompt offline.
 It never changes live route state. The command first scores the source prompt,
@@ -2456,6 +2742,7 @@ The proxy exposes aggregate AI usage as Prometheus metrics. The `/metrics` endpo
 | `sbproxy_ai_data_posture_filter_total` | Counter | `constraint`, `outcome`, `tenant` | Requests whose provider candidate set the data-posture constraint narrowed (`outcome="filtered"`) or refused outright (`outcome="refused"`). See [Provider data posture](#provider-data-posture) |
 | `sbproxy_ai_failovers_total` | Counter | `from_provider`, `to_provider`, `reason` | Provider failover events |
 | `sbproxy_ai_guardrail_blocks_total` | Counter | `category` | Guardrail block events (pii, injection, jailbreak, etc.) |
+| `sbproxy_ai_translation_dropped_total` | Counter | `surface`, `field` | Request fields dropped translating an inbound `/v1/messages` or `/v1/responses` body into the canonical chat shape. `surface` matches `sbproxy_ai_surface_requests_total`, so the ratio is a drop rate; `field` is a bounded class (`anthropic.messages.content`, `responses.text`, ...). The matching log line is `AI proxy: request fields dropped in translation`, which carries the origin and tenant |
 | `sbproxy_ai_safety_guardrail_verdicts_total` | Counter | `guardrail`, `class`, `backend`, `verdict` | Toxicity, jailbreak, and content-safety evaluations, including whether keyword or classifier mode produced the verdict |
 | `sbproxy_ai_reasoning_policy_attempts_total` | Counter | `provider`, `outcome` | Per-provider concise-reasoning result: `native`, `prompt_fallback`, `off`, `tool_bypass`, or `code_bypass` |
 | `sbproxy_ai_cache_results_total` | Counter | `provider`, `cache_type`, `result` | AI response cache results (`cache_type` is `exact` or `semantic`, `result` is `hit` or `miss`) |

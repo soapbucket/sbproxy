@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
 use prometheus::{
@@ -287,6 +287,171 @@ fn refresh_cardinality_gauges() {
     }
 }
 
+// --- Target health tri-state gauge (WOR-2560) ---
+
+/// `sbproxy_target_health_state` value for a target that is fully
+/// healthy: probe passing, not outlier-ejected, circuit breaker closed.
+pub const TARGET_HEALTH_HEALTHY: i64 = 0;
+
+/// `sbproxy_target_health_state` value for a target that is degraded
+/// but still selectable: the circuit breaker is half-open, so it is
+/// carrying trial traffic while recovery is confirmed.
+pub const TARGET_HEALTH_DEGRADED: i64 = 1;
+
+/// `sbproxy_target_health_state` value for a target excluded from
+/// selection: probe-unhealthy, outlier-ejected, or breaker open.
+pub const TARGET_HEALTH_EXCLUDED: i64 = 2;
+
+/// One load-balancer target's health, as reported by the callback
+/// installed with [`set_target_health_source`].
+///
+/// `state` uses the 0/1/2 scale LiteLLM's deployment-state gauge
+/// established, so Grafana panels built against that convention port
+/// over unchanged: [`TARGET_HEALTH_HEALTHY`] (0),
+/// [`TARGET_HEALTH_DEGRADED`] (1), [`TARGET_HEALTH_EXCLUDED`] (2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetHealthSample {
+    /// Configured origin id the target belongs to. Never the request
+    /// `Host`, so the label stays bounded by the operator's config.
+    pub origin: String,
+    /// Target URL exactly as configured under the origin's load
+    /// balancer, or the load balancer's own `url#index` identifier when
+    /// one origin configures that URL more than once. Config-bounded
+    /// for the same reason, and unique per target within an origin, so
+    /// two same-URL targets cannot collapse onto one series while
+    /// `GET /api/health/targets` still shows them apart.
+    pub target: String,
+    /// Tri-state health; one of the three `TARGET_HEALTH_*` constants.
+    pub state: i64,
+}
+
+/// The callback that samples per-target health for the gauge.
+type TargetHealthSource = Box<dyn Fn() -> Vec<TargetHealthSample> + Send + Sync>;
+
+/// Installed target-health source. An `RwLock<Option<..>>` rather than
+/// a `OnceLock` so every pipeline publication (and every test) can
+/// install afresh; [`refresh_target_health_gauge`] takes the read side
+/// once per scrape.
+static TARGET_HEALTH_SOURCE: RwLock<Option<TargetHealthSource>> = RwLock::new(None);
+
+/// Install (or replace) the callback that samples per-target health
+/// for the `sbproxy_target_health_state` gauge.
+///
+/// The proxy installs one at every pipeline publication
+/// (`reload::load_pipeline` in `sbproxy-core`) that walks the live
+/// pipeline exactly as `GET /api/health/targets` does, so the
+/// Prometheus view and the admin view cannot disagree. Until a source
+/// is installed the family is absent from the scrape, which is the
+/// honest shape for "nothing is load-balancing yet": absent, not zero.
+pub fn set_target_health_source(
+    source: impl Fn() -> Vec<TargetHealthSample> + Send + Sync + 'static,
+) {
+    *TARGET_HEALTH_SOURCE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(source));
+}
+
+/// The `sbproxy_target_health_state` gauge, registered on the
+/// `ProxyMetrics` registry on first use. Best-effort registration for
+/// the same reason as the cardinality gauges above: a duplicate
+/// registration across `ProxyMetrics::new()` calls in tests is ignored
+/// and the local copy is used.
+static TARGET_HEALTH_GAUGE: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
+
+fn target_health_gauge() -> &'static prometheus::IntGaugeVec {
+    TARGET_HEALTH_GAUGE.get_or_init(|| {
+        let gauge = prometheus::IntGaugeVec::new(
+            Opts::new(
+                "sbproxy_target_health_state",
+                "Per-target tri-state health: 0 healthy, 1 degraded (circuit breaker half-open), 2 excluded from selection (probe-unhealthy, outlier-ejected, or breaker open). `origin` is the configured origin id; `target` is the configured URL, or url#index when an origin configures one URL twice",
+            ),
+            &["origin", "target"],
+        )
+        .expect("target health gauge constructs");
+        let _ = metrics().registry.register(Box::new(gauge.clone()));
+        gauge
+    })
+}
+
+/// Label pairs the target-health gauge is currently publishing.
+///
+/// Held across the whole refresh, which is what makes two concurrent
+/// `/metrics` renders safe (see [`refresh_target_health_gauge`]). Kept
+/// in the order the source reported so removals are deterministic.
+static TARGET_HEALTH_PUBLISHED: Mutex<Vec<[String; 2]>> = Mutex::new(Vec::new());
+
+/// Refresh the target-health gauge from the installed source.
+///
+/// Driven from [`ProxyMetrics::render`] beside
+/// [`refresh_cardinality_gauges`], and for the same reason: the truth
+/// lives elsewhere (the load balancer's probe, ejection, and breaker
+/// state), it only needs to be a gauge when someone scrapes, and
+/// sampling it at scrape time keeps the per-request path free of gauge
+/// writes it would otherwise have to maintain between scrapes.
+///
+/// A target removed by a config reload has to leave the scrape rather
+/// than serve its last pre-reload value forever, and the obvious way to
+/// do that, `gauge.reset()` followed by a repopulate, is wrong here.
+/// `/metrics` is served from two independent listeners (the data plane
+/// and the admin plane) with nothing serializing them, so a second
+/// render could wipe the first one's writes and let its `gather()` land
+/// in the gap, returning the family empty. On a family where a MISSING
+/// series is the alertable condition (`absent(...)`, or
+/// `min by (origin) (...) == 2` on an origin whose targets all
+/// vanished) that turns a healthy proxy into a page.
+///
+/// So the refresh is differential instead: take the mutex, drop only
+/// the label pairs the source stopped reporting, set the ones it did,
+/// and record what is now published. There is no instant at which a
+/// live series is absent, and two concurrent renders serialize on the
+/// mutex rather than racing through a wiped vec.
+fn refresh_target_health_gauge() {
+    let source = TARGET_HEALTH_SOURCE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(source) = source.as_ref() else {
+        return;
+    };
+    let gauge = target_health_gauge();
+    // The mutex is taken before the source is sampled, not after, so a
+    // render cannot publish a snapshot an already-completed render has
+    // superseded. Two scrapes racing across the two listeners then
+    // apply in a real order rather than an interleaved one, and the
+    // pipeline walk they serialize on is a walk over the configured
+    // origins, not per-request work.
+    let mut published = TARGET_HEALTH_PUBLISHED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let samples = source();
+
+    // Both labels go through the per-label budget rather than the
+    // workspace default, so the caps the budget table publishes on
+    // `sbproxy_label_cardinality_budget` are the caps actually
+    // enforced, and an overflow demotion increments
+    // `sbproxy_label_cardinality_overflow_total` instead of demoting
+    // silently.
+    let fresh: Vec<[String; 2]> = samples
+        .iter()
+        .map(|sample| {
+            [
+                sanitize_label_budget("sbproxy_target_health_state", "origin", &sample.origin),
+                sanitize_label_budget("sbproxy_target_health_state", "target", &sample.target),
+            ]
+        })
+        .collect();
+    for stale in published.iter() {
+        if !fresh.contains(stale) {
+            let _ = gauge.remove_label_values(&[stale[0].as_str(), stale[1].as_str()]);
+        }
+    }
+    for (labels, sample) in fresh.iter().zip(samples.iter()) {
+        gauge
+            .with_label_values(&[labels[0].as_str(), labels[1].as_str()])
+            .set(sample.state);
+    }
+    *published = fresh;
+}
+
 /// Return a reference to the global [`ProxyMetrics`] registry, initialising it on first use.
 pub fn metrics() -> &'static ProxyMetrics {
     METRICS.get_or_init(ProxyMetrics::new)
@@ -352,6 +517,12 @@ pub struct ProxyMetrics {
     /// Counter `sbproxy_inbound_key_requests_total` of requests partitioned
     /// by caller credential mode and its recognized provider.
     pub inbound_key_requests: IntCounterVec,
+
+    /// Counter `sbproxy_deprecated_requests_total` of requests that
+    /// resolved to a route carrying a `deprecation:` block or a
+    /// spec-deprecated OpenAPI operation, partitioned by origin, rule,
+    /// and whether the sunset instant had already passed (WOR-2565).
+    pub deprecated_requests_total: IntCounterVec,
 
     // --- Per-origin metrics (Sprint 1A) ---
     /// Total HTTP requests with origin, method, and status labels.
@@ -432,6 +603,19 @@ pub struct ProxyMetrics {
     /// counter surfaces how often the previously-panicking path is
     /// taken so the drift can be diagnosed in production.
     pub mirror_state_drift: prometheus::IntCounter,
+
+    /// Counter `sbproxy_request_body_drain_timeout_total` incremented when
+    /// the post-response drain of a client's request body hits its bound
+    /// and the connection is closed with bytes still unread.
+    ///
+    /// A response sbproxy writes itself goes out before the client's body
+    /// has been read, and closing a socket with unread bytes queued makes
+    /// the kernel send an RST that destroys the response (WOR-2599). The
+    /// drain exists to avoid that, and this counter is how an operator
+    /// sees it give up: every increment is a client that may have lost a
+    /// response it was already sent. A steady rate means either very slow
+    /// uploads or something holding connections open deliberately.
+    pub request_body_drain_timeout: prometheus::IntCounter,
 
     // --- Agent Skills ---
     /// Counter `sbproxy_agent_skill_digest_mismatch_total` of artifact
@@ -643,6 +827,22 @@ impl ProxyMetrics {
         )
         .unwrap();
 
+        // WOR-2565: deprecated-route usage. The whole point of
+        // announcing a deprecation is finding the remaining callers,
+        // so the counter carries which route is deprecated (`route` is
+        // the forward rule's id or index, the OpenAPI path template
+        // for spec-driven matches, or empty for a whole-origin block),
+        // whether the hit landed after the announced sunset, and
+        // whether this request was served anyway or refused with 410.
+        let deprecated_requests_total = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_deprecated_requests_total",
+                "Requests that resolved to a deprecated route",
+            ),
+            &["origin", "route", "past_sunset", "outcome"],
+        )
+        .unwrap();
+
         // --- Per-origin metrics (Sprint 1A) ---
 
         let per_origin_requests_total = CounterVec::new(
@@ -828,6 +1028,12 @@ impl ProxyMetrics {
         )
         .unwrap();
 
+        let request_body_drain_timeout = prometheus::IntCounter::new(
+            "sbproxy_request_body_drain_timeout_total",
+            "Times the post-response drain of a client's request body hit its bound and the connection was closed with bytes unread",
+        )
+        .unwrap();
+
         // --- Content transform counters ---
 
         let boilerplate_stripped_bytes = IntCounterVec::new(
@@ -926,6 +1132,9 @@ impl ProxyMetrics {
             .register(Box::new(inbound_key_requests.clone()))
             .unwrap();
         registry
+            .register(Box::new(deprecated_requests_total.clone()))
+            .unwrap();
+        registry
             .register(Box::new(per_origin_requests_total.clone()))
             .unwrap();
         registry
@@ -968,6 +1177,9 @@ impl ProxyMetrics {
             .register(Box::new(mirror_state_drift.clone()))
             .unwrap();
         registry
+            .register(Box::new(request_body_drain_timeout.clone()))
+            .unwrap();
+        registry
             .register(Box::new(agent_skill_digest_mismatch.clone()))
             .unwrap();
         registry.register(Box::new(phase_duration.clone())).unwrap();
@@ -994,6 +1206,7 @@ impl ProxyMetrics {
             agent_detect_inference_seconds,
             trust_tier_requests,
             inbound_key_requests,
+            deprecated_requests_total,
             per_origin_requests_total,
             per_origin_request_duration,
             per_origin_active_connections,
@@ -1013,6 +1226,7 @@ impl ProxyMetrics {
             cache_reserve_evictions,
             synthetic_probe_failures,
             mirror_state_drift,
+            request_body_drain_timeout,
             agent_skill_digest_mismatch,
             phase_duration,
             boilerplate_stripped_bytes,
@@ -1038,6 +1252,10 @@ impl ProxyMetrics {
         // snapshot them before gathering. A scrape is exactly when
         // someone wants them current.
         refresh_cardinality_gauges();
+        // Same shape for target health: the truth is the load
+        // balancer's probe/ejection/breaker state, sampled through the
+        // installed source when a scrape wants it as a gauge.
+        refresh_target_health_gauge();
         let encoder = TextEncoder::new();
         let mut metric_families = self.registry.gather();
         metric_families.extend(prometheus::gather());
@@ -1279,6 +1497,46 @@ pub fn record_request_with_labels(
             .with_label_values(&[origin_san.as_str(), "out"])
             .inc_by(bytes_out as f64);
     }
+}
+
+/// Record one request that resolved to a deprecated route (WOR-2565).
+///
+/// `route` names which deprecation announcement matched: the forward
+/// rule's `origin.id` (or its index when no id is configured), the
+/// OpenAPI path template for a spec-driven match, or the empty-string
+/// sentinel for a whole-origin `deprecation:` block. It is deliberately
+/// not called `rule`: the accepted-value set behind the cardinality
+/// budget is keyed on the label NAME, and `rule` is already the
+/// operator-named rule ids of four MCP and redaction families, whose
+/// budget a 1200-operation deprecated spec would exhaust on its own.
+/// `route` is the value space this label actually belongs to, shared
+/// with the `sbproxy_openapi_*` families that carry the same path
+/// templates.
+///
+/// `past_sunset` says whether the request landed after the announced
+/// sunset instant; it is always `false` when no sunset is configured.
+/// `refused` says whether this particular request was turned away with
+/// `410 Gone`, which `past_sunset` alone cannot answer: an origin on
+/// `after_sunset: serve` keeps serving past its sunset, so without the
+/// split an operator running both postures cannot count who is actually
+/// being cut off. Both booleans come from real comparisons, so all four
+/// combinations are reachable from real input.
+///
+/// Both free-form labels run through [`sanitize_label_budget`], though
+/// in practice their cardinality is bounded by the authored config and
+/// spec.
+pub fn record_deprecated_request(origin: &str, route: &str, past_sunset: bool, refused: bool) {
+    let origin_san = sanitize_label_budget("sbproxy_deprecated_requests_total", "origin", origin);
+    let route_san = sanitize_label_budget("sbproxy_deprecated_requests_total", "route", route);
+    metrics()
+        .deprecated_requests_total
+        .with_label_values(&[
+            origin_san.as_str(),
+            route_san.as_str(),
+            if past_sunset { "true" } else { "false" },
+            if refused { "gone" } else { "served" },
+        ])
+        .inc();
 }
 
 /// Record an auth check result for an origin.
@@ -1931,6 +2189,152 @@ pub fn record_key_store_reachable(posture: &'static str) {
     set_key_store_unavailable(posture, 0);
 }
 
+/// Count one admin key-lifecycle operation on
+/// `sbproxy_key_operations_total{operation, outcome}` (WOR-2572).
+///
+/// `operation` is the closed admin-route set: `mint`, `update`, `delete`,
+/// `revoke`, `block`, `unblock`, `rotate`, `budget_override_grant`,
+/// `budget_override_clear`. Every one of them loads and CAS-writes the
+/// same `KeyRecord`, which is the membership test; `/admin/credentials`
+/// writes a different record and gets its own family rather than
+/// doubling this one's. `outcome` is `ok`, `refused`,
+/// or `error`, derived at the dispatch seam from the status class the
+/// handler actually returned (2xx, 4xx, 5xx), never from a default. The
+/// three values are deliberately separate: a revision conflict the
+/// operator can retry and a store that is down are different facts, and
+/// folding them into one value produces a rate panel that cannot tell an
+/// outage from a busy console.
+pub fn record_key_operation(operation: &'static str, outcome: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_key_operations_total",
+            "Admin key-lifecycle operations, by operation and by what the handler actually returned (ok, refused, error)",
+            &["operation", "outcome"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        counter.with_label_values(&[operation, outcome]).inc();
+    }
+}
+
+/// Observe one bound-credential resolution on
+/// `sbproxy_credential_resolution_duration_seconds{cache, outcome}`
+/// (WOR-2572).
+///
+/// `cache` says which layer answered: `hit` (the per-generation
+/// resolved-secret cache, fresh), `stale` (a known-good value served
+/// inside the `proxy.secrets.rotation` grace window after re-resolution
+/// failed), or `miss` (the full keystore/vault path ran). `outcome` is
+/// `ok`, `refused` (absent, revoked/blocked, or cross-tenant), or
+/// `error` (the secret backend could not answer), taken from the one
+/// `Result` every caller sees. The cache-hit ratio derives from the
+/// `_count` series; `stale` is deliberately not folded into `hit`
+/// because a stale serve is a backend failure wearing a grace period.
+pub fn record_credential_resolution(
+    cache: &'static str,
+    outcome: &'static str,
+    duration_secs: f64,
+) {
+    use prometheus::{register_histogram_vec, HistogramVec};
+    use std::sync::OnceLock;
+    static H: OnceLock<Option<HistogramVec>> = OnceLock::new();
+    let hist = H.get_or_init(|| {
+        register_histogram_vec!(
+            "sbproxy_credential_resolution_duration_seconds",
+            "Wall-clock latency of one bound-credential resolution, by which cache layer answered and the real outcome",
+            &["cache", "outcome"],
+            crate::exemplars::STANDARD_LATENCY_BUCKETS.to_vec(),
+        )
+        .ok()
+    });
+    if let Some(hist) = hist {
+        hist.with_label_values(&[cache, outcome])
+            .observe(duration_secs);
+    }
+}
+
+/// Count one keystore TTL-cache lookup on
+/// `sbproxy_key_lookup_cache_total{kind, outcome}` (WOR-2572).
+///
+/// Driven through the cache's lookup observer
+/// (`sbproxy_keystore::cache::TtlCache::with_lookup_observer`), installed
+/// where the production cache is built (`key_plane::build_cache`), because
+/// the keystore crate deliberately does not depend on this one. `kind` is
+/// `key` or `credential`; `outcome` is `hit` (fresh L1 record),
+/// `negative_hit` (fresh L1 known-absent), `tier_hit` (the L2 tier
+/// answered), `miss` (the store was consulted and answered), or `error`
+/// (the store was consulted and could not answer). Hit ratio:
+/// `(hit + negative_hit + tier_hit) / total`.
+pub fn record_key_lookup_cache(kind: &'static str, outcome: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_key_lookup_cache_total",
+            "Keystore TTL-cache lookups, by record kind and which layer answered (hit, negative_hit, tier_hit, miss, error)",
+            &["kind", "outcome"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        counter.with_label_values(&[kind, outcome]).inc();
+    }
+}
+
+/// Fold one audit emission's real write result into
+/// `sbproxy_audit_write_failures_total{channel}` (WOR-2572).
+///
+/// Modeled on Vault's audit-log failure counter, whose docs say a healthy
+/// system reads exactly zero, so the counter touches the channel's series
+/// on every emission (exporting an explicit 0 an `increase()` alert can
+/// baseline against) and increments only when `ok` is false. `ok` comes
+/// from the emit path's actual result - the chain append's returned
+/// `bool` or the serialize failure - never from a default, which is the
+/// difference between this counter and the `RB-AUDIT-WRITE-FAILURE`
+/// landmine WOR-2572 exists to avoid: an outcome label nothing can set to
+/// a failure value is an alert that structurally cannot fire. `channel`
+/// names the config key that turned the trail on: `key_path` (the key and
+/// credential mutation trail) or `admin_path` (the admin-console action
+/// trail) today, `key_access_path` reserved for the read-audit channel
+/// (WOR-2570). The family is named for the signal rather than for the key
+/// plane because `admin_path` is a console channel, not a key-management
+/// one.
+///
+/// Two things can set `ok` to false, and they have different
+/// reachability. A deployment with no chain configured cannot reach the
+/// chain half at all: [`crate::audit::KeyAuditEntry::emit`] substitutes `true`
+/// for the append result when no chain is installed. The serialize half
+/// is independent of that and does reach this call site on its own, so it
+/// is unreachable today only because every field of a `KeyAuditEntry` is
+/// a `String`, an `Option<String>`, or a `serde_json::Value`, none of
+/// which can fail to encode. A field with a hand-written `Serialize`
+/// would change that, which is why the reason is written down rather than
+/// left as "no chain, no failures".
+pub fn record_audit_write_outcome(channel: &'static str, ok: bool) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_audit_write_failures_total",
+            "Audit emissions that did not reach a sink they were promised, by audit channel; healthy systems read 0",
+            &["channel"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        let series = counter.with_label_values(&[channel]);
+        if !ok {
+            series.inc();
+        }
+    }
+}
+
 /// Shared-budget reads/writes that could not reach the Redis/KV store and
 /// fell open to the per-instance tracker. Fired at the exact branch where
 /// the store error is still distinguishable from "no shared store
@@ -2227,6 +2631,117 @@ pub fn record_http_framing_block(reason: &str, tenant: &str) {
     counter
         .with_label_values(&[reason, tenant_san.as_str()])
         .inc();
+}
+
+/// Record one `prompt_injection_v2` block, labeled by the scan path that
+/// produced it (WOR-2530).
+///
+/// `scan_path` is a closed four-value set, one per place the policy can
+/// deny: `header_scan` (the synchronous request-line and header scan in
+/// the `request_filter` enforcer), `body_scan` (the buffered request body
+/// on the generic proxy path), `ai_body` (the AI dispatch prompt
+/// segments), and `a2a` (agent-to-agent message parts).
+///
+/// The label is the point. Those four paths drifted: three wrote the
+/// operator's configured `block_body` and `block_content_type` verbatim
+/// and one wrapped the body in `{"error": ...}` with a hardcoded
+/// `application/json`. Nothing in `/metrics` told them apart, so which
+/// path had blocked a given request was not an answerable question, and
+/// the asymmetry survived until someone compared two responses by hand.
+///
+/// `tenant` is operator-supplied and passes through the cardinality
+/// limiter. A block is a security verdict about one tenant's traffic, so
+/// this family is listed in `TENANT_SCOPED_METRICS`.
+pub fn record_prompt_injection_block(scan_path: &str, tenant: &str) {
+    use prometheus::{register_counter_vec, CounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<CounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_counter_vec!(
+            "sbproxy_prompt_injection_blocks_total",
+            "Requests blocked by the prompt_injection_v2 policy, by scan path",
+            &["scan_path", "tenant"],
+        )
+        .expect("counter vec registers")
+    });
+    let tenant_san = sanitize_label("tenant", tenant);
+    counter
+        .with_label_values(&[scan_path, tenant_san.as_str()])
+        .inc();
+}
+
+/// Record one Content-Security-Policy header emitted by the
+/// `security_headers` policy, by `mode` (`enforce` or `report_only`).
+///
+/// A CSP that is configured and silently never shipped is
+/// indistinguishable from a working one by reading the config file, which
+/// is how a dropped `content_security_policy` survived in an example
+/// config and in the docs (WOR-2526). This counter is the difference: an
+/// operator who configured a CSP and watches this series sit at zero
+/// knows the header is not reaching browsers. The `mode` label carries
+/// the second half of that bug, where a `report_only` policy was emitted
+/// as an enforcing one.
+///
+/// `tenant` is operator-supplied and passes through the cardinality
+/// limiter.
+pub fn record_security_headers_csp_emitted(mode: &str, tenant: &str) {
+    use prometheus::{register_counter_vec, CounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<CounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_counter_vec!(
+            "sbproxy_security_headers_csp_emitted_total",
+            "Content-Security-Policy headers emitted by the security_headers policy, by mode",
+            &["mode", "tenant"],
+        )
+        .expect("counter vec registers")
+    });
+    let tenant_san = sanitize_label("tenant", tenant);
+    counter
+        .with_label_values(&[mode, tenant_san.as_str()])
+        .inc();
+}
+
+/// Record one WebSocket upgrade refusal or tunnel teardown initiated
+/// by the gateway (WOR-2552).
+///
+/// `reason` is a closed four-value set: `message_too_large` (a frame
+/// scan crossed the tunnel's `max_message_size` cap),
+/// `control_frame_violation` (a control frame declared more than RFC
+/// 6455's 125 payload bytes, or arrived fragmented),
+/// `subprotocol_violation` (the upstream's 101 selected a subprotocol
+/// outside the negotiated set, refused before the tunnel opened), and
+/// `upstream_error` (a post-upgrade failure tore the tunnel down:
+/// an upstream reset, timeout, or read error; WOR-2551's no-write
+/// teardown). `direction` is
+/// `client_to_upstream` or `upstream_to_client` for the two frame-scan
+/// reasons, and `none` for the two that have no per-direction scan.
+/// Both are proxy-authored constants; `tenant` and `origin` are
+/// operator-scoped and pass through the cardinality limiter.
+///
+/// Registration failure yields no counter rather than a panic, the same
+/// shape [`record_policy_panic`] uses. This runs while a connection is
+/// already being torn down, and killing the process over a metric that
+/// would not register is a worse outcome than the missing series.
+pub fn record_websocket_teardown(reason: &str, direction: &str, tenant: &str, origin: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_websocket_teardowns_total",
+            "WebSocket upgrades refused or tunnels torn down by the gateway, by closed reason, direction, tenant, and origin",
+            &["reason", "direction", "tenant", "origin"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        let tenant_san = sanitize_label("tenant", tenant);
+        let origin_san = sanitize_label("origin", origin);
+        counter
+            .with_label_values(&[reason, direction, tenant_san.as_str(), origin_san.as_str()])
+            .inc();
+    }
 }
 
 /// Count a request that was rejected before origin resolution because
@@ -3012,6 +3527,17 @@ pub fn record_mirror_state_drift() {
     metrics().mirror_state_drift.inc();
 }
 
+/// Increment `sbproxy_request_body_drain_timeout_total`.
+///
+/// Called when the drain of a client's remaining request body, run after
+/// sbproxy has already answered the request, hits its time bound. The
+/// connection is then closed with bytes still unread, which is the
+/// pre-WOR-2599 behavior and can cost the client the response it was
+/// sent.
+pub fn record_request_body_drain_timeout() {
+    metrics().request_body_drain_timeout.inc();
+}
+
 /// Add `bytes` to `sbproxy_boilerplate_stripped_bytes_total{hostname}`.
 ///
 /// Called once per request that ran a `boilerplate` transform, with the
@@ -3766,6 +4292,114 @@ pub fn record_audit_emit_duration(channel: &str, outcome: &str, duration_secs: f
         &trace_id,
         &span_id,
     );
+}
+
+/// Count one completed admin request-log export on
+/// `sbproxy_admin_request_exports_total{format}` and the rows it wrote
+/// on `sbproxy_admin_request_export_rows_total{format}` (WOR-2578).
+///
+/// `format` is the closed enum `csv|jsonl`, selected from a static
+/// match in the admin route; no caller string becomes a label.
+///
+/// Why an export needs a counter from day one: `GET
+/// /api/requests/export` is the one admin route that hands back the
+/// operational log in bulk, which makes it the exfiltration shape of
+/// the admin surface. The audit chain records that an export happened;
+/// this pair is what an operator alerts on, because "exports per hour
+/// tripled" and "one export wrote the whole ring" are rate questions
+/// an audit ring cannot answer. Two families rather than one so a
+/// dashboard can read rows-per-export without inventing a histogram
+/// over a low-frequency event.
+/// A registration failure warns once and leaves the family unscraped
+/// rather than ending the admin request: an operator who cannot see the
+/// export counter still gets the export, and still gets the audit
+/// record, which is the load-bearing half.
+pub fn record_admin_request_export(format: &'static str, rows: u64) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static EXPORTS: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    static ROWS: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let warn_failed = |name: &'static str, error: &prometheus::Error| {
+        tracing::warn!(
+            metric = name,
+            %error,
+            "admin export counter failed to register; export volume is not scrapeable"
+        );
+    };
+    let exports = EXPORTS.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_admin_request_exports_total",
+            "Admin request-log exports served, by format",
+            &["format"],
+        )
+        .inspect_err(|error| warn_failed("sbproxy_admin_request_exports_total", error))
+        .ok()
+    });
+    if let Some(counter) = exports {
+        counter.with_label_values(&[format]).inc();
+    }
+    let row_counter = ROWS.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_admin_request_export_rows_total",
+            "Rows written by admin request-log exports, by format",
+            &["format"],
+        )
+        .inspect_err(|error| warn_failed("sbproxy_admin_request_export_rows_total", error))
+        .ok()
+    });
+    if let Some(counter) = row_counter {
+        counter.with_label_values(&[format]).inc_by(rows);
+    }
+}
+
+/// Count one audit-chain read attempt on
+/// `sbproxy_audit_chain_read_total{channel, outcome}` (WOR-2579).
+///
+/// `channel` is one of `security`, `config`, `key`, `admin`. `outcome` is
+/// `verified` when every link and signature held, `broken` when the walk
+/// stopped at a bad record, `unreadable` when the file could not be
+/// walked at all, and `denied` when the viewer refused the read before
+/// walking anything. A refusal increments all four channels, because it
+/// refuses all four.
+///
+/// The reason this exists rather than leaving the verdict on the page: a
+/// broken chain that only a person looking at the console can see is a
+/// finding nobody is on call for. `broken`, `unreadable` and `denied`
+/// are all alertable from the moment this ships, and
+/// `increase(...{outcome!="verified"}[15m]) > 0` is the rule an operator
+/// wants. Both label values are closed vocabularies from this crate,
+/// never caller input, and both parameters are `&'static str` so that
+/// stays true by construction: a caller-supplied `String` cannot be
+/// passed here at all, which is what keeps this family off the
+/// cardinality limiter honestly rather than by assertion.
+///
+/// What that rule does **not** cover, so nobody sizes their response
+/// wrong: the shortfall comparison behind `broken` counts what *this
+/// process* wrote. A chain file truncated at the tail and then read
+/// after a restart re-baselines on boot, links and signs perfectly, and
+/// reports `verified`. Records written before the last restart are
+/// covered by `sbproxy audit verify` against an offsite copy, not by
+/// this counter.
+pub fn record_audit_chain_read(channel: &'static str, outcome: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    // `.ok()` rather than `.expect(...)`, the same shape
+    // [`record_key_store_outage`] uses: registration can only fail on a
+    // duplicate name, which the metric-registry guard catches at build
+    // time, and a counter is not worth ending the process over on a path
+    // whose whole job is to report on somebody else's failure.
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_audit_chain_read_total",
+            "Audit-chain reads served by the console viewer, by verification outcome",
+            &["channel", "outcome"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        counter.with_label_values(&[channel, outcome]).inc();
+    }
 }
 
 // --- script-engine metrics (CEL / Lua / JS / WASM) -----------------------
@@ -7638,6 +8272,139 @@ mod tests {
                     && *value >= 1.0
             }),
             "sbproxy_mcp_flow_total did not carry flow_pair_block: {counted:?}"
+        );
+    }
+
+    /// WOR-2560: the target-health gauge is a scrape-time sample of the
+    /// installed source, on the LiteLLM 0/1/2 scale.
+    ///
+    /// Three assertions, each a distinct failure mode:
+    /// 1. installing a source and scraping surfaces the series (red
+    ///    until `render()` calls `refresh_target_health_gauge`);
+    /// 2. a health change in the source moves the value on the next
+    ///    scrape, with no recorder call in between;
+    /// 3. a target the source stops reporting (config reload shrank the
+    ///    pool) leaves the scrape instead of freezing at its last value.
+    #[test]
+    fn target_health_gauge_follows_the_installed_source() {
+        set_target_health_source(|| {
+            vec![
+                TargetHealthSample {
+                    origin: "wor2560-origin".to_string(),
+                    target: "http://127.0.0.1:19601".to_string(),
+                    state: TARGET_HEALTH_HEALTHY,
+                },
+                TargetHealthSample {
+                    origin: "wor2560-origin".to_string(),
+                    target: "http://127.0.0.1:19602".to_string(),
+                    state: TARGET_HEALTH_EXCLUDED,
+                },
+            ]
+        });
+        let output = metrics().render();
+        assert!(
+            output.contains(
+                "sbproxy_target_health_state{origin=\"wor2560-origin\",target=\"http://127.0.0.1:19601\"} 0"
+            ),
+            "healthy target missing from the scrape:\n{output}"
+        );
+        assert!(
+            output.contains(
+                "sbproxy_target_health_state{origin=\"wor2560-origin\",target=\"http://127.0.0.1:19602\"} 2"
+            ),
+            "excluded target missing from the scrape:\n{output}"
+        );
+
+        // The pool shrinks to one target and that target recovers into
+        // half-open trial traffic. The next scrape must say exactly that.
+        set_target_health_source(|| {
+            vec![TargetHealthSample {
+                origin: "wor2560-origin".to_string(),
+                target: "http://127.0.0.1:19602".to_string(),
+                state: TARGET_HEALTH_DEGRADED,
+            }]
+        });
+        let output = metrics().render();
+        assert!(
+            output.contains(
+                "sbproxy_target_health_state{origin=\"wor2560-origin\",target=\"http://127.0.0.1:19602\"} 1"
+            ),
+            "state change did not move the gauge:\n{output}"
+        );
+        assert!(
+            !output.contains("http://127.0.0.1:19601"),
+            "a target removed from the source is still being scraped:\n{output}"
+        );
+    }
+
+    /// Fix round on the #1177 review, red-first: `/metrics` is served
+    /// from two independent listeners (the data plane's and the admin
+    /// plane's), nothing serializes them, and the first shipped refresh
+    /// did `gauge.reset()` before repopulating. Two renders in flight
+    /// meant one could wipe the other's writes and let its `gather()`
+    /// land in the gap, returning the family empty or partial.
+    ///
+    /// That matters here more than on the neighbouring cardinality
+    /// gauges, which never reset: on this family a MISSING series is
+    /// the alertable condition, so a scrape that drops it turns a
+    /// healthy proxy into `absent(sbproxy_target_health_state)` firing
+    /// and `min by (origin) (...) == 2` flapping.
+    ///
+    /// Before the differential refresh this failed within the first
+    /// handful of iterations. Every render must carry every series.
+    #[test]
+    fn concurrent_renders_never_scrape_a_half_reset_target_health_gauge() {
+        const TARGETS: [&str; 3] = [
+            "http://127.0.0.1:19701",
+            "http://127.0.0.1:19702",
+            "http://127.0.0.1:19703",
+        ];
+        set_target_health_source(|| {
+            TARGETS
+                .iter()
+                .map(|target| TargetHealthSample {
+                    origin: "wor2560-race".to_string(),
+                    target: (*target).to_string(),
+                    state: TARGET_HEALTH_HEALTHY,
+                })
+                .collect()
+        });
+        // Prime it once so a missing series can only come from a wipe.
+        let _ = metrics().render();
+
+        let missing = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let missing = std::sync::Arc::clone(&missing);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..40 {
+                    let output = metrics().render();
+                    for target in TARGETS {
+                        let series = format!(
+                            "sbproxy_target_health_state{{origin=\"wor2560-race\",target=\"{target}\"}} 0"
+                        );
+                        if !output.contains(&series) {
+                            missing
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push(series);
+                        }
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("render thread panicked");
+        }
+        let missing = missing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            missing.is_empty(),
+            "{} concurrent scrapes observed a target-health series that a parallel refresh had \
+             wiped; first: {:?}",
+            missing.len(),
+            missing.first()
         );
     }
 }

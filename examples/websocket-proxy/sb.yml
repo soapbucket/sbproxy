@@ -20,10 +20,19 @@
 #   make run CONFIG=examples/websocket-proxy/sb.yml
 #
 # Test: see README.md for the full walkthrough (handshake, auth gate,
-# and the failure mode for a non-upgrade request).
+# the failure mode for a non-upgrade request, and watching the
+# enforcement telemetry: the teardown counter on the admin metrics
+# endpoint and the policy_denied event in the NDJSON file below).
 
 proxy:
   http_bind_port: 8080
+
+  # Metrics-only admin surface so the teardown counter in the README is
+  # readable at http://127.0.0.1:9091/metrics.
+  admin:
+    enabled: true
+    port: 9091
+    # username/password default to admin / changeme; override in real configs.
 
   # Only because the demo upstream runs on loopback: the SSRF guard
   # refuses private/loopback upstream addresses unless allowlisted. A
@@ -33,6 +42,17 @@ proxy:
     upstream:
       allow_private_cidrs:
         - '127.0.0.1/32'
+
+# Every websocket enforcement verdict (the max_message_size teardown
+# demonstrated in the README, and subprotocol refusals) writes a
+# policy-violation audit record, and that record bridges onto this feed
+# as a policy_denied event. This sink writes them one JSON object per
+# line, next to wherever the proxy was started.
+events:
+  sink: file
+  path: websocket-proxy-events.ndjson
+  types:
+    - policy_denied
 
 origins:
   "ws.local":

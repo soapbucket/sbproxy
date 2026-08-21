@@ -21,6 +21,7 @@
 //! | `CompiledOrigin.response_cache.*_status`      | `responses` keys                              |
 //! | `CompiledOrigin.error_pages`                  | `responses` keys                              |
 //! | `CompiledOrigin.cors`                         | `x-sbproxy-cors` extension                    |
+//! | `deprecation:` block (rule, else origin)      | `deprecated: true` + `x-sbproxy-sunset` / `x-sbproxy-successor` |
 //!
 //! Plugin-extensible auth types we don't recognise round-trip into an
 //! `x-sbproxy-auth-type` extension and skip the `security` requirement so
@@ -136,6 +137,18 @@ pub fn build(snapshot: &CompiledConfig, host_filter: Option<&str>) -> Value {
                 }
             };
 
+            // WOR-2565: which deprecation announcement covers this
+            // rule's operations. The rule's own block wins; the
+            // origin-scope block covers rules without one. The rule
+            // block re-compiles from its raw form here (config compile
+            // already validated it, so a failure means a hand-built
+            // snapshot; skip the mark rather than the whole rule).
+            let rule_deprecation = rule
+                .deprecation
+                .as_ref()
+                .and_then(|raw| sbproxy_config::compile_deprecation(raw, "openapi emission").ok());
+            let deprecation = rule_deprecation.as_ref().or(origin.deprecation.as_ref());
+
             for matcher in &rule.rules {
                 let (path_key, extensions) = match path_key_for_matcher(matcher) {
                     Some(v) => v,
@@ -176,6 +189,25 @@ pub fn build(snapshot: &CompiledConfig, host_filter: Option<&str>) -> Value {
                     op.insert("responses".to_string(), build_responses(origin));
                     if let Some(sec) = &security_requirement {
                         op.insert("security".to_string(), sec.clone());
+                    }
+                    // WOR-2565: Zalando rule 187, deprecation reflected
+                    // in the spec. The extensions carry the exact wire
+                    // values the response filter stamps, so the emitted
+                    // spec and the headers can never disagree.
+                    if let Some(dep) = deprecation {
+                        op.insert("deprecated".to_string(), Value::Bool(true));
+                        if let Some(sunset) = dep.sunset_header.as_ref() {
+                            op.insert(
+                                "x-sbproxy-sunset".to_string(),
+                                Value::String(sunset.clone()),
+                            );
+                        }
+                        if let Some(successor) = dep.successor.as_ref() {
+                            op.insert(
+                                "x-sbproxy-successor".to_string(),
+                                Value::String(successor.clone()),
+                            );
+                        }
                     }
                     path_obj.insert((*method).to_string(), Value::Object(op));
                 }
@@ -516,6 +548,7 @@ mod tests {
             error_pages: None,
             problem_details: None,
             proxy_status: None,
+            deprecation: None,
             message_signatures: None,
             olp: None,
             web_bot_auth_publish: None,
@@ -683,6 +716,106 @@ mod tests {
             spec["paths"]["/api/"]["x-sbproxy-prefix-match"],
             serde_json::json!(true)
         );
+    }
+
+    // --- WOR-2565: deprecation marks on emitted operations ---
+
+    fn dep_block(yaml: &str) -> sbproxy_config::CompiledDeprecation {
+        sbproxy_config::compile_deprecation(
+            &serde_yaml::from_str(yaml).expect("fixture block parses"),
+            "test fixture",
+        )
+        .expect("fixture block compiles")
+    }
+
+    #[test]
+    fn rule_level_deprecation_marks_its_operations() {
+        let mut snap = make_minimal_snapshot();
+        snap.origins[0].forward_rules = vec![
+            serde_json::json!({
+                "rules": [{ "path": { "prefix": "/v1/" } }],
+                "deprecation": {
+                    "deprecated": "2026-09-01",
+                    "sunset": "2026-12-31T23:59:59Z",
+                    "successor": "https://api.example.com/v2/"
+                },
+                "origin": { "id": "v1", "action": { "type": "proxy", "url": "http://127.0.0.1/" } }
+            }),
+            serde_json::json!({
+                "rules": [{ "path": { "prefix": "/v2/" } }],
+                "origin": { "id": "v2", "action": { "type": "proxy", "url": "http://127.0.0.1/" } }
+            }),
+        ];
+        let spec = build(&snap, None);
+
+        let v1 = &spec["paths"]["/v1/"]["get"];
+        assert_eq!(v1["deprecated"], serde_json::json!(true));
+        // The extensions carry the exact wire values, so the emitted
+        // spec and the response headers can never disagree.
+        let compiled = dep_block(
+            "deprecated: 2026-09-01\nsunset: 2026-12-31T23:59:59Z\nsuccessor: https://api.example.com/v2/\n",
+        );
+        assert_eq!(
+            v1["x-sbproxy-sunset"],
+            serde_json::json!(compiled.sunset_header.expect("sunset compiles")),
+        );
+        assert_eq!(
+            v1["x-sbproxy-successor"],
+            serde_json::json!("https://api.example.com/v2/")
+        );
+
+        // The undeprecated sibling rule stays unmarked.
+        let v2 = &spec["paths"]["/v2/"]["get"];
+        assert!(v2.get("deprecated").is_none(), "got {v2}");
+        assert!(v2.get("x-sbproxy-sunset").is_none());
+    }
+
+    #[test]
+    fn origin_level_deprecation_marks_every_operation() {
+        let mut snap = make_minimal_snapshot();
+        snap.origins[0].deprecation = Some(dep_block("deprecated: 2026-09-01\n"));
+        let spec = build(&snap, None);
+        for path in ["/users/{id}", "/health"] {
+            for method in ["get", "post"] {
+                let op = &spec["paths"][path][method];
+                assert_eq!(
+                    op["deprecated"],
+                    serde_json::json!(true),
+                    "{method} {path} must be marked deprecated"
+                );
+            }
+        }
+        // No sunset configured: the extension is absent rather than null.
+        assert!(spec["paths"]["/health"]["get"]
+            .get("x-sbproxy-sunset")
+            .is_none());
+    }
+
+    #[test]
+    fn rule_block_overrides_the_origin_block() {
+        let mut snap = make_minimal_snapshot();
+        snap.origins[0].deprecation = Some(dep_block("deprecated: 2026-01-01\n"));
+        snap.origins[0].forward_rules = vec![serde_json::json!({
+            "rules": [{ "path": { "exact": "/v1/jobs" } }],
+            "deprecation": { "deprecated": "2026-09-01", "sunset": "2026-12-31" },
+            "origin": { "id": "v1", "action": { "type": "proxy", "url": "http://127.0.0.1/" } }
+        })];
+        let spec = build(&snap, None);
+        let op = &spec["paths"]["/v1/jobs"]["get"];
+        assert_eq!(op["deprecated"], serde_json::json!(true));
+        let compiled = dep_block("deprecated: 2026-09-01\nsunset: 2026-12-31\n");
+        assert_eq!(
+            op["x-sbproxy-sunset"],
+            serde_json::json!(compiled.sunset_header.expect("sunset compiles")),
+        );
+    }
+
+    #[test]
+    fn no_deprecation_config_emits_no_marks() {
+        let snap = make_minimal_snapshot();
+        let spec = build(&snap, None);
+        let op = &spec["paths"]["/users/{id}"]["get"];
+        assert!(op.get("deprecated").is_none(), "got {op}");
     }
 
     #[test]

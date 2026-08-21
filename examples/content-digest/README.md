@@ -1,8 +1,8 @@
 # content_digest: RFC 9530 request-body verification
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-20*
 
-Demonstrates the `content_digest` policy on a webhook receiver. The proxy hashes every inbound body and compares the result to the `Content-Digest:` header the sender supplied. Mismatch or missing header (with `on_missing: require`) rejects 400 before forwarding to upstream. Useful for any integrity-critical inbox: webhook receivers, payment callbacks, agent endpoints, audit-ingest paths.
+Demonstrates the `content_digest` policy on a webhook receiver. The proxy hashes every inbound body and compares the result to the `Content-Digest:` header the sender supplied. A missing header under `on_missing: require` is refused from the request headers alone, before the proxy dials the upstream at all; a mismatch is refused once the body is buffered, and the body never reaches the upstream. Useful for any integrity-critical inbox: webhook receivers, payment callbacks, agent endpoints, audit-ingest paths.
 
 ## Run
 

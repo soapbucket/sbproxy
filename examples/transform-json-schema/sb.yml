@@ -8,12 +8,17 @@
 # Two origins:
 #   - `schema-ok.local` returns a body that matches the schema, so the
 #     transform lets it through.
-#   - `schema-bad.local` returns a body that violates the schema. On a
-#     `type: proxy` action, `fail_on_error: true` rejects with a 502.
-#     KNOWN LIMITATION: on `type: static` (as used by both origins
-#     below), a transform failure is currently only logged as a warning
-#     and the original static body is still served with its configured
-#     status; `fail_on_error` has no effect here. See README.md.
+#   - `schema-bad.local` returns a body that violates the schema, so the
+#     transform refuses the response.
+#
+# `fail_on_error: true` is the legacy spelling of `failure_posture:
+# closed`, and a closed transform's contract is that the client never
+# sees the untransformed body. That holds on the `type: static` action
+# both origins use, not only on a proxied one: a refusal here answers
+# `500` with `x-sbproxy-transform-error: json_schema` and the invalid
+# body is never written. See README.md for the proxied comparison, which
+# refuses with a `502` because the upstream's headers are already
+# committed by the time the transform runs.
 #
 # Run:
 #   make run CONFIG=examples/transform-json-schema/sb.yml
@@ -22,7 +27,7 @@
 #   # Valid - body matches schema, transform passes through.
 #   curl -i -H 'Host: schema-ok.local' http://127.0.0.1:8080/
 #
-#   # Invalid - body violates schema, transform rejects with 502.
+#   # Invalid - body violates schema, the closed posture refuses with a 500.
 #   curl -i -H 'Host: schema-bad.local' http://127.0.0.1:8080/
 
 proxy:

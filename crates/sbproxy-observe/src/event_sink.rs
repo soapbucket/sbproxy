@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Soap Bucket LLC
 
-//! Egress for the thirteen [`crate::events::EventType`] variants: the
+//! Egress for the eighteen [`crate::events::EventType`] variants: the
 //! `events:` block's file and webhook sinks.
 //!
 //! # The defect this closes
@@ -104,17 +104,20 @@ const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(5);
 /// request path, once per candidate event, before anything is allocated:
 /// it has to be cheaper than the event it is deciding not to build.
 ///
-/// `u16` holds the thirteen bits [`ALL_EVENT_TYPES`] declares with room to
-/// spare. A fourteenth variant is caught by that array's fixed length
-/// long before it reaches the width of this word.
+/// `u32` holds the eighteen bits [`ALL_EVENT_TYPES`] declares with room to
+/// spare. A nineteenth variant is caught by that array's fixed length
+/// long before it reaches the width of this word. (`u16` held the
+/// original thirteen; the five key-lifecycle types of WOR-2571 pushed
+/// the bit count past sixteen, where a debug build's shift-overflow
+/// check turns `1 << index` into a panic rather than a wrong mask.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EventTypeMask(u16);
+pub struct EventTypeMask(u32);
 
 impl EventTypeMask {
     /// Every event type. What an `events:` block with no `types:` filter
     /// resolves to.
     pub fn all() -> Self {
-        let mut bits = 0u16;
+        let mut bits = 0u32;
         for event_type in ALL_EVENT_TYPES {
             bits |= 1 << event_type.index();
         }
@@ -123,7 +126,7 @@ impl EventTypeMask {
 
     /// Exactly the named types.
     pub fn from_types(types: &[EventType]) -> Self {
-        let mut bits = 0u16;
+        let mut bits = 0u32;
         for event_type in types {
             bits |= 1 << event_type.index();
         }
@@ -910,6 +913,38 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(2),
             "publishing into a full queue took {elapsed:?}; the publish path blocked"
+        );
+    }
+
+    /// WOR-2571: the drop path is type-agnostic by construction, and
+    /// that is exactly why nothing but this test says so for the
+    /// key-lifecycle kinds. A future per-type branch in `publish` (a
+    /// special case for a "critical" type, say) would make a full
+    /// queue silently uncountable for whichever types the branch
+    /// forgot, and this is the test that would catch it for the five
+    /// WOR-2571 kinds.
+    #[test]
+    fn a_full_queue_counts_drops_for_every_key_lifecycle_kind() {
+        let egress = EventEgress::never_drained_for_test(EventTypeMask::all(), "file", 1);
+        // The single slot is taken; every publish after this drops.
+        egress.publish(event(EventType::KeyMinted));
+
+        let before = dropped("file", "queue_full");
+        for kind in [
+            EventType::KeyMinted,
+            EventType::KeyRevoked,
+            EventType::KeyRotated,
+            EventType::KeyBlocked,
+            EventType::CredentialResolved,
+        ] {
+            egress.publish(event(kind));
+        }
+        let after = dropped("file", "queue_full");
+
+        assert_eq!(
+            after - before,
+            5,
+            "each overrun key-lifecycle publish must be counted"
         );
     }
 

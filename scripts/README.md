@@ -1,6 +1,6 @@
 # scripts/
 
-*Last modified: 2026-07-31*
+*Last modified: 2026-08-20*
 
 Helper scripts that wrap the day-to-day dev loop and the CI runners
 the GitHub workflows invoke. Run from the repository root unless a
@@ -50,6 +50,168 @@ optional tools that land there. The full env-var list is in `CLAUDE.md`.
 `target/release` after local release-profile experiments. The default
 cleanup keeps release artifacts so deployment-oriented workflows do not
 pay an unexpected rebuild cost.
+
+## Fuzz harnesses
+
+`fuzz/` is a standalone cargo-fuzz crate whose targets cover the Wave 4
+parsers, the stateful proxy driver, and the scripting runtimes. Nothing
+runs them for you. They had a CI lane, `.github/workflows/wave4-fuzz.yml`,
+whose job was gated on a `run-fuzz` pull request label that was never
+created in this repository, so the lane concluded `skipped` on every run
+it ever had and a green pull request never meant the fuzzers ran. That
+file is deleted rather than repaired: a lane that reads as coverage in
+review and delivers none is worse than no lane. `check.sh` does not run
+them either, so they are a deliberate manual job.
+
+cargo-fuzz is nightly-only, and neither nightly nor cargo-fuzz ships with
+a plain `cargo`:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup toolchain install nightly
+cargo install cargo-fuzz
+```
+
+`cargo install` rather than `cargo binstall`, for the reason under
+"Naming the target" below.
+
+Homebrew's rust and rustup both provide a `cargo`, and only rustup's
+understands `+nightly`, so put rustup ahead of Homebrew on `PATH`, and
+keep `~/.cargo/bin` on it so `cargo-fuzz` is found. Then, from `fuzz/`:
+
+```bash
+cargo +nightly fuzz list
+
+mkdir -p ~/.cache/sbproxy/fuzz-corpus/<target>
+cargo +nightly fuzz run \
+  --target "$(rustc +nightly -vV | sed -n 's/^host: //p')" \
+  <target> \
+  ~/.cache/sbproxy/fuzz-corpus/<target> \
+  -- -max_total_time=15
+```
+
+`+nightly` is doing real work on both lines. `fuzz/` sits under the
+repository root, so rustup resolves the root `rust-toolchain.toml` there
+and would otherwise hand cargo-fuzz the pinned stable, which cannot
+build a sanitized target at all. It propagates into the `cargo` that
+cargo-fuzz itself invokes. Dropping it produces a failure with nothing
+in this document to explain it.
+
+`cargo +nightly fuzz list` is the only complete list of targets. The
+deleted CI matrix named nine by hand while `fuzz/Cargo.toml` declares
+ten, so `cel_script`, the one target with a committed seed corpus, was
+fuzzed nowhere.
+
+### Naming the target
+
+`--target` is not decoration there, and leaving it out is why the old CI
+lane failed. Every manual dispatch of that lane, one on `main` and one on
+a branch, died inside `cargo fuzz run` with the same pair of errors on
+every target:
+
+```
+error: sanitizer is incompatible with statically linked libc,
+       disable it using `-C target-feature=-crt-static`
+error[E0463]: can't find crate for `std`
+error[E0463]: can't find crate for `core`
+error: could not compile `serde_core` (lib) due to 2 previous errors
+```
+
+cargo-fuzz builds with `-Zsanitizer=address` and passes cargo an explicit
+`--target`, which is what keeps those RUSTFLAGS off build scripts and
+proc macros. When you do not name one, it fills in
+`current_platform::CURRENT_PLATFORM`, a constant baked in when the
+cargo-fuzz binary itself was compiled. The default is therefore the
+triple cargo-fuzz was *built* for, not the triple of the machine it is
+running on.
+
+That lane installed cargo-fuzz with `cargo binstall`, and as of 0.13.2
+the only Linux binary cargo-fuzz publishes is
+`x86_64-unknown-linux-musl`. So an `ubuntu-latest` runner ended up with a
+cargo-fuzz that defaulted every build to musl. musl targets are
+`+crt-static` by default and rustc refuses AddressSanitizer on a
+statically linked libc, which is the first error. The nightly toolchain
+the lane installed carried only the gnu standard library, and nothing had
+installed a musl one, which is the rest of them. All of it comes out of
+the same mismatch.
+
+`-C target-feature=-crt-static` in the fuzz RUSTFLAGS is the other remedy
+people reach for, and it answers only the first line. It does not put a
+musl sysroot on disk, and the missing crate there is `core` as well as
+`std`, which no codegen flag can conjure. Naming the target clears the
+whole set, and it also stops the command depending on how cargo-fuzz was
+installed. Deriving the triple from `rustc +nightly -vV` rather than
+hardcoding one keeps it right on Apple Silicon too, where the only
+published darwin binary is x86_64.
+
+**What is verified and what is not.** The cause above is read off the
+error text, the `default_value` on cargo-fuzz's `BuildOptions` triple,
+and the asset list on its releases. It has not been confirmed by a
+passing run. No target in this crate has been observed passing anywhere,
+and the machine this was written on has no rustup, no nightly, and no
+cargo-fuzz to try it on. Treat the command as a derived fix that nobody
+has executed yet. If it still fails, check whether
+`cargo +nightly fuzz build <target>` gets further than `run` does, which
+separates a build problem from a libfuzzer one.
+
+One more thing the evidence does not cover. The failure was only ever
+seen with a binstalled cargo-fuzz. `cargo install` builds from source and
+bakes in the host triple, so the install above may never have hit this at
+all. Nobody has run it either way, which is the reason `--target` is in
+the command regardless: it costs nothing and it removes the question.
+
+A clean run ends with libfuzzer's own summary line, `Done N runs in M
+second(s)`, and `cargo fuzz run` exits 0. A crash writes a reproducer
+into `fuzz/artifacts/<target>/` and exits non-zero. That shape is
+libfuzzer's documented output, not a transcript captured from this
+repository.
+
+### The corpus arguments
+
+libfuzzer treats its first corpus argument as an output directory and
+grows it with every interesting input it finds, and cargo-fuzz defaults
+that argument to `fuzz/corpus/<target>/`. A default run therefore leaves
+either a new untracked directory or new files inside the tree, and
+`check.sh`'s working-tree guard fails on it afterwards. That is why the
+command above points the writable corpus at `~/.cache/`.
+
+`cel_script` is the only target with committed seeds, under
+`fuzz/corpus/cel_script/`. Pass those as a second, read-only argument
+for that target and no other:
+
+```bash
+cargo +nightly fuzz run \
+  --target "$(rustc +nightly -vV | sed -n 's/^host: //p')" \
+  cel_script \
+  ~/.cache/sbproxy/fuzz-corpus/cel_script \
+  corpus/cel_script \
+  -- -max_total_time=15
+```
+
+The other nine have no corpus directory at all, and naming one that is
+not there either stops the run or gets the directory created inside the
+repository, which is what this section exists to avoid.
+
+Crash reproducers land in `fuzz/artifacts/<target>/`, which is
+gitignored for the same reason.
+
+### If you want these on a schedule
+
+A finished implementation of a seven-day cadence already exists, and it
+was deliberately not merged: `check.sh` runs every target
+`cargo fuzz list` reports for fifteen seconds each once the stamp is
+older than a week, the stamp and the corpus live under XDG state and
+cache so the repository's many worktrees do not each pay a cold nightly
+build, and the phase prints install instructions and skips rather than
+failing the gate when nightly or cargo-fuzz is missing. Scheduling
+targets nobody has seen pass would repeat the mistake of the label that
+never existed, so it stays unmerged until a target runs clean.
+
+It is commit `5aa4a6f3` on the local branch `chore/fuzz-local-gate`,
+which has never been pushed. A fresh clone will not have that object, so
+treat the paragraph above as the durable record and the SHA as a pointer
+that only resolves in a checkout that already carries the branch. Read
+it before rebuilding any of that rather than after.
 
 ## Cross-cutting runners
 

@@ -8,34 +8,115 @@
 use super::*;
 use crate::key_plane::key_store_entrypoint;
 
-struct ConcurrentLimitDenialResponse {
+/// Authentication providers that verify an RFC 9421 HTTP Message
+/// Signature during the auth phase, which runs before the request body
+/// has been buffered.
+///
+/// The signature base covers the `Content-Digest` *header value*; only
+/// hashing the body proves that value describes the bytes the client
+/// actually sent. At the auth phase there are no such bytes yet, so
+/// these providers verify with the deferring form of the verifier and
+/// the second half of the proof is completed in the request body filter
+/// by `crate::trust_tier::verify_and_finalize_body_proof`.
+///
+/// A provider listed here MUST call
+/// `MessageSignatureVerifier::verify_request_deferring_body_binding`
+/// rather than `verify_request`: the safe-by-default form would compare
+/// the covered digest against the empty body this phase can offer,
+/// which rejects an honest client and admits one that declares the
+/// empty-body digest.
+const DEFERRED_BODY_DIGEST_PROVIDERS: &[&str] = &["bot_auth", "hmac_auth"];
+
+/// Arm the deferred `content-digest` body binding for a request that
+/// authenticated on a signature covering `content-digest`.
+///
+/// Buffering the body is what makes the second half of the proof
+/// possible, so both flags are set together. Keyed on the *deciding*
+/// provider's type rather than the configured `Auth` variant, so a
+/// signature provider that wins inside an `any_of` composition still
+/// gets its deferred check instead of failing open.
+///
+/// A no-op when the request did not authenticate on one of these
+/// providers, or when the presented signature covers no
+/// `content-digest` component (there is then nothing to bind).
+pub(crate) fn arm_deferred_body_digest_binding(
+    ctx: &mut RequestContext,
+    decided_auth_type: &str,
+    headers: &http::HeaderMap,
+) {
+    if !DEFERRED_BODY_DIGEST_PROVIDERS.contains(&decided_auth_type) {
+        return;
+    }
+    if !sbproxy_middleware::signatures::signature_input_covers_content_digest(headers) {
+        return;
+    }
+    ctx.bot_auth_digest_check_required = true;
+    ctx.validate_request_body = true;
+}
+
+/// A denial whose body and content type the policy configured, rather
+/// than the generic `{"error": ...}` envelope the dispatcher renders.
+struct ConfiguredDenialResponse {
     status: u16,
-    content_type: &'static str,
+    content_type: String,
     body: String,
 }
 
-fn take_concurrent_limit_denial_response(
+/// Pull the configured rejection envelope for policies that park one
+/// on the context during the header phase.
+///
+/// Two policies do this today and for the same reason: the
+/// `PolicyEnforcer` decision carries a status and a message but no
+/// body or content type, so a policy with an operator-configured
+/// `error_body` has nowhere else to put it.
+///
+/// * `concurrent_limit` parks a body.
+/// * `content_digest` parks `(owner, body, content_type)` in the
+///   shared `deny_payload` slot (WOR-2528), because moving its
+///   `on_missing: require` refusal out of the body filter and into
+///   the header phase had to keep `error_body` and
+///   `error_content_type` working exactly as they did before the
+///   move. It is consumed here, ahead of the status-keyed envelope
+///   branches, so a `missing_status` that collides with one of them
+///   (402, say) still serves the operator's body rather than that
+///   branch's.
+fn take_configured_denial_response(
     ctx: &mut RequestContext,
     status: u16,
     message: &str,
     policy_type: &str,
-) -> Option<ConcurrentLimitDenialResponse> {
-    if policy_type != "concurrent_limit" {
-        return None;
+) -> Option<ConfiguredDenialResponse> {
+    match policy_type {
+        "concurrent_limit" => {
+            let body = ctx
+                .concurrent_limit_denial_body
+                .take()
+                .unwrap_or_else(|| error_json_body(message));
+            Some(ConfiguredDenialResponse {
+                status,
+                content_type: "application/json".to_string(),
+                body,
+            })
+        }
+        "content_digest" => match ctx.deny_payload.take() {
+            Some(("content_digest", body, content_type)) => Some(ConfiguredDenialResponse {
+                status,
+                content_type,
+                body,
+            }),
+            other => {
+                // Someone else's payload: put it back for the
+                // owner-checked renderer at the end of the deny arm.
+                ctx.deny_payload = other;
+                None
+            }
+        },
+        _ => None,
     }
-    let body = ctx
-        .concurrent_limit_denial_body
-        .take()
-        .unwrap_or_else(|| error_json_body(message));
-    Some(ConcurrentLimitDenialResponse {
-        status,
-        content_type: "application/json",
-        body,
-    })
 }
 
 #[cfg(test)]
-mod concurrent_limit_denial_response_tests {
+mod configured_denial_response_tests {
     use super::*;
 
     #[test]
@@ -45,7 +126,7 @@ mod concurrent_limit_denial_response_tests {
         ctx.concurrent_limit_denial_body = Some(configured.to_string());
 
         let response =
-            take_concurrent_limit_denial_response(&mut ctx, 529, configured, "concurrent_limit")
+            take_configured_denial_response(&mut ctx, 529, configured, "concurrent_limit")
                 .expect("concurrent-limit response");
 
         assert_eq!(response.status, 529);
@@ -58,7 +139,7 @@ mod concurrent_limit_denial_response_tests {
     fn default_message_keeps_the_generic_json_envelope() {
         let mut ctx = RequestContext::new();
 
-        let response = take_concurrent_limit_denial_response(
+        let response = take_configured_denial_response(
             &mut ctx,
             503,
             "too many concurrent requests",
@@ -71,6 +152,62 @@ mod concurrent_limit_denial_response_tests {
         assert_eq!(
             response.body,
             "{\"error\":\"too many concurrent requests\"}"
+        );
+    }
+
+    #[test]
+    fn content_digest_envelope_carries_its_own_content_type() {
+        // WOR-2528: the header-phase refusal has to emit the
+        // operator's `error_body` and `error_content_type`, not the
+        // generic JSON envelope the dispatcher would otherwise render.
+        let mut ctx = RequestContext::new();
+        ctx.deny_payload = Some((
+            "content_digest",
+            "digest required".to_string(),
+            "text/plain".to_string(),
+        ));
+
+        let response = take_configured_denial_response(
+            &mut ctx,
+            428,
+            "Content-Digest header required but absent",
+            "content_digest",
+        )
+        .expect("content-digest response");
+
+        assert_eq!(response.status, 428);
+        assert_eq!(response.content_type, "text/plain");
+        assert_eq!(response.body, "digest required");
+        assert!(ctx.deny_payload.is_none());
+    }
+
+    #[test]
+    fn content_digest_without_a_parked_envelope_falls_through() {
+        // A `content_digest` denial that did not come from the
+        // header-phase check leaves the slot empty; the dispatcher's
+        // generic envelope must still be used rather than an empty body.
+        let mut ctx = RequestContext::new();
+        assert!(take_configured_denial_response(&mut ctx, 400, "nope", "content_digest").is_none());
+    }
+
+    #[test]
+    fn unrelated_policies_are_untouched() {
+        let mut ctx = RequestContext::new();
+        assert!(take_configured_denial_response(&mut ctx, 403, "nope", "waf").is_none());
+    }
+
+    #[test]
+    fn a_mismatched_owners_payload_survives_for_the_late_renderer() {
+        let mut ctx = RequestContext::new();
+        ctx.deny_payload = Some((
+            "prompt_injection_v2",
+            "body".to_string(),
+            "text/plain".to_string(),
+        ));
+        assert!(take_configured_denial_response(&mut ctx, 400, "nope", "content_digest").is_none());
+        assert!(
+            ctx.deny_payload.is_some(),
+            "a payload owned by another policy must stay parked for the deny_payload renderer"
         );
     }
 }
@@ -3318,8 +3455,8 @@ pub(super) async fn request_filter(
             // WOR-2517: keyed on the deciding provider's type rather
             // than the configured `Auth` variant so a `bot_auth` slot
             // that wins inside an `any_of` composition still gets its
-            // deferred content-digest check. `matches!(auth,
-            // Auth::BotAuth(_))` would skip it there and fail open.
+            // agent-class stamp. `matches!(auth, Auth::BotAuth(_))`
+            // would skip it there and fail open.
             if auth_succeeded && decided_auth_type == "bot_auth" {
                 #[cfg(feature = "agent-class")]
                 if let Some(keyid) = bot_auth_keyid.as_deref() {
@@ -3339,12 +3476,9 @@ pub(super) async fn request_filter(
                         );
                     }
                 }
-                if sbproxy_middleware::signatures::signature_input_covers_content_digest(
-                    req_headers,
-                ) {
-                    ctx.bot_auth_digest_check_required = true;
-                    ctx.validate_request_body = true;
-                }
+            }
+            if auth_succeeded {
+                arm_deferred_body_digest_binding(ctx, &decided_auth_type, req_headers);
             }
             if !auth_succeeded {
                 crate::trust_tier::finalize(ctx, trust_outcome.is_suspicious());
@@ -3704,8 +3838,13 @@ pub(super) async fn request_filter(
                                 &session.req_header().headers,
                                 &buf,
                             ) {
+                                warn!(
+                                    provider = %ctx.principal.source.as_str(),
+                                    "content-digest body binding failed before an idempotency \
+                                     replay; refusing"
+                                );
                                 ctx.idempotency_permit = None;
-                                send_error(session, 401, "bot_auth: content-digest body mismatch")
+                                send_error(session, 401, "signature: content-digest body mismatch")
                                     .await?;
                                 ctx.response_status = Some(401);
                                 return Ok(true);
@@ -3839,13 +3978,12 @@ pub(super) async fn request_filter(
             )
             .with_api_key_id(ctx.accountable_key_id())
             .emit();
-            if let Some(response) =
-                take_concurrent_limit_denial_response(ctx, status, &msg, policy_type)
+            if let Some(response) = take_configured_denial_response(ctx, status, &msg, policy_type)
             {
                 send_response(
                     session,
                     response.status,
-                    response.content_type,
+                    &response.content_type,
                     response.body.as_bytes(),
                 )
                 .await?;
@@ -4101,6 +4239,18 @@ pub(super) async fn request_filter(
                 session
                     .write_response_body(Some(bytes::Bytes::copy_from_slice(body.as_bytes())), true)
                     .await?;
+            } else if let Some((_, body, content_type)) = ctx
+                .deny_payload
+                .take()
+                .filter(|(owner, _, _)| *owner == policy_type)
+            {
+                // WOR-2530: the policy configured both the rejection body and
+                // its media type, so write them verbatim. `send_error` would
+                // wrap the body in `{"error": ...}` and stamp
+                // `application/json`, which silently overrides both knobs.
+                // The owner check means a payload can only ever be served
+                // under the refusal it was set for.
+                send_response(session, status, &content_type, body.as_bytes()).await?;
             } else {
                 send_error(session, status, &msg).await?;
             }

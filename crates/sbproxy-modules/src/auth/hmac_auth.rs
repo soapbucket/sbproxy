@@ -55,13 +55,24 @@
 //!
 //! # Body binding
 //!
-//! Header-only signatures are the v1 scope (the ticket's explicit
-//! call: APISIX's `validate_request_body` equivalent is a follow-up).
-//! Verification still fails closed on body coverage: a signature that
-//! covers `content-digest` is checked against the body bytes handed to
-//! [`HmacAuth::verify`], so at the auth phase (which runs before the
-//! body is buffered) a body-bearing request claiming body coverage is
-//! refused rather than accepted unverified.
+//! A signature covering `content-digest` commits to the *header value*.
+//! Proving that value describes the bytes the client actually sent
+//! takes a second step, and the auth phase cannot take it: it runs
+//! before the body has been buffered, so the only bytes it could hand
+//! the verifier are none at all.
+//!
+//! [`HmacAuth::verify`] therefore uses the deferring form of the
+//! verifier, and the proxy completes the proof in the request body
+//! filter against the complete pre-transform body, answering `401` on a
+//! mismatch. That is the same two-step contract
+//! [`crate::auth::bot_auth`] uses; the wiring that arms it is
+//! `sbproxy_core::server::request_phase::arm_deferred_body_digest_binding`.
+//!
+//! Comparing the covered digest against the empty body the auth phase
+//! can offer is not a conservative alternative to this. It inverts the
+//! check: an honest client sending the true digest of its body is
+//! refused, while one that declares the empty-body digest and then
+//! sends a body anyway is admitted.
 
 use std::collections::HashMap;
 
@@ -259,10 +270,14 @@ impl HmacAuth {
 
     /// Verify the signature on `req` against the configured keys.
     ///
-    /// `req` carries the body bytes available to the caller; a
-    /// signature covering `content-digest` is checked against exactly
-    /// those bytes and fails closed on a mismatch (see the module-level
-    /// "Body binding" section).
+    /// The `content-digest` half of the proof is deferred. This call
+    /// verifies the covered components cryptographically; the caller
+    /// owns the digest-versus-body comparison and must run it against
+    /// the complete request body once that body has arrived. The proxy
+    /// does that in the request body filter, so `req` here may carry an
+    /// empty body. A caller that skips the second step leaves the
+    /// request body unauthenticated. See the module-level "Body
+    /// binding" section.
     pub fn verify(&self, req: &http::Request<bytes::Bytes>) -> HmacVerdict {
         let Some(input) = req.headers().get("signature-input") else {
             return HmacVerdict::Missing;
@@ -351,9 +366,14 @@ impl HmacAuth {
                 reason: "internal: matched key disappeared".to_string(),
             };
         };
-        // Safe-by-default form: a covered `content-digest` is bound to
-        // the body bytes on `req` here and now, never deferred.
-        match key.verifier.verify_request(req) {
+        // Deferring form, matching `bot_auth`. The enforcing
+        // `verify_request` would compare a covered `content-digest`
+        // against whatever bytes `req` carries, and the auth phase
+        // carries none, which refuses the honest client and admits the
+        // one declaring the empty-body digest. The body half of the
+        // proof is completed in the request body filter instead; see
+        // "Body binding" in the module docs.
+        match key.verifier.verify_request_deferring_body_binding(req) {
             VerifyVerdict::Ok { .. } => HmacVerdict::Verified { key_id: kid },
             VerifyVerdict::Failed { reason } => HmacVerdict::Failed {
                 key_id: kid,
@@ -550,8 +570,22 @@ mod tests {
         );
     }
 
+    /// The provider verifies headers and hands the body half back.
+    ///
+    /// This test used to assert that `verify` itself refused a tampered
+    /// body. It cannot: `verify` runs in the auth phase, which has no
+    /// body to compare against, and the bytes on `req` there are always
+    /// empty. Asserting refusal at this layer is what let the shipped
+    /// build compare a covered digest against zero bytes.
+    ///
+    /// So the contract this pins is the deferral itself: the signature
+    /// verifies on its covered headers regardless of the body carried
+    /// here, and the digest-versus-body comparison the caller owes is
+    /// the thing that separates the honest body from the tampered one.
+    /// The enforcement is pinned end to end in `sbproxy-core` by
+    /// `server::tests::hmac_auth_binds_a_body_covering_signature_to_the_body_that_arrives`.
     #[test]
-    fn tampered_body_is_refused_when_signature_covers_content_digest() {
+    fn content_digest_binding_is_deferred_to_the_caller() {
         let auth = provider(None);
         let body = br#"{"amount":10}"#;
         let digest = sbproxy_middleware::digest::compute_content_digest(
@@ -568,19 +602,31 @@ mod tests {
         });
         assert!(
             matches!(auth.verify(&req), HmacVerdict::Verified { .. }),
-            "the untampered body must verify"
+            "the covered headers must verify"
         );
-        // Same signed headers, different body bytes: the Content-Digest
-        // binding must fail closed.
-        let mut tampered = http::Request::builder()
+
+        // The auth phase hands the verifier an empty body, so a
+        // provider that bound the digest here would refuse this.
+        let mut empty_bodied = http::Request::builder()
             .method("POST")
             .uri("/api/invoices")
-            .body(bytes::Bytes::from_static(br#"{"amount":999999}"#))
+            .body(bytes::Bytes::new())
             .unwrap();
-        *tampered.headers_mut() = req.headers().clone();
+        *empty_bodied.headers_mut() = req.headers().clone();
         assert!(
-            matches!(auth.verify(&tampered), HmacVerdict::Failed { .. }),
-            "a tampered body must not pass a content-digest-covering signature"
+            matches!(auth.verify(&empty_bodied), HmacVerdict::Verified { .. }),
+            "verification must not depend on body bytes this phase does not have"
+        );
+
+        // What the caller owes, and what it catches.
+        const TAMPERED: &[u8] = br#"{"amount":999999}"#;
+        assert!(
+            sbproxy_middleware::digest::verify_content_digest(&digest, body),
+            "the caller's check admits the body the signature covered"
+        );
+        assert!(
+            !sbproxy_middleware::digest::verify_content_digest(&digest, TAMPERED),
+            "the caller's check refuses a substituted body"
         );
     }
 

@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-20*
 
-SBproxy hands a SIEM three different things, and this page is the map of how they fit together: typed proxy events (the `events:` block, a closed set of thirteen), decision-audit records (`observability.log.decision_audit`, eighteen pipeline decisions normalized to OCSF), and four audit channels that write to their own tracing targets (`security_audit`, `config_audit`, `key_audit`, and the admin action ring). Two of those four, `security_audit` and `config_audit`, can additionally be hash-chained and Ed25519-signed for tamper evidence.
+SBproxy hands a SIEM three different things, and this page is the map of how they fit together: typed proxy events (the `events:` block, a closed set of eighteen), decision-audit records (`observability.log.decision_audit`, eighteen pipeline decisions normalized to OCSF), and four audit channels that write to their own tracing targets (`security_audit`, `config_audit`, `key_audit`, and the admin action ring). Two of those four, `security_audit` and `config_audit`, can additionally be hash-chained and Ed25519-signed for tamper evidence.
 
 If you only read one section, read [How the four audit channels relate to the event stream](#how-the-four-audit-channels-relate-to-the-event-stream). It is the piece that is easy to miss: `events:` is a delivery mechanism, not a source of truth, and most of what it delivers is a typed copy of a record another channel already produced.
 
@@ -44,14 +44,19 @@ all.
 | `guardrail_triggered` | An AI guardrail blocked a request or a response. | Yes, on the block only |
 | `config_reloaded` | The proxy configuration changed, or a reload was refused. | Yes |
 | `mcp_governance_decision` | An MCP interaction was decided: a `tools/call` allowed or refused by a governance gate, a pre-dispatch RBAC or quota refusal, a tool-contract change against its version lockfile, or a federated server's approval-status transition. | Yes |
+| `key_minted` | A key or upstream credential record was created through the admin key plane. | Yes |
+| `key_revoked` | A key or upstream credential was marked revoked, the terminal state. | Yes |
+| `key_rotated` | A key's secret was rotated; the prior secret keeps working for the grace window. | Yes |
+| `key_blocked` | A key or upstream credential was marked blocked. | Yes |
+| `credential_resolved` | An upstream credential's material was actually resolved, or a rotation grace window started serving the last known-good value. Never once per request. | Yes |
 | `cache_hit` | A response was served from the response cache. | No |
 | `cache_miss` | The cache lookup found no usable entry. | No |
 
-Eleven of the thirteen publish today. The other two, `cache_hit` and `cache_miss`, are declared on purpose and will not be wired: both fire on every cacheable request, and putting an NDJSON line on a configured webhook per cache lookup is a cost nobody asked to pay. The forensic question either answers, "did this response come from cache," already has a home: the `cache.admit` and `cache.key` decision-audit events (below) and the access log's `cache_status` column. If you write `events.types: [cache_hit]`, the proxy still boots, because refusing a name here would also block pre-configuring a type a later release wires. It just tells you at startup that nothing will ever arrive.
+Sixteen of the eighteen publish today. The other two, `cache_hit` and `cache_miss`, are declared on purpose and will not be wired: both fire on every cacheable request, and putting an NDJSON line on a configured webhook per cache lookup is a cost nobody asked to pay. The forensic question either answers, "did this response come from cache," already has a home: the `cache.admit` and `cache.key` decision-audit events (below) and the access log's `cache_status` column. If you write `events.types: [cache_hit]`, the proxy still boots, because refusing a name here would also block pre-configuring a type a later release wires. It just tells you at startup that nothing will ever arrive.
 
 ### The boot warning, so a quiet sink is a fact, not a guess
 
-An empty `events:` sink and a broken one look identical from the outside: neither delivers anything. So at boot, the proxy checks every name in `events.types:` (or, when `types:` is absent, every name that means "all thirteen") against the emitters that actually exist, and warns once, by name, for anything that will never fire:
+An empty `events:` sink and a broken one look identical from the outside: neither delivers anything. So at boot, the proxy checks every name in `events.types:` (or, when `types:` is absent, every name that means "all eighteen") against the emitters that actually exist, and warns once, by name, for anything that will never fire:
 
 ```
 WARN events.types selects event types that nothing publishes yet; the configured sink will not
@@ -62,15 +67,16 @@ This is the same shape `observability.log.decision_audit` has used for a while, 
 
 ### Verdict-level, not per-request
 
-Three of the eleven wired events are worth being explicit about, because "wired" does not mean "fires on every request that touches the feature":
+Four of the sixteen wired events are worth being explicit about, because "wired" does not mean "fires on every request that touches the feature":
 
 - **`provider_selected`** fires on a provider failover or advance, never on the provider chosen for an ordinary first attempt. The data carries `from_provider`, `to_provider`, and the reason (`http_503`, `transport`, `content_policy`, `managed_cold_fallback`). A deployment with healthy providers and no failovers sees none of these, which is correct: routing choice by itself is not a security-relevant event, a transition off the configured plan is.
 - **`budget_exceeded`** fires once per request that actually crosses a configured cap and gets blocked, at the same site that already builds the 402 response body. It does not fire for a request that stays under budget, and it does not fire on a soft-landing downgrade, only on a hard block. The data carries `scope` (the limit's scope label), `reason`, `max_tokens`, `max_cost_usd`, and `window_secs`.
 - **`guardrail_triggered`** fires once per guardrail evaluation stage (input, RAG-augmented input, or output) that ends in a block, never per streamed chunk and never on an allow. The data carries `stage`, `guardrail` (which one blocked), `flagged_count` (how many others flagged without blocking), `spans`, and `spans_dropped`. The span fields are populated on a `pii` block: each span is an entity type plus a byte offset and length into the scanned text (positions, never the matched value), capped at 32 with `spans_dropped` counting anything past the cap; every other guardrail publishes them empty. See [observability.md](observability.md#decision-audit-records) for which text the offsets index on each stage.
+- **`credential_resolved`** fires once per actual resolution of an upstream credential's material (an envelope opened, a vault reference dereferenced, or a plaintext record read), never on the per-request cache hit. The data carries `op`, `resource`, `id`, `outcome` (`resolved` or `stale_served`), and, on a fresh resolution only, `source` (`plaintext`, `envelope`, or `vault_ref`). A `stale_served` event is the one worth an alert rule: it means the secret backend was unreachable and the credential kept working from the last known-good value. It fires **once per outage, not once per request in the grace window**: the grace path deliberately does not refresh the cached value's timestamp (a refresh would make it look fresh and cancel the grace deadline), so every request for the length of the window retries and falls back, and only the transition into stale serving publishes. The next successful resolution arms the next one. If you want the per-request count, `sbproxy_credential_resolution_duration_seconds{cache="stale"}` has it as a rate, which is the shape an alert wants anyway. A resolution *refusal* publishes nothing here; the request that needed it is refused, and that refusal is carried by the request-side channels.
 
 ## Decision-audit: the other eighteen
 
-Most of the thirteen typed proxy events map onto request lifecycle and infrastructure facts. The gateway's actual security decisions, "did the WAF block this," "did the AI guardrail block this," "did this MCP tool dispatch succeed," live on a separate, wider channel: `DecisionEvent`, configured under `proxy.observability.log.decision_audit` and documented in full in [observability.md](observability.md#decision-audit-records) and the generated [decision-records.md](decision-records.md).
+Most of the eighteen typed proxy events map onto request lifecycle and infrastructure facts. The gateway's actual security decisions, "did the WAF block this," "did the AI guardrail block this," "did this MCP tool dispatch succeed," live on a separate, wider channel: `DecisionEvent`, configured under `proxy.observability.log.decision_audit` and documented in full in [observability.md](observability.md#decision-audit-records) and the generated [decision-records.md](decision-records.md).
 
 The short version, because this page is where the two channels need to be told apart:
 
@@ -109,6 +115,7 @@ pub struct ProxyEvent {
 - `provider_selected`, `budget_exceeded`, and `guardrail_triggered` carry the fields listed under [Verdict-level, not per-request](#verdict-level-not-per-request) above.
 - `request_completed` and `request_error` carry the full request envelope: latency, status, provider, model, token counts, and cost.
 - `mcp_governance_decision` carries OTel GenAI/MCP semantic-convention attribute names (Development stability) plus sbproxy's own `sbproxy.*` namespace: the tool name and call id, the MCP method and protocol version, the decision verdict and redacted reason, a salted hash of the tool arguments (never the arguments themselves, unless `mcp_audit.capture_arguments` opts a deployment into the redacted, size-bounded verbatim arguments too), the tenant id, and a per-tenant gapless sequence number a SIEM can use to detect a dropped record. It is emitted from the one funnel every MCP tool dispatch passes through, plus the RBAC and per-tool-quota denial sites that refuse a call before that funnel, the tool-version lockfile gate's per-refresh contract check, and the federated-server approval-status transition check. A tool-definition-change or registry-status-change record instead carries digest prefixes or the old/new status labels; see [mcp-security.md](mcp-security.md#no-usable-record-of-what-happened) for the full field mapping.
+- `key_minted`, `key_revoked`, `key_rotated`, and `key_blocked` carry an explicit allowlist rather than the `key_audit` entry they bridge from: `op`, `resource` (`key` or `credential`), the public `id`, `outcome` (`applied`; the entry only emits after the store accepted the mutation), the acting `actor` when the admin session resolved one, and, when the mutation was a status change, the closed-vocabulary `prior_status` / `new_status` labels. The `key_audit` channel's redacted before/after diff does not pass through: the chain fingerprints those values and the typed event drops them, so the SIEM copy carries strictly less than the local record. `credential_resolved` carries the same `op`/`resource`/`id`/`outcome` vocabulary plus `source`; see [Key lifecycle events: the dual record](#key-lifecycle-events-the-dual-record).
 
 None of those payloads carries a credential, and that is a property under test rather than a convention. `api_key_id` is the public id or a derived `sk_<hex>` fingerprint and never the secret. `prompt_fingerprint` is salted and non-reversible. No field holds prompt text, a header value, or a resolved config value. A field added to any of these records fails a test until somebody has confirmed it can be sent to a third party, because with a webhook sink these bytes leave your network.
 
@@ -132,7 +139,7 @@ events:
 | `path` | Output file for `sink: file`. Parent directories are created at boot. Required by `file`, refused otherwise. |
 | `url` | Destination for `sink: webhook`. Must be `http://` or `https://`. Required by `webhook`, refused otherwise. |
 | `signing_secret` | HMAC-SHA256 key for the webhook signature. Takes a secret reference and nothing else; see below. |
-| `types` | Which event types to deliver. Empty or absent means all thirteen. An unrecognized name is refused at compile time with the accepted list; a recognized but unwired name compiles and warns at boot (see above). |
+| `types` | Which event types to deliver. Empty or absent means all eighteen. An unrecognized name is refused at compile time with the accepted list; a recognized but unwired name compiles and warns at boot (see above). |
 | `fail_closed` | Event type names that must never be silently dropped. Empty by default. Same accepted set and refusal as `types`. See [Fail-closed delivery](#fail-closed-delivery). |
 | `queue_capacity` | Depth of the hand-off queue. Defaults to 4096. Zero is refused. |
 
@@ -243,12 +250,48 @@ Four channels write structured records, and only some of that traffic ever reach
 |---|---|---|
 | `security_audit` | Yes, under `audit.sink: chain` | Yes, bridged: `auth_*` and `forward_auth_*` reasons become `auth_denied`; everything else (framing violations, policy labels) becomes `policy_denied`. |
 | `config_audit` | Yes, under `audit.sink: chain` | Yes, bridged one to one to `config_reloaded`, for both an accepted and a rejected reload, on every reload path: the admin API, the file watcher, SIGHUP, the config-authority bundle apply, the remote config-source refresh poller, and the Git-backed extension-bundle refresh poller. |
-| `key_audit` | No (deliberately not chainable yet; see [audit-log.md](audit-log.md)) | No. Key-plane mutations (create, rotate, block, revoke) stay on the `key_audit` tracing target only. |
+| `key_audit` | Yes, under `audit.key_path` (metadata plus fingerprinted before/after fields, never the raw diff; see [audit-log.md](audit-log.md)) | Yes for the four alertable operations, bridged by operation: `create` becomes `key_minted`, `revoke` becomes `key_revoked`, `rotate` becomes `key_rotated`, `block` becomes `key_blocked`, for keys and upstream credentials alike. `update`, `delete`, and `unblock` stay on the `key_audit` channel only. |
 | Admin action ring | No | No. Console logins, content-inspection reads, and other admin-console actions stay on the `sbproxy::admin::audit` tracing target and the bounded in-memory ring `GET /api/audit/recent` reads. |
 
 The egress-refusal event follows the same bridge shape as the other two, just from a funnel that does not itself belong to any of the four named channels: `record_egress_refused` (the one function every purpose, AI provider, MCP token exchange, model artifact fetch, webhook and usage-sink delivery, and the OTLP telemetry exporters, already goes through) already writes a Prometheus series and a `tracing::warn!` line under `target: "sbproxy::egress"`. Since it lives in a leaf crate that cannot depend on the observability crate, the bridge to `EventType::EgressRefused` is a function pointer installed once at boot rather than a direct call, but the effect is the same as the security-audit bridge: one funnel, one typed event, covering every purpose that funnel serves.
 
-The practical read for a SIEM integration: subscribe to `events:` for a typed, filterable copy of denials and config changes, cheap to deliver and safe to lose the occasional record under load. Subscribe to `audit.sink: chain` separately, on `security_audit` and `config_audit`, when you need the tamper-evident original those typed copies were built from. Read `key_audit` and the admin ring directly if you need key-plane or console-action history; neither has a typed-event mirror.
+The practical read for a SIEM integration: subscribe to `events:` for a typed, filterable copy of denials, config changes, and key-lifecycle changes, cheap to deliver and safe to lose the occasional record under load. Subscribe to the audit chains separately (`audit.path`, `audit.config_path`, `audit.key_path`) when you need the tamper-evident original those typed copies were built from. Read the admin ring directly if you need console-action history; it is the one channel with no typed-event mirror, along with `key_audit`'s `update`, `delete`, and `unblock` operations.
+
+## Key lifecycle events: the dual record
+
+Every admin mutation of a key or an upstream credential already produces one `key_audit` record, and the four operations worth a real-time alert additionally publish a typed event. The design is deliberately dual: the chain is the durable, tamper-evident record that survives the process and proves nothing was quietly removed; the typed event is the lossy, real-time copy that gets "a credential was just revoked" into a SIEM in seconds instead of at the next chain archive. Neither substitutes for the other, and losing a typed event under load (see Backpressure, below) never loses the chain entry, because the chain append happens first, in the same emission.
+
+```mermaid
+flowchart TD
+    A["Admin key plane mutation:\nmint / revoke / rotate / block\n(POST /admin/keys, /admin/credentials)"] --> B["key_audit channel\n(tracing target + admin ring)"]
+    B -->|"audit.key_path"| C["Hash-chained, Ed25519-signed file\n(fingerprinted diffs, survives the process)"]
+    B -->|bridged| D["Typed event: key_minted /\nkey_revoked / key_rotated / key_blocked"]
+    R["Upstream credential resolution\n(material actually read, or a\ngrace window opening)"] --> E["Typed event:\ncredential_resolved"]
+    D --> F["events: sink\n(NDJSON file or signed webhook batch)"]
+    E --> F
+    F --> G["SIEM"]
+```
+
+The operation-to-event mapping, and what deliberately stays off the feed:
+
+| Admin operation | Typed event | Notes |
+|---|---|---|
+| `POST /admin/keys` (mint) | `key_minted` | Also fires for `POST /admin/credentials`, with `resource: "credential"`. |
+| `POST /admin/keys/{id}/revoke` | `key_revoked` | Also for credential revoke. Terminal; carries `prior_status` / `new_status`. |
+| `POST /admin/keys/{id}/rotate` | `key_rotated` | Keys only; credentials have no rotate endpoint. |
+| `POST /admin/keys/{id}/block` | `key_blocked` | Also for credential block. Carries `prior_status` / `new_status`. |
+| `unblock`, `PATCH` (update), `DELETE` | none | Chain and `key_audit` tracing only. The feed carries the four operations an alert rule names; the trail carries everything. |
+
+The payload posture is an explicit allowlist, the same idea as Vault's `audit_non_hmac_request_keys` exception list read in reverse: named non-secret fields cross in the clear (`op`, `resource`, the public `id`, `actor`, tenant, `outcome`, the closed `prior_status` / `new_status` vocabulary), and everything unnamed is withheld. The `key_audit` diff values never cross; the plaintext token, the verifier hash, and the envelope never exist anywhere near this path to begin with, and the tests pin both properties.
+
+Two captured events, exactly as the file sink writes them, one line per event (the block carries the status diff; the webhook sink wraps the same objects in the batch envelope above):
+
+```json
+{"event_type":"key_minted","hostname":"","tenant_id":"acme","timestamp":1787251963170,"data":{"id":"a7237f88fdd6fb04","op":"create","outcome":"applied","resource":"key"}}
+{"event_type":"key_blocked","hostname":"","tenant_id":"acme","timestamp":1787251963173,"data":{"id":"a7237f88fdd6fb04","new_status":"blocked","op":"block","outcome":"applied","prior_status":"active","resource":"key"}}
+```
+
+One honesty note for anyone mapping this feed into a normalized schema: OCSF (checked against the schema browser at 1.3.0) has **no key-management or secrets-management event class**. Its Identity and Access Management category models account changes, authentication, and entity management, and nothing in it models a credential being minted, rotated, or revoked. These events therefore ship in sbproxy's own typed shape rather than claiming an OCSF mapping that does not exist. That is specific to key-lifecycle events: the decision-audit channel's records really are OCSF API Activity, and nothing here changes that.
 
 ## Backpressure, and the drops it causes
 
@@ -313,7 +356,7 @@ Every one of these is a config that would compile, boot, serve traffic, and deli
 - A `url` that is not `http://` or `https://`.
 - `queue_capacity: 0`.
 - `types:` or `queue_capacity:` under `sink: none`.
-- An event name `types:` or `fail_closed:` does not recognize. The error quotes the name and lists all thirteen.
+- An event name `types:` or `fail_closed:` does not recognize. The error quotes the name and lists all eighteen.
 - Any key the block does not define, so a hopeful `retries:`, `batch_size:`, or `retention:` fails rather than being dropped. See [Retention](#retention) for why the last one is absent on purpose.
 
 A recognized but unwired name (`cache_hit`, `cache_miss`) is different from all of the above: it compiles, because the config layer cannot know which names a future release will wire, and it warns once at boot instead. See [The boot warning](#the-boot-warning-so-a-quiet-sink-is-a-fact-not-a-guess).

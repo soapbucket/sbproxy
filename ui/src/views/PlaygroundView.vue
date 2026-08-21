@@ -1,13 +1,32 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from "vue";
-import { api, ApiError, type AdminKeySummary, type PlaygroundChatResult } from "../api";
+import { useRoute, useRouter } from "vue-router";
+import {
+  api,
+  ApiError,
+  type AdminKeySummary,
+  type ContentSample,
+  type PlaygroundChatResult,
+} from "../api";
 import { useAsync } from "../composables/useAsync";
-import { formatMs, formatNumber, formatUsd } from "../lib/format";
+import { formatMs, formatNumber, formatUsd, shortId } from "../lib/format";
+import {
+  beginReplay,
+  contentSampleErrorMessage,
+  replayAvailabilityNotes,
+  replayDispatchMessages,
+  replayGaps,
+  resolveReplayContent,
+  type ReplayDraft,
+} from "../lib/replay";
 import PageHeader from "../components/PageHeader.vue";
 import StatCard from "../components/StatCard.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import ErrorState from "../components/ErrorState.vue";
 import EmptyState from "../components/EmptyState.vue";
+
+const route = useRoute();
+const router = useRouter();
 
 const endpointsReq = useAsync(() => api.playgroundEndpoints());
 const keysReq = useAsync(() => api.keysList());
@@ -15,7 +34,15 @@ function refresh() {
   endpointsReq.run();
   keysReq.run();
 }
-onMounted(refresh);
+onMounted(() => {
+  refresh();
+  // WOR-2580: a Logs row hands its request id over as `?replay=`; the
+  // metadata the ring retains (origin, model, minted key) rides along
+  // so the form pre-fills even when no content sample exists.
+  if (typeof route.query.replay === "string" && route.query.replay) {
+    startReplay();
+  }
+});
 
 const endpoints = computed(() => endpointsReq.data.value?.endpoints ?? []);
 // Only an active key can dispatch; a blocked or revoked one would just
@@ -48,6 +75,16 @@ function onOriginChange() {
   selectedModel.value = originModels.value[0] ?? "";
 }
 
+// The model picker's options: the endpoint's declared list, plus the
+// replayed model when the endpoint no longer declares it, so the
+// selection stays visible instead of rendering as a blank select.
+const modelOptions = computed<string[]>(() => {
+  const models = [...originModels.value];
+  const replayModel = replay.value?.model;
+  if (replayModel && !models.includes(replayModel)) models.push(replayModel);
+  return models;
+});
+
 // Pick a sensible default once endpoints (or keys) arrive.
 const ready = computed(() => endpoints.value.length > 0);
 watch(endpoints, (eps) => {
@@ -57,9 +94,119 @@ watch(endpoints, (eps) => {
   }
 });
 watch(activeKeys, (keys) => {
-  if (!selectedKeyId.value && keys.length) {
+  if (!keys.length) return;
+  // A replay prefers the key the original request ran as, so the same
+  // key policy governs both runs; anything else defaults to the first
+  // active key, and a selection the operator already made stands.
+  const replayKey = replay.value?.keyId;
+  if (replayKey && keys.some((k) => k.key_id === replayKey)) {
+    if (!selectedKeyId.value || selectedKeyId.value === keys[0].key_id) {
+      selectedKeyId.value = replayKey;
+    }
+    return;
+  }
+  if (!selectedKeyId.value) {
     selectedKeyId.value = keys[0].key_id;
   }
+});
+
+// WOR-2580: replay a logged request through the governed dispatch path.
+const replay = ref<ReplayDraft | null>(null);
+
+function queryString(value: unknown): string | undefined {
+  return typeof value === "string" && value ? value : undefined;
+}
+
+async function startReplay() {
+  const requestId = queryString(route.query.replay);
+  if (!requestId) return;
+  const draft = beginReplay({
+    requestId,
+    origin: queryString(route.query.origin),
+    model: queryString(route.query.model),
+    keyId: queryString(route.query.key),
+  });
+  replay.value = draft;
+  applyReplaySelections(draft);
+  // The body exists only as the WOR-2096 redacted content sample, read
+  // through the same audited admin endpoint as any other log read. A
+  // miss (no capture consent, evicted, or a read_only operator) leaves
+  // the body unreconstructed and says so; nothing is invented.
+  let sample: ContentSample | null = null;
+  let sampleError: string | null = null;
+  try {
+    sample = await api.requestContent(requestId);
+  } catch (e) {
+    // The server says which of the two consent flags was missing; a
+    // bare `e.message` is only the request line and the status code.
+    sampleError = contentSampleErrorMessage(e);
+  }
+  if (replay.value?.requestId !== requestId) return; // superseded or cleared
+  const settled = resolveReplayContent(replay.value, sample, sampleError);
+  replay.value = settled;
+  // Re-apply only the fields the URL lacked and the sample filled in,
+  // so a selection the operator changed while the fetch was in flight
+  // stands.
+  applyReplaySelections({
+    ...settled,
+    origin: draft.origin ? undefined : settled.origin,
+    model: draft.model ? undefined : settled.model,
+    keyId: draft.keyId ? undefined : settled.keyId,
+  });
+  // Same rule as the three selections above: what the operator typed
+  // while the fetch was in flight wins over what the sample carried.
+  if (settled.prompt && !prompt.value) prompt.value = settled.prompt;
+}
+
+function applyReplaySelections(draft: ReplayDraft) {
+  if (draft.origin) selectedOrigin.value = draft.origin;
+  if (draft.model) selectedModel.value = draft.model;
+  const keys = activeKeys.value;
+  if (draft.keyId && keys.some((k) => k.key_id === draft.keyId)) {
+    selectedKeyId.value = draft.keyId;
+  }
+}
+
+function clearReplay() {
+  replay.value = null;
+  // The replay card carries the only disclosure that this text is the
+  // stored redaction rather than the original bytes, so dropping the
+  // card has to drop the text it described. Left loaded, Send would
+  // dispatch redacted content to a live provider with nothing on
+  // screen saying so, and as a single user message rather than the
+  // captured turn sequence, so it would be neither a replay nor a
+  // fresh prompt, and it would bill. The origin, model and key
+  // selections stay: those are plain log metadata, visible on the row
+  // that started this, and not redacted content.
+  prompt.value = "";
+  router.replace({ name: "playground" });
+}
+
+watch(
+  () => route.query.replay,
+  (id) => {
+    if (typeof id === "string" && id && id !== replay.value?.requestId) {
+      startReplay();
+    }
+  },
+);
+
+/** Everything the reconstruction could not recover or no longer resolves. */
+const replayNotes = computed<string[]>(() => {
+  const draft = replay.value;
+  if (!draft) return [];
+  return [
+    ...replayGaps(draft),
+    ...replayAvailabilityNotes(draft, {
+      origins: endpointsReq.data.value
+        ? endpoints.value.map((e) => e.origin)
+        : undefined,
+      keyIds: keysReq.data.value
+        ? activeKeys.value.map((k) => k.key_id)
+        : undefined,
+      models: originModels.value.length ? originModels.value : undefined,
+    }),
+  ];
 });
 
 const answer = computed<string>(() => {
@@ -87,8 +234,11 @@ async function send() {
   sending.value = true;
   chatError.value = null;
   result.value = null;
+  // A replay carries every captured message in order, with the prompt
+  // box's text in the last user slot; otherwise this is the plain
+  // single-prompt form.
   const request: Record<string, unknown> = {
-    messages: [{ role: "user", content: prompt.value }],
+    messages: replayDispatchMessages(replay.value, prompt.value),
     stream: false,
   };
   if (selectedModel.value) request.model = selectedModel.value;
@@ -137,6 +287,40 @@ async function send() {
       title="Could not load virtual keys"
       @retry="keysReq.run"
     />
+    <div v-if="replay" class="sb-card replay">
+      <div class="replay__head">
+        <h3>
+          Replaying request
+          <span class="sb-mono" :title="replay.requestId">{{
+            shortId(replay.requestId)
+          }}</span>
+        </h3>
+        <button class="sb-btn sb-btn--sm" @click="clearReplay">Clear replay</button>
+      </div>
+      <p class="replay__lede">
+        The reconstructed request dispatches through the governed pipeline:
+        key policy, budgets, routing, and guardrails all apply, exactly as
+        they did for the original request.
+      </p>
+      <div v-if="replay.content === 'captured' && replay.messages" class="replay__capture">
+        <p class="sb-eyebrow">Captured input (redacted)</p>
+        <div
+          v-for="(msg, msgIndex) in replay.messages"
+          :key="msgIndex"
+          class="replay__message"
+        >
+          <span class="replay__role sb-mono">{{ msg.role }}</span>
+          <span class="replay__text">{{ msg.content }}</span>
+        </div>
+        <p class="sb-faint">
+          The Prompt box below edits the last user message; the other captured
+          messages replay unchanged.
+        </p>
+      </div>
+      <ul class="replay__notes">
+        <li v-for="note in replayNotes" :key="note">{{ note }}</li>
+      </ul>
+    </div>
     <div class="sb-card form">
       <div class="row">
         <label>
@@ -149,8 +333,8 @@ async function send() {
         </label>
         <label>
           <span class="lbl">Model</span>
-          <select v-if="originModels.length" v-model="selectedModel" class="sb-input">
-            <option v-for="m in originModels" :key="m" :value="m">{{ m }}</option>
+          <select v-if="modelOptions.length" v-model="selectedModel" class="sb-input">
+            <option v-for="m in modelOptions" :key="m" :value="m">{{ m }}</option>
           </select>
           <input
             v-else
@@ -255,6 +439,50 @@ async function send() {
 </template>
 
 <style scoped>
+.replay {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sb-space-3);
+  margin-bottom: var(--sb-space-4);
+}
+.replay__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sb-space-3);
+}
+.replay__lede {
+  margin: 0;
+  color: var(--sb-text-muted);
+  font-size: 0.85rem;
+}
+.replay__capture {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.replay__message {
+  display: grid;
+  grid-template-columns: 90px 1fr;
+  gap: var(--sb-space-3);
+  font-size: 0.85rem;
+}
+.replay__role {
+  color: var(--sb-text-muted);
+}
+.replay__text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.replay__notes {
+  margin: 0;
+  padding-left: 1.2em;
+  color: var(--sb-text-muted);
+  font-size: 0.82rem;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
 .form {
   display: flex;
   flex-direction: column;

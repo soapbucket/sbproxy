@@ -220,6 +220,24 @@ pub enum EventType {
     /// was decided (allowed or refused), emitted from the same funnel
     /// every MCP tool dispatch already passes through (WOR-2384).
     McpGovernanceDecision,
+    /// Event name `key_minted`. A key or upstream credential record was
+    /// created through the admin key plane (WOR-2571).
+    KeyMinted,
+    /// Event name `key_revoked`. A key or upstream credential was marked
+    /// revoked, the terminal state (WOR-2571).
+    KeyRevoked,
+    /// Event name `key_rotated`. A key's secret was rotated; the prior
+    /// secret keeps working for the grace window (WOR-2571).
+    KeyRotated,
+    /// Event name `key_blocked`. A key or upstream credential was marked
+    /// blocked (WOR-2571).
+    KeyBlocked,
+    /// Event name `credential_resolved`. An upstream credential's
+    /// material was resolved into its presentable header form, either
+    /// freshly or served stale inside the rotation grace window
+    /// (WOR-2571). Fires once per actual resolution, never on the
+    /// per-request cache hit.
+    CredentialResolved,
 }
 
 impl ProxyEvent {
@@ -259,10 +277,10 @@ impl ProxyEvent {
 ///
 /// The array length is written out, so a variant added to the enum and
 /// not added here fails to compile. That is deliberate. The failure
-/// mode this prevents is a fourteenth event type that no `events:` sink
+/// mode this prevents is a nineteenth event type that no `events:` sink
 /// can ever be told to deliver, which looks exactly like a working sink
 /// to everyone except the operator waiting for the event.
-pub const ALL_EVENT_TYPES: [EventType; 13] = [
+pub const ALL_EVENT_TYPES: [EventType; 18] = [
     EventType::RequestStarted,
     EventType::RequestCompleted,
     EventType::RequestError,
@@ -276,6 +294,11 @@ pub const ALL_EVENT_TYPES: [EventType; 13] = [
     EventType::ConfigReloaded,
     EventType::EgressRefused,
     EventType::McpGovernanceDecision,
+    EventType::KeyMinted,
+    EventType::KeyRevoked,
+    EventType::KeyRotated,
+    EventType::KeyBlocked,
+    EventType::CredentialResolved,
 ];
 
 impl EventType {
@@ -301,6 +324,11 @@ impl EventType {
             Self::ConfigReloaded => "config_reloaded",
             Self::EgressRefused => "egress_refused",
             Self::McpGovernanceDecision => "mcp_governance_decision",
+            Self::KeyMinted => "key_minted",
+            Self::KeyRevoked => "key_revoked",
+            Self::KeyRotated => "key_rotated",
+            Self::KeyBlocked => "key_blocked",
+            Self::CredentialResolved => "credential_resolved",
         }
     }
 
@@ -330,6 +358,11 @@ impl EventType {
             Self::ConfigReloaded => 10,
             Self::EgressRefused => 11,
             Self::McpGovernanceDecision => 12,
+            Self::KeyMinted => 13,
+            Self::KeyRevoked => 14,
+            Self::KeyRotated => 15,
+            Self::KeyBlocked => 16,
+            Self::CredentialResolved => 17,
         }
     }
 
@@ -361,6 +394,16 @@ impl EventType {
                 | Self::ConfigReloaded
                 | Self::EgressRefused
                 | Self::McpGovernanceDecision
+                // WOR-2571: the four mutation kinds publish from the
+                // `KeyAuditEntry::emit` bridge (every admin mint /
+                // revoke / rotate / block funnels through it), and
+                // `credential_resolved` from
+                // `sbproxy_core::key_plane`'s resolution path.
+                | Self::KeyMinted
+                | Self::KeyRevoked
+                | Self::KeyRotated
+                | Self::KeyBlocked
+                | Self::CredentialResolved
         )
         // `CacheHit` and `CacheMiss` are deliberately absent: wiring
         // them per-request would put an NDJSON line on every configured
@@ -523,6 +566,11 @@ mod tests {
                 EventType::McpGovernanceDecision,
                 "\"mcp_governance_decision\"",
             ),
+            (EventType::KeyMinted, "\"key_minted\""),
+            (EventType::KeyRevoked, "\"key_revoked\""),
+            (EventType::KeyRotated, "\"key_rotated\""),
+            (EventType::KeyBlocked, "\"key_blocked\""),
+            (EventType::CredentialResolved, "\"credential_resolved\""),
         ];
 
         for (variant, expected) in variants {

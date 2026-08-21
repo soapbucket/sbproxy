@@ -1,0 +1,105 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Structural JSON/XML body threat limits.
+#
+# The body_threat_protection policy bounds the SHAPE of a request
+# body rather than matching signatures: JSON nesting depth, entries
+# per object, items per array, key and string byte lengths, and total
+# container count; XML nesting depth, total element count, and
+# attributes per element. Any XML DOCTYPE declaration is refused
+# outright, which is the guard against billion-laughs entity
+# expansion: entity declarations live in the DTD, so refusing the DTD
+# refuses the whole class.
+#
+# The checks are content-type gated. Only `application/json` (and
+# `+json` suffixes) and `application/xml` / `text/xml` (and `+xml`
+# suffixes) are scanned; every other content type, and a request with
+# no Content-Type at all, streams through untouched. A violation in
+# `mode: block` (the default) returns 400 naming the violated limit,
+# never echoing body content. `mode: tap` logs and counts the
+# violation without blocking, so you can observe real traffic before
+# enforcing.
+#
+# The limits below are demonstration-tight so curl can trip them.
+# Omit the json:/xml: blocks entirely to get the production defaults
+# (depth 64, 10k entries/items/elements, 1 KiB keys, 128 KiB strings,
+# 50k containers, 256 attributes).
+#
+# Run:
+#   make run CONFIG=examples/body-threat-protection/sb.yml
+#
+# Test:
+#   # 200 - flat JSON within every limit reaches the upstream
+#   curl -i -H 'Host: body.local' -H 'Content-Type: application/json' \
+#        -d '{"order_id":"a-1","qty":2}' http://127.0.0.1:8080/anything
+#
+#   # 400 - six levels of nesting against max_depth: 4
+#   curl -i -H 'Host: body.local' -H 'Content-Type: application/json' \
+#        -d '{"a":{"b":{"c":{"d":{"e":{"f":1}}}}}}' http://127.0.0.1:8080/anything
+#
+#   # 400 - XML DOCTYPE (billion-laughs prefix) refused outright
+#   curl -i -H 'Host: body.local' -H 'Content-Type: application/xml' \
+#        --data-binary '<!DOCTYPE l [<!ENTITY a "x">]><l>&a;</l>' \
+#        http://127.0.0.1:8080/anything
+#
+#   # Passes untouched - not a JSON/XML content type
+#   curl -i -H 'Host: body.local' -H 'Content-Type: text/plain' \
+#        -d 'not scanned at all' http://127.0.0.1:8080/anything
+#
+#   # tap.local logs + counts the same violation instead of blocking
+#   curl -i -H 'Host: tap.local' -H 'Content-Type: application/json' \
+#        -d '{"a":{"b":{"c":{"d":{"e":{"f":1}}}}}}' http://127.0.0.1:8080/anything
+#
+#   # The policy counter, action-labeled deny vs tap (admin API):
+#   curl -s -u admin:changeme http://127.0.0.1:9091/metrics \
+#     | grep 'sbproxy_policy_triggers_total.*body_threat_protection'
+
+proxy:
+  http_bind_port: 8080
+
+  # Metrics-only admin surface so the policy counter above is readable.
+  admin:
+    enabled: true
+    port: 9091
+    # username/password default to admin / changeme; override in real configs.
+
+origins:
+  # Block mode (the default): a violation is a 400 naming the limit.
+  "body.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    policies:
+      - type: body_threat_protection
+        mode: block
+        json:
+          max_depth: 4
+          max_object_entries: 32
+          max_array_items: 16
+          max_key_length: 64
+          max_string_length: 256
+          max_containers: 64
+        xml:
+          max_depth: 4
+          max_elements: 32
+          max_attributes: 8
+
+  # Tap mode: same limits, but a violation is logged and counted
+  # (action="tap" on the policy counter) while the request proceeds.
+  "tap.local":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    policies:
+      - type: body_threat_protection
+        mode: tap
+        json:
+          max_depth: 4
+          max_object_entries: 32
+          max_array_items: 16
+          max_key_length: 64
+          max_string_length: 256
+          max_containers: 64
+        xml:
+          max_depth: 4
+          max_elements: 32
+          max_attributes: 8
