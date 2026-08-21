@@ -1,7 +1,7 @@
 # Supported providers
 *Last modified: 2026-08-21*
 
-SBproxy ships native adapters for 72 LLM providers behind one OpenAI-compatible API. The 72 breaks down as: 66 entries that speak the OpenAI wire format and pass through unchanged, 3 with in-tree request and response translators (Anthropic, Gemini, Bedrock), and 3 `Custom`-format entries (SageMaker, Oracle, Watsonx) that pass through in their native shape with no translation. You bring your own key per provider, and the `model` field passes straight through to the upstream, so the gateway reaches 200+ models (and whatever a provider ships next) without enumerating them.
+SBproxy ships native adapters for 70 LLM providers behind one OpenAI-compatible API. The 70 breaks down as: 63 entries that speak the OpenAI wire format and pass through unchanged, 3 with in-tree request and response translators (Anthropic, Gemini, Bedrock), and 4 `Custom`-format entries (SageMaker, Oracle, Watsonx, Writer) that pass through in their native shape with no translation. You bring your own key per provider, and the `model` field passes straight through to the upstream, so the gateway reaches 200+ models (and whatever a provider ships next) without enumerating them.
 
 Read the table below for what it is: a catalog, not a test report. It is hand-maintained against
 `crates/sbproxy-ai/data/ai_providers.yml`, and it records what each entry says about a provider,
@@ -24,69 +24,67 @@ Each provider has a default base URL and auth format. Override `base_url` if you
 | `openai` | OpenAI | OpenAI | `Authorization: Bearer` | `https://api.openai.com/v1` |
 | `anthropic` | Anthropic Claude | Anthropic Messages | `x-api-key` | `https://api.anthropic.com/v1` |
 | `gemini` | Google Gemini | Google | `x-goog-api-key` | `https://generativelanguage.googleapis.com/v1beta` |
-| `azure` | Azure OpenAI | OpenAI | `api-key` | `https://{resource}.openai.azure.com/openai` |
+| `azure` | Azure OpenAI | OpenAI | `api-key` | `https://{resource}.openai.azure.com/openai/v1` |
 | `bedrock` | AWS Bedrock | Bedrock | AWS SigV4[^sigv4] | `https://bedrock-runtime.{region}.amazonaws.com` |
-| `cohere` | Cohere | OpenAI | `Authorization: Bearer` | `https://api.cohere.com/v2` |
+| `meta` | Meta Model API | OpenAI | `Authorization: Bearer` | `https://api.meta.ai/v1` |
+| `cohere` | Cohere | OpenAI | `Authorization: Bearer` | `https://api.cohere.ai/compatibility/v1` |
 | `mistral` | Mistral AI | OpenAI | `Authorization: Bearer` | `https://api.mistral.ai/v1` |
 | `groq` | Groq | OpenAI | `Authorization: Bearer` | `https://api.groq.com/openai/v1` |
 | `deepseek` | DeepSeek | OpenAI | `Authorization: Bearer` | `https://api.deepseek.com/v1` |
 | `ollama` | Ollama (local) | OpenAI | `Authorization: Bearer` (optional)[^ollama] | `http://localhost:11434/v1` |
 | `vllm` | vLLM (self-hosted) | OpenAI | `Authorization: Bearer` | `http://localhost:8000/v1` |
-| `tgi` | Hugging Face TGI (self-hosted) | OpenAI | `Authorization: Bearer` | `http://localhost:8080/v1` |
+| `sglang` | SGLang (self-hosted) | OpenAI | `Authorization: Bearer` (optional) | `http://localhost:30000/v1` |
+| `localai` | LocalAI (self-hosted) | OpenAI | `Authorization: Bearer` (optional) | `http://localhost:8080/v1` |
+| `tgi` | Hugging Face TGI (self-hosted)[^tgi] | OpenAI | `Authorization: Bearer` | `http://localhost:8080/v1` |
 | `lmstudio` | LM Studio (local) | OpenAI | `Authorization: Bearer` | `http://localhost:1234/v1` |
 | `llamacpp` | `llama.cpp` server (local) | OpenAI | `Authorization: Bearer` | `http://localhost:8080/v1` |
-| `together` | Together AI | OpenAI | `Authorization: Bearer` | `https://api.together.xyz/v1` |
+| `together` | Together AI | OpenAI | `Authorization: Bearer` | `https://api.together.ai/v1` |
 | `fireworks` | Fireworks AI | OpenAI | `Authorization: Bearer` | `https://api.fireworks.ai/inference/v1` |
-| `perplexity` | Perplexity | OpenAI | `Authorization: Bearer` | `https://api.perplexity.ai` |
+| `perplexity` | Perplexity | OpenAI | `Authorization: Bearer` | `https://api.perplexity.ai/router/v1` |
 | `xai` | xAI (Grok) | OpenAI | `Authorization: Bearer` | `https://api.x.ai/v1` |
 | `sagemaker` | Amazon SageMaker | Custom | AWS SigV4[^sigv4] | `https://runtime.sagemaker.{region}.amazonaws.com` |
 | `databricks` | Databricks | OpenAI | `Authorization: Bearer` | `https://{workspace}.cloud.databricks.com/serving-endpoints` |
-| `oracle` | Oracle OCI Generative AI | Custom | `Authorization: Bearer` | `https://inference.generativeai.{region}.oci.oraclecloud.com` |
+| `oracle` | Oracle OCI Generative AI | Custom | Authorization (OCI request signature, signed externally)[^oci] | `https://inference.generativeai.{region}.oci.oraclecloud.com` |
 | `watsonx` | IBM watsonx | Custom | `Authorization: Bearer` | `https://us-south.ml.cloud.ibm.com/ml/v1` |
 | `openrouter` | OpenRouter (aggregator) | OpenAI | `Authorization: Bearer` | `https://openrouter.ai/api/v1` |
 | `cloudflare` | Cloudflare Workers AI | OpenAI | `Authorization: Bearer` | `https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1` |
 | `vertex` | Google Vertex AI | OpenAI | `Authorization: Bearer`[^vertex-oauth] | `https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}/endpoints/openapi` |
 | `runpod` | RunPod Serverless | OpenAI | `Authorization: Bearer` | `https://api.runpod.ai/v2/{endpoint_id}/openai/v1` |
-| `crusoe` | Crusoe Cloud Inference | OpenAI | `Authorization: Bearer` | `https://managed-inference-api-proxy.crusoecloud.com/v1` |
+| `crusoe` | Crusoe Cloud Inference | OpenAI | `Authorization: Bearer` | `https://api.inference.crusoecloud.com/v1` |
 | `featherless` | Featherless AI | OpenAI | `Authorization: Bearer` | `https://api.featherless.ai/v1` |
-| `reka` | Reka AI | OpenAI | `Authorization: Bearer` | `https://api.reka.ai/v1` |
-| `anyscale` | Anyscale Endpoints | OpenAI | `Authorization: Bearer` | `https://api.endpoints.anyscale.com/v1` |
+| `reka` | Reka AI | OpenAI | `X-Api-Key` | `https://api.reka.ai/v1` |
 | `cerebras` | Cerebras Inference | OpenAI | `Authorization: Bearer` | `https://api.cerebras.ai/v1` |
 | `nvidia` | NVIDIA NIM | OpenAI | `Authorization: Bearer` | `https://integrate.api.nvidia.com/v1` |
 | `hyperbolic` | Hyperbolic | OpenAI | `Authorization: Bearer` | `https://api.hyperbolic.xyz/v1` |
-| `lepton` | Lepton AI | OpenAI | `Authorization: Bearer` | `https://api.lepton.run/v1` |
 | `deepinfra` | DeepInfra | OpenAI | `Authorization: Bearer` | `https://api.deepinfra.com/v1/openai` |
-| `novita` | Novita AI | OpenAI | `Authorization: Bearer` | `https://api.novita.ai/v3/openai` |
+| `novita` | Novita AI | OpenAI | `Authorization: Bearer` | `https://api.novita.ai/openai` |
 | `sambanova` | SambaNova Cloud | OpenAI | `Authorization: Bearer` | `https://api.sambanova.ai/v1` |
 | `siliconflow` | SiliconFlow | OpenAI | `Authorization: Bearer` | `https://api.siliconflow.cn/v1` |
-| `moonshot` | Moonshot AI (Kimi) | OpenAI | `Authorization: Bearer` | `https://api.moonshot.cn/v1` |
-| `dashscope` | Alibaba DashScope (Qwen) | OpenAI | `Authorization: Bearer` | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
-| `zhipu` | Zhipu AI (GLM) | OpenAI | `Authorization: Bearer` | `https://open.bigmodel.cn/api/paas/v4` |
+| `moonshot` | Moonshot AI (Kimi)[^regional] | OpenAI | `Authorization: Bearer` | `https://api.moonshot.ai/v1` |
+| `dashscope` | Alibaba DashScope (Qwen)[^regional] | OpenAI | `Authorization: Bearer` | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` |
+| `zhipu` | Z.ai / Zhipu AI (GLM)[^regional] | OpenAI | `Authorization: Bearer` | `https://api.z.ai/api/paas/v4` |
 | `voyage` | Voyage AI (embeddings only)[^embed-only] | OpenAI | `Authorization: Bearer` | `https://api.voyageai.com/v1` |
 | `jina` | Jina AI (embeddings only)[^embed-only] | OpenAI | `Authorization: Bearer` | `https://api.jina.ai/v1` |
 | `huggingface` | Hugging Face Inference Providers | OpenAI | `Authorization: Bearer` | `https://router.huggingface.co/v1` |
-| `github_models` | GitHub Models | OpenAI | `Authorization: Bearer` | `https://models.github.ai/inference` |
 | `vercel` | Vercel AI Gateway | OpenAI | `Authorization: Bearer` | `https://ai-gateway.vercel.sh/v1` |
-| `nebius` | Nebius AI Studio | OpenAI | `Authorization: Bearer` | `https://api.studio.nebius.ai/v1` |
+| `nebius` | Nebius Token Factory | OpenAI | `Authorization: Bearer` | `https://api.tokenfactory.nebius.com/v1` |
 | `baseten` | Baseten Model APIs | OpenAI | `Authorization: Bearer` | `https://inference.baseten.co/v1` |
-| `lambda` | Lambda Inference API | OpenAI | `Authorization: Bearer` | `https://api.lambda.ai/v1` |
 | `friendliai` | FriendliAI Serverless | OpenAI | `Authorization: Bearer` | `https://api.friendli.ai/serverless/v1` |
 | `scaleway` | Scaleway Generative APIs | OpenAI | `Authorization: Bearer` | `https://api.scaleway.ai/v1` |
 | `nscale` | Nscale Serverless Inference | OpenAI | `Authorization: Bearer` | `https://inference.api.nscale.com/v1` |
-| `digitalocean` | DigitalOcean Gradient Inference | OpenAI | `Authorization: Bearer` | `https://inference.do-ai.run/v1` |
+| `digitalocean` | DigitalOcean Inference | OpenAI | `Authorization: Bearer` | `https://inference.do-ai.run/v1` |
 | `ovhcloud` | OVHcloud AI Endpoints | OpenAI | `Authorization: Bearer` | `https://oai.endpoints.kepler.ai.cloud.ovh.net/v1` |
 | `inferencenet` | Inference.net | OpenAI | `Authorization: Bearer` | `https://api.inference.net/v1` |
-| `kluster` | kluster.ai | OpenAI | `Authorization: Bearer` | `https://api.kluster.ai/v1` |
-| `openpipe` | OpenPipe | OpenAI | `Authorization: Bearer` | `https://api.openpipe.ai/api/v1` |
-| `writer` | Writer (Palmyra) | OpenAI | `Authorization: Bearer` | `https://api.writer.com/v1` |
-| `upstage` | Upstage (Solar) | OpenAI | `Authorization: Bearer` | `https://api.upstage.ai/v1/solar` |
-| `alephalpha` | Aleph Alpha | OpenAI | `Authorization: Bearer` | `https://api.aleph-alpha.com/v1` |
-| `minimax` | MiniMax | OpenAI | `Authorization: Bearer` | `https://api.minimax.io/v1` |
-| `volcengine` | Volcengine Ark (Doubao) | OpenAI | `Authorization: Bearer` | `https://ark.cn-beijing.volces.com/api/v3` |
+| `wandb` | W&B Inference (CoreWeave) | OpenAI | `Authorization: Bearer` | `https://api.inference.wandb.ai/v1` |
+| `gmi` | GMI Cloud | OpenAI | `Authorization: Bearer` | `https://api.gmi-serving.com/v1` |
+| `writer` | Writer (Palmyra) | Custom[^writer] | `Authorization: Bearer` | `https://api.writer.com/v1` |
+| `upstage` | Upstage (Solar) | OpenAI | `Authorization: Bearer` | `https://api.upstage.ai/v1` |
+| `minimax` | MiniMax[^regional] | OpenAI | `Authorization: Bearer` | `https://api.minimax.io/v1` |
+| `volcengine` | Volcengine Ark (Doubao)[^regional] | OpenAI | `Authorization: Bearer` | `https://ark.cn-beijing.volces.com/api/v3` |
 | `hunyuan` | Tencent Hunyuan | OpenAI | `Authorization: Bearer` | `https://api.hunyuan.cloud.tencent.com/v1` |
 | `qianfan` | Baidu Qianfan (ERNIE) | OpenAI | `Authorization: Bearer` | `https://qianfan.baidubce.com/v2` |
 | `stepfun` | StepFun | OpenAI | `Authorization: Bearer` | `https://api.stepfun.com/v1` |
-| `mixedbread` | Mixedbread (embeddings only)[^embed-only] | OpenAI | `Authorization: Bearer` | `https://api.mixedbread.com/v1` |
+| `mixedbread` | Mixedbread | OpenAI | `Authorization: Bearer` | `https://api.mixedbread.com/v1` |
 | `azure_foundry` | Azure AI Foundry Models | OpenAI | `api-key` | `https://{resource}.services.ai.azure.com/openai/v1` |
 | `snowflake` | Snowflake Cortex | OpenAI | `Authorization: Bearer` | `https://{account}.snowflakecomputing.com/api/v2/cortex/v1` |
 | `ai21` | AI21 Labs (Jamba) | OpenAI | `Authorization: Bearer` | `https://api.ai21.com/studio/v1` |
@@ -98,7 +96,15 @@ The `cloudflare`, `vertex`, `runpod`, `azure_foundry`, and `snowflake` defaults 
 
 [^vertex-oauth]: Vertex AI requires a short-lived OAuth2 access token rather than a static API key. Generate one with `gcloud auth print-access-token` (or your service account flow) and rotate it before expiry. SBproxy forwards the configured `api_key` verbatim as the bearer token.
 
-[^embed-only]: Voyage and Jina expose embeddings (and rerank) endpoints only. Their catalog entries set `supports_chat: false` so chat-completion configs against these providers will fail closed at validation time once the runtime check is wired.
+[^embed-only]: Voyage and Jina expose embeddings (and rerank) endpoints only. Their catalog entries set `supports_chat: false` so chat-completion configs against these providers will fail closed at validation time once the runtime check is wired. Mixedbread used to sit in this group and no longer does: its current API reference documents OpenAI-shaped `/v1/chat/completions` and has dropped the standalone embeddings reference, so refusing chat there had become a false refusal.
+
+[^tgi]: Hugging Face archived the TGI repository on 2026-03-21 and put it in maintenance mode, pointing new deployments at vLLM, SGLang, or `llama.cpp`. The entry stays because an existing TGI server keeps serving on this base; the port matches the published Docker quickstart's host mapping rather than the binary's own default.
+
+[^oci]: Oracle Cloud authenticates with a signed `Authorization` header (`Signature version="1",keyId=...`), not a bearer token. As with SigV4, SBproxy does not compute the signature: the request must arrive already signed and the header is forwarded verbatim, so the catalog entry prepends no prefix.
+
+[^writer]: Writer's published OpenAPI puts chat at `/v1/chat` and contains no `chat/completions` path at all, so an OpenAI-shaped request would 404. The entry is `Custom` for that reason: clients must send Writer's own path and body shape.
+
+[^regional]: These vendors run separate domestic and international platforms with distinct accounts and billing. The catalog default is the international endpoint, because that is the one an operator outside the vendor's home market can sign up for. The domestic hosts (`api.moonshot.cn`, `dashscope.aliyuncs.com`, `open.bigmodel.cn`, `api.minimaxi.com`, and BytePlus ModelArk for Volcengine) are a per-origin `base_url` override away.
 
 `format` is the wire protocol the upstream expects. OpenAI-compatible upstreams pass through unchanged. Anthropic, Google Gemini, and AWS Bedrock are translated bidirectionally for chat-completions requests: clients send OpenAI-shaped bodies, SBproxy rewrites the body and path on the way out, and SBproxy rewrites the response back to OpenAI shape. For streaming, the relay parses native Anthropic, Gemini, and Bedrock stream frames into the internal hub stream and re-emits OpenAI Chat, Anthropic Messages, or OpenAI Responses shape based on the inbound route. Gemini embeddings at `/v1/embeddings` translate to and from Gemini embedding calls. Oracle OCI, Watsonx, SageMaker, and other `Custom` formats remain native pass-through, so clients must send the provider's native body shape or route through OpenRouter/custom translation.
 
@@ -112,7 +118,7 @@ Override `base_url` to use a region other than us-south for watsonx. Bedrock and
 
 Every catalog entry also declares a `data_posture` block: `retains_data` (does the vendor's API retain prompt data on a stock account, for example an abuse-monitoring window) and `zdr_available` (does the vendor sell a zero-data-retention arrangement at all). The same honesty rule as the rest of this page applies: these record what each vendor's published data-processing terms say, not the result of auditing an account, and vendors change terms on their own schedule. The `data_posture:` block on an `ai_proxy` action turns these declarations into a hard routing eligibility filter; see [ai-gateway.md](ai-gateway.md#provider-data-posture).
 
-`zdr_available` is informational and is deliberately not an input to that filter. It tells you an agreement exists to go and sign, not that your account holds one, and four of the entries below offer one while retaining by default. Declaring what your own deployment holds is a line in your config (`data_posture.zdr: true` on the provider entry).
+`zdr_available` is informational and is deliberately not an input to that filter. It tells you an agreement exists to go and sign, not that your account holds one, and five of the entries below offer one while retaining by default. Declaring what your own deployment holds is a line in your config (`data_posture.zdr: true` on the provider entry).
 
 The entries with a non-pessimistic declaration:
 
@@ -121,11 +127,13 @@ The entries with a non-pessimistic declaration:
 | `openai` | `true` | `true` | Abuse-monitoring retention up to 30 days; ZDR offered for approved use cases (OpenAI API data-usage policy). |
 | `anthropic` | `true` | `true` | Limited trust-and-safety retention; ZDR agreements offered commercially (Anthropic commercial terms). |
 | `azure` | `true` | `true` | Abuse-monitoring storage up to 30 days; approved subscriptions can disable it (Azure OpenAI data-privacy note). |
-| `bedrock` | `false` | `true` | AWS states Bedrock does not store or log prompts and completions (Bedrock data-protection documentation). |
+| `bedrock` | `true` | `true` | Zero data retention is the platform default, but the abuse-detection page carves out named models: classifier-flagged traffic to the OpenAI GPT-5.x family is retained up to 30 days with no opt-in, and the model name passes straight through from the caller. Eligible customers may request full ZDR through their AWS account team (Bedrock abuse-detection docs). |
 | `vertex` | `true` | `true` | No training on customer data; caching and abuse logging can be disabled for zero-retention configurations (Vertex AI data-governance docs). |
-| `ollama`, `vllm`, `tgi`, `lmstudio`, `llamacpp` | `false` | `true` | Local engines; the default base URL keeps prompts on the operator's own host. |
+| `perplexity` | `false` | `true` | Published zero-data-retention policy for the completions API: data sent through it is not retained and is not used for training (Perplexity privacy and security docs). |
+| `cerebras` | `false` | `true` | States it does not retain inputs and outputs associated with its inference services (Cerebras privacy policy). |
+| `ollama`, `vllm`, `sglang`, `localai`, `tgi`, `lmstudio`, `llamacpp` | `false` | `true` | Local engines; the default base URL keeps prompts on the operator's own host. |
 
-The four entries with `retains_data: true, zdr_available: true` retain on a stock account, so they satisfy `require_zdr` only once you declare the agreement you hold. The six with `retains_data: false` store nothing to begin with and satisfy it as they stand. Every other entry carries the pessimistic default, `retains_data: true, zdr_available: false`, spelled out in the YAML: with no published commitment recorded, a posture-constrained origin fails closed rather than optimistically routing there. If your own agreement with a vendor differs (a signed ZDR addendum, say), declare it on your provider entry with `data_posture.zdr: true` / `data_posture.retains_data: false`, or ship a corrected catalog via `proxy.ai_providers_file`. A locally served (`serve:`) or `managed_model` provider is treated as zero-data-retention by construction.
+The five entries with `retains_data: true, zdr_available: true` retain on a stock account, so they satisfy `require_zdr` only once you declare the agreement you hold. The nine with `retains_data: false` store nothing to begin with and satisfy it as they stand. Bedrock moved from the second group to the first in this pass, which is a fail-closed change: an origin that required ZDR and configured only Bedrock now gets refused at config load instead of routing to a provider whose no-retention default no longer covers every model it serves. Every other entry carries the pessimistic default, `retains_data: true, zdr_available: false`, spelled out in the YAML: with no published commitment recorded, a posture-constrained origin fails closed rather than optimistically routing there. If your own agreement with a vendor differs (a signed ZDR addendum, say), declare it on your provider entry with `data_posture.zdr: true` / `data_posture.retains_data: false`, or ship a corrected catalog via `proxy.ai_providers_file`. A locally served (`serve:`) or `managed_model` provider is treated as zero-data-retention by construction.
 
 ## Configuring a provider
 

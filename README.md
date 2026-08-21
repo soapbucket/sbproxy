@@ -4,7 +4,7 @@
 
 # SBproxy
 
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-21*
 
 <p align="center">
   <a href="https://github.com/soapbucket/sbproxy/actions/workflows/ci.yml"><img src="https://github.com/soapbucket/sbproxy/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
@@ -15,7 +15,7 @@
   <a href="https://sbproxy.dev"><img src="https://img.shields.io/badge/docs-sbproxy.dev-16150F.svg" alt="Documentation"></a>
 </p>
 
-SBproxy is a single Rust binary that puts one policy engine in front of three kinds of traffic: HTTP APIs, AI model calls across 72 native providers reaching 200+ models through one OpenAI-compatible endpoint, and MCP or agent-to-agent tool calls. All three run through the same request pipeline, so a rate limit, a guardrail, a budget cap, and an audit record behave the same way no matter which traffic type triggered them. Every feature in this repository ships under Apache-2.0.
+SBproxy is a single Rust binary that puts one policy engine in front of three kinds of traffic: HTTP APIs, AI model calls across 70 native providers reaching 200+ models through one OpenAI-compatible endpoint, and MCP or agent-to-agent tool calls. All three run through the same request pipeline, so a rate limit, a guardrail, a budget cap, and an audit record behave the same way no matter which traffic type triggered them. Every feature in this repository ships under Apache-2.0.
 
 ## Why sbproxy
 

@@ -639,7 +639,7 @@ mod tests {
     #[test]
     fn effective_base_url_together() {
         let p = make_provider("together");
-        assert_eq!(p.effective_base_url(), "https://api.together.xyz/v1");
+        assert_eq!(p.effective_base_url(), "https://api.together.ai/v1");
     }
 
     #[test]
