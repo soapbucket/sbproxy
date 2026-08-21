@@ -1668,6 +1668,44 @@ fn record_worker_delta(observed: &ObservedStatus, current: WorkerStatus) {
             .envelopes_purged
             .saturating_sub(previous.envelopes_purged),
     );
+    // A sweep that could not run at all. Distinct from `terminal`, which is
+    // a row the sweep moved to a settled outcome: these moved nothing, so the
+    // queue behind them is still there and the flat series beside this one is
+    // an outage rather than an idle queue. Alert on the rate.
+    for (operation, failures, previous_failures) in [
+        (
+            "expire_challenge",
+            current.stage_failures.expire_challenges,
+            previous.stage_failures.expire_challenges,
+        ),
+        (
+            "recover_lease",
+            current.stage_failures.recover_leases,
+            previous.stage_failures.recover_leases,
+        ),
+        (
+            "strand_intent",
+            current.stage_failures.strand_intents,
+            previous.stage_failures.strand_intents,
+        ),
+        (
+            "reconcile",
+            current.stage_failures.reconciliation,
+            previous.stage_failures.reconciliation,
+        ),
+        (
+            "report_usage",
+            current.stage_failures.usage,
+            previous.stage_failures.usage,
+        ),
+        (
+            "purge_envelope",
+            current.stage_failures.purge_envelopes,
+            previous.stage_failures.purge_envelopes,
+        ),
+    ] {
+        record_payment_recovery(operation, "failed", failures.saturating_sub(previous_failures));
+    }
     record_payment_worker_ticks(current.ticks.saturating_sub(previous.ticks));
 
     *previous = current;

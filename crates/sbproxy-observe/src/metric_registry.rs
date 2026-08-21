@@ -3118,7 +3118,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["operation", "outcome"],
-        description: "Durable rows the settlement recovery worker moved, by recovery operation and committed outcome.",
+        description: "Durable rows the settlement recovery worker moved, by recovery operation and committed outcome. `outcome=\"failed\"` is the one value that is not a row: it counts sweeps of that operation that returned a store error and moved nothing, which the other stages of the same tick survive.",
         dead_reason: None,
     },
     MetricCapability {
