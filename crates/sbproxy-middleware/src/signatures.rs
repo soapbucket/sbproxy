@@ -35,11 +35,39 @@
 //!   `@scheme`, `@path`, `@query`.
 //! - Arbitrary HTTP header references (case-insensitive name match;
 //!   multi-value headers joined with `, ` per RFC 9421 §2.1).
-//! - `created` and `expires` parameter enforcement when present.
+//! - `created` and `expires` parameter enforcement when present. The
+//!   `created` window is symmetric: a signature more than
+//!   `clock_skew_seconds` old is refused as stale, which is the only
+//!   replay bound a Web Bot Auth signature without a `nonce` has.
 //! - Body coverage: a signature that covers `content-digest` is only
 //!   accepted when the `Content-Digest` header the signature attests to
 //!   also matches the bytes of the body handed to the verifier. See
 //!   "Body coverage" below.
+//!
+//! # `@target-uri` and `@request-target`
+//!
+//! Both derivations were wrong until they were fixed, in opposite
+//! directions: `@target-uri` emitted the origin-form request target
+//! where RFC 9421 §2.2.2 defines the full absolute URI, and
+//! `@request-target` emitted `METHOD /path`, which is draft-cavage's
+//! shape rather than §2.2.5's bare request target. Nothing conformant
+//! could interoperate with either.
+//!
+//! Verification accepts the old derivation as a fallback for a
+//! deprecation window: a signature covering one of the two that fails
+//! against the conformant base is retried against the legacy one, with
+//! the same key and after the same freshness check, and a success there
+//! logs the deprecation once per process. Signing always produces the
+//! conformant base.
+//!
+//! One more candidate exists for a request line in origin form, which
+//! carries no scheme: an `http::Request` has no connection behind it,
+//! so this module cannot tell a TLS listener from a plaintext one, and
+//! a signature covering `@target-uri` or `@scheme` is tried against
+//! both schemes rather than guessed at. The caller that does know
+//! stamps the scheme onto the URI before handing the request over
+//! (`build_signature_verification_request` in `sbproxy-core` does), and
+//! the second candidate then never runs.
 //!
 //! # Body coverage
 //!
@@ -154,10 +182,14 @@ pub struct MessageSignatureConfig {
     /// covers a strict subset.
     #[serde(default)]
     pub required_components: Vec<String>,
-    /// Optional clock skew tolerance (seconds) for `created` /
-    /// `expires` parameters. `created` may be at most this far in the
-    /// future; `expires` at least this far in the past. Defaults to
+    /// Clock skew tolerance in seconds, applied symmetrically to
+    /// `created`: a signature may be at most this far in the future and
+    /// at most this far in the past. `expires`, when the signer sends
+    /// one, may shorten that window but never extend it. Defaults to
     /// 30s.
+    ///
+    /// This window is the replay bound. A signature whose `created` is
+    /// outside it is refused before any crypto runs.
     #[serde(default = "default_skew_seconds")]
     pub clock_skew_seconds: u64,
 }
@@ -423,7 +455,7 @@ impl MessageSignatureVerifier {
         }
 
         // Reconstruct the signature base.
-        let base = match build_signature_base(req, input) {
+        let base = match build_signature_base_in(req, input, BaseDialect::Rfc9421) {
             Ok(b) => b,
             Err(e) => {
                 return VerifyVerdict::Failed {
@@ -432,67 +464,50 @@ impl MessageSignatureVerifier {
             }
         };
 
-        // Crypto.
-        let ok = match self.config.algorithm {
-            SignatureAlgorithm::HmacSha256 => {
-                let mut mac = match HmacSha256::new_from_slice(&self.key_bytes) {
-                    Ok(m) => m,
-                    Err(_) => {
-                        return VerifyVerdict::Failed {
-                            reason: "invalid hmac key".to_string(),
-                        }
-                    }
-                };
-                mac.update(base.as_bytes());
-                mac.verify_slice(raw_sig).is_ok()
-            }
-            SignatureAlgorithm::Ed25519 => {
-                let key_arr: [u8; 32] = self
-                    .key_bytes
-                    .as_slice()
-                    .try_into()
-                    .expect("ed25519 key length validated at construction");
-                let key = match VerifyingKey::from_bytes(&key_arr) {
-                    Ok(k) => k,
-                    Err(_) => {
-                        return VerifyVerdict::Failed {
-                            reason: "invalid ed25519 public key".to_string(),
-                        }
-                    }
-                };
-                let sig_arr: [u8; 64] = match raw_sig.as_slice().try_into() {
-                    Ok(a) => a,
-                    Err(_) => {
-                        return VerifyVerdict::Failed {
-                            reason: format!(
-                                "ed25519 signature must be 64 bytes, got {}",
-                                raw_sig.len()
-                            ),
-                        }
-                    }
-                };
-                let signature = Signature::from_bytes(&sig_arr);
-                key.verify(base.as_bytes(), &signature).is_ok()
-            }
-            SignatureAlgorithm::EcdsaP256Sha256 => {
-                // RFC 9421 §3.3.5 pins the `ecdsa-p256-sha256`
-                // signature to the fixed-width `r || s` form, so a
-                // 64-byte length check is a real conformance check
-                // and not just defence against a short read. DER-
-                // encoded signatures land here as the wrong length
-                // and are named as such, because a signer emitting
-                // DER is the likeliest way this fails in the field.
-                if raw_sig.len() != 64 {
-                    return VerifyVerdict::Failed {
-                        reason: format!(
-                            "ecdsa-p256-sha256 signature must be 64 bytes of r||s, got {}",
-                            raw_sig.len()
-                        ),
-                    };
-                }
-                verify_ecdsa_p256_sha256(&self.key_bytes, base.as_bytes(), raw_sig)
-            }
+        let mut ok = match self.verify_base(&base, raw_sig) {
+            Ok(verified) => verified,
+            Err(verdict) => return verdict,
         };
+
+        // Two fallback bases, both tried only after the conformant one
+        // has already failed, and only for a signature whose covered
+        // set makes them different from it. Neither weakens anything:
+        // each candidate is verified with the same key, over the same
+        // covered components, after the same freshness check.
+        //
+        // 1. The other scheme, for an origin-form request line. The
+        //    scheme is not on the wire there and this layer cannot see
+        //    the listener's TLS state, so a signature over
+        //    `https://host/path` and one over `http://host/path` are
+        //    both plausibly what the client signed. A caller that does
+        //    know stamps the scheme onto the URI it hands over, and
+        //    this candidate then never runs.
+        // 2. The pre-conformance derivations of `@target-uri` and
+        //    `@request-target`, which a signer built against this
+        //    proxy still produces. That one is a deprecation window and
+        //    says so in the log.
+        if !ok {
+            let fallbacks = [
+                (req.uri().scheme_str().is_none() && covers_scheme_sensitive_component(input))
+                    .then_some(BaseDialect::Rfc9421OtherScheme),
+                covers_retargeted_component(input).then_some(BaseDialect::Legacy),
+            ];
+            for dialect in fallbacks.into_iter().flatten() {
+                let Ok(candidate) = build_signature_base_in(req, input, dialect) else {
+                    continue;
+                };
+                ok = match self.verify_base(&candidate, raw_sig) {
+                    Ok(verified) => verified,
+                    Err(verdict) => return verdict,
+                };
+                if ok {
+                    if dialect == BaseDialect::Legacy {
+                        warn_legacy_target_derivation();
+                    }
+                    break;
+                }
+            }
+        }
 
         if !ok {
             return VerifyVerdict::Failed {
@@ -513,6 +528,118 @@ impl MessageSignatureVerifier {
             signature_label: label,
         }
     }
+
+    /// Run the configured algorithm over one candidate signature base.
+    ///
+    /// `Ok(true)` verified, `Ok(false)` did not. `Err(verdict)` is for a
+    /// key or a signature that is malformed whatever the base is, so a
+    /// caller trying a second base must not retry on it.
+    fn verify_base(&self, base: &str, raw_sig: &[u8]) -> Result<bool, VerifyVerdict> {
+        match self.config.algorithm {
+            SignatureAlgorithm::HmacSha256 => {
+                let mut mac = match HmacSha256::new_from_slice(&self.key_bytes) {
+                    Ok(m) => m,
+                    Err(_) => {
+                        return Err(VerifyVerdict::Failed {
+                            reason: "invalid hmac key".to_string(),
+                        })
+                    }
+                };
+                mac.update(base.as_bytes());
+                Ok(mac.verify_slice(raw_sig).is_ok())
+            }
+            SignatureAlgorithm::Ed25519 => {
+                let key_arr: [u8; 32] = self
+                    .key_bytes
+                    .as_slice()
+                    .try_into()
+                    .expect("ed25519 key length validated at construction");
+                let key = match VerifyingKey::from_bytes(&key_arr) {
+                    Ok(k) => k,
+                    Err(_) => {
+                        return Err(VerifyVerdict::Failed {
+                            reason: "invalid ed25519 public key".to_string(),
+                        })
+                    }
+                };
+                let sig_arr: [u8; 64] = match raw_sig.try_into() {
+                    Ok(a) => a,
+                    Err(_) => {
+                        return Err(VerifyVerdict::Failed {
+                            reason: format!(
+                                "ed25519 signature must be 64 bytes, got {}",
+                                raw_sig.len()
+                            ),
+                        })
+                    }
+                };
+                let signature = Signature::from_bytes(&sig_arr);
+                Ok(key.verify(base.as_bytes(), &signature).is_ok())
+            }
+            SignatureAlgorithm::EcdsaP256Sha256 => {
+                // RFC 9421 §3.3.5 pins the `ecdsa-p256-sha256`
+                // signature to the fixed-width `r || s` form, so a
+                // 64-byte length check is a real conformance check
+                // and not just defence against a short read. DER-
+                // encoded signatures land here as the wrong length
+                // and are named as such, because a signer emitting
+                // DER is the likeliest way this fails in the field.
+                if raw_sig.len() != 64 {
+                    return Err(VerifyVerdict::Failed {
+                        reason: format!(
+                            "ecdsa-p256-sha256 signature must be 64 bytes of r||s, got {}",
+                            raw_sig.len()
+                        ),
+                    });
+                }
+                Ok(verify_ecdsa_p256_sha256(
+                    &self.key_bytes,
+                    base.as_bytes(),
+                    raw_sig,
+                ))
+            }
+        }
+    }
+}
+
+/// Whether this signature covers a component whose derivation changed
+/// when `@target-uri` and `@request-target` were made RFC 9421
+/// conformant. Only those two signatures are worth a legacy attempt.
+fn covers_retargeted_component(input: &SignatureInputEntry) -> bool {
+    covers_any(input, &["@target-uri", "@request-target"])
+}
+
+/// Whether this signature covers a component whose value depends on the
+/// request scheme. Only those are worth an other-scheme attempt.
+fn covers_scheme_sensitive_component(input: &SignatureInputEntry) -> bool {
+    covers_any(input, &["@target-uri", "@scheme"])
+}
+
+fn covers_any(input: &SignatureInputEntry, names: &[&str]) -> bool {
+    input.components.iter().any(|c| {
+        let component = c.trim_matches('"');
+        names
+            .iter()
+            .any(|name| component.eq_ignore_ascii_case(name))
+    })
+}
+
+/// Say once per process that a signer is still on the pre-RFC-9421
+/// derivation.
+///
+/// Once, not per request: this fires on the hot path of every request
+/// from a signer that has not moved yet, and the point is to tell the
+/// operator the deprecation applies to them, which one line does.
+fn warn_legacy_target_derivation() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            "message signature verified only against the pre-RFC-9421 derivation of \
+             `@target-uri` / `@request-target`; the signer should move to a conformant \
+             RFC 9421 library. Acceptance of the old derivation is a deprecation window \
+             and will be removed. Logged once per process."
+        );
+    });
 }
 
 /// Verify that a covered `content-digest` component describes the body
@@ -814,19 +941,48 @@ fn split_top_level_commas(input: &str) -> Vec<String> {
 
 // --- Signature base construction ---
 
+/// Which derivation to use for the two request-target components.
+///
+/// Everything else in the base is identical between the two, so this
+/// only reaches `@target-uri` and `@request-target`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaseDialect {
+    /// RFC 9421 as written, with the scheme [`request_scheme`] resolves.
+    Rfc9421,
+    /// RFC 9421 with the opposite scheme. Tried on verification only,
+    /// and only for an origin-form request line, whose scheme this layer
+    /// genuinely cannot know. Never produced when signing.
+    Rfc9421OtherScheme,
+    /// What this proxy emitted before the conformance fix: `@target-uri`
+    /// as the origin-form request target and `@request-target` as
+    /// draft-cavage's `METHOD /path`. Accepted on inbound verification
+    /// for a deprecation window and never produced when signing.
+    Legacy,
+}
+
 /// Build the canonical signature base for an inbound request.
 ///
-/// Mirrors RFC 9421 §2 byte-for-byte for the components we support;
-/// unsupported component types are surfaced as errors so the verifier
-/// can fail closed rather than silently signing a different base than
-/// the signer did.
+/// Mirrors RFC 9421 §2 byte-for-byte for the components we support,
+/// including the absolute-URI form of `@target-uri` (§2.2.2) and the
+/// bare request target of `@request-target` (§2.2.5). Unsupported
+/// component types are surfaced as errors so the verifier can fail
+/// closed rather than silently signing a different base than the signer
+/// did.
 pub fn build_signature_base(
     req: &http::Request<bytes::Bytes>,
     input: &SignatureInputEntry,
 ) -> anyhow::Result<String> {
+    build_signature_base_in(req, input, BaseDialect::Rfc9421)
+}
+
+fn build_signature_base_in(
+    req: &http::Request<bytes::Bytes>,
+    input: &SignatureInputEntry,
+    dialect: BaseDialect,
+) -> anyhow::Result<String> {
     let mut out = String::new();
     for component in &input.components {
-        let value = canonical_component_value(req, component)?;
+        let value = canonical_component_value(req, component, dialect)?;
         out.push('"');
         out.push_str(&component.to_ascii_lowercase());
         out.push('"');
@@ -849,9 +1005,10 @@ pub fn build_signature_base(
 fn canonical_component_value(
     req: &http::Request<bytes::Bytes>,
     name: &str,
+    dialect: BaseDialect,
 ) -> anyhow::Result<String> {
     if let Some(rest) = name.strip_prefix('@') {
-        return derived_component(req, rest);
+        return derived_component(req, rest, dialect);
     }
     // Non-derived: HTTP header reference.
     let header_name = name.trim_matches('"').to_ascii_lowercase();
@@ -869,55 +1026,146 @@ fn canonical_component_value(
     Ok(values.join(", "))
 }
 
-fn derived_component(req: &http::Request<bytes::Bytes>, name: &str) -> anyhow::Result<String> {
+/// Scheme for the `@scheme` and `@target-uri` derivations.
+///
+/// An origin-form request line carries no scheme, so it has to come from
+/// somewhere else. What this function CANNOT see is the listener's TLS
+/// state: an `http::Request` has no connection behind it. The caller
+/// that does own that state stamps the scheme onto the URI before
+/// handing the request over (`build_signature_verification_request` in
+/// `sbproxy-core`), which is why `uri.scheme_str()` is the first branch
+/// and the rest is a fallback for a caller that did not.
+fn request_scheme(req: &http::Request<bytes::Bytes>) -> &str {
+    if let Some(scheme) = req.uri().scheme_str() {
+        return scheme;
+    }
+    if req.uri().host().is_some() {
+        "https"
+    } else {
+        "http"
+    }
+}
+
+/// Authority for the `@authority` and `@target-uri` derivations: the URI
+/// when the request line is absolute-form, the `Host` header otherwise.
+fn request_authority(req: &http::Request<bytes::Bytes>) -> Option<&str> {
+    req.uri()
+        .authority()
+        .map(|a| a.as_str())
+        .or_else(|| header_str(req.headers(), "host"))
+}
+
+/// The scheme `dialect` asks for: the resolved one, or its opposite for
+/// the other-scheme verification attempt.
+fn dialect_scheme(req: &http::Request<bytes::Bytes>, dialect: BaseDialect) -> &str {
+    let resolved = request_scheme(req);
+    match dialect {
+        BaseDialect::Rfc9421OtherScheme => {
+            if resolved.eq_ignore_ascii_case("https") {
+                "http"
+            } else {
+                "https"
+            }
+        }
+        BaseDialect::Rfc9421 | BaseDialect::Legacy => resolved,
+    }
+}
+
+fn derived_component(
+    req: &http::Request<bytes::Bytes>,
+    name: &str,
+    dialect: BaseDialect,
+) -> anyhow::Result<String> {
     let uri: &Uri = req.uri();
+    let path_and_query = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or_else(|| uri.path());
     Ok(match name {
         "method" => req.method().as_str().to_string(),
-        "target-uri" => match uri.path_and_query() {
-            Some(pq) => pq.as_str().to_string(),
-            None => uri.path().to_string(),
-        },
-        "authority" => uri
-            .authority()
-            .map(|a| a.as_str().to_string())
-            .or_else(|| header_str(req.headers(), "host").map(String::from))
-            .unwrap_or_default(),
-        "scheme" => uri.scheme_str().map(|s| s.to_string()).unwrap_or_else(|| {
-            if uri.host().is_some() {
-                "https".to_string()
-            } else {
-                "http".to_string()
+        // RFC 9421 §2.2.2: the full absolute target URI, assembled from
+        // the scheme and authority when the request line is origin-form.
+        // This used to emit `path_and_query`, which is `@request-target`
+        // semantics, so no conformant peer could interoperate in either
+        // direction.
+        "target-uri" => match dialect {
+            BaseDialect::Legacy => path_and_query.to_string(),
+            BaseDialect::Rfc9421 | BaseDialect::Rfc9421OtherScheme => {
+                match request_authority(req) {
+                    Some(authority) => format!(
+                        "{}://{}{}",
+                        dialect_scheme(req, dialect),
+                        authority,
+                        path_and_query
+                    ),
+                    // No authority on the URI and no Host header, which
+                    // is an HTTP/1.0 request line. There is no absolute
+                    // URI to assemble, so emit the target alone: it is
+                    // what the peer's own reconstruction has to fall
+                    // back to too.
+                    None => path_and_query.to_string(),
+                }
             }
-        }),
+        },
+        "authority" => request_authority(req).unwrap_or_default().to_string(),
+        "scheme" => dialect_scheme(req, dialect).to_string(),
         "path" => uri.path().to_string(),
         "query" => match uri.query() {
             Some(q) if !q.is_empty() => format!("?{}", q),
             _ => "?".to_string(),
         },
-        "request-target" => match uri.path_and_query() {
-            Some(pq) => format!("{} {}", req.method().as_str(), pq.as_str()),
-            None => format!("{} {}", req.method().as_str(), uri.path()),
+        // RFC 9421 §2.2.5: the request target as it appears in the
+        // request line, which for the origin-form requests a proxy sees
+        // is the path and query alone. The legacy shape prefixed the
+        // uppercased method, which is draft-cavage's `(request-target)`
+        // and matches neither spec.
+        "request-target" => match dialect {
+            BaseDialect::Legacy => format!("{} {}", req.method().as_str(), path_and_query),
+            BaseDialect::Rfc9421 => path_and_query.to_string(),
         },
         other => anyhow::bail!("unsupported derived component: @{}", other),
     })
 }
 
+/// Enforce the `created` / `expires` window against the wall clock.
+///
+/// The window is symmetric around `created`, which is what
+/// `clock_skew_seconds` has always been documented as: at most `skew`
+/// seconds in the future and at most `skew` seconds in the past.
+///
+/// The past half used to be missing entirely, and the timestamp window
+/// is the only replay defence a Web Bot Auth signature has: `nonce` is
+/// optional in the profile, `required_components` can require a
+/// component but never a parameter, and `bot_auth`'s nonce store is
+/// never wired by any caller in this tree. A captured `Signature-Input`
+/// / `Signature` pair with no `expires` was therefore an unexpiring
+/// bearer token for whatever identity its `keyid` carried.
+///
+/// `expires` can only shorten the window. A signer that wants a longer
+/// one is asking the verifying operator to widen
+/// `clock_skew_seconds`, which is a decision that belongs on the
+/// verifying side rather than in a parameter the signer picks.
 fn check_freshness(input: &SignatureInputEntry, skew: u64) -> Option<String> {
     let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => d.as_secs() as i64,
         Err(_) => return Some("system clock before epoch".to_string()),
     };
-    let skew = skew as i64;
+    let skew = i64::try_from(skew).unwrap_or(i64::MAX);
     if let Some(created) = input.params.created {
-        if created > now + skew {
+        if created > now.saturating_add(skew) {
             return Some(format!(
                 "signature created in future: {} > {}",
                 created, now
             ));
         }
+        if created < now.saturating_sub(skew) {
+            return Some(format!(
+                "signature created timestamp is stale: created={created}, now={now}, window={skew}s"
+            ));
+        }
     }
     if let Some(expires) = input.params.expires {
-        if expires + skew < now {
+        if expires.saturating_add(skew) < now {
             return Some(format!("signature expired: {} < {}", expires, now));
         }
     }
@@ -1223,6 +1471,21 @@ mod tests {
         }
     }
 
+    /// Wall-clock seconds, for a fixture whose `created` has to sit
+    /// inside the verifier's freshness window.
+    ///
+    /// Signatures in these tests are computed at run time, so a live
+    /// `created` costs nothing. The two fixtures that cannot move (the
+    /// ECDSA known-answer vector, whose signature is a published
+    /// constant over a base containing `created=1700000000`) widen the
+    /// skew instead and say so where they do it.
+    fn now_unix() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the epoch")
+            .as_secs()
+    }
+
     #[test]
     fn parse_signature_input_basic() {
         let inputs = parse_signature_input(
@@ -1272,11 +1535,366 @@ mod tests {
         let base = build_signature_base(&req, &entry).unwrap();
         // Expected per RFC 9421 §2: components first, then the
         // @signature-params line. Each component line is lower-case.
+        // `@target-uri` is the absolute URI of §2.2.2, assembled from
+        // the scheme and the Host header because the request line is
+        // origin-form.
         let expected = "\"@method\": POST\n\
-            \"@target-uri\": /api/items?x=1\n\
+            \"@target-uri\": http://api.example.com/api/items?x=1\n\
             \"host\": api.example.com\n\
             \"@signature-params\": (\"@method\" \"@target-uri\" \"host\");created=1700000000;keyid=\"k1\"";
         assert_eq!(base, expected);
+    }
+
+    #[test]
+    fn target_uri_is_the_absolute_uri_a_conformant_peer_signs() {
+        // The interop case: a partner signs `https://api.example.com/v1/orders`
+        // with any conformant RFC 9421 library. The proxy used to
+        // reconstruct `/v1/orders` and 401 every such request with the
+        // same generic reason a forged signature gets.
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("https://api.example.com/v1/orders?page=2")
+            .body(bytes::Bytes::new())
+            .unwrap();
+        let entry = parse_signature_input(r#"sig1=("@target-uri");keyid="k1""#)
+            .unwrap()
+            .pop()
+            .unwrap()
+            .1;
+        let base = build_signature_base(&req, &entry).unwrap();
+        assert!(
+            base.starts_with("\"@target-uri\": https://api.example.com/v1/orders?page=2\n"),
+            "got: {base}"
+        );
+    }
+
+    #[test]
+    fn target_uri_falls_back_to_the_request_target_with_no_authority() {
+        // HTTP/1.0 with no Host: there is no absolute URI to assemble,
+        // and inventing an authority would sign a name nobody sent.
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("/health")
+            .body(bytes::Bytes::new())
+            .unwrap();
+        let entry = parse_signature_input(r#"sig1=("@target-uri");keyid="k1""#)
+            .unwrap()
+            .pop()
+            .unwrap()
+            .1;
+        assert!(build_signature_base(&req, &entry)
+            .unwrap()
+            .starts_with("\"@target-uri\": /health\n"));
+    }
+
+    #[test]
+    fn request_target_is_the_bare_target_not_cavages_method_prefix() {
+        // RFC 9421 §2.2.5 is the request target alone. The old shape,
+        // `GET /v1/orders`, is draft-cavage's `(request-target)` with an
+        // uppercased method and matches neither spec.
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("/v1/orders?page=2")
+            .header("host", "api.example.com")
+            .body(bytes::Bytes::new())
+            .unwrap();
+        let entry = parse_signature_input(r#"sig1=("@request-target");keyid="k1""#)
+            .unwrap()
+            .pop()
+            .unwrap()
+            .1;
+        let base = build_signature_base(&req, &entry).unwrap();
+        assert!(
+            base.starts_with("\"@request-target\": /v1/orders?page=2\n"),
+            "got: {base}"
+        );
+        assert!(!base.contains("GET /v1/orders"), "got: {base}");
+    }
+
+    /// Sign `req` over `components` with the shared HMAC test key, using
+    /// whichever derivation `dialect` names, and stamp the two headers.
+    fn sign_hmac_with_dialect(
+        req: &mut http::Request<bytes::Bytes>,
+        secret_hex: &str,
+        components: &str,
+        dialect: BaseDialect,
+    ) {
+        let raw_input = format!(
+            r#"sig1=({components});created={};keyid="test-key";alg="hmac-sha256""#,
+            now_unix()
+        );
+        let entry = parse_signature_input(&raw_input).unwrap().pop().unwrap().1;
+        let base = build_signature_base_in(req, &entry, dialect).unwrap();
+        let mut mac = HmacSha256::new_from_slice(&hex::decode(secret_hex).unwrap()).unwrap();
+        mac.update(base.as_bytes());
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+        req.headers_mut()
+            .insert("signature-input", raw_input.parse().unwrap());
+        req.headers_mut()
+            .insert("signature", format!("sig1=:{sig_b64}:").parse().unwrap());
+    }
+
+    #[test]
+    fn a_conformant_target_uri_signature_verifies() {
+        let secret_hex = "00112233445566778899aabbccddeeff";
+        let mut req = http::Request::builder()
+            .method("GET")
+            .uri("/v1/orders")
+            .header("host", "api.example.com")
+            .body(bytes::Bytes::new())
+            .unwrap();
+        sign_hmac_with_dialect(
+            &mut req,
+            secret_hex,
+            r#""@method" "@target-uri""#,
+            BaseDialect::Rfc9421,
+        );
+        assert!(matches!(
+            MessageSignatureVerifier::new(config_hmac(secret_hex))
+                .unwrap()
+                .verify_request(&req),
+            VerifyVerdict::Ok { .. }
+        ));
+    }
+
+    #[test]
+    fn a_legacy_target_uri_signature_still_verifies_during_the_deprecation() {
+        // A signer built against the old origin-form derivation keeps
+        // working: the fallback runs only after the conformant base has
+        // failed, with the same key and the same freshness window.
+        let secret_hex = "00112233445566778899aabbccddeeff";
+        let mut req = http::Request::builder()
+            .method("GET")
+            .uri("/v1/orders")
+            .header("host", "api.example.com")
+            .body(bytes::Bytes::new())
+            .unwrap();
+        sign_hmac_with_dialect(
+            &mut req,
+            secret_hex,
+            r#""@method" "@target-uri""#,
+            BaseDialect::Legacy,
+        );
+        assert!(matches!(
+            MessageSignatureVerifier::new(config_hmac(secret_hex))
+                .unwrap()
+                .verify_request(&req),
+            VerifyVerdict::Ok { .. }
+        ));
+    }
+
+    #[test]
+    fn the_legacy_fallback_does_not_admit_a_forged_signature() {
+        // The fallback must widen the accepted bases and nothing else.
+        // A signature over a base neither dialect produces still fails.
+        let secret_hex = "00112233445566778899aabbccddeeff";
+        let mut req = http::Request::builder()
+            .method("GET")
+            .uri("/v1/orders")
+            .header("host", "api.example.com")
+            .body(bytes::Bytes::new())
+            .unwrap();
+        sign_hmac_with_dialect(
+            &mut req,
+            secret_hex,
+            r#""@method" "@target-uri""#,
+            BaseDialect::Rfc9421,
+        );
+        // Re-point the request: neither derivation of `@target-uri`
+        // matches what was signed.
+        *req.uri_mut() = "/v1/refunds".parse().unwrap();
+        match MessageSignatureVerifier::new(config_hmac(secret_hex))
+            .unwrap()
+            .verify_request(&req)
+        {
+            VerifyVerdict::Failed { reason } => {
+                assert!(reason.contains("cryptographic"), "got: {reason}")
+            }
+            VerifyVerdict::Ok { .. } => panic!("a tampered target must not verify either way"),
+        }
+    }
+
+    #[test]
+    fn a_signature_over_the_other_scheme_verifies_when_the_request_line_has_none() {
+        // An origin-form request line carries no scheme and this layer
+        // cannot see the listener's TLS state, so a partner that signed
+        // `https://api.example.com/v1/orders` must still verify against
+        // a request whose scheme the middleware would guess as `http`.
+        let secret_hex = "00112233445566778899aabbccddeeff";
+        let signed_over_https = http::Request::builder()
+            .method("GET")
+            .uri("https://api.example.com/v1/orders")
+            .body(bytes::Bytes::new())
+            .unwrap();
+        let raw_input = format!(
+            r#"sig1=("@method" "@target-uri");created={};keyid="test-key";alg="hmac-sha256""#,
+            now_unix()
+        );
+        let entry = parse_signature_input(&raw_input).unwrap().pop().unwrap().1;
+        let base = build_signature_base(&signed_over_https, &entry).unwrap();
+        assert!(base.contains("https://api.example.com/v1/orders"));
+        let mut mac = HmacSha256::new_from_slice(&hex::decode(secret_hex).unwrap()).unwrap();
+        mac.update(base.as_bytes());
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+
+        // The live request arrives origin-form with only a Host header,
+        // which is every HTTP/1.1 request a proxy sees.
+        let live = http::Request::builder()
+            .method("GET")
+            .uri("/v1/orders")
+            .header("host", "api.example.com")
+            .header("signature-input", raw_input.as_str())
+            .header("signature", format!("sig1=:{sig_b64}:"))
+            .body(bytes::Bytes::new())
+            .unwrap();
+        assert!(matches!(
+            MessageSignatureVerifier::new(config_hmac(secret_hex))
+                .unwrap()
+                .verify_request(&live),
+            VerifyVerdict::Ok { .. }
+        ));
+    }
+
+    #[test]
+    fn the_other_scheme_attempt_does_not_change_the_authority_or_the_path() {
+        // The scheme is the only thing the alternate attempt moves. A
+        // signature over another host or another path still fails.
+        let secret_hex = "00112233445566778899aabbccddeeff";
+        let signed_elsewhere = http::Request::builder()
+            .method("GET")
+            .uri("https://evil.example/v1/orders")
+            .body(bytes::Bytes::new())
+            .unwrap();
+        let raw_input = format!(
+            r#"sig1=("@method" "@target-uri");created={};keyid="test-key";alg="hmac-sha256""#,
+            now_unix()
+        );
+        let entry = parse_signature_input(&raw_input).unwrap().pop().unwrap().1;
+        let base = build_signature_base(&signed_elsewhere, &entry).unwrap();
+        let mut mac = HmacSha256::new_from_slice(&hex::decode(secret_hex).unwrap()).unwrap();
+        mac.update(base.as_bytes());
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+
+        let live = http::Request::builder()
+            .method("GET")
+            .uri("/v1/orders")
+            .header("host", "api.example.com")
+            .header("signature-input", raw_input.as_str())
+            .header("signature", format!("sig1=:{sig_b64}:"))
+            .body(bytes::Bytes::new())
+            .unwrap();
+        assert!(matches!(
+            MessageSignatureVerifier::new(config_hmac(secret_hex))
+                .unwrap()
+                .verify_request(&live),
+            VerifyVerdict::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn the_legacy_fallback_is_not_tried_for_a_signature_that_covers_neither_component() {
+        // A signature covering only `@path` gets one attempt, because
+        // the derivation of everything it covers is unchanged.
+        let entry = parse_signature_input(r#"sig1=("@method" "@path");keyid="k1""#)
+            .unwrap()
+            .pop()
+            .unwrap()
+            .1;
+        assert!(!covers_retargeted_component(&entry));
+        let entry = parse_signature_input(r#"sig1=("@method" "@target-uri");keyid="k1""#)
+            .unwrap()
+            .pop()
+            .unwrap()
+            .1;
+        assert!(covers_retargeted_component(&entry));
+        let entry = parse_signature_input(r#"sig1=("@request-target");keyid="k1""#)
+            .unwrap()
+            .pop()
+            .unwrap()
+            .1;
+        assert!(covers_retargeted_component(&entry));
+    }
+
+    // --- Freshness: the window is symmetric ---
+
+    #[test]
+    fn a_stale_created_is_refused_even_with_no_expires() {
+        // The Web Bot Auth replay shape: a captured Signature-Input /
+        // Signature pair with no `expires` and no `nonce`, replayed
+        // against the same method and path. `check_freshness` had no
+        // lower bound on `created`, `check_nonce` returns Ok when no
+        // nonce store is wired (no caller in this tree wires one), and
+        // the crypto is over an identical base, so the two headers were
+        // an unexpiring bearer token.
+        let secret_hex = "00112233445566778899aabbccddeeff";
+        let raw_input = format!(
+            r#"sig1=("@method" "@path");created={};keyid="test-key";alg="hmac-sha256""#,
+            now_unix() - 3600
+        );
+        let entry = parse_signature_input(&raw_input).unwrap().pop().unwrap().1;
+        let for_signing = http::Request::builder()
+            .method("GET")
+            .uri("/v1/orders")
+            .body(bytes::Bytes::new())
+            .unwrap();
+        let base = build_signature_base(&for_signing, &entry).unwrap();
+        let mut mac = HmacSha256::new_from_slice(&hex::decode(secret_hex).unwrap()).unwrap();
+        mac.update(base.as_bytes());
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("/v1/orders")
+            .header("signature-input", raw_input.as_str())
+            .header("signature", format!("sig1=:{sig_b64}:"))
+            .body(bytes::Bytes::new())
+            .unwrap();
+
+        // The signature is cryptographically perfect. Only the clock
+        // refuses it.
+        match MessageSignatureVerifier::new(config_hmac(secret_hex))
+            .unwrap()
+            .verify_request(&req)
+        {
+            VerifyVerdict::Failed { reason } => assert!(
+                reason.contains("stale"),
+                "reason must name staleness: {reason}"
+            ),
+            VerifyVerdict::Ok { .. } => {
+                panic!("an hour-old signature must not verify at a 30s skew")
+            }
+        }
+    }
+
+    #[test]
+    fn expires_cannot_extend_the_window_past_the_skew() {
+        // A signer cannot hand itself a longer replay window by writing
+        // a distant `expires`: the window belongs to the verifying
+        // operator's `clock_skew_seconds`.
+        let now = now_unix() as i64;
+        let entry = parse_signature_input(&format!(
+            r#"sig1=("@method");keyid="k1";created={};expires={}"#,
+            now - 3600,
+            now + 3600
+        ))
+        .unwrap()
+        .pop()
+        .unwrap()
+        .1;
+        let reason = check_freshness(&entry, 30).expect("a stale created is refused");
+        assert!(reason.contains("stale"), "got: {reason}");
+    }
+
+    #[test]
+    fn a_created_inside_the_window_passes_freshness() {
+        let entry = parse_signature_input(&format!(
+            r#"sig1=("@method");keyid="k1";created={}"#,
+            now_unix() - 10
+        ))
+        .unwrap()
+        .pop()
+        .unwrap()
+        .1;
+        assert!(check_freshness(&entry, 30).is_none());
     }
 
     #[test]
@@ -1294,7 +1912,14 @@ mod tests {
             .body(body.clone())
             .unwrap();
 
-        let raw_input = r#"sig1=("@method" "@target-uri" "host");created=1700000000;keyid="test-key";alg="hmac-sha256""#;
+        // `created` is live: the freshness window is symmetric now, so a
+        // fixture pinned to 2023 would be refused as stale before any
+        // crypto ran.
+        let raw_input = format!(
+            r#"sig1=("@method" "@target-uri" "host");created={};keyid="test-key";alg="hmac-sha256""#,
+            now_unix()
+        );
+        let raw_input = raw_input.as_str();
         let entry = parse_signature_input(raw_input).unwrap().pop().unwrap().1;
         let base = build_signature_base(&req_for_signing, &entry).unwrap();
 
@@ -1330,8 +1955,11 @@ mod tests {
         let secret_hex = "00112233445566778899aabbccddeeff";
         let cfg = config_hmac(secret_hex);
 
-        let raw_input =
-            r#"sig1=("@method" "host");created=1700000000;keyid="test-key";alg="hmac-sha256""#;
+        let raw_input = format!(
+            r#"sig1=("@method" "host");created={};keyid="test-key";alg="hmac-sha256""#,
+            now_unix()
+        );
+        let raw_input = raw_input.as_str();
         let entry = parse_signature_input(raw_input).unwrap().pop().unwrap().1;
         let req_for_signing = http::Request::builder()
             .method("GET")
@@ -1381,8 +2009,11 @@ mod tests {
             clock_skew_seconds: 30,
         };
 
-        let raw_input =
-            r#"sig1=("@method" "@path" "host");created=1700000000;keyid="test-key";alg="ed25519""#;
+        let raw_input = format!(
+            r#"sig1=("@method" "@path" "host");created={};keyid="test-key";alg="ed25519""#,
+            now_unix()
+        );
+        let raw_input = raw_input.as_str();
         let entry = parse_signature_input(raw_input).unwrap().pop().unwrap().1;
         let req_for_signing = http::Request::builder()
             .method("PUT")
@@ -2077,7 +2708,13 @@ mod tests {
             key_id: "test-key-ecdsa-p256".to_string(),
             key: public_key_hex.to_string(),
             required_components: Vec::new(),
-            clock_skew_seconds: 30,
+            // The vector's `created=1700000000` is inside the base the
+            // published signature was computed over, so it cannot move.
+            // Widen the window instead: this file's freshness behavior
+            // is pinned by its own tests, and pinning it again here
+            // would only cost the known-answer property this fixture
+            // exists for.
+            clock_skew_seconds: 1_000_000_000,
         }
     }
 
@@ -2240,8 +2877,12 @@ mod tests {
     fn hmac_body_covering_headers(secret_hex: &str, digest_over: &[u8]) -> Vec<(String, String)> {
         let content_digest =
             crate::digest::compute_content_digest(crate::digest::Algorithm::Sha256, digest_over);
-        let raw_input = "sig1=(\"@method\" \"@path\" \"content-digest\");created=1700000000;\
-             keyid=\"test-key\";alg=\"hmac-sha256\"";
+        let raw_input = format!(
+            "sig1=(\"@method\" \"@path\" \"content-digest\");created={};\
+             keyid=\"test-key\";alg=\"hmac-sha256\"",
+            now_unix()
+        );
+        let raw_input = raw_input.as_str();
         let entry = parse_signature_input(raw_input).unwrap().pop().unwrap().1;
         let for_signing = http::Request::builder()
             .method("POST")
@@ -2345,8 +2986,11 @@ mod tests {
         // that nothing has to buffer a body to check a header signature.
         let secret_hex = "00112233445566778899aabbccddeeff";
         let cfg = config_hmac(secret_hex);
-        let raw_input =
-            r#"sig1=("@method" "@path");created=1700000000;keyid="test-key";alg="hmac-sha256""#;
+        let raw_input = format!(
+            r#"sig1=("@method" "@path");created={};keyid="test-key";alg="hmac-sha256""#,
+            now_unix()
+        );
+        let raw_input = raw_input.as_str();
         let entry = parse_signature_input(raw_input).unwrap().pop().unwrap().1;
         let for_signing = http::Request::builder()
             .method("POST")

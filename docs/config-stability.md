@@ -386,6 +386,127 @@ OpenAPI tool calls, never its token endpoint.
 **What to do before upgrading.** Add every MCP token endpoint host to
 `egress.token_exchange.hosts` alongside the non-MCP ones already there.
 
+### `compression.algorithms` now selects in the order you wrote
+
+**Who this reaches.** Any origin with a `compression.algorithms` list of
+more than one codec, where a client accepts more than one of them. An
+origin with an empty list, or one codec, or one whose clients accept only
+one, sees no change.
+
+**What changes.** The list was documented as a priority order on three
+surfaces and read as a membership set by the negotiator, which then
+walked its own hardcoded `zstd` > `br` > `gzip` ladder. It is a priority
+order now: the list is walked as authored and the first entry the client
+accepts is the one served. `algorithms: [gzip, br]` sent Brotli to a
+browser that accepts both and sends gzip after the upgrade.
+
+**What an operator sees when it bites.** The `Content-Encoding` on
+responses changes to the codec listed first, and
+`sbproxy_compression_decisions_total` moves between codecs. Nothing
+fails.
+
+**What to do before upgrading.** Read your `algorithms` lists as the
+preference they now are. If a list was written to mean "these three are
+allowed, pick the best", reorder it to `[zstd, br, gzip]` or empty it,
+which selects the same way it always did.
+
+Two smaller refusals ride along, both load-time. An entry naming no codec
+(`algorithms: [deflate]`) fails config compile instead of silently
+disabling compression for the origin, and a client `Accept-Encoding`
+qvalue of zero is honored as the refusal RFC 9110 §12.5.3 says it is, so
+a client sending `identity;q=1, *;q=0` gets an uncompressed response
+where it used to get zstd it could not decode.
+
+### `cors.allowed_origins: ["*"]` with `allow_credentials: true` fails config load
+
+**Who this reaches.** Any origin whose `cors:` block sets both. Nothing
+else.
+
+**What changes.** Browsers reject that pair per the Fetch standard, and
+the CORS middleware has always refused to emit any header for it. The
+refusal was a runtime no-op plus one `warn` line per request, so
+`sbproxy validate` exited 0 on a config that served a broken browser app
+forever. It fails config compile now, and the runtime guard that remains
+logs once per process and counts every occurrence on
+`sbproxy_cors_refusals_total{reason="wildcard_with_credentials"}`.
+
+**What an operator sees when it bites.** The proxy refuses to start (or
+refuses the reload) naming the origin and both keys.
+
+**What to do before upgrading.** Run `sbproxy validate` against your
+config. If it names this pair, list the origins you actually mean in
+`allowed_origins`, or drop `allow_credentials`.
+
+### A plain `OPTIONS` request now reaches the upstream
+
+**Who this reaches.** Any origin with a `cors:` block whose upstream
+implements `OPTIONS` itself: a discovery endpoint answering with
+`Allow:`, a capability document, anything WebDAV.
+
+**What changes.** The proxy treated every `OPTIONS` carrying an `Origin`
+header as a CORS preflight, answered 204 from the edge, and never
+contacted the upstream. `Origin` rides on every cross-origin request of
+every method, so adding a `cors:` block silently deleted that endpoint. A
+preflight is now what the Fetch standard defines it as: an `OPTIONS`
+request carrying `Access-Control-Request-Method`. Everything else is a
+normal request and is proxied.
+
+**What an operator sees when it bites.** `OPTIONS` requests that used to
+return an empty 204 now return whatever the upstream returns. A browser
+preflight is unaffected, because a browser always sends
+`Access-Control-Request-Method`.
+
+**What to do before upgrading.** Nothing, unless something depended on
+the proxy answering a non-preflight `OPTIONS` without the upstream.
+
+### RFC 9421 signature verification refuses a stale `created`
+
+**Who this reaches.** Any origin with `authentication: {type: bot_auth}`
+or a `message_signatures:` verifier. `hmac_auth` already enforced this
+by hand and is unchanged in behavior.
+
+**What changes.** The freshness check refused a `created` in the future
+and an `expires` in the past, and had no lower bound on `created` at all.
+A captured `Signature-Input` / `Signature` pair with no `expires` and no
+`nonce` therefore verified forever: an unexpiring bearer token for
+whatever identity it carried. The window is symmetric now, which is what
+`clock_skew_seconds` has always been documented as: `created` may be at
+most `clock_skew_seconds` old and at most `clock_skew_seconds` in the
+future. `expires` can only shorten that window, never extend it.
+
+**What an operator sees when it bites.** A signer whose clock is behind,
+or whose signatures are minted well before they are sent, gets a 401
+whose reason names the stale timestamp.
+
+**What to do before upgrading.** If your signers legitimately mint a
+signature more than 30 seconds before sending it, raise
+`clock_skew_seconds` on that origin to cover the real gap.
+
+### `@target-uri` is the absolute URI RFC 9421 defines
+
+**Who this reaches.** Any signer or verifier whose covered component set
+includes `@target-uri` or `@request-target`. The shipped Web Bot Auth
+wiring covers `@authority`, `@method`, and `@path`, so a config that took
+those defaults is unaffected.
+
+**What changes.** `@target-uri` emitted the origin-form request target
+(`/v1/orders`) where RFC 9421 §2.2.2 defines it as the full absolute URI
+(`https://api.example.com/v1/orders`), so no conformant peer could
+interoperate in either direction. `@request-target` emitted
+`GET /v1/orders`, which is draft-cavage's shape, where RFC 9421 §2.2.5 is
+the request target alone. Both are correct now. For a deprecation
+window, inbound verification retries the old derivation when the
+conformant base fails and the covered set names one of the two, so a
+signer built against the old shape keeps verifying and the proxy logs the
+deprecation once per process.
+
+**What an operator sees when it bites.** Nothing immediately: both bases
+verify. The old one stops being accepted in a future release.
+
+**What to do before upgrading.** Move signers onto a conformant RFC 9421
+library. Outbound signatures the proxy produces are already on the new
+derivation.
+
 ---
 
 ## Selected field stability reference
@@ -478,7 +599,7 @@ them turns an `sbproxy plan` reload into a restart.
 | `allowed_headers` | `allow_headers` | array | `[]` | **stable** |
 | `expose_headers` | - | array | `[]` | **stable** |
 | `max_age` | - | integer | - | **stable** |
-| `allow_credentials` | - | boolean | false | **stable** |
+| `allow_credentials` | - | boolean | false | **stable**, **refused** with `allowed_origins: ["*"]` |
 | `enable` | `enabled` | boolean | - | **refused** at `false` |
 
 CORS is on for an origin exactly when that origin has a `cors:` block.
@@ -500,9 +621,13 @@ checked together. Delete the block to turn CORS off.
 | Field | Alias | Type | Default | Stability |
 |---|---|---|---|---|
 | `enabled` | `enable` | boolean | true | **stable** |
-| `algorithms` | - | array | `[]` | **stable** |
+| `algorithms` | - | array | `[]` | **stable**, entries **refused** outside `zstd`/`br`/`gzip` |
 | `min_size` | - | integer | 0 | **stable** |
 | `level` | - | integer | - | **beta** |
+
+`algorithms` is a priority order. The list is walked as authored and the
+first entry the client's `Accept-Encoding` accepts is served; an empty
+list takes the built-in `zstd` > `br` > `gzip` order.
 
 `level` is applied to whichever encoder the client negotiates, clamped
 into that algorithm's native range (gzip 0-9, brotli 0-11, zstd 1-22).

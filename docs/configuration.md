@@ -2673,7 +2673,7 @@ origins:
 | `type` | string | required | Must be `hmac_auth`. |
 | `keys` | list | required | Accepted signing keys, at least one. Each entry needs a unique `key_id` (the RFC 9421 `keyid` the signer advertises) and a `secret`. Entries also accept the per-credential metadata fields (`project`, `user`, `team`, `tags`, `metadata`). |
 | `clock_skew_seconds` | int | 300 | Freshness window for the mandatory `created` signature parameter, applied in both directions. A `created` older than the window is refused as a replay; one further in the future is refused as skewed. |
-| `required_components` | list | `["@method", "@target-uri"]` | Components every accepted signature must cover. The default binds the verb and the path-and-query, so a captured signature cannot be replayed against a different route. Add `content-digest` to bind the request body as well. |
+| `required_components` | list | `["@method", "@target-uri"]` | Components every accepted signature must cover. The default binds the verb and the full target URI, so a captured signature cannot be replayed against a different route. Add `content-digest` to bind the request body as well. |
 
 The `secret` resolves through the secret resolver like every other signing-key field: an inline literal, `${VAR}`, `env:NAME`, `file:PATH`, or a backend URI such as `vault://...`. A reference nothing can resolve refuses to boot rather than becoming the key. Verification failures answer `401` with a `WWW-Authenticate: Signature` challenge that carries no key material, and the failure reason is logged, never returned to the client.
 
@@ -2685,6 +2685,17 @@ Signature: sig1=:BASE64_HMAC_SHA256_OF_SIGNATURE_BASE:
 ```
 
 On a match the principal's `sub` is the `key_id`, `principal_kind` is `hmac_auth`, and the entry's metadata rides along for per-credential reporting.
+
+`@target-uri` is the absolute URI RFC 9421 §2.2.2 defines, scheme and
+authority included: `https://api.example.com/v1/orders?page=2`, not
+`/v1/orders?page=2`. Sign it the way any conformant RFC 9421 library
+does and the proxy reconstructs the same string. Earlier releases
+derived the path and query alone; a signature in that older shape is
+still accepted for a deprecation window, and the proxy logs once per
+process when one arrives. `@request-target`, for the same reason, is
+the bare request target (`/v1/orders?page=2`) rather than
+draft-cavage's `GET /v1/orders?page=2`.
+
 
 The default components bind the verb and the route, not the body. A signature over `("@method" "@target-uri")` alone says nothing about the bytes that follow it, so a request captured off the wire can be replayed with a different body until its `created` timestamp falls outside `clock_skew_seconds`. Covering `content-digest` is what closes that:
 

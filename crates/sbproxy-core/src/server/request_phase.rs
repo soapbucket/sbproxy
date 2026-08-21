@@ -1991,7 +1991,12 @@ pub(super) async fn request_filter(
                     } else {
                         bytes::Bytes::new()
                     };
-                    let Some(req) = build_signature_verification_request(session, signed_body)
+                    // The listener's TLS state is the only place the
+                    // real scheme exists for an HTTP/1.1 request line,
+                    // and RFC 9421's `@target-uri` needs it.
+                    let scheme = if ctx.tls_terminated { "https" } else { "http" };
+                    let Some(req) =
+                        build_signature_verification_request(session, signed_body, scheme)
                     else {
                         warn!(
                             hostname = %ctx.hostname,

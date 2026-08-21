@@ -1,6 +1,6 @@
 # AI crawlers are reading your site for free
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 ![An unsigned crawler gets 401, a signed crawler gets a 402 price challenge, a payment token redeems once for a 200, and the replay is charged again](assets/use-case-meter-crawlers.gif)
 
@@ -126,7 +126,7 @@ content-type: application/json
 {"error":"bot_auth: signature required"}
 ```
 
-Now sign as GPTBot. Write the demo private key (a keypair RFC 8032 publishes as a test vector; its public half is already in the config) and let the bundled helper produce the two signature headers. Sign the components exactly as the proxy derives them: the path for `@target-uri` and the `Host` value for `@authority`:
+Now sign as GPTBot. Write the demo private key (a keypair RFC 8032 publishes as a test vector; its public half is already in the config) and let the bundled helper produce the two signature headers. The helper signs `@target-uri` as the path alone, which is the shape earlier releases derived; the proxy still accepts it for a deprecation window and logs once per process when it does. A production signer should use a conformant RFC 9421 library, which signs the absolute URI (`http://blog.local/anything/article` here). `@authority` is the `Host` value in both shapes:
 
 ```bash
 printf -- '-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIJ1hsZ3v/VpguoRK9JLsLMREScVpezJpGXA7rAMcrn9g\n-----END PRIVATE KEY-----\n' \
