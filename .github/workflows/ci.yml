@@ -8,6 +8,8 @@ name: CI
 #   test           (~9 min) one workspace build -> nextest -> doctests ->
 #                           generated-artifact freshness checks
 #   lint           (~4 min) fmt, clippy, rustdoc
+#   guards         (~30 s)  no-compiler guards that must run on docs-only
+#                           PRs too; the one lane with no path filter
 #   obs-budgets    (~5 min) e2e cardinality + redaction, observability paths only
 #                           (three test targets; see the job for why)
 #   e2e-subset     (~6 min) five offline e2e files against a spawned proxy,
@@ -305,6 +307,21 @@ jobs:
       - name: no new pub items whose only consumer is a test (WOR-2065)
         run: bash scripts/check-pub-item-ratchet.sh
 
+      # The pub-item ratchet's twin, and until now the only one of the
+      # pair that ran here. `scripts/check.sh` ran both, so the local gate
+      # was the only place an added `.unwrap()` was refused, and a branch
+      # that never ran it merged green: #1185 landed with main at 784
+      # against a committed baseline of 782, and every branch that merged
+      # main afterwards inherited the red for about two hours. A ratchet
+      # nothing enforces at the merge is a number in a file.
+      #
+      # In this job rather than a lane of its own because it is pure
+      # python over the source tree, it shares the ratchet vocabulary with
+      # the step above, and a reviewer reading either failure wants the
+      # other's count in the same log.
+      - name: no new unwrap/expect/panic in production code (WOR-2252)
+        run: bash scripts/check-unwrap-ratchet.sh
+
       - name: install.sh verifies its download (WOR-1914)
         run: sh scripts/tests/install_verify.sh
 
@@ -332,10 +349,18 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # The cert-record and NOTICE-coverage fixtures ran only in
+      # scripts/check.sh until now. notice_coverage.py is the parser
+      # behind the check-notice step below, so a regression there made
+      # that step pass vacuously with nothing in CI able to say so.
       - name: gate helper self-tests
         run: |
           bash scripts/tests/workspace_bin_test.sh
           bash scripts/tests/runner_disk_test.sh
+          python3 scripts/lib/cert_record.py --self-test
+          python3 scripts/tests/test_cert_record.py
+          python3 scripts/lib/notice_coverage.py --self-test
+          python3 scripts/tests/test_notice_coverage.py
 
       # clippy-driver and rustdoc write artifacts the `test` lane cannot link
       # against, so this job keeps its own cache entry rather than fighting
@@ -400,6 +425,18 @@ jobs:
       - name: NOTICE covers Apache-2.0-only crates (WOR-2449)
         run: bash scripts/check-notice.sh
 
+      # WOR-2287: refuses a hand-rolled env:/file:/provider-URI scheme
+      # match outside crates/sbproxy-vault/src/, and a secret-shaped
+      # function whose fallback hands a parameter back unchanged without
+      # first calling a reference-shape guard, which is the bug class
+      # WOR-2283 fixed. Written as a guardrail against that convergence
+      # coming undone and then wired only into scripts/check.sh, so it has
+      # never been able to refuse anything at a merge. Pure python over
+      # the source tree; no cargo, so it belongs in this lane rather than
+      # behind a build.
+      - name: no hand-rolled secret-reference parsing (WOR-2287)
+        run: python3 scripts/check-secret-resolver-drift.py
+
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -407,6 +444,135 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings -D missing_docs
         run: cargo doc --workspace --no-deps --locked
+
+  # Guards that need no compiler and must run on every pull request,
+  # including a docs-only one.
+  #
+  # Why a lane of its own. Every other lane in this file is gated on
+  # `changes.outputs.code`, which excludes `**.md`, `docs/**` and
+  # `examples/**`, so a pull request that only touches those runs none of
+  # them. The checks below all police exactly those paths, so putting any
+  # of them in `lint` or `test` would mean they never run on the pull
+  # requests they exist for.
+  #
+  # Why not docs-ci.yml or doc-drift.yml, which do run on those paths:
+  # neither is in the `main-protection` ruleset, which requires the single
+  # context `build / test`. A check reporting outside that aggregate is a
+  # red X somebody can merge past. This lane is in the aggregate's
+  # `needs:` list, so it is not.
+  #
+  # Everything here is grep, python, or git plumbing. The lane finishes in
+  # well under a minute and never restores a cargo cache, which is also
+  # why it can afford to be unconditional.
+  guards:
+    name: guards
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The changelog guard diffs this branch against the pull
+          # request's base commit. A depth-1 checkout does not have it,
+          # and the guard fails closed rather than skipping, so the
+          # history has to be here.
+          fetch-depth: 0
+
+      # Fixtures for the guard's own parser and for its git half. The
+      # parser decides whether a fragment is well formed and the git half
+      # decides whether this branch edited CHANGELOG.md; both read green
+      # when they have quietly stopped refusing things, which is the one
+      # failure mode a gate cannot self-report.
+      - name: changelog guard fixtures
+        run: |
+          python3 scripts/changelog-fragments.py --self-test
+          bash scripts/tests/changelog_fragments_test.sh
+
+      # WOR-2108. One file per change under docs/.changes/, assembled at
+      # release. Refuses a malformed fragment, hand-written content under
+      # `## [Unreleased]`, and a commit that edits CHANGELOG.md without
+      # touching docs/.changes/ in the same diff.
+      - name: changelog entries are fragments, not CHANGELOG.md edits
+        env:
+          # The guard takes the merge base of this ref and HEAD itself
+          # (the full-depth checkout above gives it the history), so a
+          # base.sha gone stale behind a direct push to main cannot
+          # attribute main's commits to this branch. On a push there is
+          # no pull request, so the base is this commit and the diff is
+          # empty, which is right: the pull request that produced it was
+          # already gated.
+          CHANGELOG_BASE_REF: ${{ github.event.pull_request.base.sha || github.sha }}
+        run: python3 scripts/changelog-fragments.py --check
+
+      # A merge that commits its own conflict markers ships corrupted
+      # files. One reached main's CHANGELOG on 2026-08-19 through a gate
+      # that never looked, because this scan existed only in
+      # scripts/check.sh. The pattern is anchored and paired so a file
+      # discussing markers does not self-trip.
+      - name: no committed merge-conflict markers
+        run: |
+          if git grep -nE '^(<{7} |={7}$|>{7} )' -- ':!*.lock' ':!docs/llms-full.txt'; then
+            echo "::error::committed merge-conflict markers found; resolve the merge for real"
+            exit 1
+          fi
+          echo "no conflict markers in tracked files"
+
+      # examples/README.md is generated by gen-examples-catalog.py, which
+      # has supported --check since it was written and which nothing ever
+      # called: not CI, not the Makefile, and until recently not the local
+      # gate either. It had silently drifted by two rows on main. A
+      # generated file whose drift checker nobody invokes is the same
+      # thing as having no checker.
+      - name: examples catalog is current
+        run: python3 scripts/gen-examples-catalog.py --check
+
+      # The structural half of the capture harness: every CAPTURE marker
+      # is followed by a block, and no block is empty. Cheap, and it has
+      # caught real defects rather than formatting slips, since all five
+      # empty blocks in the WOR-2158 batch were product bugs.
+      #
+      # Replaying the commands needs a built proxy and live fixtures, so
+      # that half stays in release-checks.yml and in the local gate under
+      # SBPROXY_CHECK_CAPTURES=1. --stackless-only is explicit here so the
+      # lane cannot read as full coverage: the script prints how many
+      # captures it did not verify.
+      - name: every capture marker has a non-empty block
+        run: python3 scripts/check-doc-captures.py --check --stackless-only
+
+      # The next four ran only in docs-ci.yml or doc-drift.yml until
+      # now, and neither of those is in the `main-protection` ruleset,
+      # so every one of them was a red X somebody could merge past.
+      # Each is seconds of python or grep over the tree.
+      - name: spec citation hygiene (WOR-528)
+        run: bash scripts/check-spec-citations.sh
+
+      # Provider counts, routing-strategy counts, and known-stale claims
+      # in user-facing docs. The strings it bans have each shipped stale
+      # at least once.
+      - name: doc drift (counts and stale claims)
+        run: bash scripts/check-doc-drift.sh
+
+      # Strict `sbproxy-config:` blocks in docs must match the canonical
+      # example they cite. Whether those examples still compile is the
+      # test lane's job; this is only the byte comparison.
+      - name: documentation configs match canonical examples
+        run: python3 scripts/sync-doc-configs.py --check
+
+      # Tapes in sync with their example configs, GIF embeds pointing at
+      # files that exist, and the doc-generator unit tests. Three python
+      # commands behind one make target so the Makefile stays the one
+      # definition of what the check is.
+      - name: generated tapes and GIF wiring are current
+        run: make tapes-check
+
+      # The review-evidence workflow parses attacker-controlled PR
+      # bodies, and a loosened parser reads green in exactly the place
+      # it is supposed to be strict. review-evidence.yml runs these same
+      # fixtures, but that workflow is not required either; here a
+      # parser regression cannot merge.
+      - name: review-evidence parser fixtures
+        run: python3 scripts/check-review-evidence.py --self-test
 
   obs-budgets:
     name: observability budgets
@@ -865,7 +1031,7 @@ jobs:
   required:
     name: build / test
     if: always()
-    needs: [changes, test, lint, obs-budgets, e2e-subset, payments, payments-clippy, ui, supply-chain, embed-admin-ui]
+    needs: [changes, test, lint, guards, obs-budgets, e2e-subset, payments, payments-clippy, ui, supply-chain, embed-admin-ui]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

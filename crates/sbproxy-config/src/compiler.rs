@@ -1915,7 +1915,23 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         })
         .collect();
 
-    for (hostname, raw_config) in config_file.origins {
+    // Sorted by config key before anything is assigned a position.
+    //
+    // `RawConfigFile::origins` is a `HashMap`, so iterating it directly
+    // hands out `idx` values in whatever order that map's per-process
+    // seed produced. Those indices are not private bookkeeping: they
+    // are what `host_map` stores, they set the order of the `origins`
+    // vector every later stage indexes into, and they reach the hashed
+    // view behind `config_revision`. WOR-2602: three boots of one
+    // unchanged two-origin file reported two different revisions,
+    // alternating, because of exactly this. Sorting here makes every
+    // index a function of the config's content rather than of the
+    // process that read it.
+    let mut ordered_origins: Vec<(String, RawOriginConfig)> =
+        config_file.origins.into_iter().collect();
+    ordered_origins.sort_by(|left, right| left.0.cmp(&right.0));
+
+    for (hostname, raw_config) in ordered_origins {
         // Wildcard keys (`*.example.com`) are validated here and stored
         // under their literal spelling; `CompiledConfig::resolve_origin`
         // and the core `HostRouter` give them suffix-match semantics.
@@ -11521,6 +11537,87 @@ origins:
             .expect("compile from local kind");
         assert!(cfg.host_map.contains_key("app.example.com"));
     }
+
+    // --- WOR-2602: origin indices are content, not load order ---
+
+    /// Repeated compiles of one file assign the same origin indices.
+    ///
+    /// `RawConfigFile::origins` is a `HashMap`, and the compile loop
+    /// used to walk it directly, so `idx` fell out of that map's
+    /// per-process seed. Those indices are not internal bookkeeping:
+    /// `host_map` stores them, `CompiledConfig::origins` is ordered by
+    /// them, and the `config_revision` hash consumed them, which is how
+    /// one unchanged two-origin file came to report two revisions
+    /// across three boots.
+    ///
+    /// Four origins for 24 possible index assignments rather than two,
+    /// and 128 compiles because `RandomState` reseeds per map instance
+    /// inside a thread, so these are 128 independent draws and not one
+    /// draw read 128 times. Both counts match the sibling assertion in
+    /// `sbproxy-core`'s `one_unchanged_multi_origin_config_hashes_to_one_revision`,
+    /// which covers the same defect one layer up.
+    #[test]
+    fn repeated_compiles_assign_the_same_origin_indices() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  alpha.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3001
+  bravo.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3002
+  charlie.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3003
+  delta.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3004
+"#;
+
+        let mut assignments: std::collections::BTreeSet<Vec<(String, usize)>> =
+            std::collections::BTreeSet::new();
+        for _ in 0..128 {
+            let cfg = compile_config(yaml).expect("multi-origin fixture compiles");
+            let mut pairs: Vec<(String, usize)> = cfg
+                .host_map
+                .iter()
+                .map(|(host, idx)| (host.to_string(), *idx))
+                .collect();
+            pairs.sort();
+            assignments.insert(pairs);
+        }
+
+        assert_eq!(
+            assignments.len(),
+            1,
+            "one unchanged config must assign one set of origin indices, saw {assignments:?}"
+        );
+        // Which assignment, not just how many. Sorted by config key, so
+        // the index a hostname gets is readable off the file. Stability
+        // alone would also be satisfied by sorting descending, or by
+        // any other total order someone later found tidier, and the
+        // order is what `CompiledConfig::origins` is in and what the
+        // emitted OpenAPI `servers` array is ordered by.
+        assert_eq!(
+            assignments.iter().next().map(Vec::as_slice),
+            Some(
+                [
+                    ("alpha.example.com".to_string(), 0),
+                    ("bravo.example.com".to_string(), 1),
+                    ("charlie.example.com".to_string(), 2),
+                    ("delta.example.com".to_string(), 3),
+                ]
+                .as_slice()
+            )
+        );
+    }
+
     // --- WOR-2342: response_cache method allowlist ---
 
     fn response_cache_yaml(methods: &str) -> String {

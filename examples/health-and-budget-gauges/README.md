@@ -15,6 +15,17 @@ make run CONFIG=examples/health-and-budget-gauges/sb.yml
 
 The fixture serves the load balancer's healthy target on `127.0.0.1:19601` and the OpenAI stub on `127.0.0.1:19603`. Nothing serves `127.0.0.1:19602`; refused connections are the scenario.
 
+This page is deliberately left out of `scripts/check-doc-captures.py`,
+which replays a documented command and diffs its output. The walkthrough
+below scrapes inside the window before the dead target's third
+consecutive probe failure and again after it, because watching the gauge
+cross from 0 to 2 is the whole point. No replay can hold that
+roughly four-second window open on a loaded machine, so a marker here
+would buy a flaky lane rather than an honest one, and a lane people
+rerun until it passes stops being read at all. The exemption and this
+reason are also recorded in `EXEMPT_DOCS` in that script. Re-capture
+these blocks by hand when the gauges change.
+
 ## Watch a target get excluded
 
 Scrape right after startup, before the dead target's third consecutive probe failure, and both targets read healthy:

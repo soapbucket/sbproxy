@@ -26,6 +26,7 @@ ten-minute build.
 | Doc configs | `python3 scripts/sync-doc-configs.py --check` |
 | Documented output | `python3 scripts/check-doc-captures.py --check --stackless-only` |
 | Review-evidence parser | `python3 scripts/check-review-evidence.py --self-test` |
+| Changelog fragments | `python3 scripts/changelog-fragments.py --check` |
 | Installer | `sh scripts/tests/install_verify.sh` |
 | Format | `cargo fmt --all -- --check` |
 | Nested lockfiles | `bash scripts/check-nested-lockfiles.sh` |
@@ -71,6 +72,29 @@ run without it prints the skip in the `SKIPPED PHASES` block.
 Fix the issue before pushing. Do not paper over with `#[allow(...)]`
 unless you also write a one-line comment explaining the deliberate
 exception.
+
+### Changelog entries are fragments, not CHANGELOG.md edits
+
+`CHANGELOG.md` has one `## [Unreleased]` heading, so every branch that
+appended to it edited the same few lines and every branch open at the
+same time conflicted there. Five pull requests needed a hand-resolution
+on that one file on 2026-08-20. Write a fragment instead:
+
+```bash
+python3 scripts/changelog-fragments.py --new fixed 'what changed, in one Markdown bullet'
+```
+
+That writes one JSON file under `docs/.changes/`; two branches produce
+two files rather than one conflict. `--preview` renders the pending
+section and `--release <version>` assembles it into `CHANGELOG.md` and
+deletes the fragments it consumed. `docs/.changes/README.md` carries the
+schema, the type list, and when a fragment is required.
+
+`--check` is the gate, in `ci.yml`'s `guards` lane and in
+`scripts/check.sh`. It refuses a malformed fragment, hand-written
+content under `## [Unreleased]`, and a commit that edits `CHANGELOG.md`
+without touching `docs/.changes/` in the same diff. A release cut needs
+no flag: assembling deletes fragments, so it touches both.
 
 ### The gate validates the working tree; `git push` ships HEAD
 
