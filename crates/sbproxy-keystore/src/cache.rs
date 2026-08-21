@@ -280,6 +280,34 @@ impl TtlCache {
         }
     }
 
+    /// Drop a single id from L1 only, touching neither the shared tier nor
+    /// any broadcast channel behind it.
+    ///
+    /// This is the *receiving* half of cross-replica invalidation, and it
+    /// exists because the two halves are not the same operation.
+    /// [`Self::invalidate`] is what the replica that made the mutation
+    /// calls: it drops the local copy, deletes the shared tier's copy, and
+    /// announces the id to every peer. A replica that is merely reacting to
+    /// that announcement must do only the first of those three. If it
+    /// announced in turn, every peer would answer the announcement with
+    /// another announcement and the channel would sustain itself forever.
+    pub fn invalidate_local(&self, id: &str) {
+        self.keys.lock().remove(id);
+        self.creds.lock().remove(id);
+    }
+
+    /// Drop everything from L1 only, touching neither the shared tier nor
+    /// any broadcast channel behind it.
+    ///
+    /// Two callers, both of them reactive: the invalidation subscriber's
+    /// resync on every (re)subscription, and a received "drop everything"
+    /// sentinel. See [`Self::invalidate_local`] for why a reaction must not
+    /// re-broadcast.
+    pub fn invalidate_all_local(&self) {
+        self.keys.lock().clear();
+        self.creds.lock().clear();
+    }
+
     /// L1 lookup. Returns `Some(value)` (possibly a negatively cached `None`)
     /// when a fresh entry exists, or `None` when there is no fresh entry.
     fn peek_key(&self, key_id: &str, now: Instant) -> Option<Option<KeyRecord>> {
@@ -578,6 +606,96 @@ mod tests {
         async fn invalidate_all(&self) {}
     }
 
+    /// A tier that counts the calls that would have reached a shared,
+    /// broadcasting backend. Nothing else about it matters.
+    #[derive(Default)]
+    struct CountingTier {
+        invalidations: AtomicU64,
+        full_invalidations: AtomicU64,
+    }
+
+    #[async_trait]
+    impl CacheTier for CountingTier {
+        async fn get_key(&self, _: &str) -> Option<KeyRecord> {
+            None
+        }
+        async fn put_key(&self, _: &KeyRecord, _: Duration) {}
+        async fn get_credential(&self, _: &str) -> Option<CredentialRecord> {
+            None
+        }
+        async fn put_credential(&self, _: &CredentialRecord, _: Duration) {}
+        async fn invalidate(&self, _: &str) {
+            self.invalidations.fetch_add(1, Ordering::SeqCst);
+        }
+        async fn invalidate_all(&self) {
+            self.full_invalidations.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A reaction to a peer's invalidation must not become another
+    /// invalidation.
+    ///
+    /// The Redis tier's `invalidate` and `invalidate_all` both publish on
+    /// the channel the subscriber is listening to. A subscriber that
+    /// answered a received message by calling back into the tier would
+    /// publish the message it just received, every peer would do the same
+    /// with that one, and the channel would never go quiet: an endless
+    /// storm at every boot and every reconnect. The local-only forms are
+    /// what a receiver calls, and this pins that they reach nothing shared.
+    #[tokio::test]
+    async fn a_local_only_invalidation_clears_l1_and_never_touches_the_tier() {
+        let store = Arc::new(MemoryKeyStore::new());
+        store
+            .put_key(KeyRecord::new("k1", "h1", ts()))
+            .await
+            .unwrap();
+        store
+            .put_key(KeyRecord::new("k2", "h2", ts()))
+            .await
+            .unwrap();
+        let tier = Arc::new(CountingTier::default());
+        let cache = TtlCache::new(store.clone(), TtlCacheConfig::default())
+            .with_tier(tier.clone() as Arc<dyn CacheTier>);
+        assert!(cache.resolve_key("k1").await.unwrap().is_some());
+        assert!(cache.resolve_key("k2").await.unwrap().is_some());
+        store.delete_key("k1").await.unwrap();
+        store.delete_key("k2").await.unwrap();
+
+        cache.invalidate_local("k1");
+        assert!(
+            cache.resolve_key("k1").await.unwrap().is_none(),
+            "a local invalidation still drops the L1 entry"
+        );
+        assert!(
+            cache.resolve_key("k2").await.unwrap().is_some(),
+            "and drops only the one named"
+        );
+
+        cache.invalidate_all_local();
+        assert!(
+            cache.resolve_key("k2").await.unwrap().is_none(),
+            "a local full invalidation still clears L1"
+        );
+
+        assert_eq!(
+            tier.invalidations.load(Ordering::SeqCst),
+            0,
+            "a received invalidation must not be republished"
+        );
+        assert_eq!(
+            tier.full_invalidations.load(Ordering::SeqCst),
+            0,
+            "a received drop-everything must not be republished"
+        );
+
+        // The originating forms still do reach the tier: local-only is the
+        // receiver's operation, not a replacement for the mutator's.
+        cache.invalidate("k1").await;
+        cache.invalidate_all().await;
+        assert_eq!(tier.invalidations.load(Ordering::SeqCst), 1);
+        assert_eq!(tier.full_invalidations.load(Ordering::SeqCst), 1);
+    }
+
     fn credential(id: &str, material: serde_json::Value) -> CredentialRecord {
         serde_json::from_value(serde_json::json!({
             "id": id,
@@ -593,7 +711,7 @@ mod tests {
     ///
     /// The tier is a shared surface: the mesh tier replicates into a node-wide
     /// distributed cache and the Redis tier writes to an external server. A
-    /// `CredentialMaterial::Plaintext` record serialised into either puts the
+    /// `CredentialMaterial::Plaintext` record serialized into either puts the
     /// raw secret somewhere the keystore never agreed to put it.
     #[tokio::test]
     async fn plaintext_credentials_are_never_published_to_the_second_tier() {
@@ -641,7 +759,7 @@ mod tests {
             "only the non-plaintext credential may be published to the tier"
         );
 
-        // And nothing resembling the secret was serialised into the tier.
+        // And nothing resembling the secret was serialized into the tier.
         let published = tier.published.lock();
         let encoded = serde_json::to_string(&*published).expect("encode published records");
         assert!(

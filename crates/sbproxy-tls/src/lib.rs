@@ -5,6 +5,7 @@
 
 pub mod acme;
 pub mod alt_svc;
+pub mod cert_bundle;
 pub mod cert_object_store;
 pub mod cert_resolver;
 pub mod cert_store;
@@ -24,7 +25,7 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use acme::AcmeClient;
-use cert_resolver::{load_certified_key, CertResolver};
+use cert_resolver::CertResolver;
 use cert_store::{CertMeta, CertStore};
 use challenges::Http01ChallengeStore;
 use ocsp::OcspStapler;
@@ -66,6 +67,8 @@ pub struct TlsState {
     acme_config: Option<sbproxy_config::AcmeConfig>,
     /// Persistent certificate storage backend.
     cert_store: Arc<CertStore>,
+    /// The single install path for shared certificate bundles (WOR-2634).
+    installer: Arc<BundleInstaller>,
     /// Hostnames this proxy is responsible for.
     hostnames: Vec<String>,
     /// OCSP stapler for the manual fallback cert. `None` when no
@@ -286,23 +289,285 @@ fn open_cert_backend(acme: Option<&sbproxy_config::AcmeConfig>) -> Result<Arc<dy
     Ok(store)
 }
 
-/// RAII release of the ACME per-host issuance lock (WOR-1774). Dropping
-/// the guard releases the lease, so every exit from the issuance block (an
-/// early `continue` on error, or normal completion) unlocks - a peer in a
-/// fleet is never left waiting on a lock this node abandoned.
-struct IssueLockGuard<'a> {
-    store: &'a CertStore,
-    hostname: &'a str,
-    token: Vec<u8>,
+// --- Fleet issuance lease timing (WOR-2633) ---
+//
+// The lease does not try to outlast a worst-case ACME order; the heartbeat
+// does that. The TTL only has to cover the gap between two heartbeats plus
+// scheduling noise, and be short enough that a crashed holder frees the
+// fleet quickly.
+
+/// Issuance lease TTL. A holder that stops renewing frees the host for a
+/// peer after this long.
+const ISSUE_LEASE_TTL_SECS: u64 = 120;
+/// Heartbeat cadence while an order is in flight. One sixth of the TTL, so
+/// several renewals can fail transiently before the lease is at risk.
+const ISSUE_LEASE_RENEW_SECS: u64 = 20;
+/// How long a renewal is allowed to keep failing before the holder fences
+/// itself. Strictly inside the TTL: a peer can only take the lease over
+/// once the TTL has fully elapsed since our last successful renewal, so a
+/// holder that stops publishing at TTL minus one renewal period has stopped
+/// before any successor can have started.
+const ISSUE_LEASE_SAFETY_SECS: u64 = ISSUE_LEASE_TTL_SECS - ISSUE_LEASE_RENEW_SECS;
+/// How many two-second waits a contender spends watching a peer's issuance
+/// before giving up until the next renewal tick. Long enough to cover a
+/// normal order, so a fresh follower installs the winner's certificate
+/// within seconds of publication instead of at the next 12h tick.
+const ISSUE_WAIT_ATTEMPTS: u32 = 90;
+/// Pause between lease attempts while a peer holds it.
+const ISSUE_WAIT_INTERVAL: Duration = Duration::from_secs(2);
+/// Total time one renewal tick may spend waiting on peers, summed across
+/// every hostname it visits.
+///
+/// [`ISSUE_WAIT_ATTEMPTS`] bounds one hostname's wait at 180 seconds, and
+/// the tick walks hostnames serially, so without a shared budget a proxy
+/// with forty hostnames could spend two hours inside a single tick: no
+/// installs, no renewal decisions, nothing but sleeping on a lock a peer
+/// holds. The budget is the tick's, not the hostname's. A hostname that
+/// finds it exhausted gives up immediately and says so, and the tick moves
+/// on; the next tick starts with a full budget and a different hostname
+/// order of business.
+const ISSUE_WAIT_TICK_BUDGET: Duration = Duration::from_secs(180);
+
+/// How long this hostname may sleep before its next issuance-lease attempt,
+/// given what is left of the tick's shared budget.
+///
+/// `None` means the tick has spent its budget: give up on this hostname
+/// now rather than adding to a wait that is already too long.
+fn issue_wait_pause(remaining: Duration) -> Option<Duration> {
+    if remaining.is_zero() {
+        return None;
+    }
+    Some(std::cmp::min(ISSUE_WAIT_INTERVAL, remaining))
 }
 
-impl Drop for IssueLockGuard<'_> {
+/// How the bounded wait for one hostname's issuance lease ended.
+enum LeaseWait {
+    /// The lease is ours; issue under it.
+    Acquired(cert_store::IssueLease),
+    /// A peer published a certificate we could install while we waited.
+    /// Nothing to issue, and nothing to complain about.
+    PeerPublished,
+    /// The backend could not be asked. Already logged at warn.
+    Backend,
+    /// Attempts or the tick's shared budget ran out with a peer still
+    /// holding the lock.
+    Exhausted {
+        /// How long this hostname waited before giving up.
+        waited: Duration,
+    },
+}
+
+/// RAII release of the ACME per-host issuance lease (WOR-1774). Dropping
+/// the guard releases the lease, so every exit from the issuance block (an
+/// early `continue` on error, or normal completion) unlocks - a peer in a
+/// fleet is never left waiting on a lock this node abandoned. Release keeps
+/// the backend's fencing generation, so a released lease still fences.
+struct IssueLeaseGuard<'a> {
+    store: &'a CertStore,
+    lease: cert_store::IssueLease,
+}
+
+impl Drop for IssueLeaseGuard<'_> {
     fn drop(&mut self) {
-        if let Err(e) = self.store.release_issue_lock(self.hostname, &self.token) {
+        if let Err(e) = self
+            .store
+            .release_issue_lock(self.lease.hostname(), self.lease.token())
+        {
             warn!(
-                hostname = self.hostname,
-                "failed to release ACME issuance lock: {e:#}"
+                hostname = self.lease.hostname(),
+                "failed to release ACME issuance lease: {e:#}"
             );
+        }
+    }
+}
+
+/// Heartbeat that keeps an issuance lease alive for the whole order
+/// (WOR-2633).
+///
+/// A normal ACME flow can legitimately spend longer than any sensible TTL
+/// in authorization and finalization polling, so the holder renews on a
+/// cadence instead of gambling on a TTL that covers the worst case. Two
+/// exits matter:
+///
+/// * the backend says the lease is no longer ours: the lease is marked
+///   lost (renewal does that), so [`CertStore::put_cert_bundle_fenced`]
+///   will refuse the order's result;
+/// * renewals keep erroring past [`ISSUE_LEASE_SAFETY_SECS`]: the holder
+///   cannot prove it still owns the lease, so it fences itself before any
+///   peer could have taken over, rather than publishing on hope.
+///
+/// Dropping the guard aborts the task, so a finished or abandoned order
+/// stops renewing on every exit path.
+struct HeartbeatGuard {
+    task: JoinHandle<()>,
+}
+
+impl HeartbeatGuard {
+    fn spawn(store: Arc<CertStore>, lease: cert_store::IssueLease) -> Self {
+        let task = maintenance_handle().spawn(async move {
+            let mut last_ok = std::time::Instant::now();
+            let mut ticker = tokio::time::interval(Duration::from_secs(ISSUE_LEASE_RENEW_SECS));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // An interval's first tick is immediate; the lease was acquired
+            // moments ago, so skip it.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                match store.renew_issue_lease(&lease, ISSUE_LEASE_TTL_SECS) {
+                    Ok(true) => {
+                        last_ok = std::time::Instant::now();
+                    }
+                    Ok(false) => {
+                        // renew_issue_lease has already marked the lease
+                        // lost; the publication path refuses it from here.
+                        warn!(
+                            hostname = lease.hostname(),
+                            generation = lease.generation(),
+                            "the ACME issuance lease was taken by a peer; this node's \
+                             in-flight order will be discarded instead of published"
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        warn!(
+                            hostname = lease.hostname(),
+                            "ACME issuance lease renewal error: {e:#}"
+                        );
+                        if last_ok.elapsed().as_secs() >= ISSUE_LEASE_SAFETY_SECS {
+                            lease.mark_lost();
+                            warn!(
+                                hostname = lease.hostname(),
+                                generation = lease.generation(),
+                                "could not prove lease ownership within the safety deadline; \
+                                 fencing this node's in-flight order"
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        Self { task }
+    }
+}
+
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// The one place a shared certificate bundle enters the resolver (WOR-2634).
+///
+/// Initialization, ordinary renewal ticks, the lease-wait path, and the
+/// post-publication path all install through here, so a valid bundle
+/// observed anywhere is a bundle that gets served. The installed generation
+/// per hostname makes an unchanged bundle a no-op and a regressed one (an
+/// older generation appearing after a newer one) a refusal rather than a
+/// downgrade.
+struct BundleInstaller {
+    resolver: Arc<CertResolver>,
+    installed: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+}
+
+impl BundleInstaller {
+    fn new(resolver: Arc<CertResolver>) -> Self {
+        Self {
+            resolver,
+            installed: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Read the published bundle for `hostname`, install it if it is new,
+    /// and return the metadata renewal decisions should be made from.
+    ///
+    /// `None` means nothing trustworthy is published: either nothing is
+    /// there, or what is there was refused (torn, corrupted, mismatched).
+    /// Refusal keeps the last installed certificate serving; the caller's
+    /// renewal path is what repairs the store.
+    fn sync_from_store(&self, cert_store: &CertStore, hostname: &str) -> Option<CertMeta> {
+        let bundle = match cert_store.get_cert_bundle(hostname) {
+            Ok(Ok(Some(bundle))) => bundle,
+            Ok(Ok(None)) => return None,
+            Ok(Err(reason)) => {
+                warn!(
+                    hostname,
+                    reason = reason.as_str(),
+                    "published certificate bundle refused; keeping the last installed \
+                     certificate and treating this host as needing issuance"
+                );
+                return None;
+            }
+            Err(e) => {
+                warn!(
+                    hostname,
+                    "error reading the shared certificate store: {e:#}"
+                );
+                return None;
+            }
+        };
+
+        // Poison recovery rather than a panic: the map only tracks which
+        // generation is installed, and a poisoned map must not stop a valid
+        // certificate from installing.
+        let mut installed = match self.installed.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(have) = installed.get(hostname) {
+            if *have == bundle.generation {
+                return Some(bundle.meta);
+            }
+            if *have > bundle.generation {
+                warn!(
+                    hostname,
+                    installed = *have,
+                    published = bundle.generation,
+                    "the published bundle generation went backwards; keeping the newer \
+                     installed certificate"
+                );
+                return Some(bundle.meta);
+            }
+        }
+
+        // A published bundle that is already expired is worth no more than
+        // the bootstrap certificate it would replace; leave the resolver
+        // alone and let the metadata drive re-issuance.
+        if let Some(expires_at) = parse_cert_expiry(&bundle.cert_pem) {
+            let expired = chrono::DateTime::parse_from_rfc3339(&expires_at)
+                .map(|exp| exp.with_timezone(&chrono::Utc) <= chrono::Utc::now())
+                .unwrap_or(false);
+            if expired {
+                warn!(
+                    hostname,
+                    generation = bundle.generation,
+                    "published certificate bundle is already expired; not installing it"
+                );
+                return Some(bundle.meta);
+            }
+        }
+
+        match self
+            .resolver
+            .set_cert(hostname, &bundle.cert_pem, &bundle.key_pem)
+        {
+            Ok(()) => {
+                info!(
+                    hostname,
+                    generation = bundle.generation,
+                    "installed the shared certificate bundle in the resolver"
+                );
+                installed.insert(hostname.to_string(), bundle.generation);
+                Some(bundle.meta)
+            }
+            Err(e) => {
+                error!(
+                    hostname,
+                    generation = bundle.generation,
+                    "failed to install the shared certificate bundle: {e:#}"
+                );
+                None
+            }
         }
     }
 }
@@ -358,34 +623,18 @@ impl TlsState {
         }
 
         // --- Pre-load cached ACME certs ---
+        //
+        // WOR-2634: this goes through the same installer the renewal task
+        // uses, so initialization is just the first of many syncs rather
+        // than the only one. Certs register under the exact hostname only;
+        // ACME certs are hostname-specific, not fallback.
+        let installer = Arc::new(BundleInstaller::new(Arc::clone(&resolver)));
         if let Some(acme_cfg) = &config.acme {
             if acme_cfg.enabled {
                 for hostname in &hostnames {
-                    match cert_store.get_cert_and_key(hostname) {
-                        Ok(Some((cert_pem, key_pem))) => {
-                            match cert_resolver::load_certified_key(&cert_pem, &key_pem) {
-                                Ok(_ck) => {
-                                    // Register under the exact hostname only.
-                                    // ACME certs are hostname-specific, not fallback.
-                                    if let Err(e) = resolver.set_cert(hostname, &cert_pem, &key_pem)
-                                    {
-                                        warn!(hostname, "failed to register cached cert: {e:#}");
-                                    } else {
-                                        info!(hostname, "loaded cached ACME certificate");
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(hostname, "cached cert is invalid: {e:#}");
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            // No cached cert yet - will be obtained via ACME.
-                        }
-                        Err(e) => {
-                            warn!(hostname, "error reading cert store: {e:#}");
-                        }
-                    }
+                    // A missing bundle is normal before first issuance; a
+                    // refused one already warned inside the installer.
+                    let _ = installer.sync_from_store(&cert_store, hostname);
                 }
             }
         }
@@ -395,6 +644,7 @@ impl TlsState {
             challenge_store,
             acme_config: config.acme.clone(),
             cert_store,
+            installer,
             hostnames,
             ocsp_stapler,
             manual_cert_pem,
@@ -479,7 +729,7 @@ impl TlsState {
         };
 
         let cert_store = self.cert_store.clone();
-        let resolver = self.resolver.clone();
+        let installer = self.installer.clone();
         let challenge_store = self.challenge_store.clone();
         let hostnames = self.hostnames.clone();
 
@@ -496,9 +746,23 @@ impl TlsState {
             loop {
                 interval.tick().await;
 
+                // One budget for the whole tick. Spent by whichever
+                // hostnames find a peer holding their lock, in the order
+                // they are visited, and refilled only by the next tick.
+                let mut tick_budget = ISSUE_WAIT_TICK_BUDGET;
+
                 for hostname in &hostnames {
-                    let needs_issuance = match cert_store.get_meta(hostname) {
-                        Ok(Some(ref meta)) => {
+                    // WOR-2634: install whatever the fleet's store publishes
+                    // before deciding anything else. A tick that only reads
+                    // metadata and continues is how two of three replicas
+                    // serve the bootstrap certificate forever while the
+                    // third serves the real one. The metadata driving the
+                    // renewal decision comes from the same synced bundle, so
+                    // it can never describe material this node is not
+                    // actually able to serve.
+                    let synced = installer.sync_from_store(&cert_store, hostname);
+                    let needs_issuance = match &synced {
+                        Some(meta) => {
                             if cert_needs_renewal(meta, acme_config.renew_before_days) {
                                 info!(hostname, "certificate needs renewal");
                                 true
@@ -506,13 +770,9 @@ impl TlsState {
                                 false
                             }
                         }
-                        Ok(None) => {
-                            info!(hostname, "no certificate found, issuing via ACME");
+                        None => {
+                            info!(hostname, "no valid shared certificate, issuing via ACME");
                             true
-                        }
-                        Err(e) => {
-                            error!(hostname, "error checking cert meta: {e:#}");
-                            false
                         }
                     };
 
@@ -520,60 +780,100 @@ impl TlsState {
                         continue;
                     }
 
-                    // WOR-1774: serialize issuance across a fleet. Acquire a
-                    // per-host lock - an atomic lease on a shared backend
-                    // (redis), a no-op on a local one. Wait briefly for a peer
-                    // that is mid-issue, long enough to cover a typical ACME
-                    // order, so the loser reads the peer's cert rather than
-                    // racing the CA.
-                    let mut token = [0u8; 16];
-                    if ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut token)
-                        .is_err()
-                    {
-                        error!(hostname, "failed to generate issuance lock token; skipping");
-                        continue;
-                    }
-                    let mut acquired = false;
-                    for attempt in 0..15 {
-                        match cert_store.try_issue_lock(hostname, &token, 120) {
-                            Ok(true) => {
-                                acquired = true;
+                    // WOR-1774 serialized issuance across a fleet; WOR-2633
+                    // made the hold a renewable, fenced lease. While a peer
+                    // holds it, keep watching the shared store: the moment
+                    // the peer publishes, install its bundle and stand down
+                    // (WOR-2634) instead of waiting for a restart.
+                    let mut waited = Duration::ZERO;
+                    let mut outcome = LeaseWait::Exhausted { waited };
+                    for attempt in 0..ISSUE_WAIT_ATTEMPTS {
+                        match cert_store.acquire_issue_lease(hostname, ISSUE_LEASE_TTL_SECS) {
+                            Ok(Some(acquired)) => {
+                                outcome = LeaseWait::Acquired(acquired);
                                 break;
                             }
-                            Ok(false) => {
+                            Ok(None) => {
                                 if attempt == 0 {
-                                    info!(hostname, "ACME issuance lock held by a peer; waiting");
+                                    info!(
+                                        hostname,
+                                        "ACME issuance lease held by a peer; waiting and \
+                                         watching the shared store"
+                                    );
                                 }
-                                tokio::time::sleep(Duration::from_secs(2)).await;
+                                // The budget belongs to the whole tick, so
+                                // one contended hostname cannot spend the
+                                // hours that forty of them would add up to.
+                                let Some(pause) = issue_wait_pause(tick_budget) else {
+                                    outcome = LeaseWait::Exhausted { waited };
+                                    break;
+                                };
+                                tokio::time::sleep(pause).await;
+                                tick_budget -= pause;
+                                waited += pause;
+                                outcome = LeaseWait::Exhausted { waited };
+                                if let Some(meta) = installer.sync_from_store(&cert_store, hostname)
+                                {
+                                    if !cert_needs_renewal(&meta, acme_config.renew_before_days) {
+                                        info!(
+                                            hostname,
+                                            "a peer published the certificate; installed it \
+                                             without issuing"
+                                        );
+                                        outcome = LeaseWait::PeerPublished;
+                                        break;
+                                    }
+                                }
                             }
                             Err(e) => {
-                                warn!(hostname, "ACME issuance lock error: {e:#}; skipping tick");
+                                warn!(hostname, "ACME issuance lease error: {e:#}; skipping tick");
+                                outcome = LeaseWait::Backend;
                                 break;
                             }
                         }
                     }
-                    if !acquired {
-                        info!(hostname, "did not acquire ACME issuance lock; retrying next tick");
-                        continue;
-                    }
-                    // Releases on every exit path below (Drop).
-                    let _issue_lock = IssueLockGuard {
-                        store: &cert_store,
-                        hostname: hostname.as_str(),
-                        token: token.to_vec(),
-                    };
-
-                    // Re-check under the lock: a peer may have issued while we
-                    // waited, so we do not double-issue and burn CA quota.
-                    if let Ok(Some(ref meta)) = cert_store.get_meta(hostname) {
-                        if !cert_needs_renewal(meta, acme_config.renew_before_days) {
+                    let lease = match outcome {
+                        LeaseWait::Acquired(lease) => lease,
+                        LeaseWait::PeerPublished | LeaseWait::Backend => continue,
+                        LeaseWait::Exhausted { waited } => {
+                            // Restored from the pre-WOR-2634 loop, which
+                            // said this and was dropped. A node that never
+                            // wins the lock is otherwise completely silent:
+                            // it serves the bootstrap certificate and
+                            // nothing in the log says why.
                             info!(
                                 hostname,
-                                "certificate already present after acquiring lock; skipping issuance"
+                                waited_secs = waited.as_secs(),
+                                tick_budget_left_secs = tick_budget.as_secs(),
+                                "did not acquire the ACME issuance lock; a peer is holding it \
+                                 and published nothing we could install. Retrying next tick"
+                            );
+                            continue;
+                        }
+                    };
+                    // Releases on every exit path below (Drop).
+                    let _issue_lease = IssueLeaseGuard {
+                        store: &cert_store,
+                        lease: lease.clone(),
+                    };
+
+                    // Re-check under the lease: a peer may have issued while
+                    // we waited, so we do not double-issue and burn CA
+                    // quota. The sync also installs that peer's bundle.
+                    if let Some(meta) = installer.sync_from_store(&cert_store, hostname) {
+                        if !cert_needs_renewal(&meta, acme_config.renew_before_days) {
+                            info!(
+                                hostname,
+                                "certificate already present after acquiring the lease; \
+                                 skipping issuance"
                             );
                             continue;
                         }
                     }
+
+                    // Keep the lease alive for however long the CA takes.
+                    // Aborts when this scope ends, whatever the exit path.
+                    let _heartbeat = HeartbeatGuard::spawn(Arc::clone(&cert_store), lease.clone());
 
                     // --- Issue or renew certificate via ACME ---
                     // `ca_root` trusts a private or test CA for the
@@ -642,35 +942,42 @@ impl TlsState {
                                 serial: String::from("acme-issued"),
                             };
 
-                            // Persist to cert store.
-                            if let Err(e) =
-                                cert_store.put_cert_bundle(hostname, &cert_pem, &key_pem, &meta)
+                            // WOR-2633 and WOR-2635: publish the order's
+                            // result as one fenced record. The store refuses
+                            // it if the lease was lost or a newer holder
+                            // already published, however convinced this node
+                            // is that it won.
+                            match cert_store
+                                .put_cert_bundle_fenced(&lease, &cert_pem, &key_pem, &meta)
                             {
-                                error!(hostname, "failed to persist issued cert: {e:#}");
-                                continue;
-                            }
-
-                            // Validate the issued cert parses before installing in resolver.
-                            match load_certified_key(&cert_pem, &key_pem) {
-                                Ok(_) => {
-                                    // Register under the hostname for SNI-based selection.
-                                    if let Err(e) = resolver.set_cert(hostname, &cert_pem, &key_pem)
-                                    {
-                                        error!(
-                                            hostname,
-                                            "failed to install cert in resolver: {e:#}"
-                                        );
-                                    } else {
-                                        info!(hostname, "ACME certificate installed in resolver");
-                                    }
-                                }
-                                Err(e) => {
-                                    error!(
+                                Ok(cert_store::PublishOutcome::Published { generation }) => {
+                                    info!(
                                         hostname,
-                                        "failed to parse issued cert for resolver: {e:#}"
+                                        generation, "ACME certificate published for the fleet"
                                     );
                                 }
+                                Ok(refused) => {
+                                    warn!(
+                                        hostname,
+                                        outcome = refused.as_str(),
+                                        generation = lease.generation(),
+                                        "issued a certificate but the lease no longer \
+                                         authorizes publication; discarding this order's \
+                                         result in favor of the fleet's bundle"
+                                    );
+                                }
+                                Err(e) => {
+                                    error!(hostname, "failed to persist issued cert: {e:#}");
+                                    continue;
+                                }
                             }
+
+                            // WOR-2634: install through the same path a
+                            // follower uses, reading back what the store
+                            // actually holds. On a refused publication this
+                            // installs the winning peer's bundle rather than
+                            // this node's discarded one.
+                            let _ = installer.sync_from_store(&cert_store, hostname);
                         }
                         Err(e) => {
                             error!(hostname, "ACME issuance failed: {e:#}");
@@ -854,6 +1161,63 @@ mod tests {
             renew_before_days: 30,
             ca_root: None,
         }
+    }
+
+    #[test]
+    fn one_renewal_tick_cannot_wait_for_hours_across_hostnames() {
+        // ISSUE_WAIT_ATTEMPTS grew from 15 to 90, which is 180 seconds per
+        // hostname, and the tick walks hostnames one at a time. Forty
+        // hostnames all waiting on a peer's lock is two hours inside a
+        // single tick: no installs, no renewal decisions, no log line
+        // saying why. The budget belongs to the tick, so replay the tick's
+        // arithmetic here and hold it to that.
+        let mut budget = ISSUE_WAIT_TICK_BUDGET;
+        let mut total = Duration::ZERO;
+        let mut hostnames_that_gave_up_immediately = 0;
+        for _hostname in 0..40 {
+            let mut waited = Duration::ZERO;
+            for _attempt in 0..ISSUE_WAIT_ATTEMPTS {
+                let Some(pause) = issue_wait_pause(budget) else {
+                    break;
+                };
+                budget -= pause;
+                total += pause;
+                waited += pause;
+            }
+            if waited.is_zero() {
+                hostnames_that_gave_up_immediately += 1;
+            }
+        }
+        assert_eq!(
+            total, ISSUE_WAIT_TICK_BUDGET,
+            "the whole tick must be bounded by one shared budget"
+        );
+        assert!(
+            total <= Duration::from_secs(300),
+            "a renewal tick that spends {total:?} waiting is a tick that does \
+             nothing else for {total:?}"
+        );
+        assert!(
+            hostnames_that_gave_up_immediately > 0,
+            "a hostname reached once the budget is gone has to give up at once, \
+             which is what the give-up log line reports"
+        );
+        // Per-hostname bound unchanged, so a single-hostname deployment
+        // still waits out a normal order.
+        assert!(
+            ISSUE_WAIT_INTERVAL * ISSUE_WAIT_ATTEMPTS >= ISSUE_WAIT_TICK_BUDGET,
+            "the tick budget is the binding constraint, not a second per-host cap"
+        );
+        assert_eq!(issue_wait_pause(Duration::ZERO), None);
+        assert_eq!(
+            issue_wait_pause(Duration::from_secs(1)),
+            Some(Duration::from_secs(1)),
+            "the last of the budget is spent, not overshot"
+        );
+        assert_eq!(
+            issue_wait_pause(Duration::from_secs(30)),
+            Some(ISSUE_WAIT_INTERVAL)
+        );
     }
 
     #[test]
@@ -1081,26 +1445,33 @@ mod tests {
         );
     }
 
+    /// Publish a real bundle carrying the fixture metadata. `get_meta` reads
+    /// through the published bundle since WOR-2635, so a standalone metadata
+    /// row no longer counts as a certificate; these fixtures have to be
+    /// certificates.
+    fn publish_fixture(store: &CertStore, hostname: &str, meta: &CertMeta) {
+        let (cert_pem, key_pem) = self_signed_pem(hostname);
+        store
+            .put_cert_bundle(hostname, &cert_pem, &key_pem, meta)
+            .expect("publish fixture bundle");
+    }
+
     #[test]
     fn acme_expiry_reader_returns_the_nearest_fixture_certificate() {
         let store = Arc::new(CertStore::new(Arc::new(MemoryKVStore::new(0))));
         let now = chrono::DateTime::parse_from_rfc3339("2026-07-23T00:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        store
-            .put_meta(
-                "later.example",
-                &meta(&(now + chrono::Duration::days(20)).to_rfc3339()),
-            )
-            .unwrap();
-        store
-            .put_meta(
-                "near.example",
-                &meta(
-                    &(now + chrono::Duration::days(6) + chrono::Duration::seconds(1)).to_rfc3339(),
-                ),
-            )
-            .unwrap();
+        publish_fixture(
+            &store,
+            "later.example",
+            &meta(&(now + chrono::Duration::days(20)).to_rfc3339()),
+        );
+        publish_fixture(
+            &store,
+            "near.example",
+            &meta(&(now + chrono::Duration::days(6) + chrono::Duration::seconds(1)).to_rfc3339()),
+        );
 
         let reader = AcmeExpiryReader {
             cert_store: store,
@@ -1117,15 +1488,16 @@ mod tests {
         let now = chrono::DateTime::parse_from_rfc3339("2026-07-23T00:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        store
-            .put_meta(
-                "healthy.example",
-                &meta(&(now + chrono::Duration::days(90)).to_rfc3339()),
-            )
-            .unwrap();
-        store
-            .put_meta("unreadable.example", &meta("not-an-rfc3339-timestamp"))
-            .unwrap();
+        publish_fixture(
+            &store,
+            "healthy.example",
+            &meta(&(now + chrono::Duration::days(90)).to_rfc3339()),
+        );
+        publish_fixture(
+            &store,
+            "unreadable.example",
+            &meta("not-an-rfc3339-timestamp"),
+        );
 
         let reader = AcmeExpiryReader {
             cert_store: store,
@@ -1144,17 +1516,119 @@ mod tests {
         let now = chrono::DateTime::parse_from_rfc3339("2026-07-23T00:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        store
-            .put_meta(
-                "healthy.example",
-                &meta(&(now + chrono::Duration::days(90)).to_rfc3339()),
-            )
-            .unwrap();
+        publish_fixture(
+            &store,
+            "healthy.example",
+            &meta(&(now + chrono::Duration::days(90)).to_rfc3339()),
+        );
         let reader = AcmeExpiryReader {
             cert_store: store,
             hostnames: Arc::from(["healthy.example".to_string(), "missing.example".to_string()]),
         };
 
         assert_eq!(reader.earliest_at(now), None);
+    }
+
+    // --- Shared bundle install path (WOR-2634, WOR-2635) ---
+
+    fn served_der(resolver: &CertResolver, hostname: &str) -> Vec<u8> {
+        resolver
+            .resolve(hostname)
+            .expect("a certificate is served for the hostname")
+            .cert
+            .first()
+            .expect("served chain is non-empty")
+            .as_ref()
+            .to_vec()
+    }
+
+    fn first_der(cert_pem: &[u8]) -> Vec<u8> {
+        use rustls::pki_types::{pem::PemObject as _, CertificateDer};
+        CertificateDer::pem_slice_iter(cert_pem)
+            .filter_map(|r| r.ok())
+            .next()
+            .expect("PEM contains a certificate")
+            .as_ref()
+            .to_vec()
+    }
+
+    #[test]
+    fn a_refused_bundle_keeps_the_last_installed_certificate() {
+        // WOR-2635 fail posture: published-but-untrustworthy is not the
+        // same as absent. The resolver keeps serving the last good
+        // generation, and the sync reports "needs issuance" so the renewal
+        // path repairs the store.
+        let backend: Arc<dyn KVStore> = Arc::new(MemoryKVStore::new(0));
+        let cs = CertStore::new(Arc::clone(&backend));
+        let resolver = Arc::new(CertResolver::new());
+        let installer = BundleInstaller::new(Arc::clone(&resolver));
+        let host = "keeplast.example";
+
+        let (cert_pem, key_pem) = self_signed_pem(host);
+        cs.put_cert_bundle(host, &cert_pem, &key_pem, &meta("2027-01-01T00:00:00Z"))
+            .expect("publish");
+        let synced = installer.sync_from_store(&cs, host);
+        assert!(synced.is_some(), "a valid bundle syncs");
+        assert_eq!(served_der(&resolver, host), first_der(&cert_pem));
+
+        // Tear the record where a crashed writer would have.
+        backend
+            .put(
+                format!("acme:bundle:{host}").as_bytes(),
+                b"{\"version\":1,\"gen",
+            )
+            .expect("write torn record");
+        assert!(
+            installer.sync_from_store(&cs, host).is_none(),
+            "a torn record is a refusal, not a certificate"
+        );
+        assert_eq!(
+            served_der(&resolver, host),
+            first_der(&cert_pem),
+            "the last good certificate must keep serving through a torn store"
+        );
+    }
+
+    #[test]
+    fn an_older_generation_never_replaces_a_newer_installed_one() {
+        // WOR-2634: the installer moves forward only. A write that lands
+        // out of order in the store must not downgrade a resolver that has
+        // already installed a newer generation.
+        let backend: Arc<dyn KVStore> = Arc::new(MemoryKVStore::new(0));
+        let cs = CertStore::new(Arc::clone(&backend));
+        let resolver = Arc::new(CertResolver::new());
+        let installer = BundleInstaller::new(Arc::clone(&resolver));
+        let host = "monotonic.example";
+
+        let (old_cert, old_key) = self_signed_pem(host);
+        let (new_cert, new_key) = self_signed_pem(host);
+        cs.put_cert_bundle(host, &old_cert, &old_key, &meta("2027-01-01T00:00:00Z"))
+            .expect("publish generation 1");
+        cs.put_cert_bundle(host, &new_cert, &new_key, &meta("2027-06-01T00:00:00Z"))
+            .expect("publish generation 2");
+        assert!(installer.sync_from_store(&cs, host).is_some());
+        assert_eq!(served_der(&resolver, host), first_der(&new_cert));
+
+        // Regress the store to generation 1 by hand.
+        let regressed = crate::cert_bundle::CertBundle::new(
+            host,
+            1,
+            &old_cert,
+            &old_key,
+            meta("2027-01-01T00:00:00Z"),
+        )
+        .expect("build older record")
+        .encode()
+        .expect("encode older record");
+        backend
+            .put(format!("acme:bundle:{host}").as_bytes(), &regressed)
+            .expect("write older record");
+
+        assert!(installer.sync_from_store(&cs, host).is_some());
+        assert_eq!(
+            served_der(&resolver, host),
+            first_der(&new_cert),
+            "an older published generation must not replace a newer installed one"
+        );
     }
 }

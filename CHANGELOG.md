@@ -393,6 +393,144 @@ the next version cut.
 
 ### Fixed
 
+- **ACME fleet followers install the leader's certificate without a
+  restart.** A shared certificate bundle was loaded into the TLS
+  resolver exactly once, during startup. A replica that booted against
+  an empty store, waited while a peer issued, and then saw valid
+  metadata skipped issuance and kept serving its self-signed bootstrap
+  certificate indefinitely; after a renewal, followers stayed on the
+  old certificate until a restart. Every path that observes the shared
+  store now installs through one helper: initialization, every renewal
+  tick, the lease-wait path (a follower installs the winner's bundle
+  within seconds of publication), and the post-publication path. The
+  installer tracks the installed generation per hostname, so an
+  unchanged bundle is a no-op, a regressed one is refused, and a torn
+  or corrupted one keeps the last good certificate serving while the
+  renewal path repairs the store. A node that never wins the issuance
+  lock says so again on every tick, and the per-hostname wait is now
+  bounded by a budget shared across the whole tick rather than per
+  hostname, so a proxy with dozens of hostnames cannot spend hours
+  inside one renewal pass.
+
+  Stated plainly, because the record says otherwise in two places
+  people will read: the bundle digest is an unkeyed SHA-256 stored
+  inside the record it covers. It refuses a torn or corrupted record,
+  which is what it is for. It is not an authenticity check, because
+  anyone who can write the store can recompute it. Whatever keeps a
+  writer out of the store is what keeps them out of the certificate.
+
+  One tradeoff taken deliberately: the refusal reasons
+  (`digest_mismatch`, `torn_legacy`, `key_mismatch`,
+  `hostname_mismatch`) and the publication outcomes (`lease_lost`,
+  `superseded`) are structured-log fields and nothing else. They are
+  the right things to alert on and no counter carries them, because
+  the metric registry lives in `sbproxy-observe` and this change does
+  not reach into it. Both label sets are kept closed and bounded so
+  wiring the counter later is an addition rather than a rename.
+
+- **The ACME issuance lease renews for as long as the CA takes, and a
+  holder that lost it can no longer publish.** The fleet issuance lock
+  was a fixed 120 second TTL with no heartbeat, while a normal ACME
+  order can legitimately poll longer than that; stale takeover on the
+  file and object-store backends was read-then-overwrite, so two
+  replicas racing the same expired lease both believed they won. The
+  lease is now renewed every 20 seconds for the whole order, a holder
+  whose renewals keep failing fences itself before any successor can
+  have started, takeover is a conditional write (an atomic
+  create-marker on the file backend, an etag precondition on object
+  storage, a single Lua script on Redis) so exactly one contender per
+  expired lease wins, and every acquisition mints a strictly
+  increasing fencing generation that publication is checked against.
+  An object-store backend with no conditional write support refuses
+  the takeover instead of quietly double-acquiring.
+
+  On the file backend the takeover marker is now the write, not just a
+  ticket to make one: the payload is staged inside the marker and
+  published by renaming it into place, so completing an acquisition
+  consumes the right to complete it. A contender whose marker was
+  reaped as a corpse while it stalled has nothing left to publish
+  with, where before it could wake up and hand a second holder the
+  same fencing generation. Renewal on that backend is a real
+  compare-and-swap for the same reason: it holds an exclusive claim
+  across the re-read and the write and refuses unless the lease still
+  says exactly what it said, so a stale attribute-cached view over NFS
+  can no longer walk the fencing generation backwards. And a
+  publication re-proves the lease against the store immediately before
+  writing, rather than trusting a local flag that only turns false
+  when a heartbeat task gets scheduled; that heartbeat shares a
+  one-worker runtime with every blocking store call, so a hung backend
+  starves exactly the task whose job is to notice.
+
+- **A certificate, its private key, and its metadata now publish as
+  one atomic record.** `put_cert_bundle` documented atomic persistence
+  and performed three independent writes, so a crash between them left
+  a new certificate paired with the previous generation's key, and
+  metadata describing material the store could not serve steered
+  peers away from repairing it. The bundle is now a single versioned,
+  digest-checked record written in one backend operation (the file
+  backend also gained write-temp-then-rename, so a concurrent reader
+  never observes a short read). Readers validate the whole record,
+  including the certificate/key pairing, before serving it; legacy
+  three-key rows are adopted read-only only when the pair proves to
+  match, and a torn row is quarantined instead of served.
+
+- **The Kubernetes Gateway controller renews its leader Lease and
+  fences every write on loss.** Leader election acquired the 15 second
+  Lease once and returned, so after 15 seconds a standby took it over
+  while the original leader kept writing `sb.yml` and Gateway API
+  status, and takeover used force-apply, which lets a non-holder steal
+  the holder field. Leadership is now a lifecycle: the leader renews
+  every 5 seconds, takeover is conditional on the Lease's
+  `resourceVersion` so racing standbys see exactly one winner, and a
+  leader that cannot renew fences its own config and status writes
+  after 10 seconds, fails readiness, releases the Lease on graceful
+  shutdown, and exits so the Deployment restarts it as a standby.
+
+  The self-fence deadline sits strictly inside the takeover threshold,
+  and two details are what make that true rather than nearly true.
+  Both replicas measure from the same instant: the Lease's `renewTime`
+  is stamped when a renewal begins, so the leader measures its own
+  deadline from the start of its last successful renewal instead of
+  from when that call returned. And the deadline is absolute and
+  enforced from inside the renewal wait rather than checked after the
+  API call comes back, so an API server that hangs instead of erroring
+  cannot push the fence out by however long it hangs. The gate closes
+  at 10 seconds whatever the API server does, a full renewal period
+  before any successor may legally act.
+
+  Reconciles refused by that fence are counted under a new
+  `result="fenced"` label on `sbproxy_gateway_reconcile_total` and
+  logged at warn. They used to land on `result="error"` and log
+  `reconcile failed` at error level, which meant a step-down produced
+  a burst of alerts describing a controller doing exactly what it was
+  told to. Alert on `error`; `fenced` tells you how long a step-down
+  took.
+
+- **A Redis key revocation can no longer be missed for the life of
+  the positive cache.** Key-store mutations ran the record write, the
+  revision bump, and the invalidation publish as three separate
+  commands, so a failure between them could commit a revocation
+  without ever announcing it; a replica whose pub/sub subscription
+  dropped during a revoke missed the message permanently (Redis
+  pub/sub has no replay) and kept accepting the credential until its
+  L1 TTL expired. Mutations now run as one atomic Lua script, so an
+  acknowledged change has always published, and the subscriber clears
+  its whole local cache on every (re)subscription, after the
+  subscription is live, so a revocation during a gap is covered either
+  by the resync or by the stream. A subscription stream that ends now
+  reports an error, so the supervising loop resubscribes with backoff
+  instead of treating silence as health.
+
+  That resync, and every invalidation the subscriber receives, clears
+  the local cache and stops there. Reacting to a broadcast by
+  broadcasting is how one message becomes an endless storm: every peer
+  answers it, and answers the answers. Alongside that, the Redis cache
+  tier's "drop everything" now actually deletes the shared entries it
+  is named for, with a `SCAN` scoped to the keystore cache prefix
+  rather than a `FLUSHDB` on a Redis an operator may be sharing.
+  Announcing a clear without performing it left every peer's L2
+  answering from the cache the call claimed to have emptied.
+
 - **A `failure_posture: closed` transform now fails a `static` or
   `mock` response closed instead of serving it untransformed.** The
   transform chain has reached generated bodies since the response-phase

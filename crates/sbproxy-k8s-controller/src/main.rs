@@ -20,7 +20,7 @@ use kube::Client;
 use sbproxy_k8s_controller::{
     config_writer::{WriterOptions, DEFAULT_CLUSTER_DOMAIN, DEFAULT_TLS_MOUNT_DIR},
     controller::{self, ControllerHandle, KIND_PERIODIC},
-    health, metrics,
+    health, leader, metrics,
     reconciler::ReconcilerConfig,
     shutdown, CONTROLLER_NAME,
 };
@@ -171,36 +171,77 @@ async fn main() -> anyhow::Result<()> {
         return Err(e);
     }
 
+    // WOR-2614: with leader election on, writes are fenced by a gate that
+    // only leadership opens, and leadership is a lifecycle (acquire, renew,
+    // fence on loss) rather than a one-shot boolean.
+    let write_gate = if args.leader_election {
+        leader::WriteGate::for_election()
+    } else {
+        leader::WriteGate::always()
+    };
+
+    let mut leader_task = None;
     if args.leader_election {
+        let identity = leader::build_identity();
         tracing::info!(
             target: "k8s_audit",
             lease = %args.lease_name,
             namespace = %args.lease_namespace,
+            identity = %identity,
             "acquiring the leader-election Lease before starting watchers"
         );
-        match acquire_leader_lease(
+        if !leader::acquire(
             &client,
             &args.lease_namespace,
             &args.lease_name,
-            shutdown_sig.clone(),
+            &identity,
+            &write_gate,
+            &shutdown_sig,
         )
         .await
         {
-            Ok(true) => tracing::info!(target: "k8s_audit", "leader lease acquired"),
-            Ok(false) => {
-                tracing::info!(target: "k8s_audit", "shutdown arrived before the lease was won");
-                let _ = signal_task.await;
-                let _ = health_task.await;
-                return Ok(());
-            }
-            Err(e) => {
-                tracing::error!(target: "k8s_audit", error = %e, "leader election failed");
-                shutdown_trig.trigger();
-                let _ = signal_task.await;
-                let _ = health_task.await;
-                return Err(e);
-            }
+            tracing::info!(target: "k8s_audit", "shutdown arrived before the lease was won");
+            let _ = signal_task.await;
+            let _ = health_task.await;
+            return Ok(());
         }
+        tracing::info!(
+            target: "k8s_audit",
+            renew_period_secs = leader::RENEW_PERIOD.as_secs(),
+            lease_duration_secs = leader::LEASE_DURATION.as_secs(),
+            "leader lease acquired; renewing continuously"
+        );
+
+        // Renew for as long as we reconcile. On loss the gate is already
+        // closed by the time `hold` returns; readiness drops and shutdown
+        // cancels the watchers, so the pod exits cleanly and restarts as a
+        // standby that re-races for the Lease.
+        let hold_client = client.clone();
+        let hold_gate = write_gate.clone();
+        let hold_shutdown = shutdown_sig.clone();
+        let hold_trigger = shutdown_trig.clone();
+        let lease_namespace = args.lease_namespace.clone();
+        let lease_name = args.lease_name.clone();
+        leader_task = Some(tokio::spawn(async move {
+            let end = leader::hold(
+                hold_client,
+                lease_namespace,
+                lease_name,
+                identity,
+                hold_gate,
+                hold_shutdown,
+            )
+            .await;
+            if end == leader::LeadershipEnd::Lost {
+                health::set_ready(false);
+                tracing::warn!(
+                    target: "k8s_audit",
+                    "leadership lost; writes are fenced, readiness is down, and the \
+                     controller is shutting down to restart as a standby"
+                );
+                hold_trigger.trigger();
+            }
+        }));
     }
 
     let handle = Arc::new(ControllerHandle::with_client(
@@ -211,6 +252,7 @@ async fn main() -> anyhow::Result<()> {
                 tls_mount_dir: args.tls_mount_dir.clone(),
                 cluster_domain: args.cluster_domain.clone(),
             },
+            write_gate: write_gate.clone(),
         },
         client.clone(),
     ));
@@ -246,6 +288,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let _ = resync_task.await;
+    if let Some(task) = leader_task {
+        let _ = task.await;
+    }
+    // The signal task completes only when an OS signal arrives. A shutdown
+    // that started elsewhere (a lost leader Lease fencing itself, WOR-2614)
+    // must not wait for a signal that may never come.
+    signal_task.abort();
     let _ = signal_task.await;
     let _ = health_task.await;
     Ok(())
@@ -320,103 +369,7 @@ async fn serve_health(addr: SocketAddr, shutdown: shutdown::ShutdownSignal) -> a
     }
 }
 
-// --- Leader election -----------------------------------------------------
-
-/// Acquire a `coordination.k8s.io/v1` Lease. `Ok(true)` once held,
-/// `Ok(false)` when shutdown arrived first.
-///
-/// Poll-create-then-apply with a fixed retry period, the same shape
-/// client-go uses, so no extra dependency is needed. Only relevant with
-/// more than one replica: two controllers writing the same `sb.yml` would
-/// fight over the file.
-async fn acquire_leader_lease(
-    client: &Client,
-    namespace: &str,
-    name: &str,
-    shutdown: shutdown::ShutdownSignal,
-) -> anyhow::Result<bool> {
-    use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
-    use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
-    use kube::api::{Api, ObjectMeta, Patch, PatchParams, PostParams};
-
-    let identity = format!("{}-{}", hostname_or_default(), std::process::id());
-    let api: Api<Lease> = Api::namespaced(client.clone(), namespace);
-
-    let lease_duration_secs = 15i32;
-    let retry_period = Duration::from_secs(5);
-
-    loop {
-        let now = MicroTime(chrono::Utc::now());
-        match api.get_opt(name).await.context("read the leader Lease")? {
-            None => {
-                let body = Lease {
-                    metadata: ObjectMeta {
-                        name: Some(name.to_string()),
-                        namespace: Some(namespace.to_string()),
-                        ..Default::default()
-                    },
-                    spec: Some(LeaseSpec {
-                        holder_identity: Some(identity.clone()),
-                        lease_duration_seconds: Some(lease_duration_secs),
-                        acquire_time: Some(now.clone()),
-                        renew_time: Some(now),
-                        ..Default::default()
-                    }),
-                };
-                match api.create(&PostParams::default(), &body).await {
-                    Ok(_) => return Ok(true),
-                    // Someone else created it between the read and the
-                    // write. Fall through and try the takeover path.
-                    Err(kube::Error::Api(e)) if e.code == 409 => {}
-                    Err(e) => return Err(anyhow::anyhow!("create the leader Lease: {e}")),
-                }
-            }
-            Some(lease) => {
-                let spec = lease.spec.unwrap_or_default();
-                let we_hold = spec.holder_identity.as_deref() == Some(identity.as_str());
-                if we_hold || is_lease_expired(&spec, lease_duration_secs) {
-                    let stamp =
-                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
-                    let patch = serde_json::json!({
-                        "apiVersion": "coordination.k8s.io/v1",
-                        "kind": "Lease",
-                        "metadata": { "name": name },
-                        "spec": {
-                            "holderIdentity": identity,
-                            "leaseDurationSeconds": lease_duration_secs,
-                            "renewTime": stamp,
-                            "acquireTime": stamp,
-                        }
-                    });
-                    let pp = PatchParams::apply("sbproxy-gateway-controller").force();
-                    if api.patch(name, &pp, &Patch::Apply(&patch)).await.is_ok() {
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-
-        tokio::select! {
-            _ = shutdown.wait() => return Ok(false),
-            _ = tokio::time::sleep(retry_period) => {}
-        }
-    }
-}
-
-fn hostname_or_default() -> String {
-    std::env::var("HOSTNAME").unwrap_or_else(|_| "controller".to_string())
-}
-
-fn is_lease_expired(
-    spec: &k8s_openapi::api::coordination::v1::LeaseSpec,
-    lease_duration_secs: i32,
-) -> bool {
-    let Some(renew) = spec.renew_time.as_ref() else {
-        // Never renewed, so nobody is holding it.
-        return true;
-    };
-    chrono::Utc::now()
-        .signed_duration_since(renew.0)
-        .num_seconds()
-        > i64::from(lease_duration_secs)
-}
+// Leader election lives in `sbproxy_k8s_controller::leader` (WOR-2614):
+// acquisition, continuous renewal, and the write fence are one lifecycle
+// there, tested against an in-memory Lease with the API server's
+// conditional-write semantics.

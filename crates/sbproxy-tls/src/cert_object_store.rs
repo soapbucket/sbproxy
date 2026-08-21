@@ -86,16 +86,34 @@ impl ObjectStoreCertKv {
     }
 }
 
-/// A lock object's payload: `"<expiry_unix>:<hex(token)>"`.
-fn encode_lock(token: &[u8], expiry: u64) -> Vec<u8> {
-    format!("{expiry}:{}", hex::encode(token)).into_bytes()
+/// A lock object's payload: `"<expiry_unix>:<generation>:<hex(token)>"`.
+///
+/// An empty token with expiry 0 is a released lease. The object survives the
+/// release rather than being deleted, because the generation in it is the
+/// fencing token a bundle publication is checked against, and a deleted
+/// object would restart the count at one (WOR-2633).
+fn encode_lock(token: &[u8], expiry: u64, generation: u64) -> Vec<u8> {
+    format!("{expiry}:{generation}:{}", hex::encode(token)).into_bytes()
 }
 
-/// Parse `(expiry, hex_token)` from a lock object's payload.
-fn decode_lock(bytes: &[u8]) -> Option<(u64, String)> {
+/// Parse `(expiry, generation, hex_token)`. A payload written before
+/// WOR-2633 has two fields and decodes as generation zero.
+fn decode_lock(bytes: &[u8]) -> Option<(u64, u64, String)> {
     let s = std::str::from_utf8(bytes).ok()?;
-    let (exp, tok) = s.split_once(':')?;
-    Some((exp.parse().ok()?, tok.to_string()))
+    let mut parts = s.splitn(3, ':');
+    let expiry: u64 = parts.next()?.parse().ok()?;
+    let second = parts.next()?;
+    match parts.next() {
+        Some(token) => Some((expiry, second.parse().ok()?, token.to_string())),
+        None => Some((expiry, 0, second.to_string())),
+    }
+}
+
+/// A lease is expired the moment its deadline is reached, so a zero TTL is a
+/// lease nobody holds. That makes "already expired" expressible without a
+/// test having to sleep through a whole second.
+fn lease_expired(expiry: u64) -> bool {
+    unix_now() >= expiry
 }
 
 impl KVStore for ObjectStoreCertKv {
@@ -151,77 +169,183 @@ impl KVStore for ObjectStoreCertKv {
     }
 
     fn try_lock(&self, key: &[u8], token: &[u8], ttl_secs: u64) -> Result<bool> {
-        // WOR-1775: atomic create-if-absent (PutMode::Create) is the lease.
-        // On contention, steal only an expired lease (crashed holder); the
-        // ACME task re-checks the cert under the lock, so a rare double
-        // acquire does not double-issue.
+        Ok(self.try_lock_fenced(key, token, ttl_secs)?.is_some())
+    }
+
+    fn try_lock_fenced(&self, key: &[u8], token: &[u8], ttl_secs: u64) -> Result<Option<u64>> {
+        // WOR-1775 made first acquisition atomic with `PutMode::Create`
+        // (S3 `If-None-Match`, GCS generation precondition). WOR-2633 does
+        // the same for the other half: taking over an expired lease used to
+        // read the object and then overwrite it unconditionally, so two
+        // replicas that read the same stale lease both wrote and both
+        // returned success. The takeover is now a conditional update against
+        // the version the staleness decision was made on, which is the same
+        // precondition the create path already relied on, and it publishes a
+        // strictly higher generation so the superseded holder is fenced out
+        // of the bundle store rather than trusted to notice.
         let path = self.path(key);
-        let payload = encode_lock(token, unix_now() + ttl_secs);
         block_on(async {
+            let first = encode_lock(token, unix_now() + ttl_secs, 1);
             let opts = PutOptions {
                 mode: PutMode::Create,
                 ..Default::default()
             };
             match self
                 .store
-                .put_opts(&path, PutPayload::from(payload.clone()), opts)
+                .put_opts(&path, PutPayload::from(first), opts)
                 .await
             {
-                Ok(_) => Ok(true),
-                Err(object_store::Error::AlreadyExists { .. }) => {
-                    match self.store.get(&path).await {
-                        Ok(r) => {
-                            let existing = r.bytes().await?;
-                            let expired = decode_lock(&existing)
-                                .map(|(exp, _)| unix_now() > exp)
-                                .unwrap_or(true);
-                            if expired {
-                                // Overwrite the stale lease with ours.
-                                self.store
-                                    .put_opts(
-                                        &path,
-                                        PutPayload::from(payload),
-                                        PutOptions {
-                                            mode: PutMode::Overwrite,
-                                            ..Default::default()
-                                        },
-                                    )
-                                    .await?;
-                                Ok(true)
-                            } else {
-                                Ok(false)
-                            }
-                        }
-                        Err(object_store::Error::NotFound { .. }) => Ok(false),
-                        Err(e) => Err(e.into()),
-                    }
+                Ok(_) => return Ok(Some(1)),
+                Err(object_store::Error::AlreadyExists { .. }) => {}
+                Err(e) => return Err(e.into()),
+            }
+
+            let existing = match self.store.get(&path).await {
+                Ok(r) => r,
+                // Released between the create and the read. Report
+                // contention; the caller retries on its next tick.
+                Err(object_store::Error::NotFound { .. }) => return Ok(None),
+                Err(e) => return Err(e.into()),
+            };
+            let version = object_store::UpdateVersion {
+                e_tag: existing.meta.e_tag.clone(),
+                version: existing.meta.version.clone(),
+            };
+            let bytes = existing.bytes().await?;
+            let (expiry, generation, _) = decode_lock(&bytes).unwrap_or((0, 0, String::new()));
+            if !lease_expired(expiry) {
+                return Ok(None);
+            }
+
+            let next = generation.saturating_add(1);
+            let payload = encode_lock(token, unix_now() + ttl_secs, next);
+            match self
+                .store
+                .put_opts(
+                    &path,
+                    PutPayload::from(payload),
+                    PutOptions {
+                        mode: PutMode::Update(version),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(_) => Ok(Some(next)),
+                // A peer changed the object between our read and our write.
+                // Losing here is the whole point of the precondition.
+                Err(object_store::Error::Precondition { .. })
+                | Err(object_store::Error::AlreadyExists { .. }) => Ok(None),
+                // No conditional write, no fence. Refusing the takeover is
+                // the honest outcome: an unconditional overwrite here is
+                // exactly the double acquisition WOR-2633 is about, and a
+                // lock that quietly stops being a lock is worse than one
+                // that says it cannot proceed. S3, GCS, and Azure all
+                // support the precondition; `object_store`'s local
+                // filesystem does not, and a single host should be using
+                // the `file` backend anyway.
+                Err(object_store::Error::NotImplemented) => {
+                    tracing::warn!(
+                        "this object store has no conditional write, so an expired ACME \
+                         issuance lease cannot be taken over safely; use acme.storage_backend \
+                         'file' for a single host or a bucket on s3/gcs/azure for a fleet"
+                    );
+                    Ok(None)
                 }
                 Err(e) => Err(e.into()),
             }
         })
     }
 
-    fn unlock(&self, key: &[u8], token: &[u8]) -> Result<()> {
-        // Compare-and-delete: only remove the lock while it still holds our
-        // token, so we never release a lease a peer acquired after ours
-        // expired.
+    fn renew_lock(&self, key: &[u8], token: &[u8], ttl_secs: u64) -> Result<bool> {
+        // Conditional on the version we read, so a renewal can never extend
+        // a lease a peer took over after ours lapsed.
         let path = self.path(key);
         let want = hex::encode(token);
         block_on(async {
-            match self.store.get(&path).await {
-                Ok(r) => {
-                    let existing = r.bytes().await?;
-                    if decode_lock(&existing)
-                        .map(|(_, t)| t == want)
-                        .unwrap_or(false)
-                    {
-                        let _ = self.store.delete(&path).await;
-                    }
-                    Ok(())
-                }
-                Err(object_store::Error::NotFound { .. }) => Ok(()),
+            let existing = match self.store.get(&path).await {
+                Ok(r) => r,
+                Err(object_store::Error::NotFound { .. }) => return Ok(false),
+                Err(e) => return Err(e.into()),
+            };
+            let version = object_store::UpdateVersion {
+                e_tag: existing.meta.e_tag.clone(),
+                version: existing.meta.version.clone(),
+            };
+            let bytes = existing.bytes().await?;
+            let Some((_, generation, holder)) = decode_lock(&bytes) else {
+                return Ok(false);
+            };
+            if holder != want {
+                return Ok(false);
+            }
+            let payload = encode_lock(token, unix_now() + ttl_secs, generation);
+            match self
+                .store
+                .put_opts(
+                    &path,
+                    PutPayload::from(payload),
+                    PutOptions {
+                        mode: PutMode::Update(version),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(_) => Ok(true),
+                Err(object_store::Error::Precondition { .. })
+                | Err(object_store::Error::AlreadyExists { .. })
+                | Err(object_store::Error::NotImplemented) => Ok(false),
                 Err(e) => Err(e.into()),
             }
+        })
+    }
+
+    fn unlock(&self, key: &[u8], token: &[u8]) -> Result<()> {
+        // Compare-and-release: rewrite as an expired, unheld lease while it
+        // still carries our token, so we never release a lease a peer
+        // acquired after ours expired. The generation survives the release.
+        let path = self.path(key);
+        let want = hex::encode(token);
+        block_on(async {
+            let existing = match self.store.get(&path).await {
+                Ok(r) => r,
+                Err(object_store::Error::NotFound { .. }) => return Ok(()),
+                Err(e) => return Err(e.into()),
+            };
+            let version = object_store::UpdateVersion {
+                e_tag: existing.meta.e_tag.clone(),
+                version: existing.meta.version.clone(),
+            };
+            let bytes = existing.bytes().await?;
+            let Some((_, generation, holder)) = decode_lock(&bytes) else {
+                return Ok(());
+            };
+            if holder != want {
+                return Ok(());
+            }
+            let released = PutPayload::from(encode_lock(b"", 0, generation));
+            let conditional = self
+                .store
+                .put_opts(
+                    &path,
+                    released.clone(),
+                    PutOptions {
+                        mode: PutMode::Update(version),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            if matches!(conditional, Err(object_store::Error::NotImplemented)) {
+                // No precondition available. An unconditional release is
+                // still safe here in a way an unconditional takeover is not:
+                // we verified our own token is on the object, and the only
+                // writer that could have replaced it since is one that took
+                // the lease over, which is a state we are releasing into
+                // anyway.
+                let _ = self.store.put(&path, released).await;
+            }
+            Ok(())
         })
     }
 }
@@ -230,10 +354,25 @@ impl KVStore for ObjectStoreCertKv {
 mod tests {
     use super::*;
 
-    /// A local-filesystem object store exercises the same codepath as S3/GCS
-    /// (object_store's `LocalFileSystem` supports `PutMode::Create`), so the
-    /// data ops and the lock are testable without a cloud account.
+    /// An in-memory object store exercises the same codepath as S3/GCS: it
+    /// implements both `PutMode::Create` and the `PutMode::Update`
+    /// precondition the fenced lease is built on, so the lock is testable
+    /// without a cloud account. `object_store`'s local filesystem implements
+    /// only the first, which is why it is not the harness here.
     fn local_kv() -> (ObjectStoreCertKv, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        (
+            ObjectStoreCertKv {
+                store,
+                prefix: ObjectPath::from("certs"),
+            },
+            dir,
+        )
+    }
+
+    /// A store with no conditional write, to pin the refusal.
+    fn unconditional_kv() -> (ObjectStoreCertKv, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let store: Arc<dyn ObjectStore> =
             Arc::new(object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap());
@@ -244,6 +383,19 @@ mod tests {
             },
             dir,
         )
+    }
+
+    #[test]
+    fn a_store_without_a_conditional_write_refuses_to_take_over() {
+        // WOR-2633: an unconditional overwrite here is the double
+        // acquisition, so a backend that cannot fence declines instead.
+        let (kv, _d) = unconditional_kv();
+        let key = b"acme:lock:unfenced.com";
+        assert!(kv.try_lock(key, b"old", 0).unwrap(), "first acquire");
+        assert!(
+            !kv.try_lock(key, b"new", 60).unwrap(),
+            "an expired lease must not be taken over without a precondition"
+        );
     }
 
     #[test]
@@ -284,12 +436,75 @@ mod tests {
         let (kv, _d) = local_kv();
         let key = b"acme:lock:stale.com";
         assert!(kv.try_lock(key, b"old", 0).unwrap());
-        std::thread::sleep(std::time::Duration::from_millis(1100));
         assert!(
             kv.try_lock(key, b"new", 60).unwrap(),
             "expired lease stolen"
         );
         kv.unlock(key, b"old").unwrap(); // stale owner cannot free the new lock
         assert!(!kv.try_lock(key, b"other", 60).unwrap(), "new holder holds");
+    }
+
+    #[test]
+    fn takeover_generations_strictly_increase_and_renewal_is_owner_only() {
+        // WOR-2633: the generation is the fencing token a publication is
+        // checked against, so it has to keep climbing across release and
+        // across takeover, and renewal has to refuse a superseded holder.
+        let (kv, _d) = local_kv();
+        let key = b"acme:lock:fenced.com";
+        let first = kv.try_lock_fenced(key, b"a", 60).unwrap().unwrap();
+        assert!(kv.renew_lock(key, b"a", 60).unwrap(), "owner renews");
+        assert!(!kv.renew_lock(key, b"b", 60).unwrap(), "non-owner does not");
+        kv.unlock(key, b"a").unwrap();
+        let second = kv.try_lock_fenced(key, b"b", 0).unwrap().unwrap();
+        assert!(second > first, "{second} must exceed {first}");
+        let third = kv.try_lock_fenced(key, b"c", 60).unwrap().unwrap();
+        assert!(third > second, "{third} must exceed {second}");
+        assert!(
+            !kv.renew_lock(key, b"b", 60).unwrap(),
+            "a superseded holder must not renew"
+        );
+    }
+
+    #[test]
+    fn two_barriered_stealers_of_a_stale_object_lease_hand_it_to_exactly_one() {
+        // WOR-2633: the takeover is a conditional update against the
+        // version the staleness decision was made on, so of two contenders
+        // racing the same expired lease, the second write must lose its
+        // precondition. Before the fix both overwrote and both returned
+        // success. Barriered and repeated, because a single round can
+        // interleave safely by accident.
+        let key = b"acme:lock:contended.com";
+        for round in 0..50usize {
+            let (kv, _d) = local_kv();
+            let kv = std::sync::Arc::new(kv);
+            // A zero TTL is a lease that is expired the moment it lands.
+            assert!(kv.try_lock(key, b"crashed-owner", 0).unwrap());
+
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let mut handles = Vec::new();
+            for token in [b"contender-b".as_slice(), b"contender-c".as_slice()] {
+                let kv = std::sync::Arc::clone(&kv);
+                let barrier = std::sync::Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    kv.try_lock_fenced(key, token, 60).unwrap()
+                }));
+            }
+            let generations: Vec<u64> = handles
+                .into_iter()
+                .filter_map(|h| h.join().unwrap())
+                .collect();
+            assert_eq!(
+                generations.len(),
+                1,
+                "round {round}: an expired lease must go to exactly one \
+                 contender, got {generations:?}"
+            );
+            assert!(
+                generations[0] > 1,
+                "round {round}: the takeover must supersede the crashed \
+                 owner's generation"
+            );
+        }
     }
 }

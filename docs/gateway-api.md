@@ -1,6 +1,6 @@
 # Gateway API controller
 
-*Last modified: 2026-08-09*
+*Last modified: 2026-08-20*
 
 `sbproxy-k8s-controller` watches `gateway.networking.k8s.io/v1` resources and renders them into a single `sb.yml` the data plane reads. You write `Gateway` and `HTTPRoute` objects; it writes the config file.
 
@@ -297,6 +297,10 @@ Not implemented. Anything in this list is either ignored or reported through a s
 ### More than one replica
 
 One replica writes one file. Two replicas without leader election write the same file and fight over it. Set `--leader-election=true` and apply the namespaced Role in `rbac.yaml`; the loser blocks on the Lease and reconciles nothing until it wins.
+
+Leadership is a lifecycle, not a one-shot claim. The leader renews a 15 second Lease every 5 seconds. A standby may take the Lease over only after a full lease duration has passed since the last successful renewal, and the takeover is conditional on the Lease's `resourceVersion`, so two standbys racing the same expired Lease see exactly one winner. A leader whose renewals keep failing fences itself after 10 seconds: it stops writing the document and Gateway API status, fails its readiness probe, and exits so the Deployment restarts it as a standby.
+
+The self-fence deadline (10s) is strictly inside the takeover threshold (15s), so a deposed leader has stopped writing before its successor can start, and two details are what make that arithmetic true rather than approximately true. Both replicas measure from the same instant: the Lease's `renewTime` is stamped when a renewal *begins*, so the leader measures its own deadline from the start of its last successful renewal rather than from when that call returned. And the deadline is enforced from inside the wait, not checked after the API call returns, so an API server that hangs instead of erroring cannot push the fence out by however long it hangs. What is left over, a full renewal period, is the margin for clock skew between the two replicas.
 
 ### Reading the log
 

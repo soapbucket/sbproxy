@@ -28,6 +28,9 @@
 //!   status reports out.
 //! * [`controller`] owns the watch streams, the reconcile queue, and the
 //!   status writes.
+//! * [`leader`] owns the leader-election lifecycle: acquire, renew, fence
+//!   on loss (WOR-2614). Its [`leader::WriteGate`] is what the reconciler
+//!   checks before any config or status write.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -36,6 +39,7 @@ pub mod config_writer;
 pub mod controller;
 pub mod gateway_api;
 pub mod health;
+pub mod leader;
 pub mod metrics;
 pub mod reconciler;
 pub mod shutdown;

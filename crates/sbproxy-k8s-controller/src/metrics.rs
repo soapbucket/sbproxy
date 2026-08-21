@@ -32,6 +32,15 @@ use prometheus::{
 pub const RESULT_SUCCESS: &str = "success";
 /// `result` label for an operation that failed.
 pub const RESULT_ERROR: &str = "error";
+/// `result` label for a reconcile the leadership fence refused (WOR-2614).
+///
+/// Its own value, not folded into [`RESULT_ERROR`], because it is not a
+/// fault. Every reconcile still queued when a replica loses its Lease ends
+/// this way, deliberately, and counting a burst of deliberate refusals as
+/// errors pages an operator for a controller behaving correctly and buries
+/// whatever real error might be in the same burst. Alert on `error`;
+/// `fenced` is how long a step-down took.
+pub const RESULT_FENCED: &str = "fenced";
 
 static RECONCILE_TOTAL: OnceLock<Option<IntCounterVec>> = OnceLock::new();
 static RECONCILE_DURATION: OnceLock<Option<HistogramVec>> = OnceLock::new();
@@ -111,6 +120,17 @@ pub fn record_reconcile(kind: &str, result: &str, duration_secs: f64) {
     }
 }
 
+/// Current value of `sbproxy_gateway_reconcile_total{kind,result}`.
+///
+/// A test-only reader, so a test can assert on a delta rather than on the
+/// whole registry, which other tests in the same process also write to.
+#[cfg(test)]
+pub(crate) fn reconcile_count(kind: &str, result: &str) -> u64 {
+    reconcile_total()
+        .map(|counter| counter.with_label_values(&[kind, result]).get())
+        .unwrap_or(0)
+}
+
 /// Record one watch stream error.
 ///
 /// Distinct from a reconcile error: these come from the API server
@@ -187,9 +207,14 @@ mod tests {
 
     #[test]
     fn result_labels_are_stable() {
-        // Dashboards and alerts key off these two strings.
+        // Dashboards and alerts key off these strings.
         assert_eq!(RESULT_SUCCESS, "success");
         assert_eq!(RESULT_ERROR, "error");
+        assert_eq!(RESULT_FENCED, "fenced");
+        assert_ne!(
+            RESULT_FENCED, RESULT_ERROR,
+            "a deliberate fence must be countable apart from a fault"
+        );
     }
 
     #[test]

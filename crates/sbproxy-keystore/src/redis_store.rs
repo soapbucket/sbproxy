@@ -30,10 +30,44 @@ const KEYS_HASH: &str = "sbproxy:keystore:keys";
 const CREDS_HASH: &str = "sbproxy:keystore:credentials";
 const REVISION_KEY: &str = "sbproxy:keystore:revision";
 const INVALIDATE_CHANNEL: &str = "sbproxy:keystore:invalidate";
+/// Everything the L2 cache tier owns lives under this prefix, which is what
+/// makes "drop everything" a bounded `SCAN` rather than a `FLUSHDB` on a
+/// Redis an operator is probably sharing with something else.
+const CACHE_PREFIX: &str = "sbproxy:keystore:cache:";
 const CACHE_KEY_PREFIX: &str = "sbproxy:keystore:cache:key:";
 const CACHE_CRED_PREFIX: &str = "sbproxy:keystore:cache:cred:";
 /// Sentinel payload meaning "drop everything".
 const INVALIDATE_ALL: &str = "*";
+/// How many keys one `SCAN` iteration asks for while clearing the tier.
+const CACHE_SCAN_COUNT: usize = 512;
+
+/// Write a record, bump the global revision, and publish invalidation as
+/// one Redis server-side operation (WOR-2639).
+///
+/// These used to be three separate commands, which left two torn states a
+/// fleet cannot see past: a mutation that committed while the process died
+/// before the publish (peers keep serving their positive cache for the
+/// whole L1 TTL), and a revision that never moved for a record that did
+/// (nothing that compares revisions can detect the change). One Lua script
+/// makes commit, revision, and notification indivisible: if the mutation
+/// happened, the publish happened, whatever the client saw.
+const MUTATE_PUT_LUA: &str = r#"
+redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+local rev = redis.call('INCR', KEYS[2])
+redis.call('PUBLISH', KEYS[3], ARGV[1])
+return rev
+"#;
+
+/// Delete a record, bump the global revision, and publish invalidation as
+/// one Redis server-side operation (WOR-2639). Deletion is the security
+/// path: a revoke whose invalidation can be skipped is a credential that
+/// stays accepted somewhere.
+const MUTATE_DEL_LUA: &str = r#"
+redis.call('HDEL', KEYS[1], ARGV[1])
+local rev = redis.call('INCR', KEYS[2])
+redis.call('PUBLISH', KEYS[3], ARGV[1])
+return rev
+"#;
 
 /// Compare, write, bump the global revision, and publish invalidation as one
 /// Redis server-side operation. Legacy records without `policy_revision`
@@ -110,16 +144,29 @@ impl RedisKeyStore {
         }
     }
 
-    /// Bump the revision counter and announce a changed id to peers.
-    async fn announce(&self, c: &mut MultiplexedConnection, id: &str) -> Result<()> {
-        let _: i64 = c
-            .incr(REVISION_KEY, 1)
-            .await
-            .context("redis INCR revision")?;
-        let _: i64 = c
-            .publish(INVALIDATE_CHANNEL, id)
-            .await
-            .context("redis PUBLISH invalidate")?;
+    /// Run one of the atomic mutate scripts: record write or delete,
+    /// revision bump, and invalidation publish as a single server-side
+    /// operation (WOR-2639).
+    async fn mutate(
+        &self,
+        script: &str,
+        hash: &str,
+        id: &str,
+        payload: Option<&str>,
+        what: &'static str,
+    ) -> Result<()> {
+        let mut c = self.link.conn().await?;
+        let mut cmd = redis::cmd("EVAL");
+        cmd.arg(script)
+            .arg(3)
+            .arg(hash)
+            .arg(REVISION_KEY)
+            .arg(INVALIDATE_CHANNEL)
+            .arg(id);
+        if let Some(payload) = payload {
+            cmd.arg(payload);
+        }
+        let _revision: i64 = cmd.query_async(&mut c).await.context(what)?;
         Ok(())
     }
 }
@@ -144,12 +191,14 @@ impl KeyStore for RedisKeyStore {
 
     async fn put_key(&self, record: KeyRecord) -> Result<()> {
         let bytes = serde_json::to_string(&record).context("encode key record")?;
-        let mut c = self.link.conn().await?;
-        let _: i64 = c
-            .hset(KEYS_HASH, &record.key_id, bytes)
-            .await
-            .context("redis HSET key")?;
-        self.announce(&mut c, &record.key_id).await
+        self.mutate(
+            MUTATE_PUT_LUA,
+            KEYS_HASH,
+            &record.key_id,
+            Some(&bytes),
+            "redis atomic key put",
+        )
+        .await
     }
 
     async fn put_key_if_revision(
@@ -188,9 +237,14 @@ impl KeyStore for RedisKeyStore {
     }
 
     async fn delete_key(&self, key_id: &str) -> Result<()> {
-        let mut c = self.link.conn().await?;
-        let _: i64 = c.hdel(KEYS_HASH, key_id).await.context("redis HDEL key")?;
-        self.announce(&mut c, key_id).await
+        self.mutate(
+            MUTATE_DEL_LUA,
+            KEYS_HASH,
+            key_id,
+            None,
+            "redis atomic key delete",
+        )
+        .await
     }
 
     async fn get_credential(&self, id: &str) -> Result<Option<CredentialRecord>> {
@@ -216,21 +270,25 @@ impl KeyStore for RedisKeyStore {
 
     async fn put_credential(&self, record: CredentialRecord) -> Result<()> {
         let bytes = serde_json::to_string(&record).context("encode credential record")?;
-        let mut c = self.link.conn().await?;
-        let _: i64 = c
-            .hset(CREDS_HASH, &record.id, bytes)
-            .await
-            .context("redis HSET credential")?;
-        self.announce(&mut c, &record.id).await
+        self.mutate(
+            MUTATE_PUT_LUA,
+            CREDS_HASH,
+            &record.id,
+            Some(&bytes),
+            "redis atomic credential put",
+        )
+        .await
     }
 
     async fn delete_credential(&self, id: &str) -> Result<()> {
-        let mut c = self.link.conn().await?;
-        let _: i64 = c
-            .hdel(CREDS_HASH, id)
-            .await
-            .context("redis HDEL credential")?;
-        self.announce(&mut c, id).await
+        self.mutate(
+            MUTATE_DEL_LUA,
+            CREDS_HASH,
+            id,
+            None,
+            "redis atomic credential delete",
+        )
+        .await
     }
 
     async fn revision(&self) -> Result<u64> {
@@ -300,10 +358,49 @@ impl CacheTier for RedisCacheTier {
         }
     }
 
+    /// Delete every entry this tier owns, then announce the drop to peers.
+    ///
+    /// The delete is the part that used to be missing. This method only
+    /// published the `*` sentinel, so the shared entries it claimed to have
+    /// cleared were still there answering L2 lookups for the rest of their
+    /// TTL, and a caller that read the name reasonably assumed otherwise.
+    ///
+    /// `SCAN` rather than `KEYS`, because `KEYS` blocks the server for the
+    /// length of the keyspace, and scoped to the cache prefix rather than
+    /// `FLUSHDB`, because this Redis is not necessarily ours alone. `SCAN`
+    /// gives no snapshot guarantee: an entry written after the cursor passed
+    /// its slot survives, which is correct, since it was written after the
+    /// invalidation and describes a later state.
     async fn invalidate_all(&self) {
-        if let Ok(mut c) = self.link.conn().await {
-            let _: Result<i64, _> = c.publish(INVALIDATE_CHANNEL, INVALIDATE_ALL).await;
+        let Ok(mut c) = self.link.conn().await else {
+            return;
+        };
+        let pattern = format!("{CACHE_PREFIX}*");
+        let mut cursor: u64 = 0;
+        loop {
+            let scanned: Result<(u64, Vec<String>), _> = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(CACHE_SCAN_COUNT)
+                .query_async(&mut c)
+                .await;
+            let Ok((next, keys)) = scanned else {
+                // Best effort, like every other method on this tier: the
+                // publish below still reaches peers, and the store stays
+                // the source of truth.
+                break;
+            };
+            if !keys.is_empty() {
+                let _: Result<i64, _> = c.del(keys).await;
+            }
+            if next == 0 {
+                break;
+            }
+            cursor = next;
         }
+        let _: Result<i64, _> = c.publish(INVALIDATE_CHANNEL, INVALIDATE_ALL).await;
     }
 }
 
@@ -311,9 +408,21 @@ impl CacheTier for RedisCacheTier {
 /// channel and drops matching entries from the local cache when a peer mutates
 /// a record. Intended to be `tokio::spawn`ed by the caller.
 ///
-/// Returns only on a fatal connection error; the caller decides whether to
-/// retry. Each received id is invalidated in `cache`; the `*` sentinel clears
-/// everything.
+/// Returns only on error; the caller decides whether to retry. Each received
+/// id is invalidated in `cache`; the `*` sentinel clears everything.
+///
+/// # Gap recovery (WOR-2639)
+///
+/// Redis pub/sub has no replay: a message published while this replica was
+/// disconnected is gone, and before this fix a revocation missed that way
+/// stayed missed until the positive L1 TTL expired, which is a revoked
+/// credential being accepted for up to a minute. Every (re)subscription
+/// therefore begins by dropping the entire local cache, after the
+/// subscription is live, so any mutation that happened during a gap is
+/// covered either by the resync (published before we subscribed) or by the
+/// stream (published after). The stream ending is reported as an error
+/// rather than a clean return, so a supervising loop resubscribes and
+/// resynchronizes instead of treating silence as health.
 pub async fn subscribe_invalidations(url: String, cache: Arc<TtlCache>) -> Result<()> {
     use futures::StreamExt;
 
@@ -328,16 +437,74 @@ pub async fn subscribe_invalidations(url: String, cache: Arc<TtlCache>) -> Resul
         .await
         .context("subscribe invalidate channel")?;
 
-    let mut stream = pubsub.on_message();
-    while let Some(msg) = stream.next().await {
-        let payload: String = msg.get_payload().unwrap_or_default();
-        if payload == INVALIDATE_ALL {
-            cache.invalidate_all().await;
-        } else if !payload.is_empty() {
-            cache.invalidate(&payload).await;
-        }
+    // Best-effort revision checkpoint for the log line, so operators can
+    // correlate "which revision was this replica current with when it
+    // resynced". Ids and revisions only; never record contents.
+    let revision: Option<i64> = match client.get_multiplexed_async_connection().await {
+        Ok(mut conn) => redis::cmd("GET")
+            .arg(REVISION_KEY)
+            .query_async(&mut conn)
+            .await
+            .ok()
+            .flatten(),
+        Err(_) => None,
+    };
+
+    let stream = pubsub
+        .on_message()
+        .map(|msg| msg.get_payload::<String>().unwrap_or_default());
+    resync_then_pump(&cache, stream, revision).await
+}
+
+/// The subscriber's body, split from the connection plumbing so the gap
+/// contract is testable without a Redis: clear the local cache first, then
+/// apply the stream, and treat the stream ending as a failure.
+///
+/// # Why the resync is local-only
+///
+/// This is a receiver, and every write path on [`RedisCacheTier`] publishes
+/// on the very channel this task is subscribed to. Clearing through
+/// [`TtlCache::invalidate_all`] here would publish `*`, the subscription
+/// would deliver that `*` straight back, applying it would publish another
+/// one, and the loop would never close: an unbounded pub/sub storm at every
+/// boot and every reconnect on any deployment running
+/// `key_management.cache.tier: redis`. The local clear is the whole job
+/// anyway. The shared L2 entry for a record that changed during the gap was
+/// already deleted by the replica that changed it, in the same
+/// [`CacheTier::invalidate`] call that announced it.
+async fn resync_then_pump<S>(cache: &TtlCache, mut stream: S, revision: Option<i64>) -> Result<()>
+where
+    S: futures::Stream<Item = String> + Unpin,
+{
+    use futures::StreamExt;
+
+    // The subscription is already live, so this order leaves no window: a
+    // revocation is either older than this clear (covered by it) or newer
+    // (delivered by the stream).
+    cache.invalidate_all_local();
+    tracing::info!(
+        revision = revision.unwrap_or(-1),
+        "keystore invalidation subscriber connected; cleared the local cache to cover any missed window"
+    );
+
+    while let Some(payload) = stream.next().await {
+        apply_invalidation(cache, &payload).await;
     }
-    Ok(())
+    anyhow::bail!("keystore invalidation stream ended; a resubscribe must resynchronize")
+}
+
+/// One invalidation message: an id drops that entry, `*` drops everything,
+/// an empty payload is ignored.
+///
+/// Every drop here is local-only, for the reason [`resync_then_pump`]
+/// spells out: answering a broadcast with a broadcast is what turns one
+/// revocation into an endless one.
+async fn apply_invalidation(cache: &TtlCache, payload: &str) {
+    if payload == INVALIDATE_ALL {
+        cache.invalidate_all_local();
+    } else if !payload.is_empty() {
+        cache.invalidate_local(payload);
+    }
 }
 
 #[cfg(test)]
@@ -382,6 +549,211 @@ mod tests {
             assert!(KEY_POLICY_CAS_LUA.contains(command), "missing {command}");
         }
         assert!(KEY_POLICY_CAS_LUA.contains("policy_revision"));
+    }
+
+    #[test]
+    fn mutate_scripts_commit_revision_and_publish_as_one_operation() {
+        // WOR-2639: the write, the revision bump, and the invalidation
+        // publish must be one server-side script, so a mutation can never
+        // commit while its notification is skipped. A Lua script is the
+        // atomicity boundary Redis gives us; these pins keep all three
+        // commands inside it.
+        for command in ["HSET", "INCR", "PUBLISH"] {
+            assert!(
+                MUTATE_PUT_LUA.contains(command),
+                "put script missing {command}"
+            );
+        }
+        for command in ["HDEL", "INCR", "PUBLISH"] {
+            assert!(
+                MUTATE_DEL_LUA.contains(command),
+                "delete script missing {command}"
+            );
+        }
+    }
+
+    async fn warmed_cache() -> (Arc<crate::MemoryKeyStore>, Arc<TtlCache>) {
+        use crate::KeyStore as _;
+        let store = Arc::new(crate::MemoryKeyStore::new());
+        store
+            .put_key(KeyRecord::new("k1", "h1", ts()))
+            .await
+            .unwrap();
+        store
+            .put_key(KeyRecord::new("k2", "h2", ts()))
+            .await
+            .unwrap();
+        let cache = Arc::new(TtlCache::new(
+            Arc::clone(&store) as Arc<dyn crate::KeyStore>,
+            TtlCacheConfig::default(),
+        ));
+        assert!(cache.resolve_key("k1").await.unwrap().is_some());
+        assert!(cache.resolve_key("k2").await.unwrap().is_some());
+        // Revoke both behind the cache's back: this is the state a replica
+        // is in when a peer revoked during a pub/sub gap.
+        store.delete_key("k1").await.unwrap();
+        store.delete_key("k2").await.unwrap();
+        assert!(
+            cache.resolve_key("k1").await.unwrap().is_some(),
+            "the stale positive cache is exactly the hazard under test"
+        );
+        (store, cache)
+    }
+
+    /// Stands in for [`RedisCacheTier`] without a Redis. The only thing
+    /// under test is whether the subscriber path reaches a tier at all:
+    /// every write method on the real tier ends in a `PUBLISH` on the
+    /// channel the subscriber is listening to, so one call here is one
+    /// message the fleet would have to process, and answer, and process
+    /// again.
+    #[derive(Default)]
+    struct PublishCountingTier {
+        published: std::sync::atomic::AtomicU64,
+    }
+
+    impl PublishCountingTier {
+        fn publishes(&self) -> u64 {
+            self.published.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn record(&self) {
+            self.published
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl CacheTier for PublishCountingTier {
+        async fn get_key(&self, _: &str) -> Option<KeyRecord> {
+            None
+        }
+        async fn put_key(&self, _: &KeyRecord, _: Duration) {}
+        async fn get_credential(&self, _: &str) -> Option<CredentialRecord> {
+            None
+        }
+        async fn put_credential(&self, _: &CredentialRecord, _: Duration) {}
+        async fn invalidate(&self, _: &str) {
+            self.record();
+        }
+        async fn invalidate_all(&self) {
+            self.record();
+        }
+    }
+
+    #[tokio::test]
+    async fn the_subscriber_never_publishes_what_it_received() {
+        // The self-sustaining storm this pins out: `invalidate_all` on the
+        // Redis tier publishes `*` on INVALIDATE_CHANNEL, and this
+        // subscriber is subscribed to INVALIDATE_CHANNEL. A resync that
+        // published, or a received `*` that published, would be delivered
+        // straight back to every replica including this one, each of which
+        // would publish again. It never converges, and it starts at every
+        // boot and every reconnect. Neither the resync nor any received
+        // message may reach the tier.
+        use crate::KeyStore as _;
+        let store = Arc::new(crate::MemoryKeyStore::new());
+        store
+            .put_key(KeyRecord::new("k1", "h1", ts()))
+            .await
+            .unwrap();
+        let tier = Arc::new(PublishCountingTier::default());
+        let cache = Arc::new(
+            TtlCache::new(
+                Arc::clone(&store) as Arc<dyn crate::KeyStore>,
+                TtlCacheConfig::default(),
+            )
+            .with_tier(Arc::clone(&tier) as Arc<dyn CacheTier>),
+        );
+        assert!(cache.resolve_key("k1").await.unwrap().is_some());
+        store.delete_key("k1").await.unwrap();
+
+        let outcome = resync_then_pump(
+            &cache,
+            futures::stream::iter(vec![
+                INVALIDATE_ALL.to_string(),
+                "k1".to_string(),
+                String::new(),
+            ]),
+            Some(11),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "a stream that ends asks for a resubscribe"
+        );
+        assert!(
+            cache.resolve_key("k1").await.unwrap().is_none(),
+            "the local cache is still cleared; only the echo is gone"
+        );
+        assert_eq!(
+            tier.publishes(),
+            0,
+            "the subscriber published {} message(s) in response to messages it \
+             received; every one of them comes straight back",
+            tier.publishes()
+        );
+
+        // Directly, so the property is pinned per message kind and not only
+        // in aggregate.
+        apply_invalidation(&cache, INVALIDATE_ALL).await;
+        apply_invalidation(&cache, "k1").await;
+        assert_eq!(tier.publishes(), 0);
+    }
+
+    #[test]
+    fn the_cache_prefix_covers_both_entry_kinds() {
+        // `invalidate_all` clears by scanning CACHE_PREFIX. A per-kind
+        // prefix that drifted out from under it would leave entries the
+        // scan cannot see and the method claims to have deleted.
+        assert!(CACHE_KEY_PREFIX.starts_with(CACHE_PREFIX));
+        assert!(CACHE_CRED_PREFIX.starts_with(CACHE_PREFIX));
+        assert_ne!(CACHE_PREFIX, CACHE_KEY_PREFIX);
+    }
+
+    #[tokio::test]
+    async fn a_subscription_start_clears_entries_cached_before_it() {
+        // WOR-2639: a revocation published while this replica was
+        // disconnected is gone forever (pub/sub has no replay), so the
+        // subscriber's first act after subscribing must be a full local
+        // clear. An empty stream then ending must be an error, so the
+        // supervising loop resubscribes instead of idling forever.
+        let (_store, cache) = warmed_cache().await;
+        let outcome =
+            resync_then_pump(&cache, futures::stream::iter(Vec::<String>::new()), Some(7)).await;
+        assert!(
+            outcome.is_err(),
+            "a stream that ends must tell the caller to resubscribe"
+        );
+        assert!(
+            cache.resolve_key("k1").await.unwrap().is_none(),
+            "an entry cached before the subscription began must not survive it"
+        );
+        assert!(cache.resolve_key("k2").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_invalidation_message_drops_that_id_and_star_drops_everything() {
+        let (_store, cache) = warmed_cache().await;
+        // Re-warm is impossible post-delete, so drive the per-message
+        // handler directly against the still-cached entries.
+        apply_invalidation(&cache, "k1").await;
+        assert!(
+            cache.resolve_key("k1").await.unwrap().is_none(),
+            "a published id must invalidate that entry"
+        );
+        assert!(
+            cache.resolve_key("k2").await.unwrap().is_some(),
+            "an unrelated entry keeps its cache"
+        );
+        apply_invalidation(&cache, "").await;
+        assert!(
+            cache.resolve_key("k2").await.unwrap().is_some(),
+            "an empty payload is ignored"
+        );
+        apply_invalidation(&cache, INVALIDATE_ALL).await;
+        assert!(
+            cache.resolve_key("k2").await.unwrap().is_none(),
+            "the sentinel clears everything"
+        );
     }
 
     #[tokio::test]

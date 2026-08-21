@@ -92,6 +92,57 @@ pub trait KVStore: Send + Sync + 'static {
         Ok(true)
     }
 
+    /// Acquire a lock and return the *fencing generation* that goes with it
+    /// (WOR-2633). `Ok(None)` means another holder has it.
+    ///
+    /// The generation strictly increases across every successful acquisition
+    /// of the same key on a given backend, including a takeover of an expired
+    /// lease. That is what makes a lock safe to build on: mutual exclusion
+    /// alone cannot survive a holder that pauses past its lease, but a
+    /// publication that refuses any generation it has already seen can. A
+    /// superseded owner is fenced out at the write rather than trusted to
+    /// notice it was superseded.
+    ///
+    /// The default pairs [`Self::try_lock`] with a counter persisted in the
+    /// store itself under `<key>:fence`, which is the honest answer for a
+    /// single-node backend (memory, redb, sqlite): there is no cross-node
+    /// contention to fence, so the read-increment-write below cannot race,
+    /// and persisting the counter next to the data keeps it monotonic across
+    /// a process restart. A process-local counter would restart at one while
+    /// the material it fences persisted at seven, and every later
+    /// acquisition would look superseded by history. A shared backend must
+    /// override this with an atomic generation the whole fleet agrees on, or
+    /// it is not cluster-safe.
+    fn try_lock_fenced(&self, key: &[u8], token: &[u8], ttl_secs: u64) -> Result<Option<u64>> {
+        if !self.try_lock(key, token, ttl_secs)? {
+            return Ok(None);
+        }
+        let mut fence_key = key.to_vec();
+        fence_key.extend_from_slice(b":fence");
+        let next = self
+            .get(&fence_key)?
+            .and_then(|bytes| std::str::from_utf8(&bytes).ok()?.parse::<u64>().ok())
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.put(&fence_key, next.to_string().as_bytes())?;
+        Ok(Some(next))
+    }
+
+    /// Extend a lease this caller already holds under `token`, returning
+    /// `false` once the lease is no longer ours (WOR-2633).
+    ///
+    /// An ACME order can legitimately outlive any TTL short enough to release
+    /// a crashed holder promptly, so the holder heartbeats instead of picking
+    /// a TTL that has to cover the worst case. A backend that cannot renew
+    /// conditionally must return `false` rather than `true`, so the caller
+    /// stops rather than continuing on an assumption.
+    ///
+    /// The default is `true`: a single-node backend has no peer that could
+    /// have taken the lease away.
+    fn renew_lock(&self, _key: &[u8], _token: &[u8], _ttl_secs: u64) -> Result<bool> {
+        Ok(true)
+    }
+
     /// Release a lock previously acquired via [`Self::try_lock`] with the
     /// same `token`. An implementation must delete the key only when the
     /// stored value still matches `token`, so a node never releases a lock

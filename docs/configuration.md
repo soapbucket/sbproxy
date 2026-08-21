@@ -5905,7 +5905,7 @@ origins:
 
 #### Certificate store backends
 
-A single node keeps its certificates in a local `redb` file (the default), so a restart reuses the cert instead of asking the CA for a fresh one. A fleet behind a load balancer needs a shared store, or every node issues its own cert and runs into the CA's rate limits. Point `storage_backend` at a shared store and the nodes coordinate: whichever one wins a per-hostname issuance lock issues the certificate, and the rest read it back.
+A single node keeps its certificates in a local `redb` file (the default), so a restart reuses the cert instead of asking the CA for a fresh one. A fleet behind a load balancer needs a shared store, or every node issues its own cert and runs into the CA's rate limits. Point `storage_backend` at a shared store and the nodes coordinate: whichever one wins a per-hostname issuance lease issues the certificate, and the rest read it back and hot-install it without a restart. A replica that was waiting on the lease installs the winner's certificate within seconds of publication; a replica that already held a valid certificate picks up a peer's renewal on its next renewal tick (every 12 hours, well inside the 30 day renewal window). The certificate, its private key, and its metadata are published as one atomic record, so no replica can observe a certificate paired with the previous generation's key.
 
 | Backend | `storage_path` | Use |
 |---|---|---|
@@ -5918,7 +5918,7 @@ A single node keeps its certificates in a local `redb` file (the default), so a 
 
 Anything outside that list is rejected. `sbproxy plan` reports it as `unknown-acme-storage-backend` and the proxy refuses to start on it, rather than falling back to an in-memory store that would re-issue every certificate on every restart.
 
-The shared backends hold the issuance lock as an atomic create with a lease. A node that crashes mid-issue does not wedge the others: the lease expires and another node takes over.
+The shared backends hold the issuance lease as an atomic create, and the holder renews it every 20 seconds for as long as the CA takes. A node that crashes mid-issue does not wedge the others: the lease stops being renewed, expires after 120 seconds, and another node takes over with a conditional write, so two nodes racing the same expired lease see exactly one winner. Every takeover carries a fencing generation, and publication is checked against it, so a node that stalled past its lease and lost it cannot overwrite its successor's certificate however late its own order finishes.
 
 #### HTTP-01 behind a load balancer
 

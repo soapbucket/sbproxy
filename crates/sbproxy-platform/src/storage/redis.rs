@@ -435,6 +435,54 @@ impl KVStore for RedisKVStore {
         })
     }
 
+    fn try_lock_fenced(&self, key: &[u8], token: &[u8], ttl_secs: u64) -> Result<Option<u64>> {
+        self.execute(RedisOperation::Lock, || {
+            // WOR-2633: acquisition and the fencing generation land in one
+            // EVAL, so a holder can never come away with a lease and no
+            // generation, or with a generation another node also holds. The
+            // generation counter deliberately has no TTL: it is a fence, and
+            // a fence that resets to one after an idle period stops fencing.
+            const ACQUIRE: &[u8] = b"if redis.call('set', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then return redis.call('incr', KEYS[2]) else return 0 end";
+            let encoded = Self::encode_key(key);
+            let mut generation_key = key.to_vec();
+            generation_key.extend_from_slice(b":fence");
+            let encoded_generation = Self::encode_key(&generation_key);
+            let ttl_ms = ttl_secs.saturating_mul(1000);
+            self.with_conn(RedisOperation::Lock, |connection| {
+                let generation: i64 = redis::cmd("EVAL")
+                    .arg(ACQUIRE)
+                    .arg(2)
+                    .arg(&encoded)
+                    .arg(&encoded_generation)
+                    .arg(token)
+                    .arg(ttl_ms)
+                    .query(connection)?;
+                Ok((generation > 0).then_some(generation as u64))
+            })
+        })
+    }
+
+    fn renew_lock(&self, key: &[u8], token: &[u8], ttl_secs: u64) -> Result<bool> {
+        self.execute(RedisOperation::Lock, || {
+            // Extend only while the value is still our token. A bare PEXPIRE
+            // would happily extend a lease a peer took over after ours
+            // lapsed, which is the failure this exists to refuse.
+            const RENEW: &[u8] = b"if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('pexpire', KEYS[1], ARGV[2]) else return 0 end";
+            let encoded = Self::encode_key(key);
+            let ttl_ms = ttl_secs.saturating_mul(1000);
+            self.with_conn(RedisOperation::Lock, |connection| {
+                let renewed: i64 = redis::cmd("EVAL")
+                    .arg(RENEW)
+                    .arg(1)
+                    .arg(&encoded)
+                    .arg(token)
+                    .arg(ttl_ms)
+                    .query(connection)?;
+                Ok(renewed == 1)
+            })
+        })
+    }
+
     fn unlock(&self, key: &[u8], token: &[u8]) -> Result<()> {
         self.execute(RedisOperation::Unlock, || {
             // Compare-and-delete via EVAL so we only delete the lock while it is

@@ -428,8 +428,24 @@ What the backend guarantees, stated exactly:
 | Revoke from a partitioned minority | Yes. Revocation is written at one acknowledgment, and anti-entropy carries it across the heal. |
 
 If you need synchronous cluster-wide denial, the mesh backend is the wrong
-tool: use the `redis` backend, whose invalidation channel drops the record
-from every node's cache the moment it changes.
+tool: use the `redis` backend. Its mutations commit the record, bump the
+store revision, and publish the invalidation as one atomic Redis operation,
+so an acknowledged revoke has always published. A connected replica drops
+the entry as the message arrives.
+
+A replica whose subscriber connection was down during the revoke is covered
+from two directions, and both matter when `cache.tier` is `redis`:
+
+- The revoking replica deletes the shared L2 entry itself, in the same call
+  that announces the id. That deletion is not a broadcast anyone has to
+  receive, so a disconnected peer cannot miss it.
+- On reconnect, the subscriber clears its own in-memory L1 before it
+  processes anything, so nothing cached before the gap survives it.
+
+The worst-case window is therefore the subscriber's reconnect delay
+(5 seconds), not the L1 TTL. What the reconnect does *not* do is clear the
+shared L2 on every peer's behalf; it does not need to, and a resync that
+broadcast to the fleet would be answered by every peer broadcasting back.
 
 One security rule is enforced at mint time: a credential whose material is
 raw plaintext is refused, with an error naming the credential, because the
@@ -537,7 +553,10 @@ revoke or a limit change is visible on the next request.
 
 For a multi-replica deployment, set `cache.tier: redis` (or `mesh`) to add a
 shared second tier. With Redis, a peer's mutation publishes an invalidation that
-drops the matching entry on every node, so a revoke is clusterwide.
+drops the matching entry on every node, so a revoke is clusterwide. The
+mutation and its invalidation are one atomic server-side operation, and a
+replica that reconnects after missing messages resynchronizes by clearing its
+local cache, so a revoke cannot be missed permanently by a healthy replica.
 
 ```
 request -> L1 in-memory cache -> L2 tier (redis/mesh, optional) -> store

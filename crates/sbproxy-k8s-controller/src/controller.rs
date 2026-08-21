@@ -62,6 +62,10 @@ pub struct ControllerHandle {
     /// process-global flag in [`crate::health`], so the suite can run in
     /// parallel without one test flipping another's readiness.
     ready: AtomicBool,
+    /// Leadership fence, shared with the reconciler (WOR-2614). Checked
+    /// again between a successful render and the status publication, so a
+    /// leadership loss observed mid-pass stops the status writes too.
+    write_gate: crate::leader::WriteGate,
     /// Present only in the binary. Its absence is what lets the whole
     /// reconcile path be tested without a cluster.
     client: Option<Client>,
@@ -74,6 +78,7 @@ impl ControllerHandle {
     /// does not touch process-global readiness.
     pub fn new(reconciler_cfg: ReconcilerConfig) -> Self {
         let (tx, rx) = mpsc::channel::<&'static str>(64);
+        let write_gate = reconciler_cfg.write_gate.clone();
         Self {
             reconciler: Mutex::new(Reconciler::new(reconciler_cfg)),
             classes: Arc::new(Mutex::new(Vec::new())),
@@ -83,6 +88,7 @@ impl ControllerHandle {
             schedule_tx: tx,
             schedule_rx: Mutex::new(rx),
             ready: AtomicBool::new(false),
+            write_gate,
             client: None,
         }
     }
@@ -139,10 +145,40 @@ impl ControllerHandle {
                     "rendered Gateway API resources into an sbproxy config"
                 );
                 if let Some(client) = &self.client {
-                    publish_status(client, &outcome).await;
+                    // WOR-2614: leadership may have been lost between the
+                    // document write and here; status writes are fenced by
+                    // the same gate.
+                    if self.write_gate.allows() {
+                        publish_status(client, &outcome).await;
+                    } else {
+                        tracing::warn!(
+                            target: "k8s_audit",
+                            kind,
+                            "leadership was lost after the render; suppressing status writes"
+                        );
+                    }
                 }
                 self.mark_ready();
                 Ok(outcome)
+            }
+            // A closed leadership gate is a deliberate refusal, not a fault
+            // (WOR-2614). The reconciler bails on purpose while the gate is
+            // shut, and every reconcile already queued when a replica loses
+            // its Lease takes this path. Counting those as `result="error"`
+            // and logging them at error level pages an operator for a
+            // controller doing exactly what it was told to do, in a burst,
+            // at the worst possible moment, and buries any real error that
+            // happens to be in the same burst. The gate is read rather than
+            // the error message matched, so this cannot drift from the
+            // sentence the reconciler happens to bail with.
+            Err(e) if !self.write_gate.allows() => {
+                metrics::record_reconcile(kind, metrics::RESULT_FENCED, elapsed);
+                tracing::warn!(
+                    target: "k8s_audit",
+                    kind,
+                    "leadership is not held; the reconcile was fenced without writing"
+                );
+                Err(e)
             }
             Err(e) => {
                 metrics::record_reconcile(kind, metrics::RESULT_ERROR, elapsed);
@@ -474,6 +510,7 @@ mod tests {
             output_path: out,
             gateway_class: None,
             writer: WriterOptions::default(),
+            write_gate: crate::leader::WriteGate::always(),
         }))
     }
 
@@ -518,6 +555,68 @@ mod tests {
             }
         }))
         .expect("GRPCRoute fixture")
+    }
+
+    #[tokio::test]
+    async fn a_fenced_reconcile_is_not_counted_or_logged_as_a_fault() {
+        // Step-down queues reconciles that all reach the Err arm on
+        // purpose. Before this they every one of them incremented
+        // `sbproxy_gateway_reconcile_total{result="error"}` and logged
+        // `reconcile failed` at error, which is an alert storm describing a
+        // controller behaving correctly.
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("sb.yml");
+        let gate = crate::leader::WriteGate::for_election();
+        let h = Arc::new(ControllerHandle::new(ReconcilerConfig {
+            output_path: path.clone(),
+            gateway_class: None,
+            writer: WriterOptions::default(),
+            write_gate: gate.clone(),
+        }));
+        h.replace_gateway_classes(vec![class()]).await;
+        h.replace_gateways(vec![gateway("u1", 9090)]).await;
+
+        let before_error = metrics::reconcile_count(KIND_GATEWAY, metrics::RESULT_ERROR);
+        let before_fenced = metrics::reconcile_count(KIND_GATEWAY, metrics::RESULT_FENCED);
+
+        // The gate is closed: this is a standby, or a leader mid-step-down.
+        assert!(!gate.allows());
+        assert!(
+            h.reconcile_once(KIND_GATEWAY).await.is_err(),
+            "a fenced reconcile still refuses, so the caller does not act on it"
+        );
+        assert!(
+            !path.exists(),
+            "and it must not have written the document either"
+        );
+        assert_eq!(
+            metrics::reconcile_count(KIND_GATEWAY, metrics::RESULT_ERROR),
+            before_error,
+            "a deliberate fence must not count as a reconcile error"
+        );
+        assert_eq!(
+            metrics::reconcile_count(KIND_GATEWAY, metrics::RESULT_FENCED),
+            before_fenced + 1,
+            "it gets its own result label so a step-down is still visible"
+        );
+
+        // A genuine failure with the gate open still counts as an error, so
+        // the new arm narrows the error label rather than emptying it.
+        let unwritable = dir.path().join("no-such-dir").join("sb.yml");
+        let broken = Arc::new(ControllerHandle::new(ReconcilerConfig {
+            output_path: unwritable,
+            gateway_class: None,
+            writer: WriterOptions::default(),
+            write_gate: crate::leader::WriteGate::always(),
+        }));
+        broken.replace_gateway_classes(vec![class()]).await;
+        broken.replace_gateways(vec![gateway("u2", 9091)]).await;
+        assert!(broken.reconcile_once(KIND_GATEWAY).await.is_err());
+        assert_eq!(
+            metrics::reconcile_count(KIND_GATEWAY, metrics::RESULT_ERROR),
+            before_error + 1,
+            "a real write failure is still an error"
+        );
     }
 
     #[tokio::test]

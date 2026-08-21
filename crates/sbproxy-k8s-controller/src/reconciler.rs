@@ -46,6 +46,12 @@ pub struct ReconcilerConfig {
     pub gateway_class: Option<String>,
     /// Rendering knobs.
     pub writer: WriterOptions,
+    /// Leadership fence (WOR-2614). Every reconcile checks this before
+    /// writing the document, and the controller checks it again before
+    /// publishing status, so a replica that lost its Lease stops writing
+    /// the moment the loss is observed. [`crate::leader::WriteGate::always`]
+    /// (the `Default`) is the single-replica, no-election posture.
+    pub write_gate: crate::leader::WriteGate,
 }
 
 /// What one reconcile pass produced.
@@ -117,8 +123,18 @@ impl Reconciler {
 
     /// Render the current snapshot, write the document, and return the
     /// status to publish.
+    ///
+    /// Refuses to write while the leadership gate is closed (WOR-2614):
+    /// a replica that lost its Lease must not race the new leader over
+    /// `sb.yml`, however far into a pass it already was.
     pub fn reconcile(&self) -> anyhow::Result<ReconcileOutcome> {
         let cfg = &self.config;
+        if !cfg.write_gate.allows() {
+            anyhow::bail!(
+                "not the leader: refusing to write {} or publish status",
+                cfg.output_path.display()
+            );
+        }
         let now = status::now_rfc3339();
         let owned = self.owned_classes();
 
@@ -459,6 +475,7 @@ mod tests {
             output_path: dir.path().join("sb.yml"),
             gateway_class: None,
             writer: WriterOptions::default(),
+            write_gate: crate::leader::WriteGate::always(),
         })
     }
 
@@ -553,6 +570,7 @@ mod tests {
             output_path: dir.path().join("sb.yml"),
             gateway_class: Some("edge".to_string()),
             writer: WriterOptions::default(),
+            write_gate: crate::leader::WriteGate::always(),
         });
         r.set_gateway_classes(vec![
             class("edge", crate::CONTROLLER_NAME),
@@ -619,11 +637,50 @@ mod tests {
             output_path: dir.path().join("missing").join("sb.yml"),
             gateway_class: None,
             writer: WriterOptions::default(),
+            write_gate: crate::leader::WriteGate::always(),
         });
         let error = r
             .reconcile()
             .expect_err("writing into a nonexistent directory fails");
         assert!(!format!("{error:#}").is_empty());
+    }
+
+    #[test]
+    fn a_closed_leadership_gate_fences_the_config_write() {
+        // WOR-2614: losing the Lease has to stop the very next write, not
+        // the next process. Before the fix nothing between leadership and
+        // the file existed at all, so a deposed leader kept writing.
+        let dir = TempDir::new().expect("temp dir");
+        let out = dir.path().join("sb.yml");
+        let gate = crate::leader::WriteGate::for_election();
+        let mut r = Reconciler::new(ReconcilerConfig {
+            output_path: out.clone(),
+            gateway_class: None,
+            writer: WriterOptions::default(),
+            write_gate: gate.clone(),
+        });
+        r.set_gateway_classes(vec![class("sbproxy", crate::CONTROLLER_NAME)]);
+
+        let error = r.reconcile().expect_err("a non-leader must not write");
+        assert!(
+            format!("{error:#}").contains("not the leader"),
+            "the refusal names its reason: {error:#}"
+        );
+        assert!(
+            !out.exists(),
+            "a fenced reconcile must not have touched the output file"
+        );
+
+        // The same reconciler writes once leadership opens the gate; the
+        // fence is leadership, not a broken pass.
+        gate.open();
+        r.reconcile().expect("the leader writes");
+        assert!(out.exists(), "an open gate lets the document land");
+
+        // And loss fences the very next pass again.
+        gate.close();
+        r.reconcile()
+            .expect_err("a deposed leader must stop writing immediately");
     }
 
     #[test]

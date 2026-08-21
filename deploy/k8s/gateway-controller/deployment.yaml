@@ -34,7 +34,14 @@ metadata:
 spec:
   # One replica writes one file. Scale past this only with
   # --leader-election=true, or two controllers will fight over the
-  # rendered document.
+  # rendered document. With election on, the leader renews a 15s Lease
+  # every 5s; a replica that cannot renew fences its own writes after 10s
+  # and exits, and this Deployment restarts it as a standby that re-races
+  # for the Lease (WOR-2614). The 10s fence is measured from the start of
+  # the last successful renewal, which is the same instant the Lease's
+  # renewTime carries, and it is enforced from inside the renewal wait, so
+  # an API server that hangs rather than erroring still closes the gate a
+  # full 5s before any standby may take over.
   replicas: 1
   selector:
     matchLabels:
@@ -60,7 +67,10 @@ spec:
             # controller:
             # - --gateway-class=sbproxy
             #
-            # For more than one replica:
+            # For more than one replica. The loser blocks on the Lease
+            # and writes nothing; the leader renews continuously and, on
+            # losing the Lease, stops every config and status write
+            # before exiting:
             # - --leader-election=true
             # - --lease-namespace=sbproxy-system
             # - --lease-name=sbproxy-gateway-controller

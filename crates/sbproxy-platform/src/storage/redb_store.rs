@@ -208,4 +208,32 @@ mod tests {
         s.put(key, val).unwrap();
         assert_eq!(s.get(key).unwrap().unwrap(), &val[..]);
     }
+
+    #[test]
+    fn fencing_generations_persist_in_the_store_across_a_reopen() {
+        // WOR-2633: the default fenced lock keeps its counter in the store,
+        // not in the process. A process-local counter restarts at one after
+        // a restart while the certificate generations it fences persist,
+        // and every later acquisition then looks superseded by history.
+        let path = unique_path();
+        let key = b"acme:lock:reopen.example";
+        let first = {
+            let s = RedbKVStore::new(&path).unwrap();
+            let generation = s.try_lock_fenced(key, b"a", 60).unwrap().unwrap();
+            assert!(
+                s.get(b"acme:lock:reopen.example:fence").unwrap().is_some(),
+                "the fence counter must live in the store, not in the process"
+            );
+            s.unlock(key, b"a").unwrap();
+            generation
+        }; // dropped: simulates a process restart
+
+        let reopened = RedbKVStore::new(&path).unwrap();
+        let second = reopened.try_lock_fenced(key, b"b", 60).unwrap().unwrap();
+        assert!(
+            second > first,
+            "generation {second} after a reopen must exceed {first} from before it"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 }
