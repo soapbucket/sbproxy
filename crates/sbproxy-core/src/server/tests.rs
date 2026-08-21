@@ -6038,9 +6038,34 @@ fn cache_key_request(headers: &[(&'static str, &'static str)]) -> pingora_http::
     req
 }
 
+/// The principal an unauthenticated request carries. Tests that are
+/// not about the caller hold it constant.
+fn anonymous() -> sbproxy_plugin::Principal {
+    sbproxy_plugin::Principal::anonymous()
+}
+
 /// Stand-in origin cache-config fingerprint. These tests are about the
-/// vary and `cache.key` plan segments, so they hold it constant.
+/// vary and `cache.key` plan fields, so they hold it constant.
 const FP: &str = "00112233445566ff";
+
+/// Build a key through the real request-path builder, with the fields
+/// these tests hold constant already filled in.
+fn plan_key(
+    req: &pingora_http::RequestHeader,
+    cfg: &sbproxy_config::ResponseCacheConfig,
+    plan: Option<&sbproxy_cache::cache_event::CacheKeyPlan>,
+) -> String {
+    super::build_response_cache_key_with_plan(
+        "",
+        "__default__",
+        "api.local",
+        req,
+        &anonymous(),
+        cfg,
+        FP,
+        plan,
+    )
+}
 
 fn cache_cfg_with_vary(vary: &[&str]) -> sbproxy_config::ResponseCacheConfig {
     sbproxy_config::ResponseCacheConfig {
@@ -6060,9 +6085,8 @@ fn a_declining_plan_keys_identically_to_no_plan_at_all() {
     let cfg = cache_cfg_with_vary(&["x-tier", "accept-encoding"]);
     let empty = sbproxy_cache::cache_event::CacheKeyPlan::default();
 
-    let without = super::build_response_cache_key_with_plan("", "api.local", &req, &cfg, FP, None);
-    let with_empty =
-        super::build_response_cache_key_with_plan("", "api.local", &req, &cfg, FP, Some(&empty));
+    let without = plan_key(&req, &cfg, None);
+    let with_empty = plan_key(&req, &cfg, Some(&empty));
     assert_eq!(without, with_empty);
 }
 
@@ -6078,8 +6102,8 @@ fn the_operators_static_vary_order_is_not_reordered_by_a_plan() {
     let reversed = cache_cfg_with_vary(&["accept-encoding", "x-tier"]);
 
     assert_ne!(
-        super::build_response_cache_key_with_plan("", "api.local", &req, &cfg, FP, None),
-        super::build_response_cache_key_with_plan("", "api.local", &req, &reversed, FP, None),
+        plan_key(&req, &cfg, None),
+        plan_key(&req, &reversed, None),
         "config order is part of the key contract; this pins that we did not silently \
          normalize it"
     );
@@ -6104,12 +6128,9 @@ fn a_plan_dimension_actually_changes_the_key() {
     let free = cache_key_request(&[("x-tier", "free")]);
     let absent = cache_key_request(&[]);
 
-    let key_gold =
-        super::build_response_cache_key_with_plan("", "api.local", &gold, &cfg, FP, Some(&plan));
-    let key_free =
-        super::build_response_cache_key_with_plan("", "api.local", &free, &cfg, FP, Some(&plan));
-    let key_absent =
-        super::build_response_cache_key_with_plan("", "api.local", &absent, &cfg, FP, Some(&plan));
+    let key_gold = plan_key(&gold, &cfg, Some(&plan));
+    let key_free = plan_key(&free, &cfg, Some(&plan));
+    let key_absent = plan_key(&absent, &cfg, Some(&plan));
 
     assert_ne!(key_gold, key_free, "two tiers must not share an entry");
     assert_ne!(
@@ -6127,14 +6148,7 @@ fn every_accepted_host_dimension_has_a_real_resolver_arm() {
     // walks the real constant through the real resolver so the pairing
     // cannot drift silently.
     let cfg = cache_cfg_with_vary(&[]);
-    let baseline = super::build_response_cache_key_with_plan(
-        "",
-        "api.local",
-        &cache_key_request(&[]),
-        &cfg,
-        FP,
-        None,
-    );
+    let baseline = plan_key(&cache_key_request(&[]), &cfg, None);
     for name in sbproxy_cache::cache_event::CACHE_VARY_HOST_DIMENSIONS {
         let plan = match sbproxy_cache::cache_event::decode_cache_key(&serde_json::json!({
             "vary": [name]
@@ -6146,19 +6160,188 @@ fn every_accepted_host_dimension_has_a_real_resolver_arm() {
                 panic!("`{name}` is in the accepted set and must decode to a plan")
             }
         };
-        let keyed = super::build_response_cache_key_with_plan(
-            "",
-            "api.local",
-            &cache_key_request(&[]),
-            &cfg,
-            FP,
-            Some(&plan),
-        );
+        let keyed = plan_key(&cache_key_request(&[]), &cfg, Some(&plan));
         assert_ne!(
             keyed, baseline,
             "`{name}` is accepted at decode but did not change the key, so it partitions nothing"
         );
     }
+}
+
+// --- WOR-2607: the host stamps who is asking ---
+
+/// Two callers holding different bearer tokens must not read each
+/// other's entries.
+///
+/// Before WOR-2607 the key carried nothing about the caller, so an
+/// origin with `authentication` and `response_cache` both on stored the
+/// first caller's `GET /me` and replayed it to every later one, as a
+/// cache hit, with no log line, metric, or header saying so.
+#[test]
+fn two_bearer_tokens_do_not_share_a_response_cache_entry() {
+    let cfg = cache_cfg_with_vary(&[]);
+    let alice = cache_key_request(&[("authorization", "Bearer alice-token")]);
+    let bob = cache_key_request(&[("authorization", "Bearer bob-token")]);
+    let anonymous_request = cache_key_request(&[]);
+
+    assert_ne!(
+        plan_key(&alice, &cfg, None),
+        plan_key(&bob, &cfg, None),
+        "two credentials must not share an entry"
+    );
+    assert_ne!(
+        plan_key(&alice, &cfg, None),
+        plan_key(&anonymous_request, &cfg, None),
+        "a credentialed request must not read the anonymous entry"
+    );
+}
+
+/// `Proxy-Authorization` is a credential on the same terms.
+#[test]
+fn two_proxy_authorizations_do_not_share_a_response_cache_entry() {
+    let cfg = cache_cfg_with_vary(&[]);
+    assert_ne!(
+        plan_key(
+            &cache_key_request(&[("proxy-authorization", "Basic YTph")]),
+            &cfg,
+            None
+        ),
+        plan_key(
+            &cache_key_request(&[("proxy-authorization", "Basic Yjpi")]),
+            &cfg,
+            None
+        ),
+    );
+}
+
+/// A session the upstream issued authenticates nobody as far as the
+/// proxy is concerned, so both callers resolve to the same anonymous
+/// principal and the cookie is the only thing separating them.
+#[test]
+fn two_session_cookies_do_not_share_a_response_cache_entry() {
+    let cfg = cache_cfg_with_vary(&[]);
+    assert_ne!(
+        plan_key(&cache_key_request(&[("cookie", "sid=alice")]), &cfg, None),
+        plan_key(&cache_key_request(&[("cookie", "sid=bob")]), &cfg, None),
+    );
+}
+
+/// The resolved principal reaches the key even when the credential
+/// itself does not travel in a header this code enumerates: mTLS, a
+/// custom API-key header, a forward-auth subject.
+#[test]
+fn two_resolved_subjects_do_not_share_a_response_cache_entry() {
+    let cfg = cache_cfg_with_vary(&[]);
+    let req = cache_key_request(&[]);
+    let subject = |sub: &str| {
+        let mut principal = anonymous();
+        principal.sub = sub.to_owned();
+        principal.source = sbproxy_plugin::PrincipalSource::Jwt;
+        super::build_response_cache_key_with_plan(
+            "",
+            "__default__",
+            "api.local",
+            &req,
+            &principal,
+            &cfg,
+            FP,
+            None,
+        )
+    };
+    assert_ne!(subject("alice"), subject("bob"));
+}
+
+/// Two tenants must not read each other's entries even when every other
+/// field agrees.
+///
+/// One hostname resolves to one origin and one tenant today, so the
+/// hostname field already separates them. This pins the separation to
+/// the tenant itself, so it does not quietly become routing's problem
+/// the first time a second dimension enters origin resolution.
+#[test]
+fn two_tenants_do_not_share_a_response_cache_entry() {
+    let cfg = cache_cfg_with_vary(&[]);
+    let req = cache_key_request(&[]);
+    let for_tenant = |tenant: &str| {
+        super::build_response_cache_key_with_plan(
+            "",
+            tenant,
+            "api.local",
+            &req,
+            &anonymous(),
+            &cfg,
+            FP,
+            None,
+        )
+    };
+    assert_ne!(for_tenant("acme"), for_tenant("globex"));
+}
+
+/// The proxy forwards `Accept-Encoding`, so an upstream that compresses
+/// answers differently. Two capability sets get two entries; two
+/// spellings of one set share one, which is what keeps this from
+/// multiplying entries by the number of user agents in the world.
+#[test]
+fn accept_encoding_partitions_by_capability_not_by_spelling() {
+    let cfg = cache_cfg_with_vary(&[]);
+    // `&'static str`: `cache_key_request` holds its header slice for the
+    // life of the request it builds, so a borrowed literal is what it
+    // wants and a shorter lifetime cannot escape the closure.
+    let encoding = |value: &'static str| {
+        plan_key(
+            &cache_key_request(&[("accept-encoding", value)]),
+            &cfg,
+            None,
+        )
+    };
+    assert_ne!(
+        encoding("gzip"),
+        encoding("identity"),
+        "a gzip entry must not be replayed to a client that cannot decode it"
+    );
+    assert_eq!(
+        encoding("gzip, deflate, br"),
+        encoding("br;q=1.0, deflate, GZIP;q=0.8"),
+        "one capability set spelled two ways is one entry"
+    );
+}
+
+/// A `cache.key` policy adds dimensions and reaches nothing else. The
+/// fields that separate one tenant and one caller from another are in
+/// front of the fingerprint a plan feeds, so no plan output can move
+/// them.
+#[test]
+fn a_plan_cannot_reach_the_tenant_or_the_caller() {
+    let cfg = cache_cfg_with_vary(&[]);
+    let req = cache_key_request(&[("authorization", "Bearer alice-token")]);
+    let plan = match sbproxy_cache::cache_event::decode_cache_key(&serde_json::json!({
+        "vary": ["query", "header:x-anything"]
+    }))
+    .unwrap()
+    {
+        sbproxy_cache::cache_event::CacheDecision::Plan(plan) => plan,
+        sbproxy_cache::cache_event::CacheDecision::Decline => panic!("expected a plan"),
+    };
+
+    let without = plan_key(&req, &cfg, None);
+    let with_plan = plan_key(&req, &cfg, Some(&plan));
+    assert_ne!(without, with_plan, "a plan must reach the fingerprint");
+
+    // Everything up to and including the caller identity is byte
+    // identical. The identity is the sixth field after the `v2` tag, so
+    // the delimiter that closes it is the seventh in the string.
+    let host_stamped = |key: &str| {
+        key.match_indices(':')
+            .nth(6)
+            .map(|(index, _)| key[..index].to_owned())
+            .unwrap_or_else(|| panic!("key has fewer fields than the format: {key}"))
+    };
+    assert_eq!(host_stamped(&without), host_stamped(&with_plan));
+    assert!(
+        host_stamped(&without).starts_with("v2::__default__:api.local:GET:/thing:"),
+        "unexpected host-stamped prefix: {}",
+        host_stamped(&without)
+    );
 }
 
 // --- WOR-2519: ldap_auth dispatch mapping ---

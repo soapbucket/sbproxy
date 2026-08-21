@@ -276,7 +276,16 @@ pub struct ManagedEngineConfig {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ModelHostCacheConfig {
-    /// Cache directory. Omission uses the platform default.
+    /// Cache directory, as an absolute path. Omission uses the platform
+    /// default: `$HF_HOME`, then `/var/lib/sbproxy/models` when this
+    /// process can write there, then `~/.cache/sbproxy/models`.
+    ///
+    /// A relative path is refused at load. The engine subprocess that
+    /// reads this cache has its own working directory and requires an
+    /// absolute snapshot path, and in a split-role cluster each node
+    /// reads the key from its own file, so a relative value names a
+    /// different directory per process. Interpolate a variable such as
+    /// `${HOME}` when the location is per-host.
     #[serde(default)]
     pub directory: Option<String>,
     /// Disk budget in GiB. Omission leaves capacity operator-managed.
@@ -412,6 +421,9 @@ impl ModelHostControlConfig {
                 "store_path is required for admin_managed authority",
             ));
         }
+        if let Some(directory) = self.cache.directory.as_deref() {
+            validate_cache_directory(directory)?;
+        }
         if matches!(self.cache.budget_gib, Some(value) if !value.is_finite() || value <= 0.0) {
             return Err(ModelHostConfigError::new(
                 "cache budget_gib must be finite and positive",
@@ -431,6 +443,32 @@ impl ModelHostControlConfig {
         }
         Ok(())
     }
+}
+
+/// Check `cache.directory` at config load rather than at engine launch.
+///
+/// The runtime already insists on an absolute snapshot path, but it only
+/// finds out after the weights are downloaded and verified, and the error
+/// it raises names a field the operator never wrote. This is the same
+/// bounded-path shape `catalog_file` uses, plus the absolute requirement:
+/// `catalog_file` is a read-only file resolved against the config
+/// directory, while this is a writable root a separate process opens.
+fn validate_cache_directory(directory: &str) -> Result<(), ModelHostConfigError> {
+    if directory.trim().is_empty()
+        || directory.len() > 4_096
+        || directory.chars().any(char::is_control)
+    {
+        return Err(ModelHostConfigError::new(
+            "cache directory must be a bounded nonempty path without control characters",
+        ));
+    }
+    if !std::path::Path::new(directory).is_absolute() {
+        return Err(ModelHostConfigError::new(format!(
+            "cache directory {directory:?} must be an absolute path; a relative one resolves \
+             against whichever working directory the process happens to have"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_engine(
@@ -567,4 +605,79 @@ fn is_digest_pinned_image(image: &str) -> bool {
     !repository.is_empty()
         && digest.len() == 64
         && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_cache_directory(directory: &str) -> ModelHostControlConfig {
+        ModelHostControlConfig {
+            cache: ModelHostCacheConfig {
+                directory: Some(directory.to_string()),
+                ..ModelHostCacheConfig::default()
+            },
+            ..ModelHostControlConfig::default()
+        }
+    }
+
+    #[test]
+    fn relative_cache_directory_is_refused_at_config_load() {
+        let error = with_cache_directory("./models")
+            .validate()
+            .expect_err("a relative cache directory is refused");
+        assert!(
+            error.to_string().contains("must be an absolute path"),
+            "the message should name the rule the operator broke: {error}"
+        );
+        assert!(
+            error.to_string().contains("./models"),
+            "the message should quote the offending value: {error}"
+        );
+    }
+
+    #[test]
+    fn blank_cache_directory_is_refused() {
+        let error = with_cache_directory("   ")
+            .validate()
+            .expect_err("a blank cache directory is refused");
+        assert!(
+            error.to_string().contains("bounded nonempty path"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn cache_directory_with_a_control_character_is_refused() {
+        with_cache_directory("/var/lib/sbproxy\nmodels")
+            .validate()
+            .expect_err("a control character in the cache directory is refused");
+    }
+
+    #[test]
+    fn absolute_cache_directory_is_accepted() {
+        with_cache_directory("/var/lib/sbproxy/models")
+            .validate()
+            .expect("an absolute cache directory validates");
+    }
+
+    #[test]
+    fn an_omitted_cache_directory_stays_optional() {
+        ModelHostControlConfig::default()
+            .validate()
+            .expect("omitting the key leaves the platform default in charge");
+    }
+
+    #[test]
+    fn a_relative_catalog_file_is_still_accepted() {
+        // `catalog_file` resolves against the config directory by
+        // design; only the writable cache root demands absolute.
+        let config = ModelHostControlConfig {
+            catalog_file: Some("./catalog.yml".to_string()),
+            ..ModelHostControlConfig::default()
+        };
+        config
+            .validate()
+            .expect("a relative catalog_file is documented and stays valid");
+    }
 }

@@ -1,6 +1,6 @@
 # Model host
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 SBproxy can own model processes on one worker or place them across a managed
 cluster. Model-host control lives under `proxy.model_host`. Depending on its
@@ -807,7 +807,7 @@ Host-wide settings sit on the `serve:` block itself.
 | Setting | Purpose |
 |---|---|
 | `catalog_file` | Operator catalog file that replaces the built-in certified catalog. |
-| `cache_dir` | Directory for the content-addressed weight cache. |
+| `cache_dir` | Directory for the content-addressed weight cache, as an absolute path. A relative one is refused at config load, the same way `proxy.model_host.cache.directory` is; see "The cache directory is absolute" below. |
 | `cache_budget_gib` | Size at which the weight cache starts evicting, in GiB. It is a garbage-collection threshold, not a limit the OS enforces: the cache can exceed it transiently, and a single artifact larger than the budget still downloads. Size the mount for the weights you intend to hold, and let this decide when old ones go. `sbproxy doctor` compares it against free space on the cache mount, and `sbproxy doctor --strict` refuses to boot a worker whose mount cannot hold it. |
 | `allow_unpinned_refs` | Permit unpinned raw `hf:` or `file:` references on a node holding the `worker` cluster role. Default `false`. A raw reference runs the engine in repo mode: external egress, a writable cache mount, and no digest verification. Fine for `sbproxy run` and a workstation, which are unaffected; a fleet worker must opt in. |
 | `eviction` | VRAM-pressure policy: `lru` (default) or `never`. |
@@ -885,6 +885,41 @@ The cache root contains `blobs/sha256`, `snapshots`, `metadata`, `partials`,
 `locks`, and `jobs`. A snapshot becomes ready only after every declared file
 matches its exact byte length and SHA-256. Unsafe pickle artifacts require an
 explicit catalog opt-in and a supply-chain scan.
+
+### The cache directory is absolute
+
+`proxy.model_host.cache.directory`, the compatibility form `serve.cache_dir`,
+and the `--cache-dir` flag all require an absolute path, and each refuses a
+relative one by name before anything is downloaded:
+
+```text
+invalid model-host configuration: cache directory "./models" must be an
+absolute path; a relative one resolves against whichever working directory
+the process happens to have
+```
+
+Two reasons the root cannot be relative. The engine subprocess is launched
+with its own working directory and rejects a snapshot path that is not
+absolute, and in a split-role cluster every node reads this key out of its
+own file, so one relative value names a different directory on each host.
+Before this refusal existed, a relative directory was accepted by `validate`
+and `models pull`, survived a complete multi-gigabyte download, and then
+failed at engine launch with `artifact_not_ready: verified snapshot path must
+be absolute`, naming a field the operator never wrote.
+
+Interpolate a variable when the location differs per host, as
+[`examples/model-host-managed`](../examples/model-host-managed) does. Give the
+`:-` default an absolute value too, or an unset variable reintroduces the
+refusal:
+
+```yaml
+    cache:
+      directory: ${SB_MODEL_CACHE_DIR:-/var/lib/sbproxy/models}
+```
+
+`catalog_file` is the deliberate exception and still resolves relative paths
+against the directory holding `sb.yml`. It is a read-only file this process
+parses at load, not a writable root a second process opens later.
 
 Source credentials are transport-only. They are redacted in errors, zeroized on
 drop, and never written to snapshot or job metadata. Explicit pulls accept
