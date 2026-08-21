@@ -1,4 +1,4 @@
-<!-- Last modified: 2026-04-27 -->
+<!-- Last modified: 2026-08-20 -->
 
 ## What this PR does
 
@@ -33,7 +33,30 @@ cargo test --workspace --locked
 - [ ] CHANGELOG.md `## Unreleased` entry added if user-visible
 - [ ] No new unsafe blocks (or justified inline)
 - [ ] No new dependencies (or noted in PR description with rationale)
+- [ ] Adversarial review run against `.github/code-review-rubric.md`, findings and dispositions recorded below
 
 ## Notes for reviewers
 
 <!-- Anything specific you want a reviewer to look hard at, or any context that doesn't fit above. -->
+
+## Adversarial review
+
+<!--
+Required by the "Code review" section of CLAUDE.md, and read by the
+`review-evidence` workflow. Fill this in OUTSIDE the comment markers;
+a commented-out block does not count, and neither does an empty one.
+
+Reviewer: <the agent, tool, or person that ran the rubric>
+Findings: <n> Blocker, <n> Major, <n> Minor
+Verification: <how the fixes were re-checked>
+
+- <Blocker|Major|Minor> - `path/to/file.rs:LINE` - one-line claim.
+  <Fixed|Accepted|Filed>, plus the reason when it was not fixed.
+
+One list item per finding, and the item count per severity has to match
+the Findings line. When the review turned nothing up the whole block is
+two lines: a Reviewer line and `Findings: none`, with no Verification.
+
+Check a draft first:
+  python3 scripts/check-review-evidence.py --body-file /tmp/body.md
+-->
