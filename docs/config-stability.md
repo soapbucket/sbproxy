@@ -422,6 +422,40 @@ carve-out, declare it on the entry with `data_posture: {retains_data: false}`
 and the previous behavior returns. That declaration is the operator saying
 something about their own account that the catalog cannot know.
 
+### A transcoded gRPC error now sets the HTTP status, not just the body
+
+**Who this reaches.** Any origin with `action: {type: grpc, transcode: {...}}`
+whose upstream returns a non-OK `grpc-status` in the *response headers*, which
+is what tonic and grpc-go send for a unary handler that returns an error. An
+origin with no `transcode` block is unaffected, and so is `grpc_web: true`:
+gRPC-Web requires HTTP 200 with the outcome in the trailer frame, and that
+path is untouched.
+
+**What changes.** The transcoder already mapped the gRPC code to an HTTP
+status for the JSON error envelope it puts in the body, and then threw the
+mapped value away, so the response kept the upstream's 200. It is applied to
+the status line now, using the same `google.rpc.Code` table `grpc-gateway`
+uses: `NOT_FOUND` becomes 404, `PERMISSION_DENIED` 403, `FAILED_PRECONDITION`
+and `INVALID_ARGUMENT` 400, `UNAVAILABLE` 503, `UNIMPLEMENTED` 501,
+`RESOURCE_EXHAUSTED` 429, `CANCELLED` 499. A `status` response modifier on the
+same origin still wins; it is applied later in the same filter.
+
+**What an operator sees when it bites.** Calls that used to be logged and
+metered as 2xx move into the 4xx and 5xx classes, so error-rate alerts,
+the `status` label on `sbproxy_requests_total` and
+`sbproxy_origin_requests_total`, and any downstream client that retries on 5xx
+all see the change at once. Response caching for those
+origins also changes, since a 4xx or 5xx is not stored the way a 200 was.
+Nothing about the JSON body changed.
+
+**What to do before upgrading.** Re-baseline error-rate alerts on the affected
+origins, and check any client that treated a transcoded call as always-2xx and
+read the outcome out of the body. The one shape that did not change is a
+failure reported in real HTTP/2 trailers after the response headers, typically
+a server-streaming method that fails partway: the status line is already
+committed downstream when the trailers arrive, so that response stays 200 with
+the error in the body.
+
 ---
 
 ## Selected field stability reference

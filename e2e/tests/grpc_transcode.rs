@@ -178,6 +178,10 @@ origins:
             path: /echo
             grpc_method: sbproxy_e2e.echo.Echo.Hello
             body: "*"
+          - method: POST
+            path: /echo-error
+            grpc_method: sbproxy_e2e.echo.Echo.HelloError
+            body: "*"
 "#
     )
 }
@@ -226,5 +230,41 @@ fn unmapped_path_is_not_transcoded() {
         resp.status >= 400,
         "an unmapped path must not transcode; got {}",
         resp.status
+    );
+}
+
+#[test]
+fn a_grpc_error_becomes_the_mapped_http_status() {
+    // A gRPC upstream answers a failed call with HTTP 200 and puts the
+    // outcome in `grpc-status`: the status line describes the transport,
+    // not the call. A REST client on the near side of the transcoder
+    // reads the status line, so forwarding the 200 tells it the call
+    // succeeded. `HelloError` always fails with FAILED_PRECONDITION,
+    // which google.rpc.Code maps to HTTP 400.
+    //
+    // This is the trailers-only shape: tonic answers a unary `Err` with
+    // a single HEADERS frame carrying `grpc-status`, and pingora skips
+    // the body and trailer filters for a HEADERS frame with END_STREAM.
+    // So the header filter is the only place the mapping can happen and
+    // the status line is the only thing this test can assert on. The
+    // headers-then-trailers shape (`HelloStreamError`) is committed
+    // downstream before the trailers arrive and keeps its 200; see
+    // docs/routing.md.
+    let upstream = spawn_echo_grpc_server();
+    let harness = ProxyHarness::start_with_yaml(&transcode_config(&upstream)).expect("start");
+
+    let resp = harness
+        .post_json(
+            "/echo-error",
+            "transcode.localhost",
+            &json!({ "message": "precondition" }),
+            &[],
+        )
+        .expect("post");
+
+    assert_eq!(
+        resp.status, 400,
+        "FAILED_PRECONDITION must reach the REST client as 400, not as a 200 \
+         whose failure is discoverable only by parsing the body"
     );
 }

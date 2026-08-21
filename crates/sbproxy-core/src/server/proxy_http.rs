@@ -4047,6 +4047,39 @@ impl ProxyHttp for SbProxy {
                 sbproxy_observe::metrics::record_grpc_status(
                     sbproxy_observe::metrics::grpc_status_label(code_u32),
                 );
+                // A gRPC upstream answers a failed call with HTTP 200 and
+                // puts the real outcome in `grpc-status`; the status line
+                // carries the transport's health, not the call's. The
+                // body this filter is about to replace is the JSON error
+                // envelope, so forwarding the 200 tells a REST client its
+                // call succeeded and leaves the failure discoverable only
+                // by parsing the document. `transcode_response` already
+                // decides the HTTP status for that envelope; use the same
+                // mapping here so the status line and the body agree.
+                //
+                // This is the trailers-only shape (tonic and grpc-go emit
+                // it for a unary `Err`), which is the only shape fixable
+                // from a header filter. When the upstream sends response
+                // headers first and `grpc-status` in real trailers,
+                // pingora has already written the downstream header by
+                // the time `response_trailer_filter` runs, so that
+                // response keeps the upstream's 200 and only the body
+                // reports the error. docs/routing.md states the limit.
+                //
+                // An operator `status` response modifier still wins: it
+                // is applied further down this same filter.
+                //
+                // `grpc-status: 0` is left alone rather than forced to
+                // 200. On a successful call the upstream's own status
+                // line already says 200 and the override would be a
+                // no-op; where it would not be a no-op the response is
+                // malformed (a non-2xx status line carrying an OK gRPC
+                // status), and overwriting a real HTTP failure with a
+                // 200 is the one direction this must never move in.
+                let grpc = sbproxy_transport::grpc::GrpcStatus::from_code(status);
+                if grpc != sbproxy_transport::grpc::GrpcStatus::Ok {
+                    apply_response_status_override(upstream_response, grpc.to_http_status(), None);
+                }
             }
         }
 
