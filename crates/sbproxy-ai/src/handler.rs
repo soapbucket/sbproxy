@@ -55,6 +55,28 @@ pub struct AiHandlerConfig {
     /// Strategy used to select a provider for each request.
     #[serde(default = "default_strategy", deserialize_with = "deserialize_routing")]
     pub routing: RoutingStrategy,
+    /// Typed fallback list for the context-window trigger (WOR-2556):
+    /// provider names to reroute to when a prompt's pre-flight token
+    /// estimate (or a provider's own rejection) overflows the model's
+    /// context window. Ordered; each name must match a
+    /// `providers[].name` (config load refuses unknown names). Empty
+    /// (the default) disables the trigger, and the generic chain
+    /// handles every failure as before. This is the
+    /// `context_window_fallbacks` half of the LiteLLM
+    /// `fallbacks` / `context_window_fallbacks` /
+    /// `content_policy_fallbacks` split; the generic half is
+    /// `routing.strategy: fallback_chain`.
+    #[serde(default)]
+    pub context_window_fallbacks: Vec<String>,
+    /// Typed fallback list for the content-policy trigger (WOR-2556):
+    /// provider names to reroute to when a provider refuses a request
+    /// on content-policy / safety grounds. Ordered; each name must
+    /// match a `providers[].name`. Empty (the default) disables the
+    /// trigger; the legacy `resilience.content_policy_fallback`
+    /// boolean (route to the next provider in order) keeps working
+    /// unchanged when this list is not set.
+    #[serde(default)]
+    pub content_policy_fallbacks: Vec<String>,
     /// Optional allow-list of model names; empty means allow all.
     #[serde(default)]
     pub allowed_models: Vec<ModelId>,
@@ -532,6 +554,13 @@ impl AiHandlerConfig {
                         );
                         router = router.with_outlier_detection(config);
                     }
+                    if let Some(cooldown) = resilience.cooldown_policy.as_ref() {
+                        tracing::info!(
+                            providers = self.providers.len(),
+                            "ai per-error-class cooldowns armed"
+                        );
+                        router = router.with_classified_cooldowns(cooldown.clone());
+                    }
                 }
                 std::sync::Arc::new(router)
             })
@@ -683,6 +712,15 @@ pub struct AiResilienceConfig {
     /// malformed request is not. `None` keeps the status-code retry set.
     #[serde(default)]
     pub retry_policy: Option<crate::failure_cause::RetryPolicy>,
+    /// WOR-2556: per-error-class cooldown durations, the provider-level
+    /// counterpart to `retry_policy`'s request-level counts. When set,
+    /// a classified failure of a mapped class removes that provider
+    /// from candidate rotation for the configured number of seconds
+    /// (advisory, like the breaker: an all-cooling pool is revived
+    /// rather than turned into an outage). `None` keeps current
+    /// behavior exactly.
+    #[serde(default)]
+    pub cooldown_policy: Option<crate::failure_cause::CooldownPolicy>,
     /// WOR-1545: LLM-aware failover actions on top of the per-error retry
     /// policy. `None` leaves the request path unchanged.
     #[serde(default)]
@@ -1075,11 +1113,43 @@ impl AiHandlerConfig {
              oversized prompt to the model's window is what the compression pipeline does: \
              add a `window_fit` lever under `compression.levers`, or set \
              `resilience.llm_aware.context_compress: true` for the one-lever shorthand. \
-             There is no configuration today that reroutes an oversized prompt to a \
-             larger-window model; list the larger model first, or alias to it, if that is \
-             the behavior you want."
+             To reroute an oversized prompt to a larger-window model instead, list that \
+             provider in `context_window_fallbacks:` on this action."
         );
+        // WOR-2556: the `routing:` object form ignores keys the selected
+        // strategy does not read, so a typed fallback list authored there
+        // would be silently swallowed, which is the failure mode the
+        // `context_overflow:` refusal above exists to prevent. Refuse and
+        // point at the level the keys live on.
+        if let Some(routing) = value.get("routing").and_then(|v| v.as_object()) {
+            for key in ["context_window_fallbacks", "content_policy_fallbacks"] {
+                anyhow::ensure!(
+                    !routing.contains_key(key),
+                    "ai `routing.{key}` is not read by any strategy and would be silently \
+                     ignored: `{key}:` is a sibling of `routing:` on the ai_proxy action, \
+                     not a key inside it"
+                );
+            }
+        }
         let mut config: Self = serde_json::from_value(value)?;
+        // WOR-2556: a typed fallback list is an aimed allowlist. A name
+        // matching no provider would leave the trigger configured and
+        // the reroute unreachable, so it fails the load instead.
+        for (key, names) in [
+            ("context_window_fallbacks", &config.context_window_fallbacks),
+            ("content_policy_fallbacks", &config.content_policy_fallbacks),
+        ] {
+            for name in names {
+                anyhow::ensure!(
+                    config
+                        .providers
+                        .iter()
+                        .any(|provider| provider.name.as_str() == name.as_str()),
+                    "ai `{key}` names provider `{name}`, which does not match any \
+                     `providers[].name` on this action"
+                );
+            }
+        }
         if let Some(rag) = config.rag.as_ref() {
             rag.validate()
                 .map_err(|error| anyhow::anyhow!("ai rag: {error}"))?;
@@ -1970,6 +2040,117 @@ mod tests {
     }
 
     #[test]
+    fn typed_fallback_lists_naming_an_unknown_provider_are_refused() {
+        // WOR-2556: a typed fallback list is an allowlist of provider
+        // names. A name matching nothing would leave the trigger
+        // configured and the reroute silently unreachable, which is the
+        // exact rot mode the original WOR-1524 mechanism died of.
+        let error = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "small", "api_key": "k"}],
+            "context_window_fallbacks": ["big"],
+        }))
+        .expect_err("a fallback list naming no configured provider must fail the config");
+        let message = error.to_string();
+        assert!(
+            message.contains("context_window_fallbacks") && message.contains("big"),
+            "the error has to name the key and the unknown provider: {message}"
+        );
+
+        let error = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "strict", "api_key": "k"}],
+            "content_policy_fallbacks": ["permissive"],
+        }))
+        .expect_err("a fallback list naming no configured provider must fail the config");
+        let message = error.to_string();
+        assert!(
+            message.contains("content_policy_fallbacks") && message.contains("permissive"),
+            "the error has to name the key and the unknown provider: {message}"
+        );
+    }
+
+    #[test]
+    fn typed_fallback_keys_nested_under_routing_are_refused() {
+        // WOR-2556: the `routing:` object form ignores keys a strategy
+        // does not read, so a typed fallback list nested there would be
+        // silently swallowed. Refuse it and point at the right level.
+        let error = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "small", "api_key": "k"},
+                {"name": "big", "api_key": "k"},
+            ],
+            "routing": {"strategy": "fallback_chain", "context_window_fallbacks": ["big"]},
+        }))
+        .expect_err("a typed fallback list nested under routing: must fail the config");
+        let message = error.to_string();
+        assert!(
+            message.contains("context_window_fallbacks"),
+            "the error has to name the misplaced key: {message}"
+        );
+    }
+
+    #[test]
+    fn typed_fallback_lists_parse_when_names_match_providers() {
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "small", "api_key": "k"},
+                {"name": "big", "api_key": "k"},
+                {"name": "permissive", "api_key": "k"},
+            ],
+            "routing": {"strategy": "fallback_chain"},
+            "context_window_fallbacks": ["big"],
+            "content_policy_fallbacks": ["permissive"],
+        }))
+        .expect("typed fallback lists naming configured providers parse");
+        assert_eq!(config.context_window_fallbacks, vec!["big".to_string()]);
+        assert_eq!(
+            config.content_policy_fallbacks,
+            vec!["permissive".to_string()]
+        );
+    }
+
+    #[test]
+    fn cooldown_policy_removes_a_provider_after_a_mapped_failure_class() {
+        let config = resilience_config(serde_json::json!({
+            "cooldown_policy": {"rate_limit": 60},
+        }));
+        let router = config.router();
+        assert_eq!(
+            router.eligible_indices(&config.providers),
+            vec![0, 1],
+            "no failures yet: everyone eligible"
+        );
+        router.note_classified_failure(0, "openai", crate::failure_cause::FailureCause::RateLimit);
+        assert_eq!(
+            router.eligible_indices(&config.providers),
+            vec![1],
+            "a rate-limited provider is held out for the configured cooldown"
+        );
+        // A class the policy does not map must not cool anything down.
+        router.note_classified_failure(
+            1,
+            "anthropic",
+            crate::failure_cause::FailureCause::ServerError,
+        );
+        assert_eq!(
+            router.eligible_indices(&config.providers),
+            vec![1],
+            "an unmapped class never triggers a cooldown"
+        );
+    }
+
+    #[test]
+    fn without_a_cooldown_policy_classified_failures_change_nothing() {
+        let config = resilience_config(serde_json::json!({}));
+        let router = config.router();
+        router.note_classified_failure(0, "openai", crate::failure_cause::FailureCause::RateLimit);
+        assert_eq!(
+            router.eligible_indices(&config.providers),
+            vec![0, 1],
+            "defaults preserve current behavior exactly"
+        );
+    }
+
+    #[test]
     fn least_token_usage_is_still_accepted() {
         AiHandlerConfig::from_config(serde_json::json!({
             "providers": [{"name": "openai", "api_key": "k"}],
@@ -2031,6 +2212,8 @@ mod tests {
         let config = AiHandlerConfig {
             providers: Vec::new(),
             routing: RoutingStrategy::RoundRobin,
+            context_window_fallbacks: Vec::new(),
+            content_policy_fallbacks: Vec::new(),
             allowed_models: Vec::new(),
             blocked_models: Vec::new(),
             max_body_size: None,
@@ -2078,6 +2261,8 @@ mod tests {
         let config = AiHandlerConfig {
             providers: Vec::new(),
             routing: RoutingStrategy::RoundRobin,
+            context_window_fallbacks: Vec::new(),
+            content_policy_fallbacks: Vec::new(),
             allowed_models: Vec::new(),
             blocked_models: vec!["gpt-4".into()],
             max_body_size: None,
@@ -2125,6 +2310,8 @@ mod tests {
         let config = AiHandlerConfig {
             providers: Vec::new(),
             routing: RoutingStrategy::RoundRobin,
+            context_window_fallbacks: Vec::new(),
+            content_policy_fallbacks: Vec::new(),
             allowed_models: vec!["gpt-4".into(), "gpt-3.5-turbo".into()],
             blocked_models: Vec::new(),
             max_body_size: None,
@@ -2173,6 +2360,8 @@ mod tests {
         let config = AiHandlerConfig {
             providers: Vec::new(),
             routing: RoutingStrategy::RoundRobin,
+            context_window_fallbacks: Vec::new(),
+            content_policy_fallbacks: Vec::new(),
             allowed_models: vec!["gpt-4".into()],
             blocked_models: vec!["gpt-4".into()],
             max_body_size: None,

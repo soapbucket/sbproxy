@@ -1,5 +1,5 @@
 # SBproxy Features Hub
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-20*
 
 SBproxy is a high-performance reverse proxy and AI gateway built on Cloudflare's Pingora framework. It unifies traditional API proxying, AI model routing, Agent-to-Agent (A2A) communication, Model Context Protocol (MCP) tool integration, and Agent-specific workflows into a single binary.
 
@@ -55,7 +55,7 @@ Send standard chat completion requests to the proxy, and it routes them based on
 ### Smart Routing & Resilience
 Go beyond round-robin with LLM-aware routing strategies like lowest latency, least token usage, cost-optimized, cascade, or outcome-aware routing. The gateway categorizes upstream failures and retries intelligently.
 * **Docs:** [AI LLM Aware Resilience](ai-llm-aware-resilience.md), [AI Outcome Aware Routing](ai-outcome-aware-routing.md), [AI Load Balancer Benchmark](ai-lb-benchmark.md)
-* **Examples:** [AI Cascade Routing](../examples/ai-cascade-routing/), [AI Outcome Aware Routing](../examples/ai-outcome-aware-routing/), [AI Resilience](../examples/ai-resilience/), [Cost Optimized](../examples/ai-cost-optimized/), [Routing Fallback](../examples/ai-routing-fallback/)
+* **Examples:** [AI Cascade Routing](../examples/ai-cascade-routing/), [AI Outcome Aware Routing](../examples/ai-outcome-aware-routing/), [AI Resilience](../examples/ai-resilience/), [Cost Optimized](../examples/ai-cost-optimized/), [Routing Fallback](../examples/ai-routing-fallback/), [Typed Fallbacks](../examples/typed-fallbacks/)
 
 ### Budgets & Metering
 Enforce hard or soft budgets on AI spend by workspace, user, or key. Soft-landing budgets step through fixed warn and downgrade thresholds of the current spend window before the cap blocks; the mechanism is a threshold ladder, not a spend forecaster. SBproxy calculates token counts and USD costs locally, emitting metrics for attribution and saving tamper-evident logs.

@@ -377,6 +377,13 @@ pub struct RequestLogEntry {
     /// Last provider or target selected by failover.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failover_to: Option<String>,
+    /// Which typed trigger drove an AI reroute, when one did (WOR-2556).
+    /// Closed vocabulary: `context_window`, `content_policy`, or
+    /// `generic`. Absent when no reroute happened, so the LogsView can
+    /// distinguish "the prompt outgrew the model" from "the provider
+    /// refused" from an ordinary availability failover.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failover_trigger: Option<String>,
     /// Closed load-balancing or AI routing strategy name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub load_balancer_strategy: Option<String>,
@@ -5690,6 +5697,7 @@ mod tests {
             failover_engaged: true,
             failover_from: Some("openai".to_string()),
             failover_to: Some("anthropic".to_string()),
+            failover_trigger: Some("content_policy".to_string()),
             load_balancer_strategy: Some("lowest_latency".to_string()),
             load_balancer_target: Some("anthropic".to_string()),
             ..Default::default()
@@ -5704,6 +5712,7 @@ mod tests {
         assert_eq!(value["failover_engaged"], true);
         assert_eq!(value["failover_from"], "openai");
         assert_eq!(value["failover_to"], "anthropic");
+        assert_eq!(value["failover_trigger"], "content_policy");
         assert_eq!(value["load_balancer_strategy"], "lowest_latency");
         assert_eq!(value["load_balancer_target"], "anthropic");
     }

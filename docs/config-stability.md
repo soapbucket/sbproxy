@@ -1,6 +1,6 @@
 # Config stability tiers
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-20*
 
 This page defines the stability tiers and applies them to representative or
 high-impact configuration leaves. It also lists the current reviewed
@@ -122,7 +122,7 @@ surface that does the job. Boot and reload both refuse the document.
 
 | Key | Why it is refused | What to use instead |
 |---|---|---|
-| `origins.*.action.context_overflow` (`ai_proxy`) | Never a field on the AI handler and never read by anything. The decision layer behind it (error, fall back to a larger model, truncate) had no caller in the life of the tree, and the AI gateway guide described the block as ignored, which left operators free to write it. | A `window_fit` lever under `compression.levers`, or the `resilience.llm_aware.context_compress` shorthand. No configuration reroutes an oversized prompt to a larger-window model; order the larger model first, or alias to it. |
+| `origins.*.action.context_overflow` (`ai_proxy`) | Never a field on the AI handler and never read by anything. The decision layer behind it (error, fall back to a larger model, truncate) had no caller in the life of the tree, and the AI gateway guide described the block as ignored, which left operators free to write it. | A `window_fit` lever under `compression.levers`, or the `resilience.llm_aware.context_compress` shorthand, to fit the prompt in place. To reroute it to a larger-window model instead, name that provider in `context_window_fallbacks:` on the action. |
 | `origins.*.action.sticky` (`load_balancer`) | No affinity cookie was ever issued. | `algorithm: ring_hash` keyed on `cookie`, `header`, `ip`, or `uri`. |
 | `origins.*.action.targets[].zone` (`load_balancer`) | Target selection is not locality aware and never read the label, so zoned targets still received traffic from every zone. The key's name promises the zone-aware routing that Envoy and Nginx operators expect, and a promise-shaped label is a foot-gun rather than a convenience. | Remove the key; zone-aware routing is not implemented. To tell replicas apart, use `targets[].metadata`, which promises nothing about selection. |
 | `transforms[].allowed_hosts` (`type: wasm`) | Never enforced, and unenforceable: WASM modules have no network surface at all here, so the allowlist described a boundary nothing checked. | Keep the reaching on the proxy side. Gate the origin with an `expression` policy, or route the callout through an origin the proxy controls. The key returns as an enforced one if a host callout ever lands. |

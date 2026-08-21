@@ -1465,9 +1465,10 @@ pub(super) fn quota_pool_member_id_for_request(
 fn sequential_attempt_limit(
     is_failover: bool,
     content_policy_fallback: bool,
+    typed_fallbacks_configured: bool,
     provider_count: usize,
 ) -> usize {
-    if is_failover || content_policy_fallback {
+    if is_failover || content_policy_fallback || typed_fallbacks_configured {
         provider_count
     } else {
         1
@@ -1805,9 +1806,12 @@ mod quota_pool_dispatch_tests {
 
     #[test]
     fn quota_pool_alone_does_not_enable_provider_failover() {
-        assert_eq!(sequential_attempt_limit(false, false, 3), 1);
-        assert_eq!(sequential_attempt_limit(true, false, 3), 3);
-        assert_eq!(sequential_attempt_limit(false, true, 3), 3);
+        assert_eq!(sequential_attempt_limit(false, false, false, 3), 1);
+        assert_eq!(sequential_attempt_limit(true, false, false, 3), 3);
+        assert_eq!(sequential_attempt_limit(false, true, false, 3), 3);
+        // WOR-2556: a configured typed fallback list also opens the
+        // loop, or the reroute it aims could never take an attempt.
+        assert_eq!(sequential_attempt_limit(false, false, true, 3), 3);
     }
 }
 
@@ -7606,12 +7610,24 @@ pub(super) async fn handle_ai_proxy(
         .map(|r| r.content_policy_fallback)
         .unwrap_or(false);
 
+    // WOR-2556: a configured typed fallback list opens the sequential
+    // loop the same way `content_policy_fallback` does, or the reroute
+    // it aims could never take a second attempt. Configuration, not the
+    // per-request eligible subset, decides the cap: eligibility is
+    // re-checked when the list is resolved below.
+    let typed_fallbacks_configured =
+        !config.context_window_fallbacks.is_empty() || !config.content_policy_fallbacks.is_empty();
+
     // Parse retry config from the action config's routing.retry section.
     // This is done by inspecting the raw handler config. Quota membership
     // follows the caller identity, so switching providers cannot make a
     // denied member eligible and a quota pool alone never enables failover.
-    let max_attempts =
-        sequential_attempt_limit(is_failover, content_policy_fallback, config.providers.len());
+    let max_attempts = sequential_attempt_limit(
+        is_failover,
+        content_policy_fallback,
+        typed_fallbacks_configured,
+        config.providers.len(),
+    );
 
     // Build sorted provider list for failover (by priority).
     let mut provider_order: Vec<usize> = config
@@ -7803,6 +7819,72 @@ pub(super) async fn handle_ai_proxy(
                 provider_order.insert(0, p);
             }
         }
+    }
+    // WOR-2556: typed fallback triggers. Resolve each authored list to
+    // provider indices constrained to this request's eligible set (a
+    // typed list re-aims a reroute, it never widens what the credential
+    // policy or the model filter allowed), then run the context-window
+    // trigger's pre-flight half: when the prompt estimate overflows the
+    // primary's mapped model window and a typed candidate's window fits,
+    // the typed candidates move to the front before anything dispatches.
+    // Running pre-flight is what keeps streaming requests inside the
+    // trigger: the reroute happens before the stream opens, matching the
+    // guardrail streaming precedent of deciding on what is known before
+    // the response starts. A refusal that only appears mid-stream stays
+    // out of scope for v1 and is documented as such.
+    let context_window_fallback_order = sbproxy_ai::typed_fallbacks::resolve_candidates(
+        &config.context_window_fallbacks,
+        &config.providers,
+        &provider_order,
+    );
+    let content_policy_fallback_order = sbproxy_ai::typed_fallbacks::resolve_candidates(
+        &config.content_policy_fallbacks,
+        &config.providers,
+        &provider_order,
+    );
+    let typed_fallbacks_active =
+        !context_window_fallback_order.is_empty() || !content_policy_fallback_order.is_empty();
+    // Race and cascade manage their own candidate plans (race fans out,
+    // cascade pins its tiers below), so a pre-flight reorder would record
+    // a reroute those dispatchers then ignore. The in-loop body
+    // classification still covers a sequential fall-through.
+    let typed_preflight_applies =
+        !router.is_race() && routing_policy_cascade.is_none() && router.cascade_config().is_none();
+    if let Some(reroute) = sbproxy_ai::typed_fallbacks::preflight_context_window_reroute(
+        &mut provider_order,
+        &config.providers,
+        &model,
+        estimated_prompt_tokens_for_budget,
+        if typed_preflight_applies {
+            &context_window_fallback_order
+        } else {
+            &[]
+        },
+    ) {
+        let from = config.providers[reroute.from_idx].name.to_string();
+        let to = config.providers[reroute.to_idx].name.to_string();
+        ctx.admin_failover_trigger = Some("context_window".to_string());
+        // The primary is never dispatched to, so `record_admin_ai_attempt`
+        // sees a single provider and no handoff. Record the route here or
+        // the admin request log would carry a trigger with nothing to
+        // explain it, and the LogsView badge (keyed on from/to/engaged)
+        // would not render the one decision this feature exists to show.
+        ctx.admin_failover_from = Some(from.clone());
+        ctx.admin_failover_to = Some(to.clone());
+        sbproxy_ai::ai_metrics::record_failover(
+            &from,
+            &to,
+            "context_window",
+            ctx.tenant_id.as_str(),
+        );
+        warn!(
+            from = %from,
+            to = %to,
+            estimated_tokens = reroute.estimated_tokens,
+            context_window = reroute.primary_window,
+            "AI proxy: pre-flight estimate exceeds the primary model's context window; \
+             rerouting to the context_window_fallbacks list"
+        );
     }
     ctx.admin_load_balancer_target = provider_order
         .first()
@@ -8318,7 +8400,17 @@ pub(super) async fn handle_ai_proxy(
         }
     }
 
-    for (attempt, &provider_idx) in provider_order.iter().enumerate() {
+    // WOR-2556: index-based iteration rather than `iter().enumerate()`
+    // because a typed fallback trigger may rewrite the untried tail of
+    // `provider_order` mid-loop (see `splice_after_failure`). The bound
+    // is the provider count: entries are unique by construction and a
+    // splice only appends indices not already present, so the order can
+    // never grow past it.
+    let max_provider_visits = config.providers.len().max(provider_order.len());
+    for attempt in 0..max_provider_visits {
+        let Some(&provider_idx) = provider_order.get(attempt) else {
+            break;
+        };
         // The raced dispatch above already produced `last_resp` (or an
         // error); skip the sequential failover loop entirely.
         if race_mode {
@@ -8743,11 +8835,35 @@ pub(super) async fn handle_ai_proxy(
                 let terminal_managed =
                     crate::server::model_host::is_terminal_managed_response(&resp);
                 let managed_provider_fallback = ctx.managed_fallback_reason.is_some();
-                if (is_failover || managed_provider_fallback)
-                    && !terminal_managed
-                    && (retry_by_status || retry_by_policy)
-                    && attempt + 1 < effective_max_attempts
-                {
+                let retry_wanted = !terminal_managed && (retry_by_status || retry_by_policy);
+                let takes_availability_failover = (is_failover || managed_provider_fallback)
+                    && retry_wanted
+                    && attempt + 1 < effective_max_attempts;
+                let takes_managed_break =
+                    !takes_availability_failover && managed_provider_fallback && retry_wanted;
+                // WOR-2556: feed the per-error-class cooldown axis, once
+                // per failed attempt. The body-refined branch further
+                // down classifies from the body and records the refined
+                // cause itself, so record from the status alone only when
+                // this attempt will not reach that branch. The two
+                // branches immediately below also leave the range, and a
+                // `4xx` they consume (a `429` a `retry_policy` retries,
+                // say) still has to reach the axis here: otherwise a
+                // `cooldown_policy` would quietly stop applying to rate
+                // limits the moment a fallback list was configured next
+                // to it.
+                let body_refines_cause = !takes_availability_failover
+                    && !takes_managed_break
+                    && (content_policy_fallback || typed_fallbacks_active)
+                    && (400..500).contains(&status);
+                if (400..600).contains(&status) && !body_refines_cause {
+                    router.note_classified_failure(
+                        provider_idx,
+                        &provider.name,
+                        sbproxy_ai::failure_cause::FailureCause::classify(status, ""),
+                    );
+                }
+                if takes_availability_failover {
                     // WOR-1103: record the failed attempt so per-provider
                     // load distribution and failure rates are visible,
                     // not just the fact that a failover happened.
@@ -8764,6 +8880,11 @@ pub(super) async fn handle_ai_proxy(
                         &format!("http_{status}"),
                         ctx.tenant_id.as_str(),
                     );
+                    // WOR-2556: an availability failover is the generic
+                    // trigger, so the admin decision view can separate it
+                    // from the typed context-window / content-policy
+                    // reroutes below.
+                    ctx.admin_failover_trigger = Some("generic".to_string());
                     warn!(
                         provider = %provider.name,
                         status = %status,
@@ -8774,10 +8895,7 @@ pub(super) async fn handle_ai_proxy(
                     let _ = resp.bytes().await;
                     continue;
                 }
-                if managed_provider_fallback
-                    && !terminal_managed
-                    && (retry_by_status || retry_by_policy)
-                {
+                if takes_managed_break {
                     sbproxy_observe::metrics::record_provider_attempt(&provider.name, "error");
                     let _ = resp.bytes().await;
                     last_error = Some(anyhow::anyhow!(
@@ -8793,7 +8911,15 @@ pub(super) async fn handle_ai_proxy(
                 // NOT a content-policy refusal (or that has no more
                 // permissive provider left) is returned here as a
                 // passthrough rather than re-wrapped through the relay.
-                if content_policy_fallback && (400..500).contains(&status) {
+                //
+                // WOR-2556: a configured typed fallback list opens the
+                // same body-refined classification, because both typed
+                // triggers (a context-window rejection the pre-flight
+                // estimate missed, and a content-policy refusal) are
+                // only visible in the body.
+                if (content_policy_fallback || typed_fallbacks_active)
+                    && (400..500).contains(&status)
+                {
                     let content_type = resp
                         .headers()
                         .get(reqwest::header::CONTENT_TYPE)
@@ -8805,6 +8931,10 @@ pub(super) async fn handle_ai_proxy(
                         status,
                         &String::from_utf8_lossy(&body_bytes),
                     );
+                    // WOR-2556: the body-refined cause feeds the
+                    // per-error-class cooldown axis (the status-only
+                    // site above skipped this range on purpose).
+                    router.note_classified_failure(provider_idx, &provider.name, cause);
                     // WOR-2368: `ai.failure`. The one point on the AI
                     // chain that had no hook, so a provider error was
                     // observed by nothing and an operator could not
@@ -8825,11 +8955,84 @@ pub(super) async fn handle_ai_proxy(
                             )
                             .await;
                     }
+                    // WOR-2556: typed reroutes. Each trigger replaces the
+                    // untried tail of the attempt order with its own list,
+                    // so the next attempt comes from the candidates aimed
+                    // at this failure class. When the typed list is
+                    // exhausted (every candidate already tried), the
+                    // refusal falls through and is returned; the generic
+                    // tail was queued for availability, not for this
+                    // class, so it is not consulted.
+                    if cause == sbproxy_ai::failure_cause::FailureCause::ContextWindowExceeded
+                        && attempt + 1 < effective_max_attempts
+                    {
+                        if let Some(next_idx) = sbproxy_ai::typed_fallbacks::splice_after_failure(
+                            &mut provider_order,
+                            attempt,
+                            &context_window_fallback_order,
+                        ) {
+                            let to_provider = config.providers[next_idx].name.to_string();
+                            ctx.admin_failover_trigger = Some("context_window".to_string());
+                            sbproxy_observe::metrics::record_provider_attempt(
+                                &provider.name,
+                                "error",
+                            );
+                            sbproxy_ai::ai_metrics::record_failover(
+                                &provider.name,
+                                &to_provider,
+                                "context_window",
+                                ctx.tenant_id.as_str(),
+                            );
+                            warn!(
+                                provider = %provider.name,
+                                to = %to_provider,
+                                "AI proxy: context-window rejection, rerouting to the \
+                                 context_window_fallbacks list"
+                            );
+                            continue;
+                        }
+                    }
                     if cause == sbproxy_ai::failure_cause::FailureCause::ContentPolicy
+                        && !content_policy_fallback_order.is_empty()
+                        && attempt + 1 < effective_max_attempts
+                    {
+                        if let Some(next_idx) = sbproxy_ai::typed_fallbacks::splice_after_failure(
+                            &mut provider_order,
+                            attempt,
+                            &content_policy_fallback_order,
+                        ) {
+                            let to_provider = config.providers[next_idx].name.to_string();
+                            ctx.ai_outcome = Some("content_filter".to_string());
+                            ctx.admin_failover_trigger = Some("content_policy".to_string());
+                            sbproxy_observe::metrics::record_provider_attempt(
+                                &provider.name,
+                                "error",
+                            );
+                            sbproxy_ai::ai_metrics::record_failover(
+                                &provider.name,
+                                &to_provider,
+                                "content_policy",
+                                ctx.tenant_id.as_str(),
+                            );
+                            warn!(
+                                provider = %provider.name,
+                                to = %to_provider,
+                                "AI proxy: content-policy refusal, rerouting to the \
+                                 content_policy_fallbacks list"
+                            );
+                            continue;
+                        }
+                    }
+                    // WOR-1545 legacy form: no typed content-policy list,
+                    // route the refusal to the next provider in order.
+                    if cause == sbproxy_ai::failure_cause::FailureCause::ContentPolicy
+                        && content_policy_fallback
+                        && content_policy_fallback_order.is_empty()
                         && attempt + 1 < provider_order.len()
                         && attempt + 1 < max_attempts
                     {
                         ctx.ai_outcome = Some("content_filter".to_string());
+                        ctx.admin_failover_trigger = Some("content_policy".to_string());
                         let to_provider = provider_order
                             .get(attempt + 1)
                             .map(|&i| config.providers[i].name.clone())
@@ -9019,6 +9222,8 @@ pub(super) async fn handle_ai_proxy(
                     "transport",
                     ctx.tenant_id.as_str(),
                 );
+                // WOR-2556: a transport failover is the generic trigger.
+                ctx.admin_failover_trigger = Some("generic".to_string());
                 continue;
             }
         }

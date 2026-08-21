@@ -368,6 +368,7 @@ function detailFields(request: RequestLog): DetailField[] {
   push("Failover engaged", request.failover_engaged);
   push("Failover from", request.failover_from);
   push("Failover to", request.failover_to);
+  push("Failover trigger", request.failover_trigger);
   push("Load balancer", request.load_balancer_strategy);
   push("Selected target", request.load_balancer_target);
   push("Guardrail", request.guardrail_category);

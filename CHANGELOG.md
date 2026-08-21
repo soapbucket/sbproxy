@@ -12,6 +12,25 @@ the next version cut.
 
 ### Added
 
+- **Typed fallback triggers: `context_window_fallbacks` and
+  `content_policy_fallbacks`.** Two new lists on the `ai_proxy` action,
+  siblings of `routing:`, each naming providers to reroute to for one
+  specific failure class. A chat prompt whose pre-flight token estimate
+  overflows the primary model's context window reroutes to a
+  larger-window provider before anything dispatches (streaming
+  included); a content-policy refusal reroutes to the aimed list
+  instead of the generic chain's next provider. Unknown provider names
+  fail config load, and nesting either key inside `routing:` is
+  refused rather than silently ignored. A new
+  `resilience.cooldown_policy` maps the same failure classes to
+  provider cooldown seconds (a `429` can park a provider for 30s), fed
+  directly by the dispatch loop's failure classification. The admin
+  request log gains a `failover_trigger` column (`context_window`,
+  `content_policy`, or `generic`) and the LogsView failover badge names
+  the trigger. See the typed fallback triggers section of
+  [docs/ai-llm-aware-resilience.md](docs/ai-llm-aware-resilience.md)
+  and [examples/typed-fallbacks/](examples/typed-fallbacks/).
+
 - **`hmac_auth`: signed-request authentication.** A new auth provider
   for machine callers that prove possession of a shared secret by
   signing each request (RFC 9421 HTTP Message Signatures,

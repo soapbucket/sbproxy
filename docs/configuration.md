@@ -1587,6 +1587,8 @@ origins:
 |-------|------|---------|-------------|
 | `providers` | list | required | Configured upstream AI providers. |
 | `routing` | string \| object | `round_robin` | Routing strategy. Either a flat string or `{strategy: ..., ...}`. |
+| `context_window_fallbacks` | list | empty (trigger off) | Provider names to reroute to when a prompt overflows the model's context window. Names must match `providers[].name`. See [Typed fallback triggers](ai-llm-aware-resilience.md#typed-fallback-triggers). |
+| `content_policy_fallbacks` | list | empty (trigger off) | Provider names to reroute to when a provider refuses on content-policy grounds. Names must match `providers[].name`. See [Typed fallback triggers](ai-llm-aware-resilience.md#typed-fallback-triggers). |
 | `allowed_models` | list | empty (allow all) | Allow-list of model names. |
 | `blocked_models` | list | | Block-list of model names. Takes precedence over allow-list. |
 | `max_body_size` | int | | Maximum request body size in bytes. |
@@ -1595,7 +1597,7 @@ origins:
 | `model_rate_limits` | map | | Per-model rate limit overrides keyed by model name. |
 | `per_surface_rate_limits` | map | | Per-surface rate limit overrides keyed by AI surface label (`chat_completions`, `assistants`, `image_generation`, ...). |
 | `max_concurrent` | map | | Maximum concurrent in-flight requests per provider. |
-| `resilience` | object | | Per-provider circuit breaker, outlier detection, and active health probes. Also hosts the LLM-aware knobs (`retry_policy`, `llm_aware`, `content_policy_fallback`); see [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md). |
+| `resilience` | object | | Per-provider circuit breaker, outlier detection, and active health probes. Also hosts the LLM-aware knobs (`retry_policy`, `cooldown_policy`, `llm_aware`, `content_policy_fallback`); see [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md). |
 | `compression` | object | unset | Ordered AI context-compression policy. See [AI context compression](#ai-context-compression) and [ai-context-compression.md](ai-context-compression.md). |
 | `reasoning` | string or object | `off` | Route policy for concise reasoning. Use `concise`, `off`, or `{budget: N}` with `N` greater than zero. |
 | `shadow` | object | | Side-by-side eval: mirror each request to a second provider and log metrics. |
@@ -2104,7 +2106,7 @@ resilience:
 
 When `resilience` is set, retries fan across providers up to `min(providers.len(), 5)` attempts; ejected providers are skipped on the second and later attempts.
 
-The block also accepts the LLM-aware keys: `retry_policy` (per-failure-class retry counts, e.g. `rate_limit: 3`), `llm_aware.context_compress` plus `llm_aware.completion_reserve_tokens` (fit an over-long prompt to the model's window before dispatch), and `content_policy_fallback` (route a content-policy refusal to the next provider in priority order). Semantics and the failure-cause table are in [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md).
+The block also accepts the LLM-aware keys: `retry_policy` (per-failure-class retry counts, e.g. `rate_limit: 3`), `cooldown_policy` (per-failure-class provider cooldown seconds), `llm_aware.context_compress` plus `llm_aware.completion_reserve_tokens` (fit an over-long prompt to the model's window before dispatch), and `content_policy_fallback` (route a content-policy refusal to the next provider in priority order). The typed reroute lists, `context_window_fallbacks` and `content_policy_fallbacks`, are siblings of `routing:` on the action rather than resilience keys. Semantics and the failure-cause table are in [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md).
 
 #### Shadow (`shadow`)
 

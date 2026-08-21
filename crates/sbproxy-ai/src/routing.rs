@@ -375,6 +375,20 @@ pub struct Router {
     quota: ProviderRateLimitTracker,
     /// Last explicit round-robin fallback under policy-filtered selection.
     last_filtered_fallback: parking_lot::Mutex<Option<FilteredSelectionFallback>>,
+    /// Per-error-class cooldown policy (WOR-2556). `None` (the default)
+    /// disables the axis entirely; populated by
+    /// `AiHandlerConfig::router` from a `resilience.cooldown_policy`
+    /// block, and by nothing else. Unlike the breaker and the outlier
+    /// detector, this axis is fed directly by the dispatch loop's
+    /// failure classification ([`Self::note_classified_failure`]), so a
+    /// configured block acts on real traffic.
+    cooldown_policy: Option<crate::failure_cause::CooldownPolicy>,
+    /// Per-provider cooldown deadline, in milliseconds since
+    /// `cooldown_epoch`. `0` = no cooldown. Sized to the pool when a
+    /// `cooldown_policy` is attached, empty otherwise.
+    cooldown_until_ms: Vec<AtomicU64>,
+    /// The instant `cooldown_until_ms` deadlines are measured from.
+    cooldown_epoch: std::time::Instant,
 }
 
 /// Cancellation-safe accounting for one provider attempt.
@@ -441,6 +455,9 @@ impl Router {
             health,
             quota: ProviderRateLimitTracker::new(0.1),
             last_filtered_fallback: parking_lot::Mutex::new(None),
+            cooldown_policy: None,
+            cooldown_until_ms: Vec::new(),
+            cooldown_epoch: std::time::Instant::now(),
         }
     }
 
@@ -513,6 +530,73 @@ impl Router {
     pub fn with_outlier_detection(mut self, config: OutlierDetectorConfig) -> Self {
         self.outlier = Some(Arc::new(OutlierDetector::new(config)));
         self
+    }
+
+    /// Attach the per-error-class cooldown policy (WOR-2556).
+    ///
+    /// Same attachment discipline as the breaker and outlier axes: only
+    /// a `resilience.cooldown_policy` block arms it, so the default
+    /// configuration changes nothing. Unlike those two, the write side
+    /// is [`Self::note_classified_failure`], called by the dispatch
+    /// loop at its failure-classification points, so this axis is fed
+    /// by production traffic from the day it is configured.
+    pub fn with_classified_cooldowns(
+        mut self,
+        policy: crate::failure_cause::CooldownPolicy,
+    ) -> Self {
+        self.cooldown_until_ms = (0..self.latencies.len())
+            .map(|_| AtomicU64::new(0))
+            .collect();
+        self.cooldown_policy = Some(policy);
+        self
+    }
+
+    /// Record a classified upstream failure against a provider (WOR-2556).
+    ///
+    /// When a `cooldown_policy` is attached and maps `cause` to a
+    /// duration, the provider is removed from candidate rotation for
+    /// that long. A no-op without a policy, so callers do not need to
+    /// gate on configuration.
+    pub fn note_classified_failure(
+        &self,
+        provider_idx: usize,
+        provider_name: &str,
+        cause: crate::failure_cause::FailureCause,
+    ) {
+        let Some(secs) = self
+            .cooldown_policy
+            .as_ref()
+            .and_then(|policy| policy.cooldown_secs_for(cause))
+        else {
+            return;
+        };
+        let Some(slot) = self.cooldown_until_ms.get(provider_idx) else {
+            return;
+        };
+        let now_ms = self.cooldown_epoch.elapsed().as_millis() as u64;
+        let until_ms = now_ms.saturating_add(secs.saturating_mul(1_000));
+        // `max` so racing failures never shorten a longer cooldown
+        // another class just set.
+        slot.fetch_max(until_ms, Ordering::Relaxed);
+        // Like an outlier ejection, the moment traffic stops reaching a
+        // provider must be visible somewhere an operator looks.
+        tracing::warn!(
+            provider = %provider_name,
+            cause = cause.as_str(),
+            cooldown_secs = secs,
+            "ai provider placed on per-error-class cooldown"
+        );
+    }
+
+    /// Whether a provider is currently held out by a classified-failure
+    /// cooldown. Lapses by itself once the deadline passes; nothing
+    /// sweeps it.
+    fn cooldown_active(&self, provider_idx: usize) -> bool {
+        let Some(slot) = self.cooldown_until_ms.get(provider_idx) else {
+            return false;
+        };
+        let until_ms = slot.load(Ordering::Relaxed);
+        until_ms != 0 && self.cooldown_epoch.elapsed().as_millis() as u64 <= until_ms
     }
 
     /// Read access to the per-provider circuit breakers (mostly for
@@ -695,6 +779,12 @@ impl Router {
             if d.is_ejected(name) {
                 return false;
             }
+        }
+        // Per-error-class cooldown (WOR-2556). Advisory like the axes
+        // above: `routable_candidate_indices` revives an all-ineligible
+        // pool, so a cooldown can never manufacture an outage.
+        if self.cooldown_active(idx) {
+            return false;
         }
         true
     }

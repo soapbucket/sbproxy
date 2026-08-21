@@ -407,6 +407,12 @@ pub struct RequestContext {
     pub admin_failover_from: Option<String>,
     /// Latest provider selected after a handoff.
     pub admin_failover_to: Option<String>,
+    /// Which typed trigger drove the latest AI reroute, when one did
+    /// (WOR-2556). Closed vocabulary: `context_window` (prompt exceeds
+    /// the primary model's window), `content_policy` (a refusal was
+    /// rerouted), or `generic` (status/transport failover). `None` when
+    /// no reroute happened.
+    pub admin_failover_trigger: Option<String>,
     /// Most recently attempted AI provider, used to detect handoffs.
     pub admin_last_ai_provider: Option<String>,
     /// Closed generic load-balancer or AI router strategy name.
@@ -1666,6 +1672,7 @@ impl RequestContext {
             admin_failover_from: None,
             admin_failover_to: None,
             admin_last_ai_provider: None,
+            admin_failover_trigger: None,
             admin_load_balancer_strategy: None,
             admin_load_balancer_target: None,
             concurrent_limit_guards: Vec::new(),
