@@ -1,9 +1,9 @@
 # Policy engine
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-20*
 
 The policy engine evaluates a list of policies on every request. Each policy returns one of four verdicts: `Allow`, `Deny`, `AllowWithHeaders`, or `Confirm`. The dispatcher folds the per-policy results into a single decision and applies it before the request reaches the upstream.
 
-SBproxy ships twenty-seven `policies:` list types. This page is the map: every policy, grouped by what it is for, linking to wherever it is actually documented. Some get their own dedicated page; some are documented here; others are a subsection of a broader page such as [api-security.md](api-security.md) or [scripting.md](scripting.md). Two more checks that behave like policies but are not `policies:` list entries are covered separately at the bottom of this page.
+SBproxy ships twenty-eight `policies:` list types. This page is the map: every policy, grouped by what it is for, linking to wherever it is actually documented. Some get their own dedicated page; some are documented here; others are a subsection of a broader page such as [api-security.md](api-security.md) or [scripting.md](scripting.md). Two more checks that behave like policies but are not `policies:` list entries are covered separately at the bottom of this page.
 
 If you are deciding which policy stops which threat, start with the group headings below and [security.md](security.md). If you already know which policy you want and just need the field list, follow its link directly.
 
@@ -31,6 +31,7 @@ If you are deciding which policy stops which threat, start with the group headin
 
 - `request_validator`: validates request bodies against a JSON Schema at the edge. [This page](#request_validator).
 - `openapi_validation`: validates request bodies against an OpenAPI 3.0 document. [openapi-validation.md](openapi-validation.md).
+- `body_threat_protection`: structural JSON/XML body threat limits (nesting depth, container sizes, key/string lengths) with an unconditional XML DTD refusal, in block or observe-only tap mode. [api-security.md](api-security.md#structural-body-threat-limits).
 - `waf`: a curated signature ruleset against common web-application attack payloads. [waf-options.md](waf-options.md).
 - `http_framing`: refuses request-smuggling and desync primitives. [This page](#http_framing).
 - `sri`: enforces Subresource Integrity on scripts the origin serves. [api-security.md](api-security.md#browser-facing-misconfiguration).
@@ -51,7 +52,7 @@ If you are deciding which policy stops which threat, start with the group headin
 - `rego`: a Rego/OPA module evaluated against the same request context as `expression`, for teams that already have Rego. [scripting.md](scripting.md#3a-rego-policies).
 - `assertion` (alias `response_assertion`): an observational CEL check against the response; a false assertion is logged and never blocks traffic. [scripting.md](scripting.md#response-assertions).
 
-**One pack, not a twenty-eighth type.** `owasp_api_top10` is a policy-pack entry the compiler expands into concrete types from the groups above (`object_authz`, `rate_limiting`, `ddos_protection`, `request_limit`, `concurrent_limit`, `security_headers`, `http_framing`, and a `json_projection` transform) before any policy parses. It backs off per item when the origin already authors that type, and reports every enabled item in a five-state manifest (`enforced`, `report_only`, `needs_operator_input`, `operator_authored`, `not_covered`) at plan time and at `GET /admin/owasp-api-pack`. [owasp-api-top10.md](owasp-api-top10.md).
+**One pack, not a twenty-ninth type.** `owasp_api_top10` is a policy-pack entry the compiler expands into concrete types from the groups above (`object_authz`, `rate_limiting`, `ddos_protection`, `request_limit`, `concurrent_limit`, `security_headers`, `http_framing`, and a `json_projection` transform) before any policy parses. It backs off per item when the origin already authors that type, and reports every enabled item in a five-state manifest (`enforced`, `report_only`, `needs_operator_input`, `operator_authored`, `not_covered`) at plan time and at `GET /admin/owasp-api-pack`. [owasp-api-top10.md](owasp-api-top10.md).
 
 ## Calling it
 
@@ -348,7 +349,7 @@ The resolver chain that produces the verdict (Web Bot Auth keyid, then forward-c
 `bot_detection` and `threat_protection` behave like policies, denying a request before or during the pipeline, but they are not `policies:` list entries. Both are top-level keys directly under an origin, and both ship at `alpha` stability ([config-stability.md](config-stability.md#alpha)): the field name, shape, or behavior may change without notice.
 
 - `bot_detection`: blocks by `User-Agent` substring match against a deny list, with an allow-list override, before authentication runs. The `mode` field is accepted but not consulted by the enforcement path today; the runtime always blocks a denied agent regardless of its value.
-- `threat_protection`: bounds JSON request-body shape, nesting depth, key count, string length, array size, and total size, once the body is fully buffered. Any tripped limit returns 413, including a depth or key-count violation that a different service might call a 400.
+- `threat_protection`: bounds JSON request-body shape, nesting depth, key count, string length, array size, and total size, once the body is fully buffered. Any tripped limit returns 413, including a depth or key-count violation that a different service might call a 400. The `body_threat_protection` *policy* ([api-security.md](api-security.md#structural-body-threat-limits)) is the successor surface: JSON and XML, a 400 naming the violated limit, and a tap mode. Prefer it for new configs, with one caveat: the policy has no body-size knob, so move `json.max_total_size` to `request_limit.max_body_size` before dropping `threat_protection:` or the effective cap widens to the proxy's 8 MiB buffering bound.
 
 Full field tables and examples for both are in [configuration.md](configuration.md#bot-detection) and [configuration.md](configuration.md#threat-protection).
 

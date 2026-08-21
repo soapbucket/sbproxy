@@ -123,6 +123,26 @@ pub fn budget_for_label(label_name: &str) -> usize {
         "exclusion_reason" => 20,
         "stage" => 8,
         "placement_reason" => 16,
+        // Load-balancer target URLs (`sbproxy_target_health_state`).
+        // Bounded by the operator's config: the value set is the union
+        // of every origin's configured target list, never anything
+        // request-derived. `origin` is capped at 200 above and each
+        // origin carries a handful of targets, so 500 is headroom, not
+        // an invitation. The mesh gossip families also carry a `target`
+        // label (peer node ids) but write it without the limiter, so
+        // this cap governs only the sanitized health gauge.
+        "target" => 500,
+        // Route identifiers: OpenAPI path templates on the four
+        // `sbproxy_openapi_*` families, plus forward-rule ids and the
+        // same path templates on `sbproxy_deprecated_requests_total`.
+        // One value space, one shared set, which is why the deprecation
+        // counter names this label `route` rather than `rule`: `rule` is
+        // the operator-named rule ids of the MCP and reversible-redaction
+        // families, and a large spec's operation list would have eaten
+        // their budget on a lookup that keys on the label name alone.
+        // Sized above a large spec's operation count so a real API's
+        // routes are all distinguishable before demotion starts.
+        "route" => 2000,
         // Default workspace cap when the label is not in the table.
         _ => 1000,
     }

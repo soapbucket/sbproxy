@@ -1,5 +1,5 @@
 # sbproxy (Rust workspace)
-*Last modified: 2026-08-15*
+*Last modified: 2026-08-20*
 
 The active implementation of sbproxy. Cargo workspace with ~20
 crates under `crates/`, an e2e suite under `e2e/`, examples under
@@ -25,6 +25,7 @@ ten-minute build.
 | Tapes + GIF wiring | `make tapes-check` |
 | Doc configs | `python3 scripts/sync-doc-configs.py --check` |
 | Documented output | `python3 scripts/check-doc-captures.py --check --stackless-only` |
+| Review-evidence parser | `python3 scripts/check-review-evidence.py --self-test` |
 | Installer | `sh scripts/tests/install_verify.sh` |
 | Format | `cargo fmt --all -- --check` |
 | Nested lockfiles | `bash scripts/check-nested-lockfiles.sh` |
@@ -266,17 +267,112 @@ findings with severity, file:line, and a failure scenario each). The
 findings and their resolutions go into the PR body, so the review
 history merges with the change it reviewed. The mechanical gates above
 answer "does it compile, lint, and pass"; the rubric answers "is this
-going to be a problem in six months", and this repository has merged
-nothing without both since the protocol landed.
+going to be a problem in six months".
+
+The rule landed before anything enforced it, and a large batch merged
+without it. Of the 31 pull requests merged between 2026-08-19 and
+2026-08-20, 30 carried no GitHub review and 26 carried no review
+evidence anywhere in the body; retrospective rubric runs against three
+of those merged branches then turned up an auth forgery primitive, four
+Blockers, and eight Majors. The `review-evidence` check below is what
+makes the rule checkable rather than merely written.
 
 Running the rubric is not optional, and neither is acting on it: every
 finding it produces gets fixed in the same loop that surfaced it,
-Critical through Minor and nits included, before the PR merges. Do not
+Blocker through Minor and nits included, before the PR merges. Do not
 park a finding as a ticket unless its remedy is a separate product
 feature (new scope rather than a defect in the change under review),
 and record why in the PR body when that happens. A finding surfaced
 after a merge gets fixed immediately on a fresh branch rather than
 queued.
+
+### Review evidence in the PR body
+
+`.github/workflows/review-evidence.yml` reads the pull request body and
+goes red when it carries no record of the review. It runs on `opened`,
+`edited`, `synchronize`, `reopened`, and `ready_for_review`, so a body
+corrected after opening re-checks without a push, and it reads the body
+out of the event payload rather than building anything, so it reports in
+seconds instead of behind the Rust lanes.
+
+What it does *not* do yet is stop a merge. The `main-protection` ruleset
+requires one status check, `build / test`, and adding a second is a
+separate deliberate act; until `adversarial review evidence` is in that
+list, this check is a visible red X and nothing more. Say it that way
+rather than calling it a gate, because a rule everyone believes is
+enforced and is not is how the paragraph above got written in the first
+place.
+
+Run the fixtures with `python3 scripts/check-review-evidence.py
+--self-test` (`scripts/check.sh` does too), and check a draft body with
+`--body-file FILE` or `--stdin` before opening the PR.
+
+The pull request template already carries an `## Adversarial review`
+heading at the end, after "Notes for reviewers". Fill that one in.
+Appending a second block is refused, because two records raise the
+question of which one is the record.
+
+Under the heading:
+
+1. A `Reviewer:` line naming who or what ran the rubric. A placeholder
+   (`TBD`, `TODO`, `N/A`, `none`) is refused.
+2. A `Findings:` line carrying a count for each of Blocker, Major, and
+   Minor, or the literal `Findings: none`. Those three are the whole
+   severity set; the rubric has no Critical.
+3. One entry per declared finding, either a list item leading with its
+   severity or a table row with a whole cell that is the severity. The
+   entry count per severity has to match the declared count in both
+   directions, so an undercounted summary fails the same way an
+   undocumented finding does.
+4. A `Verification:` line whenever the counts are not all zero, since a
+   round that finds anything gets a second round on the fixes.
+
+Each finding ends with a sentence starting `Fixed`, `Accepted`, or
+`Filed`. The capital and the sentence break are load bearing: they are
+what separates a disposition from a description that happens to use the
+word, as in "the endpoint accepted a forged token".
+
+Findings may be grouped under subheadings, which is what a review with
+more than a handful of them wants; a `### Checked and sound` subsection
+is exempt from the findings scan, since the things listed there are the
+opposite of findings.
+
+The checker reads only what renders as live prose, so a copy sitting
+inside a fenced code block, inside an HTML comment, or indented as a
+code block does not count, and neither does an empty or whitespace-only
+section.
+
+With findings:
+
+```markdown
+## Adversarial review
+
+Reviewer: feature-dev:code-reviewer against .github/code-review-rubric.md
+Findings: 1 Blocker, 1 Major, 0 Minor
+Verification: second round by the same reviewer against the fixed tree
+
+- Blocker - `crates/sbproxy-core/src/router.rs:214` - an upstream 5xx
+  retries against the same dead peer forever. Fixed in this branch.
+- Major - `crates/sbproxy-core/src/router.rs:301` - the retry budget is
+  held by convention rather than by the type. Accepted; the type change
+  is separate scope.
+```
+
+Without:
+
+```markdown
+## Adversarial review
+
+Reviewer: feature-dev:code-reviewer against .github/code-review-rubric.md
+Findings: none
+```
+
+Renovate and Dependabot skip the check: they raise lockfile and
+action-digest bumps on a schedule and merge some of them automatically,
+and a check no bot can ever satisfy would deadlock those rather than
+gate them. The exemption is those two logins and no others, so this
+repository's own `github-actions[bot]` automation, which opens PRs that
+rewrite vendored fixtures, carries evidence like anyone else.
 
 ## Workspace layout
 

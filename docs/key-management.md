@@ -845,6 +845,8 @@ The plaintext token appears once at mint; list calls only ever show the key_id (
 | `POST /admin/keys/{id}/block` | Mark blocked (reversible) |
 | `POST /admin/keys/{id}/unblock` | Mark active |
 | `POST /admin/keys/{id}/rotate` | Rotate with a grace window |
+| `POST /admin/keys/{id}/budget-override` | Grant a temporary, auto-expiring budget raise |
+| `DELETE /admin/keys/{id}/budget-override` | End an active raise early |
 | `POST /admin/credentials` | Create an upstream credential |
 | `GET /admin/credentials` | List credentials (no secrets) |
 | `GET/PATCH/DELETE /admin/credentials/{id}` | Read, update, delete |
@@ -902,6 +904,32 @@ field leaves it unchanged.
 through the block, unblock, and revoke action routes. Revocation is terminal.
 Those action routes and rotation accept an optional `expected_revision`; PATCH
 always requires it.
+
+### Temporary budget overrides
+
+`POST /admin/keys/{id}/budget-override` raises the key's effective budget
+without touching the base caps, until an expiry the grant names, after
+which the base resumes on its own. The body takes `max_tokens_increase`
+and `max_cost_usd_increase` (at least one, each raising the matching base
+cap), the expiry as either `ttl_secs` or an RFC 3339 `expires_at`, an
+optional `reason`, and an optional `expected_revision`. A raise only lifts
+caps the base budget has: an uncapped axis stays uncapped, and a key with
+no base budget cannot be raised. Regranting replaces the current raise.
+
+While the raise is live, read responses carry three budget fields: the
+untouched `budget`, the `budget_override` (increases, `expires_at`,
+`granted_by`, `granted_at`, `reason`), and the `effective_budget` the
+request path is enforcing. `DELETE /admin/keys/{id}/budget-override` ends
+a raise early; expiry needs no call at all. Three ends of the raise's
+life reach the `key_audit` trail: `budget_override_grant` naming the
+operator who granted it, `budget_override_clear` naming the operator who
+ended a live raise early, and `budget_override_expire` for the
+unattributed, time-driven end an admin read retires. Reconcile every
+raise against `clear` OR `expire`; matching only one of them leaves
+operator-cancelled raises looking like they are still running. The
+override lifecycle,
+the enforcement seam, and the runnable walkthrough are in
+[ai-gateway.md](ai-gateway.md) under "Temporary budget overrides".
 
 ### Server schema and effective-policy preview
 
@@ -1018,7 +1046,10 @@ or support bundles.
 Successful key mutations emit a structured `key_audit` event with the operation,
 resource kind, and public record id. The event does not contain a plaintext
 secret or verifier hash. Route that tracing target to a protected audit sink and
-apply normal operational-log access controls. See [Audit log](audit-log.md).
+apply normal operational-log access controls. With `audit.key_path` set, the
+same mutations also land on the tamper-evident key chain, browsable from the
+console's Audit view with per-read verification; see
+[Audit log](audit-log.md#browsing-it-from-the-console).
 
 Mint, revoke, rotate, and block additionally publish typed events on the
 `events:` egress (`key_minted`, `key_revoked`, `key_rotated`, `key_blocked`),

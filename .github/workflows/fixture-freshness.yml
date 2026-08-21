@@ -50,7 +50,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/pinned-toolchain
 
       # Cache only the standalone tool's target dir; the parent
       # workspace's cache is owned by other workflows.

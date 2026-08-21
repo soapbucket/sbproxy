@@ -34,12 +34,13 @@ pub use auth::{ApiKeyAuth, Auth};
 pub use compile::*;
 pub use extension_hook::{DynamicHookMetadata, PluginAction, PluginPolicy, PluginTransform};
 pub use policy::{
-    classification_cache_stats, evaluate_body, evaluate_body_with_audit, parse_aipref,
-    reset_classification_cache, A2AInjectionAction, AgentBudgetDecision, AgentBudgetExceedReason,
-    AgentBudgetGuard, AgentBudgetOnAnonymous, AgentBudgetOnExceed, AgentBudgetPolicy,
-    AiCrawlControlPolicy, AiCrawlDecision, AiCrawlLedger, AiprefParseError, AiprefSignal,
-    AssertionPolicy, BodyAwareAuditContext, BodyAwareConfig, BodyAwareOutcome, BotDetection,
-    ClassificationCacheStats, ContentDigestOnMissing, ContentDigestPolicy,
+    body_threat_family, classification_cache_stats, evaluate_body, evaluate_body_with_audit,
+    parse_aipref, reset_classification_cache, A2AInjectionAction, AgentBudgetDecision,
+    AgentBudgetExceedReason, AgentBudgetGuard, AgentBudgetOnAnonymous, AgentBudgetOnExceed,
+    AgentBudgetPolicy, AiCrawlControlPolicy, AiCrawlDecision, AiCrawlLedger, AiprefParseError,
+    AiprefSignal, AssertionPolicy, BodyAwareAuditContext, BodyAwareConfig, BodyAwareOutcome,
+    BodyThreatFamily, BodyThreatMode, BodyThreatProtectionPolicy, BodyThreatViolation,
+    BotDetection, ClassificationCacheStats, ContentDigestOnMissing, ContentDigestPolicy,
     ContentDigestVerifyOutcome, ContentShape, ContentSignal, ContentSignalParseError,
     DdosCheckResult, DdosPolicy, DetectionLabel, DetectionResult, Detector, DlpAction,
     DlpDirection, DlpPolicy, DlpScanResult, ExposedCredsAction, ExposedCredsPolicy,

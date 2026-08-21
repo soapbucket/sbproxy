@@ -57,6 +57,12 @@ const routes = [
     meta: { title: "Session detail", documentation: "admin-ui" },
   },
   {
+    path: "/routing-decisions",
+    name: "routing-decisions",
+    component: () => import("./views/RoutingDecisionsView.vue"),
+    meta: { title: "Routing decisions", documentation: "admin-ui" },
+  },
+  {
     path: "/metrics",
     name: "metrics",
     component: () => import("./views/MetricsView.vue"),
@@ -67,6 +73,12 @@ const routes = [
     name: "spend",
     component: () => import("./views/SpendView.vue"),
     meta: { title: "Spend", documentation: "ai-usage-ledger" },
+  },
+  {
+    path: "/reports",
+    name: "reports",
+    component: () => import("./views/ReportsView.vue"),
+    meta: { title: "Reports", documentation: "admin-ui" },
   },
   {
     path: "/meter",

@@ -420,14 +420,28 @@ fn install_session_ledger_sink(cfg: &sbproxy_config::types::SessionLedgerConfig)
 /// check rather than an operator error, and it says so.
 ///
 /// WOR-2478: when `audit.config_path`, `audit.key_path`, or
-/// `audit.admin_path` is also set, opens and installs that channel's own
-/// chain under the same signing identity right after the security chain
-/// above. Same fail-the-boot rationale: an operator who named the file
-/// wants the failure loud, not a proxy that starts believing it is
-/// recording a trail it never opened. The key channel's fingerprint key
-/// (as opposed to the chain file itself) is a separate concern installed
-/// later, once `key_management`'s master key resolves; see
-/// `sbproxy_observe::audit_chain::install_key_audit_fingerprint_key`.
+/// `audit.admin_path` is also set, that channel gets its own chain under
+/// the same signing identity. Same fail-the-boot rationale: an operator
+/// who named the file wants the failure loud, not a proxy that starts
+/// believing it is recording a trail it never opened. The key channel's
+/// fingerprint key (as opposed to the chain file itself) is a separate
+/// concern installed later, once `key_management`'s master key resolves;
+/// see `sbproxy_observe::audit_chain::install_key_audit_fingerprint_key`.
+///
+/// WOR-2598: every file the operator named is opened before any of them
+/// is registered, so a boot that refuses over the fourth chain does not
+/// leave the first three sitting in slots that cannot be given back.
+/// That covers the whole class of failure an operator can cause, which
+/// is a file that will not open. The registrations that follow are still
+/// four separate calls that can bail part way, but the only thing that
+/// makes one of them fail is a second boot inside one process, which no
+/// configuration produces: `run` calls this once and its callers exit on
+/// the error.
+///
+/// Each open logs as it lands, so a boot that stalls on a slow or hung
+/// file says which of the four it got to. Opening replays the existing
+/// chain to find its head, so on a long-lived trail that is not a
+/// negligible wait.
 fn install_audit_chain(
     audit: &sbproxy_config::types::AuditConfig,
     web_bot_auth: Option<&sbproxy_config::types::WebBotAuthConfig>,
@@ -456,15 +470,96 @@ fn install_audit_chain(
         );
     };
 
-    let chain = SecurityAuditChain::open(
+    // WOR-2598: open every file this document named before registering
+    // any of them, and touch no slot until all four opens have come back
+    // clean. The slots are set-once, so an install that ran before a
+    // later open failed cannot be undone: a boot that refused over
+    // `audit.admin_path` used to leave the security, config, and key
+    // chains registered anyway, a process holding three quarters of a
+    // trail with no way to complete it and no way to hand the slots
+    // back. It also made this function's refusal depend on what had
+    // called it earlier in the same process, which under a runner that
+    // shares one process across tests (`release-checks.yml` runs `cargo
+    // test --workspace -- --test-threads=1`, which does not fork per
+    // test the way nextest does) is what had the two boot-refusal tests
+    // below taking turns failing on each other's leftovers.
+    //
+    // Each open announces itself on the way past. The old order proved
+    // progress by side effect, because the install line for one chain
+    // could only appear after the previous one had opened; batching the
+    // opens would otherwise have made a boot that hangs on the fourth
+    // file indistinguishable from one that hangs on the first. Worth a
+    // line each because opening replays the whole existing file to find
+    // its head, so on an accumulated trail this is a real wait rather
+    // than an instant `open(2)`.
+    let security_chain = SecurityAuditChain::open(
         std::path::Path::new(path),
         &signer.ed25519_seed_hex,
         &signer.key_id,
     )?;
+    tracing::info!(path = %path, channel = "security", "audit chain file opened");
+    // Opt-in second chain for `config_audit` events, same signing identity
+    // as the security chain above (one proxy, one key, two files). Absent
+    // `audit.config_path`, `config_audit` stays exactly what it always
+    // was: a tracing stream with no durable record.
+    let config_chain = audit
+        .config_path
+        .as_deref()
+        .map(|config_path| {
+            ConfigAuditChain::open(
+                std::path::Path::new(config_path),
+                &signer.ed25519_seed_hex,
+                &signer.key_id,
+            )
+            .map(|chain| {
+                tracing::info!(path = %config_path, channel = "config", "audit chain file opened");
+                (config_path, chain)
+            })
+        })
+        .transpose()?;
+    // WOR-2478: opt-in third chain for `key_audit` mutations, same
+    // signing identity.
+    let key_chain = audit
+        .key_path
+        .as_deref()
+        .map(|key_path| {
+            KeyAuditChain::open(
+                std::path::Path::new(key_path),
+                &signer.ed25519_seed_hex,
+                &signer.key_id,
+            )
+            .map(|chain| {
+                tracing::info!(path = %key_path, channel = "key", "audit chain file opened");
+                (key_path, chain)
+            })
+        })
+        .transpose()?;
+    // WOR-2478: opt-in fourth chain for admin-console actions, same
+    // signing identity.
+    let admin_chain = audit
+        .admin_path
+        .as_deref()
+        .map(|admin_path| {
+            AdminActionAuditChain::open(
+                std::path::Path::new(admin_path),
+                &signer.ed25519_seed_hex,
+                &signer.key_id,
+            )
+            .map(|chain| {
+                tracing::info!(path = %admin_path, channel = "admin", "audit chain file opened");
+                (admin_path, chain)
+            })
+        })
+        .transpose()?;
+
+    // Every file is open. From here on the calls claim process-wide
+    // slots, and a failure is a second boot inside one process rather
+    // than anything an operator wrote.
+
     // Read before the move, and the kid rather than the seed: this is the
     // one value an auditor needs in order to ask for the right public key.
-    let kid = chain.key_id().to_string();
-    match install_security_audit_chain(chain) {
+    let kid = security_chain.key_id().to_string();
+    match install_security_audit_chain(security_chain) {
         Ok(()) => {
             tracing::info!(
                 path = %path,
@@ -476,16 +571,7 @@ fn install_audit_chain(
         Err(error) => anyhow::bail!("audit.sink is `chain` but {error}"),
     }
 
-    // Opt-in second chain for `config_audit` events, same signing identity
-    // as the security chain above (one proxy, one key, two files). Absent
-    // `audit.config_path`, `config_audit` stays exactly what it always
-    // was: a tracing stream with no durable record.
-    if let Some(config_path) = audit.config_path.as_deref() {
-        let config_chain = ConfigAuditChain::open(
-            std::path::Path::new(config_path),
-            &signer.ed25519_seed_hex,
-            &signer.key_id,
-        )?;
+    if let Some((config_path, config_chain)) = config_chain {
         let config_kid = config_chain.key_id().to_string();
         match install_config_audit_chain(config_chain) {
             Ok(()) => {
@@ -500,14 +586,7 @@ fn install_audit_chain(
         }
     }
 
-    // WOR-2478: opt-in third chain for `key_audit` mutations, same
-    // signing identity.
-    if let Some(key_path) = audit.key_path.as_deref() {
-        let key_chain = KeyAuditChain::open(
-            std::path::Path::new(key_path),
-            &signer.ed25519_seed_hex,
-            &signer.key_id,
-        )?;
+    if let Some((key_path, key_chain)) = key_chain {
         let key_kid = key_chain.key_id().to_string();
         match install_key_audit_chain(key_chain) {
             Ok(()) => {
@@ -522,14 +601,7 @@ fn install_audit_chain(
         }
     }
 
-    // WOR-2478: opt-in fourth chain for admin-console actions, same
-    // signing identity.
-    if let Some(admin_path) = audit.admin_path.as_deref() {
-        let admin_chain = AdminActionAuditChain::open(
-            std::path::Path::new(admin_path),
-            &signer.ed25519_seed_hex,
-            &signer.key_id,
-        )?;
+    if let Some((admin_path, admin_chain)) = admin_chain {
         let admin_kid = admin_chain.key_id().to_string();
         match install_admin_audit_chain(admin_chain) {
             Ok(()) => {
@@ -5952,6 +6024,7 @@ origins:
             error_pages: None,
             problem_details: None,
             proxy_status: None,
+            deprecation: None,
             message_signatures: None,
             olp: None,
             web_bot_auth_publish: None,
@@ -6849,7 +6922,7 @@ mod event_egress_tests {
     }
 
     #[test]
-    fn install_audit_chain_installs_all_four_chains_when_every_path_is_set() {
+    fn install_audit_chain_claims_no_slot_on_a_refused_boot_and_all_four_on_a_clean_one() {
         // WOR-2478: `audit.config_path`, `audit.key_path`, and
         // `audit.admin_path` each opt a further chain into the same boot
         // call that opens the security chain, under the same signing
@@ -6858,16 +6931,66 @@ mod event_egress_tests {
         // `KEY_CHAIN`, `ADMIN_CHAIN`) are private and process-wide, so the
         // only externally observable proof any one installed is that a
         // second install of the same slot is refused.
+        //
+        // WOR-2598: which makes this deliberately the only test in this
+        // binary that reaches an install at all, and the refused boot
+        // below is how that stays true. `install_audit_chain` opens every
+        // named file before it registers any of them, so the two
+        // `fails_boot_when_..._parent_cannot_be_created` tests below stop
+        // at an `open` and never claim a slot. Before that split the
+        // refused boot here would have claimed three of the four on its
+        // way to failing, the clean boot after it would have been refused
+        // its own security slot, and the two tests below would have taken
+        // turns failing on whichever ran first. Under nextest none of
+        // that is visible, because every test gets its own process;
+        // `release-checks.yml` runs `cargo test --workspace --locked
+        // --no-fail-fast -- --test-threads=1`, which shares one.
         let dir = tempfile::tempdir().expect("temp dir");
-        let security_path = dir.path().join("security-audit.jsonl");
-        let config_path = dir.path().join("config-audit.jsonl");
-        let key_path = dir.path().join("key-audit.jsonl");
-        let admin_path = dir.path().join("admin-audit.jsonl");
         let signer = sbproxy_config::types::WebBotAuthConfig {
             key_id: "audit-test-kid".to_string(),
             ed25519_seed_hex: "cc".repeat(32),
             directory_url: None,
         };
+
+        // A boot that refuses on the last of the four. Under the old
+        // order the three before it were already registered by the time
+        // this returned, and the clean boot below could not have run.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"occupies the path a directory needs")
+            .expect("write blocker file");
+        let refused = sbproxy_config::types::AuditConfig {
+            sink: sbproxy_config::types::AuditSinkKind::Chain,
+            path: Some(
+                dir.path()
+                    .join("refused-security.jsonl")
+                    .display()
+                    .to_string(),
+            ),
+            sign_with: Some("web_bot_auth".to_string()),
+            config_path: Some(
+                dir.path()
+                    .join("refused-config.jsonl")
+                    .display()
+                    .to_string(),
+            ),
+            key_path: Some(dir.path().join("refused-key.jsonl").display().to_string()),
+            admin_path: Some(blocker.join("refused-admin.jsonl").display().to_string()),
+        };
+        let error = install_audit_chain(&refused, Some(&signer))
+            .expect_err("an admin chain whose parent cannot be created must not boot quietly");
+        assert!(
+            error.to_string().contains("audit.admin_path"),
+            "the failure names the key that turned the chain on: {error}"
+        );
+
+        // The same call again with four openable paths. It can only
+        // succeed if the refusal above registered nothing: the slots are
+        // set-once, and a security slot claimed on the way to that
+        // failure would refuse this one.
+        let security_path = dir.path().join("security-audit.jsonl");
+        let config_path = dir.path().join("config-audit.jsonl");
+        let key_path = dir.path().join("key-audit.jsonl");
+        let admin_path = dir.path().join("admin-audit.jsonl");
         let audit = sbproxy_config::types::AuditConfig {
             sink: sbproxy_config::types::AuditSinkKind::Chain,
             path: Some(security_path.display().to_string()),
@@ -6877,86 +7000,98 @@ mod event_egress_tests {
             admin_path: Some(admin_path.display().to_string()),
         };
 
-        match install_audit_chain(&audit, Some(&signer)) {
-            Ok(()) => {
-                assert!(
-                    security_path.exists(),
-                    "the security chain file is opened at boot"
-                );
-                assert!(
-                    config_path.exists(),
-                    "the config chain file is opened alongside it"
-                );
-                assert!(
-                    key_path.exists(),
-                    "the key chain file is opened alongside it"
-                );
-                assert!(
-                    admin_path.exists(),
-                    "the admin chain file is opened alongside it"
-                );
+        // Two things can put a chain in a slot before this line, and the
+        // message names both, because only one of them is the property
+        // this test exists to guard. If the refused boot registered
+        // something, the open/install split in `install_audit_chain`
+        // regressed. If some other test in this binary got here first,
+        // that test is the problem: this is supposed to be the only one
+        // that installs, and nothing mechanical enforces it.
+        install_audit_chain(&audit, Some(&signer)).expect(
+            "a clean boot installs all four chains, so either the refused boot above registered \
+             something it should not have, or another test in this binary claimed a slot before \
+             this one ran",
+        );
 
-                let redundant_seed = "dd".repeat(32);
-                let redundant_security = sbproxy_observe::audit_chain::SecurityAuditChain::open(
-                    &dir.path().join("unused-security.jsonl"),
-                    &redundant_seed,
-                    "unused",
-                )
-                .expect("chain opens");
-                let security_reinstall =
-                    sbproxy_observe::audit_chain::install_security_audit_chain(redundant_security);
-                assert!(
-                    security_reinstall.is_err(),
-                    "the security slot this boot call claimed is already taken"
-                );
+        assert!(
+            security_path.exists(),
+            "the security chain file is opened at boot"
+        );
+        assert!(
+            config_path.exists(),
+            "the config chain file is opened alongside it"
+        );
+        assert!(
+            key_path.exists(),
+            "the key chain file is opened alongside it"
+        );
+        assert!(
+            admin_path.exists(),
+            "the admin chain file is opened alongside it"
+        );
 
-                let redundant_config = sbproxy_observe::audit_chain::ConfigAuditChain::open(
-                    &dir.path().join("unused-config.jsonl"),
-                    &redundant_seed,
-                    "unused",
-                )
-                .expect("chain opens");
-                let config_reinstall =
-                    sbproxy_observe::audit_chain::install_config_audit_chain(redundant_config);
-                assert!(
-                    config_reinstall.is_err(),
-                    "the config slot this boot call claimed is already taken"
-                );
+        let redundant_seed = "dd".repeat(32);
+        let redundant_security = sbproxy_observe::audit_chain::SecurityAuditChain::open(
+            &dir.path().join("unused-security.jsonl"),
+            &redundant_seed,
+            "unused",
+        )
+        .expect("chain opens");
+        let security_reinstall =
+            sbproxy_observe::audit_chain::install_security_audit_chain(redundant_security);
+        assert!(
+            security_reinstall.is_err(),
+            "the security slot this boot call claimed is already taken"
+        );
 
-                let redundant_key = sbproxy_observe::audit_chain::KeyAuditChain::open(
-                    &dir.path().join("unused-key.jsonl"),
-                    &redundant_seed,
-                    "unused",
-                )
-                .expect("chain opens");
-                let key_reinstall =
-                    sbproxy_observe::audit_chain::install_key_audit_chain(redundant_key);
-                assert!(
-                    key_reinstall.is_err(),
-                    "the key slot this boot call claimed is already taken"
-                );
+        let redundant_config = sbproxy_observe::audit_chain::ConfigAuditChain::open(
+            &dir.path().join("unused-config.jsonl"),
+            &redundant_seed,
+            "unused",
+        )
+        .expect("chain opens");
+        let config_reinstall =
+            sbproxy_observe::audit_chain::install_config_audit_chain(redundant_config);
+        assert!(
+            config_reinstall.is_err(),
+            "the config slot this boot call claimed is already taken"
+        );
 
-                let redundant_admin = sbproxy_observe::audit_chain::AdminActionAuditChain::open(
-                    &dir.path().join("unused-admin.jsonl"),
-                    &redundant_seed,
-                    "unused",
-                )
-                .expect("chain opens");
-                let admin_reinstall =
-                    sbproxy_observe::audit_chain::install_admin_audit_chain(redundant_admin);
-                assert!(
-                    admin_reinstall.is_err(),
-                    "the admin slot this boot call claimed is already taken"
-                );
-            }
-            Err(error) if error.to_string().contains("already registered") => {
-                // Another test in this process claimed a slot first (the
-                // `cargo test` fallback path; nextest gives every test its
-                // own process, which is what the gate actually runs).
-                // Nothing left for this test to prove.
-            }
-            Err(error) => panic!("unexpected boot failure: {error}"),
-        }
+        let redundant_key = sbproxy_observe::audit_chain::KeyAuditChain::open(
+            &dir.path().join("unused-key.jsonl"),
+            &redundant_seed,
+            "unused",
+        )
+        .expect("chain opens");
+        let key_reinstall = sbproxy_observe::audit_chain::install_key_audit_chain(redundant_key);
+        assert!(
+            key_reinstall.is_err(),
+            "the key slot this boot call claimed is already taken"
+        );
+
+        let redundant_admin = sbproxy_observe::audit_chain::AdminActionAuditChain::open(
+            &dir.path().join("unused-admin.jsonl"),
+            &redundant_seed,
+            "unused",
+        )
+        .expect("chain opens");
+        let admin_reinstall =
+            sbproxy_observe::audit_chain::install_admin_audit_chain(redundant_admin);
+        assert!(
+            admin_reinstall.is_err(),
+            "the admin slot this boot call claimed is already taken"
+        );
+
+        // The four slots outlive this test: they are set once for the
+        // life of the process, and they hold open file handles to the
+        // four chains installed above. Letting the `TempDir` clean up
+        // would leave the rest of this binary emitting key and admin
+        // audit records into unlinked files, which is a state no
+        // deployment can reach and a trap for any later test that
+        // asserts on the chained fields. Keep the directory instead; the
+        // OS reclaims it, and the leak is bounded at one directory per
+        // process.
+        let _kept = dir.keep();
     }
 
     #[test]
@@ -7088,6 +7223,13 @@ egress:
         // the sibling case on the events sink): an operator who named
         // `audit.config_path` wants a proxy that refuses to start over one
         // that starts and silently records nothing.
+        //
+        // WOR-2598: this stops at an `open` and must never reach an
+        // install, which is what keeps it independent of whatever else
+        // ran first in this process. Do not add an assertion here that
+        // claims a process-wide slot; put it in
+        // `install_audit_chain_claims_no_slot_on_a_refused_boot_and_all_four_on_a_clean_one`
+        // instead, which is the one test in this binary that owns them.
         let dir = tempfile::tempdir().expect("temp dir");
         let security_path = dir.path().join("security-audit.jsonl");
         let blocker = dir.path().join("blocker");
@@ -7122,6 +7264,10 @@ egress:
         // WOR-2478: the same loud-fail posture, proved for the admin
         // channel specifically so the extension is known to be reachable
         // rather than merely mirrored in shape from the config case above.
+        //
+        // WOR-2598: same rule as the config twin above. This stops at an
+        // `open` and claims no process-wide slot, so it does not care
+        // whether it ran first or last.
         let dir = tempfile::tempdir().expect("temp dir");
         let security_path = dir.path().join("security-audit.jsonl");
         let blocker = dir.path().join("blocker");

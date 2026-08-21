@@ -12,6 +12,209 @@ the next version cut.
 
 ### Added
 
+- **Routing decision traces: `GET /api/routing-decisions` and the
+  admin console's Routing decisions view.** Every routed request
+  (AI dispatch or a load-balanced origin) now records a per-request
+  decision trace: the strategy or operator plan that decided, the
+  ordered candidates it weighed, the winner, the reason, the fallback
+  chain actually traversed, and timing. The record's open `detail`
+  map is additive by design so later explanatory columns land as
+  keys, not schema changes. Bounded in-memory ring sharing
+  `proxy.admin.max_log_entries` with the request log; server-side
+  filters by origin, strategy, model (either side of a substitution),
+  provider, and time range. See the routing-decisions sections of
+  [docs/admin-api-reference.md](docs/admin-api-reference.md) and
+  [docs/admin-ui.md](docs/admin-ui.md).
+
+- **Reporting: multi-dimension spend aggregation and raw export on
+  the request log, with shareable filtered views.**
+  `GET /api/requests/report` aggregates the same filtered ring that
+  `GET /api/requests` serves into one row per composite group:
+  `group_by` takes any mix of `model`, `api_key_id`, `tenant`, and
+  `user` simultaneously, and each row carries request count, tokens
+  in/out, and estimated cost. `GET /api/requests/export` downloads
+  the filtered rows as CSV or JSONL, bounded by the ring cap and
+  hardened against spreadsheet formula injection. Every export is an
+  audited admin action (`export_request_log`, naming the format, the
+  row count, and which filter dimensions were set) and increments the
+  new `sbproxy_admin_request_exports_total{format}` and
+  `sbproxy_admin_request_export_rows_total{format}` counters, so every
+  export is recorded and alertable. That record covers the export
+  route, not every bulk read: `GET /api/requests?limit=<max>` returns
+  the same rows under the same cap with no record and no counter, so a
+  detection built on `export_request_log` alone covers the download
+  button rather than the whole read surface. The response is bounded
+  by the ring cap but materialized rather than streamed, because the
+  admin dispatcher answers with a whole body; what the row-at-a-time
+  encoding avoids is a second copy, not the response itself.
+  All three routes share one filter surface, which gains exact
+  `model`, `tenant`, and `user` filters, refuses a malformed `status`,
+  `offset`, or `limit` with a `400` instead of ignoring it, and treats
+  an empty filter value as "rows with nothing there", so the report's
+  unattributed group drills through to its own rows like any other. The admin console's new
+  Reports view drives them and serializes filter and grouping state
+  into URL query params, so a filtered report is a shareable link.
+  See the reporting sections of
+  [docs/admin-api-reference.md](docs/admin-api-reference.md) and
+  [docs/admin-ui.md](docs/admin-ui.md), and the worked example in
+  [examples/admin-reporting/](examples/admin-reporting/).
+
+- **Audit chain viewer: `GET /api/audit/chain` and the console's
+  Audit view.** The four tamper-evident audit chains
+  (`audit.path`, `audit.config_path`, `audit.key_path`,
+  `audit.admin_path`) were CLI-only reads until now. The new route
+  reads the chained files themselves with channel, actor, and
+  time-range filters plus cursor paging, re-verifying every hash link
+  and Ed25519 signature as it reads; reads are windowed (streamed one
+  record at a time, never a whole-file load) and a verification
+  failure is served in the response with the first broken sequence
+  and reason, alongside the records that verified. A truncated or
+  deleted chain file is reported as a failure too: what is left of a
+  truncated file links and signs perfectly, so the read compares the
+  walk against the number of records **this process** wrote to that
+  chain, which means it catches a truncation the running proxy
+  outlived and not one that survived a restart. The console's
+  Audit view renders the four channel cards, the merged entry table,
+  and a failure banner. GET-only, readable by the `read_only` role;
+  a login narrowed with `proxy.admin.operators[].tenant` is refused,
+  because the chains are deployment-wide and a per-tenant slice of an
+  audit trail reads as "nothing else happened". Read access is wider
+  than the bounded ring at `GET /api/audit/events` on two axes, both
+  stated in [docs/audit-log.md](docs/audit-log.md): history is the
+  whole chain rather than the last `max_audit_events` records, and
+  each entry carries the chained payload verbatim rather than the
+  ring's `detail` projection. No secrets cross either way; a
+  deployment that wants the trail narrower turns the channel's chain
+  path off or fronts the admin port. Every call is itself
+  recorded on the admin channel (`read_audit_chain`, or
+  `read_audit_chain_denied` on the refusal). See the audit-chain
+  sections of [docs/audit-log.md](docs/audit-log.md),
+  [docs/admin-api-reference.md](docs/admin-api-reference.md), and
+  [docs/admin-ui.md](docs/admin-ui.md).
+
+- **New metric `sbproxy_audit_chain_read_total{channel, outcome}`.**
+  One increment per chain walked per viewer read, with an `outcome`
+  of `verified`, `broken`, or `unreadable`; a refusal increments all
+  four channels with `denied`, because it refuses all four. A broken
+  chain that only a person looking at the console can see is a finding
+  nobody is on call for, and a tenant-scoped operator probing a
+  deployment-wide security surface is one whose only other record sits
+  inside the chain that operator was refused. Both leave the page:
+  alert on
+  `increase(sbproxy_audit_chain_read_total{outcome!="verified"}[15m]) > 0`.
+  That rule does not cover a chain file truncated at the tail and read
+  after a restart: the boot re-baselines on what is left, every link
+  and signature holds, and the read is `verified`. Pre-restart records
+  are covered by `sbproxy audit verify` against an offsite copy.
+
+- **Temporary, auto-expiring budget overrides on dynamic keys.** `POST
+  /admin/keys/{id}/budget-override` raises a governed key's effective
+  budget on top of its base caps (`max_tokens_increase`,
+  `max_cost_usd_increase`) until a `ttl_secs` or `expires_at` expiry,
+  after which the base caps resume with no operator action: expiry is
+  persisted on the key record and evaluated lazily at every budget
+  read, so it survives restarts and needs no sweeper. Read responses
+  and the console's Keys page show the base budget, the override with
+  its countdown and grantor, and the enforced `effective_budget`;
+  `DELETE` on the same path ends a raise early. Three points in the
+  raise's life land in the `key_audit` trail: `budget_override_grant`
+  and `budget_override_clear` name the operator who granted or ended
+  one, and `budget_override_expire` is the unattributed, time-driven
+  end. All three routes are counted on
+  `sbproxy_key_operations_total{operation, outcome}` alongside the
+  other key mutations. See the temp-override section
+  of [docs/ai-gateway.md](docs/ai-gateway.md) and
+  [examples/temp-budget-override/](examples/temp-budget-override/).
+
+- **First-class API deprecation: RFC 9745 `Deprecation`, RFC 8594
+  `Sunset`, and the successor and documentation `Link` relations.** A
+  `deprecation:` block on an origin or on a single forward rule stamps
+  the standard announcement headers onto the responses that rule
+  matches. Per-path deprecation, the normal case where `/v1/*` is going
+  away and `/v2/*` is not, was not expressible before: response
+  modifiers hang only off the origin, so it was the whole origin or
+  nothing. `deprecated:` takes a date or an RFC 3339 timestamp and
+  emits `Deprecation: @<unix>`, the structured-field Date the RFC
+  requires; a bare `true` marks the route for spec emission and metrics
+  but emits no header, because the draft-era literal `true` did not
+  survive into the final RFC. `sunset:` emits the HTTP-date form, and a
+  sunset earlier than the deprecation instant is refused at config
+  compile rather than shipped as a contradiction. `successor:` and
+  `link:` emit the `successor-version` and `deprecation` relations,
+  appended so an upstream's own `Link` headers survive.
+  `after_sunset: gone` retires the route with `410 Gone` and a JSON
+  body naming the successor once the instant passes; the default
+  `serve` keeps proxying, so a forgotten config never takes an API down
+  by surprise. That refusal is enforcement, so it also emits a
+  `policy_violation` audit record with `event_type: api_deprecation`
+  carrying the tenant and the accountable key id.
+  `openapi_validation.deprecation_headers:` (off by default) drives the
+  same emission from operations a loaded spec marks `deprecated: true`,
+  and `/.well-known/openapi.json` marks config-deprecated operations
+  `deprecated: true` with `x-sbproxy-sunset` and `x-sbproxy-successor`
+  extensions, so the published spec and the wire headers cannot
+  disagree. `sbproxy_deprecated_requests_total{origin, route,
+  past_sunset, outcome}` is the migration tracker: who is still
+  calling, against which announcement, and whether they are being
+  served or refused. See
+  [docs/api-gateway.md](docs/api-gateway.md#deprecating-endpoints) and
+  [examples/api-deprecation/](examples/api-deprecation/).
+
+- **`body_threat_protection`: structural JSON and XML request-body
+  limits.** A new `policies:` entry that refuses bodies by shape rather
+  than by content: a thousand levels of nesting to blow a recursive
+  parser's stack, a million-key object to soak CPU in hash insertion,
+  an XML DTD whose entities expand into gigabytes. JSON limits are
+  `max_depth` (64), `max_object_entries` (10 000), `max_array_items`
+  (10 000), `max_key_length` (1 024 bytes), `max_string_length` (128
+  KiB), and `max_containers` (50 000, objects plus arrays); XML limits
+  are `max_depth` (64), `max_elements` (10 000), and `max_attributes`
+  (256). Any single limit set to `0` disables that one check. A
+  `<!DOCTYPE` declaration is refused unconditionally and is not
+  configurable, which closes the entity-expansion class by construction
+  rather than by pattern. The JSON scanner is iterative with an
+  explicit stack and a hard 10 000-depth ceiling that holds even when
+  the operator disables the depth check, so the attack the policy
+  exists to stop cannot overflow the scanner itself. A violation
+  answers `400` naming the limit and the observed and allowed numbers,
+  and never echoes body content into the response, the log, or the
+  audit record. `mode: tap` logs and counts without blocking, for
+  sizing limits against real traffic before enforcing; the policy
+  counter's `action` label keeps the two apart. One thing to know if
+  you are migrating from the origin-level `threat_protection:` block:
+  this policy has no body-size knob. The successor to
+  `json.max_total_size` is `request_limit.max_body_size`, not a key
+  here, and all three of the policy's structs refuse unknown fields, so
+  an invented one fails config load instead of being silently ignored.
+  See
+  [docs/api-security.md](docs/api-security.md#structural-body-threat-limits)
+  and
+  [examples/body-threat-protection/](examples/body-threat-protection/).
+
+- **`sbproxy_target_health_state`: per-target load-balancer health as a
+  Prometheus gauge.** Whether a target is actually taking traffic used
+  to mean polling `GET /api/health/targets`. It is a gauge now, on
+  LiteLLM's 0/1/2 deployment-state scale (0 healthy, 1 degraded with
+  the circuit breaker half-open, 2 excluded from selection), so Grafana
+  panels built against that convention port over unchanged. The value
+  folds all three exclusion mechanisms, active probe, passive outlier
+  ejection, and circuit breaker, and is sampled at scrape time from the
+  same pipeline walk that renders the admin endpoint, so the two
+  surfaces cannot tell different stories about one target. A target
+  dropped by a config reload leaves the scrape on the next render
+  instead of freezing at its last value. The `target` label is the
+  configured URL, or the load balancer's own `url#index` identifier
+  when one origin configures that URL more than once. A Target Health
+  State panel ships on the origins dashboard, and a Budget Utilization
+  by Scope panel on the AI gateway dashboard for the already-exported
+  `sbproxy_ai_budget_utilization_ratio`; headroom is
+  `1 - sbproxy_ai_budget_utilization_ratio` in PromQL, and there is
+  deliberately no separate remaining family, because a family and its
+  complement double the series without adding information. See
+  [docs/observability.md](docs/observability.md#budget-headroom-and-target-health)
+  and
+  [examples/health-and-budget-gauges/](examples/health-and-budget-gauges/).
+
 - **`hmac_auth`: signed-request authentication.** A new auth provider
   for machine callers that prove possession of a shared secret by
   signing each request (RFC 9421 HTTP Message Signatures,
@@ -146,6 +349,27 @@ the next version cut.
   entry is refused with a `400` before any upstream connection, and an
   upstream selection outside the negotiated set fails the upgrade with
   a `502`.
+
+- **Mid-tunnel failures on an upgraded websocket tear the connection
+  down instead of writing an HTTP error body into the frame stream.**
+  Once the `101` reaches the downstream wire the client is speaking
+  WebSocket frames, but a post-upgrade failure fell through to the
+  generic upstream-error tail and wrote a synthesized `502 Bad Gateway`
+  response, which arrives as garbage bytes spliced into the frame
+  sequence. Every post-upgrade failure (upstream reset, timeout, read
+  error) now closes both connections and writes nothing, on both
+  surfaces that upgrade: the `websocket` action, and the AI gateway's
+  realtime tunnel (`type: ai_proxy` reaching `/v1/realtime`), where a
+  provider reset used to splice a `502` into a client's audio frames.
+  What decides it is the `101` reaching the wire rather than which
+  action opened the tunnel, so pre-upgrade failures still render an
+  ordinary HTTP error a client can read: a connect error, a refused
+  subprotocol negotiation, or a realtime handshake the provider
+  answered `401`. The real failure mode still lands in the log,
+  classified the way the `Proxy-Status` machinery classifies upstream
+  errors, and on
+  `sbproxy_websocket_teardowns_total{reason="upstream_error"}`. See
+  [docs/websocket.md](docs/websocket.md#mid-tunnel-errors-never-write-http-bytes).
 - **GraphQL validation refuses before connecting upstream.** On a
   validated `graphql` origin without `request_modifiers`, an invalid
   document now gets its `400` in the request phase, before any upstream

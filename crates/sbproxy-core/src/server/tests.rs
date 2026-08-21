@@ -192,6 +192,8 @@ fn swr_revalidation_uses_the_matching_forward_action_and_vary_headers() {
             .unwrap(),
             request_modifiers: Vec::new(),
             parameters: Vec::new(),
+            id: None,
+            deprecation: None,
         }]);
     let mut request =
         pingora_http::RequestHeader::build("GET", b"/forward/resource?view=full", None).unwrap();

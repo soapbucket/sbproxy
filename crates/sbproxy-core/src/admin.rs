@@ -478,6 +478,203 @@ pub struct RequestLogFilter<'a> {
     pub key_mode: Option<&'a str>,
     /// Exact session id match (WOR-2093; previously client-side only).
     pub session_id: Option<&'a str>,
+    /// Exact AI model match (WOR-2578), one of the report dimensions.
+    pub model: Option<&'a str>,
+    /// Exact origin-scoped tenant label match (WOR-2578).
+    pub tenant: Option<&'a str>,
+    /// Exact resolved end-user id match (WOR-2578): the human subject
+    /// behind the call, sbproxy's equivalent of OpenRouter's "Creator".
+    pub user: Option<&'a str>,
+}
+
+impl RequestLogFilter<'_> {
+    /// Returns `true` when `entry` passes every dimension this filter
+    /// sets. `None` on a dimension means it is not filtered.
+    ///
+    /// This is the single predicate behind `/api/requests`,
+    /// `/api/requests/report`, and `/api/requests/export`
+    /// ([`AdminState::query_requests`] and `for_each_request` both call
+    /// it), so the three routes cannot drift into selecting different
+    /// rows for the same query string. A dimension added here is
+    /// filtered on all three.
+    ///
+    /// On the three optional *report* dimensions (`model`,
+    /// `api_key_id`, `user`) an absent value on the row reads as the
+    /// empty string, which is what `report_dimension_value` does when
+    /// it groups. The report's grouper is a fourth reader of these
+    /// fields, and if it folded unattributed rows under `""` while this
+    /// predicate required `Some(..)`, the `""` group (typically the
+    /// largest one in a deployment that does not resolve end users)
+    /// would drill through to an empty export rather than to its own
+    /// rows. The remaining exact-match dimensions keep `Some(..)`
+    /// semantics: nothing groups on them, so there is no group to drill
+    /// through from.
+    fn matches(&self, entry: &RequestLogEntry) -> bool {
+        self.status.is_none_or(|s| entry.status == s)
+            && self
+                .method
+                .is_none_or(|m| entry.method.eq_ignore_ascii_case(m))
+            && self.path_sub.is_none_or(|p| entry.path.contains(p))
+            // WOR-1874: exact-match filters on the guardrail columns so
+            // the Guardrails admin view can deep-link to blocked rows.
+            && self
+                .guardrail_action
+                .is_none_or(|a| entry.guardrail_action.as_deref() == Some(a))
+            && self
+                .guardrail_category
+                .is_none_or(|c| entry.guardrail_category.as_deref() == Some(c))
+            && self
+                .cache_status
+                .is_none_or(|status| entry.cache_status == status)
+            && self
+                .retried
+                .is_none_or(|retried| (entry.retry_count > 0) == retried)
+            && match (self.property_key, self.property_value) {
+                (None, _) => true,
+                (Some(key), None) => entry.properties.contains_key(key),
+                (Some(key), Some(value)) => entry.properties.get(key).is_some_and(|v| v == value),
+            }
+            // WOR-2093: key-accountability filters so the Keys view can
+            // deep-link to one credential's traffic, and session rows
+            // resolve server-side instead of client-side.
+            && self
+                .api_key_id
+                .is_none_or(|id| entry.api_key_id.as_deref().unwrap_or("") == id)
+            && self.key_mode.is_none_or(|mode| entry.key_mode == mode)
+            && self
+                .session_id
+                .is_none_or(|id| entry.session_id.as_deref() == Some(id))
+            // WOR-2578: the four report dimensions, filterable exactly
+            // so a grouped row drills through to the rows behind it,
+            // including the unattributed group. `unwrap_or("")` is what
+            // makes `?user=` select the rows the report folded under
+            // `""` rather than nothing at all; `tenant_id` is a `String`
+            // on the row and is already symmetric.
+            && self
+                .model
+                .is_none_or(|model| entry.model.as_deref().unwrap_or("") == model)
+            && self.tenant.is_none_or(|tenant| entry.tenant_id == tenant)
+            && self
+                .user
+                .is_none_or(|user| entry.user_id.as_deref().unwrap_or("") == user)
+    }
+}
+
+/// One provider (and optionally model) the router weighed for a request
+/// (WOR-2575). Ordered as the router saw them: a routing plan's tier
+/// order, a cascade's tier order, or the eligible provider order of the
+/// configured strategy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RoutingDecisionCandidate {
+    /// Provider name as configured under the origin's provider list.
+    pub provider: String,
+    /// Model the candidate would serve, when the routing source names
+    /// one. Plan and cascade tiers do; strategy orderings serve the
+    /// requested model and leave this empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// Recent routing decision stored in a ring buffer (WOR-2575): why one
+/// request was routed where it was.
+///
+/// The shape is additive by design. Features that explain more of a
+/// decision (typed fallback triggers, eligibility filter results,
+/// price-ceiling exclusions, semantic-match scores) add namespaced keys
+/// to the open `detail` map via `RequestContext::ai_route_detail`
+/// rather than redesigning this struct, and every optional column is
+/// omitted from the wire when absent, so readers never break when a
+/// field they do not know about appears.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RoutingDecisionEntry {
+    /// RFC 3339 timestamp marking when the request completed.
+    pub timestamp: String,
+    /// Origin name that handled the request.
+    pub origin: String,
+    /// Request id, correlating the decision with the request-log row,
+    /// the access log line, and the trace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Origin-scoped tenant label (`__default__` when unset).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub tenant_id: String,
+    /// Closed strategy name that decided the request: a built-in
+    /// strategy label (`round_robin`, `fallback_chain`, `cascade`, ...),
+    /// `ai_routing_policy` when an operator plan dispatched, or the
+    /// generic load balancer's selection method.
+    pub strategy: String,
+    /// Model the caller asked for, after alias resolution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
+    /// Provider that served (or last attempted) the request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_provider: Option<String>,
+    /// Model that served the request, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_model: Option<String>,
+    /// Reason the routing plane gave for its decision: an operator
+    /// plan's `reason` string or the `ai_policy route_to` override
+    /// note. Absent for built-in strategies, which decide by their
+    /// name's own criterion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Ordered candidates the router weighed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<RoutingDecisionCandidate>,
+    /// Providers actually attempted, in dispatch order: the fallback
+    /// chain as traversed, not as planned.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub attempted: Vec<String>,
+    /// Number of provider calls actually made.
+    pub attempts: u32,
+    /// Whether fallback or provider failover engaged.
+    pub failover_engaged: bool,
+    /// First provider that handed off to another provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failover_from: Option<String>,
+    /// Last provider selected by failover.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failover_to: Option<String>,
+    /// HTTP response status the request finished with.
+    pub status: u16,
+    /// End-to-end request latency in milliseconds.
+    pub latency_ms: f64,
+    /// Open, additive decision detail carried verbatim from
+    /// `RequestContext::ai_route_detail`. Consumers add namespaced
+    /// keys here without a schema change.
+    #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
+    pub detail: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Filters for [`AdminState::query_routing_decisions`] (WOR-2575).
+/// Every field is optional; `None` means the dimension is not
+/// filtered.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RoutingDecisionFilter<'a> {
+    /// Exact origin name match.
+    pub origin: Option<&'a str>,
+    /// Exact strategy name match.
+    pub strategy: Option<&'a str>,
+    /// Exact selected-provider match.
+    pub provider: Option<&'a str>,
+    /// Exact model match against the requested or the selected model,
+    /// so a substitution is findable from either side.
+    pub model: Option<&'a str>,
+    /// Keep decisions at or after this instant.
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Keep decisions at or before this instant.
+    pub until: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Parse a routing-decision ring entry's RFC 3339 timestamp for
+/// time-range filtering (WOR-2575). The writer always emits
+/// `chrono::Utc::now().to_rfc3339()`, so a parse failure marks a
+/// hand-built entry, which a time-bounded query excludes rather than
+/// guesses about.
+fn routing_entry_time(entry: &RoutingDecisionEntry) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(&entry.timestamp)
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc))
 }
 
 // --- Admin State ---
@@ -511,6 +708,10 @@ impl OpenApiCache {
 pub struct AdminState {
     /// Ring buffer of the most recent request log entries.
     pub recent_requests: Mutex<VecDeque<RequestLogEntry>>,
+    /// Ring buffer of the most recent routing decisions (WOR-2575).
+    /// Shares the `max_log_entries` cap with `recent_requests` so
+    /// operators size one retention knob.
+    pub recent_routing_decisions: Mutex<VecDeque<RoutingDecisionEntry>>,
     /// Admin server configuration in effect.
     pub config: AdminConfig,
     /// Revision-keyed cache of the rendered OpenAPI document.
@@ -587,6 +788,7 @@ impl AdminState {
     pub fn new(config: AdminConfig) -> Self {
         Self {
             recent_requests: Mutex::new(VecDeque::new()),
+            recent_routing_decisions: Mutex::new(VecDeque::new()),
             config,
             openapi_cache: Mutex::new(OpenApiCache::empty()),
             config_path: None,
@@ -793,65 +995,114 @@ impl AdminState {
     /// Query the recent-request log (newest first) with optional
     /// filters and pagination (WOR-1718 / WOR-1874). `offset`/`limit`
     /// paginate the filtered result.
+    ///
+    /// This is `for_each_request` collecting into a `Vec`, and both run
+    /// the same private `RequestLogFilter` predicate, so the
+    /// aggregating and exporting routes select exactly the rows this
+    /// one returns.
     pub fn query_requests(
         &self,
         filter: &RequestLogFilter<'_>,
         offset: usize,
         limit: usize,
     ) -> Vec<RequestLogEntry> {
+        let mut out = Vec::new();
+        self.for_each_request(filter, offset, limit, |entry| out.push(entry.clone()));
+        out
+    }
+
+    /// Visit the filtered recent-request log (newest first) one entry
+    /// at a time, without materializing the matching set (WOR-2578).
+    ///
+    /// The aggregation and export routes fold or serialize each row as
+    /// it is visited, so nothing holds a second copy of the result:
+    /// peak memory is the ring itself, which
+    /// `proxy.admin.max_log_entries` already bounds, plus one row's
+    /// worth of encoding. `query_requests` is this function collecting
+    /// into a `Vec`, which is why the two can never disagree about
+    /// which rows a filter selects.
+    ///
+    /// `visit` runs while the ring lock is held, so it must not call
+    /// back into the log. Both in-tree callers only write into a
+    /// `String` or a `BTreeMap`. Deliberately private: the report and
+    /// the export live in this module, and a callback that borrows the
+    /// ring lock is not a shape to hand to another crate.
+    fn for_each_request(
+        &self,
+        filter: &RequestLogFilter<'_>,
+        offset: usize,
+        limit: usize,
+        mut visit: impl FnMut(&RequestLogEntry),
+    ) {
         let log = self
             .recent_requests
             .lock()
             .expect("admin log mutex poisoned");
         log.iter()
             .rev()
-            .filter(|e| filter.status.is_none_or(|s| e.status == s))
+            .filter(|e| filter.matches(e))
+            .skip(offset)
+            .take(limit)
+            .for_each(&mut visit);
+    }
+
+    /// Add a routing decision to its ring (drops oldest when full;
+    /// WOR-2575).
+    ///
+    /// See [`RoutingDecisionFilter`] for the matching query surface. A
+    /// poisoned lock drops the record rather than panicking: the ring
+    /// is a runtime sample, and the panic that poisoned the lock is
+    /// the incident worth surfacing, not this write.
+    pub fn log_routing_decision(&self, entry: RoutingDecisionEntry) {
+        let Ok(mut log) = self.recent_routing_decisions.lock() else {
+            return;
+        };
+        if log.len() >= self.config.max_log_entries {
+            log.pop_front();
+        }
+        log.push_back(entry);
+    }
+
+    /// Query the recent routing decisions (newest first) with optional
+    /// filters and pagination (WOR-2575). `offset`/`limit` paginate the
+    /// filtered result.
+    pub fn query_routing_decisions(
+        &self,
+        filter: &RoutingDecisionFilter<'_>,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<RoutingDecisionEntry> {
+        let Ok(log) = self.recent_routing_decisions.lock() else {
+            return Vec::new();
+        };
+        log.iter()
+            .rev()
+            .filter(|e| filter.origin.is_none_or(|o| e.origin == o))
+            .filter(|e| filter.strategy.is_none_or(|s| e.strategy == s))
             .filter(|e| {
                 filter
-                    .method
-                    .is_none_or(|m| e.method.eq_ignore_ascii_case(m))
+                    .provider
+                    .is_none_or(|p| e.selected_provider.as_deref() == Some(p))
             })
-            .filter(|e| filter.path_sub.is_none_or(|p| e.path.contains(p)))
-            // WOR-1874: exact-match filters on the guardrail columns so
-            // the Guardrails admin view can deep-link to blocked rows.
+            // The model dimension matches what the caller asked for or
+            // what was served, so "every decision that touched this
+            // model" works without the operator knowing which side of a
+            // substitution it was on.
             .filter(|e| {
-                filter
-                    .guardrail_action
-                    .is_none_or(|a| e.guardrail_action.as_deref() == Some(a))
-            })
-            .filter(|e| {
-                filter
-                    .guardrail_category
-                    .is_none_or(|c| e.guardrail_category.as_deref() == Some(c))
+                filter.model.is_none_or(|m| {
+                    e.requested_model.as_deref() == Some(m)
+                        || e.selected_model.as_deref() == Some(m)
+                })
             })
             .filter(|e| {
                 filter
-                    .cache_status
-                    .is_none_or(|status| e.cache_status == status)
+                    .since
+                    .is_none_or(|since| routing_entry_time(e).is_some_and(|t| t >= since))
             })
             .filter(|e| {
                 filter
-                    .retried
-                    .is_none_or(|retried| (e.retry_count > 0) == retried)
-            })
-            .filter(|e| match (filter.property_key, filter.property_value) {
-                (None, _) => true,
-                (Some(key), None) => e.properties.contains_key(key),
-                (Some(key), Some(value)) => e.properties.get(key).is_some_and(|v| v == value),
-            })
-            // WOR-2093: key-accountability filters so the Keys view can
-            // deep-link to one credential's traffic, and session rows
-            // resolve server-side instead of client-side.
-            .filter(|e| {
-                filter
-                    .api_key_id
-                    .is_none_or(|id| e.api_key_id.as_deref() == Some(id))
-            })
-            .filter(|e| filter.key_mode.is_none_or(|mode| e.key_mode == mode))
-            .filter(|e| {
-                filter
-                    .session_id
-                    .is_none_or(|id| e.session_id.as_deref() == Some(id))
+                    .until
+                    .is_none_or(|until| routing_entry_time(e).is_some_and(|t| t <= until))
             })
             .skip(offset)
             .take(limit)
@@ -993,13 +1244,66 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 
 // --- Target health rendering ---
 
-/// Walk the live pipeline and emit a JSON snapshot of every load
-/// balancer target's resilience state: active health verdict, outlier
-/// ejection state, and circuit breaker state. Operators query this to
-/// see exactly what `select_target` would skip right now.
-fn render_target_health() -> String {
+/// One load-balancer target's resilience state, as walked from the
+/// live pipeline. Shared by `GET /api/health/targets` (the JSON body)
+/// and the `sbproxy_target_health_state` gauge (WOR-2560), so the two
+/// surfaces cannot disagree about what `select_target` would skip.
+struct TargetHealthRow {
+    /// Position in the origin's target list.
+    index: usize,
+    /// Target URL as configured.
+    url: String,
+    /// Active health probe verdict.
+    healthy: bool,
+    /// Outlier detector eject state.
+    outlier_ejected: bool,
+    /// Circuit breaker state, when one is configured.
+    breaker_state: Option<&'static str>,
+    /// Configured selection weight, echoed for the JSON body.
+    weight: u32,
+    /// Whether the target is a fallback-only backup.
+    backup: bool,
+    /// Deployment group tag (blue-green / canary), when set.
+    group: Option<String>,
+}
+
+impl TargetHealthRow {
+    /// Whether `select_target` would consider this target at all.
+    fn eligible(&self) -> bool {
+        self.healthy && !self.outlier_ejected && self.breaker_state != Some("open")
+    }
+
+    /// The tri-state `sbproxy_target_health_state` value, on LiteLLM's
+    /// 0/1/2 deployment-state scale so Grafana panels built against
+    /// that convention port over: ineligible is 2 (full outage as far
+    /// as selection is concerned), an eligible target whose breaker is
+    /// half-open is 1 (carrying trial traffic), everything else is 0.
+    fn metric_state(&self) -> i64 {
+        if !self.eligible() {
+            sbproxy_observe::metrics::TARGET_HEALTH_EXCLUDED
+        } else if self.breaker_state == Some("half_open") {
+            sbproxy_observe::metrics::TARGET_HEALTH_DEGRADED
+        } else {
+            sbproxy_observe::metrics::TARGET_HEALTH_HEALTHY
+        }
+    }
+}
+
+/// Per-origin grouping of [`TargetHealthRow`]s.
+struct OriginTargetHealth {
+    /// Origin hostname as configured.
+    hostname: String,
+    /// Stable configured origin id; the `origin` label on the gauge.
+    origin_id: String,
+    /// The origin's load-balancer targets, in config order.
+    targets: Vec<TargetHealthRow>,
+}
+
+/// Walk the live pipeline and collect every load-balancer target's
+/// resilience state: active health verdict, outlier ejection state,
+/// and circuit breaker state.
+fn collect_target_health(pipeline: &crate::pipeline::CompiledPipeline) -> Vec<OriginTargetHealth> {
     use sbproxy_modules::Action;
-    let pipeline = crate::reload::current_pipeline();
     let mut origins = Vec::new();
     for (idx, origin) in pipeline.config.origins.iter().enumerate() {
         let action = match pipeline.actions.get(idx) {
@@ -1027,28 +1331,119 @@ fn render_target_health() -> String {
                     sbproxy_platform::CircuitState::Open => "open",
                     sbproxy_platform::CircuitState::HalfOpen => "half_open",
                 });
-            let eligible = healthy && !outlier_ejected && breaker_state != Some("open");
-            // `zone` was rendered here while the config still parsed it;
-            // the key is refused at config compile now (WOR-2498), so
-            // there is no label left to echo.
-            targets.push(serde_json::json!({
-                "index": t_idx,
-                "url": target.url,
-                "eligible": eligible,
-                "healthy": healthy,
-                "outlier_ejected": outlier_ejected,
-                "circuit_breaker_state": breaker_state,
-                "weight": target.weight,
-                "backup": target.backup,
-                "group": target.group,
-            }));
+            targets.push(TargetHealthRow {
+                index: t_idx,
+                url: target.url.clone(),
+                healthy,
+                outlier_ejected,
+                breaker_state,
+                weight: target.weight,
+                backup: target.backup,
+                group: target.group.clone(),
+            });
         }
-        origins.push(serde_json::json!({
-            "hostname": origin.hostname.as_str(),
-            "origin_id": origin.origin_id.as_str(),
-            "targets": targets,
-        }));
+        origins.push(OriginTargetHealth {
+            hostname: origin.hostname.as_str().to_string(),
+            origin_id: origin.origin_id.as_str().to_string(),
+            targets,
+        });
     }
+    origins
+}
+
+/// Install the scrape-time source for the `sbproxy_target_health_state`
+/// gauge (WOR-2560).
+///
+/// Called from `reload::load_pipeline` at every pipeline publication.
+/// The closure walks whatever pipeline is current when a scrape
+/// happens, through the same [`collect_target_health`] that renders
+/// `GET /api/health/targets`, so `/metrics` and the admin endpoint can
+/// never tell different stories about the same target. Reinstalling on
+/// every publication is deliberate: it costs one boxed closure and
+/// keeps the seam correct for library embedders who never call the
+/// startup path exactly once.
+pub(crate) fn install_target_health_metrics_source() {
+    sbproxy_observe::metrics::set_target_health_source(|| {
+        target_health_samples(&collect_target_health(&crate::reload::current_pipeline()))
+    });
+}
+
+/// Project one pipeline walk onto the gauge's sample list.
+///
+/// A free function rather than a closure body so the collision rule
+/// below is testable without a live pipeline.
+///
+/// The `target` label is the configured URL when that URL is unique
+/// within its origin, which is the normal case and the readable one.
+/// When an origin configures the same URL more than once, every
+/// colliding row takes the load balancer's own `url#index` identifier
+/// instead, the same string [`sbproxy_modules::action::loadbalancer`]
+/// hands the outlier detector. Two same-URL targets are a real config
+/// (weighting, or a blue/green pair addressed through one host), and
+/// keying the label on the URL alone collapsed them onto one series:
+/// last write won, an outlier-ejected target read as healthy, and
+/// `GET /api/health/targets` went on rendering both rows with distinct
+/// `index` values. That is precisely the disagreement between the two
+/// surfaces this gauge promises cannot happen.
+fn target_health_samples(
+    origins: &[OriginTargetHealth],
+) -> Vec<sbproxy_observe::metrics::TargetHealthSample> {
+    let mut samples = Vec::new();
+    for origin in origins {
+        for row in &origin.targets {
+            let collides = origin
+                .targets
+                .iter()
+                .any(|other| other.index != row.index && other.url == row.url);
+            samples.push(sbproxy_observe::metrics::TargetHealthSample {
+                origin: origin.origin_id.clone(),
+                target: if collides {
+                    format!("{}#{}", row.url, row.index)
+                } else {
+                    row.url.clone()
+                },
+                state: row.metric_state(),
+            });
+        }
+    }
+    samples
+}
+
+/// Emit the `GET /api/health/targets` JSON snapshot from the live
+/// pipeline walk. Operators query this to see exactly what
+/// `select_target` would skip right now.
+fn render_target_health() -> String {
+    let pipeline = crate::reload::current_pipeline();
+    let origins: Vec<serde_json::Value> = collect_target_health(&pipeline)
+        .into_iter()
+        .map(|origin| {
+            let targets: Vec<serde_json::Value> = origin
+                .targets
+                .into_iter()
+                .map(|row| {
+                    // `zone` was rendered here while the config still
+                    // parsed it; the key is refused at config compile
+                    // now (WOR-2498), so there is no label left to echo.
+                    serde_json::json!({
+                        "index": row.index,
+                        "url": row.url,
+                        "eligible": row.eligible(),
+                        "healthy": row.healthy,
+                        "outlier_ejected": row.outlier_ejected,
+                        "circuit_breaker_state": row.breaker_state,
+                        "weight": row.weight,
+                        "backup": row.backup,
+                        "group": row.group,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "hostname": origin.hostname,
+                "origin_id": origin.origin_id,
+                "targets": targets,
+            })
+        })
+        .collect();
     serde_json::json!({
         "config_revision": pipeline.config_revision,
         "origins": origins,
@@ -2602,6 +2997,972 @@ fn decoded_query_param(path: &str, key: &str) -> Option<String> {
         .find_map(|(candidate, value)| (candidate == key).then(|| value.into_owned()))
 }
 
+/// Parse an optional RFC 3339 query param into UTC, or a `400` naming
+/// the parameter when it is present and malformed (WOR-2575). `key` is
+/// always a code-supplied literal, never caller input, so interpolating
+/// it into the error body is safe.
+fn parse_rfc3339_param(
+    path: &str,
+    key: &str,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, (u16, &'static str, String)> {
+    match decoded_query_param(path, key) {
+        None => Ok(None),
+        Some(raw) => match chrono::DateTime::parse_from_rfc3339(&raw) {
+            Ok(t) => Ok(Some(t.with_timezone(&chrono::Utc))),
+            Err(_) => Err((
+                400,
+                "application/json",
+                format!(r#"{{"error":"{key} must be an RFC 3339 timestamp"}}"#),
+            )),
+        },
+    }
+}
+
+// --- Request-log filter surface, report, and export (WOR-2578) ---
+
+/// An admin route's `(status, content_type, body)` triple.
+type AdminResponse = (u16, &'static str, String);
+
+/// One JSON error response, ready to return from a route.
+fn admin_error(status: u16, message: &str) -> AdminResponse {
+    (
+        status,
+        "application/json",
+        serde_json::json!({ "error": message }).to_string(),
+    )
+}
+
+/// The owned result of parsing the `/api/requests` query string
+/// (WOR-2578).
+///
+/// [`RequestLogFilter`] borrows its values, and every filter arrives as
+/// a decoded `String`, so something has to own them for the length of
+/// the request. Parsing lives here rather than inline in the route so
+/// `/api/requests`, `/api/requests/report`, and `/api/requests/export`
+/// share one parser: a value the snapshot refuses is refused
+/// identically by the aggregation and the export, and a dimension added
+/// here is filterable on all three the day it lands.
+struct ParsedRequestFilter {
+    status: Option<u16>,
+    method: Option<String>,
+    path_sub: Option<String>,
+    guardrail_action: Option<String>,
+    guardrail_category: Option<String>,
+    cache_status: Option<String>,
+    retried: Option<bool>,
+    property_key: Option<String>,
+    property_value: Option<String>,
+    api_key_id: Option<String>,
+    key_mode: Option<String>,
+    session_id: Option<String>,
+    model: Option<String>,
+    tenant: Option<String>,
+    user: Option<String>,
+    /// Rows to skip, from the caller's `offset` (0 when absent).
+    offset: usize,
+    /// Rows to take, defaulted to and clamped at `max_log_entries`.
+    limit: usize,
+}
+
+impl ParsedRequestFilter {
+    /// Parse the whole filter surface out of `path`'s query string, or
+    /// return the `400` the caller should get.
+    ///
+    /// `limit` is defaulted to and clamped at `max_log_entries` rather
+    /// than trusted: the ring holds at most that many rows, so a larger
+    /// number can only describe rows that do not exist, and clamping
+    /// keeps the export bounded by configuration instead of by what a
+    /// caller asks for.
+    fn from_query(path: &str, max_log_entries: usize) -> Result<Self, AdminResponse> {
+        let cache_status = decoded_query_param(path, "cache_status");
+        if cache_status
+            .as_deref()
+            .is_some_and(|status| !matches!(status, "disabled" | "miss" | "hit" | "semantic_hit"))
+        {
+            return Err(admin_error(
+                400,
+                "cache_status must be disabled, miss, hit, or semantic_hit",
+            ));
+        }
+        let retried = match decoded_query_param(path, "retried").as_deref() {
+            None => None,
+            Some("true") => Some(true),
+            Some("false") => Some(false),
+            Some(_) => return Err(admin_error(400, "retried must be true or false")),
+        };
+        let property_key = decoded_query_param(path, "property_key");
+        let property_value = decoded_query_param(path, "property_value");
+        if property_value.is_some() && property_key.as_deref().is_none_or(str::is_empty) {
+            return Err(admin_error(400, "property_value requires property_key"));
+        }
+        let key_mode = decoded_query_param(path, "key_mode");
+        if key_mode
+            .as_deref()
+            .is_some_and(|mode| !matches!(mode, "none" | "minted" | "native"))
+        {
+            return Err(admin_error(400, "key_mode must be none, minted, or native"));
+        }
+        // A present-but-unparseable numeric param is refused rather
+        // than dropped, matching the four params above. A dropped
+        // `?status=5xx` widens an export to the whole ring (every
+        // tenant, every user) while `applied_dimensions()` honestly
+        // reports `filters=none`, so neither the file nor its audit
+        // record says the filter never applied.
+        fn parse_number<T: std::str::FromStr>(
+            path: &str,
+            name: &str,
+            message: &'static str,
+        ) -> Result<Option<T>, AdminResponse> {
+            match rl_query_param(path, name) {
+                None => Ok(None),
+                Some(raw) => match raw.parse::<T>() {
+                    Ok(value) => Ok(Some(value)),
+                    Err(_) => Err(admin_error(400, message)),
+                },
+            }
+        }
+        let status = parse_number::<u16>(path, "status", "status must be an HTTP status code")?;
+        let offset =
+            parse_number::<usize>(path, "offset", "offset must be a whole number")?.unwrap_or(0);
+        let limit = parse_number::<usize>(path, "limit", "limit must be a whole number")?
+            .unwrap_or(max_log_entries)
+            .min(max_log_entries);
+        Ok(Self {
+            status,
+            method: decoded_query_param(path, "method"),
+            path_sub: decoded_query_param(path, "path"),
+            guardrail_action: decoded_query_param(path, "guardrail_action"),
+            guardrail_category: decoded_query_param(path, "guardrail_category"),
+            cache_status,
+            retried,
+            property_key,
+            property_value,
+            api_key_id: decoded_query_param(path, "api_key_id"),
+            key_mode,
+            session_id: decoded_query_param(path, "session_id"),
+            model: decoded_query_param(path, "model"),
+            tenant: decoded_query_param(path, "tenant"),
+            user: decoded_query_param(path, "user"),
+            offset,
+            limit,
+        })
+    }
+
+    /// Borrow the parsed values as a [`RequestLogFilter`].
+    fn filter(&self) -> RequestLogFilter<'_> {
+        RequestLogFilter {
+            status: self.status,
+            method: self.method.as_deref(),
+            path_sub: self.path_sub.as_deref(),
+            guardrail_action: self.guardrail_action.as_deref(),
+            guardrail_category: self.guardrail_category.as_deref(),
+            cache_status: self.cache_status.as_deref(),
+            retried: self.retried,
+            property_key: self.property_key.as_deref(),
+            property_value: self.property_value.as_deref(),
+            api_key_id: self.api_key_id.as_deref(),
+            key_mode: self.key_mode.as_deref(),
+            session_id: self.session_id.as_deref(),
+            model: self.model.as_deref(),
+            tenant: self.tenant.as_deref(),
+            user: self.user.as_deref(),
+        }
+    }
+
+    /// Comma-joined names of the dimensions this query actually
+    /// filtered on, or `none`.
+    ///
+    /// Names only, never values: this string goes into an audit record
+    /// and a log line, and the names are a closed compile-time set
+    /// while the values are operator-typed text of any length. That
+    /// keeps the export's audit trail bounded by construction rather
+    /// than by a truncation helper, and it still answers the question
+    /// an incident asks, which is what shape of export ran.
+    fn applied_dimensions(&self) -> String {
+        let mut names = Vec::new();
+        let mut note = |set: bool, name: &'static str| {
+            if set {
+                names.push(name);
+            }
+        };
+        note(self.status.is_some(), "status");
+        note(self.method.is_some(), "method");
+        note(self.path_sub.is_some(), "path");
+        note(self.guardrail_action.is_some(), "guardrail_action");
+        note(self.guardrail_category.is_some(), "guardrail_category");
+        note(self.cache_status.is_some(), "cache_status");
+        note(self.retried.is_some(), "retried");
+        note(self.property_key.is_some(), "property_key");
+        note(self.property_value.is_some(), "property_value");
+        note(self.api_key_id.is_some(), "api_key_id");
+        note(self.key_mode.is_some(), "key_mode");
+        note(self.session_id.is_some(), "session_id");
+        note(self.model.is_some(), "model");
+        note(self.tenant.is_some(), "tenant");
+        note(self.user.is_some(), "user");
+        if names.is_empty() {
+            "none".to_string()
+        } else {
+            names.join(",")
+        }
+    }
+}
+
+/// The four dimensions `/api/requests/report` groups on (WOR-2578), in
+/// canonical order.
+///
+/// A caller's `group_by` is resolved against this table and the
+/// `&'static str` from *here* is what gets echoed and used as a JSON
+/// key, so no caller-supplied byte ever becomes an object key in the
+/// response.
+const REPORT_DIMENSIONS: [&str; 4] = ["model", "api_key_id", "tenant", "user"];
+
+/// Resolve `group_by` into an ordered dimension list, or the `400` the
+/// caller should get.
+///
+/// `group_by` is required. It is the whole point of the route, so an
+/// absent or empty one is an error rather than a silent default that
+/// would hand back a shape the caller did not ask for. Duplicates are
+/// refused too: `model,model` would otherwise emit one JSON key twice
+/// and produce a response whose parse depends on the reader.
+fn parse_report_dimensions(path: &str) -> Result<Vec<&'static str>, AdminResponse> {
+    let raw = decoded_query_param(path, "group_by").unwrap_or_default();
+    if raw.is_empty() {
+        return Err(admin_error(
+            400,
+            "group_by is required: any comma-separated mix of model, api_key_id, tenant, user",
+        ));
+    }
+    let mut dimensions: Vec<&'static str> = Vec::new();
+    for name in raw.split(',') {
+        let Some(known) = REPORT_DIMENSIONS.iter().find(|d| **d == name) else {
+            return Err(admin_error(
+                400,
+                "group_by dimensions are model, api_key_id, tenant, user",
+            ));
+        };
+        if dimensions.contains(known) {
+            return Err(admin_error(400, "group_by dimensions must be distinct"));
+        }
+        dimensions.push(known);
+    }
+    Ok(dimensions)
+}
+
+/// One composite group's running totals (WOR-2578).
+#[derive(Default)]
+struct ReportTotals {
+    requests: u64,
+    tokens_in: u64,
+    tokens_out: u64,
+    cost_usd_micros: u64,
+}
+
+impl ReportTotals {
+    /// Fold one row in. Saturating throughout: these operands come from
+    /// an upstream usage parser, and a report is not worth an overflow
+    /// panic in the admin server.
+    fn add(&mut self, entry: &RequestLogEntry) {
+        self.requests = self.requests.saturating_add(1);
+        self.tokens_in = self.tokens_in.saturating_add(entry.tokens_in.unwrap_or(0));
+        self.tokens_out = self
+            .tokens_out
+            .saturating_add(entry.tokens_out.unwrap_or(0));
+        self.cost_usd_micros = self
+            .cost_usd_micros
+            .saturating_add(entry.cost_usd_micros.unwrap_or(0));
+    }
+
+    /// The four measures as a JSON object.
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "requests": self.requests,
+            "tokens_in": self.tokens_in,
+            "tokens_out": self.tokens_out,
+            "cost_usd_micros": self.cost_usd_micros,
+        })
+    }
+}
+
+/// This row's value on one report dimension. A row that lacks the
+/// dimension (an unkeyed call, an anonymous user) reads as the empty
+/// string, which groups those rows together instead of dropping them.
+fn report_dimension_value(entry: &RequestLogEntry, dimension: &str) -> String {
+    match dimension {
+        "model" => entry.model.clone().unwrap_or_default(),
+        "api_key_id" => entry.api_key_id.clone().unwrap_or_default(),
+        "tenant" => entry.tenant_id.clone(),
+        "user" => entry.user_id.clone().unwrap_or_default(),
+        // Unreachable: `parse_report_dimensions` resolves every name
+        // against REPORT_DIMENSIONS before it reaches this function.
+        _ => String::new(),
+    }
+}
+
+/// Aggregate the filtered ring into one row per composite group.
+///
+/// Bounded by construction: every group needs at least one row behind
+/// it, so the map can never hold more entries than the ring, which
+/// `proxy.admin.max_log_entries` caps. Rows are folded as they are
+/// visited, so the matching set is never materialized.
+fn request_report_response(
+    state: &AdminState,
+    parsed: &ParsedRequestFilter,
+    dimensions: &[&'static str],
+) -> AdminResponse {
+    let mut groups: BTreeMap<Vec<String>, ReportTotals> = BTreeMap::new();
+    let mut totals = ReportTotals::default();
+    // The caller's offset/limit page the GROUPED rows below; the scan
+    // itself always covers the whole filtered set so `totals` reads
+    // against the true denominators even on page two.
+    state.for_each_request(&parsed.filter(), 0, state.config.max_log_entries, |entry| {
+        let key = dimensions
+            .iter()
+            .map(|d| report_dimension_value(entry, d))
+            .collect();
+        groups.entry(key).or_default().add(entry);
+        totals.add(entry);
+    });
+
+    let mut ordered: Vec<(Vec<String>, ReportTotals)> = groups.into_iter().collect();
+    // Highest spend first, because "who spent what" is the question;
+    // request count then group key break ties so equal reports sort
+    // identically run to run.
+    ordered.sort_by(|(a_key, a), (b_key, b)| {
+        b.cost_usd_micros
+            .cmp(&a.cost_usd_micros)
+            .then_with(|| b.requests.cmp(&a.requests))
+            .then_with(|| a_key.cmp(b_key))
+    });
+
+    let rows: Vec<serde_json::Value> = ordered
+        .into_iter()
+        .skip(parsed.offset)
+        .take(parsed.limit)
+        .map(|(key, group_totals)| {
+            let group: serde_json::Map<String, serde_json::Value> = dimensions
+                .iter()
+                .zip(key)
+                .map(|(name, value)| ((*name).to_string(), serde_json::Value::String(value)))
+                .collect();
+            let mut row = group_totals.to_json();
+            if let Some(object) = row.as_object_mut() {
+                object.insert("group".to_string(), serde_json::Value::Object(group));
+            }
+            row
+        })
+        .collect();
+
+    let body = serde_json::json!({
+        "schema_version": 1,
+        "group_by": dimensions,
+        "rows": rows,
+        "totals": totals.to_json(),
+    });
+    (200, "application/json", body.to_string())
+}
+
+/// Encoding for `/api/requests/export` (WOR-2578).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportFormat {
+    /// One `RequestLogEntry` JSON object per line: the raw shape, and
+    /// the default.
+    Jsonl,
+    /// The same rows flattened under [`EXPORT_CSV_COLUMNS`].
+    Csv,
+}
+
+impl ExportFormat {
+    /// Closed-enum label for the metric and the audit record.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Jsonl => "jsonl",
+            Self::Csv => "csv",
+        }
+    }
+
+    /// Response content type.
+    fn content_type(self) -> &'static str {
+        match self {
+            Self::Jsonl => "application/x-ndjson",
+            Self::Csv => "text/csv",
+        }
+    }
+}
+
+/// Fixed CSV column order for `format=csv` (WOR-2578).
+///
+/// `RequestLogEntry`'s declaration order with the two structured
+/// fields moved to the end, so the header reads `timestamp` through
+/// `properties` and a future scalar field appends rather than shifting
+/// the column index a spreadsheet or a billing importer has already
+/// bound to. Unlike the JSONL shape, a CSV row is positional, so the
+/// order is part of the contract.
+const EXPORT_CSV_COLUMNS: [&str; 36] = [
+    "timestamp",
+    "origin",
+    "method",
+    "path",
+    "status",
+    "latency_ms",
+    "client_ip",
+    "request_id",
+    "trace_id",
+    "session_id",
+    "parent_session_id",
+    "cache_status",
+    "retry_count",
+    "failover_engaged",
+    "failover_from",
+    "failover_to",
+    "load_balancer_strategy",
+    "load_balancer_target",
+    "provider",
+    "model",
+    "tokens_in",
+    "tokens_out",
+    "cost_usd_micros",
+    "guardrail_category",
+    "guardrail_action",
+    "api_key_id",
+    "key_mode",
+    "key_provider",
+    "tenant_id",
+    "user_id",
+    "error_class",
+    "config_revision",
+    "policy_version",
+    "deny_reason",
+    "policy_decisions",
+    "properties",
+];
+
+/// One row's value in `column`, as text.
+///
+/// The two structured columns carry JSON so flattening stays lossless.
+/// Neither can fail to encode (`BTreeMap<String, String>` and
+/// `Vec<String>` are always representable), and an encoder that
+/// somehow disagreed yields an empty container rather than taking the
+/// export down.
+fn export_csv_cell(entry: &RequestLogEntry, column: &str) -> String {
+    let text = |value: &Option<String>| value.clone().unwrap_or_default();
+    let number = |value: &Option<u64>| value.map(|v| v.to_string()).unwrap_or_default();
+    match column {
+        "timestamp" => entry.timestamp.clone(),
+        "origin" => entry.origin.clone(),
+        "method" => entry.method.clone(),
+        "path" => entry.path.clone(),
+        "status" => entry.status.to_string(),
+        "latency_ms" => entry.latency_ms.to_string(),
+        "client_ip" => entry.client_ip.clone(),
+        "request_id" => text(&entry.request_id),
+        "trace_id" => text(&entry.trace_id),
+        "session_id" => text(&entry.session_id),
+        "parent_session_id" => text(&entry.parent_session_id),
+        "cache_status" => entry.cache_status.clone(),
+        "retry_count" => entry.retry_count.to_string(),
+        "failover_engaged" => entry.failover_engaged.to_string(),
+        "failover_from" => text(&entry.failover_from),
+        "failover_to" => text(&entry.failover_to),
+        "load_balancer_strategy" => text(&entry.load_balancer_strategy),
+        "load_balancer_target" => text(&entry.load_balancer_target),
+        "provider" => text(&entry.provider),
+        "model" => text(&entry.model),
+        "tokens_in" => number(&entry.tokens_in),
+        "tokens_out" => number(&entry.tokens_out),
+        "cost_usd_micros" => number(&entry.cost_usd_micros),
+        "guardrail_category" => text(&entry.guardrail_category),
+        "guardrail_action" => text(&entry.guardrail_action),
+        "api_key_id" => text(&entry.api_key_id),
+        "key_mode" => entry.key_mode.clone(),
+        "key_provider" => text(&entry.key_provider),
+        "tenant_id" => entry.tenant_id.clone(),
+        "user_id" => text(&entry.user_id),
+        "error_class" => text(&entry.error_class),
+        "config_revision" => entry.config_revision.clone(),
+        "policy_version" => text(&entry.policy_version),
+        "deny_reason" => text(&entry.deny_reason),
+        "policy_decisions" => {
+            serde_json::to_string(&entry.policy_decisions).unwrap_or_else(|_| "[]".to_string())
+        }
+        "properties" => {
+            serde_json::to_string(&entry.properties).unwrap_or_else(|_| "{}".to_string())
+        }
+        // Unreachable: every caller iterates EXPORT_CSV_COLUMNS.
+        _ => String::new(),
+    }
+}
+
+/// Encode one CSV field per RFC 4180, after neutralizing a leading
+/// spreadsheet formula character.
+///
+/// Several columns (`path`, `user_id`, `properties`, `model`) carry
+/// text a caller of the *data plane* influenced, and a spreadsheet
+/// evaluates a cell that opens with `=`, `+`, `-`, `@`, tab, or CR as a
+/// formula. That is OWASP's CSV-injection case: an attacker who can
+/// name a model or set a property gets code execution in whichever
+/// finance laptop opens the export. A leading apostrophe forces the
+/// cell to text; it is applied before quoting so the apostrophe lands
+/// inside the quotes where the spreadsheet looks for it. No fixed
+/// numeric column can trip the guard, because every numeric column in
+/// [`EXPORT_CSV_COLUMNS`] is unsigned or a non-negative duration.
+fn csv_field(value: &str) -> String {
+    let guarded = if value.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        format!("'{value}")
+    } else {
+        value.to_string()
+    };
+    if guarded.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", guarded.replace('"', "\"\""))
+    } else {
+        guarded
+    }
+}
+
+/// Append one CSV record (fields plus the trailing newline) to `out`.
+fn write_csv_record(out: &mut String, fields: impl Iterator<Item = String>) {
+    let mut first = true;
+    for field in fields {
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        out.push_str(&csv_field(&field));
+    }
+    out.push('\n');
+}
+
+/// Export the filtered view as CSV or JSONL.
+///
+/// Rows are encoded one at a time as the ring is visited, so the only
+/// full copy that exists is the response itself, and that is capped by
+/// `proxy.admin.max_log_entries` (the parser clamps `limit` to it) no
+/// matter what the caller asks for. The response is materialized, not
+/// streamed: `handle_admin_request` answers with a `String`, so every
+/// route on that dispatcher is buffered by construction. What the
+/// one-at-a-time encoding avoids is the *second* copy, a
+/// `Vec<RequestLogEntry>` collected before encoding starts.
+///
+/// Every export is audited, and the row count is the number an
+/// operator alerts on. Scope that record honestly: it covers **this
+/// route**, not every bulk read of the log. `GET /api/requests` runs
+/// the same parser, the same filter and the same ring cap, and returns
+/// the same rows as a JSON array with no audit record and no counter,
+/// so a detection built only on `export_request_log` covers the
+/// download button rather than the whole read surface. Auditing that
+/// route too would put a durable chain record on every console poll,
+/// and a row-count threshold would be one page size away from being
+/// bypassed, so the honest move is to say what is covered rather than
+/// to imply more.
+fn request_export_response(
+    state: &AdminState,
+    parsed: &ParsedRequestFilter,
+    format: ExportFormat,
+) -> AdminResponse {
+    let mut body = String::new();
+    if format == ExportFormat::Csv {
+        write_csv_record(
+            &mut body,
+            EXPORT_CSV_COLUMNS.iter().map(|c| (*c).to_string()),
+        );
+    }
+    let mut rows: u64 = 0;
+    let mut encode_error: Option<String> = None;
+    state.for_each_request(&parsed.filter(), parsed.offset, parsed.limit, |entry| {
+        if encode_error.is_some() {
+            return;
+        }
+        match format {
+            ExportFormat::Jsonl => match serde_json::to_string(entry) {
+                Ok(line) => {
+                    body.push_str(&line);
+                    body.push('\n');
+                    rows = rows.saturating_add(1);
+                }
+                Err(error) => encode_error = Some(error.to_string()),
+            },
+            ExportFormat::Csv => {
+                write_csv_record(
+                    &mut body,
+                    EXPORT_CSV_COLUMNS
+                        .iter()
+                        .map(|column| export_csv_cell(entry, column)),
+                );
+                rows = rows.saturating_add(1);
+            }
+        }
+    });
+    if let Some(error) = encode_error {
+        return (
+            500,
+            "application/json",
+            format!(r#"{{"error":"serialization failed: {error}"}}"#),
+        );
+    }
+
+    // Same posture as `inspect_request_content`: the operator read data
+    // in bulk, so the read is itself a security-relevant event and
+    // lands on the admin audit chain, not only in a local log line.
+    // `filters` names the dimensions that were set and never their
+    // values, so nothing operator-typed reaches the record.
+    let operator = current_admin_actor().unwrap_or_default();
+    let filters = parsed.applied_dimensions();
+    tracing::info!(
+        target: "sbproxy::admin::audit",
+        operator = %operator,
+        format = format.label(),
+        rows,
+        filters = %filters,
+        action = "export_request_log",
+        "admin request log export"
+    );
+    sbproxy_observe::AdminActionAuditEntry::new(
+        "export_request_log",
+        Some(operator),
+        None,
+        None,
+        None,
+        Some(format!(
+            "format={} rows={rows} filters={filters}",
+            format.label()
+        )),
+    )
+    .emit();
+    sbproxy_observe::metrics::record_admin_request_export(format.label(), rows);
+
+    (200, format.content_type(), body)
+}
+
+/// One channel's line in the `GET /api/audit/chain` response (WOR-2579).
+///
+/// All four channels appear on every response, including the ones this
+/// deployment never turned on and the ones this request did not walk, so
+/// the console renders "not configured" rather than nothing at all.
+///
+/// A channel that was not walked carries `enabled` and no verdict, and the
+/// absence of `ok` is load bearing: "this request proved nothing about
+/// this chain" and "this chain is broken" are different statements, and a
+/// status object that could only say one of them would let a filtered read
+/// render three chains as healthy on the strength of having ignored them.
+#[derive(Serialize)]
+struct AuditChainChannelStatus {
+    /// `security`, `config`, `key`, or `admin`.
+    channel: &'static str,
+    /// Whether this channel has a chain file configured.
+    enabled: bool,
+    /// The file the walk read. Absent unless this request walked it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    /// The `kid` the chain signs under.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_id: Option<String>,
+    /// Records committed to the chain when the read started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chain_entries: Option<u64>,
+    /// Records the walk verified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verified_entries: Option<u64>,
+    /// Whether every link and signature held. Present only on a channel
+    /// this request actually walked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ok: Option<bool>,
+    /// First sequence that failed, when `ok` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    broken_seq: Option<u64>,
+    /// Why it failed, when `ok` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    /// Records matching the filters across the verified prefix.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_matched: Option<u64>,
+    /// Cursor for the next older page. Single-channel reads only: a
+    /// sequence number only means something inside one chain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_before_seq: Option<u64>,
+    /// The file could not be read at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl AuditChainChannelStatus {
+    /// A channel this request did not walk: either it is off, or a
+    /// `channel=` filter pointed somewhere else.
+    fn not_walked(channel: &'static str, enabled: bool) -> Self {
+        Self {
+            channel,
+            enabled,
+            path: None,
+            key_id: None,
+            chain_entries: None,
+            verified_entries: None,
+            ok: None,
+            broken_seq: None,
+            reason: None,
+            total_matched: None,
+            next_before_seq: None,
+            error: None,
+        }
+    }
+
+    /// A channel this request walked, carrying the verdict the walk
+    /// reached. `paged` is false on a merged read, where a per-channel
+    /// cursor would be a number the caller cannot use.
+    fn walked(read: &sbproxy_observe::audit_chain::AuditChainRead, paged: bool) -> Self {
+        Self {
+            channel: read.channel,
+            enabled: true,
+            path: Some(read.path.clone()),
+            key_id: Some(read.key_id.clone()),
+            chain_entries: Some(read.chain_entries),
+            verified_entries: Some(read.verified_entries),
+            ok: Some(read.ok),
+            broken_seq: read.broken_seq,
+            reason: read.reason.clone(),
+            total_matched: Some(read.total_matched),
+            next_before_seq: paged.then_some(read.next_before_seq).flatten(),
+            error: read.error.clone(),
+        }
+    }
+}
+
+/// `GET /api/audit/chain`: browse the four tamper-evident audit chains,
+/// verified on the way (WOR-2579).
+///
+/// Read-only by construction. There is no arm here for any other method.
+///
+/// On the role posture, stated rather than assumed: WOR-2579's
+/// acceptance asked for a role gate once console RBAC lands, and this
+/// route ships without one. That is a decision, not an oversight, and
+/// "this route cannot mutate" is not the argument for it, because
+/// LiteLLM's cited restriction is on *read* access. The argument is
+/// that reading the trail is the job the `read_only` role exists for,
+/// and that the bounded ring behind `GET /api/audit/events` already
+/// serves the same five channels to the same operator. The widening
+/// over that ring is real and is two specific axes: history here is
+/// the whole chain rather than the last `max_audit_events` records,
+/// and each entry carries the chained payload verbatim rather than the
+/// ring's `detail` projection. `docs/audit-log.md` says both plainly.
+/// A deployment that wants the trail narrower turns the channel's
+/// chain path off, or fronts the admin port.
+///
+/// The one gate that does ship is on tenant scope, below, and the
+/// sibling reporting routes deliberately took the opposite posture: a
+/// tenant-scoped operator is served a deployment-wide report and
+/// export, exactly as `GET /api/requests` has always served them one.
+/// The asymmetry is intentional. A narrowed *audit* trail reads as
+/// "nothing else happened", which is a worse answer than a refusal; a
+/// narrowed spend report is just a smaller number.
+///
+/// A verification failure is served as a `200` carrying `ok: false`, never
+/// a `500`. The break is the finding, the records before it are still
+/// evidence, and a viewer that turned a broken chain into an error page
+/// would hide the one thing the chain exists to reveal.
+fn handle_audit_chain(method: &str, path: &str, state: &AdminState) -> (u16, &'static str, String) {
+    use sbproxy_observe::audit_chain::{
+        audit_chain_installed, parse_chain_timestamp, read_audit_chain, AuditChainQuery,
+        AUDIT_CHAIN_CHANNELS, DEFAULT_AUDIT_CHAIN_LIMIT, MAX_AUDIT_CHAIN_LIMIT,
+    };
+
+    if !method.eq_ignore_ascii_case("GET") {
+        return (
+            405,
+            "application/json",
+            r#"{"error":"method not allowed"}"#.to_string(),
+        );
+    }
+
+    // A tenant-scoped operator is refused the whole surface rather than
+    // served a filtered slice of it, on the same argument the meter routes
+    // make for a cross-tenant read: a narrowed view of an audit trail
+    // reads as "nothing else happened", which is a worse answer than a
+    // refusal because somebody will believe it. Two facts make filtering
+    // worse here than there. Records with no tenant at all (a file-watcher
+    // reload, an operator login) belong to the deployment rather than to
+    // any tenant, and the chain's own sequence numbers and entry counts
+    // describe every tenant's activity whatever the payloads say.
+    //
+    // The scope is looked up in the live config by the dispatching
+    // operator's name, exactly as `resolve_principal` does, so revoking it
+    // is a config reload rather than a wait for a session to expire.
+    let operator = current_admin_actor();
+    if let Some(scope) = operator
+        .as_deref()
+        .and_then(|who| state.operator_tenant(who))
+    {
+        sbproxy_observe::AdminActionAuditEntry::new(
+            "read_audit_chain_denied",
+            operator.clone(),
+            Some(scope.clone()),
+            None,
+            None,
+            Some("GET /api/audit/chain".to_string()),
+        )
+        .emit();
+        // The refusal is scrapeable, not only auditable. Without this
+        // the only record of a scoped principal reaching for a
+        // deployment-wide security surface lives inside the chain that
+        // principal was just refused, which takes an admin-role read to
+        // find and nothing to prompt one. One increment per channel, so
+        // the shipped alert
+        // `increase(sbproxy_audit_chain_read_total{outcome!="verified"}[15m]) > 0`
+        // covers the refusal without an operator changing the rule.
+        for channel in AUDIT_CHAIN_CHANNELS {
+            sbproxy_observe::metrics::record_audit_chain_read(channel, "denied");
+        }
+        return (
+            403,
+            "application/json",
+            serde_json::json!({
+                "error": format!(
+                    "forbidden: the audit chain is deployment-wide and this operator is scoped \
+                     to tenant `{scope}`"
+                ),
+            })
+            .to_string(),
+        );
+    }
+
+    // --- Query ---
+    let channel = decoded_query_param(path, "channel");
+    if let Some(name) = channel.as_deref() {
+        if !AUDIT_CHAIN_CHANNELS.contains(&name) {
+            return (
+                400,
+                "application/json",
+                format!(
+                    r#"{{"error":"channel must be one of {}"}}"#,
+                    AUDIT_CHAIN_CHANNELS.join(", ")
+                ),
+            );
+        }
+    }
+    let mut query = AuditChainQuery {
+        actor: decoded_query_param(path, "actor").filter(|value| !value.is_empty()),
+        limit: rl_query_param(path, "limit")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_AUDIT_CHAIN_LIMIT)
+            .clamp(1, MAX_AUDIT_CHAIN_LIMIT),
+        ..AuditChainQuery::default()
+    };
+    for (name, slot) in [
+        ("since", &mut query.since_ms),
+        ("until", &mut query.until_ms),
+    ] {
+        let Some(raw) = decoded_query_param(path, name).filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        match parse_chain_timestamp(&raw) {
+            Some(at) => *slot = Some(at),
+            None => {
+                return (
+                    400,
+                    "application/json",
+                    format!(r#"{{"error":"{name} must be an RFC 3339 timestamp"}}"#),
+                )
+            }
+        }
+    }
+    if let Some(raw) = rl_query_param(path, "before_seq") {
+        let Ok(seq) = raw.parse::<u64>() else {
+            return (
+                400,
+                "application/json",
+                r#"{"error":"before_seq must be a non-negative integer"}"#.to_string(),
+            );
+        };
+        // Refused rather than ignored across a merged read. Sequence
+        // numbers restart at zero on every chain, so one cursor applied to
+        // four of them pages each to a different place and the merged
+        // window silently skips records the caller was never told about.
+        if channel.is_none() {
+            return (
+                400,
+                "application/json",
+                r#"{"error":"before_seq requires channel: a sequence number only means something inside one chain"}"#
+                    .to_string(),
+            );
+        }
+        query.before_seq = Some(seq);
+    }
+
+    // --- Walk ---
+    let paged = channel.is_some();
+    let mut statuses: Vec<AuditChainChannelStatus> = Vec::with_capacity(AUDIT_CHAIN_CHANNELS.len());
+    let mut entries: Vec<sbproxy_observe::audit_chain::AuditChainRecord> = Vec::new();
+    for name in AUDIT_CHAIN_CHANNELS {
+        if channel.as_deref().is_some_and(|wanted| wanted != name) {
+            statuses.push(AuditChainChannelStatus::not_walked(
+                name,
+                audit_chain_installed(name),
+            ));
+            continue;
+        }
+        let Some(mut read) = read_audit_chain(name, &query) else {
+            statuses.push(AuditChainChannelStatus::not_walked(name, false));
+            continue;
+        };
+        sbproxy_observe::metrics::record_audit_chain_read(
+            read.channel,
+            match (read.error.is_some(), read.ok) {
+                (true, _) => "unreadable",
+                (false, true) => "verified",
+                (false, false) => "broken",
+            },
+        );
+        entries.append(&mut read.records);
+        statuses.push(AuditChainChannelStatus::walked(&read, paged));
+    }
+
+    // Newest first across the merged window, then cut to the page the
+    // caller asked for. Ties break on the sequence number so two records
+    // stamped in the same millisecond keep a stable order rather than
+    // shuffling between reads.
+    entries.sort_by(|left, right| {
+        let left_at = sbproxy_observe::audit_chain::parse_chain_timestamp(&left.recorded_at);
+        let right_at = sbproxy_observe::audit_chain::parse_chain_timestamp(&right.recorded_at);
+        right_at
+            .cmp(&left_at)
+            .then_with(|| right.seq.cmp(&left.seq))
+            .then_with(|| left.channel.cmp(right.channel))
+    });
+    entries.truncate(query.limit);
+    let served = entries.len();
+
+    let body = serde_json::json!({ "channels": statuses, "entries": entries });
+
+    // Reading the audit trail is itself an audited action, the same
+    // posture `/api/requests/{id}/content` takes: an investigator asking
+    // "who looked" must not have to take our word for it. Emitted after
+    // the page is built, so a reader never finds their own read inside the
+    // window they just asked for, and the next one does.
+    //
+    // The detail carries the channel (a closed vocabulary, validated
+    // above) and a count, never the caller's `actor=` or time filters: a
+    // caller-supplied string does not get to enter a file whose whole
+    // value is that nobody can quietly amend it.
+    sbproxy_observe::AdminActionAuditEntry::new(
+        "read_audit_chain",
+        operator,
+        None,
+        None,
+        None,
+        Some(format!(
+            "GET /api/audit/chain channel={} entries={served}",
+            channel.as_deref().unwrap_or("all"),
+        )),
+    )
+    .emit();
+
+    match serde_json::to_string(&body) {
+        Ok(body) => (200, "application/json", body),
+        Err(e) => (
+            500,
+            "application/json",
+            format!(r#"{{"error":"serialization failed: {e}"}}"#),
+        ),
+    }
+}
+
 /// Handle an admin API request.
 ///
 /// Returns `(status, content_type, body)`. `method` is the HTTP
@@ -3010,6 +4371,12 @@ pub fn handle_admin_request(
             ),
         };
     }
+    // WOR-2579: the durable, tamper-evident chains behind those samples,
+    // read with verification. Method-aware, so it takes the whole request
+    // line rather than just the path.
+    if path_only == "/api/audit/chain" {
+        return handle_audit_chain(method, path, state);
+    }
     // WOR-2096: fetch one request's redacted content sample. Admin role
     // only, and every read is audited before the content is returned.
     if let Some(request_id) = path_only
@@ -3073,61 +4440,49 @@ pub fn handle_admin_request(
     // WOR-1718: recent request log with filters + pagination. Query params:
     // `status` (exact), `method` (case-insensitive), `path` (substring),
     // `offset`, `limit`. No params returns the newest entries, unchanged.
+    // WOR-2578: the same parser serves the report and the export below.
     if path_only == "/api/requests" {
-        let status = rl_query_param(path, "status").and_then(|s| s.parse::<u16>().ok());
-        let method_f = decoded_query_param(path, "method");
-        let path_f = decoded_query_param(path, "path");
-        // WOR-1874: guardrail-column filters.
-        let guardrail_action_f = decoded_query_param(path, "guardrail_action");
-        let guardrail_category_f = decoded_query_param(path, "guardrail_category");
-        let cache_status_f = decoded_query_param(path, "cache_status");
-        if cache_status_f
-            .as_deref()
-            .is_some_and(|status| !matches!(status, "disabled" | "miss" | "hit" | "semantic_hit"))
-        {
-            return (
-                400,
-                "application/json",
-                r#"{"error":"cache_status must be disabled, miss, hit, or semantic_hit"}"#
-                    .to_string(),
-            );
-        }
-        let retried_raw = decoded_query_param(path, "retried");
-        let retried_f = match retried_raw.as_deref() {
-            None => None,
-            Some("true") => Some(true),
-            Some("false") => Some(false),
-            Some(_) => {
-                return (
-                    400,
-                    "application/json",
-                    r#"{"error":"retried must be true or false"}"#.to_string(),
-                );
-            }
+        let parsed = match ParsedRequestFilter::from_query(path, state.config.max_log_entries) {
+            Ok(parsed) => parsed,
+            Err(error) => return error,
         };
-        let property_key_f = decoded_query_param(path, "property_key");
-        let property_value_f = decoded_query_param(path, "property_value");
-        if property_value_f.is_some() && property_key_f.as_deref().is_none_or(str::is_empty) {
-            return (
-                400,
+        let entries = state.query_requests(&parsed.filter(), parsed.offset, parsed.limit);
+        return match serde_json::to_string(&entries) {
+            Ok(body) => (200, "application/json", body),
+            Err(e) => (
+                500,
                 "application/json",
-                r#"{"error":"property_value requires property_key"}"#.to_string(),
+                format!(r#"{{"error":"serialization failed: {e}"}}"#),
+            ),
+        };
+    }
+    // WOR-2575: recent routing decisions with filters + pagination, for
+    // the admin console's routing-decisions view. Query params: `origin`,
+    // `strategy`, `provider` (exact), `model` (matches the requested or
+    // the selected side of a substitution), `since`/`until` (RFC 3339,
+    // inclusive), `offset`, `limit`. GET-only by construction, so RBAC
+    // needs no extra gating: read routes are open to every
+    // authenticated role.
+    if path_only == "/api/routing-decisions" {
+        if !method.eq_ignore_ascii_case("GET") {
+            return (
+                405,
+                "application/json",
+                r#"{"error":"method not allowed"}"#.to_string(),
             );
         }
-        // WOR-2093: key-accountability filters.
-        let api_key_id_f = decoded_query_param(path, "api_key_id");
-        let key_mode_f = decoded_query_param(path, "key_mode");
-        if key_mode_f
-            .as_deref()
-            .is_some_and(|mode| !matches!(mode, "none" | "minted" | "native"))
-        {
-            return (
-                400,
-                "application/json",
-                r#"{"error":"key_mode must be none, minted, or native"}"#.to_string(),
-            );
-        }
-        let session_id_f = decoded_query_param(path, "session_id");
+        let origin_f = decoded_query_param(path, "origin");
+        let strategy_f = decoded_query_param(path, "strategy");
+        let provider_f = decoded_query_param(path, "provider");
+        let model_f = decoded_query_param(path, "model");
+        let since_f = match parse_rfc3339_param(path, "since") {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
+        let until_f = match parse_rfc3339_param(path, "until") {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
         let offset = rl_query_param(path, "offset")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
@@ -3135,20 +4490,14 @@ pub fn handle_admin_request(
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(state.config.max_log_entries)
             .min(state.config.max_log_entries);
-        let entries = state.query_requests(
-            &RequestLogFilter {
-                status,
-                method: method_f.as_deref(),
-                path_sub: path_f.as_deref(),
-                guardrail_action: guardrail_action_f.as_deref(),
-                guardrail_category: guardrail_category_f.as_deref(),
-                cache_status: cache_status_f.as_deref(),
-                retried: retried_f,
-                property_key: property_key_f.as_deref(),
-                property_value: property_value_f.as_deref(),
-                api_key_id: api_key_id_f.as_deref(),
-                key_mode: key_mode_f.as_deref(),
-                session_id: session_id_f.as_deref(),
+        let entries = state.query_routing_decisions(
+            &RoutingDecisionFilter {
+                origin: origin_f.as_deref(),
+                strategy: strategy_f.as_deref(),
+                provider: provider_f.as_deref(),
+                model: model_f.as_deref(),
+                since: since_f,
+                until: until_f,
             },
             offset,
             limit,
@@ -3161,6 +4510,55 @@ pub fn handle_admin_request(
                 format!(r#"{{"error":"serialization failed: {e}"}}"#),
             ),
         };
+    }
+    // WOR-2578: multi-dimension aggregation over the same filtered ring.
+    // `group_by` is required and takes any mix of the four dimensions at
+    // once, which is the "who spent what on which model" question the
+    // per-dimension breakdowns on /api/usage/spend cannot answer.
+    if path_only == "/api/requests/report" {
+        if !method.eq_ignore_ascii_case("GET") {
+            return (
+                405,
+                "application/json",
+                r#"{"error":"method not allowed"}"#.to_string(),
+            );
+        }
+        let dimensions = match parse_report_dimensions(path) {
+            Ok(dimensions) => dimensions,
+            Err(error) => return error,
+        };
+        let parsed = match ParsedRequestFilter::from_query(path, state.config.max_log_entries) {
+            Ok(parsed) => parsed,
+            Err(error) => return error,
+        };
+        return request_report_response(state, &parsed, &dimensions);
+    }
+    // WOR-2578: raw export of the current filtered view, for the
+    // spreadsheet or the billing pipeline rather than another dashboard.
+    if path_only == "/api/requests/export" {
+        if !method.eq_ignore_ascii_case("GET") {
+            return (
+                405,
+                "application/json",
+                r#"{"error":"method not allowed"}"#.to_string(),
+            );
+        }
+        let format = match decoded_query_param(path, "format").as_deref() {
+            None | Some("") | Some("jsonl") => ExportFormat::Jsonl,
+            Some("csv") => ExportFormat::Csv,
+            Some(_) => {
+                return (
+                    400,
+                    "application/json",
+                    r#"{"error":"format must be csv or jsonl"}"#.to_string(),
+                );
+            }
+        };
+        let parsed = match ParsedRequestFilter::from_query(path, state.config.max_log_entries) {
+            Ok(parsed) => parsed,
+            Err(error) => return error,
+        };
+        return request_export_response(state, &parsed, format);
     }
     if path_only == "/api/extensions" {
         if !method.eq_ignore_ascii_case("GET") {
@@ -3764,7 +5162,7 @@ fn audit_admin_reload_rejection(prior_revision: &str, reason: &str) {
 }
 
 /// Clears the actor slot when the dispatch scope ends.
-struct AdminActorGuard;
+pub(crate) struct AdminActorGuard;
 
 impl Drop for AdminActorGuard {
     fn drop(&mut self) {
@@ -3774,7 +5172,11 @@ impl Drop for AdminActorGuard {
 
 /// Install `actor` as the dispatching operator for this thread and
 /// return a guard that clears it on scope exit.
-fn set_current_admin_actor(actor: Option<(String, AdminRole)>) -> AdminActorGuard {
+///
+/// `pub(crate)` so tests below the sync dispatcher (admin_keys' audit
+/// attribution tests) can install an operator through the same seam the
+/// production dispatcher uses, rather than through a test-only side door.
+pub(crate) fn set_current_admin_actor(actor: Option<(String, AdminRole)>) -> AdminActorGuard {
     CURRENT_ADMIN_ACTOR.with(|slot| *slot.borrow_mut() = actor);
     AdminActorGuard
 }
@@ -5966,6 +7368,672 @@ mod tests {
         assert_eq!(rows.as_array().map(Vec::len), Some(1));
     }
 
+    /// One attributed AI request row for the reporting tests (WOR-2578).
+    fn reporting_entry(
+        model: &str,
+        key: &str,
+        tenant: &str,
+        user: &str,
+        tokens_in: u64,
+        tokens_out: u64,
+        cost_usd_micros: u64,
+    ) -> RequestLogEntry {
+        RequestLogEntry {
+            timestamp: "2026-08-20T00:00:00Z".to_string(),
+            origin: "ai.local".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            status: 200,
+            latency_ms: 1.0,
+            client_ip: "127.0.0.1".to_string(),
+            model: Some(model.to_string()),
+            api_key_id: Some(key.to_string()),
+            tenant_id: tenant.to_string(),
+            user_id: Some(user.to_string()),
+            tokens_in: Some(tokens_in),
+            tokens_out: Some(tokens_out),
+            cost_usd_micros: Some(cost_usd_micros),
+            ..Default::default()
+        }
+    }
+
+    /// Split one RFC 4180 CSV record into its fields, honoring quoted
+    /// fields and doubled quotes. Test-side only; the production side
+    /// writes CSV and never parses it.
+    fn split_csv_record(line: &str) -> Vec<String> {
+        let mut fields = Vec::new();
+        let mut field = String::new();
+        let mut chars = line.chars().peekable();
+        let mut quoted = false;
+        while let Some(c) = chars.next() {
+            match c {
+                '"' if quoted => {
+                    if chars.peek() == Some(&'"') {
+                        chars.next();
+                        field.push('"');
+                    } else {
+                        quoted = false;
+                    }
+                }
+                '"' => quoted = true,
+                ',' if !quoted => fields.push(std::mem::take(&mut field)),
+                other => field.push(other),
+            }
+        }
+        fields.push(field);
+        fields
+    }
+
+    #[test]
+    fn requests_endpoint_filters_by_model_tenant_and_user() {
+        let state = make_state();
+        state.log_request(reporting_entry(
+            "claude-sonnet-4",
+            "sbk_alpha",
+            "acme",
+            "dev@acme.test",
+            100,
+            10,
+            500,
+        ));
+        state.log_request(reporting_entry(
+            "gpt-5",
+            "sbk_beta",
+            "acme",
+            "ops@acme.test",
+            10,
+            1,
+            50,
+        ));
+        state.log_request(reporting_entry(
+            "claude-sonnet-4",
+            "sbk_gamma",
+            "globex",
+            "dev@globex.test",
+            20,
+            2,
+            100,
+        ));
+        let auth = basic_auth("admin", "secret");
+
+        for (query, expected) in [
+            ("model=claude-sonnet-4", 2),
+            ("tenant=acme", 2),
+            ("user=dev%40acme.test", 1),
+            ("model=claude-sonnet-4&tenant=globex", 1),
+        ] {
+            let (status, _, body) = handle_admin_request(
+                "GET",
+                &format!("/api/requests?{query}"),
+                &state,
+                Some(&auth),
+                None,
+            );
+            assert_eq!(status, 200, "{query}: {body}");
+            let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(rows.as_array().map(Vec::len), Some(expected), "{query}");
+        }
+    }
+
+    #[test]
+    fn requests_report_groups_simultaneously_across_dimensions() {
+        let state = make_state();
+        // Two rows in one composite group, one in a second group that
+        // shares every dimension except the key and user.
+        state.log_request(reporting_entry(
+            "claude-sonnet-4",
+            "sbk_alpha",
+            "acme",
+            "dev@acme.test",
+            100,
+            10,
+            500,
+        ));
+        state.log_request(reporting_entry(
+            "claude-sonnet-4",
+            "sbk_alpha",
+            "acme",
+            "dev@acme.test",
+            50,
+            5,
+            250,
+        ));
+        state.log_request(reporting_entry(
+            "claude-sonnet-4",
+            "sbk_beta",
+            "acme",
+            "ops@acme.test",
+            10,
+            1,
+            50,
+        ));
+        let auth = basic_auth("admin", "secret");
+
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/requests/report?group_by=model,api_key_id,tenant,user",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 200, "{body}");
+        let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            report["group_by"],
+            serde_json::json!(["model", "api_key_id", "tenant", "user"])
+        );
+        let rows = report["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "one row per composite group: {body}");
+        // Highest spend first.
+        assert_eq!(rows[0]["group"]["model"], "claude-sonnet-4");
+        assert_eq!(rows[0]["group"]["api_key_id"], "sbk_alpha");
+        assert_eq!(rows[0]["group"]["tenant"], "acme");
+        assert_eq!(rows[0]["group"]["user"], "dev@acme.test");
+        assert_eq!(rows[0]["requests"], 2);
+        assert_eq!(rows[0]["tokens_in"], 150);
+        assert_eq!(rows[0]["tokens_out"], 15);
+        assert_eq!(rows[0]["cost_usd_micros"], 750);
+        assert_eq!(rows[1]["group"]["api_key_id"], "sbk_beta");
+        assert_eq!(report["totals"]["requests"], 3);
+        assert_eq!(report["totals"]["tokens_in"], 160);
+        assert_eq!(report["totals"]["cost_usd_micros"], 800);
+    }
+
+    #[test]
+    fn requests_report_validates_group_dimensions() {
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        for path in [
+            // The dimension list is the whole point of the route, so a
+            // missing or empty one is an error, not a default.
+            "/api/requests/report",
+            "/api/requests/report?group_by=",
+            "/api/requests/report?group_by=flavor",
+            "/api/requests/report?group_by=model,model",
+        ] {
+            let (status, _, body) = handle_admin_request("GET", path, &state, Some(&auth), None);
+            assert_eq!(status, 400, "{path}: {body}");
+        }
+    }
+
+    #[test]
+    fn requests_report_applies_the_shared_request_filters() {
+        let state = make_state();
+        state.log_request(reporting_entry(
+            "claude-sonnet-4",
+            "sbk_alpha",
+            "acme",
+            "dev@acme.test",
+            100,
+            10,
+            500,
+        ));
+        state.log_request(reporting_entry(
+            "gpt-5",
+            "sbk_beta",
+            "globex",
+            "ops@globex.test",
+            10,
+            1,
+            50,
+        ));
+        let auth = basic_auth("admin", "secret");
+
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/requests/report?group_by=model&tenant=acme",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 200, "{body}");
+        let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let rows = report["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["group"]["model"], "claude-sonnet-4");
+        assert_eq!(report["totals"]["requests"], 1);
+
+        // An invalid shared filter fails exactly as it does on
+        // `/api/requests`; the two routes parse one filter surface.
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/requests/report?group_by=model&cache_status=warm",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 400, "{body}");
+    }
+
+    #[test]
+    fn requests_export_jsonl_round_trips_the_filtered_view() {
+        let state = make_state();
+        state.log_request(reporting_entry(
+            "claude-sonnet-4",
+            "sbk_alpha",
+            "acme",
+            "dev@acme.test",
+            100,
+            10,
+            500,
+        ));
+        state.log_request(reporting_entry(
+            "gpt-5",
+            "sbk_beta",
+            "globex",
+            "ops@globex.test",
+            10,
+            1,
+            50,
+        ));
+        let auth = basic_auth("admin", "secret");
+
+        let (status, content_type, body) = handle_admin_request(
+            "GET",
+            "/api/requests/export?format=jsonl&tenant=acme",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(content_type, "application/x-ndjson");
+        let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1);
+        let row: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+
+        // Round trip: the exported line IS the snapshot row, so an
+        // export can always be re-read as `RequestLogEntry` JSON.
+        let (_, _, snapshot) = handle_admin_request(
+            "GET",
+            "/api/requests?tenant=acme",
+            &state,
+            Some(&auth),
+            None,
+        );
+        let snapshot_rows: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+        assert_eq!(row, snapshot_rows[0]);
+
+        // Omitting `format` exports JSONL: the raw shape is the default.
+        let (status, content_type, default_body) = handle_admin_request(
+            "GET",
+            "/api/requests/export?tenant=acme",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(content_type, "application/x-ndjson");
+        assert_eq!(default_body, body);
+    }
+
+    #[test]
+    fn requests_export_csv_round_trips_the_filtered_view() {
+        let state = make_state();
+        let mut entry = reporting_entry(
+            "claude-sonnet-4",
+            "sbk_alpha",
+            "acme",
+            "dev@acme.test",
+            100,
+            10,
+            500,
+        );
+        // A path with a comma and a quote proves RFC 4180 escaping
+        // round-trips instead of splitting the record.
+        entry.path = "/v1/chat?note=\"a,b\"".to_string();
+        entry
+            .properties
+            .insert("tier".to_string(), "gold".to_string());
+        state.log_request(entry);
+        state.log_request(reporting_entry(
+            "gpt-5",
+            "sbk_beta",
+            "globex",
+            "ops@globex.test",
+            10,
+            1,
+            50,
+        ));
+        let auth = basic_auth("admin", "secret");
+
+        let (status, content_type, body) = handle_admin_request(
+            "GET",
+            "/api/requests/export?format=csv&tenant=acme",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(content_type, "text/csv");
+        let mut lines = body.lines();
+        let header = split_csv_record(lines.next().expect("header row"));
+        let col = |name: &str| {
+            header
+                .iter()
+                .position(|c| c == name)
+                .unwrap_or_else(|| panic!("missing column {name}: {header:?}"))
+        };
+        let row = split_csv_record(lines.next().expect("one data row"));
+        assert_eq!(lines.next(), None, "the globex row is filtered out");
+        assert_eq!(row[col("model")], "claude-sonnet-4");
+        assert_eq!(row[col("tenant_id")], "acme");
+        assert_eq!(row[col("user_id")], "dev@acme.test");
+        assert_eq!(row[col("api_key_id")], "sbk_alpha");
+        assert_eq!(row[col("path")], "/v1/chat?note=\"a,b\"");
+        assert_eq!(row[col("tokens_in")], "100");
+        assert_eq!(row[col("tokens_out")], "10");
+        assert_eq!(row[col("cost_usd_micros")], "500");
+        // Structured columns carry JSON so nothing is lossy.
+        let properties: serde_json::Value = serde_json::from_str(&row[col("properties")]).unwrap();
+        assert_eq!(properties["tier"], "gold");
+    }
+
+    #[test]
+    fn requests_export_clamps_limit_to_the_ring_bound() {
+        let state = make_state(); // max_log_entries: 5
+        for i in 0..7 {
+            let mut entry = reporting_entry(
+                "claude-sonnet-4",
+                "sbk_alpha",
+                "acme",
+                "dev@acme.test",
+                1,
+                1,
+                1,
+            );
+            entry.path = format!("/v1/chat/{i}");
+            state.log_request(entry);
+        }
+        let auth = basic_auth("admin", "secret");
+
+        // An absurd limit clamps to the ring bound rather than trusting
+        // the caller.
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/requests/export?format=jsonl&limit=999999",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body.lines().count(), 5);
+
+        // An explicit small limit is honored, newest first.
+        let (_, _, body) = handle_admin_request(
+            "GET",
+            "/api/requests/export?format=jsonl&limit=2",
+            &state,
+            Some(&auth),
+            None,
+        );
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let newest: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(newest["path"], "/v1/chat/6");
+    }
+
+    #[test]
+    fn requests_report_and_export_reject_bad_methods_and_formats() {
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        for path in [
+            "/api/requests/report?group_by=model",
+            "/api/requests/export",
+        ] {
+            let (status, _, body) = handle_admin_request("POST", path, &state, Some(&auth), None);
+            assert_eq!(status, 405, "{path}: {body}");
+        }
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/requests/export?format=xml",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 400, "{body}");
+    }
+
+    #[test]
+    fn requests_export_csv_neutralizes_spreadsheet_formula_prefixes() {
+        // Caller-controlled text lands in these cells; a leading `=`,
+        // `+`, `-`, `@`, or tab would execute as a formula when the
+        // export opens in a spreadsheet, so those cells gain a leading
+        // apostrophe (the OWASP CSV-injection guard).
+        let state = make_state();
+        let mut entry = reporting_entry(
+            "claude-sonnet-4",
+            "sbk_alpha",
+            "acme",
+            "dev@acme.test",
+            1,
+            1,
+            1,
+        );
+        entry.path = "=HYPERLINK(\"http://evil.test\")".to_string();
+        state.log_request(entry);
+        let auth = basic_auth("admin", "secret");
+
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/requests/export?format=csv",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 200, "{body}");
+        let mut lines = body.lines();
+        let header = split_csv_record(lines.next().expect("header row"));
+        let path_col = header.iter().position(|c| c == "path").unwrap();
+        let row = split_csv_record(lines.next().expect("one data row"));
+        assert_eq!(row[path_col], "'=HYPERLINK(\"http://evil.test\")");
+    }
+
+    /// The current `sbproxy_admin_request_exports_total{format}` value,
+    /// read back off the default registry. Zero when the family has not
+    /// registered yet, which is the same thing as never having counted.
+    fn admin_request_exports_total(format: &str) -> u64 {
+        for family in prometheus::gather() {
+            if family.name() != "sbproxy_admin_request_exports_total" {
+                continue;
+            }
+            for metric in family.get_metric() {
+                if metric
+                    .get_label()
+                    .iter()
+                    .any(|pair| pair.name() == "format" && pair.value() == format)
+                {
+                    return metric.get_counter().value() as u64;
+                }
+            }
+        }
+        0
+    }
+
+    /// `GET /api/requests` returns the same rows as `format=jsonl` under
+    /// the same parser, the same filter and the same ring cap, and moves
+    /// neither export counter (WOR-2578).
+    ///
+    /// This pins the boundary the export's audit record actually covers.
+    /// The CHANGELOG used to say a bulk read of the operational log was
+    /// recorded and alertable; the identical bulk read is one query
+    /// string away with neither, so the claim now names the export and
+    /// `docs/admin-api-reference.md` names this route as the unaudited
+    /// equivalent. If that ever changes, this test changes with it
+    /// rather than the sentence going quietly stale.
+    ///
+    /// Counter reads are process-wide, so this pins the delta around one
+    /// call rather than an absolute value; nextest gives each test its
+    /// own process.
+    #[test]
+    fn the_snapshot_route_is_the_unaudited_equivalent_of_the_export() {
+        let state = make_state();
+        for tenant in ["acme", "globex"] {
+            state.log_request(reporting_entry(
+                "gpt-4o",
+                "sbk_alpha",
+                tenant,
+                "dev@acme.test",
+                1,
+                1,
+                1,
+            ));
+        }
+        let auth = basic_auth("admin", "secret");
+
+        let (status, _, snapshot) =
+            handle_admin_request("GET", "/api/requests", &state, Some(&auth), None);
+        assert_eq!(status, 200, "{snapshot}");
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&snapshot).unwrap();
+
+        let before_export = admin_request_exports_total("jsonl");
+        let (status, _, export) = handle_admin_request(
+            "GET",
+            "/api/requests/export?format=jsonl",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 200, "{export}");
+        let exported: Vec<serde_json::Value> = export
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).expect("each JSONL line parses"))
+            .collect();
+        assert_eq!(rows, exported, "the same rows, one route over");
+        assert!(
+            admin_request_exports_total("jsonl") > before_export,
+            "the export counts itself"
+        );
+
+        let before_snapshot = admin_request_exports_total("jsonl");
+        let (status, _, body) =
+            handle_admin_request("GET", "/api/requests", &state, Some(&auth), None);
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            admin_request_exports_total("jsonl"),
+            before_snapshot,
+            "the snapshot route is the unaudited, uncounted equivalent of the export"
+        );
+    }
+
+    /// A row that carries none of the optional report dimensions groups
+    /// under `""`, and the same query string on the export has to return
+    /// the rows behind that number (WOR-2578).
+    ///
+    /// The failure this pins: a billing pipeline iterates the report's
+    /// groups and exports each one, exactly as the docs instruct. Every
+    /// populated group exports correctly and the `""` group, typically
+    /// the largest in a deployment that resolves no end user, comes back
+    /// as a header row on its own. Nothing errors and the biggest bucket
+    /// of spend is silently dropped.
+    #[test]
+    fn an_unattributed_group_drills_through_to_its_own_rows() {
+        let state = make_state();
+        state.log_request(reporting_entry(
+            "gpt-4o",
+            "sbk_alpha",
+            "acme",
+            "dev@acme.test",
+            10,
+            1,
+            100,
+        ));
+        // No model, no governed key, no resolved human subject: a call
+        // refused before it reached a provider, or simply a deployment
+        // that sets no `X-Sb-User-Id` and mints no keys.
+        let mut orphan = reporting_entry("x", "x", "acme", "x", 20, 2, 200);
+        orphan.model = None;
+        orphan.api_key_id = None;
+        orphan.user_id = None;
+        state.log_request(orphan);
+        let auth = basic_auth("admin", "secret");
+
+        for dimension in ["model", "api_key_id", "user"] {
+            let (status, _, body) = handle_admin_request(
+                "GET",
+                &format!("/api/requests/report?group_by={dimension}"),
+                &state,
+                Some(&auth),
+                None,
+            );
+            assert_eq!(status, 200, "{dimension}: {body}");
+            let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let rows = report["rows"].as_array().cloned().unwrap_or_default();
+            let unattributed = rows
+                .iter()
+                .find(|row| row["group"][dimension].as_str() == Some(""))
+                .unwrap_or_else(|| panic!("{dimension}: no unattributed group in {body}"));
+            assert_eq!(
+                unattributed["requests"].as_u64(),
+                Some(1),
+                "{dimension}: {body}"
+            );
+
+            let (status, _, body) = handle_admin_request(
+                "GET",
+                &format!("/api/requests/export?format=jsonl&{dimension}="),
+                &state,
+                Some(&auth),
+                None,
+            );
+            assert_eq!(status, 200, "{dimension}: {body}");
+            assert_eq!(
+                body.lines().filter(|line| !line.is_empty()).count(),
+                1,
+                "{dimension}: the unattributed group must drill through to its own row: {body}"
+            );
+        }
+    }
+
+    /// A present-but-unparseable numeric filter is a 400 rather than a
+    /// silently wider result set (WOR-2578).
+    ///
+    /// `?status=5xx` used to drop the status dimension and hand back the
+    /// whole ring, every tenant and every user, as a file. The audit
+    /// record was honest and unhelpful: `filters=none`, because the
+    /// dimension was never set.
+    #[test]
+    fn request_filters_refuse_a_malformed_numeric_param() {
+        let state = make_state();
+        state.log_request(reporting_entry(
+            "gpt-4o",
+            "sbk_alpha",
+            "acme",
+            "dev@acme.test",
+            10,
+            1,
+            100,
+        ));
+        let auth = basic_auth("admin", "secret");
+        for query in ["status=5xx", "limit=all", "offset=-1", "limit="] {
+            let (status, _, body) = handle_admin_request(
+                "GET",
+                &format!("/api/requests/export?format=csv&{query}"),
+                &state,
+                Some(&auth),
+                None,
+            );
+            assert_eq!(
+                status, 400,
+                "{query} must not silently widen the export: {body}"
+            );
+        }
+        // One parser, so the snapshot and the report refuse them too.
+        for path in ["/api/requests?status=5xx", "/api/requests/report?limit=all"] {
+            let (status, _, body) = handle_admin_request("GET", path, &state, Some(&auth), None);
+            assert_eq!(status, 400, "{path}: {body}");
+        }
+        // And a well-formed one still works.
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/requests/export?format=csv&status=200&limit=5&offset=0",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 200, "{body}");
+    }
+
     #[test]
     fn spend_group_by_accepts_a_percent_encoded_property_dimension() {
         // A promoted property reads `property:<key>`, and every
@@ -6310,6 +8378,45 @@ mod tests {
         .await;
 
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    }
+
+    /// WOR-2575: the routing-decisions view is a read surface, so a
+    /// read-only operator session passes the role gate.
+    #[tokio::test]
+    async fn routing_decisions_endpoint_allows_a_read_only_operator() {
+        let state = AdminState::new(AdminConfig {
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+            operators: vec![AdminOperator {
+                username: "reader".to_string(),
+                password_hash: sbproxy_keystore::crypto::hash_secret(
+                    "reader-secret",
+                    &crate::key_plane::default_admin_operator_pepper(),
+                ),
+                role: AdminRole::ReadOnly,
+                tenant: None,
+            }],
+            ..AdminConfig::default()
+        });
+        state.log_routing_decision(sample_routing_decision(
+            "2026-08-20T12:00:00+00:00",
+            "ai-gateway",
+            "round_robin",
+        ));
+        let (token, _) = state
+            .session_signer
+            .mint("reader", AdminRole::ReadOnly, 3600, unix_now());
+
+        let response = send_admin_request(
+            state,
+            format!(
+                "GET /api/routing-decisions HTTP/1.1\r\nCookie: sb_admin_session={token}\r\n\r\n"
+            ),
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("round_robin"), "{response}");
     }
 
     #[tokio::test]
@@ -6879,6 +8986,516 @@ mod tests {
         }
     }
 
+    // --- GET /api/audit/chain (WOR-2579) ---
+
+    /// The four-channel viewer route serves entries from every installed
+    /// chain, newest first, and reports the channels that are not
+    /// enabled as disabled rather than omitting them.
+    #[test]
+    fn audit_chain_route_serves_entries_across_channels() {
+        use sbproxy_observe::audit_chain::{
+            install_admin_audit_chain, install_security_audit_chain, AdminActionAuditChain,
+            SecurityAuditChain,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = "11".repeat(32);
+        let security =
+            SecurityAuditChain::open(&dir.path().join("security.jsonl"), &seed, "viewer-kid")
+                .expect("the security chain opens");
+        let admin =
+            AdminActionAuditChain::open(&dir.path().join("admin.jsonl"), &seed, "viewer-kid")
+                .expect("the admin chain opens");
+        if install_security_audit_chain(security).is_err()
+            || install_admin_audit_chain(admin).is_err()
+        {
+            // Another test in this process claimed a chain slot first
+            // (plain `cargo test` shares one process). The nextest run,
+            // where every test owns its process, covers this path.
+            return;
+        }
+        sbproxy_observe::SecurityAuditEntry::policy_violation(
+            "waf",
+            "chain-viewer-marker-deny",
+            403,
+            Some("api.example.com".to_string()),
+            None,
+            Some("req-viewer-1".to_string()),
+            Some("GET".to_string()),
+        )
+        .emit();
+        sbproxy_observe::AdminActionAuditEntry::new(
+            "admin_action",
+            Some("root".to_string()),
+            None,
+            None,
+            None,
+            Some("POST /admin/reload".to_string()),
+        )
+        .emit();
+
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        let (status, _, body) =
+            handle_admin_request("GET", "/api/audit/chain", &state, Some(&auth), None);
+        assert_eq!(status, 200, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+        let channels = json["channels"].as_array().expect("a channels array");
+        assert_eq!(channels.len(), 4, "all four channels are reported: {body}");
+        let by_name = |name: &str| {
+            channels
+                .iter()
+                .find(|c| c["channel"] == name)
+                .unwrap_or_else(|| panic!("channel {name} is reported: {body}"))
+        };
+        assert_eq!(by_name("security")["enabled"], true, "{body}");
+        assert_eq!(by_name("security")["ok"], true, "{body}");
+        assert_eq!(by_name("security")["key_id"], "viewer-kid", "{body}");
+        assert_eq!(by_name("config")["enabled"], false, "{body}");
+        assert_eq!(by_name("key")["enabled"], false, "{body}");
+        let entries = json["entries"].as_array().expect("an entries array");
+        assert!(
+            entries.iter().any(|e| e["channel"] == "security"
+                && e["event"]["reason"] == "chain-viewer-marker-deny"),
+            "the security denial is browsable: {body}"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e["channel"] == "admin" && e["actor"] == "root"),
+            "the admin action is browsable with its actor: {body}"
+        );
+    }
+
+    /// Tampering with a chained entry on disk is surfaced in the
+    /// response rather than hidden: the walk stops at the break, names
+    /// the sequence, and serves only the records that verified. This is
+    /// the property that makes the viewer more than a log reader.
+    #[test]
+    fn audit_chain_route_surfaces_a_tampered_entry() {
+        use sbproxy_observe::audit_chain::{install_security_audit_chain, SecurityAuditChain};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("security.jsonl");
+        let seed = "22".repeat(32);
+        let chain = SecurityAuditChain::open(&path, &seed, "viewer-kid").expect("the chain opens");
+        if install_security_audit_chain(chain).is_err() {
+            return;
+        }
+        for marker in ["tamper-zero", "tamper-one", "tamper-two"] {
+            sbproxy_observe::SecurityAuditEntry::policy_violation(
+                "waf", marker, 403, None, None, None, None,
+            )
+            .emit();
+        }
+        let content = std::fs::read_to_string(&path).expect("the chain file is readable");
+        let tampered = content.replace("tamper-one", "tamper-WAS-EDITED");
+        assert_ne!(content, tampered, "the marker was present to tamper with");
+        std::fs::write(&path, tampered).expect("the tampered file is writable");
+
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        let broken_before = audit_chain_read_total("security", "broken");
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/audit/chain?channel=security",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(
+            status, 200,
+            "a broken chain is a finding, not a 500: {body}"
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+        let channels = json["channels"].as_array().expect("a channels array");
+        let security = channels
+            .iter()
+            .find(|c| c["channel"] == "security")
+            .expect("the security channel is reported");
+        assert_eq!(security["ok"], false, "{body}");
+        assert_eq!(security["broken_seq"], 1, "{body}");
+        assert!(
+            security["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("tampered"),
+            "the reason names the tamper: {body}"
+        );
+        let entries = json["entries"].as_array().expect("an entries array");
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the records before the break are served: {body}"
+        );
+        assert_eq!(entries[0]["seq"], 0, "{body}");
+        // And the verdict leaves the page. A broken chain only a person
+        // looking at the console can see is a finding nobody is on call
+        // for, so the alertable signal is asserted here by name rather
+        // than left to the renderer.
+        // Strictly greater rather than exactly one more: the counter is
+        // process-wide, and under a shared-process runner another test
+        // reading the same installed chain would move it too. What is
+        // being pinned is the mapping - a walk that failed counts as
+        // `broken` - and a mapping that reported anything else leaves
+        // this label where it was.
+        assert!(
+            audit_chain_read_total("security", "broken") > broken_before,
+            "sbproxy_audit_chain_read_total{{channel=\"security\",outcome=\"broken\"}} \
+             did not move"
+        );
+    }
+
+    /// The current `sbproxy_audit_chain_read_total` value for one label
+    /// pair, read back off the default registry. Zero when the family
+    /// has not registered yet, which is the same thing as never having
+    /// counted.
+    fn audit_chain_read_total(channel: &str, outcome: &str) -> u64 {
+        for family in prometheus::gather() {
+            if family.name() != "sbproxy_audit_chain_read_total" {
+                continue;
+            }
+            for metric in family.get_metric() {
+                let has = |name: &str, want: &str| {
+                    metric
+                        .get_label()
+                        .iter()
+                        .any(|pair| pair.name() == name && pair.value() == want)
+                };
+                if has("channel", channel) && has("outcome", outcome) {
+                    return metric.get_counter().value() as u64;
+                }
+            }
+        }
+        0
+    }
+
+    /// The viewer refuses what it cannot serve: an unknown channel, a
+    /// malformed timestamp, and a cursor without a channel are each a
+    /// 400, and the route is GET-only.
+    #[test]
+    fn audit_chain_route_validates_its_query() {
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/audit/chain?channel=nope",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 400, "{body}");
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/audit/chain?since=yesterday",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 400, "{body}");
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/audit/chain?before_seq=5",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 400, "a cursor needs a channel to page: {body}");
+        let (status, _, body) =
+            handle_admin_request("POST", "/api/audit/chain", &state, Some(&auth), None);
+        assert_eq!(status, 405, "{body}");
+    }
+
+    /// The audit viewer is a read surface: a read-only operator gets the
+    /// same 200 an admin does (WOR-2579). The route is GET-only by
+    /// construction, so the mutating-action gate never applies to it.
+    #[tokio::test]
+    async fn a_read_only_operator_can_read_the_audit_chain() {
+        let state = AdminState::new(AdminConfig {
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+            operators: vec![AdminOperator {
+                username: "reader".to_string(),
+                password_hash: sbproxy_keystore::crypto::hash_secret(
+                    "reader-secret",
+                    &crate::key_plane::default_admin_operator_pepper(),
+                ),
+                role: AdminRole::ReadOnly,
+                tenant: None,
+            }],
+            ..AdminConfig::default()
+        });
+        let (token, _) = state
+            .session_signer
+            .mint("reader", AdminRole::ReadOnly, 3600, unix_now());
+
+        let response = send_admin_request(
+            state,
+            format!("GET /api/audit/chain HTTP/1.1\r\nCookie: sb_admin_session={token}\r\n\r\n"),
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    }
+
+    /// A login narrowed to one tenant is refused the whole chain
+    /// surface rather than served a filtered slice of it, and the
+    /// refusal is on the tenant axis rather than the role axis: this
+    /// operator holds the `admin` role and is still refused (WOR-2579).
+    #[tokio::test]
+    async fn a_tenant_scoped_operator_is_refused_the_audit_chain() {
+        let state = AdminState::new(AdminConfig {
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+            operators: vec![AdminOperator {
+                username: "reseller".to_string(),
+                password_hash: sbproxy_keystore::crypto::hash_secret(
+                    "reseller-secret",
+                    &crate::key_plane::default_admin_operator_pepper(),
+                ),
+                role: AdminRole::Admin,
+                tenant: Some("acme".to_string()),
+            }],
+            ..AdminConfig::default()
+        });
+        let (token, _) = state
+            .session_signer
+            .mint("reseller", AdminRole::Admin, 3600, unix_now());
+
+        let response = send_admin_request(
+            state,
+            format!("GET /api/audit/chain HTTP/1.1\r\nCookie: sb_admin_session={token}\r\n\r\n"),
+        )
+        .await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "a deployment-wide trail must not be sliced per tenant: {response}"
+        );
+        assert!(
+            response.contains("acme"),
+            "the refusal names the scope that caused it: {response}"
+        );
+    }
+
+    /// The refusal above is scrapeable, not only auditable (WOR-2579).
+    ///
+    /// Without this the only record of a scoped principal reaching for a
+    /// deployment-wide security surface is inside the chain that
+    /// principal was just refused, which takes an admin-role read to
+    /// find and nothing to prompt one. The shipped alert
+    /// `increase(sbproxy_audit_chain_read_total{outcome!="verified"}[15m]) > 0`
+    /// has to cover it unchanged, which is why the outcome lands on this
+    /// family rather than on a new one.
+    #[tokio::test]
+    async fn a_refused_audit_chain_read_moves_the_alertable_counter() {
+        let before = audit_chain_read_total("security", "denied");
+        let state = AdminState::new(AdminConfig {
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+            operators: vec![AdminOperator {
+                username: "reseller".to_string(),
+                password_hash: sbproxy_keystore::crypto::hash_secret(
+                    "reseller-secret",
+                    &crate::key_plane::default_admin_operator_pepper(),
+                ),
+                role: AdminRole::Admin,
+                tenant: Some("acme".to_string()),
+            }],
+            ..AdminConfig::default()
+        });
+        let (token, _) = state
+            .session_signer
+            .mint("reseller", AdminRole::Admin, 3600, unix_now());
+
+        let response = send_admin_request(
+            state,
+            format!("GET /api/audit/chain HTTP/1.1\r\nCookie: sb_admin_session={token}\r\n\r\n"),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+
+        // Strictly greater rather than exactly one more: the counter is
+        // process-wide and a shared-process runner may move it too.
+        assert!(
+            audit_chain_read_total("security", "denied") > before,
+            "a refused chain read must leave the page as well as render on it"
+        );
+    }
+
+    /// WOR-2578's two new routes are read surfaces, so a `read_only`
+    /// operator gets the same 200 an admin does.
+    ///
+    /// Pinned by name because the audit-chain viewer that shipped in the
+    /// same batch argued the opposite way on the tenant axis, and the
+    /// posture nobody tests is the posture that flips unnoticed.
+    #[tokio::test]
+    async fn the_report_and_the_export_allow_a_read_only_operator() {
+        for path in [
+            "/api/requests/report?group_by=model",
+            "/api/requests/export?format=csv",
+        ] {
+            let state = AdminState::new(AdminConfig {
+                username: "admin".to_string(),
+                password: "secret".to_string(),
+                max_log_entries: 100,
+                operators: vec![AdminOperator {
+                    username: "reader".to_string(),
+                    password_hash: sbproxy_keystore::crypto::hash_secret(
+                        "reader-secret",
+                        &crate::key_plane::default_admin_operator_pepper(),
+                    ),
+                    role: AdminRole::ReadOnly,
+                    tenant: None,
+                }],
+                ..AdminConfig::default()
+            });
+            let (token, _) =
+                state
+                    .session_signer
+                    .mint("reader", AdminRole::ReadOnly, 3600, unix_now());
+
+            let response = send_admin_request(
+                state,
+                format!("GET {path} HTTP/1.1\r\nCookie: sb_admin_session={token}\r\n\r\n"),
+            )
+            .await;
+            assert!(
+                response.starts_with("HTTP/1.1 200 OK"),
+                "{path}: {response}"
+            );
+        }
+    }
+
+    /// And a tenant-scoped operator is served the whole deployment on
+    /// both, exactly as `GET /api/requests` has always served them one.
+    ///
+    /// The asymmetry with `/api/audit/chain` is deliberate rather than
+    /// inherited: a narrowed audit trail reads as "nothing else
+    /// happened", which is a worse answer than a refusal, while a
+    /// narrowed spend report is just a smaller number. Recorded in code
+    /// so the decision is a decision rather than an omission (WOR-2578).
+    #[tokio::test]
+    async fn the_report_and_the_export_serve_a_tenant_scoped_operator_every_tenant() {
+        for path in [
+            "/api/requests/report?group_by=tenant",
+            "/api/requests/export?format=csv",
+        ] {
+            let state = AdminState::new(AdminConfig {
+                username: "admin".to_string(),
+                password: "secret".to_string(),
+                max_log_entries: 100,
+                operators: vec![AdminOperator {
+                    username: "reseller".to_string(),
+                    password_hash: sbproxy_keystore::crypto::hash_secret(
+                        "reseller-secret",
+                        &crate::key_plane::default_admin_operator_pepper(),
+                    ),
+                    role: AdminRole::Admin,
+                    tenant: Some("acme".to_string()),
+                }],
+                ..AdminConfig::default()
+            });
+            state.log_request(reporting_entry(
+                "gpt-4o",
+                "k-acme",
+                "acme",
+                "dev@acme.test",
+                1,
+                1,
+                1,
+            ));
+            state.log_request(reporting_entry(
+                "gpt-4o",
+                "k-globex",
+                "globex",
+                "dev@globex.test",
+                1,
+                1,
+                1,
+            ));
+            let (token, _) =
+                state
+                    .session_signer
+                    .mint("reseller", AdminRole::Admin, 3600, unix_now());
+
+            let response = send_admin_request(
+                state,
+                format!("GET {path} HTTP/1.1\r\nCookie: sb_admin_session={token}\r\n\r\n"),
+            )
+            .await;
+            assert!(
+                response.starts_with("HTTP/1.1 200 OK"),
+                "{path}: {response}"
+            );
+            assert!(
+                response.contains("globex"),
+                "{path}: the reporting routes are deployment-wide for every role: {response}"
+            );
+        }
+    }
+
+    /// Reading the trail is itself recorded on the admin chain, naming
+    /// the operator and what they asked for: an investigator asking
+    /// "who looked" must not have to take our word for it (WOR-2579).
+    #[tokio::test]
+    async fn reading_the_audit_chain_is_itself_recorded() {
+        use sbproxy_observe::audit_chain::{install_admin_audit_chain, AdminActionAuditChain};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("admin.jsonl");
+        let chain = AdminActionAuditChain::open(&path, &"44".repeat(32), "viewer-kid")
+            .expect("the admin chain opens");
+        if install_admin_audit_chain(chain).is_err() {
+            // Another test in this process claimed the slot first (plain
+            // `cargo test` shares one process); nextest covers this.
+            return;
+        }
+        let state = AdminState::new(AdminConfig {
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+            operators: vec![AdminOperator {
+                username: "auditor".to_string(),
+                password_hash: sbproxy_keystore::crypto::hash_secret(
+                    "auditor-secret",
+                    &crate::key_plane::default_admin_operator_pepper(),
+                ),
+                role: AdminRole::ReadOnly,
+                tenant: None,
+            }],
+            ..AdminConfig::default()
+        });
+        let (token, _) =
+            state
+                .session_signer
+                .mint("auditor", AdminRole::ReadOnly, 3600, unix_now());
+
+        let response = send_admin_request(
+            state,
+            format!(
+                "GET /api/audit/chain?channel=admin HTTP/1.1\r\n\
+                 Cookie: sb_admin_session={token}\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+
+        let recorded = std::fs::read_to_string(&path).expect("the admin chain is readable");
+        assert!(
+            recorded.contains(r#""action":"read_audit_chain""#),
+            "the read is on the chain under its own name: {recorded}"
+        );
+        assert!(
+            recorded.contains(r#""actor":"auditor""#),
+            "and it names who looked: {recorded}"
+        );
+        assert!(
+            recorded.contains("channel=admin"),
+            "and what they asked for: {recorded}"
+        );
+        assert!(
+            !recorded.contains("read_audit_chain_denied"),
+            "an allowed read is not a denial: {recorded}"
+        );
+    }
+
     // --- /admin/config/history (WOR-2456/2457) ---
 
     /// Installs an enabled config-history recorder rooted at `dir` as the
@@ -7358,6 +9975,228 @@ mod tests {
         assert_eq!(body, "[]");
     }
 
+    /// WOR-2575: a routing-decision entry with only the dimensions a
+    /// test cares about; everything else stays at its default.
+    fn sample_routing_decision(
+        timestamp: &str,
+        origin: &str,
+        strategy: &str,
+    ) -> RoutingDecisionEntry {
+        RoutingDecisionEntry {
+            timestamp: timestamp.to_string(),
+            origin: origin.to_string(),
+            strategy: strategy.to_string(),
+            status: 200,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn routing_decisions_endpoint_returns_recorded_decisions() {
+        let state = make_state();
+        let mut detail = serde_json::Map::new();
+        detail.insert(
+            "fallback_trigger".to_string(),
+            serde_json::Value::String("context_window".to_string()),
+        );
+        state.log_routing_decision(RoutingDecisionEntry {
+            timestamp: "2026-08-20T12:00:00+00:00".to_string(),
+            origin: "ai-gateway".to_string(),
+            request_id: Some("req-1".to_string()),
+            tenant_id: "acme".to_string(),
+            strategy: "fallback_chain".to_string(),
+            requested_model: Some("gpt-5".to_string()),
+            selected_provider: Some("anthropic".to_string()),
+            selected_model: Some("claude-sonnet-5".to_string()),
+            reason: Some("primary quota exhausted".to_string()),
+            candidates: vec![
+                RoutingDecisionCandidate {
+                    provider: "openai".to_string(),
+                    model: Some("gpt-5".to_string()),
+                },
+                RoutingDecisionCandidate {
+                    provider: "anthropic".to_string(),
+                    model: Some("claude-sonnet-5".to_string()),
+                },
+            ],
+            attempted: vec!["openai".to_string(), "anthropic".to_string()],
+            attempts: 2,
+            failover_engaged: true,
+            failover_from: Some("openai".to_string()),
+            failover_to: Some("anthropic".to_string()),
+            status: 200,
+            latency_ms: 812.4,
+            detail,
+        });
+
+        let auth = basic_auth("admin", "secret");
+        let (status, ct, body) =
+            handle_admin_request("GET", "/api/routing-decisions", &state, Some(&auth), None);
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(ct, "application/json");
+        let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let row = &rows[0];
+        assert_eq!(row["strategy"], "fallback_chain");
+        assert_eq!(row["requested_model"], "gpt-5");
+        assert_eq!(row["selected_provider"], "anthropic");
+        assert_eq!(row["reason"], "primary quota exhausted");
+        assert_eq!(row["candidates"][1]["provider"], "anthropic");
+        assert_eq!(row["attempted"], serde_json::json!(["openai", "anthropic"]));
+        assert_eq!(row["failover_from"], "openai");
+        // The open detail map rides along verbatim: WOR-2556, WOR-2557,
+        // WOR-2559, and WOR-2564 each add a key here, not a column.
+        assert_eq!(row["detail"]["fallback_trigger"], "context_window");
+    }
+
+    #[test]
+    fn routing_decisions_endpoint_is_get_only() {
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        let (status, _, _) =
+            handle_admin_request("POST", "/api/routing-decisions", &state, Some(&auth), None);
+        assert_eq!(status, 405);
+    }
+
+    #[test]
+    fn routing_decisions_ring_drops_oldest_when_full() {
+        // make_state caps the ring at 5 entries.
+        let state = make_state();
+        for i in 0..7 {
+            state.log_routing_decision(sample_routing_decision(
+                "2026-08-20T12:00:00+00:00",
+                &format!("origin-{i}"),
+                "round_robin",
+            ));
+        }
+        let rows = state.query_routing_decisions(&RoutingDecisionFilter::default(), 0, 100);
+        assert_eq!(rows.len(), 5);
+        // Newest first; the two oldest fell off the front.
+        assert_eq!(rows[0].origin, "origin-6");
+        assert_eq!(rows[4].origin, "origin-2");
+    }
+
+    #[test]
+    fn query_routing_decisions_filters_and_paginates() {
+        let state = make_state();
+        state.log_routing_decision(RoutingDecisionEntry {
+            requested_model: Some("gpt-5".to_string()),
+            selected_provider: Some("openai".to_string()),
+            selected_model: Some("gpt-5".to_string()),
+            ..sample_routing_decision("2026-08-20T10:00:00+00:00", "ai-gateway", "round_robin")
+        });
+        state.log_routing_decision(RoutingDecisionEntry {
+            requested_model: Some("gpt-5".to_string()),
+            selected_provider: Some("anthropic".to_string()),
+            selected_model: Some("claude-sonnet-5".to_string()),
+            ..sample_routing_decision("2026-08-20T11:00:00+00:00", "ai-gateway", "fallback_chain")
+        });
+        state.log_routing_decision(sample_routing_decision(
+            "2026-08-20T12:00:00+00:00",
+            "web",
+            "least_connections",
+        ));
+
+        let all = state.query_routing_decisions(&RoutingDecisionFilter::default(), 0, 100);
+        assert_eq!(all.len(), 3);
+
+        let by_origin = state.query_routing_decisions(
+            &RoutingDecisionFilter {
+                origin: Some("ai-gateway"),
+                ..Default::default()
+            },
+            0,
+            100,
+        );
+        assert_eq!(by_origin.len(), 2);
+
+        let by_strategy = state.query_routing_decisions(
+            &RoutingDecisionFilter {
+                strategy: Some("fallback_chain"),
+                ..Default::default()
+            },
+            0,
+            100,
+        );
+        assert_eq!(by_strategy.len(), 1);
+        assert_eq!(
+            by_strategy[0].selected_provider.as_deref(),
+            Some("anthropic")
+        );
+
+        // The model filter matches the requested side and the selected
+        // side, so a substituted request is findable from either name.
+        for model in ["gpt-5", "claude-sonnet-5"] {
+            let by_model = state.query_routing_decisions(
+                &RoutingDecisionFilter {
+                    model: Some(model),
+                    ..Default::default()
+                },
+                0,
+                100,
+            );
+            assert!(
+                by_model
+                    .iter()
+                    .any(|e| e.selected_model.as_deref() == Some("claude-sonnet-5")),
+                "model={model} missed the substituted decision"
+            );
+        }
+
+        let by_provider = state.query_routing_decisions(
+            &RoutingDecisionFilter {
+                provider: Some("openai"),
+                ..Default::default()
+            },
+            0,
+            100,
+        );
+        assert_eq!(by_provider.len(), 1);
+
+        let since = "2026-08-20T10:30:00+00:00"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let until = "2026-08-20T11:30:00+00:00"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let windowed = state.query_routing_decisions(
+            &RoutingDecisionFilter {
+                since: Some(since),
+                until: Some(until),
+                ..Default::default()
+            },
+            0,
+            100,
+        );
+        assert_eq!(windowed.len(), 1);
+        assert_eq!(windowed[0].strategy, "fallback_chain");
+
+        let paged = state.query_routing_decisions(&RoutingDecisionFilter::default(), 1, 1);
+        assert_eq!(paged.len(), 1);
+        assert_eq!(paged[0].strategy, "fallback_chain");
+    }
+
+    #[test]
+    fn routing_decisions_endpoint_validates_filters() {
+        let state = make_state();
+        let auth = basic_auth("admin", "secret");
+        for path in [
+            "/api/routing-decisions?since=yesterday",
+            "/api/routing-decisions?until=not-a-time",
+        ] {
+            let (status, _, body) = handle_admin_request("GET", path, &state, Some(&auth), None);
+            assert_eq!(status, 400, "{path}: {body}");
+            assert!(body.contains("RFC 3339"), "{path}: {body}");
+        }
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/routing-decisions?since=2026-08-20T10:30:00%2B00:00&strategy=round_robin&limit=10",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 200, "{body}");
+    }
+
     #[test]
     fn spend_totals_use_attributed_tokens_when_legacy_tokens_are_empty() {
         let snap = std::collections::HashMap::from([
@@ -7455,6 +10294,125 @@ mod tests {
             parsed.get("config_revision").is_some(),
             "missing 'config_revision': {body}"
         );
+    }
+
+    /// WOR-2560: the tri-state gauge value is derived from the same
+    /// row the admin JSON renders, on LiteLLM's 0/1/2 scale. Each case
+    /// pins one arm: any ineligibility source reads 2, an eligible
+    /// half-open breaker reads 1 (it is carrying trial traffic, which
+    /// is degraded rather than out), and only a fully clean target
+    /// reads 0.
+    #[test]
+    fn target_health_metric_state_matches_selection_eligibility() {
+        let row = |healthy: bool, ejected: bool, breaker: Option<&'static str>| TargetHealthRow {
+            index: 0,
+            url: "http://127.0.0.1:9601".to_string(),
+            healthy,
+            outlier_ejected: ejected,
+            breaker_state: breaker,
+            weight: 1,
+            backup: false,
+            group: None,
+        };
+        use sbproxy_observe::metrics::{
+            TARGET_HEALTH_DEGRADED, TARGET_HEALTH_EXCLUDED, TARGET_HEALTH_HEALTHY,
+        };
+        assert_eq!(
+            row(true, false, Some("closed")).metric_state(),
+            TARGET_HEALTH_HEALTHY
+        );
+        // No breaker configured is the common case and is healthy.
+        assert_eq!(row(true, false, None).metric_state(), TARGET_HEALTH_HEALTHY);
+        assert_eq!(
+            row(true, false, Some("half_open")).metric_state(),
+            TARGET_HEALTH_DEGRADED
+        );
+        assert_eq!(
+            row(false, false, None).metric_state(),
+            TARGET_HEALTH_EXCLUDED,
+            "probe-unhealthy must exclude"
+        );
+        assert_eq!(
+            row(true, true, None).metric_state(),
+            TARGET_HEALTH_EXCLUDED,
+            "outlier ejection must exclude"
+        );
+        assert_eq!(
+            row(true, false, Some("open")).metric_state(),
+            TARGET_HEALTH_EXCLUDED,
+            "an open breaker must exclude"
+        );
+        // A half-open breaker on an ejected target is still excluded:
+        // eligibility wins over the degraded reading.
+        assert_eq!(
+            row(true, true, Some("half_open")).metric_state(),
+            TARGET_HEALTH_EXCLUDED
+        );
+    }
+
+    /// Fix round on the #1177 review, red-first: keying the gauge's
+    /// `target` label on `row.url` alone collapsed two same-URL targets
+    /// into one series. The load balancer refuses that assumption in
+    /// its own identifier (`target_id` is `url#index` "so two targets
+    /// with the same URL stay distinguishable"), and two same-URL
+    /// targets are a real config: a weighted pair, or blue and green
+    /// addressed through one host.
+    ///
+    /// Before the fix both rows wrote
+    /// `with_label_values(&["lb.local", "http://a:8080"])`, last write
+    /// won, and the ejected target read healthy on `/metrics` while
+    /// `GET /api/health/targets` still showed it ejected at its own
+    /// `index`. That is exactly the disagreement between the two
+    /// surfaces the registry description, `docs/observability.md`, and
+    /// the example README all promise cannot happen.
+    #[test]
+    fn same_url_targets_get_distinct_health_gauge_series() {
+        use sbproxy_observe::metrics::{TARGET_HEALTH_EXCLUDED, TARGET_HEALTH_HEALTHY};
+        let row = |index: usize, url: &str, ejected: bool| TargetHealthRow {
+            index,
+            url: url.to_string(),
+            healthy: true,
+            outlier_ejected: ejected,
+            breaker_state: None,
+            weight: 1,
+            backup: false,
+            group: None,
+        };
+        let origins = vec![OriginTargetHealth {
+            hostname: "lb.local".to_string(),
+            origin_id: "lb.local".to_string(),
+            targets: vec![
+                row(0, "http://a:8080", true),
+                row(1, "http://a:8080", false),
+                row(2, "http://b:8080", false),
+            ],
+        }];
+
+        let samples = target_health_samples(&origins);
+        let labels: Vec<&str> = samples.iter().map(|s| s.target.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["http://a:8080#0", "http://a:8080#1", "http://b:8080"],
+            "colliding URLs take the load balancer's own url#index id; a unique URL stays \
+             readable"
+        );
+
+        // The ejected row is still readable as ejected, which is the
+        // whole failure the collapse hid.
+        assert_eq!(samples[0].state, TARGET_HEALTH_EXCLUDED);
+        assert_eq!(samples[1].state, TARGET_HEALTH_HEALTHY);
+        assert_eq!(samples[2].state, TARGET_HEALTH_HEALTHY);
+
+        // Every sample is a distinct (origin, target) pair, so nothing
+        // can be overwritten by a later `set`.
+        let mut pairs: Vec<(&str, &str)> = samples
+            .iter()
+            .map(|s| (s.origin.as_str(), s.target.as_str()))
+            .collect();
+        pairs.sort_unstable();
+        let before = pairs.len();
+        pairs.dedup();
+        assert_eq!(before, pairs.len(), "two rows still share one gauge series");
     }
 
     #[test]
@@ -8482,6 +11440,7 @@ origins:
                 error_pages: None,
                 problem_details: None,
                 proxy_status: None,
+                deprecation: None,
                 message_signatures: None,
                 olp: None,
                 web_bot_auth_publish: None,

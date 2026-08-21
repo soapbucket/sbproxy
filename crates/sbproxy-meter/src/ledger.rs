@@ -50,7 +50,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -588,21 +588,77 @@ pub fn verify_ledger<P: LedgerPayload>(
     path: impl AsRef<Path>,
     verifying_key: Option<&VerifyingKey>,
 ) -> anyhow::Result<LedgerVerifyResult> {
+    verify_ledger_visiting::<P>(path, verifying_key, None, &mut |_| {})
+}
+
+/// The walk [`verify_ledger`] is, with two things added for a reader that
+/// wants the records as well as the verdict: `visit` is handed every entry
+/// that has just passed every check, and `max_record_bytes` caps how much
+/// of one record the reader will pull into memory.
+///
+/// One walk, not two, and that is the point rather than an economy.
+/// A reader that verified a file and then re-read it to display it would
+/// be showing records it never actually checked, and any writer appending
+/// between the two passes would make the verdict describe a different file
+/// than the page. Here the entry handed to `visit` is the same value the
+/// hash chain, the signature, and the coherence check just passed, so
+/// "these records" and "this chain verified" are one statement.
+///
+/// `max_record_bytes` of `None` is unbounded, which is what
+/// [`verify_ledger`] and therefore `sbproxy audit verify` use: an auditor
+/// pointed at a damaged file wants the whole answer whatever it costs.
+/// A caller serving an HTTP response wants a bound instead, and passes
+/// one; a record longer than it stops the walk and is reported as a
+/// verification failure rather than being skipped, because a reader that
+/// cannot see a record cannot claim the chain across it.
+pub fn verify_ledger_visiting<P: LedgerPayload>(
+    path: impl AsRef<Path>,
+    verifying_key: Option<&VerifyingKey>,
+    max_record_bytes: Option<usize>,
+    visit: &mut dyn FnMut(&LedgerEntry<P>),
+) -> anyhow::Result<LedgerVerifyResult> {
     let file = std::fs::File::open(path.as_ref()).map_err(|e| {
         anyhow::anyhow!("usage ledger: cannot open {}: {e}", path.as_ref().display())
     })?;
-    let reader = std::io::BufReader::new(file);
+    let mut reader = std::io::BufReader::new(file);
+    let cap = max_record_bytes.map_or(u64::MAX, |bytes| bytes as u64);
 
     let mut expected_seq = 0u64;
     let mut running_head = GENESIS_HASH.to_string();
     let mut count = 0u64;
+    let mut buf: Vec<u8> = Vec::new();
 
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
+    loop {
+        buf.clear();
+        // `take` in front of `read_until` is what makes the bound real.
+        // `read_until` on its own grows its buffer to the next newline
+        // however far away that is, so a file with no newline in it is
+        // read whole before anyone gets to check a length.
+        let read = (&mut reader)
+            .take(cap.saturating_add(1))
+            .read_until(b'\n', &mut buf)?;
+        if read == 0 {
+            break;
+        }
+        if read as u64 > cap {
+            let bound = max_record_bytes.unwrap_or(usize::MAX);
+            return Ok(LedgerVerifyResult::broken(
+                expected_seq,
+                count,
+                format!(
+                    "record at seq {expected_seq} is longer than this reader's {bound}-byte \
+                     record bound; verify the file with the CLI, which reads it unbounded"
+                ),
+            ));
+        }
+        let line = std::str::from_utf8(&buf).map_err(|e| {
+            anyhow::anyhow!("usage ledger: record at seq {expected_seq} is not UTF-8: {e}")
+        })?;
+        let line = line.trim();
+        if line.is_empty() {
             continue;
         }
-        let entry: LedgerEntry<P> = match serde_json::from_str(&line) {
+        let entry: LedgerEntry<P> = match serde_json::from_str(line) {
             Ok(e) => e,
             Err(e) => {
                 return Ok(LedgerVerifyResult::broken(
@@ -717,6 +773,12 @@ pub fn verify_ledger<P: LedgerPayload>(
             return Ok(LedgerVerifyResult::broken(entry.seq, count, reason));
         }
 
+        // Only now, past every check above: what a visitor is handed has
+        // been proved unmodified since it was written, which is the whole
+        // reason a caller reads records through this function rather than
+        // parsing the file itself.
+        visit(&entry);
+
         running_head = entry.entry_hash;
         expected_seq += 1;
         count += 1;
@@ -821,6 +883,117 @@ mod tests {
         let res = verify_ledger::<TestPayload>(&path, None).unwrap();
         assert!(!res.ok, "tampered chain must fail");
         assert_eq!(res.broken_seq, Some(1));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- WOR-2579: the visiting walk a bounded reader uses ---
+
+    /// The visitor is handed entries only after they pass every check,
+    /// and stops being handed them at the first break. A viewer that
+    /// rendered a record past the break would be rendering a record no
+    /// walk had proved.
+    #[test]
+    fn a_visiting_walk_stops_handing_over_entries_at_the_break() {
+        let path = temp_path("visit-break");
+        let _ = std::fs::remove_file(&path);
+        {
+            let ledger = UsageLedger::<TestPayload>::open(&path, None).unwrap();
+            for i in 0..4 {
+                ledger.append_checked(&event(None, i as f64)).unwrap();
+            }
+        }
+        let content = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+        lines[2] = lines[2].replace("\"cost_usd\":2.0", "\"cost_usd\":999.0");
+        assert!(lines[2].contains("999.0"), "edit landed");
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let mut seen: Vec<u64> = Vec::new();
+        let res = verify_ledger_visiting::<TestPayload>(&path, None, None, &mut |entry| {
+            seen.push(entry.seq);
+        })
+        .unwrap();
+
+        assert!(!res.ok, "a tampered chain must fail: {res:?}");
+        assert_eq!(res.broken_seq, Some(2));
+        assert_eq!(seen, vec![0, 1], "only the verified prefix is visited");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A record longer than the caller's bound stops the walk and is
+    /// reported as a verification failure rather than skipped, and the
+    /// visitor never sees it. Unbounded, the same file reads clean,
+    /// which is what `sbproxy audit verify` does with it.
+    #[test]
+    fn a_record_over_the_readers_bound_fails_the_walk_rather_than_being_skipped() {
+        let path = temp_path("visit-bounded");
+        let _ = std::fs::remove_file(&path);
+        {
+            let ledger = UsageLedger::<TestPayload>::open(&path, None).unwrap();
+            ledger.append_checked(&event(Some("small"), 1.0)).unwrap();
+            ledger
+                .append_checked(&event(Some(&"x".repeat(4096)), 2.0))
+                .unwrap();
+        }
+
+        let mut seen: Vec<u64> = Vec::new();
+        let bounded = verify_ledger_visiting::<TestPayload>(&path, None, Some(512), &mut |entry| {
+            seen.push(entry.seq);
+        })
+        .unwrap();
+
+        assert!(
+            !bounded.ok,
+            "a record the reader cannot see is not a verified one: {bounded:?}"
+        );
+        assert_eq!(bounded.broken_seq, Some(1));
+        assert!(
+            bounded
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("512-byte record bound"),
+            "the verdict names the bound it hit: {bounded:?}"
+        );
+        assert_eq!(seen, vec![0], "the oversized record is never visited");
+
+        let unbounded = verify_ledger::<TestPayload>(&path, None).unwrap();
+        assert!(
+            unbounded.ok,
+            "unbounded, the same file verifies: {unbounded:?}"
+        );
+        assert_eq!(unbounded.entries, 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A file with no newline anywhere in it is bounded too. The bound
+    /// has to sit in front of the line read rather than behind it:
+    /// measuring a record after reading it to the next newline means a
+    /// file with no newline is read whole before anyone checks a length.
+    #[test]
+    fn a_file_with_no_newline_is_still_bounded() {
+        let path = temp_path("visit-unterminated");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "z".repeat(64 * 1024)).unwrap();
+
+        let mut seen: Vec<u64> = Vec::new();
+        let bounded = verify_ledger_visiting::<TestPayload>(&path, None, Some(256), &mut |e| {
+            seen.push(e.seq);
+        })
+        .unwrap();
+
+        assert!(!bounded.ok, "{bounded:?}");
+        assert_eq!(bounded.broken_seq, Some(0));
+        assert!(
+            bounded
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("256-byte record bound"),
+            "the bound has to be what stopped it, not the JSON parse that \
+             would also fail on these bytes: {bounded:?}"
+        );
+        assert!(seen.is_empty(), "nothing was verified, so nothing is shown");
         let _ = std::fs::remove_file(&path);
     }
 

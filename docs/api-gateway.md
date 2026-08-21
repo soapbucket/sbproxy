@@ -1,6 +1,6 @@
 # API gateway guide
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-20*
 
 SBproxy is a reverse proxy first. Before it routes to an AI provider or federates an MCP server, it does the job Nginx, Envoy, or Kong do: match a hostname, authenticate the caller, apply rate limits and a WAF, load-balance across upstreams, and proxy the request. This guide is the entry point for that traditional pillar. If you are putting SBproxy in front of an existing HTTP API, or evaluating it as a replacement for a reverse proxy you already run, start here.
 
@@ -49,6 +49,49 @@ Zero-downtime reload validates and compiles a candidate configuration, swaps it 
 Load distribution across upstreams supports 8 algorithms, including round-robin, least connections, and ketama-style consistent hashing (`ring_hash`), with active health checks, a circuit breaker, and outlier detection independently removing failing targets from the pool. Custom upstream-selection logic beyond the built-in algorithms is an extension point; see [routing-strategies.md](routing-strategies.md). [routing.md](routing.md) is the full reference for hostname matching, forward rules, load balancing, deployment patterns, and fallback origins; see [performance.md](performance.md) for tuning and [architecture.md](architecture.md#3-request-pipeline) for the pipeline internals.
 
 **Examples:** [basic-proxy](../examples/basic-proxy/), [forward-rules](../examples/forward-rules/), [host-override](../examples/host-override/), [load-balancer](../examples/load-balancer/), [active-health-checks](../examples/active-health-checks/), [circuit-breaker](../examples/circuit-breaker/), [load-balancer-deployment](../examples/load-balancer-deployment/), [grpc-h2c](../examples/grpc-h2c/), [error-pages](../examples/error-pages/), [headers-and-cors](../examples/headers-and-cors/), [compression](../examples/compression/)
+
+## Deprecating endpoints
+
+Version routing (above) creates the problem this block solves: once `/v2/` exists, `/v1/` has to tell its callers to leave, and the gateway is the right place to say it because the upstream never has to change. A `deprecation:` block on an origin or a forward rule stamps the standard announcement headers on matching responses: `Deprecation` (RFC 9745), `Sunset` (RFC 8594), and `Link` relations for the successor version and the migration docs. Marking `/v1/*` deprecated while `/v2/*` stays clean is one block on the `/v1/` rule:
+
+```yaml
+forward_rules:
+  - rules:
+      - path: { prefix: /v1/ }
+    deprecation:
+      deprecated: 2026-09-01
+      sunset: 2026-12-31T23:59:59Z
+      successor: https://api.example.com/v2/
+      after_sunset: gone      # 410 after the sunset instant; default is serve
+    origin:
+      id: v1-legacy
+      action: { type: proxy, url: https://legacy.internal }
+```
+
+What a request sees, over the lifecycle:
+
+```mermaid
+flowchart TD
+    REQ["Request settles on a route\n(forward rule match, else origin)"] --> DEP{"deprecation: block?\n(rule wins over origin,\nelse a spec-deprecated\nopenapi_validation match)"}
+    DEP -->|no| PLAIN["Response unchanged"]
+    DEP -->|yes| CNT["sbproxy_deprecated_requests_total\n{origin, route, past_sunset, outcome}"]
+    CNT --> SUN{"Past the sunset\ninstant?"}
+    SUN -->|"no (or no sunset:)"| HDR["Response + Deprecation,\nSunset, Link headers"]
+    SUN -->|"yes, after_sunset: serve"| HDR2["Response + headers,\npast_sunset=true in the counter"]
+    SUN -->|"yes, after_sunset: gone"| GONE["410 Gone, JSON body naming\nthe successor, headers attached,\nupstream never contacted"]
+```
+
+Three details worth knowing. A bare `deprecated: true` emits no `Deprecation` header, because RFC 9745 requires a date value (the draft-era literal `true` did not survive into the RFC); config load warns and asks for a date. Config load also refuses a `sunset` earlier than the `deprecated` instant, which RFC 9745 forbids. And the announcement is kept consistent across surfaces: the emitted OpenAPI document marks covered operations `deprecated: true` with `x-sbproxy-sunset` / `x-sbproxy-successor` extensions, so the spec at `/.well-known/openapi.json` and the wire headers cannot disagree ([openapi-emission.md](openapi-emission.md)). The reverse direction works too: if your uploaded spec already marks operations `deprecated: true`, the `deprecation_headers` sub-block on the `openapi_validation` policy emits the headers for exactly those operations ([configuration.md](configuration.md#openapi_validation)).
+
+The `sbproxy_deprecated_requests_total` counter is the migration tracker: `route` names which announcement matched (the forward rule's id or index, the OpenAPI path template, or empty for a whole-origin block), `past_sunset` separates the stragglers still calling after the retirement date, and `outcome` separates the ones still being served from the ones already refused with 410. `origin` is the request `Host`, the same value `sbproxy_requests_total` carries, so `sum by (origin) (rate(sbproxy_deprecated_requests_total[5m])) / sum by (origin) (rate(sbproxy_requests_total[5m]))` joins and gives you the share of traffic still on a deprecated route.
+
+The `410 Gone` refusal is enforcement, so it reaches the evidence channels too: a `policy_violation` audit record with `event_type: api_deprecation`, carrying the tenant and the accountable key id, on the `security_audit` target, the admin console's audit ring, the hash-chained audit file, and the `events:` egress as a `policy_denied` event. That is how you answer "who did we cut off, and when", which the counter alone cannot.
+
+Unretired old versions are also the classic improper-inventory finding; see [api-security.md](api-security.md).
+
+Field-by-field reference: [configuration.md](configuration.md#api-deprecation-rfc-9745--rfc-8594).
+
+**Examples:** [api-deprecation](../examples/api-deprecation/)
 
 ## Protocols: HTTP/2, WebSocket, gRPC, and GraphQL
 

@@ -3449,6 +3449,38 @@ fn route_origin_label(ctx: &crate::context::RequestContext) -> &str {
         .map_or("", |origin| origin.origin_id.as_str())
 }
 
+/// Project a cascade's tiers into the admin routing-decision ring's
+/// candidate shape (WOR-2575).
+fn cascade_candidates(
+    cascade: &sbproxy_ai::routing::CascadeConfig,
+) -> Vec<crate::admin::RoutingDecisionCandidate> {
+    cascade
+        .tiers
+        .iter()
+        .map(|tier| crate::admin::RoutingDecisionCandidate {
+            provider: tier.provider_id.clone(),
+            model: Some(tier.model.clone()),
+        })
+        .collect()
+}
+
+/// Project an eligible provider index order into the admin routing-
+/// decision ring's candidate shape (WOR-2575). Strategy orderings serve
+/// the requested model, so `model` stays empty.
+fn provider_order_candidates(
+    providers: &[sbproxy_ai::ProviderConfig],
+    order: &[usize],
+) -> Vec<crate::admin::RoutingDecisionCandidate> {
+    order
+        .iter()
+        .filter_map(|&index| providers.get(index))
+        .map(|provider| crate::admin::RoutingDecisionCandidate {
+            provider: provider.name.to_string(),
+            model: None,
+        })
+        .collect()
+}
+
 /// Map the internal failure classification onto the public one.
 ///
 /// The two are deliberately separate types. `sbproxy-ai` is internal and
@@ -4354,6 +4386,10 @@ pub(super) async fn handle_ai_proxy(
         let provider = &resolved_provider;
         ctx.admin_load_balancer_strategy = Some(router.strategy_name().to_string());
         ctx.admin_load_balancer_target = Some(provider.name.to_string());
+        // WOR-2575: the candidates this selection weighed, for the
+        // admin routing-decisions ring.
+        ctx.ai_route_candidates =
+            provider_order_candidates(&config.providers, &provider_candidates);
 
         let reservation_id = format!("{}:quota-pool:method:0", ctx.request_id);
         let Some(quota_attempt) = reserve_quota_pool_attempt_or_respond(
@@ -5034,6 +5070,9 @@ pub(super) async fn handle_ai_proxy(
         ctx.admin_load_balancer_target = provider_order
             .first()
             .map(|&index| config.providers[index].name.to_string());
+        // WOR-2575: the dispatch order this loop will traverse, for the
+        // admin routing-decisions ring.
+        ctx.ai_route_candidates = provider_order_candidates(&config.providers, &provider_order);
 
         let mut selected = None;
         let mut last_error = None;
@@ -7964,6 +8003,24 @@ pub(super) async fn handle_ai_proxy(
     } else {
         router.strategy_name().to_string()
     });
+    // WOR-2575: snapshot the candidate set this dispatch will consider,
+    // in the order it will consider them, for the admin routing-decisions
+    // ring. A plan's tier list when the plan dispatches; the built-in
+    // cascade's tier list when that path will run (mirroring the cascade
+    // executor's own gate below); the eligible provider order otherwise.
+    ctx.ai_route_candidates = if routing_plan_dispatches {
+        routing_policy_cascade
+            .as_ref()
+            .map(cascade_candidates)
+            .unwrap_or_default()
+    } else if let Some(cascade_cfg) = router
+        .cascade_config()
+        .filter(|_| !is_stream && !disallow_training && !has_managed_local)
+    {
+        cascade_candidates(cascade_cfg)
+    } else {
+        provider_order_candidates(&config.providers, &provider_order)
+    };
 
     // --- Cascade routing ---
     //
