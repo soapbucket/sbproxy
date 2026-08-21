@@ -338,7 +338,10 @@ impl SegmentRecorder {
         state.folded.insert(Arc::clone(&folded_id));
         state.fold_order.push_back(folded_id);
         if state.fold_order.len() > CLAIM_FOLD_WINDOW {
-            if let Some(evicted) = state.fold_order.pop_front() {
+            // Popped into a local first, so the queue's borrow is over before
+            // the set's begins.
+            let evicted = state.fold_order.pop_front();
+            if let Some(evicted) = evicted {
                 state.folded.remove(&evicted);
             }
         }

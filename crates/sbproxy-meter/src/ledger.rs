@@ -482,7 +482,8 @@ impl<P: LedgerPayload> UsageLedger<P> {
         // edits it by hand.
         let mut line = serde_json::to_string(&entry)?;
         line.push('\n');
-        if let Err(error) = s.file.write_all(line.as_bytes()) {
+        let written = s.file.write_all(line.as_bytes());
+        if let Err(error) = written {
             // An error out of `write_all` can still have moved bytes, so the
             // file may now end mid-entry. Nothing in this process may append
             // after that.
@@ -1459,7 +1460,6 @@ mod tests {
     /// lowers to one `write_all` for the payload and a second for the
     /// newline, and the bytes on disk are identical either way. The call
     /// count is the only place the difference shows.
-    #[derive(Clone)]
     struct RecordingSink(std::sync::Arc<parking_lot::Mutex<SinkLog>>);
 
     impl Write for RecordingSink {

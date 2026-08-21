@@ -81,7 +81,7 @@ use sbproxy_billing::sqlite::{SqliteSettlementStore, SCHEMA_VERSION};
 use sbproxy_billing::store::{BillingClock, ReconciliationOutcome, SharedSettlementStore};
 use sbproxy_billing::types::{AttemptOperation, SettlementRail};
 use sbproxy_billing::worker::{
-    SettlementWorker, SettlementWorkerHandle, WorkerConfig, WorkerStatus,
+    SettlementWorker, SettlementWorkerHandle, WorkerConfig, WorkerStageFailures, WorkerStatus,
 };
 use sbproxy_config::payments::{PaymentsConfig, PaymentsConfigError};
 use sbproxy_observe::metrics::{
@@ -1886,6 +1886,38 @@ mod tests {
             (recovery_count("expire_challenge", "terminal") - clean_failures_before).abs()
                 < f64::EPSILON,
             "an aged-out hold must not land in the clean-failure series",
+        );
+    }
+
+    #[test]
+    fn a_sweep_that_could_not_run_is_counted_apart_from_the_rows_it_moves() {
+        // The observability half of making the worker's stages independent.
+        // A sweep that returns a store error no longer takes the rest of the
+        // tick down with it, so the only way an operator sees it is a series
+        // that moves: without this, a reconciliation queue that stopped
+        // draining looks exactly like one with nothing to drain.
+        let failures_before = recovery_count("reconcile", "failed");
+        let rows_before = recovery_count("reconcile", "succeeded");
+        let observed: ObservedStatus = Arc::new(Mutex::new(WorkerStatus::default()));
+
+        record_worker_delta(
+            &observed,
+            WorkerStatus {
+                stage_failures: WorkerStageFailures {
+                    reconciliation: 1,
+                    ..WorkerStageFailures::default()
+                },
+                ..WorkerStatus::default()
+            },
+        );
+
+        assert!(
+            (recovery_count("reconcile", "failed") - failures_before - 1.0).abs() < f64::EPSILON,
+            "a sweep that could not run is one observation on its own outcome",
+        );
+        assert!(
+            (recovery_count("reconcile", "succeeded") - rows_before).abs() < f64::EPSILON,
+            "a sweep that moved nothing must not land in the series counting rows it moved",
         );
     }
 
