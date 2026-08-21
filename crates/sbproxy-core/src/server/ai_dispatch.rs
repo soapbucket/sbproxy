@@ -21190,10 +21190,17 @@ fn ai_management_response(
 /// `/v1/models` does, from the same
 /// [`sbproxy_ai::api_routes::surface_capability_names`]. Three places
 /// that publish per-model facts and derive them three ways is how one of
-/// them goes stale; deriving all three from the matrix the dispatch path
-/// enforces is what keeps a listing from advertising a 501. A group is
-/// the union across its deployments, matching the 501 gate, which admits
-/// a surface when any eligible provider handles it.
+/// them goes stale; one derivation is what keeps a listing from
+/// advertising a surface the request path refuses.
+///
+/// A `/model_group/info` group is the union across its deployments,
+/// matching the 501 gate, which admits a surface when any eligible
+/// provider handles it. Each deployment's array is already a subset of
+/// that gate, so the union is too.
+/// `model_group_info_unions_capabilities_across_deployments` pins the
+/// union against last-wins with two entries whose arrays are disjoint;
+/// a fixture of two openai deployments cannot, because both operands
+/// are equal.
 fn ai_management_response_with_policy(
     path: &str,
     config: &sbproxy_ai::handler::AiHandlerConfig,
@@ -21782,6 +21789,50 @@ mod model_routing_tests {
                 // WOR-2647: union across the group's deployments, which
                 // is one anthropic entry here.
                 "capabilities": ["chat_completions", "messages", "responses", "streaming"]
+            }])
+        );
+    }
+
+    /// WOR-2647: a group's array is the union across its deployments,
+    /// not whichever one the loop visited last.
+    ///
+    /// The two entries are chosen to be disjoint so the union is
+    /// neither of them: `voyage` is embeddings-only (`supports_chat:
+    /// false`, so no chat, messages, responses or streaming) and
+    /// `anthropic` serves the chat surfaces and no embeddings.
+    /// Replacing the `extend` with an assignment fails here; a
+    /// two-openai fixture would not, because both operands are equal.
+    #[test]
+    fn model_group_info_unions_capabilities_across_deployments() {
+        let cfg: sbproxy_ai::handler::AiHandlerConfig = serde_json::from_value(serde_json::json!({
+            "providers": [
+                {"name": "embedder", "api_key": "k", "provider_type": "voyage", "models": ["shared"]},
+                {"name": "chat", "api_key": "k", "provider_type": "anthropic", "models": ["shared"]}
+            ]
+        }))
+        .expect("AiHandlerConfig fixture");
+
+        // Each deployment on its own, so the union below is visibly
+        // wider than either operand rather than asserted in a vacuum.
+        assert_eq!(
+            sbproxy_ai::api_routes::surface_capability_names(&cfg.providers[0]),
+            ["embeddings"]
+        );
+        assert_eq!(
+            sbproxy_ai::api_routes::surface_capability_names(&cfg.providers[1]),
+            ["chat_completions", "messages", "responses", "streaming"]
+        );
+
+        let resp = super::ai_management_response("/model_group/info", &cfg).unwrap();
+        assert_eq!(
+            resp["data"],
+            serde_json::json!([{
+                "model_group": "shared",
+                "num_deployments": 2,
+                "providers": ["embedder", "chat"],
+                "capabilities": [
+                    "chat_completions", "embeddings", "messages", "responses", "streaming"
+                ]
             }])
         );
     }

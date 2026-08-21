@@ -66,14 +66,31 @@ struct LogicalModelAggregate {
 /// replica counts for managed deployments) and a `capabilities` array.
 ///
 /// The capability array is
-/// [`sbproxy_ai::api_routes::surface_capability_names`], which reads the
-/// same per-provider surface matrix the dispatch path consults before it
-/// answers 501. A caller reads this listing and then sends the request
-/// it says is supported, so anything named here has to be something the
-/// gateway will serve. It used to come from the provider catalog's
-/// `supports_chat` / `supports_embeddings` / `supports_streaming`
-/// booleans, which disagreed with the matrix on 43 of the 72 shipped
-/// catalog entries in both directions (WOR-2647).
+/// [`sbproxy_ai::api_routes::surface_capability_names`], which
+/// intersects the per-provider surface matrix the dispatch path
+/// consults before it answers 501 with the provider catalog's
+/// per-vendor claims. A caller reads this listing and then sends the
+/// request it says is supported, so anything named here has to be
+/// something the gateway will serve and something the vendor is
+/// recorded as exposing. The array used to come from the catalog
+/// booleans alone, which disagreed with the matrix on 43 of the 72
+/// shipped entries in both directions (WOR-2647).
+///
+/// ## The array is narrower than the 501 gate, in two ways
+///
+/// It is a union across the entries that declare *this* model, while
+/// the 501 gate scans every allowed provider on the origin and has no
+/// model parameter. An origin serving `gpt-4o` on an openai entry and
+/// `claude-haiku` on an anthropic one lists no `embeddings` for
+/// `claude-haiku`, and `POST /v1/embeddings` naming `claude-haiku` is
+/// still admitted by the gate, because the openai entry satisfies it.
+///
+/// It is also narrower per provider, because the matrix answers on the
+/// wire format and the catalog claims answer on the vendor.
+///
+/// Both differences run the same way: the listing is a subset of the
+/// gate, never a superset. Anything named is served; something served
+/// may go unnamed. Absence is not a refusal.
 ///
 /// The names are surfaces rather than upstream model features: the array
 /// says the gateway will forward `POST /v1/embeddings` for this model,
@@ -97,9 +114,9 @@ pub fn logical_model_listing(
                     .iter()
                     .any(|allowed| allowed == provider.name.as_str()))
     }) {
-        // WOR-2647: the capability names this entry may advertise come
-        // from the surface matrix the dispatch path enforces, not from
-        // the provider catalog's `supports_*` booleans. Resolved once
+        // WOR-2647: the capability names this entry may advertise are
+        // the surface matrix the dispatch path enforces, intersected
+        // with the provider catalog's per-vendor claims. Resolved once
         // per provider because it is a property of the entry, not of the
         // individual model names it declares.
         let capabilities = sbproxy_ai::api_routes::surface_capability_names(provider);
@@ -143,10 +160,14 @@ pub fn logical_model_listing(
                 aggregate.ready_replicas = aggregate.ready_replicas.saturating_add(1);
                 aggregate.desired_replicas = aggregate.desired_replicas.saturating_add(1);
             }
-            // A logical model can be served by several entries. The
-            // 501 gate admits a surface when any eligible provider
-            // handles it, so the aggregate unions rather than
-            // intersects, and stays no wider than that gate.
+            // A logical model can be served by several entries, and a
+            // request naming it can land on any of them. Union rather
+            // than intersect, matching the 501 gate, which admits a
+            // surface when any eligible provider handles it. Each
+            // operand is already a subset of that gate, so their union
+            // is too. `managed_model_group_capabilities_are_the_union`
+            // in `tests/managed_replica_dispatch.rs` is what stops this
+            // silently becoming last-wins.
             aggregate.capabilities.extend(capabilities.iter().copied());
         }
     }

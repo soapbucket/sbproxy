@@ -38,7 +38,12 @@ curl -s -H 'Host: ai.local' http://127.0.0.1:8080/model_group/info | jq
 #              "capabilities":["audio_speech","audio_transcription","chat_completions",
 #                              "embeddings","image_edits","image_generation",
 #                              "image_variations","messages","moderations","realtime",
-#                              "reranking","responses","streaming"]}]}
+#                              "responses","streaming"]}]}
+#
+# `capabilities` is the union across the group's deployments. Both are
+# `provider_type: openai` here, so the union is one deployment's array;
+# a group mixing an OpenAI deployment with an embeddings-only provider
+# would list the surfaces of both.
 
 # Flat list of every deployment, each with the same capabilities array.
 curl -s -H 'Host: ai.local' http://127.0.0.1:8080/model/info | jq

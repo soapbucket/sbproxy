@@ -98,7 +98,7 @@ The `cloudflare`, `vertex`, `runpod`, `azure_foundry`, and `snowflake` defaults 
 
 [^vertex-oauth]: Vertex AI requires a short-lived OAuth2 access token rather than a static API key. Generate one with `gcloud auth print-access-token` (or your service account flow) and rotate it before expiry. SBproxy forwards the configured `api_key` verbatim as the bearer token.
 
-[^embed-only]: Voyage and Jina expose embeddings (and rerank) endpoints only. Their catalog entries record that as `supports_chat: false`, which is a note about the vendor rather than a gate: nothing in the gateway reads it, so a chat-completions request against one of them is forwarded and 404s at the upstream. Keep chat traffic away from them by leaving chat models out of their `models` list, or with `allowed_models`.
+[^embed-only]: Voyage and Jina expose embeddings (and rerank) endpoints only. Their catalog entries record that as `supports_chat: false`, which keeps `chat_completions` off their model listings: `GET /v1/models` shows `["embeddings"]` and nothing else. It is not a gate, though. A chat-completions request against one of them is still forwarded and 404s at the upstream, so keep chat traffic away by leaving chat models out of their `models` list, or with `allowed_models`.
 
 `format` is the wire protocol the upstream expects. OpenAI-compatible upstreams pass through unchanged. Anthropic, Google Gemini, and AWS Bedrock are translated bidirectionally for chat-completions requests: clients send OpenAI-shaped bodies, SBproxy rewrites the body and path on the way out, and SBproxy rewrites the response back to OpenAI shape. For streaming, the relay parses native Anthropic, Gemini, and Bedrock stream frames into the internal hub stream and re-emits OpenAI Chat, Anthropic Messages, or OpenAI Responses shape based on the inbound route. Gemini embeddings at `/v1/embeddings` translate to and from Gemini embedding calls. Oracle OCI, Watsonx, SageMaker, and other `Custom` formats remain native pass-through, so clients must send the provider's native body shape or route through OpenRouter/custom translation.
 
@@ -248,20 +248,25 @@ providers:
     auth_header: Authorization     # header carrying the key (required)
     auth_prefix: "Bearer "         # prefix prepended to the key ("" for raw keys, defaults to "")
     format: openai                 # wire format: openai | anthropic | google | bedrock | custom (required)
-    supports_streaming: true       # catalog note only, see below
-    supports_embeddings: false     # catalog note only, see below
-    supports_chat: true            # catalog note only, see below
+    supports_streaming: true       # advertised, not enforced, see below
+    supports_embeddings: false     # advertised, not enforced, see below
+    supports_chat: true            # advertised, not enforced, see below
 ```
 
 A malformed override file is rejected and the gateway falls back to the embedded catalog rather than booting with no providers.
 
-The three `supports_*` keys are notes about the vendor's own API. Nothing in
+The three `supports_*` keys are claims about the vendor's own API. Nothing in
 the request path reads them, so changing one changes nothing about what the
-gateway serves. That is decided by `format` plus the per-provider surface matrix
-documented under [Supported endpoints](ai-gateway.md#supported-endpoints), and
-the same matrix is what `GET /v1/models` publishes as each model's
-`capabilities` array. A custom entry with `format: openai` gets the full OpenAI
-surface row whatever its `supports_embeddings` value says.
+gateway forwards. That is decided by `format` plus the per-provider surface
+matrix documented under
+[Supported endpoints](ai-gateway.md#supported-endpoints), and a custom entry
+with `format: openai` gets the full OpenAI surface row whatever its
+`supports_embeddings` value says.
+
+What they do decide is what a model listing advertises. `GET /v1/models`
+publishes the intersection of the two, so setting a key to `false` takes the
+surface off the listing and leaves the forwarding alone, and setting it to
+`true` adds the surface only where the matrix already agrees.
 
 ### 3. Add it to the in-tree registry
 

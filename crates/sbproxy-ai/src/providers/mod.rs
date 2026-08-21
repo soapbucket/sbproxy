@@ -65,31 +65,41 @@ pub struct ProviderInfo {
     pub format: ProviderFormat,
     /// Whether the provider supports Server-Sent Events streaming.
     ///
-    /// A catalog hint about the vendor's API, not a gateway decision;
-    /// see the note on [`Self::supports_chat`].
+    /// A per-vendor claim about the vendor's API, not a gateway
+    /// decision; see the note on [`Self::supports_chat`].
     pub supports_streaming: bool,
     /// Whether the provider exposes an embeddings endpoint.
     ///
-    /// A catalog hint about the vendor's API, not a gateway decision;
-    /// see the note on [`Self::supports_chat`].
+    /// A per-vendor claim about the vendor's API, not a gateway
+    /// decision; see the note on [`Self::supports_chat`].
     pub supports_embeddings: bool,
     /// Whether the provider exposes a chat-completions endpoint.
     /// Defaults to `true`; set to `false` for embeddings-only or
     /// reranker-only providers (e.g. Voyage, Jina).
     ///
-    /// This and its two neighbours are coarse catalog claims about the
-    /// vendor's own API. None of them decides anything: whether this
-    /// gateway serves a surface for a provider, and what `GET /v1/models`
-    /// publishes as a model's `capabilities`, both come from
-    /// [`crate::api_routes::provider_supports_surface`] and
-    /// [`crate::api_routes::surface_capability_names`] instead.
+    /// This and its two neighbours are claims about the vendor's own
+    /// API. They decide nothing on the request path: whether the
+    /// gateway forwards a surface or answers 501 comes from
+    /// [`crate::api_routes::provider_supports_surface`], which keys on
+    /// the wire format.
     ///
-    /// They used to feed the model listing while the matrix answered the
-    /// request, which let the two disagree on 43 of the 72 shipped
-    /// entries in both directions: a bedrock listing advertised the
-    /// `embeddings` surface the request path answers with 501, and a
-    /// vertex listing hid one it serves (WOR-2647). Reconcile the data
-    /// before wiring either back into a decision.
+    /// What they decide is what a model listing may advertise.
+    /// [`crate::api_routes::surface_capability_names`] publishes the
+    /// intersection of the two, so the array is never wider than the
+    /// gate (nothing named can be refused) and never claims a surface
+    /// on a vendor's behalf that the catalog has no record of. Setting
+    /// one to `false` narrows a listing and changes nothing about what
+    /// is forwarded.
+    ///
+    /// Before WOR-2647 the listing read these alone while the matrix
+    /// answered the request, and the two disagreed on 43 of the 72
+    /// shipped entries in both directions: a bedrock listing advertised
+    /// the `embeddings` surface the request path answers with 501, and
+    /// a vertex listing hid one it serves. Bedrock keeps
+    /// `supports_embeddings: true` because Titan does embed, through a
+    /// shape the gateway does not forward, and the intersection is what
+    /// keeps it off the listing; vertex's entry was simply wrong and
+    /// was corrected.
     #[serde(default = "default_true")]
     pub supports_chat: bool,
     /// Declared data-handling posture of the vendor's API, per its

@@ -441,7 +441,8 @@ fn single_provider_config(provider_type: &str) -> sbproxy_ai::handler::AiHandler
     .expect("AI config")
 }
 
-/// WOR-2647: the listing advertises exactly what the enforcer serves.
+/// WOR-2647: the listing never advertises a surface the enforcer
+/// refuses, for any entry in the shipped catalog.
 ///
 /// `GET /v1/models` publishes a per-model `capabilities` array, and the
 /// request path answers a surface it does not handle with 501. The two
@@ -452,15 +453,21 @@ fn single_provider_config(provider_type: &str) -> sbproxy_ai::handler::AiHandler
 /// catalog entries, in both directions. `bedrock` declares
 /// `supports_embeddings: true`, so a bedrock-only origin advertised
 /// `embeddings` on its own listing and then answered `POST
-/// /v1/embeddings` with 501; `vertex` declares `false` while the
-/// enforcer serves the surface, so a caller was told not to try
-/// something that works.
+/// /v1/embeddings` with 501.
 ///
-/// This sweeps the whole catalog rather than the two entries that were
-/// noticed, because a per-entry assertion is narrower than the
+/// This is one-directional on purpose. `provider_supports_surface` keys
+/// on the wire format, so it says yes to every surface for the 66
+/// entries with `format: openai`; asserting equality here would demand
+/// that a DeepSeek listing advertise `audio_speech`. The listing is the
+/// narrower of the two, and
+/// `an_openai_format_deployment_does_not_advertise_the_whole_format`
+/// below pins that it really is narrower rather than trivially equal.
+///
+/// The sweep covers the whole catalog rather than the two entries that
+/// were noticed, because a per-entry assertion is narrower than the
 /// enforcer it is meant to track.
 #[test]
-fn model_listing_advertises_only_surfaces_the_enforcer_serves() {
+fn model_listing_never_advertises_a_surface_the_enforcer_refuses() {
     use sbproxy_ai::api_routes::provider_supports_surface;
     use sbproxy_ai::handler::AiSurface;
 
@@ -469,24 +476,134 @@ fn model_listing_advertises_only_surfaces_the_enforcer_serves() {
         let config = single_provider_config(&provider_type);
         let listing = logical_model_listing(&config, &[], &[], &[], &BTreeMap::new());
         let advertised = listed_capabilities(&listing);
+        assert!(
+            !advertised.is_empty(),
+            "{provider_type}: every catalog entry serves something"
+        );
 
-        for (surface, label) in [
-            (AiSurface::ChatCompletions, "chat_completions"),
-            (AiSurface::Embeddings, "embeddings"),
-            (AiSurface::Reranking, "reranking"),
-            (AiSurface::AudioSpeech, "audio_speech"),
-        ] {
-            let enforced = provider_supports_surface(&provider_type, &surface);
-            let listed = advertised.contains(label);
-            assert_eq!(
-                listed, enforced,
-                "{provider_type}: listing advertises {label}={listed}, \
-                 enforcer answers {enforced}"
+        for surface in &AiSurface::ALL {
+            if !advertised.contains(surface.label()) {
+                continue;
+            }
+            assert!(
+                provider_supports_surface(&provider_type, surface),
+                "{provider_type}: the listing advertises {} and the \
+                 request path answers 501",
+                surface.label()
             );
             checked += 1;
         }
     }
     assert!(checked >= 200, "the catalog sweep ran: {checked} checks");
+}
+
+/// The finding-3 regression, through the real listing rather than the
+/// helper: an openai-format vendor does not inherit OpenAI's surface
+/// set.
+///
+/// Deriving the array from the format-wide matrix alone gave 64 of the
+/// 72 catalog entries the same thirteen names, so a DeepSeek origin's
+/// own `/v1/models` offered `audio_speech` and `image_generation`. The
+/// gateway forwards both (the second half of the assertion), so the
+/// caller was not refused here; the request reached
+/// `api.deepseek.com/v1/audio/speech` and 404'd, on a path this listing
+/// named.
+#[test]
+fn an_openai_format_deployment_does_not_advertise_the_whole_format() {
+    use sbproxy_ai::api_routes::provider_supports_surface;
+    use sbproxy_ai::handler::AiSurface;
+
+    let listing = logical_model_listing(
+        &single_provider_config("deepseek"),
+        &[],
+        &[],
+        &[],
+        &BTreeMap::new(),
+    );
+    let advertised = listed_capabilities(&listing);
+    assert_eq!(
+        advertised,
+        ["chat_completions", "messages", "responses", "streaming"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>()
+    );
+
+    // The 501 gate stays wide. Narrowing it would refuse an
+    // openai-format aggregator that does serve the surface, so the fix
+    // is to stop advertising, not to stop forwarding.
+    assert!(provider_supports_surface(
+        "deepseek",
+        &AiSurface::AudioSpeech
+    ));
+}
+
+/// WOR-2647: a model group reports the union across its deployments,
+/// not the last one the loop happened to visit.
+///
+/// The two operands are chosen to be disjoint, so the union is neither
+/// of them and an intersection would be empty: `voyage` is an
+/// embeddings-only vendor (`supports_chat: false`) and `anthropic`
+/// serves the chat surfaces and no embeddings. Replacing the `extend`
+/// in `logical_model_listing` with an assignment fails here.
+/// `model_group_info_unions_capabilities_across_deployments` in
+/// `crates/sbproxy-core/src/server/ai_dispatch.rs` covers the second
+/// union site, the one behind `/model_group/info`.
+#[test]
+fn managed_model_group_capabilities_are_the_union() {
+    let config: sbproxy_ai::handler::AiHandlerConfig = serde_json::from_value(serde_json::json!({
+        "providers": [
+            {
+                "name": "embedder",
+                "provider_type": "voyage",
+                "api_key": "test",
+                "models": ["shared"]
+            },
+            {
+                "name": "chat",
+                "provider_type": "anthropic",
+                "api_key": "test",
+                "models": ["shared"]
+            }
+        ]
+    }))
+    .expect("AI config");
+
+    let listing = logical_model_listing(&config, &[], &[], &[], &BTreeMap::new());
+    assert_eq!(
+        listing["data"].as_array().map(|data| data.len()),
+        Some(1),
+        "both entries declare the same public name"
+    );
+    let advertised = listed_capabilities(&listing);
+
+    let voyage_only = listed_capabilities(&logical_model_listing(
+        &single_provider_config("voyage"),
+        &[],
+        &[],
+        &[],
+        &BTreeMap::new(),
+    ));
+    let anthropic_only = listed_capabilities(&logical_model_listing(
+        &single_provider_config("anthropic"),
+        &[],
+        &[],
+        &[],
+        &BTreeMap::new(),
+    ));
+    assert!(
+        voyage_only.is_disjoint(&anthropic_only),
+        "the two operands have to differ for this test to mean anything: \
+         {voyage_only:?} vs {anthropic_only:?}"
+    );
+
+    let union: BTreeSet<String> = voyage_only.union(&anthropic_only).cloned().collect();
+    assert_eq!(
+        advertised, union,
+        "the group is the union, not either deployment"
+    );
+    assert!(advertised.len() > voyage_only.len());
+    assert!(advertised.len() > anthropic_only.len());
 }
 
 /// The bedrock case named in the ticket, pinned on its own so a
