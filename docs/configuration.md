@@ -1518,7 +1518,7 @@ action:
 
 ### websocket
 
-Proxy WebSocket connections for real-time applications, chat systems, and streaming APIs. The action forwards the `Upgrade` request through the normal auth/policy/transform pipeline and then relays bytes transparently once the upstream answers `101`; it does not inspect frames after that point. See [websocket.md](websocket.md) for upgrade semantics and which of the two fields below are actually enforced today.
+Proxy WebSocket connections for real-time applications, chat systems, and streaming APIs. The action forwards the `Upgrade` request through the normal auth/policy/transform pipeline, and once the upstream answers `101` it relays bytes in both directions while parsing frame headers on the pipe: it never reads or buffers payload bytes, but it does enforce `max_message_size`, RFC 6455's 125-byte control-frame limit, and the `subprotocols` allowlist. See [websocket.md](websocket.md) for upgrade semantics and the exact enforcement points.
 
 ```yaml
 origins:

@@ -93,7 +93,45 @@ the next version cut.
   metrics section of
   [docs/key-management.md](docs/key-management.md#operational-metrics).
 
+- **A signed extension bundle can ship a `runtime: rego` transform, not
+  just a policy.** A `kind: transform` hook on a Rego bundle attaches
+  under `transforms[]` by its `type` name and evaluates once per
+  buffered response body. Its input is `input.body.body_base64` (the
+  complete body, base64), `input.body.content_type`,
+  `input.body.origin`, and `input.config`; the pinned rule must return
+  a base64 string, which becomes the replacement body, bounded by
+  `sandbox.max_output_bytes`. An undefined rule is the transform
+  declining and the body passes through untouched. The module compiles
+  once per hook at candidate load and its query is proved evaluable
+  there, so a bad rule reference refuses the bundle instead of failing
+  every request. Bounded by `sandbox.budget_ms` plus the buffer and
+  output caps; `memory_mb` and `stack_kb` do not apply to Rego and are
+  now refused on a Rego manifest rather than accepted and ignored. See
+  the Rego transform section of
+  [docs/extension-bundles.md](docs/extension-bundles.md).
+
 ### Changed, and worth checking before you upgrade
+
+- **`POST /admin/keys/{id}/rotate` returns the current `sbp_` token
+  shape, and refuses a key id it cannot mint one for.** Every shipped
+  release before this returned the legacy `sk-<id>-<secret>` shape from
+  this endpoint while `POST /admin/keys` had already moved to
+  `sbp_<id>_<secret>`. Any operator script matching `^sk-`, or splitting
+  a rotated token on `-` to recover the key id, needs updating.
+
+  The refusal is the part to check before you upgrade. A minted key id
+  is sixteen lowercase hex characters, and the strict parser on the
+  inbound path asserts exactly that. A key seeded from config under
+  `key_management.seed.keys[]` can carry any id its author wrote, and
+  rotating one produced a token nothing could parse: the endpoint
+  answered `200` with a credential that authenticated on no code path,
+  and when the grace window closed the working token died with it.
+  Rotating a non-conforming id now answers
+  `409 {"error": "key id is not in the minted format ..."}` and changes
+  nothing. If you rotated a seeded key on a build carrying the earlier
+  behavior, the token you were handed is not usable; create a
+  replacement key with `POST /admin/keys`, move callers over, and revoke
+  the seeded id.
 
 - **`transport: stdio` MCP servers now run as one supervised
   persistent child per configured server, not one process per
@@ -127,6 +165,48 @@ the next version cut.
   [docs/ai-gateway.md](docs/ai-gateway.md).
 
 ### Fixed
+
+- **A `failure_posture: closed` transform now fails a `static` or
+  `mock` response closed instead of serving it untransformed.** The
+  transform chain has reached generated bodies since the response-phase
+  work landed, but a fault there logged a warning and continued with
+  the untransformed buffer, whatever the transform's declared posture.
+  A redaction transform on a `type: static` origin therefore shipped
+  the exact string it existed to strip whenever it faulted (a budget
+  overrun, a non-string result, a body over the buffer cap). A `closed`
+  transform's fault now answers `500` with
+  `x-sbproxy-transform-error: <transform>` and never writes the
+  generated body, matching the proxied and plugin-action paths.
+  `failure_posture: open`, which is what a `transforms:` entry defaults
+  to, keeps warning and continuing.
+
+- **A WebSocket control frame can no longer disable
+  `max_message_size`.** Control frames do not count toward a message
+  total, so their declared payload length was skipped rather than
+  checked. A fourteen-byte masked pong header declaring `u64::MAX` was
+  enough: the scanner spent the declared count skipping payload bytes,
+  never parsed another frame header, and the cap stopped applying in
+  that direction for the life of the connection, with nothing logged
+  and no teardown. RFC 6455 section 5.5 is now enforced on the frames
+  it governs: a control frame over 125 payload bytes, or one arriving
+  without `FIN`, closes the tunnel.
+
+- **Every upgraded WebSocket tunnel is scanned, not only a `websocket`
+  action's.** The frame scanner was armed inside a match on
+  `Action::WebSocket`, so `/v1/realtime` (which runs under an
+  `ai_proxy` origin and hands off to transparent forwarding) and any
+  `type: proxy` or `type: load_balancer` origin fronting a WebSocket
+  backend opened a completely unscanned tunnel. Those now get the
+  scanner with the same documented 10 MB default a `websocket` action
+  gets when it configures nothing. A `101` for a non-WebSocket upgrade
+  is still left alone.
+
+- **`print()` inside a Rego bundle hook is bounded and redacted.** A
+  transform hook's input is the complete buffered response body, so
+  `print(input.body.body_base64)` copied every response into the log at
+  `info`, uncapped and unredacted. Messages now pass through the secret
+  redactor, are truncated at 512 bytes, and at most eight events are
+  emitted per evaluation with one summary line for the remainder.
 
 - **Prompts admin page "Add version" now sends the field the backend
   expects.** The form built a `content` key while

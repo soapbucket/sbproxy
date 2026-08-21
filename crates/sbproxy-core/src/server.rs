@@ -5536,6 +5536,21 @@ fn build_session_cookie(config: &sbproxy_config::SessionConfig, session_id: &str
 
 // --- Response phases for locally generated responses (WOR-2496) ---
 
+/// What the transform walk over a locally generated body produced.
+///
+/// `terminal_failure` is the `failure_posture: closed` outcome: the body
+/// the caller must serve is the substituted error, never the buffer the
+/// refused transform did not get to touch. Mirrors
+/// `PluginActionTransformOutcome`, which carries the same decision for
+/// the plugin-action path.
+pub(crate) struct GeneratedBodyTransformOutcome {
+    /// The bytes to serve.
+    pub(crate) body: Bytes,
+    /// A `closed` transform failed, so the response is a 500 and the
+    /// generated body must not be written.
+    pub(crate) terminal_failure: bool,
+}
+
 /// Apply the origin's transform chain to a locally generated response
 /// body (a `static` or `mock` action's payload) and return the
 /// transformed bytes.
@@ -5543,23 +5558,34 @@ fn build_session_cookie(config: &sbproxy_config::SessionConfig, session_id: &str
 /// Mirrors the walk the static action has always run: each transform
 /// goes through `apply_transform_with_ctx` so the per-request ctx
 /// fields (content shape, markdown projection, canonical URL, CEL
-/// header mutations) behave exactly as they do for an upstream body,
-/// and a failing transform logs a warning and continues rather than
-/// failing the response (generated bodies are operator-authored, so
-/// the closed-transform posture the upstream body filter applies has
-/// nothing untrusted to fail closed against).
+/// header mutations) behave exactly as they do for an upstream body.
+///
+/// A failing transform reaches its own `failure_posture`, exactly as it
+/// does on the proxied path and the plugin-action path. The earlier
+/// reasoning for warning and continuing here was that a generated body
+/// is operator-authored, so there is nothing untrusted to fail closed
+/// against. That does not survive a bundle transform: the untrusted
+/// party is the *transform*, and a redaction transform that faults on a
+/// `static` body ships the exact string it existed to strip. `open`
+/// keeps the warn-and-continue behavior, which is what a `transforms:`
+/// entry defaults to when neither the attachment nor the bundle says
+/// otherwise.
 fn apply_origin_transforms_to_generated_body(
     pipeline: &CompiledPipeline,
     origin_idx: Option<usize>,
     ctx: &mut RequestContext,
     body: Bytes,
     content_type: &str,
-) -> Bytes {
+) -> GeneratedBodyTransformOutcome {
+    let unchanged = |body: Bytes| GeneratedBodyTransformOutcome {
+        body,
+        terminal_failure: false,
+    };
     let Some(idx) = origin_idx else {
-        return body;
+        return unchanged(body);
     };
     if idx >= pipeline.transforms.len() || pipeline.transforms[idx].is_empty() {
-        return body;
+        return unchanged(body);
     }
     let mut buf = bytes::BytesMut::from(&body[..]);
     let ratio = resolved_token_bytes_ratio(Some(&pipeline.config.origins[idx]));
@@ -5575,14 +5601,38 @@ fn apply_origin_transforms_to_generated_body(
         if let Err(e) =
             apply_transform_with_ctx(compiled_transform, &mut buf, Some(content_type), ctx)
         {
+            let transform_name = compiled_transform.transform.transform_type();
+            // Read the resolved posture off the compiled transform, never
+            // the legacy `fail_on_error` wire boolean, the same way the
+            // proxied body filter does.
+            let posture = compiled_transform.failure_posture;
+            if posture == sbproxy_config::FailureMode::Closed {
+                warn!(
+                    hostname = %ctx.hostname,
+                    transform = transform_name,
+                    error = %e,
+                    failure_posture = posture.as_label(),
+                    "generated-response transform failed; response failed by failure_posture"
+                );
+                // Substitute before returning: the caller serves whatever
+                // is in this buffer, and serving the untransformed
+                // generated body would deliver exactly the bytes this
+                // refusal exists to withhold.
+                ctx.transform_error_attribution = Some(transform_name.to_string());
+                return GeneratedBodyTransformOutcome {
+                    body: Bytes::from_static(b"{\"error\":\"internal server error\"}"),
+                    terminal_failure: true,
+                };
+            }
             warn!(
-                transform = compiled_transform.transform.transform_type(),
+                transform = transform_name,
                 error = %e,
+                failure_posture = posture.as_label(),
                 "generated-response transform failed, continuing"
             );
         }
     }
-    buf.freeze()
+    unchanged(buf.freeze())
 }
 
 /// Apply the response-phase policy surface to a locally generated
@@ -6070,5 +6120,109 @@ mod wor_2477_panic_containment_tests {
             before + 1.0,
             "sbproxy_policy_panic_total did not rise for the panicking buffered policy"
         );
+    }
+}
+
+/// A generated (`static` / `mock`) response body goes through the same
+/// origin transform chain a proxied body does, so a transform that
+/// faults there has to reach the same `failure_posture`.
+///
+/// Retrospective review of PR #1153 found it did not: every fault was a
+/// `warn!` and the loop continued with the untransformed buffer, so a
+/// redaction transform declared `closed` shipped the exact bytes it
+/// existed to strip.
+#[cfg(test)]
+mod generated_body_failure_posture_tests {
+    use super::*;
+    use sbproxy_config::FailureMode;
+
+    /// A `static` origin serving a secret-bearing body, with one
+    /// transform whose posture the caller picks. The transform is
+    /// replaced wholesale rather than written into the YAML so the test
+    /// controls the posture and the fault independently of what any
+    /// built-in transform's config validation allows.
+    fn static_origin_pipeline(posture: FailureMode) -> crate::pipeline::CompiledPipeline {
+        const YAML: &str = r#"
+origins:
+  "status.example":
+    action:
+      type: static
+      status: 200
+      content_type: text/plain
+      body: "placeholder"
+"#;
+        let config = sbproxy_config::compile_config(YAML).expect("fixture config");
+        let mut pipeline =
+            crate::pipeline::CompiledPipeline::from_config(config).expect("fixture pipeline");
+        let inner =
+            sbproxy_modules::transform::HtmlToMarkdownTransform::from_config(serde_json::json!({}))
+                .expect("default html_to_markdown");
+        pipeline.transforms = vec![vec![sbproxy_modules::transform::CompiledTransform {
+            transform: sbproxy_modules::transform::Transform::HtmlToMarkdown(inner),
+            content_types: Vec::new(),
+            failure_posture: posture,
+            max_body_size: 1024,
+        }]];
+        pipeline
+    }
+
+    /// Invalid UTF-8 makes `html_to_markdown` fault deterministically
+    /// and synchronously. It stands in for the failure scenario's
+    /// budget-exceeded Rego scrub: what matters is that the transform
+    /// returned an error without touching the body.
+    const SECRET_BODY: &[u8] = b"\xffbuild=abcdef1 key=sk-live-9f2c0a4b";
+
+    #[test]
+    fn a_closed_transform_that_faults_on_a_generated_body_refuses_to_serve_it() {
+        let pipeline = static_origin_pipeline(FailureMode::Closed);
+        let mut ctx = RequestContext::new();
+
+        let outcome = apply_origin_transforms_to_generated_body(
+            &pipeline,
+            Some(0),
+            &mut ctx,
+            Bytes::from_static(SECRET_BODY),
+            "text/plain",
+        );
+
+        assert!(
+            outcome.terminal_failure,
+            "a closed transform's fault must fail the generated response"
+        );
+        assert!(
+            !outcome.body.windows(7).any(|window| window == b"sk-live"),
+            "the untransformed body must not reach the client: {:?}",
+            outcome.body
+        );
+        assert_eq!(
+            ctx.transform_error_attribution.as_deref(),
+            Some("html_to_markdown"),
+            "the refusal must name the transform that caused it"
+        );
+    }
+
+    #[test]
+    fn an_open_transform_that_faults_on_a_generated_body_still_continues() {
+        let pipeline = static_origin_pipeline(FailureMode::Open);
+        let mut ctx = RequestContext::new();
+
+        let outcome = apply_origin_transforms_to_generated_body(
+            &pipeline,
+            Some(0),
+            &mut ctx,
+            Bytes::from_static(SECRET_BODY),
+            "text/plain",
+        );
+
+        assert!(
+            !outcome.terminal_failure,
+            "an open transform's fault admits, exactly as it did before"
+        );
+        assert_eq!(
+            outcome.body.as_ref(),
+            SECRET_BODY,
+            "an open posture passes the untransformed body through unchanged"
+        );
+        assert!(ctx.transform_error_attribution.is_none());
     }
 }

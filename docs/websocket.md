@@ -1,5 +1,5 @@
 # websocket action
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-20*
 
 The `websocket` action proxies `ws://`/`wss://` upstreams. The inbound HTTP `Upgrade` request runs through the same origin pipeline as any other action, host routing, `authentication`, `policies`, request transforms, and once the upstream answers `101 Switching Protocols` the connection becomes a byte pipe in both directions. The gateway does not read frame payloads, but it does parse frame headers on that pipe to enforce `max_message_size`, and it holds `Sec-WebSocket-Protocol` negotiation to the configured `subprotocols` allowlist. This page covers the action's config keys, what runs before the upgrade completes, and what does and does not happen after it. For where `websocket` sits among the other protocol-specific actions, see [routing.md](routing.md#protocol-specific-routing); for the field table in the general configuration reference, see [configuration.md#websocket](configuration.md#websocket).
 
@@ -49,8 +49,9 @@ Points worth knowing before relying on it:
 
 - **The teardown is abrupt.** There is no `1009 Message Too Big` close handshake; the gateway will not forward a message it has refused, so both TCP connections are dropped. Clients see the socket die mid-message.
 - **The cap measures wire bytes.** If the client and upstream negotiate `permessage-deflate`, payload lengths on the wire are compressed sizes, and the cap applies to those.
-- **Control frames do not count.** Pings, pongs, and closes interleave freely without affecting the running message total (RFC 6455 caps them at 125 bytes on its own).
+- **Control frames do not count toward a message, and are bounded on their own.** Pings, pongs, and closes interleave freely without affecting the running message total. The gateway holds them to RFC 6455 section 5.5 itself: a control frame declaring more than 125 payload bytes, or arriving without `FIN`, closes the connection. It has to check rather than assume, because a control frame's declared length is skipped rather than accumulated, so an unchecked one would both reach the upstream and desynchronize the gateway's own scanner for the life of the tunnel.
 - **The default is enforced too.** An action that never mentions `max_message_size` gets the documented 10 MB ceiling.
+- **Every upgraded tunnel is scanned, not just this action's.** A `101` on any origin whose request asked for a WebSocket upgrade gets the frame scanner, including `/v1/realtime` under an `ai_proxy` origin and a `type: proxy` or `type: load_balancer` origin fronting a WebSocket backend. Only a `websocket` action configures the cap, so every other action's tunnel is held to the same 10 MB default. A `101` for some other protocol upgrade is left alone: those bytes are not RFC 6455 frames.
 
 ## Subprotocol negotiation
 
@@ -66,7 +67,9 @@ The gateway never adds subprotocols the client did not offer, and it does not re
 
 ## Honest limits
 
-Beyond the message-size cap and the subprotocol allowlist, post-upgrade traffic gets no per-frame inspection: no PII redaction, no payload-shape validation, no per-message rate limiting, nothing that reads or acts on frame *content*. The `max_message_size` scanner reads frame headers only. If you need content-level control over what flows after the upgrade, that has to live in the WebSocket backend itself; the gateway's contribution stops at the pre-upgrade pipeline plus the two enforcement points described above.
+Beyond the message-size cap, the control-frame checks, and the subprotocol allowlist, post-upgrade traffic gets no per-frame inspection: no PII redaction, no payload-shape validation, no per-message rate limiting, nothing that reads or acts on frame *content*. The scanner reads frame headers only. If you need content-level control over what flows after the upgrade, that has to live in the WebSocket backend itself; the gateway's contribution stops at the pre-upgrade pipeline plus the enforcement points described above.
+
+One more limit worth naming: an upgraded tunnel that is not a `websocket` action's has no config key of its own for the cap. `/v1/realtime` and a proxied upgrade are scanned, and both are held to the 10 MB default; there is nowhere to raise or lower it for them today.
 
 ## Runnable example
 

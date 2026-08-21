@@ -1353,7 +1353,26 @@ fn rotate_key(id: &str, body: Option<&str>) -> Resp {
     if rec.status == RecordStatus::Revoked {
         return terminal_key(id, rec.policy_revision);
     }
-    let minted = plane.crypto().mint_secret(id);
+    // Refuse before minting, and mint from the record's own id rather than
+    // the URL path segment.
+    //
+    // `format_token` builds `sbp_<id>_<secret>` from whatever string it is
+    // handed, while `parse_minted_token` asserts an exact 85 characters and
+    // a 16-lowercase-hex id. A config-seeded id such as `seed0001` produces
+    // a 77-character token that parses on no inbound path at all, so the
+    // `200 OK` would hand the operator a credential that authenticates
+    // nowhere while the grace window quietly runs out on the one that still
+    // worked. A 409 naming the reason is the only honest answer: there is
+    // no token shape this endpoint can mint for a non-conforming id that
+    // the current resolver would accept.
+    if !sbproxy_keystore::crypto::is_conforming_key_id(&rec.key_id) {
+        return conflict(
+            "key id is not in the minted format (16 lowercase hex characters), so a rotated \
+             token could not be parsed back by the inbound resolver; create a replacement key \
+             with POST /admin/keys and retire this one instead of rotating it",
+        );
+    }
+    let minted = plane.crypto().mint_secret(&rec.key_id);
     let now = Utc::now();
     // The current secret becomes the graced prior secret.
     rec.prev_secret_hash = Some(rec.secret_hash.clone());
@@ -2650,6 +2669,54 @@ mod tests {
             .expect("legacy record in list response");
         assert!(legacy_view["policy_digest"].is_null());
         assert!(!listed.2.contains("sensitive-stored-verifier"));
+    }
+
+    #[test]
+    fn rotating_a_config_seeded_key_id_refuses_rather_than_minting_a_dead_token() {
+        let _g = crate::key_plane::test_plane_guard();
+        let store = Arc::new(MemoryKeyStore::new());
+        install_test_plane_with_store(store.clone());
+
+        // `seed0001` is the id `examples/ai-dynamic-keys/sb.yml` used to
+        // seed and `docs/tapes/ai-dynamic-keys.tape` used to rotate, so this
+        // is the shipped demo's own key id rather than a contrived one; the
+        // example moved to a conforming id in the same change. Nothing
+        // validates the field: `lower_seed_key` takes
+        // `key_management.seed.keys[].key_id` verbatim, so any string an
+        // operator writes there still reaches this endpoint.
+        let seeded = KeyRecord::new(
+            "seed0001".to_string(),
+            "seeded-secret-hash".to_string(),
+            Utc::now(),
+        );
+        block_on_keystore(store.put_key(seeded)).unwrap();
+
+        let resp = dispatch("POST", "/admin/keys/seed0001/rotate", Some("{}")).unwrap();
+        assert_eq!(
+            resp.0, 409,
+            "a non-conforming key id must be refused, not rotated: {}",
+            resp.2
+        );
+        assert!(
+            !resp.2.contains("sbp_"),
+            "the refusal must not carry a token: {}",
+            resp.2
+        );
+
+        // The prior secret is untouched, so whatever still holds the old
+        // token keeps working. A 200 here would have opened a grace window
+        // that expires onto a token nothing can parse.
+        let after = block_on_keystore(store.get_key("seed0001"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.secret_hash, "seeded-secret-hash");
+        assert!(after.prev_secret_hash.is_none());
+
+        // The reason the refusal exists: the token this endpoint would have
+        // built for that id parses on no inbound path.
+        let would_have_minted = format!("sbp_seed0001_{}", "a".repeat(64));
+        assert!(sbproxy_keystore::crypto::parse_minted_token(&would_have_minted).is_none());
+        assert!(sbproxy_keystore::crypto::parse_token(&would_have_minted).is_none());
     }
 
     #[test]

@@ -8,8 +8,16 @@ use serde::Deserialize;
 
 use super::ForwardingHeaderControls;
 
+/// Message payload ceiling a `websocket` action gets when it does not
+/// configure `max_message_size`, and the ceiling every other upgraded
+/// tunnel gets, since no other action type configures one.
+pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
+
+/// Largest payload RFC 6455 section 5.5 permits on a control frame.
+const MAX_CONTROL_FRAME_PAYLOAD: u64 = 125;
+
 fn default_max_message_size() -> usize {
-    10 * 1024 * 1024 // 10 MB
+    DEFAULT_MAX_MESSAGE_SIZE
 }
 
 /// WebSocket action config - proxies requests to an upstream WebSocket server.
@@ -105,23 +113,70 @@ pub fn parse_subprotocol_header_values<'a>(
         .collect()
 }
 
-/// A WebSocket message crossed the configured `max_message_size`.
+/// A frame on an upgraded tunnel crossed one of the limits the gateway
+/// enforces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MessageTooLarge {
-    /// Total payload bytes the message had declared when the cap tripped,
-    /// summed across continuation fragments.
-    pub observed: u64,
-    /// The configured `max_message_size` in bytes.
-    pub limit: u64,
+pub enum FrameViolation {
+    /// A data message crossed the configured `max_message_size`.
+    MessageTooLarge {
+        /// Total payload bytes the message had declared when the cap
+        /// tripped, summed across continuation fragments.
+        observed: u64,
+        /// The configured `max_message_size` in bytes.
+        limit: u64,
+    },
+    /// A control frame declared more payload than RFC 6455 section 5.5
+    /// permits.
+    ///
+    /// Control frames do not count toward a data message's total, so
+    /// their declared length is skipped rather than accumulated. That
+    /// makes an unchecked length load bearing twice over: the upstream
+    /// is handed a control frame it may allocate for before validating,
+    /// and the scanner would spend the declared count skipping payload
+    /// bytes, so a `u64::MAX` pong header wedges it for the life of the
+    /// connection and `max_message_size` stops applying to anything.
+    OversizedControlFrame {
+        /// Payload length the frame header declared.
+        declared: u64,
+    },
+    /// A control frame arrived without `FIN`. RFC 6455 section 5.5
+    /// forbids fragmenting control frames, and a continuation of one
+    /// has no defined reassembly.
+    FragmentedControlFrame {
+        /// Opcode of the frame that arrived fragmented.
+        opcode: u8,
+    },
 }
 
-impl std::fmt::Display for MessageTooLarge {
+impl FrameViolation {
+    /// Stable label for logs, metrics, and the teardown's error type.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::MessageTooLarge { .. } => "websocket_message_too_large",
+            Self::OversizedControlFrame { .. } => "websocket_oversized_control_frame",
+            Self::FragmentedControlFrame { .. } => "websocket_fragmented_control_frame",
+        }
+    }
+}
+
+impl std::fmt::Display for FrameViolation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "websocket message of {} bytes exceeds max_message_size {}",
-            self.observed, self.limit
-        )
+        match self {
+            Self::MessageTooLarge { observed, limit } => write!(
+                f,
+                "websocket message of {observed} bytes exceeds max_message_size {limit}"
+            ),
+            Self::OversizedControlFrame { declared } => write!(
+                f,
+                "websocket control frame declares {declared} payload bytes; RFC 6455 permits at \
+                 most {MAX_CONTROL_FRAME_PAYLOAD}"
+            ),
+            Self::FragmentedControlFrame { opcode } => write!(
+                f,
+                "websocket control frame with opcode 0x{opcode:X} arrived fragmented; RFC 6455 \
+                 forbids fragmenting control frames"
+            ),
+        }
     }
 }
 
@@ -159,7 +214,7 @@ impl FrameSizeScanner {
         }
     }
 
-    fn scan(&mut self, bytes: &[u8]) -> Result<(), MessageTooLarge> {
+    fn scan(&mut self, bytes: &[u8]) -> Result<(), FrameViolation> {
         let mut input = bytes;
         while !input.is_empty() {
             if self.remaining_payload > 0 {
@@ -181,13 +236,27 @@ impl FrameSizeScanner {
                 continue;
             };
             self.header_len = 0;
-            self.remaining_payload = payload_len;
             // Control frames (opcode high bit set: close, ping, pong, and
             // the reserved control opcodes) may interleave with a
-            // fragmented message and never count toward it.
+            // fragmented message and never count toward it. Because their
+            // declared length is skipped rather than accumulated, it has
+            // to be checked here or it is never checked at all: RFC 6455
+            // section 5.5 caps a control frame at 125 payload bytes and
+            // forbids fragmenting one, and both rules are refused before
+            // `remaining_payload` is set from a length already rejected.
             if opcode & 0x8 != 0 {
+                if payload_len > MAX_CONTROL_FRAME_PAYLOAD {
+                    return Err(FrameViolation::OversizedControlFrame {
+                        declared: payload_len,
+                    });
+                }
+                if !fin {
+                    return Err(FrameViolation::FragmentedControlFrame { opcode });
+                }
+                self.remaining_payload = payload_len;
                 continue;
             }
+            self.remaining_payload = payload_len;
             // A non-continuation opcode, or any data frame after a FIN,
             // starts a new message.
             if opcode != 0x0 || self.message_complete {
@@ -196,7 +265,7 @@ impl FrameSizeScanner {
             self.message_bytes = self.message_bytes.saturating_add(payload_len);
             self.message_complete = fin;
             if self.message_bytes > self.limit {
-                return Err(MessageTooLarge {
+                return Err(FrameViolation::MessageTooLarge {
                     observed: self.message_bytes,
                     limit: self.limit,
                 });
@@ -244,7 +313,7 @@ fn parse_frame_header(bytes: &[u8]) -> Option<(u64, u8, bool)> {
 pub struct WebSocketTunnelGuard {
     client_to_upstream: FrameSizeScanner,
     upstream_to_client: FrameSizeScanner,
-    violation: Option<MessageTooLarge>,
+    violation: Option<FrameViolation>,
 }
 
 impl WebSocketTunnelGuard {
@@ -259,7 +328,7 @@ impl WebSocketTunnelGuard {
     }
 
     /// Scan client-to-upstream tunnel bytes.
-    pub fn scan_client_bytes(&mut self, bytes: &[u8]) -> Result<(), MessageTooLarge> {
+    pub fn scan_client_bytes(&mut self, bytes: &[u8]) -> Result<(), FrameViolation> {
         if let Some(violation) = self.violation {
             return Err(violation);
         }
@@ -271,7 +340,7 @@ impl WebSocketTunnelGuard {
     }
 
     /// Scan upstream-to-client tunnel bytes.
-    pub fn scan_upstream_bytes(&mut self, bytes: &[u8]) -> Result<(), MessageTooLarge> {
+    pub fn scan_upstream_bytes(&mut self, bytes: &[u8]) -> Result<(), FrameViolation> {
         if let Some(violation) = self.violation {
             return Err(violation);
         }
@@ -490,7 +559,7 @@ mod tests {
             .expect_err("frame over the cap must be refused");
         assert_eq!(
             violation,
-            MessageTooLarge {
+            FrameViolation::MessageTooLarge {
                 observed: 1025,
                 limit: 1024
             }
@@ -519,7 +588,13 @@ mod tests {
         let violation = guard
             .scan_client_bytes(&frame(true, 0x0, true, 600))
             .expect_err("fragments summing over the cap must be refused");
-        assert_eq!(violation.observed, 1200);
+        assert_eq!(
+            violation,
+            FrameViolation::MessageTooLarge {
+                observed: 1200,
+                limit: 1024
+            }
+        );
     }
 
     #[test]
@@ -615,5 +690,79 @@ mod tests {
         guard
             .scan_client_bytes(&frame(true, 0x1, true, 301))
             .expect_err("16-bit length over the cap");
+    }
+
+    /// The exact fourteen bytes from the retrospective review of PR
+    /// #1148: a masked pong header declaring `u64::MAX` payload, and
+    /// nothing after it.
+    ///
+    /// ```text
+    /// 8A FF  FF FF FF FF FF FF FF FF  11 22 33 44
+    /// ^  ^   \_____ 64-bit declared length = u64::MAX ____/  \_ mask _/
+    /// |  +-- MASK=1, len7=127
+    /// +----- FIN=1, opcode=0xA (pong)
+    /// ```
+    const WEDGING_PONG_HEADER: [u8; 14] = [
+        0x8A, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x11, 0x22, 0x33, 0x44,
+    ];
+
+    #[test]
+    fn tunnel_guard_refuses_a_control_frame_over_the_rfc_limit() {
+        let mut guard = WebSocketTunnelGuard::new(1_048_576);
+        let violation = guard
+            .scan_client_bytes(&WEDGING_PONG_HEADER)
+            .expect_err("a control frame declaring u64::MAX must be refused");
+        assert_eq!(
+            violation,
+            FrameViolation::OversizedControlFrame { declared: u64::MAX }
+        );
+        assert!(guard.violated());
+    }
+
+    #[test]
+    fn a_bogus_control_frame_length_cannot_wedge_the_scanner() {
+        // Before the fix this was the whole attack: the pong's declared
+        // length was written into `remaining_payload` and the cap check
+        // was skipped, so every later byte was consumed as payload, no
+        // frame header was ever parsed again, and `max_message_size`
+        // was inert for the life of the tunnel while `violated()` stayed
+        // false.
+        let mut guard = WebSocketTunnelGuard::new(1_048_576);
+        let mut wire = WEDGING_PONG_HEADER.to_vec();
+        wire.extend(frame(true, 0x1, true, 2 * 1_048_576));
+
+        guard
+            .scan_client_bytes(&wire)
+            .expect_err("the oversized message behind the pong must still be seen");
+        assert!(
+            guard.violated(),
+            "the guard must trip, so `fail_to_proxy` tears the tunnel down"
+        );
+    }
+
+    #[test]
+    fn tunnel_guard_refuses_a_fragmented_control_frame() {
+        let mut guard = WebSocketTunnelGuard::new(1024);
+        let violation = guard
+            .scan_client_bytes(&frame(false, 0x9, true, 4))
+            .expect_err("RFC 6455 forbids fragmenting a control frame");
+        assert_eq!(
+            violation,
+            FrameViolation::FragmentedControlFrame { opcode: 0x9 }
+        );
+    }
+
+    #[test]
+    fn tunnel_guard_allows_a_control_frame_at_the_rfc_limit() {
+        // 125 is legal and must stay legal: the ping/pong keepalives a
+        // working tunnel relies on carry real payloads.
+        let mut guard = WebSocketTunnelGuard::new(1024);
+        guard
+            .scan_client_bytes(&frame(true, 0xA, true, 125))
+            .expect("a 125-byte pong is exactly at the RFC ceiling");
+        guard
+            .scan_client_bytes(&frame(true, 0x8, true, 2))
+            .expect("a close frame carrying a status code");
+        assert!(!guard.violated());
     }
 }

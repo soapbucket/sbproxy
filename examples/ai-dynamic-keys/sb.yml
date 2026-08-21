@@ -13,12 +13,12 @@
 #   export SBPROXY_KEY_MASTER=a-long-random-master-key
 #   make run CONFIG=examples/ai-dynamic-keys/sb.yml
 #
-# Use the seeded key (its plaintext token is sk-seed0001-<secret>; here the
+# Use the seeded key (its plaintext token is sk-a1b2c3d4e5f60789-<secret>; here the
 # secret is "demo-secret-please-rotate", so the bearer token is
-# sk-seed0001-demo-secret-please-rotate):
+# sk-a1b2c3d4e5f60789-demo-secret-please-rotate):
 #   curl -s http://127.0.0.1:8080/v1/chat/completions \
 #     -H 'Host: openai.local' \
-#     -H 'Authorization: Bearer sk-seed0001-demo-secret-please-rotate' \
+#     -H 'Authorization: Bearer sk-a1b2c3d4e5f60789-demo-secret-please-rotate' \
 #     -H 'Content-Type: application/json' \
 #     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
 #
@@ -55,7 +55,7 @@ proxy:
     failure_posture: closed
     seed:
       keys:
-        - key_id: seed0001
+        - key_id: a1b2c3d4e5f60789
           secret: demo-secret-please-rotate
           name: seeded-demo-key
           max_requests_per_minute: 60
