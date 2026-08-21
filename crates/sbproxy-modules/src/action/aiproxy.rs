@@ -83,6 +83,17 @@ impl AiProxyAction {
                 wasm_routing,
             )?
         };
+        // WOR-2648: refuse an `aws_sigv4:` block that cannot produce a
+        // signature here, above the validation-mode early return, so
+        // `sbproxy validate` and config load both catch it. `AiClient`
+        // re-checks before it builds a signer, so a bad block fails
+        // closed on the request path either way; this is the only place
+        // that turns it into a message an operator can act on.
+        for provider in &config.providers {
+            provider.validate_aws_sigv4().map_err(|error| {
+                anyhow::anyhow!("ai provider {:?} aws_sigv4: {error}", provider.name)
+            })?;
+        }
         if !prepare_runtime {
             // WOR-2098: validate and plan construction resolve RAG
             // credential references too when a process resolver is
@@ -108,6 +119,32 @@ impl AiProxyAction {
                         anyhow::anyhow!("resolving api_key for provider {:?}: {e}", provider.name)
                     })?;
                 provider.api_key = Some(resolved);
+            }
+            // WOR-2648: the AWS signing block carries its own
+            // credentials (`secret_access_key`, `session_token`,
+            // `external_id`), and they get the same treatment as
+            // `api_key`. An unresolved `vault://` would otherwise become
+            // the signing key itself and come back from AWS as
+            // `SignatureDoesNotMatch`, which reads like a wrong key
+            // rather than like a reference nobody dereferenced. The
+            // error names the provider and the field, never the
+            // reference and never the value.
+            let provider_name = provider.name.to_string();
+            if let Some(sigv4) = provider.aws_sigv4.as_mut() {
+                for secret in sigv4.credential_secrets_mut() {
+                    let resolved = resolve_runtime_credential(resolver.as_deref(), secret.expose())
+                        .map_err(|error| {
+                            let detail = if error.to_string().contains("secret not found") {
+                                "secret not found"
+                            } else {
+                                "credential resolution failed"
+                            };
+                            anyhow::anyhow!(
+                                "aws_sigv4 credential for provider {provider_name:?}: {detail}"
+                            )
+                        })?;
+                    secret.set_resolved(&resolved);
+                }
             }
         }
         if let Some(guardrails) = config.guardrails.as_mut() {
@@ -382,6 +419,101 @@ mod tests {
         assert!(message.contains("external guardrail 'customer-policy'"));
         assert!(!message.contains("secret://fixture-guardrail/missing"));
         assert!(!message.contains("resolved-guardrail-value"));
+    }
+
+    /// WOR-2648: the AWS signing block's credentials are references
+    /// like any other, and the signer would otherwise use the reference
+    /// text as the secret key.
+    #[test]
+    fn resolves_aws_sigv4_credential_references() {
+        install_fixture_resolver();
+        let action = AiProxyAction::from_config(serde_json::json!({
+            "providers": [{
+                "name": "bedrock",
+                "provider_type": "bedrock",
+                "aws_sigv4": {
+                    "region": "us-east-1",
+                    "credentials": {
+                        "source": "static",
+                        "access_key_id": "AKIDEXAMPLE",
+                        "secret_access_key": "secret://fixture-guardrail/credential",
+                    }
+                }
+            }]
+        }))
+        .expect("aws_sigv4 credential reference resolves");
+
+        let sigv4 = action.config.providers[0]
+            .aws_sigv4
+            .as_ref()
+            .expect("the signing block survives construction");
+        let secret = sigv4
+            .credentials
+            .as_ref()
+            .and_then(|credentials| credentials.secret_access_key.as_ref())
+            .expect("the secret survives construction");
+        assert_eq!(
+            secret.expose(),
+            "resolved-guardrail-value",
+            "the reference must be dereferenced, not handed to the signer verbatim"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_aws_sigv4_reference_fails_closed_without_naming_it() {
+        install_fixture_resolver();
+        let error = AiProxyAction::from_config(serde_json::json!({
+            "providers": [{
+                "name": "bedrock",
+                "provider_type": "bedrock",
+                "aws_sigv4": {
+                    "region": "us-east-1",
+                    "credentials": {
+                        "source": "static",
+                        "access_key_id": "AKIDEXAMPLE",
+                        "secret_access_key": "secret://fixture-guardrail/missing",
+                    }
+                }
+            }]
+        }))
+        .expect_err("a missing secret must fail configuration, not sign with the reference");
+        let message = error.to_string();
+        assert!(message.contains("bedrock"), "{message}");
+        assert!(
+            !message.contains("secret://fixture-guardrail/missing"),
+            "{message}"
+        );
+        assert!(!message.contains("resolved-guardrail-value"), "{message}");
+    }
+
+    /// WOR-2648: an unusable signing block is refused at config load,
+    /// not on the first request. This runs in validation mode too, so
+    /// `sbproxy validate` catches it before a deploy.
+    #[test]
+    fn an_unusable_aws_sigv4_block_is_refused_at_config_load() {
+        let error = AiProxyAction::from_config(serde_json::json!({
+            "providers": [{
+                "name": "bedrock",
+                "provider_type": "bedrock",
+                "api_key": "Bearer leftover",
+                "aws_sigv4": {"region": "us-east-1"}
+            }]
+        }))
+        .expect_err("api_key alongside aws_sigv4 is refused");
+        assert!(error.to_string().contains("mutually exclusive"), "{error}");
+
+        let error = AiProxyAction::from_config(serde_json::json!({
+            "providers": [{
+                "name": "bedrock",
+                "provider_type": "bedrock",
+                "aws_sigv4": {
+                    "region": "us-east-1",
+                    "credentials": {"source": "static", "access_key_id": "AKIDEXAMPLE"}
+                }
+            }]
+        }))
+        .expect_err("a static source with no secret is refused");
+        assert!(error.to_string().contains("secret_access_key"), "{error}");
     }
 
     #[test]

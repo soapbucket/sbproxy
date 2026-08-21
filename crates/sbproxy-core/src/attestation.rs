@@ -37,14 +37,23 @@
 //!
 //! # Validation mode never touches the disk
 //!
-//! `prepare_attestation` creates the directories the queue and the
-//! ledger live in, and opens the receipt chain for a role that writes
-//! receipts. Those are real side effects and exactly the reason the
-//! pipeline calls it only under `PipelineConstructionMode::Runtime`.
-//! `sbproxy validate` must be able to check a candidate config on an
-//! operator's laptop without leaving ledger files behind. Everything
-//! that can be decided without a filesystem is decided earlier, at
-//! config compile, so validation still rejects a broken block.
+//! `prepare_attestation` creates the directory the ledger lives in and
+//! opens the receipt chain. Those are real side effects and exactly the
+//! reason the pipeline calls it only under
+//! `PipelineConstructionMode::Runtime`. `sbproxy validate` must be able
+//! to check a candidate config on an operator's laptop without leaving
+//! ledger files behind. Everything that can be decided without a
+//! filesystem is decided earlier, at config compile, so validation still
+//! rejects a broken block.
+//!
+//! The ledger is the whole of that list. WOR-2623: boot used to create
+//! the claim queue's directory too, on the same "find out at boot that
+//! the disk is unwritable" reasoning, and that reasoning belonged to a
+//! half of attestation this build does not have. `compile_config`
+//! refuses every role that makes claims, so no code path can ever put a
+//! byte in that directory, and a directory nothing writes is a mark on
+//! an operator's disk they have to explain. It is left alone until the
+//! claim lifecycle lands with something to write there.
 //!
 //! Opening the chain is the one side effect that cannot fail the boot.
 //! A ledger that will not open becomes an unwritable
@@ -107,10 +116,19 @@ pub struct AttestationRuntime {
     /// `proxy.attestation.sign_with` names. `None` when the role makes
     /// claims but writes no receipts.
     pub signing_key_id: Option<String>,
-    /// Where unsettled claims are held.
+    /// Where unsettled claims would be held.
+    ///
+    /// Resolved and recorded, and read by nothing. WOR-2623: the claim
+    /// half of attestation is not implemented in this build and
+    /// `compile_config` refuses every role that asks for it, so no
+    /// claim is ever written here and boot does not create the
+    /// directory either. Kept resolved rather than dropped so the
+    /// lifecycle slice lands against a path already lowered the same
+    /// way the ledger's is.
     pub queue_path: PathBuf,
-    /// How many unsettled claims to hold before
-    /// [`Self::failure_mode`] applies.
+    /// How many unsettled claims would be held before
+    /// [`Self::failure_mode`] applies. Read by nothing today, for the
+    /// reason [`Self::queue_path`] gives.
     pub queue_max_entries: usize,
     /// Where settled records are chained.
     pub ledger_path: PathBuf,
@@ -280,10 +298,15 @@ pub(crate) fn prepare_attestation(
         .collect();
 
     // Boot is the right time to find out the state directory is
-    // unwritable. Discovering it at the first claim means the first
+    // unwritable. Discovering it at the first receipt means the first
     // billable request of the deployment is also the first one that
     // takes the failure_mode branch.
-    ensure_state_dir(&queue_path, "proxy.attestation.queue.path")?;
+    //
+    // The ledger only. WOR-2623: the queue directory was created here
+    // too, and nothing has ever written to it. `compile_config` refuses
+    // every role that makes claims, so nothing can, and creating a
+    // directory for a file this build will not produce leaves an
+    // operator holding state they cannot account for.
     ensure_state_dir(&ledger_path, "proxy.attestation.ledger.path")?;
 
     // The chain is opened here, once, and pinned to this generation, so a
@@ -563,18 +586,21 @@ mod tests {
 
     #[test]
     fn an_origin_role_override_wins_over_the_proxy_role() {
+        // Narrowing, because that is the only direction a supported
+        // config can override in: `compile_config` refuses every role
+        // that makes claims, at the proxy and at the origin alike.
         let proxy = AttestationConfig {
-            role: AttestationRole::Both,
+            role: AttestationRole::Receipt,
             ..AttestationConfig::default()
         };
         let origin = OriginAttestationConfig {
-            role: Some(AttestationRole::Claim),
+            role: Some(AttestationRole::Off),
             agreement_id: Some("acme-2026".to_string()),
         };
 
         let resolved = resolve_origin_attestation(Some(&proxy), Some(&origin));
 
-        assert_eq!(resolved.role, AttestationRole::Claim);
+        assert_eq!(resolved.role, AttestationRole::Off);
         assert_eq!(resolved.agreement_id.as_deref(), Some("acme-2026"));
     }
 
@@ -613,7 +639,7 @@ mod tests {
         let ledger_path = dir.path().join("state").join("receipts.ndjson");
 
         let cfg = AttestationConfig {
-            role: AttestationRole::Both,
+            role: AttestationRole::Receipt,
             sign_with: Some(ATTESTATION_SIGN_WITH_WEB_BOT_AUTH.to_string()),
             queue: Some(AttestationQueueConfig {
                 path: queue_path.display().to_string(),
@@ -635,7 +661,7 @@ mod tests {
             .expect("a complete block builds")
             .expect("a declared role yields a runtime");
 
-        assert_eq!(runtime.role, AttestationRole::Both);
+        assert_eq!(runtime.role, AttestationRole::Receipt);
         assert_eq!(runtime.signing_key_id.as_deref(), Some("sbproxy-2026"));
         assert_eq!(runtime.queue_max_entries, 4_096);
         assert_eq!(runtime.queue_path, queue_path);
@@ -645,11 +671,11 @@ mod tests {
             Billable::Collapse
         );
         assert!(
-            queue_path
+            ledger_path
                 .parent()
-                .expect("the queue has a parent")
+                .expect("the ledger has a parent")
                 .is_dir(),
-            "boot creates the state directory so the first claim is not the first failure"
+            "boot creates the state directory so the first receipt is not the first failure"
         );
         let chain = runtime
             .chain
@@ -659,6 +685,12 @@ mod tests {
         assert_eq!(chain.node_id(), NODE);
     }
 
+    /// `compile_config` refuses every claim-making role (WOR-2623), so
+    /// this is not a config a supported path can reach. The arm stays,
+    /// and so does this test, for the same reason the bails above are
+    /// checks rather than assumptions: a runtime that assumes its input
+    /// came from a compiled config is a runtime that misbehaves when it
+    /// did not.
     #[test]
     fn a_role_that_makes_claims_and_writes_none_opens_no_chain() {
         // Opening a ledger the role will never write to would leave a file
@@ -675,6 +707,48 @@ mod tests {
 
         assert!(runtime.chain.is_none());
         assert!(!runtime.ledger_path.exists());
+    }
+
+    /// WOR-2623: boot creates the ledger's directory, because the chain
+    /// is opened there and appended to. It creates nothing for the
+    /// queue. No claim is written anywhere in this build, so a directory
+    /// for one is state an operator carries and nobody can account for,
+    /// and the two paths are deliberately in different directories here
+    /// so the ledger's own `create_dir_all` cannot cover for the queue's.
+    #[test]
+    fn boot_creates_the_ledger_directory_and_leaves_no_queue_directory() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let queue_dir = dir.path().join("queue");
+        let ledger_dir = dir.path().join("ledger");
+        let cfg = AttestationConfig {
+            queue: Some(AttestationQueueConfig {
+                path: queue_dir.join("claims.q").display().to_string(),
+                max_entries: 16,
+            }),
+            ledger: Some(AttestationLedgerConfig {
+                path: ledger_dir.join("receipts.ndjson").display().to_string(),
+            }),
+            ..metering_config(dir.path(), Vec::new(), Vec::new())
+        };
+
+        let runtime = prepare_attestation(Some(&cfg), Some(&signer()), REVISION, NODE)
+            .expect("a complete block builds")
+            .expect("a receipt role yields a runtime");
+
+        assert!(
+            runtime.chain.is_some(),
+            "a receipt role opens its chain, which is what makes the ledger directory needed"
+        );
+        assert!(
+            ledger_dir.is_dir(),
+            "the chain is opened under {}, so boot has to create it",
+            ledger_dir.display()
+        );
+        assert!(
+            !queue_dir.exists(),
+            "nothing writes the claim queue, so nothing creates {}",
+            queue_dir.display()
+        );
     }
 
     #[test]

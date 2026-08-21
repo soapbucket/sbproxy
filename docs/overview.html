@@ -331,7 +331,7 @@ docs rather than discovered in production.</p>
 <h2 id="models">Models</h2>
 
 <p>The model gateway (<code>action: ai_proxy</code>) presents one
-OpenAI-compatible endpoint and routes behind it across a 72-provider
+OpenAI-compatible endpoint and routes behind it across a 70-provider
 catalog, from the hosted majors through Bedrock and OpenRouter down to
 llama.cpp hosts the proxy itself supervises as a local cluster with
 GPU-aware placement. Model aliases decouple the name your clients send
@@ -448,7 +448,7 @@ a linked plugin, an extension-bundle hook, or a config error.</p>
   <tr><th>Action</th><th>What it does</th></tr>
   <tr><td><code>proxy</code></td><td>Reverse proxy to one upstream: base-path stripping, Host and SNI overrides, retries with backoff, DNS service discovery, IP pinning.</td></tr>
   <tr><td><code>load_balancer</code></td><td>Target pools with eight algorithms plus five custom strategies, three health layers, circuit breakers, blue-green and canary modes.</td></tr>
-  <tr><td><code>ai_proxy</code></td><td>The model gateway: OpenAI-compatible surface, 72 providers, aliasing, routing strategies, guardrails, budgets, semantic caching, local hosting.</td></tr>
+  <tr><td><code>ai_proxy</code></td><td>The model gateway: OpenAI-compatible surface, 70 providers, aliasing, routing strategies, guardrails, budgets, semantic caching, local hosting.</td></tr>
   <tr><td><code>mcp</code></td><td>The tool gateway: federated MCP servers, OpenAPI-derived tools, config-defined local tools, all governed through one catalog.</td></tr>
   <tr><td><code>a2a</code></td><td>Agent-to-agent JSON-RPC with envelope trust, delegation caps, cycle detection, and agent-card rewriting.</td></tr>
   <tr><td><code>websocket</code></td><td>WebSocket proxying with subprotocol negotiation; auth and policies run before the upgrade.</td></tr>

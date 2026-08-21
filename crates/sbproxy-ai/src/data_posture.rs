@@ -445,8 +445,15 @@ mod tests {
 
     #[test]
     fn catalog_posture_flows_through_the_effective_provider_type() {
-        // Bedrock's catalog entry declares it does not store prompts.
-        let p = provider("{name: aws, provider_type: bedrock}");
+        // A locally served engine, deliberately, rather than a hosted
+        // vendor. This test only needs a catalog entry whose posture
+        // differs from the pessimistic default, and a vendor's posture is
+        // a claim about published terms that can change under us: it did,
+        // when Bedrock moved to `retains_data: true` after AWS was found
+        // to retain classifier-flagged traffic for 30 days with no opt-in.
+        // Ollama runs on the operator's own machine, so its posture cannot
+        // move for a reason outside this repository.
+        let p = provider("{name: local, provider_type: ollama}");
         assert_eq!(
             effective_data_posture(&p),
             EffectiveDataPosture {

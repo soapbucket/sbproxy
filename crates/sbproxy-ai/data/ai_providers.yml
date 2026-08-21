@@ -60,9 +60,10 @@ providers:
     format: anthropic
     supports_streaming: true
     supports_embeddings: false
-    # API data is not used for training by default and is retained for
-    # a limited trust-and-safety window; zero-data-retention agreements
-    # are offered commercially (Anthropic commercial terms).
+    # API inputs and outputs are deleted within 30 days by default,
+    # extending to two years where trust-and-safety classifiers flag
+    # them; zero-data-retention agreements are applied per organization
+    # (Anthropic privacy center, data-retention article).
     data_posture:
       retains_data: true
       zdr_available: true
@@ -86,15 +87,19 @@ providers:
   - name: azure
     display_name: Azure OpenAI
     aliases: [azure_openai]
-    default_base_url: https://{resource}.openai.azure.com/openai
+    # The v1 API surface appends /v1 to the resource endpoint and
+    # drops the dated api-version parameter; api-key remains supported
+    # alongside Entra bearer tokens (Azure OpenAI v1 API docs).
+    default_base_url: https://{resource}.openai.azure.com/openai/v1
     auth_header: api-key
     auth_prefix: ""
     format: openai
     supports_streaming: true
     supports_embeddings: true
-    # Prompts and completions are stored up to 30 days for abuse
-    # monitoring; approved subscriptions can disable that storage via
-    # modified abuse monitoring (Azure OpenAI data-privacy note).
+    # Prompts and completions are stored for human review under abuse
+    # monitoring, with no duration published on the current page;
+    # eligible customers can apply for modified abuse monitoring to
+    # disable it (Azure OpenAI abuse-monitoring docs).
     data_posture:
       retains_data: true
       zdr_available: true
@@ -108,17 +113,41 @@ providers:
     format: bedrock
     supports_streaming: true
     supports_embeddings: true
-    # AWS states Bedrock does not store or log prompts and completions
-    # and does not use them to train models (Bedrock data-protection
-    # documentation).
+    # Bedrock's platform default is zero data retention, but the abuse
+    # detection page carves out named models: classifier-flagged
+    # traffic to the OpenAI GPT-5.x family is retained up to 30 days
+    # with no opt-in, and the model name passes straight through from
+    # the caller, so a stock account can reach a retention window
+    # without asking for one. Eligible customers may request full ZDR
+    # through their AWS account team (Bedrock abuse-detection docs).
     data_posture:
-      retains_data: false
+      retains_data: true
       zdr_available: true
+
+  - name: meta
+    display_name: Meta Model API
+    aliases: [llama, llama_api, meta_llama]
+    # llama.developer.meta.com redirects to ai.developer.meta.com and
+    # the shipping product is the Meta Model API. The legacy
+    # api.llama.com/compat/v1 host still answers 401 rather than 404,
+    # so it reads as live to a spot check; it is not the current base.
+    default_base_url: https://api.meta.ai/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+    data_posture:
+      retains_data: true
+      zdr_available: false
 
   # --- Tier 2: Dedicated AI providers ---
   - name: cohere
     display_name: Cohere
-    default_base_url: https://api.cohere.com/v2
+    # Cohere's OpenAI-compatible surface, not its native v2 API: the
+    # compatibility layer is a different host (api.cohere.ai) as well
+    # as a different path (Cohere "Compatibility API" docs).
+    default_base_url: https://api.cohere.ai/compatibility/v1
     auth_header: Authorization
     auth_prefix: "Bearer "
     format: openai
@@ -167,15 +196,21 @@ providers:
 
   - name: perplexity
     display_name: Perplexity
-    default_base_url: https://api.perplexity.ai
+    # OpenAI-wire chat completions now live under the Router surface;
+    # the bare host is no longer the documented base (Perplexity
+    # gateway quickstart).
+    default_base_url: https://api.perplexity.ai/router/v1
     auth_header: Authorization
     auth_prefix: "Bearer "
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    # Perplexity publishes a zero-data-retention policy for the
+    # completions API: data sent through it is not retained and is not
+    # used for training (Perplexity privacy and security docs).
     data_posture:
-      retains_data: true
-      zdr_available: false
+      retains_data: false
+      zdr_available: true
 
   # --- Tier 3: Inference platforms ---
   - name: groq
@@ -193,7 +228,7 @@ providers:
   - name: together
     display_name: Together AI
     aliases: [together_ai]
-    default_base_url: https://api.together.xyz/v1
+    default_base_url: https://api.together.ai/v1
     auth_header: Authorization
     auth_prefix: "Bearer "
     format: openai
@@ -260,6 +295,11 @@ providers:
   - name: tgi
     display_name: Hugging Face Text Generation Inference
     aliases: [huggingface_tgi]
+    # Hugging Face archived the TGI repository on 2026-03-21 and put
+    # it in maintenance mode, pointing new deployments at vLLM,
+    # SGLang, or llama.cpp. The entry stays because an operator's
+    # existing TGI server keeps serving on this base. The port matches
+    # the published Docker quickstart's host mapping.
     default_base_url: http://localhost:8080/v1
     auth_header: Authorization
     auth_prefix: "Bearer "
@@ -302,6 +342,39 @@ providers:
       retains_data: false
       zdr_available: true
 
+  - name: sglang
+    display_name: SGLang server
+    aliases: [sg_lang]
+    # SGLang's server defaults to port 30000, not the 8000/8080 the
+    # other runtimes use. Hugging Face names it one of the successors
+    # to TGI (SGLang server-arguments docs).
+    default_base_url: http://localhost:30000/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: true
+    # Local engine: the default base URL keeps prompts on the
+    # operator's own host.
+    data_posture:
+      retains_data: false
+      zdr_available: true
+
+  - name: localai
+    display_name: LocalAI
+    aliases: [local_ai]
+    default_base_url: http://localhost:8080/v1
+    auth_header: Authorization
+    auth_prefix: "Bearer "
+    format: openai
+    supports_streaming: true
+    supports_embeddings: false
+    # Local engine: the default base URL keeps prompts on the
+    # operator's own host.
+    data_posture:
+      retains_data: false
+      zdr_available: true
+
   # --- Tier 5: Enterprise cloud platforms ---
   - name: sagemaker
     display_name: AWS SageMaker
@@ -332,8 +405,12 @@ providers:
     display_name: Oracle Cloud GenAI
     aliases: [oci]
     default_base_url: https://inference.generativeai.{region}.oci.oraclecloud.com
+    # OCI authenticates with a signed Authorization header
+    # (Signature version="1",keyId=...), not a bearer token. The
+    # gateway forwards it verbatim, as it does for SigV4, so no prefix
+    # may be prepended (OCI request-signing docs).
     auth_header: Authorization
-    auth_prefix: "Bearer "
+    auth_prefix: ""
     format: custom
     supports_streaming: true
     supports_embeddings: true
@@ -355,18 +432,6 @@ providers:
       zdr_available: false
 
   # --- Tier 6: Inference platforms (OpenAI-compatible) ---
-  - name: anyscale
-    display_name: Anyscale Endpoints
-    default_base_url: https://api.endpoints.anyscale.com/v1
-    auth_header: Authorization
-    auth_prefix: "Bearer "
-    format: openai
-    supports_streaming: true
-    supports_embeddings: true
-    data_posture:
-      retains_data: true
-      zdr_available: false
-
   - name: cerebras
     display_name: Cerebras Inference
     default_base_url: https://api.cerebras.ai/v1
@@ -375,9 +440,11 @@ providers:
     format: openai
     supports_streaming: true
     supports_embeddings: false
+    # Cerebras states it does not retain inputs and outputs associated
+    # with its inference services (Cerebras privacy policy).
     data_posture:
-      retains_data: true
-      zdr_available: false
+      retains_data: false
+      zdr_available: true
 
   - name: nvidia
     display_name: NVIDIA NIM
@@ -404,18 +471,6 @@ providers:
       retains_data: true
       zdr_available: false
 
-  - name: lepton
-    display_name: Lepton AI
-    default_base_url: https://api.lepton.run/v1
-    auth_header: Authorization
-    auth_prefix: "Bearer "
-    format: openai
-    supports_streaming: true
-    supports_embeddings: false
-    data_posture:
-      retains_data: true
-      zdr_available: false
-
   - name: deepinfra
     display_name: DeepInfra
     default_base_url: https://api.deepinfra.com/v1/openai
@@ -430,7 +485,7 @@ providers:
 
   - name: novita
     display_name: Novita AI
-    default_base_url: https://api.novita.ai/v3/openai
+    default_base_url: https://api.novita.ai/openai
     auth_header: Authorization
     auth_prefix: "Bearer "
     format: openai
@@ -468,7 +523,11 @@ providers:
   - name: moonshot
     display_name: Moonshot AI (Kimi)
     aliases: [kimi]
-    default_base_url: https://api.moonshot.cn/v1
+    # The international platform (platform.moonshot.ai, which now
+    # redirects to platform.kimi.ai) documents the .ai host; the .cn
+    # host remains the separate China platform and is a per-origin
+    # base_url override.
+    default_base_url: https://api.moonshot.ai/v1
     auth_header: Authorization
     auth_prefix: "Bearer "
     format: openai
@@ -481,7 +540,11 @@ providers:
   - name: dashscope
     display_name: Alibaba DashScope (Qwen)
     aliases: [qwen, alibaba]
-    default_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    # International Model Studio host; dashscope.aliyuncs.com is the
+    # China host. Alibaba is steering traffic to workspace-scoped
+    # {WorkspaceId}.{region}.maas.aliyuncs.com names but documents the
+    # domain below as remaining fully functional.
+    default_base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
     auth_header: Authorization
     auth_prefix: "Bearer "
     format: openai
@@ -492,9 +555,12 @@ providers:
       zdr_available: false
 
   - name: zhipu
-    display_name: Zhipu AI (GLM)
-    aliases: [glm, chatglm]
-    default_base_url: https://open.bigmodel.cn/api/paas/v4
+    display_name: Z.ai / Zhipu AI (GLM)
+    aliases: [glm, chatglm, zai, bigmodel]
+    # Z.ai is the international GLM platform and the one the English
+    # docs describe; open.bigmodel.cn remains the separate China
+    # platform and is a per-origin base_url override.
+    default_base_url: https://api.z.ai/api/paas/v4
     auth_header: Authorization
     auth_prefix: "Bearer "
     format: openai
@@ -548,7 +614,7 @@ providers:
 
   - name: crusoe
     display_name: Crusoe Cloud Inference
-    default_base_url: https://managed-inference-api-proxy.crusoecloud.com/v1
+    default_base_url: https://api.inference.crusoecloud.com/v1
     auth_header: Authorization
     auth_prefix: "Bearer "
     format: openai
@@ -573,8 +639,11 @@ providers:
   - name: reka
     display_name: Reka AI
     default_base_url: https://api.reka.ai/v1
-    auth_header: Authorization
-    auth_prefix: "Bearer "
+    # Reka documents a raw X-Api-Key header on every chat sample; the
+    # OpenAI-SDK example implies Bearer is also accepted, but the
+    # documented header is the one recorded here.
+    auth_header: X-Api-Key
+    auth_prefix: ""
     format: openai
     supports_streaming: true
     supports_embeddings: false
@@ -624,19 +693,6 @@ providers:
       retains_data: true
       zdr_available: false
 
-  - name: github_models
-    display_name: GitHub Models
-    aliases: [github]
-    default_base_url: https://models.github.ai/inference
-    auth_header: Authorization
-    auth_prefix: "Bearer "
-    format: openai
-    supports_streaming: true
-    supports_embeddings: true
-    data_posture:
-      retains_data: true
-      zdr_available: false
-
   - name: vercel
     display_name: Vercel AI Gateway
     aliases: [vercel_ai_gateway]
@@ -652,9 +708,12 @@ providers:
 
   # --- Tier 11: Inference platforms (OpenAI-compatible) ---
   - name: nebius
-    display_name: Nebius AI Studio
-    aliases: [nebius_token_factory]
-    default_base_url: https://api.studio.nebius.ai/v1
+    display_name: Nebius Token Factory
+    aliases: [nebius_ai_studio, nebius_studio]
+    # AI Studio was renamed Token Factory and moved off the .ai
+    # domain; docs.nebius.com/studio now redirects to the Token
+    # Factory docs (Nebius "switch to Token Factory" guide).
+    default_base_url: https://api.tokenfactory.nebius.com/v1
     auth_header: Authorization
     auth_prefix: "Bearer "
     format: openai
@@ -667,19 +726,6 @@ providers:
   - name: baseten
     display_name: Baseten Model APIs
     default_base_url: https://inference.baseten.co/v1
-    auth_header: Authorization
-    auth_prefix: "Bearer "
-    format: openai
-    supports_streaming: true
-    supports_embeddings: false
-    data_posture:
-      retains_data: true
-      zdr_available: false
-
-  - name: lambda
-    display_name: Lambda Inference API
-    aliases: [lambda_labs, lambdalabs]
-    default_base_url: https://api.lambda.ai/v1
     auth_header: Authorization
     auth_prefix: "Bearer "
     format: openai
@@ -727,8 +773,8 @@ providers:
       zdr_available: false
 
   - name: digitalocean
-    display_name: DigitalOcean Gradient Inference
-    aliases: [gradient]
+    display_name: DigitalOcean Inference
+    aliases: [gradient, do_inference]
     default_base_url: https://inference.do-ai.run/v1
     auth_header: Authorization
     auth_prefix: "Bearer "
@@ -765,10 +811,10 @@ providers:
       retains_data: true
       zdr_available: false
 
-  - name: kluster
-    display_name: kluster.ai
-    aliases: [klusterai]
-    default_base_url: https://api.kluster.ai/v1
+  - name: wandb
+    display_name: W&B Inference (CoreWeave)
+    aliases: [coreweave, wandb_inference, weights_and_biases]
+    default_base_url: https://api.inference.wandb.ai/v1
     auth_header: Authorization
     auth_prefix: "Bearer "
     format: openai
@@ -778,9 +824,11 @@ providers:
       retains_data: true
       zdr_available: false
 
-  - name: openpipe
-    display_name: OpenPipe
-    default_base_url: https://api.openpipe.ai/api/v1
+  - name: gmi
+    display_name: GMI Cloud
+    aliases: [gmicloud, gmi_serving]
+    # The API host is gmi-serving.com, not the gmicloud.ai docs domain.
+    default_base_url: https://api.gmi-serving.com/v1
     auth_header: Authorization
     auth_prefix: "Bearer "
     format: openai
@@ -797,7 +845,10 @@ providers:
     default_base_url: https://api.writer.com/v1
     auth_header: Authorization
     auth_prefix: "Bearer "
-    format: openai
+    # Native pass-through, not OpenAI-compatible: Writer's published
+    # OpenAPI puts chat at /v1/chat and contains no chat/completions
+    # path at all, so an OpenAI-shaped request would 404.
+    format: custom
     supports_streaming: true
     supports_embeddings: false
     data_posture:
@@ -807,20 +858,9 @@ providers:
   - name: upstage
     display_name: Upstage (Solar)
     aliases: [solar]
-    default_base_url: https://api.upstage.ai/v1/solar
-    auth_header: Authorization
-    auth_prefix: "Bearer "
-    format: openai
-    supports_streaming: true
-    supports_embeddings: false
-    data_posture:
-      retains_data: true
-      zdr_available: false
-
-  - name: alephalpha
-    display_name: Aleph Alpha
-    aliases: [aleph_alpha]
-    default_base_url: https://api.aleph-alpha.com/v1
+    # Upstage dropped the /solar path segment; the documented base
+    # is the plain /v1 root (Upstage chat API docs).
+    default_base_url: https://api.upstage.ai/v1
     auth_header: Authorization
     auth_prefix: "Bearer "
     format: openai
@@ -832,6 +872,7 @@ providers:
 
   - name: minimax
     display_name: MiniMax
+    # International host; api.minimaxi.com is the China host.
     default_base_url: https://api.minimax.io/v1
     auth_header: Authorization
     auth_prefix: "Bearer "
@@ -846,6 +887,9 @@ providers:
   - name: volcengine
     display_name: Volcengine Ark (Doubao)
     aliases: [ark, doubao]
+    # China Ark host. The international product ships under a separate
+    # brand and console as BytePlus ModelArk
+    # (ark.ap-southeast.bytepluses.com), which needs its own account.
     default_base_url: https://ark.cn-beijing.volces.com/api/v3
     auth_header: Authorization
     auth_prefix: "Bearer "
@@ -905,7 +949,10 @@ providers:
     format: openai
     supports_streaming: false
     supports_embeddings: true
-    supports_chat: false
+    # Mixedbread's current API reference documents OpenAI-shaped
+    # /v1/chat/completions and no longer carries the standalone
+    # embeddings reference, so refusing chat here was a false refusal.
+    supports_chat: true
     data_posture:
       retains_data: true
       zdr_available: false
@@ -979,6 +1026,9 @@ providers:
   - name: sarvam
     display_name: Sarvam AI
     default_base_url: https://api.sarvam.ai/v1
+    # Sarvam documents api-subscription-key as its primary header and
+    # Bearer as the accepted alternative for OpenAI-compatible
+    # tooling, which is what this gateway is.
     auth_header: Authorization
     auth_prefix: "Bearer "
     format: openai

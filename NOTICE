@@ -222,7 +222,8 @@ aws-smithy-http, aws-smithy-http-client, aws-smithy-json,
 aws-smithy-observability, aws-smithy-query, aws-smithy-runtime,
 aws-smithy-runtime-api, aws-smithy-runtime-api-macros, aws-smithy-schema,
 aws-smithy-types, aws-smithy-xml, aws-types. Pulled in by
-sbproxy-vault's AWS Secrets Manager backend.
+sbproxy-vault's AWS Secrets Manager backend and by sbproxy-ai's AWS
+SigV4 request signer for Bedrock and SageMaker.
 
 ===========================================================================
 

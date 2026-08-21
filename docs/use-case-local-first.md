@@ -1,6 +1,6 @@
 # You bought a GPU. Prove it pays for itself.
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 > **Compatibility form:** This walkthrough still uses provider `serve:`. Prefer `proxy.model_host` + `provider_type: managed_model` for new deployments; see [model-host.md](model-host.md) and [`examples/model-host-managed/`](../examples/model-host-managed/).
 
@@ -8,7 +8,7 @@
 
 The recording above shows provider failover between two hosted providers, the closest recorded behavior to this story's local-to-cloud spill. The local-first recording is still to come.
 
-The card is racked, the driver loads, and most of your prompts would run fine on it. But traffic spikes past what one GPU can serve, a few requests genuinely need a frontier model, and finance keeps asking whether the hardware was worth it. SBproxy's pitch is "Call any model. Serve your own. Govern both.": one Apache-2.0 binary that routes to 72 providers or runs the weights on your own GPUs. This page uses both halves at once, and the ledger that comes with them answers the finance question.
+The card is racked, the driver loads, and most of your prompts would run fine on it. But traffic spikes past what one GPU can serve, a few requests genuinely need a frontier model, and finance keeps asking whether the hardware was worth it. SBproxy's pitch is "Call any model. Serve your own. Govern both.": one Apache-2.0 binary that routes to 70 providers or runs the weights on your own GPUs. This page uses both halves at once, and the ledger that comes with them answers the finance question.
 
 ## What you will build
 
