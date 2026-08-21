@@ -1704,7 +1704,11 @@ fn record_worker_delta(observed: &ObservedStatus, current: WorkerStatus) {
             previous.stage_failures.purge_envelopes,
         ),
     ] {
-        record_payment_recovery(operation, "failed", failures.saturating_sub(previous_failures));
+        record_payment_recovery(
+            operation,
+            "failed",
+            failures.saturating_sub(previous_failures),
+        );
     }
     record_payment_worker_ticks(current.ticks.saturating_sub(previous.ticks));
 

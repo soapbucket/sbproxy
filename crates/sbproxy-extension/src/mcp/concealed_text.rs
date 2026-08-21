@@ -118,9 +118,7 @@ impl ConcealmentClass {
             '\u{00ad}' | '\u{180e}' => Some(Self::ZeroWidth),
             '\u{2061}'..='\u{2064}' | '\u{fff9}'..='\u{fffb}' => Some(Self::ZeroWidth),
             // Variation Selectors and Variation Selectors Supplement.
-            '\u{fe00}'..='\u{fe0f}' | '\u{e0100}'..='\u{e01ef}' => {
-                Some(Self::VariationSelector)
-            }
+            '\u{fe00}'..='\u{fe0f}' | '\u{e0100}'..='\u{e01ef}' => Some(Self::VariationSelector),
             '\t' | '\n' | '\r' => None,
             other if other.is_control() => Some(Self::OtherControl),
             _ => None,
@@ -281,7 +279,10 @@ mod tests {
             concealment_classes("Deploy \u{2705}\u{fe0f}"),
             vec![ConcealmentClass::VariationSelector]
         );
-        assert_eq!(strip_concealed("Deploy \u{2705}\u{fe0f}"), "Deploy \u{2705}");
+        assert_eq!(
+            strip_concealed("Deploy \u{2705}\u{fe0f}"),
+            "Deploy \u{2705}"
+        );
     }
 
     /// A CJK ideographic variation sequence classifies too, and that is

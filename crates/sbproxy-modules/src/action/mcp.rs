@@ -4404,9 +4404,9 @@ impl McpAction {
         let mut policies: Vec<(&String, &ToolAccessPolicy)> = cfg.rbac_policies.iter().collect();
         policies.sort_by(|(left, _), (right, _)| left.cmp(right));
         for (label, policy) in policies {
-            policy
-                .validate_quota_windows()
-                .map_err(|error| anyhow::anyhow!("mcp action: rbac_policies['{label}']: {error}"))?;
+            policy.validate_quota_windows().map_err(|error| {
+                anyhow::anyhow!("mcp action: rbac_policies['{label}']: {error}")
+            })?;
         }
 
         // WOR-2384 fix round 1, item 1 (critical): federation's
