@@ -13,7 +13,7 @@
 //! - `block_list`: keys in this set always evaluate `false`.
 //! - `allow_list`: keys in this set always evaluate `true`.
 //! - `rollout_percent`: sticky FNV-1a bucketing on
-//!   `hash(flag_name + key) % 100`.
+//!   `fnv1a64(flag_name + "|" + key) % 100`.
 //! - `segments`: `true` when the request's segment label matches one
 //!   of the configured values.
 //!
@@ -36,8 +36,12 @@ pub struct FlagRule {
     #[serde(default)]
     pub block_list: HashSet<String>,
     /// 0 to 100 sticky-bucket cutoff. A request's bucket is
-    /// `xxhash(flag_name + key) % 100`. The flag is `true` when
+    /// `fnv1a64(flag_name + "|" + key) % 100`. The flag is `true` when
     /// `bucket < rollout_percent`.
+    ///
+    /// The `|` separator byte is mixed into the hash between the two
+    /// strings, so a cohort-preview tool that concatenates them
+    /// without it computes a different bucket than the proxy does.
     #[serde(default)]
     pub rollout_percent: u32,
     /// Segment labels that always evaluate `true`.
@@ -139,8 +143,10 @@ fn evaluate(flag: &FlagConfig, key: &str, segment: Option<&str>) -> bool {
 }
 
 /// Map `(flag_name, key)` deterministically into `[0, 100)`. Uses a
-/// FNV-1a 64-bit hash followed by `% 100` so the same pair always
-/// lands in the same bucket regardless of process restart.
+/// FNV-1a 64-bit hash over `flag_name`, a `|` separator byte, then
+/// `key`, followed by `% 100`, so the same pair always lands in the
+/// same bucket regardless of process restart. The separator is what
+/// keeps `("ab", "c")` and `("a", "bc")` in different buckets.
 fn sticky_bucket(flag_name: &str, key: &str) -> u32 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -405,5 +411,48 @@ mod tests {
         }
         writer.join().expect("writer should finish");
         set_global_store(previous);
+    }
+
+    /// The documented formula has to be the one the proxy runs.
+    ///
+    /// `FlagRule::rollout_percent` said `xxhash(flag_name + key) % 100`
+    /// while `sticky_bucket` was FNV-1a over `flag_name`, a `|`, then
+    /// `key`. An operator pre-warming a canary reproduced the doc and
+    /// pre-warmed the wrong cohort. This recomputes the documented
+    /// formula independently, the way an external cohort-preview tool
+    /// would, and refuses to let the two drift again.
+    #[test]
+    fn sticky_bucket_matches_the_documented_fnv1a_formula() {
+        fn documented_bucket(flag_name: &str, key: &str) -> u32 {
+            let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+            let mut mix = |bytes: &[u8]| {
+                for byte in bytes {
+                    hash ^= u64::from(*byte);
+                    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            };
+            mix(flag_name.as_bytes());
+            mix(b"|");
+            mix(key.as_bytes());
+            (hash % 100) as u32
+        }
+
+        for (flag_name, key) in [
+            ("new-ui", "tenant-7"),
+            ("", ""),
+            ("a", "bc"),
+            ("checkout-v2", "acct_000000000000"),
+        ] {
+            assert_eq!(
+                sticky_bucket(flag_name, key),
+                documented_bucket(flag_name, key),
+                "{flag_name:?}/{key:?}",
+            );
+        }
+        // Pinned so a change to the hash is a change to this test.
+        assert_eq!(sticky_bucket("new-ui", "tenant-7"), 26);
+        // The separator is load bearing: without it these two pairs
+        // would hash identically.
+        assert_ne!(sticky_bucket("ab", "c"), sticky_bucket("a", "bc"));
     }
 }
