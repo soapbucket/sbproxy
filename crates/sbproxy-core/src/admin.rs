@@ -686,8 +686,14 @@ fn routing_entry_time(entry: &RoutingDecisionEntry) -> Option<chrono::DateTime<c
 /// config changes. Reads after the first miss for a revision return the
 /// cached bytes directly.
 struct OpenApiCache {
-    /// Revision tag of the pipeline that produced the cached bytes.
-    revision: String,
+    /// Pipeline generation that produced the cached bytes.
+    ///
+    /// Not `config_revision`: that is an origin-set identity hash and
+    /// holds still across a reload that changes auth, forward rules or
+    /// a deprecation block, all of which change this document. Keyed
+    /// on it, the cache served the pre-reload spec for the life of the
+    /// process on any config whose hostnames did not move.
+    generation: u64,
     /// Cached JSON rendering, populated on first JSON request for a revision.
     json: Option<String>,
     /// Cached YAML rendering, populated on first YAML request for a revision.
@@ -697,7 +703,10 @@ struct OpenApiCache {
 impl OpenApiCache {
     fn empty() -> Self {
         Self {
-            revision: String::new(),
+            // No generation can equal this, so the first request for
+            // either format is always a miss rather than a hit on an
+            // empty body.
+            generation: u64::MAX,
             json: None,
             yaml: None,
         }
@@ -1512,23 +1521,34 @@ fn handle_owasp_api_pack() -> (u16, &'static str, String) {
 
 /// Render the live pipeline's OpenAPI document as JSON or YAML.
 ///
-/// The render is cached per `config_revision` on the supplied
-/// `AdminState` so back-to-back requests return the cached bytes. The
-/// cache invalidates whenever the live pipeline's revision changes
-/// (i.e. on hot reload).
+/// The render is cached per pipeline generation on the supplied
+/// `AdminState` so back-to-back requests return the cached bytes, and
+/// every hot reload invalidates it.
 fn render_openapi(state: &AdminState, yaml: bool) -> Result<String, String> {
+    // Generation first, pipeline second. A swap landing between the two
+    // reads then renders the newer pipeline under the older generation,
+    // and the next request sees the bump and re-renders. Reading them
+    // the other way round caches the older pipeline's document under
+    // the newer generation, which is served until the reload after it.
+    //
+    // This ordering argument only holds because `load_pipeline`
+    // advances the generation strictly after the pipeline store swap
+    // (see `advance_config_version`). With the bump before the store,
+    // no read order here would be safe: this one would see the new
+    // generation while the old pipeline was still installed and cache
+    // the stale document under it.
+    let generation = crate::reload::pipeline_generation();
     let pipeline = crate::reload::current_pipeline();
-    let revision = pipeline.config_revision.clone();
 
     let mut cache = state
         .openapi_cache
         .lock()
         .expect("openapi cache mutex poisoned");
-    if cache.revision != revision {
+    if cache.generation != generation {
         // Stale: drop both renderings; we'll repopulate the requested
         // format below and let the other format lazy-build on its
         // first request.
-        cache.revision = revision;
+        cache.generation = generation;
         cache.json = None;
         cache.yaml = None;
     }

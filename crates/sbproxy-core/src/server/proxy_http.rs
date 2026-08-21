@@ -707,6 +707,28 @@ fn hold_request_body_chunk(body: &mut Option<Bytes>) {
     *body = Some(Bytes::new());
 }
 
+/// Stable one-word label for a `content_digest` refusal, for the log
+/// line and the deny reason.
+///
+/// The `VerifyOutcome` variants are the policy's own vocabulary;
+/// this maps them to snake_case tokens an operator can grep for and
+/// an alert rule can match on. The two pass outcomes are named too so
+/// the match stays exhaustive and a new variant fails the build here
+/// rather than silently logging the wrong word.
+fn content_digest_outcome_label(
+    outcome: &sbproxy_modules::ContentDigestVerifyOutcome,
+) -> &'static str {
+    use sbproxy_modules::ContentDigestVerifyOutcome as Outcome;
+    match outcome {
+        Outcome::Verified => "verified",
+        Outcome::Skipped => "skipped",
+        Outcome::MissingRequired => "missing_required",
+        Outcome::Malformed => "malformed",
+        Outcome::UnsupportedAlgorithm => "unsupported_algorithm",
+        Outcome::Mismatch => "mismatch",
+    }
+}
+
 /// The transform that forbids skipping when the body outgrows the
 /// buffer, if any.
 ///
@@ -4246,6 +4268,12 @@ impl ProxyHttp for SbProxy {
                     let path = session.req_header().uri.path();
                     let (headers, nonce) = sec.resolved_headers_for_request(path);
                     for (name, value) in headers {
+                        if let Some(mode) = crate::server::csp_emission_mode(&name) {
+                            sbproxy_observe::metrics::record_security_headers_csp_emitted(
+                                mode,
+                                ctx.tenant_id.as_ref(),
+                            );
+                        }
                         to_set.push((name, value));
                     }
                     if let Some(n) = nonce {
@@ -5791,6 +5819,50 @@ impl ProxyHttp for SbProxy {
                                             ),
                                         })
                                         .to_string();
+                                        tracing::warn!(
+                                            target: "sbproxy::content_digest",
+                                            reason = "body_over_cap",
+                                            status = 413,
+                                            received = representation_body.len(),
+                                            cap = cd.max_body_bytes,
+                                            "content_digest refused the request body"
+                                        );
+                                        sbproxy_observe::metrics::record_policy(
+                                            ctx.hostname.as_str(),
+                                            "content_digest",
+                                            "deny",
+                                        );
+                                        ctx.record_policy_decision("content_digest", "deny");
+                                        if ctx.deny_reason.is_none() {
+                                            ctx.deny_reason =
+                                                Some("content_digest: body_over_cap".to_string());
+                                        }
+                                        // The header-phase refusal rides the shared
+                                        // policy-deny path and gets its
+                                        // SecurityAuditEntry there; the body-phase
+                                        // refusals emit their own or the SIEM never
+                                        // sees the tampered-body case this policy
+                                        // exists for.
+                                        sbproxy_observe::SecurityAuditEntry::policy_violation(
+                                            "content_digest",
+                                            format!(
+                                                "body_over_cap: received {}, cap {}",
+                                                representation_body.len(),
+                                                cd.max_body_bytes
+                                            ),
+                                            413,
+                                            Some(ctx.hostname.to_string()),
+                                            ctx.client_ip,
+                                            Some(ctx.request_id.to_string()),
+                                            Some(session.req_header().method.as_str().to_string()),
+                                        )
+                                        .with_tenant_id(ctx.tenant_id.to_string())
+                                        .with_key_context(
+                                            ctx.native_key_provider.clone(),
+                                            ctx.inbound_key_mode.as_str(),
+                                        )
+                                        .with_api_key_id(ctx.accountable_key_id())
+                                        .emit();
                                         failed =
                                             Some((413, body_str, "application/json".to_string()));
                                         break;
@@ -5805,11 +5877,17 @@ impl ProxyHttp for SbProxy {
                                     // the client sent. `Content-Digest`
                                     // wins on a tie since clients that
                                     // know to set both prefer it.
-                                    let req_headers = &session.req_header().headers;
-                                    let header_value = req_headers
-                                        .get("content-digest")
-                                        .or_else(|| req_headers.get("repr-digest"))
-                                        .and_then(|v| v.to_str().ok());
+                                    //
+                                    // WOR-2528: the lookup lives in
+                                    // `builtin_enforcers::content_digest`
+                                    // so this phase and the header phase
+                                    // that now refuses `on_missing:
+                                    // require` provably agree on what
+                                    // "absent" means.
+                                    let header_value =
+                                        crate::builtin_enforcers::content_digest::inbound_digest_header(
+                                            &session.req_header().headers,
+                                        );
                                     let outcome = cd.verify(header_value, representation_body);
                                     // WOR-805 PR2: on a verified body,
                                     // stamp the audit flag so the
@@ -5823,7 +5901,59 @@ impl ProxyHttp for SbProxy {
                                     ) {
                                         ctx.content_digest_verified = true;
                                     }
+                                    // Computed before the move into
+                                    // `rejection_envelope`, which takes
+                                    // the outcome by value.
+                                    let reason = content_digest_outcome_label(&outcome);
                                     if let Some(envelope) = cd.rejection_envelope(outcome) {
+                                        // WOR-2528: a refusal nobody
+                                        // counts is a refusal nobody can
+                                        // alert on. The header-phase
+                                        // branch gets its metric from
+                                        // the policy dispatcher for
+                                        // free; the body-phase branches
+                                        // (mismatch, malformed,
+                                        // unsupported algorithm, and the
+                                        // 413 cap above) had none at
+                                        // all, so they record their own
+                                        // here and name the outcome in
+                                        // the log rather than leaving
+                                        // the generic "request body
+                                        // validator rejected" debug line
+                                        // as the only trace.
+                                        tracing::warn!(
+                                            target: "sbproxy::content_digest",
+                                            reason = reason,
+                                            status = envelope.0,
+                                            "content_digest refused the request body"
+                                        );
+                                        sbproxy_observe::metrics::record_policy(
+                                            ctx.hostname.as_str(),
+                                            "content_digest",
+                                            "deny",
+                                        );
+                                        ctx.record_policy_decision("content_digest", "deny");
+                                        if ctx.deny_reason.is_none() {
+                                            ctx.deny_reason =
+                                                Some(format!("content_digest: {reason}"));
+                                        }
+                                        // Same SIEM parity as the over-cap refusal above.
+                                        sbproxy_observe::SecurityAuditEntry::policy_violation(
+                                            "content_digest",
+                                            reason,
+                                            envelope.0,
+                                            Some(ctx.hostname.to_string()),
+                                            ctx.client_ip,
+                                            Some(ctx.request_id.to_string()),
+                                            Some(session.req_header().method.as_str().to_string()),
+                                        )
+                                        .with_tenant_id(ctx.tenant_id.to_string())
+                                        .with_key_context(
+                                            ctx.native_key_provider.clone(),
+                                            ctx.inbound_key_mode.as_str(),
+                                        )
+                                        .with_api_key_id(ctx.accountable_key_id())
+                                        .emit();
                                         failed = Some(envelope);
                                         break;
                                     }
@@ -5934,6 +6064,10 @@ impl ProxyHttp for SbProxy {
                                                 p, route, a2a, parsed, &collected, audit,
                                             )
                                         {
+                                            sbproxy_observe::metrics::record_prompt_injection_block(
+                                                "a2a",
+                                                ctx.tenant_id.as_ref(),
+                                            );
                                             ctx.deny_policy_type = Some(rejection.deny_policy_type);
                                             failed = Some((
                                                 rejection.status,
@@ -5973,10 +6107,15 @@ impl ProxyHttp for SbProxy {
                                     {
                                         match p.action() {
                                             PromptInjectionAction::Block => {
+                                                sbproxy_observe::metrics::record_prompt_injection_block(
+                                                    "body_scan",
+                                                    ctx.tenant_id.as_ref(),
+                                                );
                                                 tracing::warn!(
                                                     target: "sbproxy::prompt_injection_v2",
                                                     score = %result.score,
                                                     label = %result.label,
+                                                    scan_path = "body_scan",
                                                     "blocked: detector matched request body"
                                                 );
                                                 // WOR-2159: honour the
@@ -6033,8 +6172,20 @@ impl ProxyHttp for SbProxy {
                     ctx.validator_failed = Some((status, body_str, ct));
                     // Returning an error sends Pingora into
                     // fail_to_proxy, where we synthesise the typed
-                    // rejection response. We never contact the
-                    // upstream.
+                    // rejection response.
+                    //
+                    // The upstream never sees the body. It has,
+                    // however, already been dialed: `request_body_filter`
+                    // runs after `upstream_peer` has picked a peer and
+                    // the connection is up, so every refusal decided
+                    // here costs one upstream dial. That is inherent to
+                    // deciding on the body. A verdict that does not need
+                    // the body does not belong in this phase at all;
+                    // WOR-2528 moved `content_digest`'s `on_missing:
+                    // require` branch into the header phase for exactly
+                    // that reason. This comment used to claim the
+                    // upstream was never contacted, which was never true
+                    // for any policy funnelling through here.
                     return Err(pingora_error::Error::explain(
                         pingora_error::ErrorType::HTTPStatus(status),
                         "request body failed schema validation",

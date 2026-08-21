@@ -91,15 +91,6 @@ impl ContentSecurityPolicySpec {
             Self::Detailed(_) => None,
         }
     }
-
-    /// Returns true if this spec requires per-request processing (nonce or
-    /// dynamic routes). Simple string specs never require it.
-    pub fn requires_per_request_build(&self) -> bool {
-        match self {
-            Self::Simple(_) => false,
-            Self::Detailed(d) => d.enable_nonce || !d.dynamic_routes.is_empty(),
-        }
-    }
 }
 
 /// Generate a base64-encoded 16-byte random nonce for CSP.
@@ -195,20 +186,37 @@ impl SecHeadersPolicy {
             .map(|a| !a.is_empty())
             .unwrap_or(false);
 
+        // `flat` is `value` with the Go-compat nested CSP spelling folded
+        // into the canonical one. `value` itself is left untouched, because
+        // the nested reader at the bottom still has to see what the operator
+        // actually wrote.
+        let flat = Self::fold_nested_csp(&value);
+
         if has_headers_array {
             // New canonical format - deserialize directly.
-            return serde_json::from_value::<Self>(value)
-                .map_err(|e| anyhow::anyhow!("security_headers parse error: {}", e));
+            let policy = serde_json::from_value::<Self>(flat)
+                .map_err(|e| anyhow::anyhow!("security_headers parse error: {}", e))?;
+            policy.validate()?;
+            return Ok(policy);
         }
 
         // Try flat legacy format first.
-        if let Ok(policy) = serde_json::from_value::<Self>(value.clone()) {
-            // Log deprecation warning if any legacy fields are set.
+        if let Ok(policy) = serde_json::from_value::<Self>(flat) {
+            policy.validate()?;
+            // Log deprecation warning if any legacy fields are set. The
+            // detailed `content_security_policy` object is deliberately not
+            // on this list: it is the documented way to ask for a nonce,
+            // report-only mode, a report URI, or per-route overrides, none
+            // of which a `headers:` entry can express. Only the plain-string
+            // shortcut form is a legacy spelling of a static header.
             if policy.x_frame_options.is_some()
                 || policy.x_content_type_options.is_some()
                 || policy.x_xss_protection.is_some()
                 || policy.referrer_policy.is_some()
-                || policy.content_security_policy.is_some()
+                || matches!(
+                    policy.content_security_policy,
+                    Some(ContentSecurityPolicySpec::Simple(_))
+                )
                 || policy.permissions_policy.is_some()
                 || policy.strict_transport_security.is_some()
             {
@@ -220,16 +228,197 @@ impl SecHeadersPolicy {
             return Ok(policy);
         }
         // Fall back to Go nested format.
-        Self::from_nested_config(&value)
+        let policy = Self::from_nested_config(&value)?;
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    /// Fold the Go-compat nested CSP spelling into the canonical one.
+    ///
+    /// The nested form writes a CSP as `{enabled: bool, policy: "..."}`.
+    /// [`ContentSecurityPolicy`] has no `enabled` field and does not deny
+    /// unknown keys, so that same object also deserializes as a detailed
+    /// spec, with `enabled` dropped on the floor. The two readers therefore
+    /// disagree about what `{enabled: false}` means: the nested one reads a
+    /// deliberately disabled CSP, the flat one reads a CSP with an empty
+    /// policy string.
+    ///
+    /// That disagreement was harmless only while an empty policy was a
+    /// silent no-op. Now that [`Self::validate`] refuses a block that can
+    /// emit no header, a config saying `enabled: false` would be refused
+    /// with an error about a missing `policy:` string, which is both wrong
+    /// and confusing, and it would never reach the nested reader that
+    /// understands it. Resolve the spelling before any parse decides.
+    ///
+    /// `enabled: true` keeps every other key rather than collapsing to a
+    /// plain string: an operator who mixed the two spellings should not
+    /// lose `enable_nonce` or `report_only` to this.
+    fn fold_nested_csp(value: &serde_json::Value) -> serde_json::Value {
+        let mut out = value.clone();
+        let Some(obj) = out.as_object_mut() else {
+            return out;
+        };
+        let Some(csp) = obj.get_mut("content_security_policy") else {
+            return out;
+        };
+        let Some(csp_obj) = csp.as_object_mut() else {
+            return out;
+        };
+        let Some(enabled) = csp_obj.remove("enabled") else {
+            return out;
+        };
+        if enabled.as_bool() != Some(true) {
+            obj.remove("content_security_policy");
+        }
+        out
+    }
+
+    /// Reject or flag configurations whose stated intent cannot be honored.
+    ///
+    /// Two silent drops motivated this (WOR-2526). A `content_security_policy`
+    /// block used to be discarded whenever a `headers:` array was also present
+    /// and `enable_nonce` was false, and a CSP block with an empty `policy`
+    /// string emitted nothing at all. Both looked like an accepted config and
+    /// shipped a response with no CSP.
+    ///
+    /// The block and the array now merge, so the only combination left that
+    /// has no single honest answer is a CSP authored in *both* places. That is
+    /// refused here rather than resolved quietly, because picking a winner
+    /// silently is what produced the original bug.
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.content_security_policy.is_some() {
+            if let Some(dup) = self.headers.iter().find(|h| {
+                let n = h.name.to_ascii_lowercase();
+                n == "content-security-policy" || n == "content-security-policy-report-only"
+            }) {
+                anyhow::bail!(
+                    "security_headers: `{}` is set in the `headers:` array and a \
+                     `content_security_policy:` block is set as well. Only one of them can \
+                     define the policy. Use `content_security_policy:` when you need a nonce, \
+                     report-only mode, a report URI, or per-route overrides; use the \
+                     `headers:` entry for a plain static policy. Refusing rather than \
+                     silently dropping one of them.",
+                    dup.name
+                );
+            }
+        }
+
+        if let Some(spec) = &self.content_security_policy {
+            let emits_nothing = match spec {
+                ContentSecurityPolicySpec::Simple(s) => s.trim().is_empty(),
+                ContentSecurityPolicySpec::Detailed(d) => {
+                    d.policy.trim().is_empty() && d.dynamic_routes.is_empty()
+                }
+            };
+            anyhow::ensure!(
+                !emits_nothing,
+                "security_headers: `content_security_policy` is set but its `policy` string is \
+                 empty and no `dynamic_routes` are defined, so no Content-Security-Policy \
+                 header can ever be emitted. Set `policy:` or drop the block."
+            );
+        }
+
+        // A non-empty `headers:` array supersedes the legacy flat shortcuts
+        // (documented precedence), but doing so without a word is the same
+        // silent-drop shape as the CSP bug. Name the fields that will not be
+        // emitted. This is a warning, not a refusal: the precedence is
+        // long-standing and configs depend on it.
+        if !self.headers.is_empty() {
+            let mut superseded: Vec<&str> = Vec::new();
+            for (name, set) in [
+                ("x_frame_options", self.x_frame_options.is_some()),
+                (
+                    "x_content_type_options",
+                    self.x_content_type_options.is_some(),
+                ),
+                ("x_xss_protection", self.x_xss_protection.is_some()),
+                ("referrer_policy", self.referrer_policy.is_some()),
+                ("permissions_policy", self.permissions_policy.is_some()),
+                (
+                    "strict_transport_security",
+                    self.strict_transport_security.is_some(),
+                ),
+            ] {
+                if set {
+                    superseded.push(name);
+                }
+            }
+            if !superseded.is_empty() {
+                tracing::warn!(
+                    target: "sbproxy::security_headers",
+                    superseded = %superseded.join(", "),
+                    "security_headers: the `headers:` array supersedes these legacy flat \
+                     fields, so they will not be emitted. Move them into `headers:` as \
+                     {{name, value}} entries."
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Build the Content-Security-Policy header for one request path.
+    ///
+    /// This is the single place a CSP header value is produced. Both config
+    /// shapes (the plain policy string and the detailed object) and every
+    /// knob on the detailed one (`enable_nonce`, `report_only`, `report_uri`,
+    /// `dynamic_routes`) run through it, so the emitted header no longer
+    /// depends on which internal path happened to run (WOR-2526).
+    ///
+    /// Returns the header name, its value, and the generated nonce if the
+    /// resolved policy asked for one. `None` means this policy configures no
+    /// CSP, or configures one that resolves to an empty policy string for
+    /// this path.
+    fn csp_for_path(&self, path: &str) -> Option<(&'static str, String, Option<String>)> {
+        let resolved = match self.content_security_policy.as_ref()? {
+            // A plain string carries no nonce, report-only, or route
+            // overrides by construction; emit it as an enforcing policy.
+            ContentSecurityPolicySpec::Simple(s) if !s.trim().is_empty() => {
+                return Some(("content-security-policy", s.clone(), None));
+            }
+            ContentSecurityPolicySpec::Simple(_) => return None,
+            ContentSecurityPolicySpec::Detailed(d) => d.resolve_for_path(path),
+        };
+
+        let nonce = if resolved.enable_nonce {
+            generate_csp_nonce()
+        } else {
+            None
+        };
+        let mut value = match &nonce {
+            Some(n) => inject_nonce_into_policy(&resolved.policy, n),
+            None => resolved.policy.clone(),
+        };
+        // An empty policy string means this path opts out; appending a
+        // report-uri to nothing would emit a header with no directives.
+        if value.trim().is_empty() {
+            return None;
+        }
+        if !resolved.report_uri.is_empty() {
+            value.push_str("; report-uri ");
+            value.push_str(&resolved.report_uri);
+        }
+        let name = if resolved.report_only {
+            "content-security-policy-report-only"
+        } else {
+            "content-security-policy"
+        };
+        Some((name, value, nonce))
     }
 
     /// Resolve all headers to inject, merging canonical `headers` array with
     /// legacy flat fields. The `headers` array takes precedence; legacy fields
     /// are appended only when the canonical array is empty.
     ///
-    /// This method does not handle CSP nonce generation or dynamic routes.
-    /// Callers that need per-request features should use
-    /// [`resolved_headers_for_request`](Self::resolved_headers_for_request).
+    /// This method does not build the Content-Security-Policy header. The CSP
+    /// entry it returns from the legacy fallback below is a static
+    /// best-effort that [`resolved_headers_for_request`] always replaces with
+    /// the properly built one. Response paths must call
+    /// [`resolved_headers_for_request`] and never this method directly, or
+    /// they will drop nonce, report-only, report-uri, and per-route CSP
+    /// handling on the floor.
+    ///
+    /// [`resolved_headers_for_request`]: Self::resolved_headers_for_request
     pub(crate) fn resolved_headers(&self) -> Vec<(String, String)> {
         if !self.headers.is_empty() {
             return self
@@ -278,53 +467,27 @@ impl SecHeadersPolicy {
         &self,
         path: &str,
     ) -> (Vec<(String, String)>, Option<String>) {
-        // If the CSP spec doesn't need per-request processing, the static
-        // resolution is already correct.
-        let needs_rich = matches!(
-            self.content_security_policy.as_ref(),
-            Some(spec) if spec.requires_per_request_build()
-        );
-        if !needs_rich {
-            return (self.resolved_headers(), None);
-        }
-
-        // Start from the static list, then remove any CSP header (we'll
-        // rebuild it) and append the rich version.
         let mut headers = self.resolved_headers();
+
+        // The CSP is always built here, not conditionally. Gating this on
+        // "does the spec need per-request work" is what silently dropped a
+        // configured `content_security_policy` whenever a `headers:` array
+        // was also present and `enable_nonce` was false (WOR-2526): the
+        // static path above returns the array verbatim and never reaches the
+        // legacy CSP fallback.
+        let Some((name, value, nonce)) = self.csp_for_path(path) else {
+            return (headers, None);
+        };
+
+        // The `content_security_policy` block is the single source of truth
+        // for this header, so drop whatever the static resolution produced
+        // before pushing the built value. `validate` refuses a config that
+        // authors a CSP in both places, so in practice this only strips the
+        // legacy fallback's own entry.
         headers.retain(|(n, _)| {
             n != "content-security-policy" && n != "content-security-policy-report-only"
         });
-
-        let spec = match self.content_security_policy.as_ref() {
-            Some(ContentSecurityPolicySpec::Detailed(d)) => d,
-            _ => return (headers, None),
-        };
-        let resolved = spec.resolve_for_path(path);
-
-        let nonce = if resolved.enable_nonce {
-            generate_csp_nonce()
-        } else {
-            None
-        };
-
-        let mut value = if let Some(n) = &nonce {
-            inject_nonce_into_policy(&resolved.policy, n)
-        } else {
-            resolved.policy.clone()
-        };
-        if !resolved.report_uri.is_empty() {
-            value.push_str("; report-uri ");
-            value.push_str(&resolved.report_uri);
-        }
-
-        if !value.is_empty() {
-            let name = if resolved.report_only {
-                "content-security-policy-report-only"
-            } else {
-                "content-security-policy"
-            };
-            headers.push((name.to_string(), value));
-        }
+        headers.push((name.to_string(), value));
 
         (headers, nonce)
     }
@@ -679,5 +842,203 @@ mod tests {
         assert!(csp
             .1
             .contains(&format!("style-src 'self' 'nonce-{}'", nonce)));
+    }
+
+    // --- WOR-2526: a configured CSP must never be silently dropped ---
+
+    /// The reported bug. A `headers:` array plus a `content_security_policy`
+    /// block with `enable_nonce: false` used to emit the array and drop the
+    /// CSP entirely, with no error and no warning.
+    #[test]
+    fn csp_ships_alongside_headers_array_without_nonce() {
+        let policy = SecHeadersPolicy::from_config(serde_json::json!({
+            "headers": [
+                {"name": "X-Frame-Options", "value": "DENY"},
+                {"name": "X-Content-Type-Options", "value": "nosniff"}
+            ],
+            "content_security_policy": {
+                "policy": "default-src 'self'; script-src 'self'",
+                "enable_nonce": false,
+                "report_only": false
+            }
+        }))
+        .unwrap();
+
+        let (headers, nonce) = policy.resolved_headers_for_request("/get");
+        assert!(nonce.is_none(), "enable_nonce is false, so no nonce");
+        assert!(
+            headers
+                .iter()
+                .any(|(n, v)| n == "x-frame-options" && v == "DENY"),
+            "the headers: array must still ship: {headers:?}"
+        );
+        assert!(
+            headers.iter().any(|(n, v)| n == "content-security-policy"
+                && v == "default-src 'self'; script-src 'self'"),
+            "the configured content_security_policy must ship alongside the \
+             headers: array: {headers:?}"
+        );
+    }
+
+    /// The plain-string CSP shortcut has the same collision.
+    #[test]
+    fn simple_string_csp_ships_alongside_headers_array() {
+        let policy = SecHeadersPolicy::from_config(serde_json::json!({
+            "headers": [{"name": "X-Frame-Options", "value": "DENY"}],
+            "content_security_policy": "default-src 'self'"
+        }))
+        .unwrap();
+
+        let (headers, _) = policy.resolved_headers_for_request("/");
+        assert!(
+            headers
+                .iter()
+                .any(|(n, v)| n == "content-security-policy" && v == "default-src 'self'"),
+            "a plain-string CSP must ship alongside the headers: array: {headers:?}"
+        );
+    }
+
+    /// Sibling of the reported bug: `report_only` was consulted only on the
+    /// per-request build path, which ran only for `enable_nonce` or
+    /// `dynamic_routes`. An operator asking for report-only monitoring got an
+    /// enforcing CSP instead, and lost `report_uri` with it.
+    #[test]
+    fn csp_report_only_honored_without_nonce() {
+        let policy = SecHeadersPolicy::from_config(serde_json::json!({
+            "content_security_policy": {
+                "policy": "default-src 'self'",
+                "enable_nonce": false,
+                "report_only": true,
+                "report_uri": "https://csp.example.com/report"
+            }
+        }))
+        .unwrap();
+
+        let (headers, _) = policy.resolved_headers_for_request("/");
+        assert!(
+            !headers.iter().any(|(n, _)| n == "content-security-policy"),
+            "report_only must not emit an enforcing CSP: {headers:?}"
+        );
+        let (_, value) = headers
+            .iter()
+            .find(|(n, _)| n == "content-security-policy-report-only")
+            .expect("report_only must emit the report-only header");
+        assert_eq!(
+            value,
+            "default-src 'self'; report-uri https://csp.example.com/report"
+        );
+    }
+
+    /// Authoring the CSP in both places has no honest winner, so the config
+    /// is refused instead of one of them being picked quietly.
+    #[test]
+    fn csp_authored_in_both_places_is_refused() {
+        let err = SecHeadersPolicy::from_config(serde_json::json!({
+            "headers": [
+                {"name": "Content-Security-Policy", "value": "default-src 'none'"}
+            ],
+            "content_security_policy": {"policy": "default-src 'self'"}
+        }))
+        .expect_err("a CSP in both the headers: array and the block must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Content-Security-Policy") && msg.contains("content_security_policy"),
+            "the refusal must name both keys the operator wrote: {msg}"
+        );
+    }
+
+    /// A `headers:` array with a CSP entry and no block stays legal: there is
+    /// nothing ambiguous about it.
+    #[test]
+    fn csp_in_headers_array_alone_is_accepted() {
+        let policy = SecHeadersPolicy::from_config(serde_json::json!({
+            "headers": [
+                {"name": "Content-Security-Policy", "value": "default-src 'none'"}
+            ]
+        }))
+        .unwrap();
+        let (headers, _) = policy.resolved_headers_for_request("/");
+        assert!(headers
+            .iter()
+            .any(|(n, v)| n == "content-security-policy" && v == "default-src 'none'"));
+    }
+
+    /// A CSP block that can never produce a header is a configured control
+    /// that ships nothing. Refuse it at compile rather than serve responses
+    /// with no CSP.
+    #[test]
+    fn csp_block_that_emits_nothing_is_refused() {
+        let err = SecHeadersPolicy::from_config(serde_json::json!({
+            "content_security_policy": {"enable_nonce": true}
+        }))
+        .expect_err("a CSP block with an empty policy must be refused");
+        assert!(
+            err.to_string().contains("policy"),
+            "the refusal must point at the empty `policy` string: {err}"
+        );
+    }
+
+    /// Per-route overrides still work when the outer policy is empty, so the
+    /// empty-policy refusal must not fire on that shape.
+    #[test]
+    fn csp_dynamic_routes_with_empty_outer_policy_is_accepted() {
+        let policy = SecHeadersPolicy::from_config(serde_json::json!({
+            "content_security_policy": {
+                "policy": "",
+                "dynamic_routes": {"/admin": {"policy": "default-src 'none'"}}
+            }
+        }))
+        .unwrap();
+        let (headers, _) = policy.resolved_headers_for_request("/admin");
+        assert!(headers
+            .iter()
+            .any(|(n, v)| n == "content-security-policy" && v == "default-src 'none'"));
+        // A path with no override emits no CSP, which is the documented
+        // meaning of an empty outer policy.
+        let (headers, _) = policy.resolved_headers_for_request("/public");
+        assert!(!headers
+            .iter()
+            .any(|(n, _)| n.starts_with("content-security")));
+    }
+
+    /// The Go-compat nested spelling of a disabled CSP. `enabled: false`
+    /// means "no CSP", and it must not be read as "a CSP with an empty
+    /// policy string" and refused. Before the fold, this config parsed as a
+    /// detailed spec with `enabled` silently discarded, which the
+    /// empty-policy refusal then rejected without ever reaching the nested
+    /// reader that understands the key.
+    #[test]
+    fn nested_csp_disabled_compiles_to_no_policy() {
+        let policy = SecHeadersPolicy::from_config(serde_json::json!({
+            "content_security_policy": {"enabled": false}
+        }))
+        .expect("a disabled nested CSP must compile, not be refused");
+        assert!(policy.content_security_policy.is_none());
+        let (headers, _) = policy.resolved_headers_for_request("/");
+        assert!(!headers
+            .iter()
+            .any(|(n, _)| n.starts_with("content-security")));
+    }
+
+    /// The same spelling with `enabled: true` keeps the policy, and keeps
+    /// the richer keys alongside it rather than collapsing to a bare string.
+    #[test]
+    fn nested_csp_enabled_keeps_the_policy_and_its_knobs() {
+        let policy = SecHeadersPolicy::from_config(serde_json::json!({
+            "content_security_policy": {
+                "enabled": true,
+                "policy": "default-src 'self'",
+                "report_only": true
+            }
+        }))
+        .expect("an enabled nested CSP must compile");
+        let (headers, _) = policy.resolved_headers_for_request("/");
+        assert!(
+            headers
+                .iter()
+                .any(|(n, v)| n == "content-security-policy-report-only"
+                    && v == "default-src 'self'"),
+            "report_only must survive the fold: {headers:?}"
+        );
     }
 }

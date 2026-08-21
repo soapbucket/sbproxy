@@ -915,6 +915,11 @@ class DocCaptureCheckerTests(unittest.TestCase):
         repo_root = Path(__file__).resolve().parent.parent.parent
         for rel, config in self.mod.MANIFEST.items():
             self.assertTrue((repo_root / rel).exists(), f"{rel} is in the manifest but is gone")
+            self.assertTrue(
+                self.mod._has_marker(repo_root / rel),
+                f"{rel} is in the manifest but carries no CAPTURE marker; "
+                "the document glob would drop it from coverage without a word",
+            )
             sections = config.get("sections") or []
             self.assertTrue(sections, f"{rel} has no sections")
             for section in sections:
@@ -923,6 +928,28 @@ class DocCaptureCheckerTests(unittest.TestCase):
                 sections[-1].get("match"),
                 f"{rel}'s last section must be the catch-all, or captures fall through unrouted",
             )
+
+    def test_every_stack_declares_the_ports_it_binds(self) -> None:
+        """A stack missing from STACK_PORTS gets no preflight at all.
+
+        `_busy_ports` is what stops a stack from starting into ports
+        something else already holds, and it reads the port list from
+        `STACK_PORTS`. A starter added without an entry there looks
+        guarded and is not: its proxy loses the bind, the readiness
+        probe is answered by whatever is already listening, and the
+        whole document replays against a foreign proxy without a word
+        of complaint. That is the exact failure the guard exists to
+        catch, so the two maps have to stay in step.
+        """
+        self.assertEqual(
+            sorted(self.mod.STACK_STARTERS),
+            sorted(self.mod.STACK_PORTS),
+            "every stack starter needs a STACK_PORTS entry, and vice versa",
+        )
+        for name, ports in self.mod.STACK_PORTS.items():
+            self.assertTrue(ports, f"{name} declares no ports")
+            for port in ports:
+                self.assertIsInstance(port, int, f"{name} lists a non-integer port")
 
 
 if __name__ == "__main__":

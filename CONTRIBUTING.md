@@ -147,6 +147,35 @@ Run all five before pushing. Each one mirrors a required CI gate; if any fails l
 
 Fix the issue before pushing. Do not paper over with `#[allow(...)]` unless you also write a one-line comment explaining the deliberate exception.
 
+## Changelog entries
+
+Do not edit `CHANGELOG.md`. Its `## [Unreleased]` heading was one shared
+set of lines that every open branch appended to, so every open branch
+conflicted there. Write a fragment instead:
+
+```bash
+python3 scripts/changelog-fragments.py --new fixed \
+  'A `failure_posture: closed` transform now fails the request rather than passing it through.'
+```
+
+That writes one JSON file under [`docs/.changes/`](docs/.changes/), so
+two branches landing the same night produce two files instead of one
+conflict. The release cut assembles them into `CHANGELOG.md` and deletes
+them.
+
+A fragment is required whenever a reader of the release notes would
+change what they do: new config keys, routes, metrics or flags, changed
+behavior or defaults, a bug fix someone could have hit, anything with a
+security consequence, anything removed. It is not required for work no
+operator can observe, such as refactors, tests, CI, or comments.
+[`docs/.changes/README.md`](docs/.changes/README.md) has the schema, the
+type list, and the release command.
+
+`python3 scripts/changelog-fragments.py --check` is the gate. It runs on
+every pull request and refuses a malformed fragment, hand-written
+content under `## [Unreleased]`, and a commit that edits `CHANGELOG.md`
+without touching `docs/.changes/` in the same diff.
+
 ## E2E tests
 
 Two suites ship in-tree. Both run against the release binary:

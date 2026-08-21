@@ -706,6 +706,8 @@ curl -s -u "admin:${SB_ADMIN_PASSWORD}" \
   "${SB_ADMIN_URL}/api/requests/report?group_by=flavor"
 ```
 
+<!-- CAPTURE: curl -s -u admin:demo-change-me 'http://127.0.0.1:9090/api/requests/report?group_by=flavor' -->
+
 ```json
 {"error":"group_by dimensions are model, api_key_id, tenant, user"}
 ```
@@ -729,6 +731,8 @@ curl -s -u "admin:${SB_ADMIN_PASSWORD}" \
   "${SB_ADMIN_URL}/api/requests/report?group_by=model,api_key_id,tenant,user" \
   | python3 -m json.tool
 ```
+
+<!-- CAPTURE: curl -s -u admin:demo-change-me 'http://127.0.0.1:9090/api/requests/report?group_by=model,api_key_id,tenant,user' | python3 -m json.tool -->
 
 ```json
 {
@@ -810,6 +814,8 @@ and human only, which is the cut a cost review usually wants:
 curl -s -u "admin:${SB_ADMIN_PASSWORD}" \
   "${SB_ADMIN_URL}/api/requests/report?group_by=model,user" | python3 -m json.tool
 ```
+
+<!-- CAPTURE: curl -s -u admin:demo-change-me 'http://127.0.0.1:9090/api/requests/report?group_by=model,user' | python3 -m json.tool -->
 
 ```json
 {
@@ -946,6 +952,8 @@ curl -s -u "admin:${SB_ADMIN_PASSWORD}" \
   "${SB_ADMIN_URL}/api/requests/export?format=csv&tenant=acme" | head -3
 ```
 
+<!-- CAPTURE: curl -s -u admin:demo-change-me 'http://127.0.0.1:9090/api/requests/export?format=csv&tenant=acme' | head -3 -->
+
 ```text
 timestamp,origin,method,path,status,latency_ms,client_ip,request_id,trace_id,session_id,parent_session_id,cache_status,retry_count,failover_engaged,failover_from,failover_to,load_balancer_strategy,load_balancer_target,provider,model,tokens_in,tokens_out,cost_usd_micros,guardrail_category,guardrail_action,api_key_id,key_mode,key_provider,tenant_id,user_id,error_class,config_revision,policy_version,deny_reason,policy_decisions,properties
 2026-08-21T01:11:55.226687+00:00,acme.ai.local,POST,/v1/chat/completions,200,1.887458,127.0.0.1:64696,01a021dfe05874f1b6ba866697bd518b,6531cb754eae46b5ba1b255f2c61eadb,,,disabled,0,false,,,round_robin,openai,openai,gpt-4o-mini,120,40,42,,,cfg:4:acme:13:acme.ai.local:acme-research,minted,,acme,sci@acme.test,,8cb4b33d8ffc,c:8cb4b33d8ffc:ae10235dbb7fdde7,,[],"{""feature"":""literature-scan""}"
@@ -964,6 +972,8 @@ curl -s -u "admin:${SB_ADMIN_PASSWORD}" \
   "${SB_ADMIN_URL}/api/requests/export?format=jsonl&user=dev@acme.test" \
   | head -1 | python3 -m json.tool
 ```
+
+<!-- CAPTURE: curl -s -u admin:demo-change-me 'http://127.0.0.1:9090/api/requests/export?format=jsonl&user=dev@acme.test' | head -1 | python3 -m json.tool -->
 
 ```json
 {
@@ -1010,6 +1020,8 @@ Reading the metrics after those two exports:
 curl -s -u "admin:${SB_ADMIN_PASSWORD}" "${SB_ADMIN_URL}/metrics" \
   | grep admin_request_export
 ```
+
+<!-- CAPTURE: curl -s -u admin:demo-change-me 'http://127.0.0.1:9090/metrics' | grep admin_request_export -->
 
 ```text
 # HELP sbproxy_admin_request_export_rows_total Rows written by admin request-log exports, by format
@@ -1141,6 +1153,8 @@ the `route.decide` decision audit records to your log pipeline instead
 ### `GET /api/health`
 
 Aggregate liveness summary. Returns `200` with:
+
+<!-- CAPTURE: curl -sS -u admin:demo-change-me http://127.0.0.1:9090/api/health -->
 
 ```json
 {"status":"ok","origins":[]}

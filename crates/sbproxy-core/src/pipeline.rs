@@ -1819,6 +1819,49 @@ pub struct CompiledPipeline {
     pub listings: sbproxy_config::ListingRegistry,
 }
 
+/// Hash a stable view of the loaded origin set into a `config_revision`.
+///
+/// Webhook receivers, the request log, the access log, the CSV export
+/// and `policy_version`'s prefix all carry this value, and every one of
+/// them reads it as "the config generation that served the request". So
+/// the only property that matters is that it is a pure function of the
+/// config's content: equal content, equal revision, on any process, on
+/// any host, at any time.
+///
+/// The view is the routable hostname set in sorted order, each host
+/// paired with its rank in that same sorted order, prefixed by the
+/// origin count. Rank rather than the index `host_map` stores: those
+/// indices are positions into `CompiledConfig::origins`, and a position
+/// is a property of how the config was loaded rather than of what it
+/// says. WOR-2602 is what that cost. `compile_config` used to walk a
+/// `HashMap` to fill those positions, so three boots of one unchanged
+/// two-origin file reported two revisions, alternating. The compiler
+/// now assigns them in sorted key order, which fixes it at the source;
+/// ranking again here means a later change that reorders `origins` for
+/// its own reasons cannot reopen the same hole.
+///
+/// Byte-perfect fidelity to the config is not the goal and never was:
+/// the contract is "different when the routable surface differs", not
+/// "different when any byte differs".
+fn compute_config_revision(config: &CompiledConfig) -> String {
+    let mut hosts: Vec<&compact_str::CompactString> = config.host_map.keys().collect();
+    hosts.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    let mut buf = Vec::with_capacity(hosts.len() * 32);
+    // `hosts.len()` rather than `config.origins.len()`: the two are
+    // equal for anything `compile_config` built, one insert and one
+    // push per origin, but a hand-assembled `CompiledConfig` can carry
+    // vectors that disagree, and a hash that reads two collections has
+    // two ways to be wrong. This one reads the collection it hashes.
+    buf.extend_from_slice(format!("origins:{}\n", hosts.len()).as_bytes());
+    for (rank, host) in hosts.iter().enumerate() {
+        buf.extend_from_slice(host.as_bytes());
+        buf.push(b'=');
+        buf.extend_from_slice(rank.to_string().as_bytes());
+        buf.push(b'\n');
+    }
+    crate::identity::config_revision(&buf)
+}
+
 fn compile_sensitive_header_names(config: &CompiledConfig) -> HashSet<String> {
     let mut names = sbproxy_config::types::SENSITIVE_HEADER_DENYLIST
         .iter()
@@ -2671,24 +2714,7 @@ impl CompiledPipeline {
             "trusted_proxies",
         )?;
 
-        // Hash a stable view of the loaded origin set so webhook
-        // receivers can tell which config revision fired the event. We
-        // use the host_map (which is sorted hostnames) plus origin
-        // count so the revision changes whenever the routable surface
-        // changes; we don't need byte-perfect fidelity, only "different
-        // when the config differs."
-        let mut keyed: Vec<(&compact_str::CompactString, &usize)> =
-            config.host_map.iter().collect();
-        keyed.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
-        let mut buf = Vec::with_capacity(keyed.len() * 32);
-        buf.extend_from_slice(format!("origins:{}\n", config.origins.len()).as_bytes());
-        for (host, idx) in keyed {
-            buf.extend_from_slice(host.as_bytes());
-            buf.push(b'=');
-            buf.extend_from_slice(idx.to_string().as_bytes());
-            buf.push(b'\n');
-        }
-        let config_revision = crate::identity::config_revision(&buf);
+        let config_revision = compute_config_revision(&config);
 
         // Wave 5 day-6 Item 3: lift TLS-fingerprint config off
         // proxy.extensions[tls_fingerprint] (which the day-6 Item 2
@@ -4517,6 +4543,128 @@ mod tests {
     use sbproxy_plugin::{ExtensionHookKind, ExtensionState};
     use std::collections::HashMap;
     use tempfile::TempDir;
+
+    /// One unchanged multi-origin config hashes to one revision.
+    ///
+    /// WOR-2602. `config_revision` rides the request log, the access
+    /// log, the CSV export, webhook envelopes and `policy_version`'s
+    /// prefix, and every one of those readers takes it to mean "the
+    /// config generation that served this". It used to be a function of
+    /// `HashMap` iteration order instead: the hashed view paired each
+    /// sorted hostname with its position in `CompiledConfig::origins`,
+    /// and the compiler filled those positions by walking a `HashMap`.
+    /// Three boots of one unchanged two-origin file reported
+    /// `8cb4b33d8ffc` and `cf7ba3e14142`, alternating.
+    ///
+    /// Four origins and 128 compiles walk the map-order space: four
+    /// origins give 24 index permutations, and `RandomState` bumps its
+    /// seed per map instance within a thread, so each compile is a
+    /// fresh draw rather than a repeat of the first one. What a green
+    /// run proves is that nothing on the whole compile-to-revision
+    /// path reads that order anymore. It is deliberately not the red
+    /// test for the compiler seam: `compute_config_revision` ranks
+    /// hostnames internally, so this assertion holds even over a
+    /// compiler that assigns indices in map order. The test that goes
+    /// red on that regression is the compiler's own
+    /// `repeated_compiles_assign_the_same_origin_indices`; this one
+    /// exists so the end-to-end contract keeps a pin of its own if the
+    /// hash input ever grows a new order-sensitive component.
+    #[test]
+    fn one_unchanged_multi_origin_config_hashes_to_one_revision() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  alpha.test.sbproxy.dev:
+    action:
+      type: proxy
+      url: http://localhost:3001
+  bravo.test.sbproxy.dev:
+    action:
+      type: proxy
+      url: http://localhost:3002
+  charlie.test.sbproxy.dev:
+    action:
+      type: proxy
+      url: http://localhost:3003
+  delta.test.sbproxy.dev:
+    action:
+      type: proxy
+      url: http://localhost:3004
+"#;
+
+        let mut revisions = std::collections::BTreeSet::new();
+        for _ in 0..128 {
+            let config =
+                sbproxy_config::compile_config(yaml).expect("multi-origin fixture compiles");
+            revisions.insert(compute_config_revision(&config));
+        }
+
+        assert_eq!(
+            revisions.len(),
+            1,
+            "one unchanged config must hash to one revision, saw {revisions:?}"
+        );
+        // The value, not just its stability. Asserting only "one
+        // distinct revision" would stay green through a rewrite of the
+        // serialization itself, and that serialization is what pins
+        // `8f10eba811d1` and `8cb4b33d8ffc` into the pages under
+        // `scripts/check-doc-captures.py` and into every signed
+        // metering receipt already issued. Changing it is a decision,
+        // so it should have to be made here rather than happen.
+        assert_eq!(
+            revisions.iter().next().map(String::as_str),
+            Some("9e1c694ee344"),
+            "the revision for this fixture is a published constant"
+        );
+    }
+
+    /// A revision holds still when only an origin's behavior changes.
+    ///
+    /// This is the shape of the value rather than a gap in it: the
+    /// hashed view is the routable hostname set, so the revision
+    /// answers "is this the same routable surface" and not "is this
+    /// the same file". Same hostnames, same revision, however different
+    /// the auth, policies, transforms or upstreams behind them.
+    ///
+    /// It is asserted because things keep trying to key caches on it.
+    /// `render_openapi` did, and served the pre-reload document for the
+    /// life of the process on any config whose hostnames did not move;
+    /// it keys on the pipeline generation now. Anything asking "has the
+    /// loaded config drifted from the file" wants the config content
+    /// hash behind `/admin/drift`, which is a hash of the bytes.
+    #[test]
+    fn a_revision_holds_still_when_only_an_origins_behavior_changes() {
+        let bare = r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  app.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3001
+"#;
+        let with_auth = r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  app.example.com:
+    auth:
+      type: api_key
+      keys: ["secret-one"]
+    action:
+      type: proxy
+      url: http://localhost:3001
+"#;
+
+        let bare = sbproxy_config::compile_config(bare).expect("bare fixture compiles");
+        let with_auth = sbproxy_config::compile_config(with_auth).expect("auth fixture compiles");
+        assert_eq!(
+            compute_config_revision(&bare),
+            compute_config_revision(&with_auth),
+            "the revision tracks the routable surface, not the file"
+        );
+    }
 
     /// An MCP catalogue is injectable only by keys on its own tenant.
     ///

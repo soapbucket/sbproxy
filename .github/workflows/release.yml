@@ -880,6 +880,32 @@ jobs:
         with:
           subject-path: 'dist/sbproxy_*.tar.gz'
 
+      # WOR-2108's tag-time half. The per-PR guard proves each fragment
+      # parses; this one proves the release consumed them. A tag cut with
+      # fragments still pending would publish notes missing whatever those
+      # fragments say, and the next cut would then claim this one's
+      # changes as its own.
+      - name: no unconsumed change fragments at the tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -d docs/.changes ]; then
+            echo "docs/.changes/ does not exist on the tagged commit; nothing pending"
+            exit 0
+          fi
+          # `! -name '.*'` keeps this gate exactly as wide as
+          # `fragment_paths()` in scripts/changelog-fragments.py, which
+          # skips hidden files as OS junk. A gate that is wider than the
+          # guard fails at the tag, where the only remedy is the retag
+          # flow this repo documents as digest-orphaning.
+          pending=$(find docs/.changes -type f ! -name README.md ! -name '.*' | sort)
+          if [ -n "$pending" ]; then
+            echo "::error::the tagged commit leaves change fragments unconsumed; run scripts/changelog-fragments.py --release before tagging"
+            printf '%s\n' "$pending" >&2
+            exit 1
+          fi
+          echo "docs/.changes/ holds no pending fragments"
+
       - name: create GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -932,6 +958,33 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@v5
+
+      # WOR-2108's tag-time half, duplicated from the release job: this
+      # job pushes :X.Y.Z and :latest to the registries on the same tag
+      # and does not depend on the release job, so it refuses an
+      # unconsumed fragment itself. Without this, a refused release
+      # still ships a wrongly-noted image, and the fix is the retag
+      # flow this repo documents as digest-orphaning.
+      - name: no unconsumed change fragments at the tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -d docs/.changes ]; then
+            echo "docs/.changes/ does not exist on the tagged commit; nothing pending"
+            exit 0
+          fi
+          # `! -name '.*'` keeps this gate exactly as wide as
+          # `fragment_paths()` in scripts/changelog-fragments.py, which
+          # skips hidden files as OS junk. A gate that is wider than the
+          # guard fails at the tag, where the only remedy is the retag
+          # flow this repo documents as digest-orphaning.
+          pending=$(find docs/.changes -type f ! -name README.md ! -name '.*' | sort)
+          if [ -n "$pending" ]; then
+            echo "::error::the tagged commit leaves change fragments unconsumed; run scripts/changelog-fragments.py --release before tagging"
+            printf '%s\n' "$pending" >&2
+            exit 1
+          fi
+          echo "docs/.changes/ holds no pending fragments"
 
       - name: download binaries
         uses: actions/download-artifact@v5
