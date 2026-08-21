@@ -26,25 +26,53 @@
 //!
 //! ### Caller status
 //!
-//! - `validate_url` and `validate_url_resolved` are called from seven
-//!   places across the workspace: webhook targets in
-//!   `sbproxy-core::policy_dispatch`, A2A push targets in
-//!   `sbproxy-modules::policy::a2a`, alerting channel URLs in
-//!   `sbproxy-observe::alerting::channels`, AI provider base URLs in
-//!   `sbproxy-ai::provider`, external guardrail endpoints in
-//!   `sbproxy-ai::external_guardrail` (two call sites), and the RAG
-//!   HTTP provider base URL in `sbproxy-rag::http`.
-//!   `validate_url_with_allowlist` has no callers outside this module.
-//! - The Pingora dial path follows the contract above:
-//!   `guard_upstream` in `sbproxy-core/src/server.rs` (WOR-1689)
-//!   re-resolves the upstream host with [`resolve_host_addrs`] and
-//!   re-checks every resolved address with [`is_private_ip`]
-//!   immediately before the dial, honoring the operator's
-//!   `upstream.allow_private_cidrs` allowlist. The RAG Redis backend
-//!   pins its dial through [`resolve_host_addrs`] the same way.
-//! - A caller that uses an in-process HTTP client (e.g. `reqwest`)
-//!   should pin the address by passing the pre-resolved `SocketAddr`
-//!   directly rather than re-resolving the hostname.
+//! This list exists so a reviewer auditing the contract above can walk
+//! every path that needs dial-time re-validation without grepping.
+//! Nine call sites across the workspace, split by whether the caller
+//! actually pins what it validated.
+//!
+//! Pinned: the caller takes the [`SocketAddr`]s back and dials those.
+//!
+//! - `sbproxy-ai::external_guardrail`, `build_prepared`: two call sites
+//!   (allowlisted and plain), both feeding `resolve_to_addrs` on the
+//!   guardrail's HTTP client.
+//! - `sbproxy-rag::http`, provider base URL: also re-checks each
+//!   address with [`is_private_ip`] before pinning, so an
+//!   `allow_private_url` typo cannot quietly open the private range.
+//! - `sbproxy-observe::event_sink`, `deliver_batch`: revalidates on
+//!   every batch, not once at startup, and pins the collector.
+//!
+//! Not pinned. Each is defensible for its own reason, and each is a
+//! place the rebinding window is still open:
+//!
+//! - `sbproxy-core::policy_dispatch`, Confirm webhook target: the OSS
+//!   pipeline never dials it. Validation is a fail-closed decision
+//!   gate, not a pre-dial check.
+//! - `sbproxy-modules::policy::a2a`, `check_push_notification`: the
+//!   resolved addresses are discarded because the gateway does not own
+//!   that dial; the remote agent does.
+//! - `sbproxy-observe::alerting::channels`, `webhook_url_allowed`:
+//!   validates with `validate_url` and then POSTs through a shared
+//!   `reqwest` client that resolves the hostname again. This is the one
+//!   caller whose own dial re-resolves, and the one to fix first.
+//! - `sbproxy-ai::provider`, base URL: a config-time refusal; the
+//!   provider client dials later on its own.
+//! - `sbproxy-observe::event_sink`, `start_webhook_worker`: a startup
+//!   refusal via `validate_url_with_allowlist` so a bad `events.url` is
+//!   an operator-visible boot failure. The per-batch site above is what
+//!   guards the dial.
+//!
+//! Separately, the Pingora dial path follows the contract above without
+//! going through these functions: `guard_upstream` in
+//! `sbproxy-core/src/server.rs` re-resolves the upstream host with
+//! [`resolve_host_addrs`] and re-checks every resolved address with
+//! [`is_private_ip`] immediately before the dial, honoring the
+//! operator's `upstream.allow_private_cidrs` allowlist. The RAG Redis
+//! backend pins its dial through [`resolve_host_addrs`] the same way.
+//!
+//! A new caller that uses an in-process HTTP client belongs in the
+//! pinned list: pass the pre-resolved `SocketAddr` to the client rather
+//! than letting it re-resolve the hostname.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
@@ -569,5 +597,158 @@ mod tests {
         assert!(resolved.allowlisted);
         assert_eq!(resolved.addrs.len(), 1);
         assert_eq!(resolved.addrs[0].port(), 8080);
+    }
+}
+
+/// Guard for the "Caller status" block in this module's docs.
+///
+/// That block is not decoration. It is the enumeration a reviewer walks
+/// when auditing the dial-time re-validation contract, so a call site
+/// missing from it is a call site nobody audits. It went stale exactly
+/// that way once: two `sbproxy-observe::event_sink` sites existed while
+/// the block still said `validate_url_with_allowlist` had no callers
+/// outside this module.
+///
+/// What it cannot see, and what still needs a human reviewer:
+///
+/// - A caller that renames the import (`use ... as check;`) or reaches
+///   these functions through a macro. It matches on the function name
+///   followed by an open paren, nothing cleverer.
+/// - Whether a caller listed as pinned actually pins. The pinned /
+///   not-pinned split in the block is prose, and only the count and the
+///   membership are checked here.
+#[cfg(test)]
+mod caller_status_guard {
+    use std::path::{Path, PathBuf};
+
+    /// Every entry point outside code can call to validate a URL. The
+    /// trailing paren is what separates a call from a `use` line or a
+    /// doc reference.
+    const VALIDATORS: &[&str] = &[
+        "validate_url(",
+        "validate_url_with_allowlist(",
+        "validate_url_resolved(",
+    ];
+
+    /// The doc block spells its count as a word, so the guard has to
+    /// read one.
+    const NUMBER_WORDS: &[&str] = &[
+        "Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten",
+        "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen",
+    ];
+
+    fn rust_files(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let skip = path
+                        .file_name()
+                        .is_some_and(|n| n == "target" || n == "node_modules");
+                    if !skip {
+                        stack.push(path);
+                    }
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
+    /// `crates/sbproxy-observe/src/alerting/channels.rs` becomes
+    /// `sbproxy-observe::alerting::channels`, which is the form the doc
+    /// block names callers in.
+    fn qualified_name(crates_dir: &Path, file: &Path) -> Option<String> {
+        let rel = file.strip_prefix(crates_dir).ok()?;
+        let mut parts: Vec<String> = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        if parts.len() < 3 || parts[1] != "src" {
+            return None;
+        }
+        let krate = parts[0].clone();
+        let mut modules: Vec<String> = parts.drain(2..).collect();
+        let leaf = modules.pop()?;
+        let leaf = leaf.strip_suffix(".rs")?.to_string();
+        if leaf != "mod" && leaf != "lib" {
+            modules.push(leaf);
+        }
+        Some(format!("{krate}::{}", modules.join("::")))
+    }
+
+    #[test]
+    fn caller_status_block_names_every_call_site() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let crates_dir = manifest.parent().expect("crate lives under crates/");
+        assert!(
+            crates_dir.join("sbproxy-security").is_dir(),
+            "this guard reads the workspace source tree; {} is not it",
+            crates_dir.display()
+        );
+
+        let this_file = manifest.join("src").join("ssrf.rs");
+        let source = std::fs::read_to_string(&this_file).expect("read ssrf.rs");
+        let block = source
+            .split("//! ### Caller status")
+            .nth(1)
+            .expect("caller-status block still exists")
+            .split("\nuse ")
+            .next()
+            .expect("block ends where the code starts");
+
+        let mut sites = 0usize;
+        let mut unnamed: Vec<String> = Vec::new();
+        for file in rust_files(crates_dir) {
+            if file == this_file {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let calls = text
+                .lines()
+                .filter(|line| {
+                    let trimmed = line.trim_start();
+                    !trimmed.starts_with("//")
+                        && !trimmed.starts_with('*')
+                        && VALIDATORS.iter().any(|v| trimmed.contains(*v))
+                })
+                .count();
+            if calls == 0 {
+                continue;
+            }
+            sites += calls;
+            match qualified_name(crates_dir, &file) {
+                // A call site outside `<crate>/src/` is not something
+                // the doc's naming scheme can express, so it is a
+                // finding rather than something to skip quietly.
+                None => unnamed.push(file.display().to_string()),
+                Some(name) => {
+                    if !block.contains(&format!("`{name}`")) {
+                        unnamed.push(format!("{name} ({calls} call sites)"));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            unnamed.is_empty(),
+            "the caller-status block does not name these SSRF-validating call sites: {unnamed:?}"
+        );
+        let word = NUMBER_WORDS
+            .get(sites)
+            .copied()
+            .expect("call-site count is within the guard's vocabulary");
+        assert!(
+            block.contains(&format!("{word} call sites")),
+            "the caller-status block claims a count other than {sites} ({word})"
+        );
     }
 }
