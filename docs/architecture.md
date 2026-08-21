@@ -1,6 +1,6 @@
 # SBproxy architecture and deployment guide
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 This document covers the internal architecture of SBproxy, the request lifecycle, the plugin
 system, the AI gateway, caching, events, and common deployment topologies.
@@ -734,10 +734,25 @@ LRU eviction policy are configured independently.
 ### Cache key partitioning
 
 Response cache keys are built as
-`workspace:hostname:method:path:canonical_query:vary_fp`, where `canonical_query` is the
-query string canonicalized under the origin's query mode and `vary_fp` is a fingerprint of
-the configured `vary` header values. The leading workspace segment prevents cross-tenant
-collisions when multiple origins share a backend store.
+
+```text
+v2:workspace:tenant:hostname:method:path:identity:canonical_query:vary_fp:config_fp
+```
+
+`canonical_query` is the query string canonicalized under the origin's query mode,
+`vary_fp` is a fingerprint of the configured `vary` header values plus the negotiated
+content coding, `identity` is a digest of the caller's credentials (empty when the request
+presented none), and `config_fp` is a digest of the origin's cache-relevant config.
+
+Every field after the `v2` tag is percent-escaped, so a `:` inside a path or a query
+cannot move a field boundary. The tenant, hostname, and identity fields are stamped by the
+proxy and are the ones that prevent cross-tenant and cross-caller collisions when several
+origins share a backend store; nothing an operator configures and nothing a `cache.key`
+policy returns can remove them.
+
+The `v2` tag is the key-space version. It changes when the field list or the escaping
+changes, so entries written by an older build are never read back by a newer one; they age
+out on their TTLs instead.
 
 ---
 

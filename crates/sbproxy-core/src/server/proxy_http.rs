@@ -79,6 +79,185 @@ pub(super) fn request_modifiers_for_route(
     modifiers
 }
 
+// --- WOR-2607: what a cache entry may honestly claim about itself ---
+//
+// Both decisions below are made in `response_filter`, where the
+// upstream's headers exist and the body does not yet. They are free
+// functions so the seams are testable by name without a live `Session`.
+
+/// Dimensions every response-cache key carries whether or not an
+/// operator listed them.
+///
+/// `accept-encoding` is folded into the key as a normalized capability
+/// bucket, and `authorization`, `proxy-authorization`, and `cookie` are
+/// folded into the caller-identity digest, both by
+/// `build_response_cache_key_with_plan`. `host` is a key field outright.
+/// A response that varies on one of these is already partitioned by it.
+///
+/// This list has to stay as wide as, and no wider than, what that
+/// function actually stamps. Too narrow refuses a store that would have
+/// been correct, which costs hit rate. Too wide admits a store that a
+/// later request will read when it should have missed, which is the
+/// cross-request leak this check exists to prevent.
+const HOST_STAMPED_VARY_DIMENSIONS: &[&str] = &[
+    "accept-encoding",
+    "authorization",
+    "cookie",
+    "host",
+    "proxy-authorization",
+];
+
+/// Name the first `Vary` dimension the cache key does not carry, if any.
+///
+/// A stored response is replayed to every later request whose key
+/// matches. `Vary` is the upstream telling us which request headers
+/// change what it would have answered, and nothing read it: an upstream
+/// answering `Vary: Accept-Language` had one variant stored and served
+/// to every language, as a hit, with nothing saying so.
+///
+/// Honoring it by folding the named headers into the key was the other
+/// option and is rejected here. The key is fixed before the request goes
+/// upstream and the `Vary` arrives with the response, so folding it in
+/// would mean storing under a key no lookup computes, which is a cache
+/// that fills and never hits, or re-keying after the fact, which needs a
+/// second lookup level the store trait does not have. Refusing is what
+/// is available at this point in the pipeline and it fails in the safe
+/// direction: the origin keeps answering, it just answers from upstream.
+///
+/// `Vary: *` is always uncovered. It means the response varies on
+/// something the request headers do not name, which no key can carry.
+///
+/// A `cache.key` policy's dimensions are deliberately **not** counted as
+/// covered. They are per-request and this decision is per-response, so
+/// counting them would mean trusting that the policy fired for this
+/// request the same way it fires for the next one, which is exactly the
+/// determinism a policy is not required to have. The cost is a refused
+/// store on an origin whose upstream `Vary` is covered only by a policy;
+/// the alternative cost is a leak.
+fn uncovered_vary_dimension<'a>(
+    vary_values: impl IntoIterator<Item = &'a str>,
+    configured_vary: &[String],
+) -> Option<String> {
+    for value in vary_values {
+        for field in value.split(',') {
+            let field = field.trim();
+            if field.is_empty() {
+                continue;
+            }
+            if field == "*" {
+                return Some("*".to_owned());
+            }
+            let covered = HOST_STAMPED_VARY_DIMENSIONS
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(field))
+                || configured_vary
+                    .iter()
+                    .any(|listed| listed.eq_ignore_ascii_case(field));
+            if !covered {
+                return Some(field.to_ascii_lowercase());
+            }
+        }
+    }
+    None
+}
+
+/// Why this response may not be written to the response cache, if it
+/// may not.
+///
+/// The two gates are one function because they are one decision, taken
+/// at one point: `response_filter` is the last place a response can be
+/// kept out of the cache before the body filter starts buffering it. A
+/// gate that lives at the call site instead is a gate no test can reach
+/// without a live `Session`, and this whole area is here because a
+/// condition nobody checked let one request read another's entry.
+///
+/// `None` means storable.
+#[derive(Debug, PartialEq, Eq)]
+enum CacheStoreRefusal {
+    /// The status is outside the origin's `cacheable_status`.
+    Status,
+    /// The upstream declared a `Vary` dimension the key does not carry.
+    /// Carries the field name, for the log line that tells an operator
+    /// which header to add to `vary:`.
+    UncoveredVary(String),
+}
+
+fn response_cache_store_refusal<'a>(
+    status: u16,
+    cfg: &sbproxy_config::ResponseCacheConfig,
+    vary_values: impl IntoIterator<Item = &'a str>,
+) -> Option<CacheStoreRefusal> {
+    let status_ok = if cfg.cacheable_status.is_empty() {
+        status == 200
+    } else {
+        cfg.cacheable_status.contains(&status)
+    };
+    if !status_ok {
+        return Some(CacheStoreRefusal::Status);
+    }
+    // Checked second so a `500` that also varies is reported as the
+    // status refusal it is, rather than sending an operator off to add
+    // a header to `vary:` that would not have helped.
+    uncovered_vary_dimension(vary_values, &cfg.vary).map(CacheStoreRefusal::UncoveredVary)
+}
+
+/// Project the upstream's response headers down to what the cache may
+/// store, dropping the ones that would describe bytes it is not holding.
+///
+/// Hop-by-hop headers come off because a cache must not replay them.
+///
+/// The stored body is the representation before the proxy's own content
+/// coding: the compression step runs at the end of
+/// `response_body_filter`, after the store dispatch, and a cache hit
+/// short-circuits in `request_filter` and never reaches it. That split
+/// is deliberate and documented at the store dispatch. What was not
+/// deliberate is that `response_filter` inserts `Content-Encoding`
+/// before capturing the headers, so an entry went in holding identity
+/// bytes under a `Content-Encoding: gzip` label and every hit shipped a
+/// body no client could decode.
+///
+/// So the label comes off when `proxy_coded` says the proxy is the one
+/// that added it, and only then: an upstream that compressed for itself
+/// sends coded bytes, which are the bytes the cache holds, and its
+/// header is true.
+///
+/// Nothing else derived from the stored body needs the same treatment,
+/// and each was checked rather than assumed. `Content-Length` is already
+/// removed by the same block that inserts `Content-Encoding` and by the
+/// transform block, so no stored length can disagree with a stored body
+/// either of them changed. `ETag`, `Last-Modified`, and
+/// `Content-Digest` are the upstream's, computed over the upstream's
+/// representation, which is exactly what the cache stores.
+fn cacheable_response_headers(
+    headers: &http::HeaderMap,
+    proxy_coded: bool,
+) -> Vec<(String, String)> {
+    let mut captured: Vec<(String, String)> = Vec::with_capacity(headers.len());
+    for (name, value) in headers.iter() {
+        let name = name.as_str().to_ascii_lowercase();
+        if matches!(
+            name.as_str(),
+            "connection"
+                | "transfer-encoding"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "te"
+                | "trailer"
+                | "upgrade"
+        ) {
+            continue;
+        }
+        if proxy_coded && name == "content-encoding" {
+            continue;
+        }
+        if let Ok(value) = value.to_str() {
+            captured.push((name, value.to_string()));
+        }
+    }
+    captured
+}
+
 // --- WOR-2490 / WOR-2551 / WOR-2552: websocket tunnel enforcement ---
 //
 // The `websocket` action's post-upgrade enforcement lives in three
@@ -4777,6 +4956,13 @@ impl ProxyHttp for SbProxy {
         // the floor check here and let the body filter re-evaluate at
         // end-of-stream. Already-compressed responses (upstream already set
         // `Content-Encoding`) are left alone.
+        //
+        // Known open defect, named at `RequestContext::compression_min_size`
+        // and not fixed here: inserting `Content-Encoding` below commits it,
+        // and the body filter's second look at the floor can decline to
+        // produce the coding this line just promised. The response cache is
+        // not exposed to it (see `strip_proxy_added_content_coding`), but a
+        // client of an origin with a non-zero `min_size` is.
         if let Some(origin_idx) = ctx.origin_idx {
             let origin = &pipeline2.config.origins[origin_idx];
             if let Some(comp_cfg) = origin.compression.as_ref() {
@@ -4847,62 +5033,69 @@ impl ProxyHttp for SbProxy {
         // If `request_filter` recorded a cache_key for this request (= cache
         // enabled, method cacheable, and the entry was not already in the
         // cache), this is the earliest point where we know the upstream
-        // status. Gate on the `cacheable_status` list here so non-cacheable
-        // statuses (e.g. 500) don't populate the cache.
+        // status. Three things are decided here, and all three have to be,
+        // because this is the last point at which the response can be kept
+        // out of the cache before the body filter starts buffering it:
+        //
+        // * the `cacheable_status` gate, so a `500` does not populate the
+        //   cache,
+        // * whether the upstream declared a `Vary` the key does not carry,
+        //   which would make a later request read this entry when it should
+        //   have missed,
+        // * and which of these headers may be stored as they stand, since
+        //   the proxy's own content coding is applied after the entry is
+        //   written and a hit never runs it.
         if ctx.cache_key.is_some() {
             let status = upstream_response.status.as_u16();
-            let cache_status_ok = if let Some(idx) = ctx.origin_idx {
-                match pipeline2
-                    .config
-                    .origins
-                    .get(idx)
-                    .and_then(|o| o.response_cache.as_ref())
-                {
-                    Some(cfg) => {
-                        if cfg.cacheable_status.is_empty() {
-                            status == 200
-                        } else {
-                            cfg.cacheable_status.contains(&status)
-                        }
-                    }
-                    None => false,
-                }
-            } else {
-                false
+            let refusal = match ctx
+                .origin_idx
+                .and_then(|idx| pipeline2.config.origins.get(idx))
+                .and_then(|origin| origin.response_cache.as_ref())
+            {
+                Some(cfg) => response_cache_store_refusal(
+                    status,
+                    cfg,
+                    upstream_response
+                        .headers
+                        .get_all("vary")
+                        .iter()
+                        .filter_map(|value| value.to_str().ok()),
+                ),
+                // No response-cache config on the serving origin, so
+                // whatever put a key on the context does not apply here.
+                None => Some(CacheStoreRefusal::Status),
             };
 
-            if cache_status_ok {
-                ctx.cache_status = Some(status);
-                // Capture a lossy view of the response headers. Hop-by-hop
-                // headers that must not be forwarded by the cache (e.g.
-                // Connection, Transfer-Encoding) are skipped.
-                let mut captured: Vec<(String, String)> =
-                    Vec::with_capacity(upstream_response.headers.len());
-                for (name, value) in upstream_response.headers.iter() {
-                    let n = name.as_str().to_ascii_lowercase();
-                    if matches!(
-                        n.as_str(),
-                        "connection"
-                            | "transfer-encoding"
-                            | "keep-alive"
-                            | "proxy-authenticate"
-                            | "proxy-authorization"
-                            | "te"
-                            | "trailer"
-                            | "upgrade"
-                    ) {
-                        continue;
-                    }
-                    if let Ok(v) = value.to_str() {
-                        captured.push((n, v.to_string()));
-                    }
+            if let Some(CacheStoreRefusal::UncoveredVary(dimension)) = refusal.as_ref() {
+                // Debug rather than warn: this fires on every response
+                // from the origin, and the operator-facing form of it is
+                // a hit rate that stays at zero. The remedy is naming the
+                // header in `response_cache.vary`, which
+                // configuration.md says under the same heading.
+                tracing::debug!(
+                    hostname = %ctx.hostname,
+                    vary = %dimension,
+                    "response not cached: upstream Vary names a dimension the cache key does \
+                     not carry"
+                );
+            }
+
+            match refusal {
+                None => {
+                    ctx.cache_status = Some(status);
+                    // WOR-2607: the coding the compression block
+                    // negotiated above is applied after the entry is
+                    // stored, and a hit never runs it, so the label must
+                    // not travel with the body.
+                    ctx.cache_headers = Some(cacheable_response_headers(
+                        &upstream_response.headers,
+                        ctx.compression_encoding.is_some(),
+                    ));
+                    ctx.cache_body_buf = Some(bytes::BytesMut::with_capacity(4096));
                 }
-                ctx.cache_headers = Some(captured);
-                ctx.cache_body_buf = Some(bytes::BytesMut::with_capacity(4096));
-            } else {
-                // Non-cacheable status: clear the key so the body filter
-                // doesn't accumulate a response we're going to discard.
-                ctx.cache_key = None;
+                // Not storable: clear the key so the body filter doesn't
+                // accumulate a response we're going to discard.
+                Some(_) => ctx.cache_key = None,
             }
         }
 
@@ -7083,8 +7276,17 @@ impl ProxyHttp for SbProxy {
                 // final body is below `min_size` the encoder is bypassed and
                 // the body passes through; the `Content-Encoding` header was
                 // already set in `response_filter`, so we do not flip it back
-                // to identity from here. The floor is a CPU optimisation,
-                // not a correctness requirement.
+                // to identity from here.
+                //
+                // That bypass is the open defect named at
+                // `RequestContext::compression_min_size`: a committed header
+                // cannot be withdrawn, so this ships a coding label over bytes
+                // that do not carry it, and the same goes for the encoder
+                // failure below. Both are compression bugs rather than cache
+                // bugs, and the cache is held clear of them by
+                // `strip_proxy_added_content_coding`, which keeps a
+                // proxy-added label out of a stored entry whichever way this
+                // lands.
                 if let Some(encoding) = ctx.compression_encoding.take() {
                     let pre = buf.len();
                     sbproxy_observe::metrics::record_response_body_bytes(
@@ -8348,6 +8550,251 @@ mod tests {
         bytes.extend_from_slice(&payload_len.to_be_bytes());
         bytes.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
         bytes
+    }
+
+    // --- WOR-2607: what a cache entry may honestly claim about itself ---
+
+    /// An upstream that varies on a header the key does not carry gets
+    /// one variant stored and replayed to every request, whatever that
+    /// header said.
+    ///
+    /// This is the cross-request half of the cache-key work: the read
+    /// side cannot see the `Vary`, because the key is fixed before the
+    /// request goes upstream, so the write side has to refuse.
+    #[test]
+    fn an_upstream_vary_the_key_does_not_carry_refuses_the_store() {
+        assert_eq!(
+            uncovered_vary_dimension(["Accept-Language"], &[]),
+            Some("accept-language".to_owned()),
+            "a response that varies on language must not be stored under a key that does not"
+        );
+        assert_eq!(
+            uncovered_vary_dimension(["Origin"], &[]),
+            Some("origin".to_owned()),
+            "a CORS-varying response is per-caller-origin and the key carries no such field"
+        );
+    }
+
+    /// `Vary: *` names a dimension that is not a request header at all,
+    /// so no key can ever carry it and no config can cover it.
+    #[test]
+    fn a_wildcard_vary_is_never_covered() {
+        assert_eq!(
+            uncovered_vary_dimension(["*"], &["*".to_owned()]),
+            Some("*".to_owned()),
+            "not even listing `*` in vary: may admit it"
+        );
+    }
+
+    /// The operator's `vary:` list is what covering a dimension means,
+    /// matched the way HTTP matches header names.
+    #[test]
+    fn a_configured_vary_covers_the_dimension_case_insensitively() {
+        assert_eq!(
+            uncovered_vary_dimension(["Accept-Language"], &["accept-language".to_owned()]),
+            None
+        );
+        assert_eq!(
+            uncovered_vary_dimension(["accept-language"], &["Accept-Language".to_owned()]),
+            None
+        );
+    }
+
+    /// The host stamps some dimensions into every key without the
+    /// operator listing them, and an upstream varying on one of those is
+    /// already partitioned by it.
+    ///
+    /// Walks the real constant rather than a copy of it: a name added
+    /// there without the key actually carrying it would admit a store
+    /// this check exists to refuse, and a name dropped from the key
+    /// without being dropped here would do the same.
+    #[test]
+    fn every_host_stamped_dimension_is_covered_without_configuration() {
+        for dimension in HOST_STAMPED_VARY_DIMENSIONS {
+            assert_eq!(
+                uncovered_vary_dimension([*dimension], &[]),
+                None,
+                "`{dimension}` is host-stamped and must not refuse a store"
+            );
+        }
+        assert!(
+            HOST_STAMPED_VARY_DIMENSIONS.contains(&"accept-encoding")
+                && HOST_STAMPED_VARY_DIMENSIONS.contains(&"authorization")
+                && HOST_STAMPED_VARY_DIMENSIONS.contains(&"cookie"),
+            "these three are what `build_response_cache_key_with_plan` folds in; dropping one \
+             here without dropping it there refuses stores that were correct, and the reverse \
+             admits stores that are not"
+        );
+    }
+
+    /// One `Vary` may list several fields, and a response may carry
+    /// several `Vary` headers. Every field in every one has to be
+    /// covered, not just the first.
+    #[test]
+    fn a_single_covered_field_does_not_cover_the_rest_of_the_list() {
+        assert_eq!(
+            uncovered_vary_dimension(["Accept-Encoding, Accept-Language"], &[]),
+            Some("accept-language".to_owned()),
+        );
+        assert_eq!(
+            uncovered_vary_dimension(["Accept-Encoding", "User-Agent"], &[]),
+            Some("user-agent".to_owned()),
+            "a second Vary header is not a second chance"
+        );
+        assert_eq!(
+            uncovered_vary_dimension(["Accept-Encoding , Cookie ,"], &[]),
+            None,
+            "whitespace and a trailing comma are not dimensions"
+        );
+    }
+
+    /// No `Vary` at all is the ordinary case and must not refuse.
+    #[test]
+    fn a_response_without_vary_is_storable() {
+        assert_eq!(
+            uncovered_vary_dimension(std::iter::empty::<&str>(), &[]),
+            None
+        );
+        assert_eq!(uncovered_vary_dimension([""], &[]), None);
+    }
+
+    /// An origin's response-cache config with the given `vary:` list.
+    fn cache_cfg(vary: &[&str]) -> sbproxy_config::ResponseCacheConfig {
+        sbproxy_config::ResponseCacheConfig {
+            enabled: true,
+            vary: vary.iter().map(|name| (*name).to_owned()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The store decision, not just the `Vary` helper underneath it.
+    ///
+    /// The helper existing is not the same as the store consulting it.
+    /// This walks the function `response_filter` actually calls, so a
+    /// `Vary` gate that got dropped from the decision fails here even
+    /// though `uncovered_vary_dimension` still passes its own tests.
+    #[test]
+    fn the_store_decision_refuses_an_uncovered_vary() {
+        assert_eq!(
+            response_cache_store_refusal(200, &cache_cfg(&[]), ["Accept-Language"]),
+            Some(CacheStoreRefusal::UncoveredVary(
+                "accept-language".to_owned()
+            )),
+            "a 200 that varies on a dimension the key does not carry is not storable"
+        );
+        assert_eq!(
+            response_cache_store_refusal(
+                200,
+                &cache_cfg(&["accept-language"]),
+                ["Accept-Language"]
+            ),
+            None,
+            "the same response is storable once the operator covers the dimension"
+        );
+    }
+
+    /// The status gate still decides first, and still decides alone when
+    /// there is no `Vary` to consider.
+    #[test]
+    fn the_store_decision_keeps_the_status_gate() {
+        assert_eq!(
+            response_cache_store_refusal(500, &cache_cfg(&[]), std::iter::empty::<&str>()),
+            Some(CacheStoreRefusal::Status),
+        );
+        assert_eq!(
+            response_cache_store_refusal(200, &cache_cfg(&[]), std::iter::empty::<&str>()),
+            None,
+        );
+        let mut cfg = cache_cfg(&[]);
+        cfg.cacheable_status = vec![404];
+        assert_eq!(
+            response_cache_store_refusal(404, &cfg, std::iter::empty::<&str>()),
+            None,
+            "an explicit cacheable_status list replaces the 200-only default"
+        );
+    }
+
+    /// A refused status is reported as the status, not as the `Vary` it
+    /// also happens to carry: sending an operator to add a header that
+    /// would not have helped is worse than saying nothing.
+    #[test]
+    fn a_refused_status_is_not_reported_as_a_vary_problem() {
+        assert_eq!(
+            response_cache_store_refusal(500, &cache_cfg(&[]), ["Accept-Language"]),
+            Some(CacheStoreRefusal::Status),
+        );
+    }
+
+    /// A response header map, for the capture tests.
+    fn response_headers(pairs: &[(&str, &str)]) -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        for (name, value) in pairs {
+            headers.append(
+                http::HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+                http::HeaderValue::from_str(value).expect("header value"),
+            );
+        }
+        headers
+    }
+
+    /// A cache entry must not claim a content coding the cache is not
+    /// holding.
+    ///
+    /// The stored body is captured before the compression step and a hit
+    /// never runs that step, so storing the `Content-Encoding` that
+    /// `response_filter` inserted a few lines earlier meant every hit
+    /// shipped identity bytes labeled `gzip`.
+    #[test]
+    fn a_proxy_added_content_coding_is_not_stored_with_the_body() {
+        let captured = cacheable_response_headers(
+            &response_headers(&[
+                ("content-type", "application/json"),
+                ("content-encoding", "gzip"),
+                ("etag", "\"v1\""),
+            ]),
+            true,
+        );
+        assert!(
+            !captured.iter().any(|(name, _)| name == "content-encoding"),
+            "the coding the proxy applies after the store must not be stored: {captured:?}"
+        );
+        assert_eq!(
+            captured.len(),
+            2,
+            "nothing else comes off: the ETag describes the representation, which is what is \
+             stored"
+        );
+    }
+
+    /// An upstream that compressed for itself sends coded bytes, so the
+    /// cache holds coded bytes and the header is true. Dropping it there
+    /// would make every hit ship undeclared brotli.
+    #[test]
+    fn an_upstream_content_coding_is_stored_as_it_stands() {
+        let captured =
+            cacheable_response_headers(&response_headers(&[("content-encoding", "br")]), false);
+        assert_eq!(
+            captured,
+            vec![("content-encoding".to_owned(), "br".to_owned())]
+        );
+    }
+
+    /// The hop-by-hop skip list is part of the same projection and has
+    /// to survive the coding change.
+    #[test]
+    fn hop_by_hop_headers_are_still_not_stored() {
+        let captured = cacheable_response_headers(
+            &response_headers(&[
+                ("connection", "keep-alive"),
+                ("transfer-encoding", "chunked"),
+                ("cache-control", "max-age=60"),
+            ]),
+            false,
+        );
+        assert_eq!(
+            captured,
+            vec![("cache-control".to_owned(), "max-age=60".to_owned())]
+        );
     }
 
     #[test]

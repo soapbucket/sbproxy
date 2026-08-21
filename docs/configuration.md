@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -3944,9 +3944,10 @@ origins:
 
 #### Why only GET and HEAD
 
-The cache key is built from the workspace, hostname, method, path, canonical
-query, a fingerprint of the `Vary` headers, and a fingerprint of the origin's
-cache-relevant config. It does not include the request body.
+The cache key is built from the workspace, tenant, hostname, method, path, a
+digest of the caller's credentials, canonical query, a fingerprint of the `Vary`
+headers, and a fingerprint of the origin's cache-relevant config. It does not
+include the request body.
 
 For `GET` and `HEAD` that is complete: the request is fully described by its
 target and its headers. For a method whose body carries the request it is not.
@@ -3962,6 +3963,65 @@ To cache AI completions, use [the semantic cache](ai-gateway.md), which keys on
 prompt content with a similarity threshold and per-scope isolation. That is a
 different mechanism for a different job, and it is the one that makes caching a
 `POST` safe.
+
+#### Who a cached entry belongs to
+
+A cached entry belongs to the caller that seeded it. The key carries a digest
+of whatever credential the request presented: the resolved principal (a JWT
+subject, an API key id, a forward-auth subject, an mTLS-derived identity),
+the `Authorization` or `Proxy-Authorization` header, and the `Cookie` header.
+A request that presents none of those keys as it always did, so public traffic
+is unaffected.
+
+Without that field, an origin running `authentication` and `response_cache`
+together stored the first caller's `GET /me` and replayed it to every later
+caller as a hit, with no log line, metric, or response header saying so. RFC 9111
+section 3.5 has a shared cache refuse to store a credentialed response at all;
+partitioning per caller is more permissive than that and still safe, because the
+partition is drawn by the proxy rather than by the response.
+
+What it costs: on an origin whose callers are all authenticated, a shared entry
+becomes one entry per credential, so the hit rate falls toward the per-caller
+repeat rate and the upstream sees more traffic. On an origin whose callers carry
+any cookie at all, the same applies per cookie, including a cookie no upstream
+reads. If that is your origin and the content really is identical for everyone,
+the answer is a `request_modifier` upstream of SBproxy that strips the cookie,
+or leaving `response_cache` off for that origin and caching at a layer that
+knows the content is public.
+
+Two more dimensions are stamped the same way and for the same reason:
+
+- **Tenant.** One hostname resolves to one origin and one tenant today, so the
+  hostname already separated them. The tenant field says so directly, rather
+  than leaving cross-tenant isolation as a property of the routing table.
+- **The negotiated content coding.** SBproxy forwards `Accept-Encoding`, so an
+  upstream that compresses returns different bytes to different callers. The
+  key varies on the set of codings the caller accepts, not on the spelling, so
+  `gzip, deflate, br` and `br;q=1.0, deflate, gzip;q=0.8` still share an entry.
+
+**A response that varies on something the key does not carry is not stored.**
+The upstream's `Vary:` header names the request headers that change its
+answer. SBproxy reads it at store time and refuses the entry when it names a
+dimension the key does not have, because the alternative is a later request
+reading a variant it should have missed. `Accept-Encoding`, `Authorization`,
+`Proxy-Authorization`, `Cookie`, and `Host` are covered by the proxy itself;
+anything else has to be in `vary:`. `Vary: *` is never storable.
+
+The visible symptom of getting this wrong is an origin whose hit rate stays at
+zero. Run the proxy at `debug` level and look for
+`response not cached: upstream Vary names a dimension the cache key does not
+carry`, which names the header to add. Note that a dimension covered only by a
+`key_event` policy does not count: the policy is per request and this decision
+is per response, so a policy that fires for one request and declines for the
+next cannot be trusted to have partitioned the entry.
+
+What is still **not** in the key, and what that means for you:
+
+- Which `forward_rules` branch a request takes is decided after the key is
+  built. If a rule matches on a header, list that header in `vary:`.
+- A `request_modifier` runs after the key is built. One that rewrites the
+  request based on a header outside the key produces two upstream requests
+  under one key.
 
 #### Which config changes rotate the cache
 
@@ -4095,11 +4155,11 @@ Every field on a `key_event` document is optional, and `{}` or `null` declines, 
 
 A dimension name is not free-form. Each one is either `query` or a request header written `header:<name>`. Anything else is refused when the document is decoded. That refusal is the safety property: a name resolving to nothing would contribute the same empty value to every request, partition nothing, and merge every caller into one cache entry, which is the poisoning bug wearing a working config's clothes. Names are trimmed, lowercased, deduplicated, and sorted, so a policy that returns the same set in a different order still produces the same key.
 
-A `key_event` can only add dimensions to the key. The `<workspace>:<hostname>:<method>:<path>:<query>:` prefix is stamped by the host whatever the event returns, so a policy can narrow a key and can never widen one.
+A `key_event` can only add dimensions to the key. Every field of `v2:<workspace>:<tenant>:<hostname>:<method>:<path>:<identity>:<query>:` is stamped by the host whatever the event returns, and the event reaches only the Vary fingerprint that follows them, so a policy can narrow a key and can never widen one.
 
-Worth being precise about which segment separates tenants, because the obvious answer is wrong: `workspace` is passed as the empty string on every path in this build, so tenant separation comes from `hostname` plus the per-origin store handle, not from a workspace prefix.
+Worth being precise about which field separates tenants, because the obvious answer is wrong: `workspace` is passed as the empty string on every path in this build. The separation comes from `tenant`, `hostname`, and the per-origin store handle. Callers are separated by `identity`, a digest of the credentials the request presented.
 
-**Why the host-resolved list is one entry long.** `method`, `path`, and the hostname are already key segments, so varying on them adds nothing. `tenant` and `origin` are worse than redundant: both are fixed per origin, so every request that could share a key already agrees on them, and a `tenant` dimension would look like a tenant partition while delivering none. `query` earns its place only because `query_normalize: ignore_all` deliberately empties that segment, and this is the way to put it back for a subset of requests. Note it resolves the raw query, so it does not inherit the origin's normalization. Everything else that genuinely partitions is a request header.
+**Why the host-resolved list is one entry long.** `method`, `path`, the hostname, the tenant, and the caller are already key fields, so varying on them adds nothing. An `origin` dimension is worse than redundant: it is fixed per origin, so every request that could share a key already agrees on it. `query` earns its place only because `query_normalize: ignore_all` deliberately empties that field, and this is the way to put it back for a subset of requests. Note it resolves the raw query, so it does not inherit the origin's normalization. Everything else that genuinely partitions is a request header.
 
 The two events fall back in opposite directions, and the asymmetry is deliberate:
 
@@ -4195,7 +4255,7 @@ Sandbox budgets, the engine surfaces, and worked scripts are in [scripting.md](s
 
 ### Choosing the backing store
 
-There is one response-cache store per process. Every origin with `response_cache.enabled` shares it, which is safe because the cache key already carries the workspace, hostname, method, path, canonical query, the Vary fingerprint, and the origin's config fingerprint, so two origins cannot read each other's entries. The store is built only when at least one origin enables the cache.
+There is one response-cache store per process. Every origin with `response_cache.enabled` shares it, which is safe because the cache key already carries the workspace, tenant, hostname, method, path, caller identity, canonical query, the Vary fingerprint, and the origin's config fingerprint, so two origins cannot read each other's entries and two callers of one origin cannot read each other's. The store is built only when at least one origin enables the cache.
 
 `proxy.response_cache_store` picks which store that is. It is a top-level `proxy` block, not a per-origin field.
 

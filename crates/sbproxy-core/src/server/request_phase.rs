@@ -4261,10 +4261,11 @@ pub(super) async fn request_filter(
     // --- Response cache lookup ---
     //
     // When the origin has response-caching enabled and the incoming method
-    // is eligible, compute the canonical cache key (workspace, hostname,
-    // method, path, normalized query, Vary fingerprint). If we get a live
-    // entry from the cache, replay its status/headers/body to the client
-    // and short-circuit (`return Ok(true)`). When the entry is past TTL
+    // is eligible, compute the canonical cache key (workspace, tenant,
+    // hostname, method, path, caller identity, normalized query, Vary
+    // fingerprint, config fingerprint). If we get a live entry from the
+    // cache, replay its status/headers/body to the client and
+    // short-circuit (`return Ok(true)`). When the entry is past TTL
     // but inside the configured `stale_while_revalidate` window we serve
     // it stale (with `x-sbproxy-cache: STALE`) and fire a background
     // revalidation. On a true miss we remember the key in `ctx.cache_key`
@@ -4298,6 +4299,7 @@ pub(super) async fn request_filter(
             if cache_cfg.invalidate_on_mutation && sbproxy_cache::is_mutation_method(&req_method) {
                 let prefix = sbproxy_cache::path_invalidation_prefix(
                     "",
+                    ctx.tenant_id.as_str(),
                     ctx.hostname.as_str(),
                     session.req_header().uri.path(),
                 );
@@ -4328,11 +4330,22 @@ pub(super) async fn request_filter(
                 // variants must wait for natural expiry; the
                 // reserve trait surface is intentionally narrow
                 // so backends like S3 don't need to scan.
+                //
+                // WOR-2607: caller identity is now part of that key,
+                // so this clears the mutating caller's own reserve
+                // variant and not another caller's. The hot store
+                // above still drops every identity variant, because
+                // `delete_prefix` stops at the path; only the cold
+                // tier waits for a TTL. Reaching another caller's
+                // variant would need a prefix delete the reserve
+                // trait deliberately does not offer.
                 if let Some(reserve) = pipeline.cache_reserve.clone() {
                     let invalidate_key = build_response_cache_key(
                         "",
+                        ctx.tenant_id.as_str(),
                         ctx.hostname.as_str(),
                         session.req_header(),
+                        &ctx.principal,
                         cache_cfg,
                         origin.cache_config_fingerprint.as_str(),
                     );
@@ -4375,8 +4388,10 @@ pub(super) async fn request_filter(
                     evaluate_cache_key(ctx, session.req_header(), cache_cfg);
                 let key = crate::server::build_response_cache_key_with_plan(
                     "",
+                    ctx.tenant_id.as_str(),
                     ctx.hostname.as_str(),
                     session.req_header(),
+                    &ctx.principal,
                     cache_cfg,
                     origin.cache_config_fingerprint.as_str(),
                     key_plan.as_ref(),

@@ -1,6 +1,6 @@
 # Config stability tiers
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 This page defines the stability tiers and applies them to representative or
 high-impact configuration leaves. It also lists the current reviewed
@@ -378,6 +378,24 @@ through a release yet, so they are tiered separately.
 | `admit_event` | object | - | **alpha** | Response-side `cache.admit` script, same shape. Returns whether the response is stored and for how long. Refused alongside a non-zero `stale_while_revalidate`, which the background refresh cannot evaluate it against. |
 | `key_event.engine`, `admit_event.engine` | string | required | **alpha** | `lua` or `js`. `cel` and `wasm` fail config load; see the refusal rows above. |
 | `key_event.source`, `admit_event.source` | string | required | **alpha** | Inline script body. An empty one fails config load. |
+
+**The key these fields feed changed shape in the next release.** `vary` and
+`key_event` are unchanged as config leaves: same names, same types, same
+defaults, and a document that compiled before still compiles. What changed
+is the key they contribute to. It is now versioned (`v2:`), its fields are
+percent-escaped, and it carries three the host stamps on its own: the
+tenant, a digest of the caller's credentials, and the set of content
+codings the caller accepts. Two consequences for an existing config:
+
+- Every entry written by an earlier build is unreadable to this one and
+  ages out on its TTL. Expect one cold cache per origin on upgrade, and on
+  a shared Redis or file store expect the old entries to hold space until
+  they expire.
+- On an origin whose callers authenticate or carry cookies, a shared entry
+  becomes one entry per caller. That is the fix, not a side effect: the
+  shared entry was serving one caller's response to another. See
+  [configuration.md](configuration.md#who-a-cached-entry-belongs-to) for
+  what to do if the content really is public.
 
 ### Request Modifier (`request_modifiers[]`)
 

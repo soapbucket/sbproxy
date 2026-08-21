@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
@@ -2812,8 +2812,23 @@ whole cache:
 
 ```bash
 curl -u "admin:${SB_ADMIN_PASSWORD}" -X POST "${SB_ADMIN_URL}/admin/cache/purge" \
-  -H 'content-type: application/json' -d '{"prefix":"gpt-4o-mini:"}'
+  -H 'content-type: application/json' -d '{"prefix":"v2::__default__:api.example.com:"}'
 ```
+
+Both `key` and `prefix` match the stored key byte for byte, so they are
+written in the wire format
+[architecture.md](architecture.md#cache-key-partitioning) documents:
+
+```text
+v2:workspace:tenant:hostname:method:path:identity:canonical_query:vary_fp:config_fp
+```
+
+Two things to know when writing one by hand. Each field is
+percent-escaped, so a path containing `:` is written `%3A` and a path
+containing `%` is written `%25`. And a prefix that is meant to stop at a
+field boundary has to include the trailing `:`, or
+`v2::__default__:api.example.com:GET:/users/4` purges `/users/42` as
+well.
 
 `409 {"error":"response cache not enabled"}` when no origin enabled
 caching.

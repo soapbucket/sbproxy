@@ -4830,10 +4830,16 @@ pub struct ResponseCacheConfig {
     pub max_size: usize,
 
     /// Request headers whose values are folded into the cache key, so
-    /// variants of the same path with different `Accept-Encoding` /
-    /// `Accept-Language` etc. cache independently. The list is matched
-    /// case-insensitively. Aliased as `vary_by` for parity with the
-    /// docs/Cloudflare-style schema.
+    /// variants of the same path with different `Accept-Language` etc.
+    /// cache independently. The list is matched case-insensitively.
+    /// Aliased as `vary_by` for parity with the docs/Cloudflare-style
+    /// schema.
+    ///
+    /// This is the operator's list, on top of what the host varies on
+    /// by itself. Tenant, caller identity, and the negotiated content
+    /// coding are already in every key and do not need listing here;
+    /// removing a name from this list cannot widen a key past any of
+    /// them.
     #[serde(default, alias = "vary_by")]
     pub vary: Vec<String>,
 
@@ -4865,7 +4871,8 @@ pub struct ResponseCacheConfig {
 
     /// When true (default), `POST` / `PUT` / `PATCH` / `DELETE` to a
     /// path evicts every cached `GET` entry for the same workspace +
-    /// hostname + path, across every Vary fingerprint.
+    /// tenant + hostname + path, across every caller and every Vary
+    /// fingerprint.
     #[serde(default = "default_invalidate_on_mutation")]
     pub invalidate_on_mutation: bool,
 
@@ -4885,10 +4892,11 @@ pub struct ResponseCacheConfig {
     /// dimensions to fold into the key, or declines and leaves `vary:`
     /// in charge.
     ///
-    /// It can only **add** dimensions. The workspace, hostname, method,
-    /// and path segments are stamped by the host on every key whatever
-    /// the event returns, so a policy can narrow a key and can never
-    /// widen one past its own tenant.
+    /// It can only **add** dimensions. The workspace, tenant, hostname,
+    /// method, path, and caller-identity fields are stamped by the host
+    /// on every key whatever the event returns, so a policy can narrow
+    /// a key and can never widen one past its own tenant or its own
+    /// caller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_event: Option<DecisionScriptConfig>,
 

@@ -1,6 +1,6 @@
 # SBproxy scripting reference: CEL, Rego, Lua, JavaScript, and WASM
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 SBproxy includes five scripting engines for custom logic: CEL (Common Expression Language), Rego (via Regorus), Lua, JavaScript, and WASM. All run in sandboxed environments with access to request context.
 
@@ -1195,7 +1195,7 @@ Declining is the cheap common case and means "the static config applies unchange
 
 **Dimension names are a closed set.** Each name in `vary` is either `query` or a request header written `header:<name>`. Anything else is refused when the document is decoded. A name resolving to nothing would contribute the same empty value to every request, partition nothing, and merge every caller into one cache entry, so a typo has to fail loudly rather than quietly serve one customer's response to another. Names are trimmed, lowercased, deduplicated, and sorted, which keeps the same set in a different order producing the same key.
 
-**A key can only get narrower.** The `<workspace>:<hostname>:<method>:<path>:<query>:` prefix is stamped by the host whatever the event returns, so a policy adds dimensions and can never widen a key. Worth being precise about what separates tenants: `workspace` is empty on every path today, so that separation comes from `hostname` plus the per-origin cache store, not from the workspace segment.
+**A key can only get narrower.** Every field of `v2:<workspace>:<tenant>:<hostname>:<method>:<path>:<identity>:<query>:` is stamped by the host whatever the event returns, and the event reaches only the Vary fingerprint that follows them, so a policy adds dimensions and can never widen a key. Worth being precise about what separates tenants and callers: `workspace` is empty on every path today, so tenant separation comes from `tenant` and `hostname` plus the per-origin cache store, and caller separation from `identity`, a digest of the credentials the request presented. None of the three is addressable from a policy.
 
 **A faulted `key_event` bypasses the cache.** If the engine faults, or the document cannot be decoded, the request gets no cache read and no cache write. Falling back to the static `vary:` alone would produce a coarser key rather than a narrower one, and the same key carries the write-back, so that response would be published to every other caller whose script also faulted. `admit_event` fails the other way, because nothing about the key changed: a fault there stores the response under the configured `ttl_secs`, which is what an origin without the event already does.
 
