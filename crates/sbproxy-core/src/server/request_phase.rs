@@ -3483,7 +3483,7 @@ pub(super) async fn request_filter(
                         // A verified keyid usually settles the verdict
                         // at step 1, in which case this offloads
                         // nothing. It only reaches DNS when the catalog
-                        // does not recognise the keyid.
+                        // does not recognize the keyid.
                         crate::agent_class::stamp_request_context_offloaded(
                             ctx,
                             &resolver,
