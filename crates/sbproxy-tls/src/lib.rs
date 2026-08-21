@@ -182,7 +182,7 @@ impl AcmeExpiryReader {
 /// the error normally arrives before the config is ever applied.
 ///
 /// A *shared* backend that cannot be opened is an error for the same reason
-/// and a larger one. See [`SHARED_CERT_BACKENDS`].
+/// and a larger one. See `SHARED_CERT_BACKENDS`.
 fn open_cert_backend(acme: Option<&sbproxy_config::AcmeConfig>) -> Result<Arc<dyn KVStore>> {
     use sbproxy_platform::storage::{RedbKVStore, SqliteKVStore};
     let Some(acme) = acme else {
@@ -332,10 +332,11 @@ fn open_cert_backend(acme: Option<&sbproxy_config::AcmeConfig>) -> Result<Arc<dy
 /// pod that will not start is a far cheaper failure than a rate-limited
 /// domain days later.
 ///
-/// This is an allowlist of shared backends rather than a denylist of local
-/// ones on purpose: a backend added to `open_cert_backend` later and
-/// classified in neither list is caught by
-/// `every_backend_is_classified_shared_or_pod_local`.
+/// The refusal itself keys off `POD_LOCAL_CERT_BACKENDS` rather than this
+/// list, so a backend added to `open_cert_backend` later and classified in
+/// neither place refuses to start rather than degrading. This list only
+/// decides the wording, and
+/// `every_backend_is_classified_shared_or_pod_local` keeps it honest.
 const SHARED_CERT_BACKENDS: [&str; 5] = ["file", "redis", "s3", "gcs", "azure"];
 
 /// Certificate-store backends that live and die with a single process.
@@ -360,10 +361,20 @@ const POD_LOCAL_CERT_BACKENDS: [&str; 3] = ["memory", "redb", "sqlite"];
 /// an object-store URL can carry a query credential), so callers pass either
 /// a filesystem path, a redacted origin, or no path at all.
 fn cert_backend_open_failed(backend: &str, detail: &str) -> Result<Arc<dyn KVStore>> {
-    if SHARED_CERT_BACKENDS.contains(&backend) {
+    // Fail closed on anything not explicitly pod-local, rather than open on
+    // anything explicitly shared. A backend added to `open_cert_backend`
+    // later and left out of both lists then refuses to start instead of
+    // taking the degrade branch and quietly removing mutual exclusion, which
+    // is the failure this whole function exists to stop.
+    if !POD_LOCAL_CERT_BACKENDS.contains(&backend) {
+        let classification = if SHARED_CERT_BACKENDS.contains(&backend) {
+            "is a shared certificate store"
+        } else {
+            "is not classified as a pod-local certificate store"
+        };
         return Err(anyhow::anyhow!(
-            "acme.storage_backend '{backend}' is a shared certificate store and could \
-             not be opened ({detail}). Refusing to start: an in-memory fallback would \
+            "acme.storage_backend '{backend}' {classification} and could not be \
+             opened ({detail}). Refusing to start: an in-memory fallback would \
              give every replica its own issuance lease, so each one would open its own \
              ACME order for the same hostname and publish an HTTP-01 token no other \
              replica can read. Fix the backend, or set acme.storage_backend to a \
@@ -1383,15 +1394,18 @@ mod tests {
 
     #[test]
     fn every_backend_is_classified_shared_or_pod_local() {
-        // `cert_backend_open_failed` decides refuse-versus-degrade by asking
-        // whether the backend is in SHARED_CERT_BACKENDS. A backend added to
-        // `open_cert_backend` later and left out of both lists would silently
-        // take the degrade branch, which is the exact fail-open this change
-        // removed. Keep the two lists exhaustive against the match arms.
+        // `cert_backend_open_failed` decides refuse-versus-degrade off
+        // POD_LOCAL_CERT_BACKENDS, so an unclassified backend already fails
+        // closed and SHARED_CERT_BACKENDS only picks the wording. This test
+        // is the second half: it keeps the two lists exhaustive against the
+        // match arms so the wording stays right and a backend that should
+        // have been pod-local is not left refusing to start by accident.
         //
         // What this cannot see: an arm added to `open_cert_backend` whose
-        // name is not also added here. It is a consistency check between two
-        // lists in this file, not a parse of the match.
+        // name is not also added to `known` below. It is a consistency check
+        // between three lists in this file, not a parse of the match. The
+        // fail-closed default is what makes that blind spot safe rather than
+        // merely unlikely.
         let known = [
             "memory", "redb", "sqlite", "redis", "file", "s3", "gcs", "azure",
         ];

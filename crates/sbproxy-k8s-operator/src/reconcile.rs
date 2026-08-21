@@ -45,9 +45,9 @@ use crate::crd::{ClusteringSpec, SBProxy, SBProxyConfig, SBProxyStatus};
 /// rollout-restart path so a config-incompatible pod is never left
 /// running.
 ///
-/// `running_config_hash` is [`running_config_hash`], read off
-/// `status.configHash`, and deliberately not the pod template's
-/// `sbproxy.dev/config-hash` annotation. A successful hot reload does not
+/// The `running_config_hash` argument comes from [`running_config_hash`],
+/// which reads `status.configHash`, and is deliberately not the pod
+/// template's `sbproxy.dev/config-hash` annotation. A hot reload does not
 /// touch the pod template, by design: changing it is what rolls the pods,
 /// which is the restart the reload exists to avoid. Gate 4 read that
 /// annotation until now, so it compared the new config against a value that
@@ -1459,14 +1459,15 @@ mod tests {
         // permanently H0 on this path, so gate 4 was permanently true and
         // every requeue and every watch event reloaded the whole fleet
         // again, rebuilding each handler chain and dropping warmed state.
+        let gated_on_template = should_hot_reload(
+            &sbp,
+            Some(&existing),
+            &desired,
+            template_hash.as_deref(),
+            "H1",
+        );
         assert!(
-            should_hot_reload(
-                &sbp,
-                Some(&existing),
-                &desired,
-                template_hash.as_deref(),
-                "H1"
-            ),
+            gated_on_template,
             "the pod-template annotation is exactly the value that can never \
              advance on the hot-reload path"
         );
@@ -1546,14 +1547,15 @@ mod tests {
             rollout_config_hash(template_hash.as_deref(), running, "H1"),
         );
 
+        let gated_on_template = should_hot_reload_statefulset(
+            &sbp,
+            Some(&existing),
+            &desired,
+            template_hash.as_deref(),
+            "H1",
+        );
         assert!(
-            should_hot_reload_statefulset(
-                &sbp,
-                Some(&existing),
-                &desired,
-                template_hash.as_deref(),
-                "H1"
-            ),
+            gated_on_template,
             "same defect, same shape, on the StatefulSet path"
         );
         assert!(!should_hot_reload_statefulset(

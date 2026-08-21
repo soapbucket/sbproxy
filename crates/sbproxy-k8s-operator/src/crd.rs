@@ -210,7 +210,10 @@ impl SBProxyStatus {
     /// an empty string on every pass, which reads as "the config changed"
     /// forever.
     pub fn delivered_config_hash(&self) -> Option<&str> {
-        Some(self.config_hash.as_str()).filter(|hash| !hash.is_empty())
+        if self.config_hash.is_empty() {
+            return None;
+        }
+        Some(self.config_hash.as_str())
     }
 }
 

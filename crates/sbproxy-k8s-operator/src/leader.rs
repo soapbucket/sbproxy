@@ -772,10 +772,15 @@ mod tests {
         assert_eq!(read_a.resource_version, read_b.resource_version);
 
         let now = Utc::now();
-        let a = fake.replace(&read_a.taken_over_by("a", now)).await.unwrap();
-        let b = fake.replace(&read_b.taken_over_by("b", now)).await.unwrap();
+        let a_takeover = read_a.taken_over_by("a", now);
+        let b_takeover = read_b.taken_over_by("b", now);
+        let a = fake.replace(&a_takeover).await.unwrap();
+        let b = fake.replace(&b_takeover).await.unwrap();
 
-        assert!(matches!(a, WriteResult::Applied(_)), "the first stealer wins");
+        assert!(
+            matches!(a, WriteResult::Applied(_)),
+            "the first stealer wins"
+        );
         assert_eq!(b, WriteResult::Conflict, "the second stealer must lose");
         assert_eq!(fake.stored().unwrap().holder.as_deref(), Some("a"));
         assert_eq!(
@@ -845,7 +850,10 @@ mod tests {
 
         assert!(gate.allows(), "a recovered holder keeps writing");
         assert_eq!(fake.stored().unwrap().holder.as_deref(), Some("a"));
-        assert!(!holder.is_finished(), "the holder must not have stepped down");
+        assert!(
+            !holder.is_finished(),
+            "the holder must not have stepped down"
+        );
         holder.abort();
     }
 
