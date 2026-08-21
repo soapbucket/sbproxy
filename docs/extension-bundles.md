@@ -1,5 +1,5 @@
 # Extension Bundles
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 Dynamic bundles add policies, request authentication, transforms, actions, HTTP filters, provider-neutral event hooks, and AI routing decisions without linking a new proxy binary. A local installation is a directory of bundle directories:
 
@@ -113,6 +113,8 @@ permissions: []
 A granted hook calls `sbproxy_fetch(JSON.stringify({url, method, headers, body_base64}))` and receives a JSON envelope string back: `{"status", "headers", "body_base64"}` on success, `{"error": "<bounded reason>"}` on refusal. The host authorizes every call against the granted destinations, pins resolution (the address the guard checked is the address dialed), follows no redirects (a redirect is a destination that was never granted), runs the whole call inside the hook's remaining `budget_ms`, and caps the response at `sandbox.max_buffer_bytes`. Grants naming only literal addresses (or `localhost`) may reach private address space, because the operator typed the address and no DNS answer is involved; grants naming hostnames refuse resolutions into private space, which is what stops a rebinding answer from steering a public name inward. The call is synchronous from the guest's view and occupies one JavaScript worker for its duration, so a hook doing outbound work should set `sandbox.budget_ms` accordingly.
 
 Hook types cannot replace a built-in or linked registration of the same kind. Duplicate claims fail candidate construction instead of choosing a winner by load order.
+
+Two linked registrations claiming one name are refused the same way, for all four typed channels. A binary that links two crates each registering an `auth`, `policy`, `transform`, or `action` plugin under the same name fails the config load with `duplicate <kind> plugin registration: <name>` and the number of claims, rather than binding whichever one the linker emitted first. Which crates they are is a question for the binary's dependency graph: a registration carries a name and a factory and nothing that says where it came from.
 
 Where a hook's `failure_posture` applies, an attachment in `sb.yml` can override it. The precedence has three steps, and it matters that the middle one exists:
 
