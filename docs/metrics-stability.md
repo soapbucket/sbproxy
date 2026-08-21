@@ -75,8 +75,9 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `mesh_replication_read_repairs_total` | Counter | `stable` | `beta` | none | Stale replicas repaired in line by quorum reads. |
 | `mesh_replication_writes_total` | Counter | `stable` | `beta` | `outcome` | Replicated substrate writes, by coordinator outcome (acked or quorum_failed). |
 | `mesh_tombstone_gc_total` | Counter | `stable` | `beta` | `outcome` | Ack-aware tombstone garbage collection decisions (collected or deferred). |
+| `mesh_transport_inbound_rejected_total` | Counter | `stable` | `beta` | `reason` | Inbound cache RPC connections refused or torn down by an admission or deadline bound, by reason (connection_limit, handshake_timeout, handshake_failed, idle_timeout, frame_timeout, write_timeout). Any sustained connection_limit rate means peers are being turned away; the peer address is in the log line, never in a label. |
 | `mesh_transport_rpc_duration_seconds` | Histogram | `stable` | `beta` | `op` | Successful cross-node cache RPC duration, by operation. Healthy same-zone means sit well under 5ms; a mean near 40ms is the delayed-ACK/Nagle transport stall signature and warrants an alert. |
-| `mesh_transport_rpc_errors_total` | Counter | `stable` | `beta` | `kind` | Cross-node cache RPC failures, by transport phase. |
+| `mesh_transport_rpc_errors_total` | Counter | `stable` | `beta` | `kind` | Cross-node cache RPC failures, by transport phase. The five timeout_ kinds (timeout_lock, timeout_connect, timeout_tls, timeout_write, timeout_read) are the deadline half of the same set: a peer that answered with nothing rather than with a refusal. |
 | `sbproxy_a2a_chain_depth` | Histogram | `stable` | `beta` | `route`, `spec` | Distribution of A2A chain depth observed at the proxy. |
 | `sbproxy_a2a_denied_total` | Counter | `stable` | `beta` | `route`, `reason` | A2A hops denied by the a2a policy, labeled by route and reason. |
 | `sbproxy_a2a_hops_total` | Counter | `stable` | `beta` | `route`, `spec`, `decision` | A2A hops observed by the proxy, labeled by route, spec, and policy decision. |
