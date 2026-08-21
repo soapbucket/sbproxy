@@ -1,6 +1,6 @@
 # RAG integration
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-21*
 
 SBproxy supports retrieval-augmented generation on two surfaces, and they
 answer different questions.
@@ -218,6 +218,15 @@ fixture returns three-element vectors.
 defaults to `content`. Every variant accepts `allow_private_url` and
 `distance_metric`.
 
+`distance_metric` accepts exactly one value, `cosine`, and defaults to it.
+The field exists so a future metric can be added without a config break, but
+today a value such as `euclidean` is rejected at config load as an unknown
+variant. The real requirement is on your index: build the collection with a
+cosine metric, because `min_score` is compared against the store's returned
+score as a cosine similarity. An index built with dot product or Euclidean
+distance returns scores on a different scale and will match too much or
+nothing at all.
+
 The `redis` adapter opens one multiplexed connection on the first search and
 reuses it for every search after that; nothing connects at config load, so a
 validation run never touches your Redis. When Redis drops the socket, the
@@ -229,15 +238,6 @@ private address. Searches that were in flight together on a dropped
 connection share one replacement: a search whose failure surfaces late does
 not discard the connection a search after it already opened, so an outage
 costs one reconnect per drop rather than one per failed search.
-
-`distance_metric` accepts exactly one value, `cosine`, and defaults to it.
-The field exists so a future metric can be added without a config break, but
-today a value such as `euclidean` is rejected at config load as an unknown
-variant. The real requirement is on your index: build the collection with a
-cosine metric, because `min_score` is compared against the store's returned
-score as a cosine similarity. An index built with dot product or Euclidean
-distance returns scores on a different scale and will match too much or
-nothing at all.
 
 ### Tenant and static filters
 

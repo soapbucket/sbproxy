@@ -64,6 +64,12 @@ pub trait EphemeralKv: Send + Sync {
     /// goes early still honors it. `RedisStore` counts in whole seconds
     /// and so refuses anything under one second; `MockEphemeralKv`
     /// keeps the full `Duration` and refuses only zero.
+    ///
+    /// So the portable floor for a caller is one second. A sub-second
+    /// TTL that a test accepts against the in-memory double is refused
+    /// against Redis, and that refusal surfaces wherever the caller
+    /// runs rather than where it was written. Ask for whole seconds
+    /// unless the call site is pinned to one implementation.
     async fn put(&self, key: &str, value: Bytes, ttl: Duration) -> Result<(), StorageError>;
 
     /// Atomically read and delete `key` (Redis GETDEL semantics).
