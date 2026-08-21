@@ -912,10 +912,12 @@ mod tests {
     #[tokio::test]
     async fn redis_link_error_names_the_origin_not_the_password() {
         let link = RedisLink::new("http://aclname:topsecret@cache.internal:6379/3");
-        let err = link
-            .conn()
-            .await
-            .expect_err("a non-redis scheme cannot open");
+        // `let Err(..) else` rather than `expect_err`: the Ok half is a
+        // `ConnectionManager`, which is not `Debug`, so `expect_err` will
+        // not compile against it.
+        let Err(err) = link.conn().await else {
+            panic!("a non-redis scheme cannot open");
+        };
         let msg = format!("{err:#}");
         assert!(!msg.contains("topsecret"), "password leaked: {msg}");
         assert!(!msg.contains("aclname"), "username leaked: {msg}");
