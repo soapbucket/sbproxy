@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
 use prometheus::{
@@ -287,6 +287,118 @@ fn refresh_cardinality_gauges() {
     }
 }
 
+// --- Target health tri-state gauge (WOR-2560) ---
+
+/// `sbproxy_target_health_state` value for a target that is fully
+/// healthy: probe passing, not outlier-ejected, circuit breaker closed.
+pub const TARGET_HEALTH_HEALTHY: i64 = 0;
+
+/// `sbproxy_target_health_state` value for a target that is degraded
+/// but still selectable: the circuit breaker is half-open, so it is
+/// carrying trial traffic while recovery is confirmed.
+pub const TARGET_HEALTH_DEGRADED: i64 = 1;
+
+/// `sbproxy_target_health_state` value for a target excluded from
+/// selection: probe-unhealthy, outlier-ejected, or breaker open.
+pub const TARGET_HEALTH_EXCLUDED: i64 = 2;
+
+/// One load-balancer target's health, as reported by the callback
+/// installed with [`set_target_health_source`].
+///
+/// `state` uses the 0/1/2 scale LiteLLM's deployment-state gauge
+/// established, so Grafana panels built against that convention port
+/// over unchanged: [`TARGET_HEALTH_HEALTHY`] (0),
+/// [`TARGET_HEALTH_DEGRADED`] (1), [`TARGET_HEALTH_EXCLUDED`] (2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetHealthSample {
+    /// Configured origin id the target belongs to. Never the request
+    /// `Host`, so the label stays bounded by the operator's config.
+    pub origin: String,
+    /// Target URL exactly as configured under the origin's load
+    /// balancer. Config-bounded for the same reason.
+    pub target: String,
+    /// Tri-state health; one of the three `TARGET_HEALTH_*` constants.
+    pub state: i64,
+}
+
+/// The callback that samples per-target health for the gauge.
+type TargetHealthSource = Box<dyn Fn() -> Vec<TargetHealthSample> + Send + Sync>;
+
+/// Installed target-health source. An `RwLock<Option<..>>` rather than
+/// a `OnceLock` so every pipeline publication (and every test) can
+/// install afresh; [`refresh_target_health_gauge`] takes the read side
+/// once per scrape.
+static TARGET_HEALTH_SOURCE: RwLock<Option<TargetHealthSource>> = RwLock::new(None);
+
+/// Install (or replace) the callback that samples per-target health
+/// for the `sbproxy_target_health_state` gauge.
+///
+/// The proxy installs one at every pipeline publication
+/// (`reload::load_pipeline` in `sbproxy-core`) that walks the live
+/// pipeline exactly as `GET /api/health/targets` does, so the
+/// Prometheus view and the admin view cannot disagree. Until a source
+/// is installed the family is absent from the scrape, which is the
+/// honest shape for "nothing is load-balancing yet": absent, not zero.
+pub fn set_target_health_source(
+    source: impl Fn() -> Vec<TargetHealthSample> + Send + Sync + 'static,
+) {
+    *TARGET_HEALTH_SOURCE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(source));
+}
+
+/// The `sbproxy_target_health_state` gauge, registered on the
+/// `ProxyMetrics` registry on first use. Best-effort registration for
+/// the same reason as the cardinality gauges above: a duplicate
+/// registration across `ProxyMetrics::new()` calls in tests is ignored
+/// and the local copy is used.
+static TARGET_HEALTH_GAUGE: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
+
+fn target_health_gauge() -> &'static prometheus::IntGaugeVec {
+    TARGET_HEALTH_GAUGE.get_or_init(|| {
+        let gauge = prometheus::IntGaugeVec::new(
+            Opts::new(
+                "sbproxy_target_health_state",
+                "Per-target tri-state health: 0 healthy, 1 degraded (circuit breaker half-open), 2 excluded from selection (probe-unhealthy, outlier-ejected, or breaker open)",
+            ),
+            &["origin", "target"],
+        )
+        .expect("target health gauge constructs");
+        let _ = metrics().registry.register(Box::new(gauge.clone()));
+        gauge
+    })
+}
+
+/// Refresh the target-health gauge from the installed source.
+///
+/// Driven from [`ProxyMetrics::render`] beside
+/// [`refresh_cardinality_gauges`], and for the same reason: the truth
+/// lives elsewhere (the load balancer's probe, ejection, and breaker
+/// state), it only needs to be a gauge when someone scrapes, and
+/// sampling it at scrape time keeps the per-request path free of gauge
+/// writes it would otherwise have to maintain between scrapes. The vec
+/// is reset before the fresh samples are applied so a target removed by
+/// a config reload drops out of the scrape instead of serving its last
+/// pre-reload value forever.
+fn refresh_target_health_gauge() {
+    let source = TARGET_HEALTH_SOURCE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(source) = source.as_ref() else {
+        return;
+    };
+    let samples = source();
+    let gauge = target_health_gauge();
+    gauge.reset();
+    for sample in &samples {
+        let origin = sanitize_label("origin", &sample.origin);
+        let target = sanitize_label("target", &sample.target);
+        gauge
+            .with_label_values(&[origin.as_str(), target.as_str()])
+            .set(sample.state);
+    }
+}
+
 /// Return a reference to the global [`ProxyMetrics`] registry, initialising it on first use.
 pub fn metrics() -> &'static ProxyMetrics {
     METRICS.get_or_init(ProxyMetrics::new)
@@ -352,6 +464,12 @@ pub struct ProxyMetrics {
     /// Counter `sbproxy_inbound_key_requests_total` of requests partitioned
     /// by caller credential mode and its recognized provider.
     pub inbound_key_requests: IntCounterVec,
+
+    /// Counter `sbproxy_deprecated_requests_total` of requests that
+    /// resolved to a route carrying a `deprecation:` block or a
+    /// spec-deprecated OpenAPI operation, partitioned by origin, rule,
+    /// and whether the sunset instant had already passed (WOR-2565).
+    pub deprecated_requests_total: IntCounterVec,
 
     // --- Per-origin metrics (Sprint 1A) ---
     /// Total HTTP requests with origin, method, and status labels.
@@ -643,6 +761,21 @@ impl ProxyMetrics {
         )
         .unwrap();
 
+        // WOR-2565: deprecated-route usage. The whole point of
+        // announcing a deprecation is finding the remaining callers,
+        // so the counter carries which route is deprecated (`rule` is
+        // the forward rule's id or index, the OpenAPI path template
+        // for spec-driven matches, or empty for a whole-origin block)
+        // and whether the hit landed after the announced sunset.
+        let deprecated_requests_total = IntCounterVec::new(
+            Opts::new(
+                "sbproxy_deprecated_requests_total",
+                "Requests that resolved to a deprecated route",
+            ),
+            &["origin", "rule", "past_sunset"],
+        )
+        .unwrap();
+
         // --- Per-origin metrics (Sprint 1A) ---
 
         let per_origin_requests_total = CounterVec::new(
@@ -926,6 +1059,9 @@ impl ProxyMetrics {
             .register(Box::new(inbound_key_requests.clone()))
             .unwrap();
         registry
+            .register(Box::new(deprecated_requests_total.clone()))
+            .unwrap();
+        registry
             .register(Box::new(per_origin_requests_total.clone()))
             .unwrap();
         registry
@@ -994,6 +1130,7 @@ impl ProxyMetrics {
             agent_detect_inference_seconds,
             trust_tier_requests,
             inbound_key_requests,
+            deprecated_requests_total,
             per_origin_requests_total,
             per_origin_request_duration,
             per_origin_active_connections,
@@ -1038,6 +1175,10 @@ impl ProxyMetrics {
         // snapshot them before gathering. A scrape is exactly when
         // someone wants them current.
         refresh_cardinality_gauges();
+        // Same shape for target health: the truth is the load
+        // balancer's probe/ejection/breaker state, sampled through the
+        // installed source when a scrape wants it as a gauge.
+        refresh_target_health_gauge();
         let encoder = TextEncoder::new();
         let mut metric_families = self.registry.gather();
         metric_families.extend(prometheus::gather());
@@ -1279,6 +1420,29 @@ pub fn record_request_with_labels(
             .with_label_values(&[origin_san.as_str(), "out"])
             .inc_by(bytes_out as f64);
     }
+}
+
+/// Record one request that resolved to a deprecated route (WOR-2565).
+///
+/// `rule` names which deprecation announcement matched: the forward
+/// rule's `origin.id` (or its index when no id is configured), the
+/// OpenAPI path template for a spec-driven match, or the empty-string
+/// sentinel for a whole-origin `deprecation:` block. `past_sunset`
+/// says whether the request landed after the announced sunset instant;
+/// it is always `false` when no sunset is configured. Both free-form
+/// labels run through [`sanitize_label_budget`], though in practice
+/// their cardinality is bounded by the authored config and spec.
+pub fn record_deprecated_request(origin: &str, rule: &str, past_sunset: bool) {
+    let origin_san = sanitize_label_budget("sbproxy_deprecated_requests_total", "origin", origin);
+    let rule_san = sanitize_label_budget("sbproxy_deprecated_requests_total", "rule", rule);
+    metrics()
+        .deprecated_requests_total
+        .with_label_values(&[
+            origin_san.as_str(),
+            rule_san.as_str(),
+            if past_sunset { "true" } else { "false" },
+        ])
+        .inc();
 }
 
 /// Record an auth check result for an origin.
@@ -2369,6 +2533,46 @@ pub fn record_http_framing_block(reason: &str, tenant: &str) {
     counter
         .with_label_values(&[reason, tenant_san.as_str()])
         .inc();
+}
+
+/// Record one WebSocket upgrade refusal or tunnel teardown initiated
+/// by the gateway (WOR-2552).
+///
+/// `reason` is a closed three-value set: `message_too_large` (a frame
+/// scan crossed the `websocket` action's `max_message_size` cap),
+/// `subprotocol_violation` (the upstream's 101 selected a subprotocol
+/// outside the negotiated set, refused before the tunnel opened), and
+/// `upstream_error` (a post-upgrade failure tore the tunnel down:
+/// an upstream reset, timeout, or read error; WOR-2551's no-write
+/// teardown). `direction` is
+/// `client_to_upstream` or `upstream_to_client` for the size cap, and
+/// `none` for the two reasons that have no per-direction scan. Both
+/// are proxy-authored constants; `tenant` and `origin` are
+/// operator-scoped and pass through the cardinality limiter.
+///
+/// Registration failure yields no counter rather than a panic, the same
+/// shape [`record_policy_panic`] uses. This runs while a connection is
+/// already being torn down, and killing the process over a metric that
+/// would not register is a worse outcome than the missing series.
+pub fn record_websocket_teardown(reason: &str, direction: &str, tenant: &str, origin: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_websocket_teardowns_total",
+            "WebSocket upgrades refused or tunnels torn down by the gateway, by closed reason, direction, tenant, and origin",
+            &["reason", "direction", "tenant", "origin"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        let tenant_san = sanitize_label("tenant", tenant);
+        let origin_san = sanitize_label("origin", origin);
+        counter
+            .with_label_values(&[reason, direction, tenant_san.as_str(), origin_san.as_str()])
+            .inc();
+    }
 }
 
 /// Count a request that was rejected before origin resolution because
@@ -7888,6 +8092,68 @@ mod tests {
                     && *value >= 1.0
             }),
             "sbproxy_mcp_flow_total did not carry flow_pair_block: {counted:?}"
+        );
+    }
+
+    /// WOR-2560: the target-health gauge is a scrape-time sample of the
+    /// installed source, on the LiteLLM 0/1/2 scale.
+    ///
+    /// Three assertions, each a distinct failure mode:
+    /// 1. installing a source and scraping surfaces the series (red
+    ///    until `render()` calls `refresh_target_health_gauge`);
+    /// 2. a health change in the source moves the value on the next
+    ///    scrape, with no recorder call in between;
+    /// 3. a target the source stops reporting (config reload shrank the
+    ///    pool) leaves the scrape instead of freezing at its last value.
+    #[test]
+    fn target_health_gauge_follows_the_installed_source() {
+        set_target_health_source(|| {
+            vec![
+                TargetHealthSample {
+                    origin: "wor2560-origin".to_string(),
+                    target: "http://127.0.0.1:19601".to_string(),
+                    state: TARGET_HEALTH_HEALTHY,
+                },
+                TargetHealthSample {
+                    origin: "wor2560-origin".to_string(),
+                    target: "http://127.0.0.1:19602".to_string(),
+                    state: TARGET_HEALTH_EXCLUDED,
+                },
+            ]
+        });
+        let output = metrics().render();
+        assert!(
+            output.contains(
+                "sbproxy_target_health_state{origin=\"wor2560-origin\",target=\"http://127.0.0.1:19601\"} 0"
+            ),
+            "healthy target missing from the scrape:\n{output}"
+        );
+        assert!(
+            output.contains(
+                "sbproxy_target_health_state{origin=\"wor2560-origin\",target=\"http://127.0.0.1:19602\"} 2"
+            ),
+            "excluded target missing from the scrape:\n{output}"
+        );
+
+        // The pool shrinks to one target and that target recovers into
+        // half-open trial traffic. The next scrape must say exactly that.
+        set_target_health_source(|| {
+            vec![TargetHealthSample {
+                origin: "wor2560-origin".to_string(),
+                target: "http://127.0.0.1:19602".to_string(),
+                state: TARGET_HEALTH_DEGRADED,
+            }]
+        });
+        let output = metrics().render();
+        assert!(
+            output.contains(
+                "sbproxy_target_health_state{origin=\"wor2560-origin\",target=\"http://127.0.0.1:19602\"} 1"
+            ),
+            "state change did not move the gauge:\n{output}"
+        );
+        assert!(
+            !output.contains("http://127.0.0.1:19601"),
+            "a target removed from the source is still being scraped:\n{output}"
         );
     }
 }

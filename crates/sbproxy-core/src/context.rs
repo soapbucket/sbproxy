@@ -308,6 +308,23 @@ impl PaymentResponse {
     }
 }
 
+/// A spec-driven deprecation match staged on the request context by
+/// the `openapi_validation` enforcer (WOR-2565).
+///
+/// Pairs the OpenAPI path template that identified the operation (used
+/// as the `rule` label on `sbproxy_deprecated_requests_total`) with the
+/// policy's compiled `deprecation_headers:` values. The `Arc` is shared
+/// with the compiled policy, so staging it per request is a pointer
+/// clone.
+#[derive(Clone)]
+pub struct SpecDeprecation {
+    /// The matched operation's OpenAPI path template, e.g. `/users/{id}`.
+    pub template: String,
+    /// The compiled header set from the policy's `deprecation_headers:`
+    /// sub-block.
+    pub config: std::sync::Arc<sbproxy_config::CompiledDeprecation>,
+}
+
 /// Per-request state threaded through all Pingora phases as CTX.
 pub struct RequestContext {
     // --- Identity ---
@@ -814,6 +831,16 @@ pub struct RequestContext {
     /// If a response modifier specifies a body replacement, it is stored here
     /// so that response_body_filter can swap it in.
     pub response_body_replacement: Option<bytes::Bytes>,
+
+    // --- API deprecation (WOR-2565) ---
+    /// Spec-driven deprecation staged by the `openapi_validation`
+    /// enforcer when its `deprecation_headers:` sub-block is on and
+    /// the request matched an operation the loaded spec marks
+    /// `deprecated: true`. Read at route settlement (metrics, the
+    /// post-sunset gate) and at response stamping. A config-scope
+    /// `deprecation:` block (forward rule first, then origin) takes
+    /// precedence over it.
+    pub openapi_deprecation: Option<SpecDeprecation>,
 
     // --- Forward auth trust headers ---
     /// Headers from a successful forward auth response (e.g., X-User-ID)
@@ -1778,6 +1805,7 @@ impl RequestContext {
             response_status_override: None,
             response_reason_override: None,
             response_body_replacement: None,
+            openapi_deprecation: None,
             trust_headers: None,
             callback_inject_headers: None,
             cel_response_header_mutations: Vec::new(),

@@ -69,10 +69,31 @@ impl std::fmt::Display for StoredPolicyError {
 
 impl std::error::Error for StoredPolicyError {}
 
-/// Lower one authenticated stored record into the canonical secret-free policy.
+/// Lower one authenticated stored record into the canonical secret-free
+/// policy, evaluated now.
+///
+/// Timed state on the record (WOR-2561's budget override) is resolved at the
+/// current instant; [`key_record_to_effective_policy_at`] is the same lowering
+/// with the instant injected, for previews and clock-driven tests.
 pub fn key_record_to_effective_policy(
     record: &KeyRecord,
     origin_tenant_id: &str,
+) -> Result<EffectiveKeyPolicy, StoredPolicyError> {
+    key_record_to_effective_policy_at(record, origin_tenant_id, chrono::Utc::now())
+}
+
+/// [`key_record_to_effective_policy`] evaluated at an explicit instant.
+///
+/// `now` decides whether a temporary budget override still applies: the
+/// lowered budget is [`KeyRecord::effective_budget`] at `now`, which is the
+/// base budget raised by an unexpired override and the base budget alone once
+/// the override lapses. Expiry is therefore enforced lazily at every read of
+/// this seam (request dispatch, admin preview) rather than by a timer, which
+/// is what makes it robust across restarts.
+pub fn key_record_to_effective_policy_at(
+    record: &KeyRecord,
+    origin_tenant_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<EffectiveKeyPolicy, StoredPolicyError> {
     if record.key_id.trim().is_empty() {
         return Err(StoredPolicyError::new(StoredPolicyErrorKind::EmptyKeyId));
@@ -112,8 +133,12 @@ pub fn key_record_to_effective_policy(
             StoredPolicyError::new(StoredPolicyErrorKind::InvalidPriority),
         )?,
     };
-    if record
-        .budget
+    // WOR-2561: the enforced budget is the effective one, base plus any
+    // unexpired override, so the validity check runs against the same value
+    // the request path will compare spend to. An expired override is inert
+    // and cannot fail a key whose base budget is sound.
+    let effective_budget = record.effective_budget(now);
+    if effective_budget
         .as_ref()
         .and_then(|budget| budget.max_cost_usd)
         .is_some_and(|value| {
@@ -163,7 +188,7 @@ pub fn key_record_to_effective_policy(
         allow_content_capture: record.allow_content_capture,
         max_requests_per_minute: record.max_requests_per_minute,
         max_tokens_per_minute: record.max_tokens_per_minute,
-        budget: record.budget.as_ref().map(|budget| KeyBudgetPolicy {
+        budget: effective_budget.map(|budget| KeyBudgetPolicy {
             max_tokens: budget.max_tokens,
             max_cost_usd: budget.max_cost_usd,
         }),

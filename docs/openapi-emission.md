@@ -1,5 +1,5 @@
 # OpenAPI Emission
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-20*
 
 SBproxy documents and governs your API. It does not just proxy it.
 
@@ -73,6 +73,12 @@ The gateway derives every part of the document from its compiled config. Each ro
 | `response_cache.cacheable_status`             | `responses` keys                              |
 | `error_pages` keys                            | `responses` keys                              |
 | `cors`                                        | `x-sbproxy-cors` extension                    |
+| `deprecation:` block (rule wins over origin)  | `deprecated: true` + `x-sbproxy-sunset` / `x-sbproxy-successor` extensions |
+
+The deprecation extensions carry the exact wire values the response
+filter stamps (`x-sbproxy-sunset` is the RFC 8594 HTTP-date), so the
+emitted spec and the response headers cannot disagree. See
+[api-gateway.md](api-gateway.md#deprecating-endpoints).
 
 Coverage is bounded by what the gateway config knows. Upstream request and response body schemas are not described unless you declare them explicitly (or feed in an upstream OpenAPI spec via the existing consumption path).
 

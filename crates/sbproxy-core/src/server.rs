@@ -5604,10 +5604,12 @@ fn apply_origin_transforms_to_generated_body(
 /// 3. plugin-policy response headers accumulated during the request
 ///    phase (`AllowWithHeaders`, appended in chain order)
 /// 4. the CSRF cookie staged by the csrf enforcer
-/// 5. `assertion` policies (the body size is known exactly here, so it
+/// 5. deprecation announcement headers from the route's `deprecation:`
+///    block or a spec-driven `openapi_validation` match (WOR-2565)
+/// 6. `assertion` policies (the body size is known exactly here, so it
 ///    is passed instead of the proxied header-phase's `None`)
-/// 6. session cookie issuance from the origin's `session:` block
-/// 7. the `sri` scan over the final body (observation-only, `text/html`
+/// 7. session cookie issuance from the origin's `session:` block
+/// 8. the `sri` scan over the final body (observation-only, `text/html`
 ///    responses under an enforcing policy, identical logging and
 ///    metrics to the proxied body filter)
 ///
@@ -5685,7 +5687,30 @@ fn apply_generated_response_phases(
         let _ = header.append_header("set-cookie", cookie);
     }
 
-    // 5. Assertions: observational only, never block or modify. Unlike
+    // 5. WOR-2565: deprecation announcement headers (RFC 9745
+    // `Deprecation`, RFC 8594 `Sunset`, the `successor-version` /
+    // `deprecation` Link relations). Resolved the same way the proxied
+    // response filter resolves them (forward-rule block, origin block,
+    // then a spec-driven `openapi_validation` match), so static, mock,
+    // redirect, and post-sunset 410 responses announce exactly like
+    // proxied ones. Stamped before the assertions so an assertion can
+    // observe them.
+    if let Some(resolved) = deprecation::resolved_deprecation(
+        pipeline,
+        idx,
+        ctx.forward_rule_idx,
+        ctx.openapi_deprecation.as_ref(),
+    ) {
+        for (name, value) in deprecation::response_headers(resolved.config) {
+            if name == "link" {
+                let _ = header.append_header(name, &value);
+            } else {
+                let _ = header.insert_header(name, &value);
+            }
+        }
+    }
+
+    // 6. Assertions: observational only, never block or modify. Unlike
     // the proxied header phase, the full body is in hand, so its size
     // is passed to the CEL context.
     if let Some(policies) = policies {
@@ -5731,7 +5756,7 @@ fn apply_generated_response_phases(
         }
     }
 
-    // 6. Session cookie: issue when the origin configures a `session:`
+    // 7. Session cookie: issue when the origin configures a `session:`
     // block and the client did not already present the cookie.
     {
         let origin = &pipeline.config.origins[idx];
@@ -5757,7 +5782,7 @@ fn apply_generated_response_phases(
         }
     }
 
-    // 7. SRI scan over the final body. Same gate and semantics as the
+    // 8. SRI scan over the final body. Same gate and semantics as the
     // proxied body filter: only under an enforcing policy, only for
     // text/html, observation-only (log + metric, no mutation).
     if let Some(policies) = policies {
@@ -5830,6 +5855,10 @@ pub(crate) mod model_host;
 // --- Non-proxy action handlers ---
 
 mod action_dispatch;
+/// First-class API deprecation: RFC 9745 `Deprecation`, RFC 8594
+/// `Sunset`, the Link relations, the deprecated-usage metric, and the
+/// post-sunset `gone` posture (WOR-2565).
+pub(crate) mod deprecation;
 use action_dispatch::*;
 
 // Dispatch-side glue for the MCP tool rollout plane (versioned

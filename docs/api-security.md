@@ -40,7 +40,7 @@ manifest naming exactly what it did for each.
 | API6 | Unrestricted Access to Sensitive Business Flows | `not_covered`: compose `rate_limiting`, `object_authz`, and bot checks yourself | [Automated traffic you cannot distinguish](#automated-traffic-you-cannot-distinguish) |
 | API7 | Server Side Request Forgery | `enforced`, always, with nothing synthesized: the SSRF guard already runs on every outbound dial *sbproxy itself* makes - not the backend's own server-side URL fetching | [Requests the service makes on the caller's behalf](#requests-the-service-makes-on-the-callers-behalf) |
 | API8 | Security Misconfiguration | `enforced`: adds `security_headers` and `http_framing` on proxied and generated-response origins alike (`static`/`mock`/`echo`/`beacon`/`redirect` included; `mcp`/`storage`/`ai_proxy`/plugin actions only get `http_framing`); layer `waf` yourself for broader coverage | [Browser-facing misconfiguration](#browser-facing-misconfiguration) |
-| API9 | Improper Inventory Management | `enforced`: sets `expose_openapi: true`, a disclosure decision worth reviewing first | [openapi-emission.md](openapi-emission.md) |
+| API9 | Improper Inventory Management | `enforced`: sets `expose_openapi: true`, a disclosure decision worth reviewing first | [openapi-emission.md](openapi-emission.md); unretired old versions are the classic finding here, so announce and retire them with a [`deprecation:` block](api-gateway.md#deprecating-endpoints) |
 | API10 | Unsafe Consumption of APIs | `not_covered`: no response-handling safety net for third-party API calls today | n/a |
 
 `enable: all` defaults every item's posture to `report_only`. API7,
@@ -241,6 +241,111 @@ complete working config.
 request look like two, refusing conflicting `Content-Length` and
 `Transfer-Encoding` combinations rather than guessing which one the backend will
 believe.
+
+### Structural body threat limits
+
+`body_threat_protection` bounds the *shape* of a JSON or XML request body
+rather than its content: how deep it nests, how many entries an object or
+items an array carries, how long keys and strings run, how many containers or
+elements the whole document holds. A parser-stressing payload is a shape
+problem before it is a content problem, and shape limits are immune to the
+encoding evasions a signature ruleset has to chase. Kong gates the equivalent
+capability (its JSON Threat Protection and XML Threat Protection plugins)
+behind its Enterprise tier; SBproxy ships it in OSS.
+
+<!-- sbproxy-config-excerpt -->
+```yaml
+    policies:
+      - type: body_threat_protection
+        mode: block          # block (default) refuses with 400; tap logs + counts only
+        json:
+          max_depth: 64            # nesting depth; top-level container is 1
+          max_object_entries: 10000 # entries in any single object
+          max_array_items: 10000   # items in any single array
+          max_key_length: 1024     # bytes per object key
+          max_string_length: 131072 # bytes per string value
+          max_containers: 50000    # objects + arrays in the whole document
+        xml:
+          max_depth: 64            # element nesting depth
+          max_elements: 10000      # elements in the whole document
+          max_attributes: 256      # attributes on any single element
+```
+
+Every field above shows its default; omitting the `json:` and `xml:` blocks
+enforces exactly these numbers. Setting a single limit to `0` disables that
+one check; setting `enabled: false` inside a block switches that family off
+entirely. One ceiling survives every override: JSON nesting deeper than
+10,000 containers is always refused, because the scanner keeps a small state
+frame per open container and an unbounded depth would turn that bookkeeping
+into a memory amplifier. There is one non-configurable rule: an XML `<!DOCTYPE` declaration
+is always refused. Entity declarations live in the DTD, so refusing the DTD
+refuses the entire expansion class, billion laughs and external entities
+alike, without the proxy ever expanding anything.
+
+The decision path per request:
+
+```mermaid
+flowchart TD
+    REQ["Request arrives with a body"] --> CT{"Content-Type gate"}
+    CT -->|"application/json, +json"| BUF["Buffer the body\n(replay-armed, 8 MiB hard cap)"]
+    CT -->|"application/xml, text/xml, +xml"| BUF
+    CT -->|"anything else, or absent"| PASS["Pass untouched:\nnot buffered, not scanned"]
+    BUF --> SCAN["One-pass structural scan\n(JSON: iterative tokenizer,\nXML: pull reader, entities never expanded)"]
+    SCAN --> DTD{"XML DOCTYPE?"}
+    DTD -->|yes| V["Violation named:\nxml.doctype"]
+    DTD -->|no| LIM{"Per-limit checks\n(depth, entries, items,\nkey/string length, containers,\nelements, attributes)"}
+    LIM -->|"all within limits"| REL["Release the exact buffered\nbytes to the upstream"]
+    LIM -->|"limit exceeded"| V2["Violation named:\njson.max_depth, xml.max_elements, ..."]
+    V --> MODE{"mode"}
+    V2 --> MODE
+    MODE -->|block| B400["400 naming the violated limit,\nupstream never contacted,\npolicy counter action=deny,\nsecurity audit event"]
+    MODE -->|tap| TAP["Log + policy counter action=tap"]
+    TAP --> REL
+```
+
+The refusal names the limit and the observed and allowed numbers
+(`json.max_depth: observed 65 exceeds the configured limit 64`) and never
+echoes body content, the same rule `request_validator` follows. A body the
+scanner cannot finish (unterminated string, unbalanced brackets, malformed
+XML) is refused as `json.malformed` / `xml.malformed`: fail closed, because a
+body that defeats the guard's own parse should not get to try its luck
+upstream.
+
+`mode: tap` exists for the same reason `object_authz` ships enumeration
+detection as detect-only: shape limits alone can false-positive on
+legitimately deep payloads, so operators can watch
+`sbproxy_policy_triggers_total{policy_type="body_threat_protection",action="tap"}`
+against real traffic before flipping to `block`.
+
+Like `request_validator` and `openapi_validation`, the policy evaluates on
+the buffered request body, so it applies to actions that actually forward a
+body upstream (`proxy`, `load_balancer`, `ai_proxy`, and the other
+body-consuming actions). A `static` or `mock` origin answers during the
+request phase and never streams its request body, so bodies sent at those
+origins are not scanned; there is also nothing behind them for a hostile
+body to reach.
+
+Interplay with the size caps: this policy deliberately has no body-size limit
+of its own. `request_limit.max_body_size` is the operator's byte cap, and the
+shared body-buffering seam this policy evaluates on refuses anything past its
+8 MiB hard cap with a 413 before any scan runs, so an oversized body can
+never be used to balloon the proxy's memory on the way to a structural scan.
+A body too large to buffer is refused as too large; it is never waved through
+unscanned.
+
+Scope, stated plainly: these are shape limits, not body inspection. The WAF's
+signature rules still do not read request bodies at all
+([waf-options.md](waf-options.md#what-the-baseline-is-not)), and
+`body_threat_protection` does not change that; it closes the structural slice
+of the gap, the slice that needs no rule engine. The signature-matching slice
+stays open, and the requirements a real CRS integration would have to meet are
+listed on that same page. The origin-level `threat_protection:` block is this
+policy's alpha-stability predecessor: JSON-only, 413s instead of naming the
+limit, no tap mode. Prefer the policy.
+
+See [`examples/body-threat-protection/`](../examples/body-threat-protection/)
+for a runnable config with captured refusals for depth, entity expansion, and
+string length, plus the tap-mode run.
 
 **Still yours.** Keeping the specification honest. Validation against a stale
 spec enforces last quarter's contract.

@@ -15,6 +15,8 @@ pub mod ai_crawl;
 /// aipref preference signal parser.
 pub mod aipref;
 pub mod assertion;
+/// `body_threat_protection` structural JSON/XML body limits.
+pub mod body_threat_protection;
 pub mod bot_detection;
 pub mod concurrent_limit;
 pub mod content_digest;
@@ -68,6 +70,10 @@ pub use ai_crawl::{
 pub use ai_crawl::{HttpLedger, HttpLedgerConfig};
 pub use aipref::{parse_aipref, AiprefParseError, AiprefSignal};
 pub use assertion::AssertionPolicy;
+pub use body_threat_protection::{
+    body_threat_family, BodyThreatFamily, BodyThreatMode, BodyThreatProtectionPolicy,
+    BodyThreatViolation,
+};
 pub use bot_detection::BotDetection;
 pub use concurrent_limit::{ConcurrentLimitGuard, ConcurrentLimitPolicy};
 pub use content_digest::{
@@ -160,6 +166,13 @@ pub enum Policy {
     /// reach the upstream. Rejects malformed or non-conforming
     /// payloads at the edge with a configurable status / body.
     RequestValidator(RequestValidatorPolicy),
+    /// Structural JSON/XML body threat limits: nesting depth,
+    /// container sizes, key/string lengths, and an unconditional XML
+    /// DTD refusal (the billion-laughs guard). Shape enforcement over
+    /// the buffered request body, gated on the JSON/XML content-type
+    /// families; `tap` mode observes without blocking. See
+    /// `policy/body_threat_protection.rs`.
+    BodyThreatProtection(BodyThreatProtectionPolicy),
     /// WOR-805: verifies the inbound `Content-Digest` header (RFC
     /// 9530) against the SHA-256 / SHA-512 of the request body
     /// before forwarding upstream. Rejects malformed headers and
@@ -250,6 +263,7 @@ impl Policy {
             Self::Assertion(_) => "assertion",
             Self::Waf(_) => "waf",
             Self::RequestValidator(_) => "request_validator",
+            Self::BodyThreatProtection(_) => "body_threat_protection",
             Self::ContentDigest(_) => "content_digest",
             Self::ConcurrentLimit(_) => "concurrent_limit",
             Self::AiCrawl(_) => "ai_crawl_control",
@@ -286,6 +300,9 @@ impl std::fmt::Debug for Policy {
             Self::Assertion(r) => f.debug_tuple("Assertion").field(r).finish(),
             Self::Waf(r) => f.debug_tuple("Waf").field(r).finish(),
             Self::RequestValidator(r) => f.debug_tuple("RequestValidator").field(r).finish(),
+            Self::BodyThreatProtection(r) => {
+                f.debug_tuple("BodyThreatProtection").field(r).finish()
+            }
             Self::ContentDigest(c) => f.debug_tuple("ContentDigest").field(c).finish(),
             Self::ConcurrentLimit(r) => f.debug_tuple("ConcurrentLimit").field(r).finish(),
             Self::AiCrawl(r) => f.debug_tuple("AiCrawl").field(r).finish(),
@@ -328,6 +345,9 @@ mod tests {
             Policy::Assertion(
                 AssertionPolicy::from_config(serde_json::json!({"expression": "true"})).unwrap(),
             ),
+            Policy::BodyThreatProtection(
+                BodyThreatProtectionPolicy::from_config(serde_json::json!({})).unwrap(),
+            ),
         ];
 
         let expected_names = [
@@ -339,6 +359,7 @@ mod tests {
             "Sri",
             "Expression",
             "Assertion",
+            "BodyThreatProtection",
         ];
 
         for (policy, name) in variants.iter().zip(expected_names.iter()) {

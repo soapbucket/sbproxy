@@ -3445,6 +3445,24 @@ pub const METRICS: &[MetricCapability] = &[
         description: "Decision events that proceeded without the decision being made.",
         dead_reason: None,
     },
+    // WOR-2565. Zalando rule 188: deprecated-API usage must be
+    // monitored, because the whole point of announcing a deprecation
+    // is enumerating the callers who have not migrated yet. `rule`
+    // names which announcement matched (forward-rule id or index,
+    // OpenAPI path template, or empty for a whole-origin block) and
+    // `past_sunset` separates stragglers still calling after the
+    // announced retirement instant.
+    MetricCapability {
+        name: "sbproxy_deprecated_requests_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_deprecated_request"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &["origin", "rule", "past_sunset"],
+        description: "Requests that resolved to a deprecated route.",
+        dead_reason: None,
+    },
     MetricCapability {
         name: "sbproxy_semantic_cache_results_total",
         kind: MetricKind::Counter,
@@ -3520,6 +3538,17 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Proxy,
         labels: &["reason"],
         description: "Synthetic readiness probe failures by reason.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_target_health_state",
+        kind: MetricKind::Gauge,
+        writer: Writer::Recorder("refresh_target_health_gauge"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &["origin", "target"],
+        description: "Per-target tri-state health on LiteLLM's 0/1/2 scale: 0 healthy, 1 degraded (circuit breaker half-open), 2 excluded from selection (probe-unhealthy, outlier-ejected, or breaker open). Sampled at scrape time from the same pipeline walk that renders GET /api/health/targets.",
         dead_reason: None,
     },
     MetricCapability {
@@ -3681,6 +3710,17 @@ pub const METRICS: &[MetricCapability] = &[
         description: "WAF persistent (time-boxed) block actions, by lifecycle event and key kind.",
         dead_reason: None,
     },
+    MetricCapability {
+        name: "sbproxy_websocket_teardowns_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_websocket_teardown"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["reason", "direction", "tenant", "origin"],
+        description: "WebSocket upgrades refused or tunnels torn down by the gateway, by closed reason, direction, tenant, and origin.",
+        dead_reason: None,
+    },
 ];
 
 /// Dashboards and alert rules that knowingly read a metric nothing writes.
@@ -3821,6 +3861,12 @@ pub const TENANT_SCOPED_METRICS: &[&str] = &[
     "sbproxy_usage_bridge_enqueued_total",
     "sbproxy_usage_bridge_gap_total",
     "sbproxy_waf_persistent_blocks_total",
+    // WOR-2552. A websocket enforcement teardown is a security-policy
+    // outcome for one tenant's tunnel traffic, same reasoning as the
+    // WAF and egress counters beside it: merged across tenants it
+    // answers "some tunnel was torn down somewhere", which cannot tell
+    // an operator whose traffic is being refused.
+    "sbproxy_websocket_teardowns_total",
 ];
 
 /// Tenant-scoped families that are known to lack a tenant label today, and

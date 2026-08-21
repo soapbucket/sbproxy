@@ -161,6 +161,10 @@ with the full lifecycle inline.
   renders once in a copy-once modal and is never retrievable again),
   `PATCH /admin/keys/{id}` (edit policy, gated by `expected_revision`),
   `POST /admin/keys/{id}/revoke|block|unblock|rotate`,
+  `POST /admin/keys/{id}/budget-override` (Raise budget: a temporary,
+  auto-expiring raise on the base budget; the row then shows a "raised"
+  badge with the increase, a countdown to expiry, and who granted it),
+  `DELETE /admin/keys/{id}/budget-override` (Clear raise),
   `DELETE /admin/keys/{id}`. The edit modal also calls
   `POST /admin/keys/{id}/effective-policy/preview` live as you edit, so
   you can see the resolved policy before saving. A usage panel calls

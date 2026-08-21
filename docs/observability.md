@@ -358,6 +358,8 @@ Every family below is emitted by running code. That is worth stating because it 
 | `sbproxy_ai_shadow_dropped_total` | 6 | Counter; labels: `reason` (`streaming`\|`provider_not_found`\|`provider_not_allowed`\|`prompt_training_disallowed`\|`egress_denied`\|`saturated`). Counts configured shadow evaluations skipped or dropped before dispatch. Sampling out is intentionally excluded. |
 | `sbproxy_ai_shadow_timeout_total` | 1 | Counter; shadow evaluations dropped because the per-eval timeout fired. |
 | `sbproxy_ai_token_estimate_error_ratio_bucket` | 200 | Labels: `model`; histogram buckets `(estimate - actual) / actual` between -1 and +1. Drives the pre-flight estimator's accuracy alert. |
+| `sbproxy_ai_budget_utilization_ratio` | 7 | Labels: `scope` (workspace\|api_key\|user\|model\|origin\|tag\|agent). Gauge; fraction of a scope's tightest configured cap consumed, above 1 is over budget. Republished after every billing debit and on every preflight that trips a limit, so it is the same consumed fraction `warn_at`/`downgrade_at` compare against. Headroom is `1 - sbproxy_ai_budget_utilization_ratio` in PromQL; there is deliberately no separate remaining family, because a family and its complement double the series without adding information. |
+| `sbproxy_target_health_state` | 500 | Labels: `origin` (configured origin id, sanitized), `target` (configured target URL, sanitized). Gauge on LiteLLM's 0/1/2 deployment-state scale: 0 healthy, 1 degraded (circuit breaker half-open), 2 excluded from selection (probe-unhealthy, outlier-ejected, or breaker open). Sampled at scrape time from the same pipeline walk that renders `GET /api/health/targets`, so the two surfaces cannot disagree; a target removed by a config reload leaves the scrape on the next render instead of freezing at its last value. |
 
 Hard rule: run-scoped identifiers are never label values on Prometheus metrics. That covers run ids, task ids, context ids, session ids, conversation ids, trace and span ids, and request or correlation ids. Each takes one distinct value per run and never repeats, so as a label it mints one time series per run, and those series outlive the run by the whole retention window. They belong on spans (under traces), on log lines (under logs), and in durable per-request records, where reconstructing a single run is exactly the point.
 
@@ -378,6 +380,33 @@ sbproxy_label_cardinality_unique_values / sbproxy_label_cardinality_budget > 0.9
 Both are labeled by label name and nothing else. There is no `metric` label, because one budget is shared by every metric using that label name and splitting by metric would be a lie. There is no `tenant_id` label either, because that would multiply the series count by the tenant budget, which is the failure these gauges exist to warn about.
 
 Forbidding the label does not mean losing the identifier. A run id reaches the AI span as `session.id` and the access log as `a2a_context_id`, which is where reconstructing one run is exactly the point. The one place it cannot reach is an outbound request header on the hop that learned it: the A2A `contextId` lives in the JSON-RPC request body, the body is parsed at the body phase, and the body phase runs after the upstream request header has already been assembled and sent. Run correlation between hops rides the W3C trace context instead. "[The phase constraint: a run id cannot ride an outbound header](#the-phase-constraint-a-run-id-cannot-ride-an-outbound-header)" under Traces has the detail.
+
+### Budget headroom and target health
+
+Two gauges answer the questions an operator otherwise polls the admin API for: how close each budget scope is to its cap (`sbproxy_ai_budget_utilization_ratio{scope}`) and whether each load-balancer target is actually taking traffic (`sbproxy_target_health_state{origin,target}`). They get their values by different routes, and the difference is the mechanism worth knowing:
+
+```mermaid
+flowchart TD
+    BILL["AI billing event\n(record_billing_event,\nthe single budget writer)"] --> TRACK["BUDGET_TRACKER\nconsumed tokens / USD per scope key"]
+    TRACK --> FRAC["Consumed fraction per limit\n(the value warn_at / downgrade_at\ncompare against)"]
+    FRAC --> UTIL["set_budget_utilization recorder\nsbproxy_ai_budget_utilization_ratio{scope}"]
+    UTIL --> SCRAPE["/metrics scrape"]
+
+    PROBE["Active health probe"] --> LB["Load-balancer target state"]
+    EJECT["Passive outlier ejection"] --> LB
+    BREAK["Circuit breaker"] --> LB
+    LB --> WALK["collect_target_health\n(one pipeline walk, shared)"]
+    WALK --> ADMIN["GET /api/health/targets\n(admin JSON)"]
+    WALK --> SRC["installed target-health source,\nsampled by refresh_target_health_gauge\ninside every /metrics render"]
+    SRC --> GAUGE["sbproxy_target_health_state{origin,target}\n0 healthy / 1 degraded / 2 excluded"]
+    GAUGE --> SCRAPE
+```
+
+The budget gauge is written at the enforcement path: `refresh_budget_utilization` republishes it after every billing debit, and the budget preflight sets it again when a limit trips, so the scrape always carries the fraction the last debit produced. It is utilization rather than remaining on purpose. `1 - sbproxy_ai_budget_utilization_ratio` is headroom, and the alert that pages before exhaustion is already in `dashboards/prometheus/alerts.yml`: `max by (scope) (sbproxy_ai_budget_utilization_ratio) > 0.9`.
+
+The health gauge is sampled at scrape time instead, the same way the cardinality headroom gauges are: the truth lives in the load balancer's probe, ejection, and breaker state, and only a scrape needs it as a number. Every `/metrics` render runs the installed source, which walks the live pipeline through the same `collect_target_health` that renders `GET /api/health/targets`, so the JSON body and the Prometheus series cannot tell different stories about one target. The 0/1/2 values match LiteLLM's deployment-state scale, so panels built against that convention port over: alert on `sbproxy_target_health_state == 2` for targets `select_target` is skipping, and on `min by (origin) (sbproxy_target_health_state) == 2` for an origin with no eligible target left.
+
+Both gauges are staged in one runnable config at [`examples/health-and-budget-gauges/`](../examples/health-and-budget-gauges/): a dead load-balancer target walks its series from 0 to 2, and three fixture-billed AI calls walk the workspace budget to 1.0 and a 402, with the captured scrape output in that README.
 
 ### Fleet totals across a cluster
 

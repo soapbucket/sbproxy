@@ -1344,6 +1344,123 @@ budget:
 
 Window selection, the downgrade-target resolution order, and how a downgrade is tagged in the spend history are in [ai-predictive-budget.md](ai-predictive-budget.md).
 
+### Temporary budget overrides
+
+A governed key's base budget lives on its dynamic key record (see
+[key-management.md](key-management.md)). When a launch day or a load test
+needs more headroom for a few hours, editing that durable limit means
+remembering to put it back. A temporary override raises the effective
+budget instead: it applies on top of the base caps until an expiry you
+choose, then the base resumes on its own. The same mechanic LiteLLM ships
+as `temp_budget_increase` / `temp_budget_expiry`.
+
+```mermaid
+flowchart TD
+    GRANT["Operator grants a raise:\nPOST /admin/keys/{id}/budget-override\nincrease + TTL + reason"] --> STORE["Override persisted on the\nkey record in the store:\nincrease, expiry, grantor"]
+    STORE --> AUDIT1["key_audit: budget_override_grant,\nnaming the grantor"]
+    STORE --> READ{"Budget read\n(request dispatch, preview,\nusage snapshot)"}
+    READ -->|"now < expiry"| RAISED["Effective budget =\nbase caps + increase"]
+    READ -->|"now >= expiry"| BASE["Effective budget =\nbase caps alone"]
+    RESTART["Process restart"] --> READ
+    BASE --> SWEEP["Next admin read retires the\nlapsed grant from the record"]
+    SWEEP --> AUDIT2["key_audit:\nbudget_override_expire"]
+    CLEAR["Operator ends it early:\nDELETE .../budget-override"] --> BASE
+```
+
+Three properties fall out of evaluating the expiry at read time rather
+than running a timer. A restart changes nothing, because the override is
+persisted in the key store and every read re-derives the effective budget
+from it. The revert cannot be forgotten, because there is nothing to
+revert. And the enforcement path, the admin preview, and the usage
+snapshot cannot disagree, because all three read the budget through the
+same seam.
+
+Granting and clearing:
+
+```bash
+# Raise the key's caps by 100k tokens and $50 for one hour.
+curl -u admin:admin -X POST http://127.0.0.1:9090/admin/keys/<key_id>/budget-override \
+  -H 'Content-Type: application/json' \
+  -d '{"max_tokens_increase": 100000, "max_cost_usd_increase": 50.0,
+       "ttl_secs": 3600, "reason": "launch-day spike"}'
+
+# End it early; the base budget resumes immediately.
+curl -u admin:admin -X DELETE http://127.0.0.1:9090/admin/keys/<key_id>/budget-override
+```
+
+The grant body takes `max_tokens_increase` and `max_cost_usd_increase`
+(at least one, each raising the matching base cap), an expiry as either
+`ttl_secs` or an RFC 3339 `expires_at`, and an optional `reason`. A raise
+only lifts caps that exist: an axis the base budget leaves uncapped stays
+uncapped, and a key with no base budget cannot be raised at all. While the
+raise is live, `GET /admin/keys/{id}` shows the untouched `budget`, the
+`budget_override` (increase, expiry, grantor, reason), and the
+`effective_budget` the enforcement path is comparing spend against. The
+console's Keys page renders the same three as a "raised" badge with a
+countdown and a Clear raise action.
+
+Both ends of the raise's life land in the `key_audit` trail:
+`budget_override_grant` names the operator who granted it, and
+`budget_override_expire` is written when an admin read first observes the
+lapsed grant and retires it from the record. Overrides are granted at
+runtime only; a key seeded from `key_management.seed` gets its override
+dropped if the seed re-applies on reload, the same as any other runtime
+mutation of a config-sourced record.
+
+The runnable walkthrough, with the refusal at the base cap, the grant, the
+admitted request, and the expiry, is
+[examples/temp-budget-override/](../examples/temp-budget-override/):
+
+<!-- sbproxy-config: examples/temp-budget-override/sb.yml -->
+```yaml
+proxy:
+  http_bind_port: 8080
+
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: admin
+
+  key_management:
+    enabled: true
+    store:
+      backend: embedded
+      path: /tmp/sbproxy-temp-budget-override.redb
+    cache:
+      ttl_secs: 60
+    crypto:
+      pepper: env:SBPROXY_KEY_PEPPER
+      master_key: env:SBPROXY_KEY_MASTER
+    failure_posture: closed
+    seed:
+      keys:
+        - key_id: seed0001
+          secret: demo-secret-please-rotate
+          name: launch-day-demo-key
+          # The base cap the override temporarily raises: 200 total
+          # tokens across the key's lifetime. Small on purpose, so one
+          # fixture request can exhaust it.
+          max_budget_tokens: 200
+
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          provider_type: openai
+          # The fixture ignores the credential; OpenAI-shaped provider
+          # config carries one. Against the real provider this would be
+          # ${OPENAI_API_KEY}.
+          api_key: ${FIXTURE_API_KEY:-fixture-local-token}
+          base_url: http://127.0.0.1:18080/v1
+          allow_private_base_url: true
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+```
+
 ### Model prices
 
 Cost tracking and cost-based routing need a per-model price. SBproxy ships a built-in catalog of current families (GPT-5 / 4.1 / 4o / o-series, Claude 4.x and 3.x, Gemini 2.x and 1.5); a model the catalog does not know is billed at a deliberately high $5 / $5 per million tokens so a budget cap fires early rather than late. You can supply prices two ways, both layered over the catalog.
