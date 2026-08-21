@@ -133,5 +133,11 @@
   "settle_rejection": {
     "success": false,
     "errorReason": "settlement_failed"
+  },
+  "settle_foreign_error": {
+    "success": false,
+    "error": "Bad Gateway",
+    "upstream": "facilitator-api",
+    "requestId": "req_fixture_0001"
   }
 }

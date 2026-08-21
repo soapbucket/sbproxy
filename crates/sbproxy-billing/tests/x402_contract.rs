@@ -22,9 +22,9 @@ use sbproxy_billing::x402::{
     REQUIREMENT_EXTENSION_KEY, REQUIREMENT_EXTENSION_SCHEMA,
 };
 use sbproxy_billing::{
-    BillingClock, BillingService, PaymentLifecycleEvent, PaymentLifecycleObserver, PaymentProof,
-    RailRegistry, RedemptionRequest, RequirementInput, SignedPaymentRequirement,
-    SqliteSettlementStore, X402Adapter,
+    derive_intent_id, BillingClock, BillingService, IntentStatus, PaymentLifecycleEvent,
+    PaymentLifecycleObserver, PaymentProof, RailRegistry, RedemptionRequest, RequirementInput,
+    SharedSettlementStore, SignedPaymentRequirement, SqliteSettlementStore, X402Adapter,
 };
 use sbproxy_billing::{
     BillingError, PaymentLifecycleDecision, PaymentLifecycleOutcome, PaymentLifecyclePhase,
@@ -272,7 +272,36 @@ struct ServiceLifecycleFixture {
     signed: SignedPaymentRequirement,
     observer: Arc<RejectPhaseObserver>,
     calls: Arc<Mutex<Vec<String>>>,
+    store: SharedSettlementStore,
+    intent_id: String,
     _directory: tempfile::TempDir,
+}
+
+impl ServiceLifecycleFixture {
+    /// The durable state of the one intent these fixtures settle.
+    async fn intent_status(&self) -> IntentStatus {
+        self.store
+            .load_intent(&self.intent_id)
+            .await
+            .expect("the intent reads back")
+            .expect("the intent exists")
+            .status
+    }
+
+    /// The attempts the recovery sweep would pick up on its next tick.
+    ///
+    /// This is what makes an ambiguous settle reconcilable later: an
+    /// attempt that is not on this queue is one no sweep will ever ask
+    /// the facilitator about.
+    async fn reconciliation_queue(&self) -> Vec<String> {
+        self.store
+            .claim_reconciliation(1_700_000_000_000, 30_000, 8)
+            .await
+            .expect("the reconciliation queue reads back")
+            .into_iter()
+            .map(|claimed| claimed.attempt.intent_id)
+            .collect()
+    }
 }
 
 async fn service_lifecycle_fixture(
@@ -300,7 +329,7 @@ async fn service_lifecycle_fixture(
         .unwrap()
         .with_clock(Arc::clone(&clock) as Arc<dyn BillingClock>)
         .shared();
-    let service = BillingService::builder(store)
+    let service = BillingService::builder(Arc::clone(&store))
         .adapters(registry)
         .clock(clock as Arc<dyn BillingClock>)
         .signer(Arc::new(FixtureSigner))
@@ -330,6 +359,8 @@ async fn service_lifecycle_fixture(
         signed: prepared.signed,
         observer,
         calls,
+        store,
+        intent_id: derive_intent_id("tenant-1", "request-key"),
         _directory: directory,
     }
 }
@@ -823,6 +854,89 @@ async fn x402_service_emits_succeeded_after_durable_settlement() {
     );
 }
 
+/// The events one authorization emits, verify leg through settle leg.
+fn legs(
+    settle_outcome: PaymentLifecycleOutcome,
+) -> [(PaymentLifecyclePhase, PaymentLifecycleOutcome); 4] {
+    [
+        (
+            PaymentLifecyclePhase::Verify,
+            PaymentLifecycleOutcome::Started,
+        ),
+        (
+            PaymentLifecyclePhase::Verify,
+            PaymentLifecycleOutcome::Succeeded,
+        ),
+        (
+            PaymentLifecyclePhase::Settle,
+            PaymentLifecycleOutcome::Started,
+        ),
+        (PaymentLifecyclePhase::Settle, settle_outcome),
+    ]
+}
+
+#[tokio::test]
+async fn a_settle_answering_five_hundred_lands_on_the_reconciliation_queue() {
+    // The whole seam for the unknown class, not just the settler's return
+    // value. The dispatch stamp is committed, the facilitator answers 500
+    // with a body saying `success: false`, and the durable record must
+    // stay open and claimable rather than asserting that no funds moved.
+    let settle = Reply::Body {
+        status: 500,
+        body: body("settle_rejection"),
+        delay_ms: 0,
+    };
+    let fixture = service_lifecycle_fixture(None, settle).await;
+
+    let decision = authorize_fixture(&fixture).await;
+
+    // Fail closed to the payer, but as "outstanding", never as "refused".
+    assert!(matches!(
+        decision,
+        sbproxy_billing::AuthorizationDecision::Unavailable { .. }
+    ));
+    // `IntentStatus::Terminal` asserts that no funds moved. Nothing here
+    // proved that, so the intent may not carry it.
+    assert_eq!(
+        fixture.intent_status().await,
+        IntentStatus::NeedsReconciliation
+    );
+    // And it is on the queue, so a sweep will keep asking. An ambiguous
+    // settle that leaves no claimable row is unreconcilable forever.
+    assert_eq!(
+        fixture.reconciliation_queue().await,
+        [fixture.intent_id.clone()]
+    );
+    assert_eq!(
+        *fixture.observer.events.lock().unwrap(),
+        legs(PaymentLifecycleOutcome::Ambiguous)
+    );
+}
+
+#[tokio::test]
+async fn a_two_hundred_refusal_still_closes_the_intent_terminal() {
+    // The counterpart, and the reason the fix is a status test rather
+    // than "treat every settle failure as unknown": a facilitator that
+    // answers 200 in its own protocol saying the payment is not valid has
+    // refused it, and that answer still closes the record and bills the
+    // payer nothing.
+    let fixture = service_lifecycle_fixture(None, ok("settle_rejection")).await;
+
+    let decision = authorize_fixture(&fixture).await;
+
+    assert!(matches!(
+        decision,
+        sbproxy_billing::AuthorizationDecision::PaymentRequired(_)
+    ));
+    assert_eq!(fixture.intent_status().await, IntentStatus::Terminal);
+    // Nothing to reconcile: the facilitator already answered.
+    assert!(fixture.reconciliation_queue().await.is_empty());
+    assert_eq!(
+        *fixture.observer.events.lock().unwrap(),
+        legs(PaymentLifecycleOutcome::Rejected)
+    );
+}
+
 #[tokio::test]
 async fn a_verify_rejection_never_prepares_or_calls_settle() {
     let calls = Arc::new(Mutex::new(Vec::new()));
@@ -921,6 +1035,99 @@ async fn an_authoritative_settle_failure_is_terminal_not_ambiguous() {
         "an authoritative settle failure must not authorize",
     );
     assert_eq!(error, BillingError::ProviderRejected);
+}
+
+/// Runs one authorization whose settle answers with `status` and the
+/// named fixture body, and returns the error and the number of stamps.
+async fn settle_answered(status: u16, fixture: &str) -> (BillingError, usize, usize) {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let stamps = Arc::new(AtomicUsize::new(0));
+    let settler = settler(
+        ok("verify_response"),
+        Reply::Body {
+            status,
+            body: body(fixture),
+            delay_ms: 0,
+        },
+        calls.clone(),
+        breaker(),
+    );
+    let required = frozen_required();
+    let payload = frozen_payload();
+
+    let error = expect_error(
+        settler
+            .authorize_and_settle(
+                X402AuthorizationRequest {
+                    challenge: challenge(&required),
+                    payload: &payload,
+                    now_ms: 1_800_000_000_000,
+                },
+                &RecordingGate {
+                    stamps: stamps.clone(),
+                    delay_ms: 0,
+                },
+            )
+            .await,
+        "a settle outside 2xx must not authorize",
+    );
+    let total_calls = calls.lock().unwrap().len();
+    (error, stamps.load(Ordering::SeqCst), total_calls)
+}
+
+#[tokio::test]
+async fn a_five_hundred_saying_success_false_is_not_an_authoritative_refusal() {
+    // The facilitator broadcast the settlement and then its own handler
+    // faulted, so its framework rendered the house error envelope, which
+    // for an API whose responses always carry `success` says `false`. The
+    // funds may well have moved. Reading the body here would close the
+    // attempt terminal and assert that they did not.
+    let (error, stamps, calls) = settle_answered(500, "settle_rejection").await;
+
+    assert_eq!(error, BillingError::NeedsReconciliation);
+    assert_eq!(stamps, 1);
+    // Still exactly two calls. Nothing retried and no second facilitator.
+    assert_eq!(calls, 2);
+}
+
+#[tokio::test]
+async fn a_foreign_error_envelope_never_speaks_for_the_facilitator() {
+    // A 502 from a gateway in front of the facilitator. The hazard is
+    // real rather than theoretical: `SettleResponse` is deliberately not
+    // `deny_unknown_fields`, so this body decodes as a settle answer and
+    // its `success: false` would read as the facilitator's own verdict.
+    let decoded: SettleResponse =
+        decode_x402_json(&body("settle_foreign_error")).expect("the foreign envelope decodes");
+    assert_eq!(decoded.success, Some(false));
+
+    // The status is what says it is not the facilitator's verdict.
+    let (error, stamps, _calls) = settle_answered(502, "settle_foreign_error").await;
+
+    assert_eq!(error, BillingError::NeedsReconciliation);
+    assert_eq!(stamps, 1);
+}
+
+#[tokio::test]
+async fn a_conflict_status_saying_success_false_is_not_an_authoritative_refusal() {
+    // The status where reading the body is exactly backwards: a 409 on a
+    // replayed idempotency key means the facilitator has seen this
+    // settlement before, which is evidence that funds moved rather than
+    // that they did not.
+    let (error, stamps, _calls) = settle_answered(409, "settle_rejection").await;
+
+    assert_eq!(error, BillingError::NeedsReconciliation);
+    assert_eq!(stamps, 1);
+}
+
+#[tokio::test]
+async fn a_five_hundred_saying_success_true_is_not_a_settlement() {
+    // The other direction of the same rule. A body claiming success is no
+    // more authoritative outside 2xx than a body claiming refusal, and it
+    // must never mint a receipt.
+    let (error, stamps, _calls) = settle_answered(503, "settle_response").await;
+
+    assert_eq!(error, BillingError::NeedsReconciliation);
+    assert_eq!(stamps, 1);
 }
 
 #[tokio::test]
