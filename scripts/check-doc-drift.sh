@@ -98,6 +98,7 @@ GENERATED_CORPUS="llms-full.txt"
 # cannot disagree about what is exempt.
 CORPUS_LAG=(
   "90+ AI provider :: MIGRATION.md carried this from the initial commit and WOR-2627 fixed it there; the corpus still embeds the pre-fix page"
+  "rewrites the first matching tag per selector :: docs/transforms.md described the html transform's rewrite_attributes first-match bug as behavior and WOR-2533 fixed both the code and the page; the corpus still embeds the pre-fix table row"
 )
 corpus_lag_reason() {
   local entry
@@ -130,6 +131,12 @@ STALE_STRINGS=(
   # scan ever covered the file. The derived check below is what stops
   # the next one; this entry stops this one coming back.
   "90+ AI provider"
+  # WOR-2533: the `html` transform stamped only the first tag a selector
+  # matched, and `docs/transforms.md` wrote that down as the feature
+  # rather than as the bug it was. The code stamps every match now, so a
+  # page describing the old behavior is a page telling an operator the
+  # transform cannot do what it does.
+  "rewrites the first matching tag per selector"
   "one trivial built-in strategy"
   "36 OpenAI-compatible"
   "certpin"
