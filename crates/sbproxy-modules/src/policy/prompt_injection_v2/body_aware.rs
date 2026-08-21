@@ -25,7 +25,7 @@
 //!   tooling) skip the scan entirely via the
 //!   `bypass_prompt_injection` flag on their virtual key.
 //!
-//! The metrics counter `prompt_injection_v2_results_total{action,
+//! The metrics counter `sbproxy_prompt_injection_v2_results_total{action,
 //! label, detector}` is incremented every time `evaluate_body` runs,
 //! including on the bypass path so operators see how many requests
 //! the bypass shielded.
@@ -385,7 +385,7 @@ pub fn evaluate_body_with_audit(
     }
 }
 
-/// Increment the `prompt_injection_v2_results_total` counter.
+/// Increment the `sbproxy_prompt_injection_v2_results_total` counter.
 fn record_metric(policy: &PromptInjectionV2Policy, action: &str, label: DetectionLabel) {
     let counter = body_aware_counter();
     counter
@@ -398,8 +398,8 @@ static BODY_AWARE_COUNTER: OnceLock<prometheus::IntCounterVec> = OnceLock::new()
 fn body_aware_counter() -> &'static prometheus::IntCounterVec {
     BODY_AWARE_COUNTER.get_or_init(|| {
         let opts = prometheus::Opts::new(
-            "prompt_injection_v2_results_total",
-            "Body-aware prompt-injection detector results, labelled by action, label, and detector.",
+            "sbproxy_prompt_injection_v2_results_total",
+            "Body-aware prompt-injection detector results, labeled by action, label, and detector.",
         );
         let counter = prometheus::IntCounterVec::new(opts, &["action", "label", "detector"])
             .expect("counter shape is constant");

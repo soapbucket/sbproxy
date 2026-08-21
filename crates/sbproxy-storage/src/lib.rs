@@ -24,8 +24,11 @@
 //! Every method returns [`StorageError`]. Backends validate keys against
 //! [`MAX_KEY_BYTES`] and values against [`MAX_VALUE_BYTES`] via
 //! [`error::check_key`] and [`error::check_value`]. [`metrics::observe_op`]
-//! wraps a backend call with the `storage_op_duration_seconds` histogram and the
-//! `storage_op_errors_total` counter.
+//! wraps a backend call with the `sbproxy_storage_op_duration_seconds`
+//! histogram and the `sbproxy_storage_op_errors_total` counter. Both carry
+//! the sanctioned `sbproxy_` prefix; under the `storage_op_*` names they
+//! shipped with, every scrape config built from the prefixes
+//! `docs/metrics-stability.md` sanctions dropped them.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]

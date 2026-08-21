@@ -5565,7 +5565,7 @@ IPv6 targets are supported: the URL builder preserves bracketing. See [example 7
 
 ## Circuit breaker
 
-A formal Closed → Open → HalfOpen → Closed state machine attached to each `load_balancer` target. On `failure_threshold` consecutive failures (5xx response, connect error, timeout) the breaker trips Open; every subsequent request to that target is excluded from `select_target` and routed to a healthy peer instead. After `open_duration_secs`, the breaker enters HalfOpen and admits probe requests; on `success_threshold` consecutive successes it closes again, otherwise it re-opens.
+A formal Closed → Open → HalfOpen → Closed state machine attached to each `load_balancer` target. On `failure_threshold` consecutive failures (5xx response, connect error, timeout) the breaker trips Open; every subsequent request to that target is excluded from `select_target` and routed to a healthy peer instead. After `open_duration_secs`, the breaker enters HalfOpen and admits one probe request at a time: the request that takes the probe slot is dispatched, everything else is refused as if the breaker were still Open, and the slot comes back when that probe succeeds or fails. On `success_threshold` consecutive successes it closes again, otherwise it re-opens. Recovery therefore takes `success_threshold` sequential probes rather than one concurrent burst; raise `success_threshold` if you want a recovering upstream warmed more before it is trusted, not concurrency.
 
 ```yaml
 action:
@@ -5573,7 +5573,7 @@ action:
   circuit_breaker:
     failure_threshold: 5         # trip after 5 consecutive failures
     success_threshold: 2         # close after 2 consecutive HalfOpen successes
-    open_duration_secs: 30       # stay Open for 30s before trying probes
+    open_duration_secs: 30       # stay Open for 30s before trying a probe
   targets:
     - url: http://backend-1.internal:8080
     - url: http://backend-2.internal:8080
@@ -5583,7 +5583,7 @@ action:
 |-------|------|---------|-------------|
 | `failure_threshold` | int | `5` | Consecutive failures before tripping Open. |
 | `success_threshold` | int | `2` | Consecutive successes in HalfOpen to return to Closed. |
-| `open_duration_secs` | int | `30` | How long the breaker stays Open before admitting probes. |
+| `open_duration_secs` | int | `30` | How long the breaker stays Open before admitting a probe. Also how long an admitted probe whose caller never reported an outcome is waited out before the slot is written off and a fresh probe goes through. |
 
 The breaker is **complementary to** [outlier detection](#outlier-detection):
 

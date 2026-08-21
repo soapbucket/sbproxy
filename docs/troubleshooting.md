@@ -1,6 +1,6 @@
 # Troubleshooting
 
-*Last modified: 2026-08-08*
+*Last modified: 2026-08-21*
 
 When something breaks, this is the first place to look. Each section is one failure: the symptom, the likely cause, and the fix. For *why* these things happen, see [architecture.md](architecture.md); for what the proxy does on its own while a dependency is down, see [degradation.md](degradation.md); for the dashboard-to-action triage flow, see [operator-runbook.md](operator-runbook.md).
 
@@ -69,7 +69,7 @@ Check:
 
 ## A circuit breaker keeps opening
 
-Errors arrive in bursts separated by quiet periods: the breaker trips on consecutive failures, holds requests off the target for `open_duration_secs`, lets a few probes through in HalfOpen, then trips again because the target is still bad.
+Errors arrive in bursts separated by quiet periods: the breaker trips on consecutive failures, holds requests off the target for `open_duration_secs`, lets one probe through in HalfOpen, then trips again because the target is still bad.
 
 Check:
 - `sbproxy_circuit_breaker_transitions_total{origin,from_state,to_state}` tells you how often and in which direction the breaker is moving. A steady `open -> half_open -> open` cycle means the upstream never actually recovered.

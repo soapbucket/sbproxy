@@ -1,6 +1,6 @@
 # How SBproxy compares
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-21*
 
 SBproxy is an AI gateway that governs traffic in both directions. Most AI gateways only handle the calls your apps make out to models; SBproxy also governs the AI agents and crawlers coming in to your APIs and content, and because it is a real reverse proxy it handles the rest of your API traffic on the same runtime. This page is honest about where SBproxy fits and where you should pick something else.
 
@@ -200,7 +200,7 @@ Caddy is a Go reverse proxy known for automatic HTTPS.
 | Circuit breaker | Built-in (3-state) | Latency-based |
 | Health checks | Active + passive | Active + passive |
 | Retries | Configurable with backoff | Configurable |
-| PROXY protocol | Yes (v1) | Yes (v1/v2) |
+| PROXY protocol | No (v1 parser present, not wired to a listener) | Yes (v1/v2) |
 | Service discovery | Config-based + DNS (A/AAAA re-resolution) | SRV, A/AAAA |
 | Load balancing | 8 algorithms | 12+ algorithms |
 | WAF | Built-in baseline (12 CRS-derived rules, no SecLang engine) | Community module |
