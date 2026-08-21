@@ -20,6 +20,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use redis::{aio::MultiplexedConnection, AsyncCommands, Client};
+use sbproxy_security::url_redact::redacted_url_with_path;
 use tokio::sync::Mutex;
 
 use crate::cache::{CacheTier, TtlCache};
@@ -95,13 +96,24 @@ return {'applied', ARGV[4]}
 /// A lazily-connected, shareable multiplexed Redis link.
 struct RedisLink {
     url: String,
+    /// Origin and database index of `url`, rendered once at construction.
+    ///
+    /// Every error this link can raise is about the connection, and the
+    /// DSN is the natural thing to name in one. Computing the safe form
+    /// up front is what makes that safe by construction rather than by
+    /// each error path remembering to redact: the connect failure at
+    /// least fires on every transient outage, so a missed one is a
+    /// high-volume password leak, not a rare one (WOR-2640).
+    label: String,
     conn: Mutex<Option<MultiplexedConnection>>,
 }
 
 impl RedisLink {
     fn new(url: impl Into<String>) -> Self {
+        let url = url.into();
         Self {
-            url: url.into(),
+            label: redacted_url_with_path(&url),
+            url,
             conn: Mutex::new(None),
         }
     }
@@ -117,11 +129,11 @@ impl RedisLink {
             }
         }
         let client = Client::open(self.url.as_str())
-            .with_context(|| format!("invalid redis url '{}'", self.url))?;
+            .with_context(|| format!("invalid redis url '{}'", self.label))?;
         let c = client
             .get_multiplexed_async_connection()
             .await
-            .with_context(|| format!("connecting to redis at '{}'", self.url))?;
+            .with_context(|| format!("connecting to redis at '{}'", self.label))?;
         let mut guard = self.conn.lock().await;
         if let Some(existing) = guard.as_ref() {
             return Ok(existing.clone());
@@ -426,8 +438,8 @@ impl CacheTier for RedisCacheTier {
 pub async fn subscribe_invalidations(url: String, cache: Arc<TtlCache>) -> Result<()> {
     use futures::StreamExt;
 
-    let client =
-        Client::open(url.as_str()).with_context(|| format!("invalid redis url '{url}'"))?;
+    let client = Client::open(url.as_str())
+        .with_context(|| format!("invalid redis url '{}'", redacted_url_with_path(&url)))?;
     let mut pubsub = client
         .get_async_pubsub()
         .await
@@ -792,5 +804,49 @@ mod tests {
 
         // Touch the unused config import so the test file exercises it.
         let _ = TtlCacheConfig::default();
+    }
+
+    // --- WOR-2640: a Redis DSN never reaches an error string ---
+
+    #[test]
+    fn redis_link_renders_a_credential_free_label_at_construction() {
+        let link = RedisLink::new("redis://aclname:topsecret@cache.internal:6379/3");
+        assert_eq!(link.label, "redis://cache.internal:6379/3");
+        // The dial still needs the real DSN; only the label is rendered.
+        assert!(link.url.contains("topsecret"), "the DSN was not retained");
+    }
+
+    /// The connect failure is the highest-volume site in this file: it
+    /// fires on every transient outage, not only on a misconfiguration.
+    #[tokio::test]
+    async fn redis_link_error_names_the_origin_not_the_password() {
+        let link = RedisLink::new("http://aclname:topsecret@cache.internal:6379/3");
+        let err = link
+            .conn()
+            .await
+            .expect_err("a non-redis scheme cannot open");
+        let msg = format!("{err:#}");
+        assert!(!msg.contains("topsecret"), "password leaked: {msg}");
+        assert!(!msg.contains("aclname"), "username leaked: {msg}");
+        assert!(
+            msg.contains("http://cache.internal:6379/3"),
+            "expected the redacted origin in the error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_invalidations_refuses_a_bad_dsn_without_echoing_it() {
+        let store = Arc::new(crate::MemoryKeyStore::new()) as Arc<dyn crate::KeyStore>;
+        let cache = Arc::new(TtlCache::new(store, TtlCacheConfig::default()));
+        let dsn = "http://aclname:topsecret@cache.internal:6379/3".to_string();
+        let err = subscribe_invalidations(dsn, cache)
+            .await
+            .expect_err("a non-redis scheme cannot open");
+        let msg = format!("{err:#}");
+        assert!(!msg.contains("topsecret"), "password leaked: {msg}");
+        assert!(
+            msg.contains("http://cache.internal:6379/3"),
+            "expected the redacted origin in the error, got: {msg}"
+        );
     }
 }

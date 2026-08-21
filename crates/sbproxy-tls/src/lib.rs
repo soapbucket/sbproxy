@@ -266,14 +266,18 @@ fn open_cert_backend(acme: Option<&sbproxy_config::AcmeConfig>) -> Result<Arc<dy
             // gs://bucket/prefix, az://...); credentials come from the
             // environment. The issuance lock uses the atomic conditional
             // create the object store provides (WOR-1775).
+            // Origin only at both log sites: `storage_path` is operator
+            // config and an operator can write credentials into it
+            // (WOR-2640). The bucket is what identifies the backend.
+            let store_origin = sbproxy_security::url_redact::redacted_url(&acme.storage_path);
             match crate::cert_object_store::ObjectStoreCertKv::from_url(&acme.storage_path) {
                 Ok(s) => {
-                    info!(url = %acme.storage_path, backend = %acme.storage_backend,
+                    info!(url = %store_origin, backend = %acme.storage_backend,
                         "cert store backend: object storage (shared, cluster-safe)");
                     Arc::new(s)
                 }
                 Err(e) => {
-                    warn!(url = %acme.storage_path, error = %e,
+                    warn!(url = %store_origin, error = %e,
                         "cert store: object-store backend open failed; certs will NOT persist (in-memory fallback)");
                     Arc::new(MemoryKVStore::new(0))
                 }

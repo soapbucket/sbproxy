@@ -122,7 +122,9 @@ pub fn translate_plugin_decision(
                 if let Err(reason) = sbproxy_security::ssrf::validate_url(url.as_str()) {
                     tracing::warn!(
                         target: "sbproxy::policy",
-                        url = %url,
+                        // Origin only: an operator Confirm webhook keeps
+                        // its secret in the path (WOR-2629).
+                        url = %sbproxy_security::url_redact::redacted_url(url.as_str()),
                         ssrf_reason = %reason,
                         "policy Confirm webhook blocked by SSRF guard"
                     );

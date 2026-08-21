@@ -1,6 +1,6 @@
 # SBproxy architecture and deployment guide
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 This document covers the internal architecture of SBproxy, the request lifecycle, the plugin
 system, the AI gateway, caching, events, and common deployment topologies.
@@ -300,7 +300,7 @@ tiers, in order: built-in modules (explicit match arms in
 
 ```rust,no_run
 pub trait ActionHandler: Send + Sync + 'static {
-    fn handler_type(&self) -> &'static str;
+    fn handler_type(&self) -> &str;
     fn handle(
         &self,
         req: &mut http::Request<bytes::Bytes>,
@@ -357,6 +357,28 @@ which consult the typed inventory registrations, and finally to the bundle regis
 populated from config for JavaScript and WASM bundles. Built-ins are enum variants
 (`Policy::RateLimit(...)`); plugin and bundle handlers ride `Policy::Plugin(...)` and
 pay dynamic dispatch.
+
+### What the host does with the body first (linked actions)
+
+`ActionHandler::handle` takes a complete `http::Request<bytes::Bytes>`, and a linked
+plugin carries no manifest to say it wants less, so the host reads the whole inbound
+body before it calls the handler. That read is bounded: `request_limit.max_body_size`
+when the origin sets one, 64 MiB when it does not, clamped to 1 GiB either way. An
+oversize declared `Content-Length` is refused before the first read and a chunked
+upload is refused on the chunk that crosses the cap; both answer `413` and the handler
+never runs. The cap has to live here because an action answers from the request phase
+and returns without an upstream, so the streaming check that guards a proxied request
+never fires behind it.
+
+Any `body_mode: buffered` bundle policy on the origin also runs at this point, in
+configured chain order, before the action. Those policies are deferred out of the
+header phase because there is no body to hand them yet, and a terminal action is the
+last place they can run at all, so a fail-closed policy decides on the same bytes the
+action would otherwise have received. Each of those policies bounds the read while it
+happens rather than after: its `max_buffer_bytes` is checked before every append, so a
+policy that declared a kilobyte never has the host cap streamed past it. Bundle actions
+declare `body_mode` and `max_buffer_bytes` in the manifest and are bounded by those
+instead; see [extension-bundles.md](extension-bundles.md).
 
 ### Built-in vs plugin dispatch
 

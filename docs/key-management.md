@@ -1,6 +1,6 @@
 # SBproxy dynamic key management
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 A virtual key is a live, governed resource, not a line of YAML. With the
 `key_management:` block enabled, you mint, revoke, and rotate inbound keys at
@@ -587,6 +587,46 @@ cache:
 ```
 
 See the runnable `examples/ai-dynamic-keys-cluster/` for a two-replica setup.
+
+### What bounds the mesh transport
+
+The node-to-node RPC port (`transport_port` above) is a network listener like
+any other, so it carries admission limits and deadlines rather than trusting
+peers to behave. There is nothing to configure. Every bound below is a fixed
+default sized against how a mesh actually behaves, because a limit that only
+exists when an operator remembers to set it is not a limit.
+
+| Bound | Default | What it stops |
+|---|---|---|
+| Inbound connections | 1024 | A peer opening sockets until the node has no task left to serve anyone. Sized to cluster shape: one connection per peer per direction, so 1024 is several times the largest mesh anyone runs. |
+| Inbound TLS handshakes at once | 64 | A handshake flood turning into a CPU stall. Each handshake is a signature verification for a peer that has proved nothing yet. |
+| TLS admission | 10s | A peer that opens a socket and sends no ClientHello. Covers the wait for a handshake slot as well, so the queue in front of the handshake is bounded too. |
+| Inbound idle | 5 minutes | A connection that is admitted and then says nothing, forever, while holding a slot. |
+| Inbound frame body | 30s | A peer that announces a 16 MiB frame and then delivers it one byte at a time. The deadline covers the whole body, so a single byte does not reset it. |
+| Response write | 30s | A peer that issues a request and then stops reading, parking the handler inside the write. |
+| Outbound connect / TLS / write / response | 3s / 5s / 10s / 10s | A dead or wedged peer stalling a resolution that a request is waiting on. Scanning operations (`purge`, digest, snapshot) get 60s instead of 10s, because they walk the peer's shard rather than looking one key up. |
+| Outbound request, overall | 15s (90s for a scan) | Five phase timeouts that each restart the clock are not a bound on the call. This one is, and every phase is clamped by whichever expires first. |
+
+A peer refused by the connection limit gets an immediate close rather than a
+hang: its next RPC fails as a transport error, it drops the connection, and
+it reconnects on the call after that. Every refusal, and every connection
+torn down by one of the deadlines, increments
+`mesh_transport_inbound_rejected_total` with a `reason` from a fixed set
+(`connection_limit`, `handshake_timeout`, `handshake_failed`,
+`idle_timeout`, `frame_timeout`, `write_timeout`). The peer address is not a
+label, because it is attacker-chosen; it goes in a rate-limited log line
+instead, so the counter says how much and the log says who. Alert on any
+sustained `connection_limit` rate.
+
+Client-side deadlines report on `mesh_transport_rpc_errors_total` under five
+`timeout_` kinds, kept separate from the failure kinds beside them: a
+`connect` is a peer that refused, a `timeout_connect` is a peer that answered
+with nothing, and only the second one means reachable-but-wedged.
+
+The two halves are tuned against each other. A node replaces its own cached
+connection to a peer after 60 seconds of quiet, well before the peer's
+five-minute idle reaper would take the slot back, so a quiet period costs one
+extra handshake rather than one failed RPC.
 
 ## Operational metrics
 

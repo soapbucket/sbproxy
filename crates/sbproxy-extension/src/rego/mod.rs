@@ -86,9 +86,10 @@
 //! treating it as a request-time signal would manufacture an event
 //! nothing real produced.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use anyhow::{Context, Result};
+use regorus::unstable::{Expr, Literal, Query, Rule, RuleHead};
 
 use crate::cel::{CelContext, CelValue};
 
@@ -156,6 +157,28 @@ impl std::fmt::Debug for CompiledRego {
     }
 }
 
+/// A rule path below the `data` root, as its literal components.
+///
+/// `package sbproxy` with an `allow` rule gives `["sbproxy", "allow"]`.
+/// The root is implicit and deliberately so: Regorus indexes the base
+/// document by exactly these components when it decides whether to keep
+/// a rule's computed value, so a path in this form compares against an
+/// operator's `data` object with no string parsing in between.
+type RulePath = Vec<String>;
+
+/// Render a [`RulePath`] the way an operator writes it in a query.
+fn render_rule_path(path: &[String]) -> String {
+    format!("data.{}", path.join("."))
+}
+
+/// The path components of a query, or `None` when the query is not
+/// rooted at `data`.
+fn query_rule_path(query: &str) -> Option<RulePath> {
+    query
+        .strip_prefix("data.")
+        .map(|path| path.split('.').map(str::to_owned).collect())
+}
+
 /// Whether a base-data document already defines a value at the rule
 /// path a query names.
 ///
@@ -163,20 +186,668 @@ impl std::fmt::Debug for CompiledRego {
 /// `data`, so the query's path after the `data.` prefix indexes
 /// straight into it. A defined value there is the shadowing Regorus
 /// resolves in the base document's favor.
+///
+/// A JSON `null` counts. Regorus keeps the base document's value for
+/// anything other than *undefined*, and `add_data`'s deep merge carries
+/// a `null` through as a defined value, so `{"sbproxy": {"allow": null}}`
+/// shadows an `allow` rule exactly the way `true` does.
 fn data_defines_query_path(data: &serde_json::Value, query: &str) -> bool {
-    let Some(path) = query.strip_prefix("data.") else {
+    let Some(path) = query_rule_path(query) else {
         // A query not rooted at `data` (rare) cannot be shadowed by a
         // `data` document; nothing to refuse.
         return false;
     };
     let mut cursor = data;
-    for segment in path.split('.') {
-        match cursor.get(segment) {
+    for segment in &path {
+        match cursor.get(segment.as_str()) {
             Some(next) => cursor = next,
             None => return false,
         }
     }
-    !cursor.is_null()
+    true
+}
+
+/// One component of a reference expression.
+///
+/// `roles["admin"]` is two literals; `roles[name]` is a literal and a
+/// component whose value exists only during evaluation. The distinction
+/// bounds how much of a path can be compared against base data at config
+/// load: everything up to the first dynamic component is known from the
+/// source text, and nothing after it is.
+enum RefComponent {
+    /// A key that is written in the source.
+    Key(String),
+    /// A key computed per evaluation.
+    Dynamic,
+}
+
+/// Break a reference expression into its components, or `None` when the
+/// expression is not a reference.
+///
+/// This is deliberately not Regorus's own `get_path_ref_components`,
+/// which flattens a variable index to its source text and so reports
+/// `roles[name]` as the literal path `roles.name`. A rule with a
+/// variable key resolves to a different path on every evaluation, and
+/// treating the variable's spelling as a key would both miss the real
+/// collisions and invent one against a `data` key that happened to be
+/// spelled the same as the variable.
+fn ref_components(expr: &Expr) -> Option<Vec<RefComponent>> {
+    match expr {
+        Expr::Var { span, .. } => Some(vec![RefComponent::Key(span.text().to_owned())]),
+        Expr::RefDot { refr, field, .. } => {
+            let mut components = ref_components(refr)?;
+            components.push(RefComponent::Key(field.0.text().to_owned()));
+            Some(components)
+        }
+        Expr::RefBrack { refr, index, .. } => {
+            let mut components = ref_components(refr)?;
+            components.push(match index.as_ref() {
+                Expr::String { value, .. } | Expr::RawString { value, .. } => {
+                    value.as_string().map_or(RefComponent::Dynamic, |key| {
+                        RefComponent::Key(key.to_string())
+                    })
+                }
+                _ => RefComponent::Dynamic,
+            });
+            Some(components)
+        }
+        _ => None,
+    }
+}
+
+/// Everything up to the first component whose key is not in the source.
+fn literal_prefix(components: &[RefComponent]) -> RulePath {
+    components
+        .iter()
+        .map_while(|component| match component {
+            RefComponent::Key(key) => Some(key.clone()),
+            RefComponent::Dynamic => None,
+        })
+        .collect()
+}
+
+/// What a rule head's literal path means, which is not the same thing
+/// for every head shape.
+///
+/// A head with no dynamic component resolves to exactly one path, and
+/// Regorus compares the base document against that path. A head like
+/// `limits[method]` resolves to a *different* path on every evaluation,
+/// and the only thing known at load is the part before the variable.
+/// Treating that prefix as the rule's own path is what made the guard
+/// refuse a base table whose keys the rule never produces.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HeadPath {
+    /// The whole path is in the source, so it is the path Regorus
+    /// indexes the base document by.
+    Exact,
+    /// The head carried a component computed per evaluation, so this is
+    /// the path the rule's keys land *under*, one segment above
+    /// anything Regorus actually compares.
+    ComputedKeys,
+}
+
+/// Resolve a reference inside a rule to the `data` path it reads.
+///
+/// Rego resolves a bare name against the enclosing package first, which
+/// is how `trusted` inside `package sbproxy` reads `data.sbproxy.trusted`.
+/// An explicit `data.` root is taken as written and `input` is not a
+/// rule at all. A local variable resolves here the same way a rule name
+/// does; the caller keeps only paths that are rules the module defines,
+/// so a local never becomes an edge.
+fn resolve_reference(package: &[String], components: &[RefComponent]) -> Option<RulePath> {
+    let RefComponent::Key(root) = components.first()? else {
+        return None;
+    };
+    match root.as_str() {
+        "data" => Some(literal_prefix(components.get(1..)?)),
+        "input" => None,
+        _ => {
+            let mut path = package.to_vec();
+            path.extend(literal_prefix(components));
+            Some(path)
+        }
+    }
+}
+
+/// Collect every reference expression inside `expr`.
+///
+/// A reference chain is collected whole rather than one component at a
+/// time, since `data.sbproxy.trusted` names one rule and not three.
+/// Bracket indices are still walked, because `roles[helper]` reads
+/// `helper` as well as `roles`.
+fn collect_references(expr: &Expr, out: &mut Vec<Vec<RefComponent>>) {
+    match expr {
+        Expr::Var { .. } | Expr::RefDot { .. } | Expr::RefBrack { .. } => {
+            if let Some(components) = ref_components(expr) {
+                out.push(components);
+            }
+            collect_index_references(expr, out);
+        }
+        Expr::Array { items, .. } | Expr::Set { items, .. } => {
+            for item in items {
+                collect_references(item, out);
+            }
+        }
+        Expr::Object { fields, .. } => {
+            for (_, key, value) in fields {
+                collect_references(key, out);
+                collect_references(value, out);
+            }
+        }
+        Expr::ArrayCompr { term, query, .. } | Expr::SetCompr { term, query, .. } => {
+            collect_references(term, out);
+            collect_query_references(query, out);
+        }
+        Expr::ObjectCompr {
+            key, value, query, ..
+        } => {
+            collect_references(key, out);
+            collect_references(value, out);
+            collect_query_references(query, out);
+        }
+        Expr::Call { fcn, params, .. } => {
+            // The callee is a reference too: a call to a helper function
+            // defined in the same package is how a chain reaches one.
+            if let Some(components) = ref_components(fcn) {
+                out.push(components);
+            }
+            for param in params {
+                collect_references(param, out);
+            }
+        }
+        Expr::UnaryExpr { expr: inner, .. } => collect_references(inner, out),
+        Expr::BinExpr { lhs, rhs, .. }
+        | Expr::BoolExpr { lhs, rhs, .. }
+        | Expr::ArithExpr { lhs, rhs, .. }
+        | Expr::AssignExpr { lhs, rhs, .. } => {
+            collect_references(lhs, out);
+            collect_references(rhs, out);
+        }
+        Expr::Membership {
+            key,
+            value,
+            collection,
+            ..
+        } => {
+            if let Some(key) = key {
+                collect_references(key, out);
+            }
+            collect_references(value, out);
+            collect_references(collection, out);
+        }
+        // A scalar carries no reference. The catch-all also covers
+        // Regorus's feature-gated expression forms, which this build
+        // does not enable. Missing one costs a dependency edge in a
+        // diagnostic and never a missed collision, because detection
+        // enumerates rule heads rather than following references.
+        _ => {}
+    }
+}
+
+/// Walk the bracket indices inside a reference chain.
+fn collect_index_references(expr: &Expr, out: &mut Vec<Vec<RefComponent>>) {
+    match expr {
+        Expr::RefBrack { refr, index, .. } => {
+            collect_index_references(refr, out);
+            collect_references(index, out);
+        }
+        Expr::RefDot { refr, .. } => collect_index_references(refr, out),
+        _ => {}
+    }
+}
+
+/// Collect every reference expression inside a query body.
+fn collect_query_references(query: &Query, out: &mut Vec<Vec<RefComponent>>) {
+    for statement in &query.stmts {
+        match &statement.literal {
+            Literal::SomeVars { .. } => {}
+            Literal::SomeIn {
+                key,
+                value,
+                collection,
+                ..
+            } => {
+                if let Some(key) = key {
+                    collect_references(key, out);
+                }
+                collect_references(value, out);
+                collect_references(collection, out);
+            }
+            Literal::Expr { expr, .. } | Literal::NotExpr { expr, .. } => {
+                collect_references(expr, out);
+            }
+            Literal::Every {
+                domain,
+                query: inner,
+                ..
+            } => {
+                collect_references(domain, out);
+                collect_query_references(inner, out);
+            }
+        }
+        // A `with` modifier's target is an override rather than a read,
+        // so only the replacement value is walked.
+        for modifier in &statement.with_mods {
+            collect_references(&modifier.r#as, out);
+        }
+    }
+}
+
+/// The rule paths a module defines and the references between them.
+struct RuleGraph {
+    /// Every rule path the module defines. Identical to
+    /// [`Self::edges`]'s key set, kept separately because resolving the
+    /// *query* to the rules it reads runs the same match as resolving a
+    /// reference does, and that resolution reads heads while `edges` is
+    /// being written.
+    heads: BTreeSet<RulePath>,
+    /// Every rule path in the module, mapped to the rule paths that rule
+    /// reads. A function is a key here so a chain can pass through a
+    /// helper function, and is absent from [`Self::shadowable`].
+    edges: BTreeMap<RulePath, BTreeSet<RulePath>>,
+    /// The rule paths Regorus stores under `data`, which is every rule
+    /// except a function that takes parameters: such a function lives in
+    /// the function table and nothing indexes the base document for it,
+    /// so base data cannot shadow one. The value says whether the path
+    /// is the rule's own or only the literal prefix of a head whose keys
+    /// are computed, which decides what a value found there means.
+    shadowable: BTreeMap<RulePath, HeadPath>,
+}
+
+/// Enumerate the rule paths the engine's parsed modules define, with the
+/// references between them.
+///
+/// Call this after `add_policy` and before `add_data`, which is the
+/// window where the engine holds the parsed module and an empty base
+/// document.
+///
+/// Every rule head is enumerated, not only the ones the query names,
+/// because Regorus resolves a rule against the base document by *that
+/// rule's* own path: `update_rule_value` returns early for any rule
+/// whose path is already defined in `init_data`, so a helper four hops
+/// from the query is shadowed exactly as readily as the query's own
+/// rule. Walking heads is also strictly wider than walking the query's
+/// dependency closure, which would need to resolve references through
+/// comprehensions, `with` overrides, and dynamic refs to be sound, and
+/// would go stale the moment somebody edited the policy to call a rule
+/// it had not called before.
+fn rule_graph(engine: &mut regorus::Engine) -> RuleGraph {
+    let mut heads: BTreeSet<RulePath> = BTreeSet::new();
+    let mut shadowable: BTreeMap<RulePath, HeadPath> = BTreeMap::new();
+    let mut references: Vec<(RulePath, RulePath)> = Vec::new();
+
+    for module in engine.get_modules() {
+        let Some(components) = ref_components(&module.package.refr) else {
+            continue;
+        };
+        let package = literal_prefix(&components);
+        if package.is_empty() {
+            continue;
+        }
+        for rule in &module.policy {
+            let mut found: Vec<Vec<RefComponent>> = Vec::new();
+            let (refr, is_function) = match rule.as_ref() {
+                Rule::Spec { head, bodies, .. } => {
+                    let (refr, is_function) = match head {
+                        RuleHead::Compr { refr, assign, .. } => {
+                            if let Some(assign) = assign {
+                                collect_references(&assign.value, &mut found);
+                            }
+                            (refr, false)
+                        }
+                        RuleHead::Set { refr, key, .. } => {
+                            if let Some(key) = key {
+                                collect_references(key, &mut found);
+                            }
+                            (refr, false)
+                        }
+                        RuleHead::Func {
+                            refr, args, assign, ..
+                        } => {
+                            if let Some(assign) = assign {
+                                collect_references(&assign.value, &mut found);
+                            }
+                            // A zero-argument function is not in the
+                            // function table: Regorus's `Func` arm calls
+                            // `update_data` for it, which honors the
+                            // base document exactly the way a rule does,
+                            // so it is shadowable and a function with
+                            // parameters is not.
+                            (refr, !args.is_empty())
+                        }
+                    };
+                    for body in bodies {
+                        if let Some(assign) = &body.assign {
+                            collect_references(&assign.value, &mut found);
+                        }
+                        collect_query_references(&body.query, &mut found);
+                    }
+                    (refr, is_function)
+                }
+                Rule::Default {
+                    refr, args, value, ..
+                } => {
+                    collect_references(value, &mut found);
+                    (refr, !args.is_empty())
+                }
+            };
+
+            let Some(components) = ref_components(refr) else {
+                continue;
+            };
+            let head = literal_prefix(&components);
+            if head.is_empty() {
+                // A head whose very first component is computed names no
+                // path that can be compared at load.
+                continue;
+            }
+            let shape = if head.len() == components.len() {
+                HeadPath::Exact
+            } else {
+                HeadPath::ComputedKeys
+            };
+            let mut path = package.clone();
+            path.extend(head);
+            heads.insert(path.clone());
+            if !is_function {
+                // Two heads can land on the same path, `denies := {...}`
+                // beside `denies[k] := ...`. The exact one is the
+                // stricter reading, so it wins.
+                let entry = shadowable.entry(path.clone()).or_insert(shape);
+                if shape == HeadPath::Exact {
+                    *entry = HeadPath::Exact;
+                }
+            }
+            for components in &found {
+                if let Some(target) = resolve_reference(&package, components) {
+                    references.push((path.clone(), target));
+                }
+            }
+        }
+    }
+
+    let mut edges: BTreeMap<RulePath, BTreeSet<RulePath>> = heads
+        .iter()
+        .map(|head| (head.clone(), BTreeSet::new()))
+        .collect();
+    for (from, target) in references {
+        for resolved in reached_heads(&heads, &target) {
+            if resolved != from {
+                edges.entry(from.clone()).or_default().insert(resolved);
+            }
+        }
+    }
+
+    RuleGraph {
+        heads,
+        edges,
+        shadowable,
+    }
+}
+
+/// The rule heads a read of `target` evaluates.
+///
+/// Two directions, and both are real reads. A reference *at or below* a
+/// head names that rule: `roles.admin` reads the `roles` rule, so the
+/// longest head that prefixes the reference is the rule it points at. A
+/// reference *above* a head reads every rule beneath it, because
+/// resolving `data.sbproxy.denies` evaluates every `denies[...]` rule in
+/// the package to build the object it returns. Following only the first
+/// direction is what let the guard call a live collision latent: a
+/// policy that iterates a parent path reaches every rule under it, and
+/// no edge said so.
+///
+/// A reference that matches in neither direction (a base-data lookup, a
+/// builtin, a local variable) reaches nothing and is not an edge.
+fn reached_heads(heads: &BTreeSet<RulePath>, target: &[String]) -> BTreeSet<RulePath> {
+    let mut reached: BTreeSet<RulePath> = heads
+        .iter()
+        .filter(|head| head.starts_with(target))
+        .cloned()
+        .collect();
+    if let Some(nearest) = heads
+        .iter()
+        .filter(|head| target.starts_with(head.as_slice()))
+        .max_by_key(|head| head.len())
+    {
+        reached.insert(nearest.clone());
+    }
+    reached
+}
+
+/// The shortest reference chain from `from` to `to`, both included.
+///
+/// Breadth first over sorted collections, so the chain an operator is
+/// shown for a given module is the same on every boot.
+fn reference_chain(
+    edges: &BTreeMap<RulePath, BTreeSet<RulePath>>,
+    from: &[String],
+    to: &[String],
+) -> Option<Vec<RulePath>> {
+    if from == to {
+        return Some(vec![to.to_vec()]);
+    }
+    let mut previous: BTreeMap<RulePath, RulePath> = BTreeMap::new();
+    let mut seen: BTreeSet<RulePath> = BTreeSet::new();
+    let mut queue: VecDeque<RulePath> = VecDeque::new();
+    seen.insert(from.to_vec());
+    queue.push_back(from.to_vec());
+    while let Some(node) = queue.pop_front() {
+        let Some(neighbors) = edges.get(&node) else {
+            continue;
+        };
+        for neighbor in neighbors {
+            if !seen.insert(neighbor.clone()) {
+                continue;
+            }
+            previous.insert(neighbor.clone(), node.clone());
+            if neighbor.as_slice() == to {
+                let mut chain = vec![to.to_vec()];
+                let mut cursor = to.to_vec();
+                while let Some(parent) = previous.get(&cursor) {
+                    chain.push(parent.clone());
+                    cursor = parent.clone();
+                }
+                chain.reverse();
+                return Some(chain);
+            }
+            queue.push_back(neighbor.clone());
+        }
+    }
+    None
+}
+
+/// How a base-data document collides with one rule path.
+enum DataCollision {
+    /// Base data carries a value at the rule's own path, so Regorus
+    /// keeps the base value and the rule never contributes one.
+    Shadows(RulePath),
+    /// Base data carries an object at the path a rule computes its keys
+    /// under. Which keys collide is not knowable at load, so this says
+    /// only what is true: any key the base object already defines beats
+    /// the rule's.
+    ShadowsComputedKeys(RulePath),
+    /// Base data carries a value that is not an object above the rule's
+    /// path, leaving the rule nowhere under `data` to land.
+    Blocks {
+        /// The path holding the non-object value.
+        at: RulePath,
+        /// The rule underneath it.
+        rule: RulePath,
+    },
+    /// Base data carries a value that is not an object at the path a
+    /// rule computes its keys under, so no key it produces can land.
+    BlocksComputedKeys(RulePath),
+}
+
+/// Whether a base-data document collides with one rule path.
+///
+/// Base data at a *shallower* path is only a collision when the value
+/// there is not an object: an object merges with the rules beneath it,
+/// which is what makes a `data.sbproxy.roles` table legal beside a
+/// `data.sbproxy.allow` rule. Base data at the rule's own path, or at
+/// any path *below* it (which makes the rule's own path an object),
+/// shadows.
+///
+/// `shape` decides what a value at the end of the path means, and this
+/// is where a partial rule stops being comparable. For an
+/// [`HeadPath::Exact`] head the path is the one Regorus indexes, so a
+/// value there is a whole-rule shadow. For a
+/// [`HeadPath::ComputedKeys`] head (`limits[method] := ...`) Regorus
+/// indexes `data.sbproxy.limits.GET`, one segment deeper than anything
+/// the source names, so the three cases split:
+///
+/// - A non-object at the prefix blocks every key the rule computes.
+///   `update_rule_value` walks the path with `as_object_mut` and fails
+///   with "previous value is not an object" mid evaluation.
+/// - An **empty** object merges and can shadow nothing: no key exists
+///   to win against a computed one. Not a collision, and saying so is
+///   the one case where a dynamic head compares precisely.
+/// - A non-empty object merges too, and there the keys are what
+///   collide. `{"POST": "no"}` beside a rule that only ever produces
+///   `GET` is a working config; `{"GET": "no"}` beside the same rule
+///   silently kills the rule's only output. Which one it is depends on
+///   values the rule computes per evaluation, so load time cannot tell
+///   them apart.
+///
+/// That last case is refused rather than warned or skipped, and it is
+/// deliberately the conservative side of a call that costs real false
+/// refusals. The two directions are not symmetric: refusing a working
+/// config is loud, arrives at boot, and is fixed by renaming a key,
+/// while admitting a shadowed one is silent, arrives as a `deny` rule
+/// that stopped contributing its key, and fails open. WOR-2428 is that
+/// second failure, so the refusal keeps the wide side. The message it
+/// carries says only what is knowable, because a refusal that overstates
+/// what the detector saw sends the operator looking for a bug that is
+/// not there.
+fn rule_collision(
+    data: &serde_json::Value,
+    rule: &[String],
+    shape: HeadPath,
+) -> Option<DataCollision> {
+    let mut cursor = data;
+    for (index, segment) in rule.iter().enumerate() {
+        match cursor.get(segment.as_str()) {
+            Some(next) => cursor = next,
+            None => {
+                return (index > 0 && !cursor.is_object()).then(|| DataCollision::Blocks {
+                    at: rule[..index].to_vec(),
+                    rule: rule.to_vec(),
+                });
+            }
+        }
+    }
+    match shape {
+        HeadPath::Exact => Some(DataCollision::Shadows(rule.to_vec())),
+        HeadPath::ComputedKeys => match cursor.as_object() {
+            Some(keys) if keys.is_empty() => None,
+            Some(_) => Some(DataCollision::ShadowsComputedKeys(rule.to_vec())),
+            None => Some(DataCollision::BlocksComputedKeys(rule.to_vec())),
+        },
+    }
+}
+
+/// The base-data collision to refuse on, and how the query reaches it.
+///
+/// A collision the query demonstrably reaches wins over one it does not,
+/// because that is the one whose decision is already wrong. Ties break
+/// on sorted rule-path order, so the same config refuses with the same
+/// message on every boot.
+fn base_data_collision(
+    data: &serde_json::Value,
+    graph: &RuleGraph,
+    query: &str,
+) -> Option<(DataCollision, Option<Vec<RulePath>>)> {
+    // The query is a reference like any other, so it resolves to rules
+    // the same way one inside a module does. A query naming a path
+    // above the heads (`data.sbproxy` against a package of rules) or
+    // below one (`data.sbproxy.limits.GET` against a `limits[m]` rule)
+    // starts the walk at the rules it reads rather than at a node the
+    // graph does not hold.
+    let starts = query_rule_path(query)
+        .map(|path| reached_heads(&graph.heads, &path))
+        .unwrap_or_default();
+    let mut latent = None;
+    for (rule, shape) in &graph.shadowable {
+        let Some(collision) = rule_collision(data, rule, *shape) else {
+            continue;
+        };
+        // Shortest chain wins, and ties break on path order, so the
+        // same config prints the same walk on every boot.
+        let chain = starts
+            .iter()
+            .filter_map(|start| reference_chain(&graph.edges, start, rule))
+            .min_by(|left, right| left.len().cmp(&right.len()).then_with(|| left.cmp(right)));
+        if chain.is_some() {
+            return Some((collision, chain));
+        }
+        if latent.is_none() {
+            latent = Some((collision, None));
+        }
+    }
+    latent
+}
+
+/// The operator-facing explanation of a base-data collision.
+///
+/// Names the data path, the rule it hit, and the reference chain that
+/// carries the query to that rule, because "something collided" leaves
+/// an operator staring at a module whose logic looks correct.
+///
+/// Every clause here is bounded by what the detector actually saw. The
+/// no-chain wording reports a failed search rather than an absence,
+/// because the walk does not resolve an import alias, a reference built
+/// by a builtin, or a query that is not rooted at `data`, so "nothing
+/// reaches it" is a claim the search cannot support. Naming the wrong
+/// reason costs more than naming none: an operator told the collision is
+/// latent stops looking at the rule that is already dead.
+fn describe_collision(
+    collision: &DataCollision,
+    chain: Option<&[RulePath]>,
+    query: &str,
+) -> String {
+    let reach = match chain {
+        Some(chain) => {
+            let hops: Vec<String> = chain
+                .iter()
+                .map(|path| render_rule_path(path.as_slice()))
+                .collect();
+            format!("The query `{query}` reaches it: {}.", hops.join(" -> "))
+        }
+        None => format!(
+            "No reference chain from the query `{query}` was found, so the collision may be \
+             latent; an aliased import or a reference built at evaluation time is not traced."
+        ),
+    };
+    match collision {
+        DataCollision::Shadows(rule) => format!(
+            "base data defines `{}`, and the module defines a rule at that path, so Rego resolves \
+             the base document there and the rule never evaluates. {reach} Move the base data \
+             under a key no rule in the module produces.",
+            render_rule_path(rule)
+        ),
+        DataCollision::ShadowsComputedKeys(rule) => format!(
+            "base data defines keys under `{}`, and the module defines a rule that computes its \
+             own keys at that path, so every key the base document already carries wins over the \
+             rule's and the rule cannot replace it. Which keys collide depends on values the rule \
+             computes per request, so this cannot be narrowed at config load. {reach} Move the \
+             base data under a key no rule in the module produces.",
+            render_rule_path(rule)
+        ),
+        DataCollision::Blocks { at, rule } => format!(
+            "base data sets `{}` to a value that is not an object, and the module defines a rule \
+             at `{}` beneath it, so the rule has nowhere to resolve. {reach} Move the base data \
+             under a key that does not sit above a rule the module defines.",
+            render_rule_path(at),
+            render_rule_path(rule)
+        ),
+        DataCollision::BlocksComputedKeys(rule) => format!(
+            "base data sets `{}` to a value that is not an object, and the module defines a rule \
+             that computes its own keys at that path, so no key the rule produces has anywhere to \
+             land. {reach} Move the base data under a key no rule in the module produces.",
+            render_rule_path(rule)
+        ),
+    }
 }
 
 /// One source file's line coverage from a [`CompiledRego`] engine, read
@@ -276,14 +947,48 @@ impl CompiledRego {
             // the `allow` rule and make every request identical while
             // the rule body still runs and spends the budget. Refuse it
             // at load, because nothing downstream can tell the operator
-            // their policy logic is dead. The check is at the query
-            // path specifically, so base data at a sibling path
-            // (`data.sbproxy.roles` next to an `allow` rule) is fine.
+            // their policy logic is dead.
+            //
+            // Counted on the way out, on `semantic_error`, the same
+            // label `prove_evaluable`'s refusal carries. An operator
+            // rolling out an upgrade watches
+            // `sbproxy_script_compile_total{engine="rego"}` to see
+            // whether their policies still compile, and a refusal that
+            // exists only as a returned error is a fleet-wide failure
+            // showing as a flat series. The label is reused rather than
+            // extended: a `base_data_conflict` value would be a wider
+            // closed set than `metrics.rs`, `metric_registry.rs`,
+            // `docs/observability.md`, and `docs/metrics-stability.md`
+            // all publish, and this refusal belongs to the category
+            // those already name, a module that parsed and then failed
+            // analysis. Which analysis failed is in the error text.
             if data_defines_query_path(&data, &query) {
+                sbproxy_observe::metrics::record_script_compile("rego", "semantic_error");
                 return Err(anyhow::anyhow!(
                     "{site}: base data defines `{query}`, the rule the query names, so it \
                      would override the rule's own value; put base data under a different \
                      key than the queried rule"
+                ));
+            }
+
+            // The same override applies to every *other* rule the module
+            // defines, and that case is worse: a shadowed helper leaves
+            // the query evaluating normally against a constant, so the
+            // top-level decision changes with no error and nothing in
+            // the logs saying the rule stopped running rather than
+            // stopped matching. A `deny` that quietly stops evaluating
+            // fails open. Refuse at load rather than warn at evaluation:
+            // an operator can rename a data key at author time, and a
+            // shadow that only surfaces on the request that trips it is
+            // a decision already made wrongly. Base data at a sibling
+            // path (`data.sbproxy.roles` next to an `allow` rule) is
+            // still fine, since it collides with no rule head.
+            let graph = rule_graph(&mut engine);
+            if let Some((collision, chain)) = base_data_collision(&data, &graph, &query) {
+                sbproxy_observe::metrics::record_script_compile("rego", "semantic_error");
+                return Err(anyhow::anyhow!(
+                    "{site}: {}",
+                    describe_collision(&collision, chain.as_deref(), &query)
                 ));
             }
             let value = regorus::Value::from_json_str(&data.to_string())
@@ -821,6 +1526,600 @@ allow if {
             false,
         )
         .expect("sibling base data does not shadow the rule");
+    }
+
+    /// The query's rule is one hop from the shadowed helper: `allow`
+    /// reads `trusted`, and `trusted` is what base data defines.
+    const ALLOW_VIA_TRUSTED: &str = r#"
+package sbproxy
+
+default trusted := false
+
+trusted if {
+    input.request.trust_tier == "strong"
+}
+
+default allow := false
+
+allow if {
+    trusted
+}
+"#;
+
+    #[test]
+    fn base_data_shadowing_a_helper_rule_refuses_at_load() {
+        // WOR-2428, the whole ticket. The base document names no rule
+        // the query names, so the query-path check passes it, and then
+        // Regorus resolves `data.sbproxy.trusted` out of the base
+        // document instead of running the `trusted` rule. `allow` keeps
+        // evaluating and keeps returning true for every request,
+        // including the anonymous one the rule was written to deny.
+        // Without the rule-head enumeration this compiles and
+        // `eval_bool` returns true for an anonymous request.
+        let error = CompiledRego::compile(
+            "policy `rego`",
+            ALLOW_VIA_TRUSTED,
+            "data.sbproxy.allow",
+            50,
+            Some(serde_json::json!({ "sbproxy": { "trusted": true } })),
+            false,
+        )
+        .expect_err("base data at a helper rule's path must refuse");
+        let message = error.to_string();
+        assert!(
+            message.contains("base data defines `data.sbproxy.trusted`"),
+            "the refusal names the shadowing data path: {message}"
+        );
+        assert!(
+            message.contains("data.sbproxy.allow -> data.sbproxy.trusted"),
+            "the refusal shows how the query reaches the shadowed rule: {message}"
+        );
+    }
+
+    #[test]
+    fn the_shadow_check_follows_more_than_one_hop() {
+        // The direct case is one comparison; the transitive case is a
+        // graph. Three rules deep, so a fix that only looked at the
+        // query's immediate references would still miss this.
+        const THREE_HOPS: &str = r#"
+package sbproxy
+
+default strong_tier := false
+
+strong_tier if {
+    input.request.trust_tier == "strong"
+}
+
+default trusted := false
+
+trusted if {
+    strong_tier
+}
+
+default allow := false
+
+allow if {
+    trusted
+}
+"#;
+        let error = CompiledRego::compile(
+            "policy `rego`",
+            THREE_HOPS,
+            "data.sbproxy.allow",
+            50,
+            Some(serde_json::json!({ "sbproxy": { "strong_tier": true } })),
+            false,
+        )
+        .expect_err("base data two hops from the query must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("data.sbproxy.allow -> data.sbproxy.trusted -> data.sbproxy.strong_tier"),
+            "the refusal walks the whole chain: {error}"
+        );
+    }
+
+    #[test]
+    fn a_shadowed_helper_the_query_does_not_reach_still_refuses() {
+        // Regorus resolves the base document against a rule's own path,
+        // not the query's, so an unreferenced rule is shadowed just as
+        // readily. It is dead config either way, and it goes live the
+        // moment somebody calls it, so it refuses with the reachability
+        // stated rather than implied. Stated as a failed search, not as
+        // an absence: see the parent-path test below for why the walk
+        // cannot claim nothing reaches a rule.
+        const UNREFERENCED_HELPER: &str = r#"
+package sbproxy
+
+default allow := false
+
+allow if {
+    input.request.method == "GET"
+}
+
+default audited := false
+
+audited if {
+    input.request.method == "POST"
+}
+"#;
+        let error = CompiledRego::compile(
+            "policy `rego`",
+            UNREFERENCED_HELPER,
+            "data.sbproxy.allow",
+            50,
+            Some(serde_json::json!({ "sbproxy": { "audited": true } })),
+            false,
+        )
+        .expect_err("a shadowed rule refuses whether or not the query reaches it");
+        let message = error.to_string();
+        assert!(
+            message.contains("base data defines `data.sbproxy.audited`"),
+            "{message}"
+        );
+        assert!(
+            message.contains("No reference chain from the query `data.sbproxy.allow` was found"),
+            "the refusal reports a failed search rather than inventing a chain: {message}"
+        );
+        assert!(
+            !message.contains("No reference in the module reaches it"),
+            "the refusal does not assert an absence the walk cannot prove: {message}"
+        );
+    }
+
+    #[test]
+    fn a_reference_to_a_parent_path_reaches_every_rule_under_it() {
+        // Reading `data.sbproxy.denies` evaluates every `denies[...]`
+        // rule in the package, so the query does reach the shadowed one.
+        // Following only references at or below a head made this print
+        // "the collision is latent until a rule calls it" about a deny
+        // the base document had already neutralized, which sends the
+        // operator looking for the bug in the wrong module.
+        const EVERY_OVER_A_PARENT: &str = r#"
+package sbproxy
+
+default allow := false
+
+allow if {
+    every _, v in data.sbproxy.denies {
+        v == false
+    }
+}
+
+denies["path_traversal"] := true if {
+    contains(input.request.path, "..")
+}
+"#;
+        let error = CompiledRego::compile(
+            "policy `rego`",
+            EVERY_OVER_A_PARENT,
+            "data.sbproxy.allow",
+            50,
+            Some(serde_json::json!({
+                "sbproxy": { "denies": { "path_traversal": false } }
+            })),
+            false,
+        )
+        .expect_err("base data at a rule under a read parent path must refuse");
+        let message = error.to_string();
+        assert!(
+            message.contains("base data defines `data.sbproxy.denies.path_traversal`"),
+            "{message}"
+        );
+        assert!(
+            message.contains("data.sbproxy.allow -> data.sbproxy.denies.path_traversal"),
+            "the refusal shows the query reaching the rule through the parent path: {message}"
+        );
+    }
+
+    #[test]
+    fn a_query_deeper_than_a_rule_head_still_gets_a_chain() {
+        // The query is a reference too, so it resolves to the rules it
+        // reads the same way one inside a module does. Querying a key of
+        // a partial rule starts the walk at a path no head equals, and
+        // the walk used to miss on the first pop and print no chain at
+        // all for a collision it was refusing.
+        const PARTIAL_OBJECT: &str = r#"
+package sbproxy
+
+limits[method] := "yes" if {
+    method := input.request.method
+}
+"#;
+        let error = CompiledRego::compile(
+            "policy `rego`",
+            PARTIAL_OBJECT,
+            "data.sbproxy.limits.GET",
+            50,
+            Some(serde_json::json!({ "sbproxy": { "limits": { "POST": "no" } } })),
+            false,
+        )
+        .expect_err("base data at the partial rule's prefix must refuse");
+        let message = error.to_string();
+        assert!(
+            message.contains("The query `data.sbproxy.limits.GET` reaches it: data.sbproxy.limits"),
+            "the refusal resolves the query to the rule it reads: {message}"
+        );
+    }
+
+    #[test]
+    fn a_json_null_shadows_a_rule_the_same_way_a_value_does() {
+        // Regorus keeps the base document's value for anything other
+        // than undefined, and `add_data`'s merge carries a JSON null
+        // through as defined. A check that skipped nulls would let the
+        // cheapest possible shadow straight past.
+        let error = CompiledRego::compile(
+            "policy `rego`",
+            ALLOW_VIA_TRUSTED,
+            "data.sbproxy.allow",
+            50,
+            Some(serde_json::json!({ "sbproxy": { "trusted": null } })),
+            false,
+        )
+        .expect_err("a null at a rule path must refuse");
+        assert!(
+            error.to_string().contains("data.sbproxy.trusted"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn base_data_below_a_rule_path_shadows_it() {
+        // The rule's path is what Regorus compares, so a document that
+        // only defines something *under* the rule still makes the rule's
+        // own path defined, and the rule loses.
+        let error = CompiledRego::compile(
+            "policy `rego`",
+            ALLOW_VIA_TRUSTED,
+            "data.sbproxy.allow",
+            50,
+            Some(serde_json::json!({ "sbproxy": { "trusted": { "reason": "vendor" } } })),
+            false,
+        )
+        .expect_err("base data below a rule path must refuse");
+        assert!(
+            error.to_string().contains("data.sbproxy.trusted"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_non_object_above_a_rule_path_refuses_with_that_reason() {
+        // The other prefix direction. An object at `data.sbproxy` merges
+        // with the rules beneath it, which is the sibling case above; a
+        // scalar there leaves them nowhere to land, and Regorus reports
+        // it as an opaque "previous value is not an object" mid
+        // evaluation if it reports it at all.
+        let error = CompiledRego::compile(
+            "policy `rego`",
+            ALLOW_ENGINEERS,
+            "data.sbproxy.allow",
+            50,
+            Some(serde_json::json!({ "sbproxy": 5 })),
+            false,
+        )
+        .expect_err("a scalar above a rule path must refuse");
+        let message = error.to_string();
+        assert!(
+            message.contains("base data sets `data.sbproxy` to a value that is not an object"),
+            "{message}"
+        );
+        assert!(message.contains("data.sbproxy.allow"), "{message}");
+    }
+
+    #[test]
+    fn a_partial_rule_is_compared_by_its_literal_prefix() {
+        // `limits[method]` resolves to a different path on every
+        // evaluation, so only `data.sbproxy.limits` is known at load.
+        // Regorus's own `get_path_ref_components` would report the path
+        // as `limits.method`, taking the variable's spelling for a key,
+        // and would miss this document entirely.
+        const PARTIAL_OBJECT: &str = r#"
+package sbproxy
+
+default allow := false
+
+allow if {
+    limits[input.request.method] == "yes"
+}
+
+limits[method] := "yes" if {
+    method := "GET"
+}
+"#;
+        let error = CompiledRego::compile(
+            "policy `rego`",
+            PARTIAL_OBJECT,
+            "data.sbproxy.allow",
+            50,
+            Some(serde_json::json!({ "sbproxy": { "limits": { "GET": "no" } } })),
+            false,
+        )
+        .expect_err("base data over a partial rule's own path must refuse");
+        let message = error.to_string();
+        assert!(
+            message.contains("base data defines keys under `data.sbproxy.limits`"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("the rule never evaluates"),
+            "a computed-key head cannot be said to never evaluate: {message}"
+        );
+    }
+
+    /// `limits[method]` with the key computed from the request, so
+    /// nothing at load knows which keys the rule produces.
+    const COMPUTED_KEYS: &str = r#"
+package sbproxy
+
+default allow := false
+
+allow if {
+    limits[input.request.method] == "yes"
+}
+
+limits[method] := "yes" if {
+    method := input.request.method
+}
+"#;
+
+    #[test]
+    fn a_computed_key_head_refuses_even_when_the_base_keys_are_disjoint() {
+        // The deliberate false refusal, pinned so it stays deliberate.
+        // Regorus indexes `data.sbproxy.limits.POST`, one segment deeper
+        // than the head names, so base `POST` merges with a computed
+        // `GET` and this config would have worked. Load time cannot tell
+        // it from base `GET` beside the same rule, which kills the
+        // rule's only output silently, so the refusal keeps the wide
+        // side and the message stops at what the detector saw: it says
+        // the base keys win, not that the rule never runs.
+        let error = CompiledRego::compile(
+            "policy `rego`",
+            COMPUTED_KEYS,
+            "data.sbproxy.allow",
+            50,
+            Some(serde_json::json!({ "sbproxy": { "limits": { "POST": "no" } } })),
+            false,
+        )
+        .expect_err("a computed-key head refuses on any key the base document defines");
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "the module defines a rule that computes its own keys at that path, so every key \
+                 the base document already carries wins over the rule's"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains("cannot be narrowed at config load"),
+            "the refusal says why it cannot be precise: {message}"
+        );
+        assert!(
+            !message.contains("the rule never evaluates"),
+            "the refusal claims nothing about the rule not running: {message}"
+        );
+    }
+
+    #[test]
+    fn an_empty_base_object_over_a_computed_key_head_loads() {
+        // The one sub-case a computed-key head compares precisely: an
+        // empty object holds no key that can beat a computed one, so it
+        // merges and nothing is shadowed. Comparing the literal prefix
+        // alone refused this.
+        CompiledRego::compile(
+            "policy `rego`",
+            COMPUTED_KEYS,
+            "data.sbproxy.allow",
+            50,
+            Some(serde_json::json!({ "sbproxy": { "limits": {} } })),
+            false,
+        )
+        .expect("an empty base object cannot shadow a computed key");
+    }
+
+    #[test]
+    fn a_scalar_over_a_computed_key_head_says_the_keys_cannot_land() {
+        // `update_rule_value` walks the full path with `as_object_mut`
+        // and fails with "previous value is not an object" mid
+        // evaluation, so the rule is blocked rather than shadowed. The
+        // prefix comparison called this a shadow and told the operator
+        // the base document resolves in the rule's place, which is not
+        // what happens.
+        let error = CompiledRego::compile(
+            "policy `rego`",
+            COMPUTED_KEYS,
+            "data.sbproxy.allow",
+            50,
+            Some(serde_json::json!({ "sbproxy": { "limits": 5 } })),
+            false,
+        )
+        .expect_err("a scalar at a computed-key head's path must refuse");
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "base data sets `data.sbproxy.limits` to a value that is not an object, and the \
+                 module defines a rule that computes its own keys at that path, so no key the \
+                 rule produces has anywhere to land"
+            ),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn base_data_beside_a_function_of_the_same_name_is_allowed() {
+        // A function that takes parameters lives in the function table,
+        // not under `data`, so nothing resolves the base document
+        // against its name. Refusing this would be the detector running
+        // wider than the behavior it guards.
+        const FUNCTION_HELPER: &str = r#"
+package sbproxy
+
+default allow := false
+
+allow if {
+    permitted(input.request.method)
+}
+
+permitted(method) if {
+    method == "GET"
+}
+"#;
+        let mut policy = CompiledRego::compile(
+            "policy `rego`",
+            FUNCTION_HELPER,
+            "data.sbproxy.allow",
+            50,
+            Some(serde_json::json!({ "sbproxy": { "permitted": "not a rule path" } })),
+            false,
+        )
+        .expect("base data cannot shadow a function that takes parameters");
+        assert!(
+            policy
+                .eval_bool(&ctx_for("GET", "/v1/chat"))
+                .expect("evaluates"),
+            "the function still decides"
+        );
+    }
+
+    #[test]
+    fn base_data_over_a_zero_argument_function_refuses() {
+        // The other side of `!args.is_empty()`. A function with no
+        // parameters is not in the function table: Regorus's `Func` arm
+        // routes it through `update_data`, which keeps the base
+        // document's value at the same path, so it is shadowable exactly
+        // like a rule. Simplifying the arm to a plain `RuleHead::Func`
+        // match reads as a cleanup and drops every zero-argument
+        // function out of `shadowable`, which is WOR-2428 reintroduced
+        // for that one rule shape.
+        const ZERO_ARG_FUNCTION: &str = r#"
+package sbproxy
+
+default allow := false
+
+allow if {
+    input.request.method == "GET"
+}
+
+audit_enabled() := true
+"#;
+        let error = CompiledRego::compile(
+            "policy `rego`",
+            ZERO_ARG_FUNCTION,
+            "data.sbproxy.allow",
+            50,
+            Some(serde_json::json!({ "sbproxy": { "audit_enabled": false } })),
+            false,
+        )
+        .expect_err("base data at a zero-argument function's path must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("base data defines `data.sbproxy.audit_enabled`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn base_data_beside_a_default_function_of_the_same_name_is_allowed() {
+        // `Rule::Default` carries its own `args`, and a default with
+        // parameters is a function default: `eval_default_rule` returns
+        // early for it and the value is served from the function table,
+        // never written under `data`. Every other default-rule test in
+        // this file uses a parameterless default, so nothing else pins
+        // this arm and a detector that treated a default function as
+        // shadowable would refuse a config Regorus runs correctly.
+        const DEFAULT_FUNCTION: &str = r#"
+package sbproxy
+
+default allow := false
+
+allow if {
+    permitted(input.request.method)
+}
+
+default permitted(_) := false
+
+permitted(method) if {
+    method == "GET"
+}
+"#;
+        let mut policy = CompiledRego::compile(
+            "policy `rego`",
+            DEFAULT_FUNCTION,
+            "data.sbproxy.allow",
+            50,
+            Some(serde_json::json!({ "sbproxy": { "permitted": "not a rule path" } })),
+            false,
+        )
+        .expect("base data cannot shadow a default function that takes parameters");
+        assert!(
+            policy
+                .eval_bool(&ctx_for("GET", "/v1/chat"))
+                .expect("evaluates"),
+            "the function still decides"
+        );
+        assert!(
+            !policy
+                .eval_bool(&ctx_for("POST", "/v1/chat"))
+                .expect("evaluates"),
+            "the default answers for a method the function does not permit"
+        );
+    }
+
+    #[test]
+    fn a_base_data_refusal_is_counted_on_the_compile_metric() {
+        // A refusal that exists only as a returned error is invisible to
+        // an operator watching whether their rego policies still
+        // compile: the fleet goes to zero working policies and the
+        // series stays flat. Both base-data refusals count on the same
+        // family every other compile outcome uses.
+        let before = compile_result_count("rego", "semantic_error");
+
+        CompiledRego::compile(
+            "policy `rego`",
+            ALLOW_ENGINEERS,
+            "data.sbproxy.allow",
+            50,
+            Some(serde_json::json!({ "sbproxy": { "allow": true } })),
+            false,
+        )
+        .expect_err("base data at the query path must refuse");
+
+        CompiledRego::compile(
+            "policy `rego`",
+            ALLOW_VIA_TRUSTED,
+            "data.sbproxy.allow",
+            50,
+            Some(serde_json::json!({ "sbproxy": { "trusted": true } })),
+            false,
+        )
+        .expect_err("base data at a helper rule's path must refuse");
+
+        // At least, not exactly: the counter is process wide, and under
+        // a threaded `cargo test` another rego test can land between the
+        // two reads. Under nextest's process per test it is exactly two.
+        assert!(
+            compile_result_count("rego", "semantic_error") >= before + 2.0,
+            "both base-data refusals count on sbproxy_script_compile_total"
+        );
+    }
+
+    /// The current value of `sbproxy_script_compile_total` for one
+    /// engine and result, or zero before the series exists.
+    fn compile_result_count(engine: &str, result: &str) -> f64 {
+        sbproxy_observe::metrics::metrics()
+            .render()
+            .lines()
+            .find_map(|line| {
+                if !line.starts_with("sbproxy_script_compile_total")
+                    || !line.contains(&format!("engine=\"{engine}\""))
+                    || !line.contains(&format!("result=\"{result}\""))
+                {
+                    return None;
+                }
+                line.split_whitespace().nth(1)?.parse().ok()
+            })
+            .unwrap_or(0.0)
     }
 
     #[test]

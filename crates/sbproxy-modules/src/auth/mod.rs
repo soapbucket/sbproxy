@@ -258,6 +258,42 @@ impl std::fmt::Debug for Auth {
     }
 }
 
+/// Deserialize one `authentication:` provider block into its config
+/// struct, dropping the `type:` discriminator first.
+///
+/// WOR-2181. Every provider config reached through this helper
+/// declares `#[serde(deny_unknown_fields)]`. Before that, an operator
+/// who wrote `require_dp0p: true` on a bearer block got a config that
+/// compiled, booted, and served with DPoP proof-of-possession off,
+/// because serde drops unrecognized keys by default and the two
+/// config-layer `deny_unknown_fields` passes stop at the block
+/// boundary (`authentication` is an opaque `serde_json::Value` on the
+/// typed envelope). The same held for `require_mtls_bound` on `jwt`.
+///
+/// Denying unknown fields makes `type:` itself an unknown field, since
+/// [`compile_auth`](crate::compile::compile_auth) already matched on
+/// it to pick this provider and nothing below reads it again. It is
+/// removed here rather than declared on each of the eleven provider
+/// structs, for two reasons. Several of those structs are public and
+/// are built as struct literals by callers in other crates, so a
+/// private `_type` field would make them unconstructible there. And
+/// removing the key means nothing below parses its value, so every
+/// spelling the dispatcher routes on keeps working unchanged:
+/// `bearer`/`bearer_token`, `forward_auth`/`forward`,
+/// `ldap_auth`/`ldap`, `bot_auth`/`web_bot_auth`.
+///
+/// A non-object value is passed through untouched and fails in serde
+/// with the same error it would have produced before.
+pub(crate) fn provider_config_from_value<T>(mut value: serde_json::Value) -> anyhow::Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    if let Some(object) = value.as_object_mut() {
+        object.remove("type");
+    }
+    Ok(serde_json::from_value(value)?)
+}
+
 // --- ApiKeyAuth ---
 
 /// One entry in the `api_keys:` list of an `ApiKeyAuth` config. Each
@@ -266,6 +302,16 @@ impl std::fmt::Debug for Auth {
 /// `Principal` on a successful match (WOR-1047 PR2). The YAML accepts
 /// either a bare string (back-compat) or a full struct of
 /// `{secret, project, ...}`.
+///
+/// This entry stays permissive on unknown keys while the provider
+/// around it refuses them (WOR-2181): serde rejects
+/// `deny_unknown_fields` together with `flatten` at compile time, and
+/// the flattened `attrs` below is what lets an operator write
+/// `{secret, project, team}` without nesting. Do not add
+/// `deny_unknown_fields` here; it will not build. Closing the entry
+/// level means giving `CredentialAttrs` a deny of its own, which is a
+/// separate change with its own blast radius across every provider
+/// that flattens it.
 #[derive(Debug, Deserialize, Clone)]
 pub struct ApiKeyEntry {
     /// The API key secret a caller presents in the configured header
@@ -294,7 +340,10 @@ impl<'de> Deserialize<'de> for ApiKeyAuth {
     where
         D: serde::Deserializer<'de>,
     {
+        // WOR-2181: unknown keys are refused. `type:` is stripped by
+        // `provider_config_from_value` before this runs.
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Raw {
             #[serde(default = "default_header")]
             header_name: String,
@@ -344,9 +393,10 @@ fn default_header() -> String {
 }
 
 impl ApiKeyAuth {
-    /// Build an ApiKeyAuth from a generic JSON config value.
+    /// Build an ApiKeyAuth from a generic JSON config value. Unknown
+    /// keys are refused (WOR-2181).
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
-        Ok(serde_json::from_value(value)?)
+        provider_config_from_value(value)
     }
 
     /// Check if the request has a valid API key in the header or query string.
@@ -430,7 +480,11 @@ impl ApiKeyAuth {
 
 /// HTTP Basic Authentication provider.
 /// Validates base64-encoded username:password from the Authorization header.
+///
+/// Unknown keys are refused (WOR-2181); see the module's
+/// `provider_config_from_value` for why `type:` is not declared here.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BasicAuthProvider {
     /// Accepted username/password pairs.
     pub users: Vec<BasicAuthUser>,
@@ -440,6 +494,10 @@ pub struct BasicAuthProvider {
 }
 
 /// A username/password pair for basic auth.
+///
+/// Permissive on unknown keys, for the same reason as [`ApiKeyEntry`]:
+/// serde refuses `deny_unknown_fields` alongside the flattened `attrs`
+/// below at compile time.
 #[derive(Debug, Deserialize, Clone)]
 pub struct BasicAuthUser {
     /// Username portion of the credential.
@@ -456,8 +514,9 @@ pub struct BasicAuthUser {
 
 impl BasicAuthProvider {
     /// Build a BasicAuthProvider from a generic JSON config value.
+    /// Unknown keys are refused (WOR-2181).
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
-        Ok(serde_json::from_value(value)?)
+        provider_config_from_value(value)
     }
 
     /// Check if the request has valid basic auth credentials.
@@ -538,6 +597,10 @@ impl BasicAuthProvider {
 ///     team: platform
 ///     tags: [internal]
 /// ```
+///
+/// Permissive on unknown keys, for the same reason as [`ApiKeyEntry`]:
+/// serde refuses `deny_unknown_fields` alongside the flattened `attrs`
+/// below at compile time. The provider around it does refuse them.
 #[derive(Debug, Deserialize, Clone)]
 pub struct BearerToken {
     /// The bearer secret a caller presents in
@@ -571,7 +634,12 @@ impl<'de> Deserialize<'de> for BearerAuth {
     where
         D: serde::Deserializer<'de>,
     {
+        // WOR-2181: unknown keys are refused, so `require_dp0p:` is a
+        // config error instead of a silently disabled DPoP binding.
+        // `type:` is stripped by `provider_config_from_value` before
+        // this runs.
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Raw {
             #[serde(deserialize_with = "deserialize_bearer_tokens")]
             tokens: Vec<BearerToken>,
@@ -614,9 +682,10 @@ where
 }
 
 impl BearerAuth {
-    /// Build a BearerAuth from a generic JSON config value.
+    /// Build a BearerAuth from a generic JSON config value. Unknown
+    /// keys are refused (WOR-2181).
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
-        Ok(serde_json::from_value(value)?)
+        provider_config_from_value(value)
     }
 
     /// Check if the request carries a valid bearer token.
@@ -697,7 +766,14 @@ impl BearerAuth {
 /// instantiated without either a shared `secret` or a `jwks_url`, all
 /// tokens are rejected: there is no configuration under which this
 /// provider accepts an unsigned or unverified token.
+///
+/// Unknown keys are refused (WOR-2181), so `require_mtls_bnd:` is a
+/// config error rather than an mTLS binding nobody enforces. See the
+/// module's `provider_config_from_value` for why `type:` is not declared
+/// as a field here. `attrs` is a nested block rather than a flattened one,
+/// which is what lets this struct carry the deny at all.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JwtAuth {
     /// Shared HMAC secret for verifying tokens (used with HS-family algorithms).
     #[serde(default)]
@@ -764,9 +840,10 @@ pub struct JwtAuth {
 }
 
 impl JwtAuth {
-    /// Build a JwtAuth from a generic JSON config value.
+    /// Build a JwtAuth from a generic JSON config value. Unknown keys
+    /// are refused (WOR-2181).
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
-        Ok(serde_json::from_value(value)?)
+        provider_config_from_value(value)
     }
 
     /// Validate the request's JWT: signature, standard claims, and any
@@ -1117,7 +1194,10 @@ impl<'de> Deserialize<'de> for DigestAuth {
     where
         D: serde::Deserializer<'de>,
     {
+        // WOR-2181: unknown keys are refused. `type:` is stripped by
+        // `provider_config_from_value` before this runs.
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Raw {
             realm: String,
             #[serde(deserialize_with = "deserialize_digest_users")]
@@ -1190,8 +1270,10 @@ impl DigestAuth {
     /// length does not match the selected algorithm can never produce a
     /// matching response, so it is refused here rather than turning
     /// into a permanent 401 nobody can explain (WOR-2316).
+    ///
+    /// Unknown keys are refused (WOR-2181).
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
-        let parsed: Self = serde_json::from_value(value)?;
+        let parsed: Self = provider_config_from_value(value)?;
         let expected = parsed.algorithm.ha1_hex_len();
         for user in &parsed.users {
             let hash = &user.password;
@@ -1452,8 +1534,14 @@ impl ForwardAuthProvider {
     /// - `success_status` as either `200` or `[200, 201]` (takes first)
     /// - `trust_headers` for headers to trust from the auth response
     /// - `timeout` in seconds
+    ///
+    /// Unknown keys are refused (WOR-2181). The Go-compat aliases
+    /// above are declared fields, so they keep working.
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
+        // WOR-2181: unknown keys are refused. `type:` is stripped by
+        // `provider_config_from_value` before this runs.
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct RawConfig {
             url: String,
             #[serde(default)]
@@ -1474,7 +1562,7 @@ impl ForwardAuthProvider {
             disable_forwarded_host_header: bool,
         }
 
-        let raw: RawConfig = serde_json::from_value(value)?;
+        let raw: RawConfig = provider_config_from_value(value)?;
 
         // Merge headers_to_forward and forward_headers (Go alias)
         let mut headers = raw.headers_to_forward;
@@ -3000,6 +3088,305 @@ mod tests {
         assert_eq!(
             auth.roles_claim,
             vec!["roles".to_string(), "groups".to_string()]
+        );
+    }
+
+    // --- WOR-2181: unknown keys on an auth provider block ---
+    //
+    // These sit here rather than next to the other `compile_auth`
+    // tests because `crates/sbproxy-modules/src/compile.rs` is owned
+    // by a concurrent change; `compile_auth` is `pub`, so calling it
+    // from this module tests the same seam an operator's config takes.
+
+    /// The bug in one test. `require_dp0p` is `require_dpop` with a
+    /// zero for the `o`, which is the kind of thing that survives code
+    /// review because it looks right. Before WOR-2181 this compiled,
+    /// booted, and served with DPoP proof-of-possession off: serde
+    /// dropped the key and `require_dpop` took its `false` default,
+    /// so a stolen bearer token was enough on an origin whose config
+    /// says it is not.
+    ///
+    /// `examples/auth-bearer-dpop/sb.yml` is the shipped config this
+    /// mirrors; changing its one key was the whole repro.
+    #[test]
+    fn bearer_typo_on_require_dpop_is_refused() {
+        let json = serde_json::json!({
+            "type": "bearer",
+            "tokens": ["t"],
+            "require_dp0p": true,
+        });
+        let err = crate::compile::compile_auth(&json)
+            .expect_err("a misspelled DPoP switch must not compile");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("require_dp0p"),
+            "the error must name the key the operator typed: {text}"
+        );
+        assert!(
+            text.contains("require_dpop"),
+            "the error must offer the accepted spelling: {text}"
+        );
+    }
+
+    /// The other half: the correctly spelled key still turns the
+    /// control on. A deny that also broke the working config would be
+    /// a worse bug than the one it fixes.
+    #[test]
+    fn bearer_require_dpop_compiles_when_spelled_correctly() {
+        let json = serde_json::json!({
+            "type": "bearer",
+            "tokens": ["t"],
+            "require_dpop": true,
+        });
+        match crate::compile::compile_auth(&json).expect("the documented shape must compile") {
+            Auth::Bearer(bearer) => assert!(
+                bearer.require_dpop,
+                "the correctly spelled key must still bind the token to a DPoP proof"
+            ),
+            other => panic!("expected Auth::Bearer, got {other:?}"),
+        }
+    }
+
+    /// The same fail-open on the JWT provider: `require_mtls_bnd`
+    /// left RFC 8705 certificate binding off while the config read as
+    /// though it were on.
+    #[test]
+    fn jwt_typo_on_require_mtls_bound_is_refused() {
+        let json = serde_json::json!({
+            "type": "jwt",
+            "secret": "s",
+            "require_mtls_bnd": true,
+        });
+        let err = crate::compile::compile_auth(&json)
+            .expect_err("a misspelled mTLS-binding switch must not compile");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("require_mtls_bnd"),
+            "the error must name the key the operator typed: {text}"
+        );
+    }
+
+    #[test]
+    fn jwt_require_mtls_bound_compiles_when_spelled_correctly() {
+        let json = serde_json::json!({
+            "type": "jwt",
+            "secret": "s",
+            "require_mtls_bound": true,
+        });
+        match crate::compile::compile_auth(&json).expect("the documented shape must compile") {
+            Auth::Jwt(jwt) => assert!(
+                jwt.require_mtls_bound,
+                "the correctly spelled key must still require a bound certificate"
+            ),
+            other => panic!("expected Auth::Jwt, got {other:?}"),
+        }
+    }
+
+    /// Every built-in auth `type:` an operator can write, paired with
+    /// a config the provider accepts.
+    ///
+    /// Alias spellings are separate rows because `compile_auth` routes
+    /// on the raw string and an operator can write either one. That is
+    /// the property most at risk from this change: the discriminator
+    /// is stripped rather than declared, so nothing below the
+    /// dispatcher parses its value and every spelling has to keep
+    /// working.
+    ///
+    /// `noop` is deliberately absent. It has no config struct at all
+    /// (the dispatcher returns `Auth::Noop` without deserializing
+    /// anything), so there is nothing for a deny to attach to, and an
+    /// unknown key on a `noop` block is still accepted.
+    fn builtin_auth_provider_configs() -> Vec<(&'static str, serde_json::Value)> {
+        vec![
+            (
+                "api_key",
+                serde_json::json!({
+                    "type": "api_key",
+                    "api_keys": ["k"],
+                    "header_name": "X-Api-Key",
+                    "query_param": "token",
+                }),
+            ),
+            (
+                "basic_auth",
+                serde_json::json!({
+                    "type": "basic_auth",
+                    "users": [{"username": "u", "password": "p"}],
+                    "realm": "r",
+                }),
+            ),
+            (
+                "bearer",
+                serde_json::json!({
+                    "type": "bearer",
+                    "tokens": ["t"],
+                    "require_dpop": false,
+                }),
+            ),
+            (
+                "bearer_token",
+                serde_json::json!({"type": "bearer_token", "tokens": ["t"]}),
+            ),
+            (
+                "jwt",
+                serde_json::json!({
+                    "type": "jwt",
+                    "secret": "s",
+                    "issuer": "https://issuer.example.com",
+                    "audience": "api",
+                    "algorithms": ["HS256"],
+                    "require_dpop": false,
+                    "require_mtls_bound": false,
+                }),
+            ),
+            (
+                "digest",
+                serde_json::json!({
+                    "type": "digest",
+                    "realm": "Restricted",
+                    "users": [{"username": "u", "password": "p"}],
+                    "algorithm": "SHA-256",
+                }),
+            ),
+            (
+                "hmac_auth",
+                serde_json::json!({
+                    "type": "hmac_auth",
+                    "keys": [{"key_id": "svc-a", "secret": "0011223344556677"}],
+                    "clock_skew_seconds": 300,
+                }),
+            ),
+            (
+                "forward_auth",
+                serde_json::json!({
+                    "type": "forward_auth",
+                    "url": "http://auth-svc/check",
+                    "method": "GET",
+                }),
+            ),
+            (
+                "forward",
+                serde_json::json!({
+                    "type": "forward",
+                    "url": "http://auth-svc/check",
+                    "forward_headers": ["X-Auth-Token"],
+                }),
+            ),
+            (
+                "ldap_auth",
+                serde_json::json!({
+                    "type": "ldap_auth",
+                    "url": "ldaps://directory.example.org:636",
+                    "base_dn": "ou=users,dc=example,dc=org",
+                }),
+            ),
+            (
+                "ldap",
+                serde_json::json!({
+                    "type": "ldap",
+                    "url": "ldaps://directory.example.org:636",
+                    "base_dn": "ou=users,dc=example,dc=org",
+                }),
+            ),
+            (
+                "bot_auth",
+                serde_json::json!({
+                    "type": "bot_auth",
+                    "agents": [{
+                        "name": "a",
+                        "key_id": "k1",
+                        "algorithm": "hmac_sha256",
+                        "public_key": "secret-a",
+                    }],
+                }),
+            ),
+            (
+                "web_bot_auth",
+                serde_json::json!({
+                    "type": "web_bot_auth",
+                    "agents": [{
+                        "name": "a",
+                        "key_id": "k1",
+                        "algorithm": "hmac_sha256",
+                        "public_key": "secret-a",
+                    }],
+                }),
+            ),
+            (
+                "cap",
+                serde_json::json!({
+                    "type": "cap",
+                    "jwks_url": "https://issuer.example.com/.well-known/cap/keys.json",
+                }),
+            ),
+            (
+                "oidc",
+                serde_json::json!({
+                    "type": "oidc",
+                    "authorization_endpoint": "https://idp.example.com/authorize",
+                    "token_endpoint": "https://idp.example.com/oauth/token",
+                    "jwks_uri": "https://idp.example.com/.well-known/jwks.json",
+                    "issuer": "https://idp.example.com",
+                    "client_id": "sbproxy",
+                    "client_secret": "super-secret-client-secret-of-arbitrary-length",
+                    "cookie_secret": "operator-supplied-32-plus-byte-cookie-secret",
+                }),
+            ),
+        ]
+    }
+
+    /// Stripping `type:` instead of declaring it must leave every
+    /// routed spelling compiling, aliases included.
+    #[test]
+    fn every_builtin_auth_provider_still_compiles_with_its_discriminator() {
+        for (type_name, config) in builtin_auth_provider_configs() {
+            crate::compile::compile_auth(&config)
+                .unwrap_or_else(|e| panic!("`type: {type_name}` must still compile: {e:#}"));
+        }
+    }
+
+    /// The same table with one misspelled key bolted on. Each provider
+    /// has to refuse it and name it, so the operator reads which key
+    /// they got wrong rather than watching a control go quietly
+    /// missing.
+    #[test]
+    fn every_builtin_auth_provider_refuses_an_unknown_key() {
+        for (type_name, mut config) in builtin_auth_provider_configs() {
+            config["not_a_real_auth_key"] = serde_json::json!(true);
+            let err = match crate::compile::compile_auth(&config) {
+                Ok(_) => {
+                    panic!("`type: {type_name}` must refuse an unknown key rather than dropping it")
+                }
+                Err(e) => e,
+            };
+            let text = format!("{err:#}");
+            assert!(
+                text.contains("not_a_real_auth_key"),
+                "`type: {type_name}` must name the offending key: {text}"
+            );
+        }
+    }
+
+    /// A provider inside an `authentication:` list gets the same
+    /// treatment. The list form routes each entry through the single
+    /// provider path, so a typo in the second entry is refused with
+    /// the entry index for context.
+    #[test]
+    fn unknown_key_in_a_composed_provider_is_refused() {
+        let json = serde_json::json!([
+            {"type": "api_key", "api_keys": ["k"]},
+            {"type": "bearer", "tokens": ["t"], "require_dp0p": true},
+        ]);
+        let err = crate::compile::compile_auth(&json)
+            .expect_err("a typo in a list entry must refuse the whole block");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("require_dp0p"),
+            "the error must name the key: {text}"
+        );
+        assert!(
+            text.contains("authentication[1]"),
+            "the error must say which entry carried it: {text}"
         );
     }
 }

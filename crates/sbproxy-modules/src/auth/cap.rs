@@ -188,7 +188,13 @@ impl CapError {
 /// production path; `jwks_static` is the offline / pre-issued-token
 /// deployment shape described in the ADR's "Issuance (enterprise)"
 /// closing paragraph.
+///
+/// WOR-2181: unknown keys are refused, so `require_agent_bindng: true`
+/// fails the config instead of leaving an unbound token acceptable.
+/// `type:` is stripped by `crate::auth::provider_config_from_value`
+/// before this parses.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CapConfig {
     /// JWKS endpoint URL (typically
     /// `https://<issuer>/.well-known/cap/keys.json`). Cached for
@@ -306,9 +312,10 @@ impl std::fmt::Debug for CapVerifier {
 }
 
 impl CapVerifier {
-    /// Build a verifier from JSON config.
+    /// Build a verifier from JSON config. Unknown keys are refused
+    /// (WOR-2181).
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
-        let cfg: CapConfig = serde_json::from_value(value)?;
+        let cfg: CapConfig = crate::auth::provider_config_from_value(value)?;
         Self::from_typed_config(cfg)
     }
 

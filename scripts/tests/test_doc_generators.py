@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import http.server
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -13,6 +14,7 @@ import tempfile
 import textwrap
 import threading
 import unittest
+import unittest.mock
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -721,6 +723,133 @@ class SyncDocConfigsTests(unittest.TestCase):
         self.assertNotIn("stale: true", contents)
 
 
+class DocDriftCatalogTests(unittest.TestCase):
+    """`check-doc-drift.sh` against a scratch root and a mutated catalog."""
+
+    def _root(self) -> Path:
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root)
+        shutil.copytree(REPOSITORY / "docs", root / "docs")
+        for name in ("llms.txt", "README.md", "SECURITY.md", "CLAUDE.md", "MIGRATION.md"):
+            shutil.copy(REPOSITORY / name, root / name)
+        (root / "crates" / "sbproxy-ai" / "data").mkdir(parents=True)
+        for name in ("ai_providers.yml", "ai_providers.yml.gz"):
+            shutil.copy(
+                REPOSITORY / "crates" / "sbproxy-ai" / "data" / name,
+                root / "crates" / "sbproxy-ai" / "data" / name,
+            )
+        (root / ".github" / "workflows").mkdir(parents=True)
+        shutil.copy(
+            REPOSITORY / ".github" / "workflows" / "release.yml",
+            root / ".github" / "workflows" / "release.yml",
+        )
+        shutil.copytree(REPOSITORY / "schemas", root / "schemas")
+        return root
+
+    def _write_catalog(self, root: Path, text: str) -> None:
+        import gzip
+
+        data = root / "crates" / "sbproxy-ai" / "data"
+        (data / "ai_providers.yml").write_text(text)
+        (data / "ai_providers.yml.gz").write_bytes(
+            gzip.compress(text.encode("utf-8"), 9, mtime=0)
+        )
+
+    def _run(self, root: Path) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["bash", str(REPOSITORY / "scripts" / "check-doc-drift.sh"), "--root", str(root)],
+            capture_output=True,
+            text=True,
+        )
+
+    def test_the_catalog_is_counted_the_way_serde_counts_it(self) -> None:
+        """Key order is not part of the count, because it is not to serde.
+
+        The count came off `^  - name:`, justified by a Rust test that
+        pins the count and the format split but never the key order.
+        `YamlProvider` is a plain derive, so `- display_name: NewCo` then
+        `name: newco` parses on one side and vanished on the other; the
+        two counters then disagreed by one and this script blamed the
+        prose, which is how a correct doc gets edited back to a wrong
+        number.
+        """
+        root = self._root()
+        self.assertEqual(self._run(root).returncode, 0, "baseline should be clean")
+
+        lines = (
+            (root / "crates" / "sbproxy-ai" / "data" / "ai_providers.yml")
+            .read_text()
+            .split("\n")
+        )
+        for index, line in enumerate(lines):
+            if line.startswith("  - name: "):
+                name = line[len("  - name: "):]
+                self.assertTrue(lines[index + 1].startswith("    display_name:"))
+                lines[index] = "  - " + lines[index + 1].strip()
+                lines[index + 1] = "    name: " + name
+                break
+        else:
+            self.fail("no provider entry led with `name:`")
+        swapped = "\n".join(lines)
+        self.assertEqual(
+            len(re.findall(r"^  - name:", swapped, re.MULTILINE)),
+            72 - 1,
+            "the old regex should miscount this catalog, which is the point",
+        )
+        self._write_catalog(root, swapped)
+        result = self._run(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_an_entry_with_no_name_is_reported(self) -> None:
+        root = self._root()
+        catalog = root / "crates" / "sbproxy-ai" / "data" / "ai_providers.yml"
+        self._write_catalog(
+            root, catalog.read_text() + "  - display_name: Nameless\n    format: openai\n"
+        )
+        result = self._run(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("has no `name:`", result.stderr)
+
+    def test_the_format_split_is_held_even_when_the_total_is_right(self) -> None:
+        """The breakdown drifts on its own, and only the breakdown sees it.
+
+        Retyping one `custom` entry as `openai` leaves the total at 72,
+        so every total claim in the tree stays green while "3
+        custom-format entries" on four pages goes wrong.
+        """
+        root = self._root()
+        catalog = root / "crates" / "sbproxy-ai" / "data" / "ai_providers.yml"
+        self._write_catalog(
+            root, catalog.read_text().replace("    format: custom\n", "    format: openai\n", 1)
+        )
+        result = self._run(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("providers$", result.stderr)
+        for page in ("ai-gateway.md", "features.md", "providers.md"):
+            self.assertIn(f"docs/{page}", result.stderr)
+        self.assertIn("but the catalog has 2 custom-format entries", result.stderr)
+
+    def test_the_generated_corpus_is_still_in_the_fixed_string_scan(self) -> None:
+        """Excluding it for the derived check must not narrow the old one."""
+        root = self._root()
+        corpus = root / "docs" / "llms-full.txt"
+        corpus.write_text(corpus.read_text() + "\nThe certpin module rejects it.\n")
+        result = self._run(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("stale string found: 'certpin'", result.stderr)
+        self.assertIn("llms-full.txt", result.stderr)
+
+    def test_a_corpus_lag_entry_that_covers_nothing_is_reported(self) -> None:
+        root = self._root()
+        corpus = root / "docs" / "llms-full.txt"
+        corpus.write_text(
+            corpus.read_text().replace("The 90+ AI provider catalog", "The 72-provider AI catalog")
+        )
+        result = self._run(root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("drop it from", result.stderr)
+
+
 class DocCaptureCheckerTests(unittest.TestCase):
     """Unit coverage for scripts/check-doc-captures.py.
 
@@ -910,6 +1039,349 @@ class DocCaptureCheckerTests(unittest.TestCase):
             self.mod.normalize("requirement_id: req_01kz4tprft0pf62bk3drd79tpn"),
             self.mod.normalize("requirement_id: req_01kz57t7yk9kyh51ksvgd96j15"),
         )
+
+    def test_the_usage_bridge_walkthrough_replays_every_step_it_shows(self) -> None:
+        """Producer, both reads, and the metric scrape, in that order.
+
+        The page bills a call, reads the row it wrote twice, and scrapes
+        the counter the same call incremented. Three of the four were
+        marked and the scrape was not (WOR-2643), so the page read as
+        covered while its metric claim was a transcript. Order is pinned
+        alongside the count because the producer has to run first: the
+        stack wipes /tmp/sbproxy-usage-bridge on every boot, so a read
+        that ran before the bill would read an empty database.
+        """
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        readme = repo_root / "examples" / "usage-bridge-queue" / "README.md"
+        commands = [capture.command for capture in self.mod.parse_captures(readme)]
+        self.assertEqual(
+            len(commands),
+            4,
+            f"expected producer, two reads, and the metric scrape; got {commands}",
+        )
+        self.assertEqual(commands[0], "bash examples/usage-bridge-queue/bin/bill-one-call.sh")
+        self.assertIn("from usage_reports order by created_at_ms", commands[1])
+        self.assertIn("select event_jcs from usage_reports", commands[2])
+        self.assertEqual(
+            commands[3],
+            "curl -s http://127.0.0.1:8080/metrics | grep sbproxy_usage_bridge",
+        )
+
+    def test_a_shown_output_with_no_marker_is_a_finding(self) -> None:
+        path = self._doc(
+            """\
+            # Doc
+
+            ```bash
+            echo hello
+            ```
+
+            ```
+            hello
+            ```
+            """
+        )
+        findings = self.mod.uncaptured_output_blocks(path)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0][1], "echo hello")
+
+    def test_a_marker_between_command_and_output_clears_the_finding(self) -> None:
+        path = self._doc(
+            """\
+            # Doc
+
+            ```bash
+            echo hello
+            ```
+
+            <!-- CAPTURE: echo hello -->
+
+            ```
+            hello
+            ```
+            """
+        )
+        self.assertEqual(self.mod.uncaptured_output_blocks(path), [])
+
+    def test_a_setup_block_that_shows_no_output_is_not_policed(self) -> None:
+        """`mkdir`, `cargo build`, `kill %1` are outside the rule by shape.
+
+        They print nothing the page shows, so no output block follows
+        them and there is no claim to hold to the code. Exempting them
+        by name would be a list that grows with every walkthrough.
+        """
+        path = self._doc(
+            """\
+            # Doc
+
+            ```bash
+            mkdir -p /tmp/demo
+            ```
+
+            Then, from the repository root:
+
+            ```bash
+            sbproxy serve -f sb.yml
+            ```
+
+            ```yaml
+            proxy:
+              listen: 127.0.0.1:8080
+            ```
+            """
+        )
+        self.assertEqual(self.mod.uncaptured_output_blocks(path), [])
+
+    def test_a_command_separated_from_its_output_by_prose_is_a_finding(self) -> None:
+        """"That returns:" is the shape, not an escape hatch.
+
+        The rule used to drop any pair with a non-blank line between the
+        two blocks, which is the commonest way this repo shows output.
+        Five of the 32 command-and-output pairs on the covered pages are
+        prose-separated and all five are genuine output.
+        """
+        path = self._doc(
+            """\
+            # Doc
+
+            ```bash
+            curl -sS http://127.0.0.1:9090/api/health | jq
+            ```
+
+            That returns:
+
+            ```json
+            {"status": "ok"}
+            ```
+            """
+        )
+        findings = self.mod.uncaptured_output_blocks(path)
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("api/health", findings[0][1])
+
+    def test_a_heading_between_command_and_output_is_out_of_scope(self) -> None:
+        """A heading starts a new subject, so the block belongs to it."""
+        path = self._doc(
+            """\
+            # Doc
+
+            ```bash
+            curl -sS http://127.0.0.1:9090/api/health | jq
+            ```
+
+            ## The response shape
+
+            ```json
+            {"status": "ok"}
+            ```
+            """
+        )
+        self.assertEqual(self.mod.uncaptured_output_blocks(path), [])
+
+    def test_http_and_xml_blocks_count_as_shown_output(self) -> None:
+        for lang in ("http", "xml"):
+            with self.subTest(lang=lang):
+                path = self._doc(
+                    f"""\
+                    # Doc
+
+                    ```bash
+                    curl -i http://127.0.0.1:9090/api/health
+                    ```
+
+                    ```{lang}
+                    body
+                    ```
+                    """
+                )
+                self.assertEqual(len(self.mod.uncaptured_output_blocks(path)), 1)
+
+    def test_a_fence_with_attributes_does_not_desynchronize_the_parser(self) -> None:
+        """`rust,no_run` is an opener, and everything below it stays paired.
+
+        The old pattern accepted only a bare lowercase language, so a
+        comma in the info string made the walker skip the opener, read
+        the block's closing fence as an opener, and pair off every fence
+        below it by one. `docs/audit-log.md:1019` shipped that: the file
+        has 31 blocks and the parser returned 30, reporting prose as code
+        for the rest of the page. The uncaptured pair below is the thing
+        that went invisible.
+        """
+        path = self._doc(
+            """\
+            # Doc
+
+            ```rust,no_run
+            let x = 1;
+            ```
+
+            ```bash
+            echo hello
+            ```
+
+            ```
+            hello
+            ```
+            """
+        )
+        blocks, problems = self.mod._fences(path.read_text().split("\n"))
+        self.assertEqual(problems, [])
+        self.assertEqual([lang for _, _, lang in blocks], ["rust", "bash", ""])
+        findings = self.mod.uncaptured_output_blocks(path)
+        self.assertEqual(len(findings), 1, findings)
+        self.assertEqual(findings[0][1], "echo hello")
+
+    def test_the_live_page_that_desynchronized_parses_whole(self) -> None:
+        """`docs/audit-log.md` is a manifest page and had the bad fence."""
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        lines = (repo_root / "docs" / "audit-log.md").read_text().split("\n")
+        blocks, problems = self.mod._fences(lines)
+        self.assertEqual(problems, [])
+        opener_lines = sum(1 for line in lines if line.lstrip().startswith("```"))
+        self.assertEqual(
+            len(blocks) * 2,
+            opener_lines,
+            "every triple-backtick line on the page should be an opener or a closer",
+        )
+
+    def test_an_unreadable_fence_is_reported_rather_than_skipped(self) -> None:
+        """A parser that desynchronizes quietly is worse than one that errors."""
+        path = self._doc(
+            """\
+            # Doc
+
+            ```sh `inline`
+            echo hi
+            ```
+            """
+        )
+        problems = self.mod.fence_problems(path)
+        self.assertIn("cannot read", problems[0][1])
+        self.assertEqual(problems[0][0], 3)
+        # The cascade is the failure being made visible: the block's own
+        # closing fence is read as an opener, so it runs to the end of
+        # the file. That used to be the silent half.
+        self.assertIn("never closed", problems[1][1])
+
+    def test_an_unclosed_fence_is_reported_rather_than_skipped(self) -> None:
+        path = self._doc(
+            """\
+            # Doc
+
+            ```bash
+            echo dangling
+            """
+        )
+        problems = self.mod.fence_problems(path)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("never closed", problems[0][1])
+
+    def test_no_manifest_page_carries_a_fence_this_parser_cannot_read(self) -> None:
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        for rel in self.mod.MANIFEST:
+            path = repo_root / rel
+            if not path.exists():
+                continue
+            self.assertEqual(self.mod.fence_problems(path), [], rel)
+
+    def test_no_manifest_page_shows_an_output_nothing_accounts_for(self) -> None:
+        """The repo-level gate: every shown output is replayed or recorded.
+
+        `check_block_coverage` also audits the other direction, so a note
+        in `UNCAPTURED_BLOCKS` that stops matching a block fails here
+        rather than sitting in the file excusing something that no longer
+        exists.
+        """
+        self.assertEqual(self.mod.check_block_coverage(), [])
+
+    def _coverage_on(self, body: str, recorded: dict) -> list[str]:
+        """`check_block_coverage` over one synthetic page."""
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root)
+        (root / "page.md").write_text(textwrap.dedent(body))
+        patcher = unittest.mock.patch.multiple(
+            self.mod,
+            ROOT=root,
+            MANIFEST={"page.md": {}},
+            UNCAPTURED_BLOCKS={"page.md": recorded},
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return self.mod.check_block_coverage()
+
+    def test_a_needle_matching_two_blocks_is_its_own_error(self) -> None:
+        """One excuse cannot spread to a block nobody wrote it for.
+
+        The map keys on a substring, so a later block containing that
+        substring used to be exempted silently while the reverse audit
+        stayed satisfied by the original. That is the denylist this map
+        replaced, wearing a different hat.
+        """
+        page = """\
+            # Page
+
+            ```bash
+            curl -s 'http://127.0.0.1:9090/api/audit/chain?limit=5'
+            ```
+
+            ```json
+            {"records": []}
+            ```
+
+            ```bash
+            curl -s 'http://127.0.0.1:9090/api/audit/chain?limit=5&channel=security'
+            ```
+
+            ```json
+            {"records": []}
+            ```
+            """
+        errors = self._coverage_on(page, {"chain?limit=5": "the inline fixture"})
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("matches 2 uncaptured blocks", errors[0])
+
+    def test_one_needle_per_block_is_clean_and_a_stale_needle_is_not(self) -> None:
+        page = """\
+            # Page
+
+            ```bash
+            curl -s 'http://127.0.0.1:9090/api/audit/chain?limit=5'
+            ```
+
+            ```json
+            {"records": []}
+            ```
+            """
+        self.assertEqual(
+            self._coverage_on(page, {"chain?limit=5": "the inline fixture"}), []
+        )
+        stale = self._coverage_on(page, {"chain?limit=9": "the inline fixture"})
+        self.assertEqual(len(stale), 2, stale)
+        self.assertTrue(any("matches no uncaptured block" in error for error in stale))
+
+    def test_an_unreadable_fence_stops_the_coverage_report_on_that_page(self) -> None:
+        """Findings from a half-read page would name the wrong lines."""
+        page = """\
+            # Page
+
+            ```sh `inline`
+            echo hi
+            ```
+            """
+        errors = self._coverage_on(page, {})
+        self.assertTrue(errors)
+        self.assertIn("page.md:3: opens a code fence this parser cannot read", errors[0])
+
+    def test_every_uncaptured_block_note_names_a_manifest_page(self) -> None:
+        for rel, blocks in self.mod.UNCAPTURED_BLOCKS.items():
+            self.assertIn(
+                rel,
+                self.mod.MANIFEST,
+                f"{rel} records uncaptured blocks but is not a covered page",
+            )
+            self.assertTrue(blocks, f"{rel} has an empty UNCAPTURED_BLOCKS entry")
+            for needle, reason in blocks.items():
+                self.assertTrue(reason.strip(), f"{rel}: '{needle}' gives no reason")
 
     def test_every_manifest_section_names_a_known_stack(self) -> None:
         repo_root = Path(__file__).resolve().parent.parent.parent

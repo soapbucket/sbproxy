@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
 
+use sbproxy_security::url_redact::try_redacted_url;
 use serde::Serialize;
 
 use super::channels::{Alert, AlertChannelConfig};
@@ -91,7 +92,7 @@ pub struct AlertChannelSnapshot {
     /// Configured channel type.
     #[serde(rename = "type")]
     pub channel_type: String,
-    /// URL scheme and host only for webhook and Slack channels.
+    /// URL scheme, host, and port only for webhook and Slack channels.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     /// Whether PagerDuty has a routing key, without exposing its value.
@@ -418,13 +419,25 @@ impl AlertRuntime {
     }
 }
 
+/// The delivery target as the health surface reports it: scheme, host, and
+/// port, never the path a Slack or Teams webhook keeps its secret in.
+///
+/// This used to build `scheme://host` by hand and drop the port, so two
+/// alert receivers on one host were indistinguishable on the health page
+/// (WOR-2640). [`try_redacted_url`] keeps the port when the URL names one.
+///
+/// The `try_` form rather than `redacted_url`, because the shape of this
+/// `Option` is part of the `/api/alerts` document: `target` is
+/// `skip_serializing_if = "Option::is_none"`, and the console renders the
+/// field verbatim when it is present and falls back to "target
+/// unavailable" when it is not. A URL with no origin to render has to
+/// stay an absence here rather than becoming the string `[invalid url]`
+/// on an operator's alerts page.
 fn sanitized_target(channel: &AlertChannelConfig) -> Option<String> {
     if !matches!(channel.channel_type.as_str(), "webhook" | "slack") {
         return None;
     }
-    let url = reqwest::Url::parse(channel.url.as_deref()?).ok()?;
-    let host = url.host_str()?;
-    Some(format!("{}://{host}", url.scheme()))
+    try_redacted_url(channel.url.as_deref()?)
 }
 
 #[cfg(test)]
@@ -549,9 +562,12 @@ mod tests {
         );
 
         let initial = runtime.snapshot();
+        // The port is part of the target. This assertion used to expect
+        // it missing, which is the dropped-port bug WOR-2640 fixed rather
+        // than a property worth keeping.
         assert_eq!(
             initial.channels[0].target.as_deref(),
-            Some("https://hooks.example.com")
+            Some("https://hooks.example.com:8443")
         );
         assert_eq!(
             initial.channels[1].target.as_deref(),
@@ -608,5 +624,76 @@ mod tests {
         assert_eq!(snapshot.history[198].event, AlertHistoryEvent::Resolved);
         assert_eq!(snapshot.history[199].event, AlertHistoryEvent::Test);
         assert_eq!(snapshot.history[199].channel_index, Some(0));
+    }
+
+    /// The health surface names the channel it could not reach. Before
+    /// WOR-2640 it built `scheme://host` by hand, so a fleet running two
+    /// receivers on one host saw one target for both.
+    #[test]
+    fn snapshot_target_keeps_the_port_and_drops_the_webhook_path() {
+        let mut first = channel("webhook");
+        first.url = Some("https://alerts.test:8443/hooks/path-secret".to_string());
+        let mut second = channel("webhook");
+        second.url = Some("https://alerts.test:9443/hooks/other-secret".to_string());
+
+        let runtime = AlertRuntime::new(&EngineConfig::default(), &[first, second]);
+        let snapshot = runtime.snapshot();
+        let targets: Vec<_> = snapshot
+            .channels
+            .iter()
+            .map(|entry| entry.target.clone())
+            .collect();
+
+        assert_eq!(
+            targets,
+            vec![
+                Some("https://alerts.test:8443".to_string()),
+                Some("https://alerts.test:9443".to_string()),
+            ]
+        );
+        for target in targets.into_iter().flatten() {
+            assert!(!target.contains("secret"), "path leaked: {target}");
+        }
+    }
+
+    /// `target` is omitted rather than filled with a placeholder when
+    /// there is no origin to render. The shared redactor is total and
+    /// answers `[invalid url]` or `scheme://[no host]`, and both of those
+    /// would reach an operator's alerts page as if they were the target;
+    /// the console tests `if (channel.target)` and has its own "target
+    /// unavailable" state for the absent case.
+    ///
+    /// A `log` channel is in the fixture too, because the type guard and
+    /// the render are two separate reasons for the same answer and a test
+    /// that only covered the first would pass with the render reverted.
+    #[test]
+    fn snapshot_omits_the_target_when_there_is_no_renderable_origin() {
+        let mut scheme_less = channel("webhook");
+        scheme_less.url = Some("hooks.example.com/hooks/path-secret".to_string());
+        let mut no_authority = channel("webhook");
+        no_authority.url = Some("mailto:ops@example.test".to_string());
+        let mut unparseable = channel("slack");
+        unparseable.url = Some("hunter2".to_string());
+
+        let runtime = AlertRuntime::new(
+            &EngineConfig::default(),
+            &[scheme_less, no_authority, unparseable, channel("log")],
+        );
+        let snapshot = runtime.snapshot();
+
+        for entry in &snapshot.channels {
+            assert_eq!(
+                entry.target, None,
+                "a {} channel rendered a placeholder target",
+                entry.channel_type
+            );
+        }
+
+        // Absent from the document, not serialized as null: the field
+        // carries `skip_serializing_if` and the console branches on the
+        // key being there at all.
+        let rendered =
+            serde_json::to_string(&snapshot.channels[0]).expect("a channel snapshot serializes");
+        assert!(!rendered.contains("target"), "got: {rendered}");
     }
 }
