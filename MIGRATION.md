@@ -23,7 +23,7 @@ and later.
 - **Hot reload**. Send `SIGHUP` (or save the config file when watcher mode is on) and the new pipeline atomically swaps in.
 - **Admin endpoint**. `/api/health`, `/api/metrics`, `/api/openapi.{json,yaml}` work the same way.
 - **CEL and Lua scripts**. Existing CEL expressions and Lua transform scripts run unchanged on the Rust extension engine.
-- **Provider catalog**. The 90+ AI provider catalog is the same data file; existing AI routes continue to resolve providers by the same names.
+- **Provider catalog**. The 72-provider AI catalog is the same data file; existing AI routes continue to resolve providers by the same names.
 
 ## What's new in v1.0
 
