@@ -387,6 +387,8 @@ policies:
 
 `agent_id` on a tier matches against the resolver's verdict. The first tier whose route pattern AND agent id both match wins. A tier without `agent_id` matches every agent. `expected_keyids` lets a verified Web Bot Auth signature classify the request even when the User-Agent string is missing or spoofed.
 
+Note the shape of every `expected_user_agent_pattern` above, because the proxy compiles the pattern exactly as you wrote it and adds nothing. The leading `(?i)` is yours: without it the pattern is case-sensitive, `gptbot/2` does not match `GPTBot/\d`, and the request is priced as `unknown` instead. The proxy warns once per such entry at load. The `\b` and the `/\d` are yours too: the match is a substring search, not an anchored one, which is what makes a pattern work against a compound header like `Mozilla/5.0 (compatible; GPTBot/1.2; +https://openai.com/gptbot)`. A bare `MyPartnerBot` with no delimiter therefore also matches `Mozilla/5.0 (compatible; MyPartnerBot-imposter)` and hands that client your partner's tier, so put a boundary the impersonator cannot append after your name. A `User-Agent` is unauthenticated in both directions in any case: `expected_keyids` and `expected_reverse_dns_suffixes` are what verify a crawler, and the UA pattern only classifies one.
+
 The default agent classes ship embedded in the binary. Use `catalog: inline` when you want `sb.yml` to provide a complete catalog with your own `expected_keyids`; use `catalog: builtin` or omit the block to keep the embedded catalog.
 
 ## Observability
