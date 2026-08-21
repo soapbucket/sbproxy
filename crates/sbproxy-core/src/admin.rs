@@ -396,6 +396,13 @@ pub struct RequestLogEntry {
     /// widened across zones. Absent when the stage did not engage.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zone_locality: Option<String>,
+    /// Why the strategy picked that target, for strategies that decide
+    /// per request (WOR-2564). `semantic_route` reports the matched
+    /// deployment, the winning exemplar's ordinal, and the cosine score,
+    /// or the near-miss that sent the request to the fallback. Bounded
+    /// and operator-derived; never exemplar text or caller input.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_detail: Option<String>,
     /// AI provider that served the request, when the AI gateway did.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
@@ -7252,6 +7259,7 @@ mod tests {
             failover_trigger: Some("content_policy".to_string()),
             load_balancer_strategy: Some("lowest_latency".to_string()),
             load_balancer_target: Some("anthropic".to_string()),
+            routing_detail: Some("exemplar 1 at 0.83 (floor 0.75)".to_string()),
             ..Default::default()
         };
 
@@ -7267,6 +7275,9 @@ mod tests {
         assert_eq!(value["failover_trigger"], "content_policy");
         assert_eq!(value["load_balancer_strategy"], "lowest_latency");
         assert_eq!(value["load_balancer_target"], "anthropic");
+        // WOR-2564: the routing-decisions row carries why the strategy
+        // picked that target, not only which target it picked.
+        assert_eq!(value["routing_detail"], "exemplar 1 at 0.83 (floor 0.75)");
     }
 
     #[test]

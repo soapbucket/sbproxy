@@ -374,6 +374,7 @@ function detailFields(request: RequestLog): DetailField[] {
   push("Selected target", request.load_balancer_target);
   // WOR-2328: whether selection stayed in the proxy's own zone.
   push("Zone locality", request.zone_locality);
+  push("Routing detail", request.routing_detail);
   push("Guardrail", request.guardrail_category);
   push("Guardrail action", request.guardrail_action);
   // WOR-2093 key accountability.

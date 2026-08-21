@@ -470,6 +470,99 @@ warm-up instead of waiting for a hard threshold. The scoring formula,
 confidence schedule, and feedback lifetime are in
 [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md).
 
+### semantic_route
+
+Routes on what the request means. Each deployment declares its specialty as
+exemplar prompts (or precomputed embedding centroids); the proxy embeds the
+request's final user message once, cosine-matches it against the exemplar
+vectors, and pins the best-scoring deployment when the score clears
+`min_similarity`. Distinct from `prefix_affinity`, which routes byte-stable
+prompt prefixes back to the worker holding their KV cache: prefix affinity
+optimizes cache reuse, semantic routing sends a newly worded request to the
+pool that specializes in its topic.
+
+```mermaid
+flowchart TD
+    A[Request arrives] --> B{Final user message present?}
+    B -->|no| F[Fallback deployment]
+    B -->|yes| C["Embed the message
+(exemplar vectors are cached from first use)"]
+    C -->|embedder unavailable| F
+    C -->|vector| D["Cosine-match against every
+declared exemplar vector"]
+    D --> E{"Best score >= min_similarity?"}
+    E -->|yes| G[Best-matching deployment]
+    E -->|no| F
+    F --> H[Dispatch]
+    G --> H
+```
+
+```yaml
+routing:
+  strategy: semantic_route
+  min_similarity: 0.75
+  fallback: chat-pool
+  routes:
+    - deployment: code-pool
+      exemplars:
+        - "Write a function that parses JSON and handles errors"
+        - "Review this pull request and point out bugs"
+    - deployment: chat-pool
+      exemplars:
+        - "Have a friendly conversation about everyday topics"
+  source: openai
+  openai:
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_API_KEY}
+    model: text-embedding-3-small
+```
+
+`routes` declares up to 64 deployments with up to 64 exemplars each. A rule
+may carry a precomputed `centroid` vector instead of (or alongside) exemplar
+texts; centroids never trigger an embedding call. A rule's score is the best
+cosine similarity over all of its vectors, and the best-scoring rule wins.
+Score ties keep the earliest declared exemplar, so decisions are
+deterministic.
+
+The embedding source reuses the semantic cache's source shapes: `provider`
+(an `embedding: {provider, model}` block naming one of the origin's
+providers), `sidecar` (the local classifier sidecar, no egress), or `openai`
+(a standalone OpenAI-compatible `/v1/embeddings` endpoint). An embedding
+source is required: a `semantic_route` block without one fails config
+compile with a named error, the same refusal posture `token_rate` gets.
+Route deployments, the `fallback`, and `embedding.provider` must all name
+configured providers or the config is refused, the way cascade tiers are.
+
+Exemplar texts embed once per process on first use and the vectors are
+cached, so the steady-state cost is one embedding call per request, bounded
+by the embedding source's own timeout. Every non-match is a fallback, never
+a failure: a below-floor score, a request with no user message, and an
+unavailable embedder all route to the declared `fallback` deployment (or
+round-robin across the eligible set when none is declared). The request is
+never failed or hung on this strategy's account.
+
+Each decision ticks
+`sbproxy_ai_semantic_route_decisions_total{outcome}` (`matched`,
+`below_floor`, `no_prompt`, `embed_error`, `target_ineligible`); the
+fallback outcomes also tick
+`sbproxy_ai_routing_fallbacks_total{strategy="semantic_route"}`, so an
+embedder outage is a visible fallback rate rather than silence.
+`sbproxy_ai_semantic_route_similarity{provider}` records the best cosine
+score of every scored request, matched and below-floor both, which is the
+histogram to consult when tuning the floor. The score is the observation,
+never a label.
+
+Per-request, the decision lands on the admin request log as
+`routing_detail` (the console renders it as **Routing detail** beside the
+strategy and the selected target), which is the durable record. The
+matching `ai.semantic_route.route` and `ai.semantic_route.fallback` log
+events carry the same deployment, exemplar ordinal, and score, at `debug`
+for the two expected outcomes and `warn` for an ineligible target or an
+unavailable embedder.
+
+See [examples/semantic-routing](../examples/semantic-routing/) for a
+runnable two-pool config with a below-floor fallback walkthrough.
+
 ## Routing policy
 
 The strategies above are a fixed menu. `ai_routing_policy` lets you write

@@ -7852,6 +7852,7 @@ impl ProxyHttp for SbProxy {
                 load_balancer_strategy: ctx.admin_load_balancer_strategy.clone(),
                 load_balancer_target: ctx.admin_load_balancer_target.clone(),
                 zone_locality: ctx.admin_zone_locality.map(str::to_string),
+                routing_detail: ctx.admin_routing_detail.clone(),
                 provider: ctx.ai_provider.clone(),
                 model: ctx.ai_model.clone(),
                 tokens_in: ctx.ai_tokens_in,

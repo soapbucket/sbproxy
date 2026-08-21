@@ -1,6 +1,7 @@
 //! Routing strategies for selecting AI providers.
 
 mod peak_ewma;
+pub mod semantic_route;
 
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -130,6 +131,21 @@ pub enum RoutingStrategy {
     /// report remaining capacity sort first. Unknown/stale signals sort
     /// last and never invent a reset time.
     ResetAware,
+    /// Semantic (embedding-similarity) routing (WOR-2564): the operator
+    /// declares exemplar prompts or embedding centroids per deployment,
+    /// the dispatcher embeds the request's final user message through the
+    /// configured embedding source, and the best cosine match above
+    /// `min_similarity` pins that deployment. Below-floor scores, absent
+    /// prompts, and embedder failures all fall to the declared `fallback`
+    /// deployment (or round-robin), never to an error. Routes on meaning,
+    /// where `prefix_affinity` routes on byte-stable prefixes for
+    /// KV-cache reuse.
+    ///
+    /// Boxed: the config carries the declared routes and their exemplar
+    /// texts, and inlining it would grow every `RoutingStrategy` value in
+    /// the process from 56 bytes to 328, including the eighteen
+    /// strategies that declare nothing.
+    SemanticRoute(Box<semantic_route::SemanticRouteConfig>),
 }
 
 /// Default half-life for Peak EWMA latency decay.
@@ -200,6 +216,14 @@ impl<'de> Deserialize<'de> for RoutingStrategy {
         if value.as_str() == Some("prefix_affinity") {
             return Ok(Self::PrefixAffinity(PrefixAffinityConfig::default()));
         }
+        if value.as_str() == Some("semantic_route") {
+            return Err(D::Error::custom(
+                "routing strategy `semantic_route` requires a routing object carrying `routes` \
+                 and an embedding source; the flat string form declares no specialties to \
+                 route on. Write `routing: {strategy: semantic_route, routes: [...], \
+                 embedding: {provider: ..., model: ...}}`",
+            ));
+        }
 
         #[derive(Deserialize)]
         #[serde(rename_all = "snake_case")]
@@ -222,6 +246,7 @@ impl<'de> Deserialize<'de> for RoutingStrategy {
             OutcomeAware,
             Headroom,
             ResetAware,
+            SemanticRoute(Box<semantic_route::SemanticRouteConfig>),
         }
 
         let wire = serde_json::from_value::<Wire>(value).map_err(D::Error::custom)?;
@@ -244,6 +269,7 @@ impl<'de> Deserialize<'de> for RoutingStrategy {
             Wire::OutcomeAware => Self::OutcomeAware,
             Wire::Headroom => Self::Headroom,
             Wire::ResetAware => Self::ResetAware,
+            Wire::SemanticRoute(config) => Self::SemanticRoute(config),
         })
     }
 }
@@ -1268,6 +1294,18 @@ impl Router {
                 clear_fallback();
                 self.select_reset_aware(enabled)
             }
+            RoutingStrategy::SemanticRoute(_) => {
+                // The synchronous select path has no prompt to embed, so
+                // this arm is the strategy's declared secondary: an
+                // intentional round-robin over the eligible set, marked
+                // as a missing-signal fallback the way PrefixAffinity and
+                // Sticky mark theirs. The dispatcher's async path is
+                // where the embedding, the floor, and the declared
+                // `fallback` deployment apply.
+                mark_missing_signal();
+                let counter = self.counter.fetch_add(1, Ordering::Relaxed);
+                Some(enabled[counter as usize % enabled.len()].0)
+            }
         }
     }
 
@@ -1491,6 +1529,7 @@ impl Router {
             RoutingStrategy::OutcomeAware => "outcome_aware",
             RoutingStrategy::Headroom => "headroom",
             RoutingStrategy::ResetAware => "reset_aware",
+            RoutingStrategy::SemanticRoute(_) => "semantic_route",
         }
     }
 
@@ -1520,6 +1559,16 @@ impl Router {
     pub fn cost_quality_config(&self) -> Option<&crate::cost_quality::CostQualityConfig> {
         match &self.strategy {
             RoutingStrategy::CostQuality(cfg) => Some(cfg),
+            _ => None,
+        }
+    }
+
+    /// Borrow the semantic-route config when the configured strategy is
+    /// [`RoutingStrategy::SemanticRoute`] (WOR-2564). The dispatcher uses
+    /// this to run the embed-and-match step before provider ordering.
+    pub fn semantic_route_config(&self) -> Option<&semantic_route::SemanticRouteConfig> {
+        match &self.strategy {
+            RoutingStrategy::SemanticRoute(cfg) => Some(cfg.as_ref()),
             _ => None,
         }
     }
@@ -3359,6 +3408,44 @@ mod tests {
             counts,
             [10, 10, 10],
             "PrefixAffinity without a prefix must explicitly round-robin on the filtered set"
+        );
+        assert_eq!(
+            router.last_filtered_fallback(),
+            Some(FilteredSelectionFallback::RoundRobinMissingSignal)
+        );
+    }
+
+    #[test]
+    fn semantic_route_without_a_prompt_signal_round_robins_and_records_it() {
+        // The synchronous select path has no prompt to embed, so the
+        // SemanticRoute arm is a declared missing-signal round-robin,
+        // recorded per the FilteredSelectionFallback contract.
+        let providers = vec![
+            make_provider("a", 1, None, true),
+            make_provider("b", 1, None, true),
+        ];
+        let config: semantic_route::SemanticRouteConfig =
+            serde_json::from_value(serde_json::json!({
+                "routes": [{"deployment": "a", "exemplars": ["code review"]}],
+                "embedding": {"provider": "a", "model": "text-embedding-3-small"}
+            }))
+            .expect("semantic_route fixture parses");
+        let router = Router::new(
+            RoutingStrategy::SemanticRoute(Box::new(config)),
+            providers.len(),
+        );
+        let allowed = vec!["a".to_string(), "b".to_string()];
+        let mut counts = [0u32; 2];
+        for _ in 0..10 {
+            let pick = router
+                .select_with_allowed(&providers, &allowed)
+                .expect("eligible");
+            counts[pick] += 1;
+        }
+        assert_eq!(
+            counts,
+            [5, 5],
+            "SemanticRoute on the sync path must explicitly round-robin the filtered set"
         );
         assert_eq!(
             router.last_filtered_fallback(),

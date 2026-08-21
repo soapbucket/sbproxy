@@ -3387,6 +3387,25 @@ pub(super) fn extract_semantic_prompt(body: &serde_json::Value) -> SemanticPromp
     }
 }
 
+/// The semantic query text alone, with no request-context digest
+/// (WOR-2564).
+///
+/// [`extract_semantic_prompt`] additionally hashes the whole canonical
+/// request so the semantic cache can fence reuse across differing
+/// instructions, history, tools, and assets. The `semantic_route`
+/// routing strategy needs only the text: it scores the query against
+/// declared exemplar vectors and never keys a cache with it, so paying
+/// for that digest on every request of a `semantic_route` origin would
+/// be a hot-path cost with no reader.
+///
+/// Both call the same slot extractor, so the text a routing decision
+/// scores is the text the cache would have embedded, and the two cannot
+/// drift into disagreeing about which turn is the query.
+pub(super) fn semantic_query_text(body: &serde_json::Value) -> String {
+    let mut normalized = body.clone();
+    replace_semantic_query_slot(&mut normalized)
+}
+
 /// Replace the semantic query slot with the sentinel and return its text.
 ///
 /// Returns an empty string, and leaves `body` untouched, when no single
@@ -3899,6 +3918,50 @@ mod semantic_identity_tests {
         assert_eq!(
             first.request_context_digest, second.request_context_digest,
             "the context digest must be built from the sentinel, never the query"
+        );
+    }
+
+    #[test]
+    fn semantic_query_text_agrees_with_the_cache_extractor_on_every_body_shape() {
+        // WOR-2564: `semantic_route` scores this text and the semantic
+        // cache embeds that one. Two extractors that disagree about
+        // which turn is the query would route on one sentence and cache
+        // another, so the routing path reuses the cache path's slot
+        // logic and this pins the two together across every shape the
+        // slot extractor recognizes: chat messages, an Anthropic or
+        // Responses body after the inbound shim normalizes it, a
+        // Responses `input`, a legacy `prompt`, and an ambiguous batch.
+        for body in [
+            serde_json::json!({
+                "model": "gpt-4o-mini",
+                "messages": [
+                    {"role": "system", "content": "be terse"},
+                    {"role": "user", "content": "first question"},
+                    {"role": "assistant", "content": "an answer"},
+                    {"role": "user", "content": "the question that routes"}
+                ]
+            }),
+            serde_json::json!({"input": "a responses-shaped query"}),
+            serde_json::json!({"prompt": "a legacy completions query"}),
+            serde_json::json!({
+                "requests": [{"prompt": "batch one"}, {"prompt": "batch two"}]
+            }),
+        ] {
+            assert_eq!(
+                semantic_query_text(&body),
+                extract_semantic_prompt(&body).text,
+                "the routing and cache extractors disagreed on {body}"
+            );
+        }
+        assert_eq!(
+            semantic_query_text(&serde_json::json!({
+                "messages": [
+                    {"role": "user", "content": "first question"},
+                    {"role": "user", "content": "the question that routes"}
+                ]
+            })),
+            "the question that routes",
+            "the final user turn is what a routing decision scores"
         );
     }
 

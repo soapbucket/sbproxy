@@ -1045,6 +1045,19 @@ where
         return Ok(RoutingStrategy::PrefixAffinity(config));
     }
 
+    // WOR-2564: semantic routing carries routes / min_similarity /
+    // fallback / an embedding-source block alongside the discriminator.
+    // Validation runs here so a strategy with nothing to embed with or
+    // nothing to route to refuses the config at load.
+    if strategy_name == "semantic_route" {
+        let mut fields = obj.clone();
+        fields.remove("strategy");
+        let config: crate::routing::semantic_route::SemanticRouteConfig =
+            serde_json::from_value(serde_json::Value::Object(fields)).map_err(Error::custom)?;
+        config.validate().map_err(Error::custom)?;
+        return Ok(RoutingStrategy::SemanticRoute(Box::new(config)));
+    }
+
     // WOR-797: cost/quality routing carries cheap_provider /
     // frontier_provider / cost_threshold alongside the discriminator.
     // `learned` is accepted as an alias.
@@ -1331,6 +1344,39 @@ impl AiHandlerConfig {
                         "ai routing cascade tier {index} names provider {:?}, \
                          which is not configured",
                         tier.provider_id
+                    );
+                }
+            }
+        }
+        // WOR-2564: the same literal, checkable discipline for semantic
+        // routing. A route pinned to a deployment nobody configured, a
+        // fallback nothing can serve, or an embedding provider outside
+        // `providers` would each surface as a silent per-request fallback
+        // at runtime; each is a config-compile refusal instead.
+        if let RoutingStrategy::SemanticRoute(semantic) = &config.routing {
+            for (index, rule) in semantic.routes.iter().enumerate() {
+                if !provider_names.contains(rule.deployment.as_str()) {
+                    anyhow::bail!(
+                        "ai semantic_route route {index} names deployment {:?}, \
+                         which is not a configured provider",
+                        rule.deployment
+                    );
+                }
+            }
+            if let Some(fallback) = semantic.fallback.as_deref() {
+                if !provider_names.contains(fallback) {
+                    anyhow::bail!(
+                        "ai semantic_route fallback names provider {fallback:?}, \
+                         which is not configured"
+                    );
+                }
+            }
+            if let Some(embedding) = semantic.embedding.as_ref() {
+                if !provider_names.contains(embedding.provider.as_str()) {
+                    anyhow::bail!(
+                        "ai semantic_route embedding provider {:?} is not configured; \
+                         `source: provider` must name one of this origin's providers",
+                        embedding.provider
                     );
                 }
             }
@@ -2210,6 +2256,174 @@ mod tests {
             "routing": "least_token_usage",
         }))
         .expect("the strategy token_rate degenerates into stays available");
+    }
+
+    /// One valid `semantic_route` block, shared by the registration and
+    /// refusal tests so each refusal test mutates exactly one thing.
+    fn semantic_route_config(routing: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "providers": [
+                {"name": "code-pool", "api_key": "k"},
+                {"name": "chat-pool", "api_key": "k"},
+                {"name": "embedder", "api_key": "k"}
+            ],
+            "routing": routing,
+        })
+    }
+
+    #[test]
+    fn semantic_route_registers_as_a_named_strategy() {
+        let config = AiHandlerConfig::from_config(semantic_route_config(serde_json::json!({
+            "strategy": "semantic_route",
+            "min_similarity": 0.7,
+            "fallback": "chat-pool",
+            "routes": [
+                {"deployment": "code-pool", "exemplars": ["Write a Rust function that parses JSON"]},
+                {"deployment": "chat-pool", "exemplars": ["Chat about everyday topics"]}
+            ],
+            "embedding": {"provider": "embedder", "model": "text-embedding-3-small"}
+        })))
+        .expect("semantic_route with routes and an embedding source compiles");
+        assert_eq!(config.router().strategy_name(), "semantic_route");
+    }
+
+    #[test]
+    fn semantic_route_without_an_embedding_source_is_refused_at_config_compile() {
+        let error = AiHandlerConfig::from_config(semantic_route_config(serde_json::json!({
+            "strategy": "semantic_route",
+            "routes": [
+                {"deployment": "code-pool", "exemplars": ["Write a Rust function that parses JSON"]}
+            ]
+        })))
+        .expect_err("no embedding source must fail config compile, not surprise at runtime");
+        let message = error.to_string();
+        assert!(
+            message.contains("semantic_route") && message.contains("embedding"),
+            "the error has to name the strategy and the missing embedding block: {message}"
+        );
+    }
+
+    #[test]
+    fn semantic_route_naming_an_unknown_deployment_is_refused() {
+        let error = AiHandlerConfig::from_config(semantic_route_config(serde_json::json!({
+            "strategy": "semantic_route",
+            "routes": [
+                {"deployment": "no-such-pool", "exemplars": ["Write a Rust function"]}
+            ],
+            "embedding": {"provider": "embedder", "model": "text-embedding-3-small"}
+        })))
+        .expect_err("a route naming an unconfigured provider must be refused like a cascade tier");
+        let message = error.to_string();
+        assert!(
+            message.contains("no-such-pool"),
+            "the error has to name the offending deployment: {message}"
+        );
+    }
+
+    #[test]
+    fn semantic_route_naming_an_unknown_fallback_is_refused() {
+        let error = AiHandlerConfig::from_config(semantic_route_config(serde_json::json!({
+            "strategy": "semantic_route",
+            "fallback": "no-such-pool",
+            "routes": [
+                {"deployment": "code-pool", "exemplars": ["Write a Rust function"]}
+            ],
+            "embedding": {"provider": "embedder", "model": "text-embedding-3-small"}
+        })))
+        .expect_err("a fallback naming an unconfigured provider must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("no-such-pool"),
+            "the error has to name the offending fallback: {message}"
+        );
+    }
+
+    #[test]
+    fn semantic_route_embedding_provider_must_be_configured() {
+        let error = AiHandlerConfig::from_config(semantic_route_config(serde_json::json!({
+            "strategy": "semantic_route",
+            "routes": [
+                {"deployment": "code-pool", "exemplars": ["Write a Rust function"]}
+            ],
+            "embedding": {"provider": "no-such-embedder", "model": "text-embedding-3-small"}
+        })))
+        .expect_err("an embedding provider outside `providers` must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("no-such-embedder"),
+            "the error has to name the offending embedding provider: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exemplars_embed_once_across_the_router_lookups_a_request_makes() {
+        // WOR-2564's cost claim lives at this seam, not inside `decide`.
+        // The dispatcher reaches the strategy through
+        // `AiHandlerConfig::router()` on every request, so if that handed
+        // back a freshly cloned config the exemplar cache would be cold
+        // every time and the "config-time cost, not a per-request one"
+        // promise would be false while `decide`'s own cache test stayed
+        // green. Two lookups, two decisions, one exemplar build.
+        let config = AiHandlerConfig::from_config(semantic_route_config(serde_json::json!({
+            "strategy": "semantic_route",
+            "min_similarity": 0.5,
+            "routes": [
+                {"deployment": "code-pool", "exemplars": ["one", "two"]},
+                {"deployment": "chat-pool", "exemplars": ["three"]}
+            ],
+            "embedding": {"provider": "embedder", "model": "text-embedding-3-small"}
+        })))
+        .expect("semantic_route compiles");
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let embed = |_text: String| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            async { Ok(vec![1.0_f32, 0.0]) }
+        };
+
+        let first_lookup = config.router();
+        let semantic = first_lookup
+            .semantic_route_config()
+            .expect("the compiled strategy is semantic_route");
+        crate::routing::semantic_route::decide(semantic, "a request", &embed).await;
+        // Three exemplars plus this request's own prompt.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 4);
+        drop(first_lookup);
+
+        let second_lookup = config.router();
+        let semantic = second_lookup
+            .semantic_route_config()
+            .expect("the compiled strategy is semantic_route");
+        crate::routing::semantic_route::decide(semantic, "another request", &embed).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            5,
+            "a second request must cost one prompt embed, not a whole exemplar rebuild"
+        );
+    }
+
+    #[test]
+    fn the_shipped_semantic_routing_example_compiles_at_this_layer() {
+        // compile_config leaves the ai_proxy action opaque, so the
+        // sbproxy-config example sweep cannot prove the routing block.
+        // This layer owns it; parse the published example directly.
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let example = manifest
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crates/sbproxy-ai sits two levels under the workspace root")
+            .join("examples/semantic-routing/sb.yml");
+        let text = std::fs::read_to_string(&example)
+            .unwrap_or_else(|error| panic!("read {}: {error}", example.display()));
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&text).expect("example parses");
+        let action = parsed
+            .get("origins")
+            .and_then(|origins| origins.get("ai.local"))
+            .and_then(|origin| origin.get("action"))
+            .expect("example declares the ai.local action");
+        let action_json = serde_json::to_value(action).expect("action converts to JSON");
+        let config = AiHandlerConfig::from_config(action_json)
+            .expect("the published semantic-routing example must compile");
+        assert_eq!(config.router().strategy_name(), "semantic_route");
     }
 
     #[test]

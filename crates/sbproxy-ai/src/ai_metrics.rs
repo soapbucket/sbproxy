@@ -287,6 +287,45 @@ static AI_PREFIX_AFFINITY_EVICTIONS: LazyLock<CounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Semantic-route selections by closed decision outcome (WOR-2564).
+/// `matched` pinned a deployment; every other outcome is a fallback
+/// disposition, mirrored on `sbproxy_ai_routing_fallbacks_total`.
+///
+/// Held as an `Option` rather than unwrapped like the older families
+/// above: a registration error is a duplicate name or a malformed label
+/// set, and losing one metric family is not worth ending the process a
+/// request is running through. The recorder below no-ops when the family
+/// is absent. The unwrap ratchet
+/// (`scripts/check-unwrap-ratchet.sh`) counts the older form; this is the
+/// shape new families take.
+static AI_SEMANTIC_ROUTE_DECISIONS: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_semantic_route_decisions_total",
+            "Semantic-route selections by decision outcome"
+        ),
+        &["outcome"]
+    )
+    .ok()
+});
+
+/// Best exemplar cosine similarity per scored semantic-route request
+/// (WOR-2564). Recorded on matched and below-floor outcomes both, so an
+/// operator tuning `min_similarity` can see the near-miss distribution
+/// and not just the winners. Labeled by the best-scoring deployment; the
+/// score itself is the observation, never a label.
+static AI_SEMANTIC_ROUTE_SIMILARITY: LazyLock<Option<HistogramVec>> = LazyLock::new(|| {
+    register_histogram_vec!(
+        HistogramOpts::new(
+            "sbproxy_ai_semantic_route_similarity",
+            "Best exemplar cosine similarity of scored semantic-route requests"
+        )
+        .buckets(vec![0.3, 0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0]),
+        &["provider"]
+    )
+    .ok()
+});
+
 /// Distributed quota-pool admissions allowed during backend unavailability.
 ///
 /// Pool names are operator-declared config values. Virtual-key identities are
@@ -944,11 +983,15 @@ pub fn record_lb_decision(strategy: &str, provider: &str) {
 
 /// Record an intentional routing fallback.
 ///
-/// Reasons are a closed vocabulary shared by the outcome-aware and
-/// prefix-affinity strategies.
+/// Reasons are a closed vocabulary shared by the outcome-aware,
+/// prefix-affinity, and semantic-route strategies. `below_floor`,
+/// `embed_error`, and `target_ineligible` are the semantic-route
+/// dispositions (WOR-2564); an unavailable embedder is deliberately a
+/// counted fallback here, never a failed request.
 pub fn record_routing_fallback(strategy: &str, reason: &str) {
     let reason = match reason {
-        "warmup" | "missing_signal" | "no_holder" | "no_feedback" => reason,
+        "warmup" | "missing_signal" | "no_holder" | "no_feedback" | "below_floor"
+        | "embed_error" | "target_ineligible" => reason,
         _ => "unknown",
     };
     AI_ROUTING_FALLBACKS
@@ -989,6 +1032,30 @@ pub fn record_prefix_affinity_eviction(reason: &str) {
     AI_PREFIX_AFFINITY_EVICTIONS
         .with_label_values(&[reason])
         .inc();
+}
+
+/// Record one semantic-route decision by closed outcome (WOR-2564):
+/// `matched`, `below_floor`, `no_prompt`, `embed_error`, or
+/// `target_ineligible`.
+pub fn record_semantic_route_decision(outcome: &str) {
+    let outcome = match outcome {
+        "matched" | "below_floor" | "no_prompt" | "embed_error" | "target_ineligible" => outcome,
+        _ => "unknown",
+    };
+    if let Some(decisions) = AI_SEMANTIC_ROUTE_DECISIONS.as_ref() {
+        decisions.with_label_values(&[outcome]).inc();
+    }
+}
+
+/// Record the best exemplar cosine similarity of one scored
+/// semantic-route request, labeled by the best-scoring deployment
+/// (WOR-2564).
+pub fn record_semantic_route_similarity(provider: &str, score: f32) {
+    if let Some(similarity) = AI_SEMANTIC_ROUTE_SIMILARITY.as_ref() {
+        similarity
+            .with_label_values(&[provider])
+            .observe(f64::from(score));
+    }
 }
 
 /// Record an admission that bypassed a failed shared quota backend.
@@ -2667,6 +2734,10 @@ mod tests {
         record_prefix_affinity_decision("operator-controlled");
         record_prefix_affinity_eviction("ttl");
         record_prefix_affinity_eviction("operator-controlled");
+        record_routing_fallback("semantic_route", "embed_error");
+        record_semantic_route_decision("matched");
+        record_semantic_route_decision("operator-controlled");
+        record_semantic_route_similarity("code-pool", 0.91);
         record_quota_pool_fail_open("shared-upstream");
         record_quota_pool_overshare("shared-upstream");
 
@@ -2683,6 +2754,14 @@ mod tests {
             (
                 "sbproxy_ai_prefix_affinity_evictions_total",
                 vec![("reason", "ttl")],
+            ),
+            (
+                "sbproxy_ai_routing_fallbacks_total",
+                vec![("strategy", "semantic_route"), ("reason", "embed_error")],
+            ),
+            (
+                "sbproxy_ai_semantic_route_decisions_total",
+                vec![("outcome", "matched")],
             ),
             (
                 "sbproxy_ai_quota_pool_fail_open_total",
@@ -2715,6 +2794,7 @@ mod tests {
             ("sbproxy_ai_routing_fallbacks_total", "reason"),
             ("sbproxy_ai_prefix_affinity_decisions_total", "outcome"),
             ("sbproxy_ai_prefix_affinity_evictions_total", "reason"),
+            ("sbproxy_ai_semantic_route_decisions_total", "outcome"),
         ] {
             let family = families
                 .iter()

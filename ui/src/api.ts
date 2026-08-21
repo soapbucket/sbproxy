@@ -2036,6 +2036,8 @@ export interface RequestLog {
    *  same-zone target was healthy). Absent when the stage did not
    *  engage. */
   zone_locality?: "local" | "spilled" | string;
+  /** Why the strategy picked that target, when it decides per request. */
+  routing_detail?: string;
   provider?: string;
   model?: string;
   tokens_in?: number;

@@ -463,6 +463,15 @@ pub struct RequestContext {
     /// selection widened across zones, `None` when the locality stage
     /// did not engage.
     pub admin_zone_locality: Option<&'static str>,
+    /// Why the strategy chose that target, when the strategy has a
+    /// per-request reason worth showing (WOR-2564). `semantic_route`
+    /// fills it with the matched deployment, the winning exemplar's
+    /// ordinal, and the cosine score, so the admin routing-decisions row
+    /// shows which declared specialty fired rather than only the
+    /// provider it landed on. Bounded and operator-derived: a provider
+    /// name, a small integer, and a score. Never exemplar text, never a
+    /// client-supplied string.
+    pub admin_routing_detail: Option<String>,
 
     // --- Concurrent limit guards ---
     /// Permits issued by `ConcurrentLimitPolicy` for this request. The
@@ -1774,6 +1783,7 @@ impl RequestContext {
             ai_route_attempted: Vec::new(),
             ai_route_detail: serde_json::Map::new(),
             admin_zone_locality: None,
+            admin_routing_detail: None,
             concurrent_limit_guards: Vec::new(),
             concurrent_limit_denial_body: None,
             agent_budget_guards: Vec::new(),
