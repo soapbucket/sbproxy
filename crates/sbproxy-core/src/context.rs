@@ -312,7 +312,7 @@ impl PaymentResponse {
 /// the `openapi_validation` enforcer (WOR-2565).
 ///
 /// Pairs the OpenAPI path template that identified the operation (used
-/// as the `rule` label on `sbproxy_deprecated_requests_total`) with the
+/// as the `route` label on `sbproxy_deprecated_requests_total`) with the
 /// policy's compiled `deprecation_headers:` values. The `Arc` is shared
 /// with the compiled policy, so staging it per request is a pointer
 /// clone.

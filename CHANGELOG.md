@@ -116,11 +116,104 @@ the next version cut.
   read, so it survives restarts and needs no sweeper. Read responses
   and the console's Keys page show the base budget, the override with
   its countdown and grantor, and the enforced `effective_budget`;
-  `DELETE` on the same path ends a raise early. Grant and expiry both
-  land in the `key_audit` trail (`budget_override_grant` naming the
-  operator, `budget_override_expire`). See the temp-override section
+  `DELETE` on the same path ends a raise early. Three points in the
+  raise's life land in the `key_audit` trail: `budget_override_grant`
+  and `budget_override_clear` name the operator who granted or ended
+  one, and `budget_override_expire` is the unattributed, time-driven
+  end. All three routes are counted on
+  `sbproxy_key_operations_total{operation, outcome}` alongside the
+  other key mutations. See the temp-override section
   of [docs/ai-gateway.md](docs/ai-gateway.md) and
   [examples/temp-budget-override/](examples/temp-budget-override/).
+
+- **First-class API deprecation: RFC 9745 `Deprecation`, RFC 8594
+  `Sunset`, and the successor and documentation `Link` relations.** A
+  `deprecation:` block on an origin or on a single forward rule stamps
+  the standard announcement headers onto the responses that rule
+  matches. Per-path deprecation, the normal case where `/v1/*` is going
+  away and `/v2/*` is not, was not expressible before: response
+  modifiers hang only off the origin, so it was the whole origin or
+  nothing. `deprecated:` takes a date or an RFC 3339 timestamp and
+  emits `Deprecation: @<unix>`, the structured-field Date the RFC
+  requires; a bare `true` marks the route for spec emission and metrics
+  but emits no header, because the draft-era literal `true` did not
+  survive into the final RFC. `sunset:` emits the HTTP-date form, and a
+  sunset earlier than the deprecation instant is refused at config
+  compile rather than shipped as a contradiction. `successor:` and
+  `link:` emit the `successor-version` and `deprecation` relations,
+  appended so an upstream's own `Link` headers survive.
+  `after_sunset: gone` retires the route with `410 Gone` and a JSON
+  body naming the successor once the instant passes; the default
+  `serve` keeps proxying, so a forgotten config never takes an API down
+  by surprise. That refusal is enforcement, so it also emits a
+  `policy_violation` audit record with `event_type: api_deprecation`
+  carrying the tenant and the accountable key id.
+  `openapi_validation.deprecation_headers:` (off by default) drives the
+  same emission from operations a loaded spec marks `deprecated: true`,
+  and `/.well-known/openapi.json` marks config-deprecated operations
+  `deprecated: true` with `x-sbproxy-sunset` and `x-sbproxy-successor`
+  extensions, so the published spec and the wire headers cannot
+  disagree. `sbproxy_deprecated_requests_total{origin, route,
+  past_sunset, outcome}` is the migration tracker: who is still
+  calling, against which announcement, and whether they are being
+  served or refused. See
+  [docs/api-gateway.md](docs/api-gateway.md#deprecating-endpoints) and
+  [examples/api-deprecation/](examples/api-deprecation/).
+
+- **`body_threat_protection`: structural JSON and XML request-body
+  limits.** A new `policies:` entry that refuses bodies by shape rather
+  than by content: a thousand levels of nesting to blow a recursive
+  parser's stack, a million-key object to soak CPU in hash insertion,
+  an XML DTD whose entities expand into gigabytes. JSON limits are
+  `max_depth` (64), `max_object_entries` (10 000), `max_array_items`
+  (10 000), `max_key_length` (1 024 bytes), `max_string_length` (128
+  KiB), and `max_containers` (50 000, objects plus arrays); XML limits
+  are `max_depth` (64), `max_elements` (10 000), and `max_attributes`
+  (256). Any single limit set to `0` disables that one check. A
+  `<!DOCTYPE` declaration is refused unconditionally and is not
+  configurable, which closes the entity-expansion class by construction
+  rather than by pattern. The JSON scanner is iterative with an
+  explicit stack and a hard 10 000-depth ceiling that holds even when
+  the operator disables the depth check, so the attack the policy
+  exists to stop cannot overflow the scanner itself. A violation
+  answers `400` naming the limit and the observed and allowed numbers,
+  and never echoes body content into the response, the log, or the
+  audit record. `mode: tap` logs and counts without blocking, for
+  sizing limits against real traffic before enforcing; the policy
+  counter's `action` label keeps the two apart. One thing to know if
+  you are migrating from the origin-level `threat_protection:` block:
+  this policy has no body-size knob. The successor to
+  `json.max_total_size` is `request_limit.max_body_size`, not a key
+  here, and all three of the policy's structs refuse unknown fields, so
+  an invented one fails config load instead of being silently ignored.
+  See
+  [docs/api-security.md](docs/api-security.md#structural-body-threat-limits)
+  and
+  [examples/body-threat-protection/](examples/body-threat-protection/).
+
+- **`sbproxy_target_health_state`: per-target load-balancer health as a
+  Prometheus gauge.** Whether a target is actually taking traffic used
+  to mean polling `GET /api/health/targets`. It is a gauge now, on
+  LiteLLM's 0/1/2 deployment-state scale (0 healthy, 1 degraded with
+  the circuit breaker half-open, 2 excluded from selection), so Grafana
+  panels built against that convention port over unchanged. The value
+  folds all three exclusion mechanisms, active probe, passive outlier
+  ejection, and circuit breaker, and is sampled at scrape time from the
+  same pipeline walk that renders the admin endpoint, so the two
+  surfaces cannot tell different stories about one target. A target
+  dropped by a config reload leaves the scrape on the next render
+  instead of freezing at its last value. The `target` label is the
+  configured URL, or the load balancer's own `url#index` identifier
+  when one origin configures that URL more than once. A Target Health
+  State panel ships on the origins dashboard, and a Budget Utilization
+  by Scope panel on the AI gateway dashboard for the already-exported
+  `sbproxy_ai_budget_utilization_ratio`; headroom is
+  `1 - sbproxy_ai_budget_utilization_ratio` in PromQL, and there is
+  deliberately no separate remaining family, because a family and its
+  complement double the series without adding information. See
+  [docs/observability.md](docs/observability.md#budget-headroom-and-target-health)
+  and
+  [examples/health-and-budget-gauges/](examples/health-and-budget-gauges/).
 
 - **`hmac_auth`: signed-request authentication.** A new auth provider
   for machine callers that prove possession of a shared secret by
@@ -256,6 +349,27 @@ the next version cut.
   entry is refused with a `400` before any upstream connection, and an
   upstream selection outside the negotiated set fails the upgrade with
   a `502`.
+
+- **Mid-tunnel failures on an upgraded websocket tear the connection
+  down instead of writing an HTTP error body into the frame stream.**
+  Once the `101` reaches the downstream wire the client is speaking
+  WebSocket frames, but a post-upgrade failure fell through to the
+  generic upstream-error tail and wrote a synthesized `502 Bad Gateway`
+  response, which arrives as garbage bytes spliced into the frame
+  sequence. Every post-upgrade failure (upstream reset, timeout, read
+  error) now closes both connections and writes nothing, on both
+  surfaces that upgrade: the `websocket` action, and the AI gateway's
+  realtime tunnel (`type: ai_proxy` reaching `/v1/realtime`), where a
+  provider reset used to splice a `502` into a client's audio frames.
+  What decides it is the `101` reaching the wire rather than which
+  action opened the tunnel, so pre-upgrade failures still render an
+  ordinary HTTP error a client can read: a connect error, a refused
+  subprotocol negotiation, or a realtime handshake the provider
+  answered `401`. The real failure mode still lands in the log,
+  classified the way the `Proxy-Status` machinery classifies upstream
+  errors, and on
+  `sbproxy_websocket_teardowns_total{reason="upstream_error"}`. See
+  [docs/websocket.md](docs/websocket.md#mid-tunnel-errors-never-write-http-bytes).
 - **GraphQL validation refuses before connecting upstream.** On a
   validated `graphql` origin without `request_modifiers`, an invalid
   document now gets its `400` in the request phase, before any upstream

@@ -333,38 +333,86 @@ pub(super) fn enforce_upstream_subprotocol_selection(
     ))
 }
 
+/// Whether this request is riding an upgraded tunnel, and whether the
+/// gateway's own frame scanner already tore it down (WOR-2551).
+///
+/// `Some(true)` means the `websocket` action's `max_message_size` guard
+/// tripped, which already logged, counted, and audited at the scan site.
+/// `Some(false)` means a tunnel is open and nothing has reported why it
+/// is ending yet. `None` means the client is still speaking HTTP.
+///
+/// Two surfaces reach 101 and then speak raw frames, and both belong
+/// here:
+///
+/// - `Action::WebSocket`, which arms
+///   [`RequestContext::websocket_tunnel`] in `response_filter` right
+///   after the upstream's 101 passes subprotocol enforcement. The guard
+///   exists because that action scans frames; its presence is the
+///   proxy's own record that the upgrade settled.
+/// - AI realtime (`type: ai_proxy` reaching `/v1/realtime`), dispatched
+///   through `action_dispatch::handle_action` into
+///   `ctx.ai_realtime_dispatch`. It never arms a frame-scanner guard,
+///   because scanning is a `websocket`-action duty, so it needs the
+///   second half of the test: `ctx.response_status` carries the
+///   upstream's status from `response_filter`, and a 101 there is the
+///   same proof of an open tunnel the guard gives the other surface.
+///   Without this arm a realtime provider reset wrote `bad gateway`
+///   into the client's audio frame stream, which is the exact defect
+///   WOR-2551 fixed on the `websocket` action and left standing here.
+///
+/// The realtime arm is deliberately keyed on the status rather than on
+/// `ai_realtime_dispatch` alone: the dispatch context is populated
+/// before the provider answers, so a realtime request the provider
+/// refused with a 401 is still an ordinary HTTP exchange and still owes
+/// its client a readable error body.
+fn upgraded_tunnel_torn_down(ctx: &RequestContext) -> Option<bool> {
+    if let Some(guard) = ctx.websocket_tunnel.as_ref() {
+        return Some(guard.violated());
+    }
+    if ctx.ai_realtime_dispatch.is_some()
+        && ctx
+            .response_status
+            .is_some_and(realtime_response_accepts_session)
+    {
+        return Some(false);
+    }
+    None
+}
+
 /// The teardown `fail_to_proxy` owes an upgraded websocket tunnel, or
 /// `None` when the ordinary HTTP error rendering still applies
 /// (WOR-2490, widened by WOR-2551).
 ///
 /// Two conditions, and both are load bearing.
 ///
-/// `ctx.websocket_tunnel` says a `websocket` action's 101 passed
-/// subprotocol enforcement and the frame scanner was armed.
+/// [`upgraded_tunnel_torn_down`] says one of the two upgrade surfaces
+/// settled its 101 and the client is now on frames.
 /// `downstream_header_written` says Pingora has already put that 101 on
 /// the downstream connection, which is what actually turns the client
-/// side into a WebSocket frame stream. The guard is armed inside
-/// `response_filter`, which runs before that write, so the tunnel being
-/// armed is not by itself proof the client has stopped speaking HTTP.
-/// Suppressing the body on the strength of the guard alone would trade a
-/// readable 502 for a dead socket for any failure caught in that window.
+/// side into a WebSocket frame stream. The `websocket` action's guard is
+/// armed inside `response_filter`, which runs before that write, so the
+/// tunnel being armed is not by itself proof the client has stopped
+/// speaking HTTP. Suppressing the body on the strength of the guard
+/// alone would trade a readable 502 for a dead socket for any failure
+/// caught in that window.
 ///
 /// WOR-2551: what this must NOT be keyed on is `guard.violated()`, which
 /// the first shipped shape used. That covered only the max_message_size
 /// teardown, so a mid-tunnel upstream reset, timeout, or read error fell
 /// through to the generic upstream-error tail and wrote a synthesized
 /// "bad gateway" response into the raw frame stream. Every post-upgrade
-/// failure belongs here, whatever caused it.
+/// failure belongs here, whatever caused it and whichever action opened
+/// the tunnel.
 pub(super) fn websocket_teardown_response(
     ctx: &RequestContext,
     e: &Error,
     downstream_header_written: bool,
 ) -> Option<FailToProxy> {
-    let guard = ctx.websocket_tunnel.as_ref()?;
+    let already_torn_down = upgraded_tunnel_torn_down(ctx)?;
     if !downstream_header_written {
         return None;
     }
-    if !guard.violated() {
+    if !already_torn_down {
         // The guard's own violation was already logged, counted, and
         // audited at the scan site. Everything else lands here: keep the
         // real failure mode in the log (the same classification the
@@ -5403,6 +5451,9 @@ impl ProxyHttp for SbProxy {
                                             BodyThreatMode::Block => {
                                                 tracing::warn!(
                                                     target: "sbproxy::body_threat_protection",
+                                                    hostname = %ctx.hostname,
+                                                    tenant = %ctx.tenant_id,
+                                                    request_id = %ctx.request_id,
                                                     limit = violation.limit,
                                                     observed = violation.observed,
                                                     allowed = violation.allowed,
@@ -5433,6 +5484,11 @@ impl ProxyHttp for SbProxy {
                                                     ),
                                                 )
                                                 .with_tenant_id(ctx.tenant_id.to_string())
+                                                .with_key_context(
+                                                    ctx.native_key_provider.clone(),
+                                                    ctx.inbound_key_mode.as_str(),
+                                                )
+                                                .with_api_key_id(ctx.accountable_key_id())
                                                 .emit();
                                                 ctx.deny_policy_type =
                                                     Some("body_threat_protection");
@@ -5465,8 +5521,20 @@ impl ProxyHttp for SbProxy {
                                                 // can false-positive on
                                                 // legitimately deep
                                                 // payloads.
+                                                // Tap mode writes no audit
+                                                // record, so this line is the
+                                                // only per-request evidence
+                                                // there is: it has to name
+                                                // which origin produced it or
+                                                // an operator tapping twelve
+                                                // origins to size limits
+                                                // before enforcing cannot use
+                                                // it at all.
                                                 tracing::warn!(
                                                     target: "sbproxy::body_threat_protection",
+                                                    hostname = %ctx.hostname,
+                                                    tenant = %ctx.tenant_id,
+                                                    request_id = %ctx.request_id,
                                                     limit = violation.limit,
                                                     observed = violation.observed,
                                                     allowed = violation.allowed,
@@ -9866,6 +9934,76 @@ origins:
             websocket_teardown_count("upstream_error", "none", ORIGIN),
             before,
             "a guard violation is counted at the scan site, not again in fail_to_proxy"
+        );
+    }
+
+    /// A realtime request context as `action_dispatch::handle_action`
+    /// leaves one for `type: ai_proxy` on `/v1/realtime`: the dispatch
+    /// is staged, and no frame-scanner guard is ever armed because
+    /// scanning is a `websocket`-action duty.
+    fn realtime_ctx(origin: &str, response_status: Option<u16>) -> RequestContext {
+        let mut ctx = websocket_request_ctx(origin);
+        ctx.ai_realtime_dispatch = Some(crate::context::RealtimeDispatchCtx {
+            provider_name: "openai".to_string(),
+            upstream_host: "api.openai.com".to_string(),
+            upstream_port: 443,
+            upstream_tls: true,
+            model_override: Some("gpt-realtime".to_string()),
+            started_at: std::time::Instant::now(),
+            surface_label: "realtime",
+        });
+        ctx.response_status = response_status;
+        ctx
+    }
+
+    /// WOR-2551 fix round, red-first: the AI realtime surface is the
+    /// second thing in this proxy that answers 101 and then speaks raw
+    /// frames, and it never arms the `websocket` action's frame-scanner
+    /// guard. Keyed on the guard alone, a mid-tunnel provider reset on
+    /// `/v1/realtime` fell through to the generic upstream-error tail
+    /// and spliced `HTTP/1.1 502 Bad Gateway ... bad gateway` into the
+    /// client's audio frame stream, which is the exact defect WOR-2551
+    /// fixed on the other surface.
+    ///
+    /// The 101 is load bearing in both directions: a realtime request
+    /// the provider refused is an ordinary HTTP exchange and still owes
+    /// its client a readable body.
+    #[test]
+    fn wor_2551_realtime_tunnel_tears_down_without_http_bytes() {
+        const ORIGIN: &str = "realtime-teardown.example.com";
+        let reset = pingora_error::Error::new(pingora_error::ErrorType::ConnectionClosed);
+
+        let ctx = realtime_ctx(ORIGIN, Some(101));
+        let before = websocket_teardown_count("upstream_error", "none", ORIGIN);
+        let teardown = websocket_teardown_response(&ctx, &reset, true).expect(
+            "a provider reset on an accepted /v1/realtime tunnel must tear down, not splice \
+             an HTTP error body into the frame stream",
+        );
+        assert_eq!(teardown.error_code, 0, "nothing is written downstream");
+        assert!(!teardown.can_reuse_downstream);
+        assert_eq!(
+            websocket_teardown_count("upstream_error", "none", ORIGIN),
+            before + 1,
+            "the realtime teardown reaches the same counter as the websocket action's"
+        );
+
+        // The provider refused the handshake: no tunnel, so the client
+        // is still on HTTP and still gets a rendered error.
+        for refused_status in [None, Some(401), Some(502)] {
+            let ctx = realtime_ctx(ORIGIN, refused_status);
+            assert!(
+                websocket_teardown_response(&ctx, &reset, true).is_none(),
+                "a realtime request the provider answered {refused_status:?} never upgraded \
+                 and still renders its HTTP error body"
+            );
+        }
+
+        // And the arming window applies here too: a 101 the proxy has
+        // not yet put on the downstream wire is not a frame stream.
+        let ctx = realtime_ctx(ORIGIN, Some(101));
+        assert!(
+            websocket_teardown_response(&ctx, &reset, false).is_none(),
+            "a realtime 101 that has not reached the wire must still render HTTP"
         );
     }
 

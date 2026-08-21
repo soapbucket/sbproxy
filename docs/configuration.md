@@ -4814,6 +4814,8 @@ Threat protection guards against pathological JSON request bodies. When the requ
 
 The `body_threat_protection` *policy* ([api-security.md](api-security.md#structural-body-threat-limits)) is the successor surface for this job: it adds XML limits with a DTD refusal, returns a 400 naming the violated limit instead of a blanket 413, and has an observe-only `tap` mode. Prefer the policy for new configs; this origin-level block remains for existing ones.
 
+One knob does not carry over. The policy has no body-size limit of its own, so an origin that sets `json.max_total_size` here and then deletes this block for the policy silently widens its body cap to the proxy's 8 MiB buffering bound. Move the value to `request_limit.max_body_size` before removing `threat_protection:`.
+
 ```yaml
 origins:
   "api.example.com":
@@ -4835,7 +4837,7 @@ origins:
 | `json.max_keys` | int | unlimited | Maximum number of keys in any single object. |
 | `json.max_string_length` | int | unlimited | Maximum length of any single string value. |
 | `json.max_array_size` | int | unlimited | Maximum length of any single array. |
-| `json.max_total_size` | int | `8388608` | Maximum total body size in bytes, enforced while the body streams in and before parsing. A body past the cap is rejected with `413`, so proxy memory for the scan is bounded by the cap. Unset takes the proxy's 8 MiB buffering hard cap; the same bound applies to the body-validation buffer used by `request_validator`, `openapi_validation`, `content_digest`, and body-aware `prompt_injection_v2`. |
+| `json.max_total_size` | int | `8388608` | Maximum total body size in bytes, enforced while the body streams in and before parsing. A body past the cap is rejected with `413`, so proxy memory for the scan is bounded by the cap. Unset takes the proxy's 8 MiB buffering hard cap; the same bound applies to the body-validation buffer used by `request_validator`, `openapi_validation`, `content_digest`, `body_threat_protection`, and body-aware `prompt_injection_v2`. |
 
 ---
 
@@ -5001,7 +5003,7 @@ Announcing is half the job; the other half is finding who has not
 migrated. Every request that resolves to a deprecated route increments
 
 ```
-sbproxy_deprecated_requests_total{origin, rule, past_sunset}
+sbproxy_deprecated_requests_total{origin, route, past_sunset, outcome}
 ```
 
 where `rule` is the forward rule's `origin.id` (or its index), the

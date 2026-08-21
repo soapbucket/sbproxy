@@ -920,9 +920,14 @@ While the raise is live, read responses carry three budget fields: the
 untouched `budget`, the `budget_override` (increases, `expires_at`,
 `granted_by`, `granted_at`, `reason`), and the `effective_budget` the
 request path is enforcing. `DELETE /admin/keys/{id}/budget-override` ends
-a raise early; expiry needs no call at all. The grant and the expiry are
-both written to the `key_audit` trail (`budget_override_grant`, naming
-the operator, and `budget_override_expire`). The override lifecycle,
+a raise early; expiry needs no call at all. Three ends of the raise's
+life reach the `key_audit` trail: `budget_override_grant` naming the
+operator who granted it, `budget_override_clear` naming the operator who
+ended a live raise early, and `budget_override_expire` for the
+unattributed, time-driven end an admin read retires. Reconcile every
+raise against `clear` OR `expire`; matching only one of them leaves
+operator-cancelled raises looking like they are still running. The
+override lifecycle,
 the enforcement seam, and the runnable walkthrough are in
 [ai-gateway.md](ai-gateway.md) under "Temporary budget overrides".
 

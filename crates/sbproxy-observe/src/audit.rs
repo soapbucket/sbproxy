@@ -295,8 +295,13 @@ impl SecurityAuditEntry {
     /// Build a policy-violation audit entry. `event_type` is the
     /// enforcing policy's stable label (`rate_limit`, `ip_filter`,
     /// `request_limit`, `waf`, `prompt_injection`, `credential_exposure`,
-    /// `threat_protection`, `ddos`, `concurrent_limit`, `policy`); the
+    /// `threat_protection`, `body_threat_protection`, `api_deprecation`,
+    /// `ddos`, `concurrent_limit`, `policy`); the
     /// matching `record_policy` Prometheus counter uses the same string.
+    /// `api_deprecation` is the one entry with no `policies:` list
+    /// equivalent: the `410 Gone` refusal is route lifecycle rather
+    /// than a policy, and it lands here because a refusal reaching no
+    /// audit channel is not enforcement.
     /// `reason` is a free-form, machine-readable detail (the policy's
     /// deny message, the matched rule id, ...). `status_code` is the
     /// HTTP status the proxy returns to the client.
@@ -930,13 +935,26 @@ impl KeyAuditEntry {
 /// for credentials would double the closed set to say the same four
 /// things.
 ///
-/// `update`, `delete`, and `unblock` map to `None` on purpose. They
-/// stay on the `key_audit` channel (the tracing target, the admin ring,
-/// and the hash chain when `audit.key_path` is set), which records
-/// every mutation; the typed feed carries the four operations the
-/// WOR-2571 alerting surface names. `credential_resolved`, the fifth
-/// type, is not minted here at all: it is a read, not a mutation, and
-/// publishes from the resolution path in `sbproxy-core`.
+/// `update`, `delete`, and `unblock` map to `None` on purpose, and so
+/// do the three budget-override ops (`budget_override_grant`,
+/// `budget_override_clear`, `budget_override_expire`). They stay on the
+/// `key_audit` channel (the tracing target, the admin ring, and the
+/// hash chain when `audit.key_path` is set), which records every
+/// mutation; the typed feed carries the four operations the WOR-2571
+/// alerting surface names. `credential_resolved`, the fifth type, is
+/// not minted here at all: it is a read, not a mutation, and publishes
+/// from the resolution path in `sbproxy-core`.
+///
+/// So the honest scope of this feed is "key existence and key
+/// authority", not "key mutations". Raising a spending ceiling for a
+/// day reaches `key_audit`, the admin ring, and the hash chain and does
+/// not reach the typed feed, exactly as editing `max_budget_usd`
+/// durably through `update` already does not. Widening it is a
+/// deliberate decision about the closed `EventType` set rather than an
+/// oversight to patch per feature; a budget event would want its own
+/// type and the same explicit payload allowlist
+/// [`key_lifecycle_event`] uses, and would have to exclude `reason`,
+/// which is free operator text bound for a webhook.
 fn key_lifecycle_event_type(op: &str) -> Option<crate::events::EventType> {
     match op {
         "create" => Some(crate::events::EventType::KeyMinted),
@@ -1419,6 +1437,11 @@ mod tests {
             // says which feed a SIEM rule finds them on.
             "websocket_message_too_large",
             "websocket_subprotocol_violation",
+            // WOR-2563 and WOR-2565, for the same reason: a structural
+            // body refusal and a post-sunset `410 Gone` are both proxy
+            // refusals on a rule, so both belong on `policy_denied`.
+            "body_threat_protection",
+            "api_deprecation",
         ] {
             let entry = SecurityAuditEntry::policy_violation(
                 policy, "blocked", 403, None, None, None, None,

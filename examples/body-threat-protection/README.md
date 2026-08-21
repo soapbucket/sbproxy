@@ -1,5 +1,7 @@
 # Structural body threat limits
 
+*Last modified: 2026-08-20*
+
 A request body can attack a service without carrying a single recognizable payload string: a thousand levels of JSON nesting to blow a recursive parser's stack, a million-key object to soak CPU in hash insertion, an XML DTD whose entities expand into gigabytes. The `body_threat_protection` policy refuses these by shape. It bounds JSON nesting depth, entries per object, items per array, key and string lengths, and total container count; for XML it bounds depth, element count, and attributes per element, and refuses any `<!DOCTYPE` outright, which is the guard against billion-laughs entity expansion. Kong sells the equivalent pair of plugins in its Enterprise tier; this ships in OSS.
 
 This example runs two origins with deliberately tight limits: `body.local` in `mode: block` (violations get a 400 naming the limit) and `tap.local` in `mode: tap` (violations are logged and counted, the request proceeds).
@@ -85,12 +87,21 @@ $ curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: tap.local' \
 ```
 
 The proxy log carries both outcomes, and blocked requests also emit a
-`security_audit` event with the violated limit as the reason:
+`security_audit` event with the violated limit as the reason. Both warn
+lines name the origin, the tenant, and the request id, which is what makes
+tap mode usable: a tap run has no audit record, so its warn line is the
+only per-request evidence there is, and an operator tapping several
+origins at once has to be able to tell which one produced a line.
+
+Fields are abridged below (`...` in the audit record stands for the
+`timestamp`, `client_ip`, `request_id`, `tenant_id`, and key-context
+fields the real record carries) and shown in reading order rather than
+serialization order:
 
 ```text
-WARN sbproxy::body_threat_protection: blocked: request body violates structural threat limit limit="json.max_string_length" observed=300 allowed=256
+WARN sbproxy::body_threat_protection: blocked: request body violates structural threat limit hostname="body.local" tenant="__default__" request_id="01K3..." limit="json.max_string_length" observed=300 allowed=256
 WARN security_audit: {"event_type":"body_threat_protection","reason":"json.max_string_length: observed 300 exceeds the configured limit 256","hostname":"body.local","method":"POST","status_code":400,...}
-WARN sbproxy::body_threat_protection: tap mode: request body violates structural threat limit (not blocked) limit="json.max_depth" observed=5 allowed=4
+WARN sbproxy::body_threat_protection: tap mode: request body violates structural threat limit (not blocked) hostname="tap.local" tenant="__default__" request_id="01K3..." limit="json.max_depth" observed=5 allowed=4
 ```
 
 The policy counter splits enforcement from observation by the `action` label:
@@ -101,6 +112,12 @@ $ curl -s -u admin:changeme http://127.0.0.1:9091/metrics \
 sbproxy_policy_triggers_total{action="deny",agent_class="",agent_id="",origin="body.local",policy_type="body_threat_protection"} 3
 sbproxy_policy_triggers_total{action="tap",agent_class="",agent_id="",origin="tap.local",policy_type="body_threat_protection"} 1
 ```
+
+The blocks on this page are a transcript of a real run rather than a
+replayed capture: unlike the pages listed in `scripts/check-doc-captures.py`,
+nothing re-executes these commands on every change. If you are sizing
+limits from a tap run, read the counter above rather than trusting the
+numbers here.
 
 ## What this shows
 
