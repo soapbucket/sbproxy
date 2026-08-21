@@ -4154,6 +4154,12 @@ impl ProxyHttp for SbProxy {
                     let path = session.req_header().uri.path();
                     let (headers, nonce) = sec.resolved_headers_for_request(path);
                     for (name, value) in headers {
+                        if let Some(mode) = crate::server::csp_emission_mode(&name) {
+                            sbproxy_observe::metrics::record_security_headers_csp_emitted(
+                                mode,
+                                ctx.tenant_id.as_ref(),
+                            );
+                        }
                         to_set.push((name, value));
                     }
                     if let Some(n) = nonce {
@@ -5833,6 +5839,10 @@ impl ProxyHttp for SbProxy {
                                                 p, route, a2a, parsed, &collected, audit,
                                             )
                                         {
+                                            sbproxy_observe::metrics::record_prompt_injection_block(
+                                                "a2a",
+                                                ctx.tenant_id.as_ref(),
+                                            );
                                             ctx.deny_policy_type = Some(rejection.deny_policy_type);
                                             failed = Some((
                                                 rejection.status,
@@ -5872,10 +5882,15 @@ impl ProxyHttp for SbProxy {
                                     {
                                         match p.action() {
                                             PromptInjectionAction::Block => {
+                                                sbproxy_observe::metrics::record_prompt_injection_block(
+                                                    "body_scan",
+                                                    ctx.tenant_id.as_ref(),
+                                                );
                                                 tracing::warn!(
                                                     target: "sbproxy::prompt_injection_v2",
                                                     score = %result.score,
                                                     label = %result.label,
+                                                    scan_path = "body_scan",
                                                     "blocked: detector matched request body"
                                                 );
                                                 // WOR-2159: honour the

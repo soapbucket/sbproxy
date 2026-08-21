@@ -488,16 +488,23 @@ content-length: 37
 ```
 
 The body is the configured `block_body` and the content type is the
-configured `block_content_type`. A body-borne block honors it the same way
-the `ai_proxy` and A2A dispatch paths always have. Two settings on that
-origin make this exchange work: `block_content_type: application/json`
+configured `block_content_type`. All four block paths (URI and headers,
+the buffered body, `ai_proxy`, and A2A) answer this way. Two settings on
+that origin make this exchange work: `block_content_type: application/json`
 shapes the response, and `enable_body_aware: true` is what makes the body
 scan run at all. Without it the payload above would stream to the upstream
 unscanned, because the policy reads only the URI and headers by default.
 
-### Which phase caught it decides what you get
+Each block also increments `sbproxy_prompt_injection_blocks_total`, labeled
+with the `scan_path` that fired (`header_scan`, `body_scan`, `ai_body`, or
+`a2a`) and the tenant. The label is there so the four paths can be compared
+rather than merged into one number.
 
-Detection runs in two places and they do not behave the same way.
+### Which phase caught it
+
+Detection runs in two places. They differ in what they can see and in
+which actions they can take, but a `block` from either serves the same
+response.
 
 ```mermaid
 flowchart TD
@@ -507,7 +514,7 @@ flowchart TD
     D --> C
     B -->|hit, action log| E[Structured warn, forward]
     E --> C
-    B -->|hit, action block| F["403: block_body wrapped as {error: block_body}\nContent-Type fixed at application/json"]
+    B -->|hit, action block| F["403: block_body served verbatim\nContent-Type = block_content_type"]
     C -->|false| G[Forward to upstream, body unscanned]
     C -->|true| H["request_body_filter: scan buffered body"]
     H -->|clean| G
@@ -531,27 +538,27 @@ compile_config refuses `action: tag` together with `enable_body_aware`.
 If a future path skipped the compiler, the body-phase arm logs an error
 rather than looking like `log`.
 
-The two `block` cells below also differ in what the caller receives, not
-just in when they fire. The body phase (and the `ai_proxy` and A2A dispatch
-paths, which are body-phase scans by construction) serve `block_body`
-verbatim as the response body with `block_content_type` as the
-`Content-Type`. The URI + header phase does not: a hit there returns a
-generic policy denial that the dispatcher renders through the same
-catch-all JSON path every other synchronous policy without a dedicated
-response branch uses. That path wraps `block_body`'s text inside a fixed
-`{"error": "<block_body>"}` envelope and always answers with
-`Content-Type: application/json`, regardless of `block_content_type`. An
-operator relying on `block_content_type` for a non-JSON body (or on
-`block_body` being returned as raw bytes rather than re-embedded as a JSON
-string) gets that behavior only when the hit is body-borne; a hit caught in
-the URI or a header, including the query-parameter and custom-header
-patterns in the next section, always comes back as the generic JSON
-envelope.
+What the caller receives does not depend on which phase fired. Every
+`block`, whether it came from the URI and headers, the buffered body, the
+`ai_proxy` prompt segments, or an A2A message part, answers `403` with
+`block_body` as the raw response body and `block_content_type` as the
+`Content-Type`.
+
+That was not always true. The URI and header phase used to return a
+generic policy denial rendered through the catch-all JSON path that every
+synchronous policy without a dedicated response branch uses. It wrapped
+`block_body` in a fixed `{"error": "<block_body>"}` envelope and always
+answered `Content-Type: application/json`, so `block_content_type` was
+ignored on that phase and a `block_body` that was already JSON came back
+double-encoded as a string inside an `error` field. Enforcement depended
+on which internal path happened to run. If you have a config that worked
+around it by pre-wrapping `block_body`, unwrap it: the value is now
+written to the wire exactly as you set it.
 
 | Action | URI + header phase | Body phase (`enable_body_aware: true`) |
 |--------|--------------------|----------------------------------------|
 | `tag` | Stamps the score and label headers on the upstream request | Refused at config compile on non-`ai_proxy` origins; unreachable arm logs an error |
-| `block` | Rejects with `403`; body is `{"error": "<block_body>"}`, `Content-Type` fixed at `application/json`, `block_content_type` ignored | Rejects with `403`; body is `block_body` verbatim, `Content-Type` is `block_content_type` |
+| `block` | Rejects with `403`; body is `block_body` verbatim, `Content-Type` is `block_content_type` | Rejects with `403`; body is `block_body` verbatim, `Content-Type` is `block_content_type` |
 | `log` | Structured warn, request forwarded | Structured warn, request forwarded |
 
 The body scan buffers at most 8 MiB of request body. A body past that cap is

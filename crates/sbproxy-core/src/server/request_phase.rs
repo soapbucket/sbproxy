@@ -4101,6 +4101,18 @@ pub(super) async fn request_filter(
                 session
                     .write_response_body(Some(bytes::Bytes::copy_from_slice(body.as_bytes())), true)
                     .await?;
+            } else if let Some((_, body, content_type)) = ctx
+                .deny_payload
+                .take()
+                .filter(|(owner, _, _)| *owner == policy_type)
+            {
+                // WOR-2530: the policy configured both the rejection body and
+                // its media type, so write them verbatim. `send_error` would
+                // wrap the body in `{"error": ...}` and stamp
+                // `application/json`, which silently overrides both knobs.
+                // The owner check means a payload can only ever be served
+                // under the refusal it was set for.
+                send_response(session, status, &content_type, body.as_bytes()).await?;
             } else {
                 send_error(session, status, &msg).await?;
             }
