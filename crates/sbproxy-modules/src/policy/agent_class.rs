@@ -162,8 +162,9 @@ pub struct AgentClassResolver {
 
 impl AgentClassResolver {
     /// Build a resolver around the supplied catalog and DNS resolver.
-    /// `rdns_cache_capacity` caps the per-process verdict cache; pass
-    /// 4096 for the OSS default (matches `ReverseDnsCache`'s docs).
+    /// `rdns_cache_capacity` caps the per-process verdict cache; the
+    /// binary passes the operator's `agent_classes.resolver.cache_size`,
+    /// which defaults to 10 000.
     /// `rdns_enabled` / `bot_auth_keyid_enabled` gate the rDNS and keyid
     /// resolver steps respectively (WOR-1164).
     pub fn new(
@@ -264,10 +265,18 @@ impl AgentClassResolver {
     /// deriving the expected answer from a resolver that counts its own
     /// calls, rather than by re-reading this function.
     ///
-    /// What it cannot see: a query that `hickory-resolver` will answer
-    /// out of its own in-process response cache. Those report `true`
-    /// here and are simply fast, which is the safe direction to be
-    /// wrong in.
+    /// Two things it cannot see, both stated because a predicate is
+    /// only as good as its known edges:
+    ///
+    /// - A query that `hickory-resolver` will answer out of its own
+    ///   in-process response cache. Those report `true` here and are
+    ///   simply fast, which is the safe direction to be wrong in.
+    /// - A verdict that expires in the window between this call and the
+    ///   [`Self::resolve`] that follows it. That reports `false` and
+    ///   then queries anyway, on the caller's thread. The window is the
+    ///   few microseconds between two cache reads, and the cost of
+    ///   losing that race once is one blocked thread for the query
+    ///   timeout, which `sbproxy-security::agent_verify` bounds.
     pub fn resolve_would_query_dns(&self, inputs: &ResolveInputs<'_>) -> bool {
         // Step 1 short-circuits the whole chain before step 2 runs.
         if self.bot_auth_keyid_enabled {
@@ -721,7 +730,11 @@ agent_classes:
   - id: signing-bot
     vendor: Example
     purpose: training
-    expected_user_agent_pattern: "(?i)\bSigningBot/\d"
+    # Double backslashes: this is a YAML double-quoted scalar, where
+    # `\b` is a backspace and `\d` is not an escape at all, so the
+    # single-backslash form is a parse error rather than a regex. The
+    # shipped catalog writes its patterns the same way.
+    expected_user_agent_pattern: "(?i)\\bSigningBot/\\d"
     expected_reverse_dns_suffixes:
       - .signing.example
     expected_keyids:

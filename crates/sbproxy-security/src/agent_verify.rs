@@ -53,19 +53,27 @@
 //! - A whole verification is capped at four forward lookups
 //!   (`MAX_FORWARD_CONFIRMS`). A reverse zone that answers with 50 PTR
 //!   names costs the same as one that answers with four.
-//! - A whole verification is capped at two seconds of wall clock
-//!   (`VERIFY_BUDGET`) measured across the forward-confirm loop and
-//!   checked before each forward lookup is issued.
+//! - The forward-confirm loop stops issuing lookups once `VERIFY_BUDGET`
+//!   (two seconds) of it has elapsed. The check runs before each
+//!   lookup, not during one, so the loop costs at most the budget plus
+//!   the one query that was already in flight, and a whole
+//!   verification, PTR query included, costs at most about six seconds
+//!   rather than the eleven the count cap alone would allow.
 //! - [`SystemResolver`] caps each individual query and runs it on one
 //!   shared background runtime with one shared `hickory-resolver`
 //!   instance, so a lookup costs neither an OS thread nor a fresh
 //!   resolver (and repeat queries hit hickory's own response cache).
+//! - At most `MAX_CONCURRENT_LOOKUPS` queries wait at once. The
+//!   per-query timeout bounds one wait; this bounds how many threads
+//!   can be inside one at the same time, which is the bound that
+//!   matters when every client IP in a flood is a different one and the
+//!   verdict cache therefore never hits.
 //!
-//! A run that hits either cap without forward-confirming anything
-//! returns [`ReverseDnsVerdict::DnsError`] rather than
-//! [`ReverseDnsVerdict::NotMatched`]: we stopped early, so we do not
-//! know that the client is unmatched, only that we refused to keep
-//! looking.
+//! A run stopped by the count cap or the budget without
+//! forward-confirming anything returns [`ReverseDnsVerdict::DnsError`]
+//! rather than [`ReverseDnsVerdict::NotMatched`]: we stopped early, so
+//! we do not know that the client is unmatched, only that we refused to
+//! keep looking. A refused query is a `DnsError` for the same reason.
 //!
 //! # Caching
 //!
@@ -118,7 +126,8 @@ const MAX_FORWARD_CONFIRMS: usize = 4;
 /// `verify_reverse_dns` call.
 ///
 /// Checked before each forward lookup is issued, so the real ceiling is
-/// this budget plus one query timeout. It exists so a zone that answers
+/// this budget plus one query timeout, and the clock starts after the
+/// PTR lookup rather than before it. It exists so a zone that answers
 /// slowly rather than not at all cannot turn `MAX_FORWARD_CONFIRMS`
 /// queries into `MAX_FORWARD_CONFIRMS` times the per-query timeout.
 const VERIFY_BUDGET: Duration = Duration::from_secs(2);
@@ -336,6 +345,55 @@ const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 /// one that fires and the error string stays specific.
 const DNS_QUERY_WAIT_SLACK: Duration = Duration::from_millis(250);
 
+/// Ceiling on how many hickory queries may be waiting at the same time.
+///
+/// The per-query timeout says how long one wait costs; this says how
+/// many of them can exist at once, and without it the two are not the
+/// same bound. Each wait parks the thread that issued it, which on the
+/// request path is a Tokio blocking-pool thread shared with every other
+/// blocking call the proxy makes (SSRF resolution, file IO). Tokio's
+/// pool defaults to 512 threads, and a verification costs about six
+/// seconds of one of them in the worst case, so a flood of *distinct*
+/// client IPs (a botnet, or one host rotating through an IPv6 /64) would
+/// otherwise be able to take the whole pool with roughly a hundred new
+/// addresses a second. The per-IP negative cache does not help there:
+/// every address is new.
+///
+/// 32 is deliberately far below the pool size. The bound is on
+/// unclassified traffic, and being over it costs a request its `rdns`
+/// agent-id source, not its response.
+const MAX_CONCURRENT_LOOKUPS: usize = 32;
+
+/// Live count of threads parked in `run_hickory_lookup`.
+static LOOKUPS_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Reservation against `MAX_CONCURRENT_LOOKUPS`, released on drop.
+///
+/// A guard type rather than a bare increment/decrement pair because the
+/// wait it covers has several exits (answered, timed out, sender gone)
+/// and a leaked slot is permanent: the counter never falls again and
+/// rDNS verification is off for the life of the process.
+struct LookupSlot;
+
+impl LookupSlot {
+    /// Take a slot, or `None` when the cap is already reached.
+    fn acquire() -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        LOOKUPS_IN_FLIGHT
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_CONCURRENT_LOOKUPS).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for LookupSlot {
+    fn drop(&mut self) {
+        LOOKUPS_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// [`Resolver`] backed by the host DNS configuration through
 /// `hickory-resolver`.
 ///
@@ -449,13 +507,24 @@ fn shared_resolver() -> Result<&'static hickory_resolver::TokioResolver, String>
 /// that matters, and the request-path caller
 /// (`sbproxy-core::agent_class::stamp_request_context_offloaded`) hands
 /// this to `spawn_blocking` so the blocked thread is a blocking-pool
-/// thread rather than an async worker.
+/// thread rather than an async worker. That pool is finite and shared,
+/// so how many threads may be parked here at once is capped too; see
+/// `MAX_CONCURRENT_LOOKUPS`.
 fn run_hickory_lookup<T, F, Fut>(f: F) -> Result<T, String>
 where
     F: FnOnce(&'static hickory_resolver::TokioResolver) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<T, String>> + Send + 'static,
     T: Send + 'static,
 {
+    // Refuse rather than queue. A queued lookup still holds the thread
+    // that is waiting for it, which is the resource being defended; a
+    // refusal becomes a `DnsError` verdict, which the caller negatively
+    // caches and falls through to User-Agent matching on.
+    let Some(_slot) = LookupSlot::acquire() else {
+        return Err(format!(
+            "DNS lookup refused: {MAX_CONCURRENT_LOOKUPS} queries already in flight"
+        ));
+    };
     let runtime = dns_runtime()?;
     let resolver = shared_resolver()?;
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -494,9 +563,10 @@ where
 ///
 /// The cache is bounded to `max_entries` and uses a coarse FIFO ring
 /// eviction when full because verdict lookups dominate over inserts.
-/// The OSS default capacity is 4096, picked so a single flooded /24 of
-/// bots fits without thrashing the cache while staying well under any
-/// memory-pressure threshold.
+/// The capacity is the operator's `agent_classes.resolver.cache_size`,
+/// which defaults to 10 000: large enough that a flooded /24 of bots
+/// fits without thrashing the cache, small enough to stay well under
+/// any memory-pressure threshold.
 pub struct ReverseDnsCache {
     inner: Mutex<CacheInner>,
     max_entries: usize,
@@ -762,6 +832,31 @@ mod tests {
         assert_eq!(
             verdict,
             ReverseDnsVerdict::Verified("crawl-2.googlebot.com".to_string())
+        );
+    }
+
+    #[test]
+    fn concurrent_lookup_slots_are_capped_and_released() {
+        // `LOOKUPS_IN_FLIGHT` is process-wide, so this test would be
+        // order-dependent if anything else touched it. Nothing does:
+        // the only other caller is `run_hickory_lookup`, which no unit
+        // test reaches because reaching it means real DNS.
+        let held: Vec<LookupSlot> = (0..MAX_CONCURRENT_LOOKUPS)
+            .map(|i| LookupSlot::acquire().unwrap_or_else(|| panic!("slot {i} is under the cap")))
+            .collect();
+
+        assert!(
+            LookupSlot::acquire().is_none(),
+            "the cap must refuse the request past it, not queue it behind a parked thread"
+        );
+
+        // A refused lookup is only a degradation if the slot comes
+        // back. A leaked one turns a burst into a permanent outage of
+        // rDNS verification for the life of the process.
+        drop(held);
+        assert!(
+            LookupSlot::acquire().is_some(),
+            "slots must be released when the wait ends"
         );
     }
 

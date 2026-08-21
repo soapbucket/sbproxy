@@ -376,9 +376,10 @@ one PTR per address as vendors do, resolves exactly as before.
 **What changes.** Resolver step 2 queries a zone the client being identified
 controls, and it previously followed that zone wherever it led: every PTR name
 it returned got its own forward lookup, serially, with the host resolver's
-default timeout and no ceiling on the total. Four bounds now apply. At most four
+default timeout and no ceiling on the total. Five bounds now apply. At most four
 PTR names per address are forward-confirmed; each query is capped at two
-seconds; the forward-confirm loop as a whole is capped at two more; and a DNS
+seconds; the forward-confirm loop stops issuing new lookups once two seconds of
+it have elapsed; at most 32 queries are in flight process-wide; and a DNS
 failure is cached for 30 seconds instead of being re-queried on the next
 request. Nothing about the config schema changes.
 
@@ -386,7 +387,10 @@ request. Nothing about the config schema changes.
 `rdns` agent-id source resolves from its `User-Agent` instead, which is the same
 degradation path an unreachable resolver has always taken. The agent is still
 classified; only the source stamp and the confidence change. A policy that keys
-on the rDNS source specifically stops matching for that vendor.
+on the rDNS source specifically stops matching for that vendor. The
+in-flight cap can produce the same demotion transiently, under a burst of
+traffic from addresses the verdict cache has never seen; the next request from
+that address, 30 seconds later, verifies normally.
 
 **What to do before upgrading.** If a crawler you verify by rDNS publishes more
 than four PTR names per address, verify it by Web Bot Auth `keyid` instead

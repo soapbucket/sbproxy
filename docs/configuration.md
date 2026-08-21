@@ -294,13 +294,19 @@ bounds rather than operator-set ones:
 
 - At most four PTR names per address are forward-confirmed. A zone that
   answers with more is not verified further.
-- Each DNS query is capped at two seconds, and the forward-confirm loop
-  as a whole at two more.
-- Verdicts are cached per client IP for the `cache_size` window: 300
+- Each DNS query is capped at two seconds. The forward-confirm loop
+  stops issuing new lookups once two seconds of it have elapsed, so a
+  whole verification, PTR query included, costs at most about six
+  seconds of wall clock.
+- At most 32 of these queries are in flight process-wide. Past that a
+  lookup is refused rather than queued, because a queued one still holds
+  the thread waiting on it.
+- Verdicts are cached per client IP, up to `cache_size` addresses: 300
   seconds for a resolved verdict, 30 seconds for a DNS failure, so an
   address with no PTR record costs one lookup per 30 seconds rather than
   one per request.
-- All of it runs off the request's worker thread.
+- The lookup runs on the blocking pool, never on the async worker
+  handling the request, and only on a request that actually needs it.
 
 A client that fails or exceeds any of these is not classified by rDNS;
 resolution falls through to the User-Agent pass, exactly as it does for
