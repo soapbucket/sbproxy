@@ -2820,7 +2820,16 @@ pub fn record_telemetry_dropped(kind: &'static str, reason: &'static str) {
 /// at capacity when a request tried to publish), `worker_stopped` (the
 /// delivery thread is gone), `serialize_error`, `write_error`,
 /// `http_error` (the endpoint answered non-2xx), `delivery_failed` (the
-/// request never got an answer), and `ssrf_rejected`.
+/// request never got an answer), `ssrf_rejected` (the configured URL
+/// resolved onto an address the SSRF guard refuses), and
+/// `egress_denied` (the collector, or a host it redirected to, is not
+/// one egress authorization allows this proxy to reach).
+///
+/// This enumeration is the closest thing the label has to a schema, so
+/// an alert whose `reason=~` union is written from it has to stay
+/// complete: a new drop path that lands here and not in this list is
+/// invisible to every dashboard built on it. The other copies are the
+/// `event_sink` module docs and the reason table in `docs/events.md`.
 ///
 /// A drop that is not counted is indistinguishable from a proxy that saw
 /// no traffic, which is the failure this exists to make impossible.

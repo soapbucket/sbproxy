@@ -5,6 +5,10 @@
 //! `use super::*` re-imports the parent module's private items and
 //! `use` aliases, so the moved code needs no rewiring.
 
+use super::downstream_body::{
+    buffered_body_limit, read_capped_request_body, settle_buffered_policy_plan, BufferedPolicyGate,
+    PLAN_STAGE_BUFFERED, PLAN_STAGE_DECLARED,
+};
 use super::*;
 use sbproxy_config::types::FailureMode;
 
@@ -16,6 +20,75 @@ pub(super) fn is_websocket_upgrade_request(request: &pingora_http::RequestHeader
         .and_then(|value| value.to_str().ok())
         .map(|value| value.to_ascii_lowercase().contains("websocket"))
         .unwrap_or(false)
+}
+
+/// The `Content-Length` the client declared, when it declared a usable one.
+fn declared_body_length(headers: &http::HeaderMap) -> Option<usize> {
+    headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+}
+
+/// Run the buffered dynamic policies the header phase deferred.
+///
+/// `check_policies` skips every `BundleBodyMode::Buffered` policy
+/// because it has no body to hand them, and
+/// `check_buffered_dynamic_policies` is the only thing that ever runs
+/// them afterwards. An action that answers from `request_filter` is the
+/// last place they can run at all, since nothing below it reaches the
+/// body phase. Both plugin action arms call this with the complete body
+/// before they invoke their handler, so a fail-closed policy decides
+/// before the handler sees content it would have denied.
+///
+/// Returns `Ok(false)` once it has written the deny itself.
+async fn run_deferred_body_policies(
+    session: &mut Session,
+    ctx: &mut RequestContext,
+    pipeline: &CompiledPipeline,
+    origin_idx: Option<usize>,
+    body: Bytes,
+) -> Result<bool> {
+    if !ctx.dynamic_request_body_plan.has_active_buffered_policies() {
+        return Ok(true);
+    }
+    let Some(origin_idx) = origin_idx else {
+        ctx.response_status = Some(500);
+        send_error(session, 500, "plugin policy plan has no origin").await?;
+        return Ok(false);
+    };
+    let Some(enforcers) = pipeline.enforcers.get(origin_idx) else {
+        ctx.response_status = Some(500);
+        send_error(session, 500, "plugin policy plan has no enforcers").await?;
+        return Ok(false);
+    };
+    // `enforcers` and `config.origins` are built in lockstep, so this
+    // lookup succeeds whenever the one above did. Reached by index
+    // rather than asserted, because a policy chain that outlives its
+    // origin should fail this request closed rather than the process.
+    let Some(origin) = pipeline.config.origins.get(origin_idx) else {
+        ctx.response_status = Some(500);
+        send_error(session, 500, "plugin policy plan has no origin config").await?;
+        return Ok(false);
+    };
+    let verdict_ctx = PolicyVerdictCtx {
+        request_id: ctx.request_id.to_string(),
+        workspace_id: origin.workspace_id.to_string(),
+        origin: origin.origin_id.to_string(),
+        tenant: ctx.tenant_id.to_string(),
+        record_format: pipeline.config.decision_audit.policy_record_format(),
+    };
+    if let Some((status, message, policy_type)) =
+        check_buffered_dynamic_policies(enforcers, session, ctx, body, &verdict_ctx).await
+    {
+        let policy_type = effective_policy_type(ctx, policy_type);
+        sbproxy_observe::metrics::record_policy(ctx.hostname.as_str(), policy_type, "deny");
+        ctx.record_policy_decision(policy_type, "deny");
+        ctx.response_status = Some(status);
+        send_error(session, status, &message).await?;
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 /// Handle non-proxy actions directly in request_filter.
@@ -1124,6 +1197,10 @@ pub(super) async fn handle_action(
             let uri = request_header.uri.clone();
             let headers = request_header.headers.clone();
             let dynamic_hook = handler.dynamic_hook().cloned();
+            // Both arms below refuse an oversize declared length before
+            // the first read, so an honest client hears no before it
+            // sends the bytes.
+            let declared_body_len = declared_body_length(&headers);
             let request_body = if let Some(action_hook) = dynamic_hook.as_ref() {
                 let action_buffers = match action_hook.body_mode() {
                     sbproxy_config::BundleBodyMode::None => false,
@@ -1140,10 +1217,6 @@ pub(super) async fn handle_action(
                         return Ok(true);
                     }
                 };
-                let declared_body_len = headers
-                    .get(http::header::CONTENT_LENGTH)
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(|value| value.parse::<usize>().ok());
 
                 if let Some(declared_body_len) = declared_body_len {
                     if let Some(cap) = ctx.body_size_limit {
@@ -1158,43 +1231,16 @@ pub(super) async fn handle_action(
                             return Ok(true);
                         }
                     }
-                    let skipped = match ctx
-                        .dynamic_request_body_plan
-                        .before_growth(declared_body_len, action_buffers.then_some(action_hook))
+                    if !settle_buffered_policy_plan(
+                        session,
+                        ctx,
+                        declared_body_len,
+                        action_buffers.then_some(action_hook),
+                        PLAN_STAGE_DECLARED,
+                    )
+                    .await?
                     {
-                        Ok(skipped) => skipped,
-                        Err(overflow) => {
-                            let hook = overflow.metadata();
-                            debug!(
-                                target: "sbproxy::extension",
-                                bundle = hook.bundle_id(),
-                                hook = hook.hook_type(),
-                                policy_index = ?overflow.policy_index(),
-                                received = declared_body_len,
-                                cap = overflow.cap(),
-                                "dynamic hook rejected plugin action body from declared length"
-                            );
-                            ctx.response_status = Some(413);
-                            send_error(session, 413, "request entity too large").await?;
-                            return Ok(true);
-                        }
-                    };
-                    for skipped_hook in skipped {
-                        let hook = skipped_hook.metadata();
-                        let posture = hook.failure_posture();
-                        tracing::warn!(
-                            target: "sbproxy::extension",
-                            bundle = hook.bundle_id(),
-                            hook = hook.hook_type(),
-                            policy_index = skipped_hook.policy_index(),
-                            received = declared_body_len,
-                            cap = skipped_hook.cap(),
-                            failure_posture = posture.as_label(),
-                            "skipping buffered dynamic policy from declared plugin action body length"
-                        );
-                        if posture.guarantee_waived() || posture.records_counterfactual() {
-                            ctx.record_policy_decision(hook.hook_type(), posture.as_label());
-                        }
+                        return Ok(true);
                     }
                 }
 
@@ -1225,43 +1271,16 @@ pub(super) async fn handle_action(
                         || ctx.dynamic_request_body_plan.has_active_buffered_policies();
                     if needs_buffer {
                         let proposed_len = buffered.len().saturating_add(chunk.len());
-                        let skipped = match ctx
-                            .dynamic_request_body_plan
-                            .before_growth(proposed_len, action_buffers.then_some(action_hook))
+                        if !settle_buffered_policy_plan(
+                            session,
+                            ctx,
+                            proposed_len,
+                            action_buffers.then_some(action_hook),
+                            PLAN_STAGE_BUFFERED,
+                        )
+                        .await?
                         {
-                            Ok(skipped) => skipped,
-                            Err(overflow) => {
-                                let hook = overflow.metadata();
-                                debug!(
-                                    target: "sbproxy::extension",
-                                    bundle = hook.bundle_id(),
-                                    hook = hook.hook_type(),
-                                    policy_index = ?overflow.policy_index(),
-                                    received = proposed_len,
-                                    cap = overflow.cap(),
-                                    "dynamic hook blocked plugin action body before allocation"
-                                );
-                                ctx.response_status = Some(413);
-                                send_error(session, 413, "request entity too large").await?;
-                                return Ok(true);
-                            }
-                        };
-                        for skipped_hook in skipped {
-                            let hook = skipped_hook.metadata();
-                            let posture = hook.failure_posture();
-                            tracing::warn!(
-                                target: "sbproxy::extension",
-                                bundle = hook.bundle_id(),
-                                hook = hook.hook_type(),
-                                policy_index = skipped_hook.policy_index(),
-                                received = proposed_len,
-                                cap = skipped_hook.cap(),
-                                failure_posture = posture.as_label(),
-                                "skipping buffered dynamic policy whose plugin action body exceeded its cap"
-                            );
-                            if posture.guarantee_waived() || posture.records_counterfactual() {
-                                ctx.record_policy_decision(hook.hook_type(), posture.as_label());
-                            }
+                            return Ok(true);
                         }
                         if action_buffers
                             || ctx.dynamic_request_body_plan.has_active_buffered_policies()
@@ -1276,45 +1295,10 @@ pub(super) async fn handle_action(
                 }
                 let buffered = buffered.freeze();
 
-                if ctx.dynamic_request_body_plan.has_active_buffered_policies() {
-                    let Some(origin_idx) = origin_idx else {
-                        ctx.response_status = Some(500);
-                        send_error(session, 500, "plugin policy plan has no origin").await?;
-                        return Ok(true);
-                    };
-                    let Some(enforcers) = pipeline.enforcers.get(origin_idx) else {
-                        ctx.response_status = Some(500);
-                        send_error(session, 500, "plugin policy plan has no enforcers").await?;
-                        return Ok(true);
-                    };
-                    let workspace_id = pipeline.config.origins[origin_idx].workspace_id.to_string();
-                    let verdict_ctx = PolicyVerdictCtx {
-                        request_id: ctx.request_id.to_string(),
-                        workspace_id,
-                        origin: pipeline.config.origins[origin_idx].origin_id.to_string(),
-                        tenant: ctx.tenant_id.to_string(),
-                        record_format: pipeline.config.decision_audit.policy_record_format(),
-                    };
-                    if let Some((status, message, policy_type)) = check_buffered_dynamic_policies(
-                        enforcers,
-                        session,
-                        ctx,
-                        buffered.clone(),
-                        &verdict_ctx,
-                    )
-                    .await
-                    {
-                        let policy_type = effective_policy_type(ctx, policy_type);
-                        sbproxy_observe::metrics::record_policy(
-                            ctx.hostname.as_str(),
-                            policy_type,
-                            "deny",
-                        );
-                        ctx.record_policy_decision(policy_type, "deny");
-                        ctx.response_status = Some(status);
-                        send_error(session, status, &message).await?;
-                        return Ok(true);
-                    }
+                if !run_deferred_body_policies(session, ctx, pipeline, origin_idx, buffered.clone())
+                    .await?
+                {
+                    return Ok(true);
                 }
 
                 if action_buffers {
@@ -1323,13 +1307,53 @@ pub(super) async fn handle_action(
                     Bytes::new()
                 }
             } else {
-                // Linked plugins predate body planning and retain their
-                // complete-body behavior until they adopt bundle metadata.
-                let mut request_body = bytes::BytesMut::new();
-                while let Some(chunk) = session.read_request_body().await? {
-                    request_body.extend_from_slice(&chunk);
+                // A linked Rust action carries no bundle manifest, so it
+                // has no channel for declaring a body mode and the host
+                // has to assume it wants the whole body:
+                // `ActionHandler::handle` takes an
+                // `http::Request<Bytes>` and there is no way to say "no
+                // body, thanks". Assume it, then, but bound it. This arm
+                // used to drain whatever arrived, and because the action
+                // answers from `request_filter` and returns `Ok(true)`,
+                // the streaming cap in `request_body_filter` never ran
+                // behind it (WOR-2628).
+                let cap = buffered_body_limit(ctx.body_size_limit);
+                if let Some(declared) = declared_body_len {
+                    if !settle_buffered_policy_plan(
+                        session,
+                        ctx,
+                        declared,
+                        None,
+                        PLAN_STAGE_DECLARED,
+                    )
+                    .await?
+                    {
+                        return Ok(true);
+                    }
                 }
-                request_body.freeze()
+                // `SettlePerChunk`, not a settle once the read is done.
+                // A chunked client declares nothing, so the declared
+                // check above never ran for it, and a buffered policy
+                // that asked to hold 1 KiB must not have the whole host
+                // cap streamed past it before anyone consults its
+                // number.
+                let Some(body) = read_capped_request_body(
+                    session,
+                    ctx,
+                    cap,
+                    "request entity too large",
+                    BufferedPolicyGate::SettlePerChunk,
+                )
+                .await?
+                else {
+                    return Ok(true);
+                };
+                if !run_deferred_body_policies(session, ctx, pipeline, origin_idx, body.clone())
+                    .await?
+                {
+                    return Ok(true);
+                }
+                body
             };
             let mut request = http::Request::builder()
                 .method(method)
@@ -1800,6 +1824,8 @@ mod realtime_gate_tests {
 mod plugin_action_tests {
     use std::future::Future;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use pingora_core::protocols::l4::stream::Stream;
@@ -1846,6 +1872,62 @@ mod plugin_action_tests {
         exchange_with(action, pipeline, origin_idx, DEFAULT_TEST_REQUEST, |_| {}).await
     }
 
+    /// Whether `buffer` holds a complete HTTP/1.1 response: a terminated
+    /// header block plus at least `content-length` body bytes.
+    fn http_response_is_complete(buffer: &[u8]) -> bool {
+        let Some(header_end) = buffer
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|position| position + 4)
+        else {
+            return false;
+        };
+        let headers = String::from_utf8_lossy(&buffer[..header_end]);
+        let declared = headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        });
+        match declared {
+            Some(length) => buffer.len() - header_end >= length,
+            None => true,
+        }
+    }
+
+    /// Read a response, treating a reset as EOF once the response is
+    /// whole.
+    ///
+    /// A refusal answers before it has read the rest of the request, so
+    /// the server closes with unread bytes still in the socket buffer
+    /// and the FIN becomes an RST. The RST can land between the
+    /// response headers and the response body, and a plain
+    /// `read_to_end` then either panics or hands back a truncated
+    /// response, which is a flake rather than a failure.
+    async fn read_http_response(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut response = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            match stream.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(read) => response.extend_from_slice(&chunk[..read]),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ConnectionReset
+                        && http_response_is_complete(&response) =>
+                {
+                    break;
+                }
+                Err(error) => panic!(
+                    "read downstream response: {error:?} after {} bytes: {}",
+                    response.len(),
+                    String::from_utf8_lossy(&response)
+                ),
+            }
+        }
+        response
+    }
+
     async fn exchange_with(
         action: &Action,
         pipeline: &CompiledPipeline,
@@ -1853,6 +1935,24 @@ mod plugin_action_tests {
         raw_request: &[u8],
         prepare_ctx: impl FnOnce(&mut RequestContext),
     ) -> (pingora_error::Result<bool>, Vec<u8>) {
+        let (result, response, _ctx) =
+            exchange_with_ctx(action, pipeline, origin_idx, raw_request, prepare_ctx).await;
+        (result, response)
+    }
+
+    /// [`exchange_with`], but hands back the request context too.
+    ///
+    /// A refusal's *timing* is only visible on the context: two
+    /// implementations can both answer 413 while one of them read the
+    /// whole body first, and `request_body_bytes` is what separates
+    /// them.
+    async fn exchange_with_ctx(
+        action: &Action,
+        pipeline: &CompiledPipeline,
+        origin_idx: Option<usize>,
+        raw_request: &[u8],
+        prepare_ctx: impl FnOnce(&mut RequestContext),
+    ) -> (pingora_error::Result<bool>, Vec<u8>, RequestContext) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind downstream fixture");
@@ -1864,12 +1964,7 @@ mod plugin_action_tests {
                 .expect("connect downstream fixture");
             stream.write_all(&request).await.expect("write request");
             stream.shutdown().await.expect("half-close request");
-            let mut response = Vec::new();
-            stream
-                .read_to_end(&mut response)
-                .await
-                .expect("read response");
-            response
+            read_http_response(&mut stream).await
         });
         let (stream, _) = listener.accept().await.expect("accept downstream");
         let mut session = Session::new_h1(Box::new(Stream::from(stream)));
@@ -1887,7 +1982,7 @@ mod plugin_action_tests {
             .await
             .expect("downstream response timeout")
             .expect("downstream client task");
-        (result, response)
+        (result, response, ctx)
     }
 
     #[tokio::test]
@@ -3365,6 +3460,259 @@ origins:
         assert!(
             response.contains("deprecation: @1788220800"),
             "a spec-staged match must stamp the header: {response}"
+        );
+    }
+
+    // --- WOR-2628: the linked plugin action's inbound body ---
+
+    /// A linked action that answers 200 and counts how often it ran.
+    ///
+    /// The count is the assertion that matters: a refusal that still
+    /// invokes the handler has refused nothing, because the handler is
+    /// the thing operating on content the cap or the policy rejected.
+    struct CountingAction(Arc<AtomicUsize>);
+
+    impl ActionHandler for CountingAction {
+        fn handler_type(&self) -> &str {
+            "counting_plugin_action_fixture"
+        }
+
+        fn handle(
+            &self,
+            _req: &mut http::Request<Bytes>,
+            _ctx: &mut dyn std::any::Any,
+        ) -> Pin<Box<dyn Future<Output = PluginResult<ActionOutcome>> + Send + '_>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(ActionOutcome::Response {
+                    status: 200,
+                    headers: vec![("content-type".into(), "text/plain".into())],
+                    body: Bytes::from_static(b"handled"),
+                })
+            })
+        }
+    }
+
+    fn counting_linked_action() -> (Action, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let action = Action::Plugin(sbproxy_modules::PluginAction::linked(Box::new(
+            CountingAction(Arc::clone(&calls)),
+        )));
+        (action, calls)
+    }
+
+    /// A chunked request: framed body, no `Content-Length` for an
+    /// admission check to read. This is the shape `request_limit`
+    /// cannot see, and the shape `request_body_filter`'s streaming cap
+    /// would have caught for a request that went upstream.
+    fn chunked_request(chunks: &[&[u8]]) -> Vec<u8> {
+        let mut wire = b"POST /jobs HTTP/1.1\r\nHost: plugin.test\r\n\
+             transfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+            .to_vec();
+        for chunk in chunks {
+            wire.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            wire.extend_from_slice(chunk);
+            wire.extend_from_slice(b"\r\n");
+        }
+        wire.extend_from_slice(b"0\r\n\r\n");
+        wire
+    }
+
+    #[tokio::test]
+    async fn linked_action_refuses_a_chunked_body_past_the_configured_cap() {
+        let (action, calls) = counting_linked_action();
+        let pipeline = CompiledPipeline::empty_for_test();
+        let payload = vec![b'x'; 1024];
+        let request = chunked_request(&[payload.as_slice(), payload.as_slice()]);
+
+        let (result, wire) = exchange_with(&action, &pipeline, None, &request, |ctx| {
+            ctx.body_size_limit = Some(1024);
+        })
+        .await;
+
+        assert!(result.expect("a refused body still terminates the request"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(response.starts_with("HTTP/1.1 413"), "response: {response}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the handler must not see a body the cap rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn linked_action_is_bounded_with_no_request_limit_configured() {
+        // A bound that exists only once an operator configures one is
+        // not a bound. With no `request_limit` policy attached,
+        // `ctx.body_size_limit` is `None` and the host default is the
+        // only thing standing between this arm and the client's claim.
+        // 128 MiB declared, twice that default, refused before the
+        // first read so the test never allocates it.
+        let (action, calls) = counting_linked_action();
+        let pipeline = CompiledPipeline::empty_for_test();
+        let request = b"POST /jobs HTTP/1.1\r\nHost: plugin.test\r\n\
+             content-length: 134217728\r\nconnection: close\r\n\r\n";
+
+        let (result, wire) = exchange_with(&action, &pipeline, None, request, |ctx| {
+            assert!(ctx.body_size_limit.is_none(), "fixture has no cap policy");
+        })
+        .await;
+
+        assert!(result.expect("a refused body still terminates the request"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(response.starts_with("HTTP/1.1 413"), "response: {response}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the handler must not run for a body the host default rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn linked_action_still_receives_a_body_inside_the_cap() {
+        let (action, calls) = counting_linked_action();
+        let pipeline = CompiledPipeline::empty_for_test();
+        let request = chunked_request(&[br#"{"job":1}"#.as_slice()]);
+
+        let (result, wire) = exchange_with(&action, &pipeline, None, &request, |ctx| {
+            ctx.body_size_limit = Some(1024);
+        })
+        .await;
+
+        assert!(result.expect("a plugin action inside the cap must dispatch"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(response.starts_with("HTTP/1.1 200"), "response: {response}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "response: {response}");
+    }
+
+    /// A buffered bundle policy that denies whatever body it is handed.
+    struct DenyingBufferedPolicy;
+
+    impl sbproxy_plugin::PolicyEnforcer for DenyingBufferedPolicy {
+        fn policy_type(&self) -> &'static str {
+            "buffered_deny_fixture"
+        }
+
+        fn enforce(
+            &self,
+            _req: &http::Request<Bytes>,
+            _ctx: &mut dyn std::any::Any,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = sbproxy_plugin::PluginResult<sbproxy_plugin::PolicyDecision>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async {
+                Ok(sbproxy_plugin::PolicyDecision::Deny {
+                    status: 403,
+                    message: "buffered policy denied".to_string(),
+                })
+            })
+        }
+    }
+
+    fn buffered_policy_metadata(max_buffer_bytes: usize) -> sbproxy_modules::DynamicHookMetadata {
+        sbproxy_modules::DynamicHookMetadata::new(
+            "fixture-bundle",
+            "buffered_deny_fixture",
+            sbproxy_config::BundleRuntime::Wasm,
+            sbproxy_config::BundleBodyMode::Buffered,
+            max_buffer_bytes,
+            FailureMode::Closed,
+        )
+    }
+
+    /// An origin whose only policy is a fail-closed buffered one, which
+    /// `check_policies` defers out of the header phase because it has
+    /// no body to hand it.
+    fn pipeline_with_buffered_policy(max_buffer_bytes: usize) -> CompiledPipeline {
+        let mut pipeline = pipeline_from_yaml(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: static
+      status: 200
+      content_type: text/plain
+      body: "placeholder"
+"#,
+        );
+        pipeline.enforcers = vec![vec![crate::builtin_enforcers::CompiledEnforcer {
+            surface: sbproxy_observe::events::PolicySurface::Plugin,
+            engine: sbproxy_observe::decision::DecisionEngine::Wasm,
+            enforcer: Box::new(DenyingBufferedPolicy),
+            dynamic_hook: Some(buffered_policy_metadata(max_buffer_bytes)),
+            shared_admission: None,
+        }]];
+        pipeline
+    }
+
+    #[tokio::test]
+    async fn linked_action_runs_the_deferred_buffered_policy_before_the_handler() {
+        let (action, calls) = counting_linked_action();
+        let pipeline = pipeline_with_buffered_policy(8192);
+        let request = chunked_request(&[br#"{"job":1}"#.as_slice()]);
+
+        let (result, wire) = exchange_with(&action, &pipeline, Some(0), &request, |ctx| {
+            let metadata = buffered_policy_metadata(8192);
+            ctx.dynamic_request_body_plan =
+                crate::request_body_plan::DynamicRequestBodyPlan::from_policy_metadata([(
+                    0,
+                    Some(&metadata),
+                )]);
+        })
+        .await;
+
+        assert!(result.expect("a denied request still terminates"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(response.starts_with("HTTP/1.1 403"), "response: {response}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a fail-closed buffered policy must decide before the handler runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn linked_action_stops_reading_at_the_buffered_policys_own_cap() {
+        // The host cap here is the 64 MiB default, because the fixture
+        // attaches no `request_limit`. The policy, though, declared it
+        // will hold 1 KiB. Settling the plan only once the read
+        // finished would let a chunked client stream the whole host cap
+        // past a control that asked for a kilobyte, which is a cap
+        // checked after the allocation rather than before it.
+        //
+        // Both the fixed and the unfixed code answer 413 here, so the
+        // status proves nothing. `request_body_bytes` is the assertion:
+        // it counts what the host actually accepted before refusing.
+        let (action, calls) = counting_linked_action();
+        let pipeline = pipeline_with_buffered_policy(1024);
+        let payload = vec![b'x'; 512];
+        let chunks = vec![payload.as_slice(); 8];
+        let request = chunked_request(&chunks);
+
+        let (result, wire, context) =
+            exchange_with_ctx(&action, &pipeline, Some(0), &request, |ctx| {
+                assert!(ctx.body_size_limit.is_none(), "fixture has no cap policy");
+                let metadata = buffered_policy_metadata(1024);
+                ctx.dynamic_request_body_plan =
+                    crate::request_body_plan::DynamicRequestBodyPlan::from_policy_metadata([(
+                        0,
+                        Some(&metadata),
+                    )]);
+            })
+            .await;
+
+        assert!(result.expect("a refused body still terminates the request"));
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(response.starts_with("HTTP/1.1 413"), "response: {response}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "response: {response}");
+        assert!(
+            context.request_body_bytes <= 1024,
+            "the host accepted {} bytes for a policy that declared a 1024-byte buffer",
+            context.request_body_bytes
         );
     }
 }
@@ -6128,6 +6476,7 @@ pub(super) async fn handle_mcp_action(
                                         .redirect(reqwest::redirect::Policy::none())
                                         .build()
                                         .unwrap_or_else(|_| reqwest::Client::new());
+                                    let token_exchange_egress = mcp_token_exchange_gate();
                                     let subject_token = session
                                         .req_header()
                                         .headers
@@ -6143,7 +6492,7 @@ pub(super) async fn handle_mcp_action(
                                         &mcp_exec,
                                         &mcp_secret_lookup,
                                         &http,
-                                        None,
+                                        token_exchange_egress.as_ref(),
                                         subject_token,
                                     )
                                     .await
@@ -7220,6 +7569,28 @@ fn mcp_server_approval_refusal_for_non_tool_call(
 
 /// WOR-1792 / GS: mint upstream Authorization for run-as-user without
 /// mutating tool arguments. Identity and tokens never enter args.
+/// The authorizer the MCP run-as-user token exchange dials under.
+///
+/// WOR-2620: the one production call site passed a literal `None`, so
+/// the exchange ran ungated whatever the operator configured: no
+/// allowlist, no private-address refusal, and no pin set for the dial
+/// to be held to, while two docs said the opposite. The top-level
+/// `egress.token_exchange:` block is the authority for this purpose,
+/// the same way `proxy_http.rs` arms the non-MCP outbound-credential
+/// resolver from it; a per-server `egress:` block gates that server's
+/// upstream connects and OpenAPI tool calls and never reaches here.
+///
+/// A named function rather than the read spelled inline at the call
+/// site, because inline it had no test seam: every test caller of
+/// `mcp_prepare_run_as_user_auth` hands it `None`, so putting the
+/// literal back would have left the suite green. See
+/// `the_mcp_token_exchange_reads_its_gate_from_the_egress_registry`.
+fn mcp_token_exchange_gate() -> Option<sbproxy_security::egress::EgressAuthorizer> {
+    sbproxy_security::egress::configured_gate(
+        sbproxy_security::egress::EgressPurpose::TokenExchange,
+    )
+}
+
 async fn mcp_prepare_run_as_user_auth(
     arguments: serde_json::Value,
     auth_config: &sbproxy_extension::mcp::auth::McpUpstreamAuthConfig,
@@ -10446,6 +10817,84 @@ mod govern_security_tests {
             .await
             .expect_err("anonymous must fail closed");
         assert_eq!(err, UpstreamAuthError::AnonymousCaller);
+    }
+
+    /// WOR-2620: the production MCP token exchange takes its authorizer
+    /// out of the `egress.token_exchange:` registry slot, and a slot
+    /// that does not name the endpoint refuses the exchange.
+    ///
+    /// Every other caller of `mcp_prepare_run_as_user_auth` in this file
+    /// hands it a literal `None`, which is how the literal `None` at the
+    /// one production site survived being the whole defect: deleting the
+    /// wiring left the suite green, and the unit tests in
+    /// `sbproxy_extension::mcp::auth` construct their authorizer by hand
+    /// and say nothing about where the production site gets one. This
+    /// drives `mcp_token_exchange_gate` itself, so putting the `None`
+    /// back is red here.
+    ///
+    /// Reads a process-global registry, so it relies on nextest giving
+    /// every test its own process; it clears the slot on the way out for
+    /// the serial `cargo test` fallback.
+    #[tokio::test]
+    async fn the_mcp_token_exchange_reads_its_gate_from_the_egress_registry() {
+        use sbproxy_security::egress::{
+            install_configured_gate, EgressAuthorizer, EgressConfig, EgressPurpose,
+            PurposeAllowlist,
+        };
+        use std::collections::HashSet;
+
+        // The compiled shape of an `egress.token_exchange:` sub-block
+        // set to `deny_by_default` with a host list this endpoint is not
+        // on.
+        let mut purposes = HashMap::new();
+        purposes.insert(
+            EgressPurpose::TokenExchange,
+            PurposeAllowlist {
+                hosts: HashSet::from(["idp.allowed.test".to_string()]),
+                schemes: HashSet::from(["https".to_string()]),
+                ports: HashSet::from([443u16]),
+                allow_private: false,
+            },
+        );
+        install_configured_gate(
+            EgressPurpose::TokenExchange,
+            Some(EgressAuthorizer::new(EgressConfig { purposes })),
+        );
+
+        let gate = mcp_token_exchange_gate();
+        assert!(
+            gate.is_some(),
+            "the production reader must find the armed `token_exchange` slot"
+        );
+
+        let principal = jwt_principal("user-a");
+        let exec = exec_ctx(&principal);
+        let cfg = McpUpstreamAuthConfig::TokenExchange {
+            token_endpoint: "https://idp.denied.test/token"
+                .parse()
+                .expect("endpoint url"),
+            audience: "wor2620-audience".to_string(),
+            scope: None,
+            client_credential_ref: None,
+        };
+        let lookup = |_r: &str| Ok("unused".to_string());
+        let http = reqwest::Client::new();
+        // A host refusal short-circuits before any DNS lookup, so this
+        // reaches no network even though the endpoint looks live.
+        let err = mcp_prepare_run_as_user_auth(
+            json!({}),
+            &cfg,
+            &exec,
+            &lookup,
+            &http,
+            gate.as_ref(),
+            Some("caller-subject-token"),
+        )
+        .await
+        .expect_err("a token endpoint outside the allowlist must be refused");
+        assert_eq!(err, UpstreamAuthError::EgressDenied);
+
+        install_configured_gate(EgressPurpose::TokenExchange, None);
     }
 
     #[test]

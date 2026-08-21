@@ -568,7 +568,15 @@ pub const ENROLLMENT_REASON_OK: &str = "ok";
 /// transport, by the phase that failed.
 ///
 /// Labels: `kind` (`connect` | `tls` | `encode` | `io` | `decrypt` |
-/// `decode` | `remote`).
+/// `decode` | `remote` | `timeout_lock` | `timeout_connect` |
+/// `timeout_tls` | `timeout_write` | `timeout_read`).
+///
+/// The five `timeout_` values are the deadline half of the same closed
+/// set. A failure and a deadline are different operational facts: a
+/// `connect` means the peer answered with a refusal, a `timeout_connect`
+/// means it answered with nothing at all, and only the second one implies
+/// the peer is reachable-but-wedged rather than down. Alert on
+/// `kind=~"timeout_.*"` for the wedged case.
 pub static MESH_TRANSPORT_RPC_ERRORS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         Opts::new(
@@ -601,6 +609,79 @@ pub const TRANSPORT_RPC_KIND_DECODE: &str = "decode";
 /// `kind` label for [`MESH_TRANSPORT_RPC_ERRORS`]: the peer answered with
 /// a business-level `CacheResult::Error`.
 pub const TRANSPORT_RPC_KIND_REMOTE: &str = "remote";
+/// `kind` label for [`MESH_TRANSPORT_RPC_ERRORS`]: the caller gave up
+/// waiting for the per-peer RPC lock, because an earlier request to the
+/// same peer was still occupying the single connection.
+pub const TRANSPORT_RPC_KIND_TIMEOUT_LOCK: &str = "timeout_lock";
+/// `kind` label for [`MESH_TRANSPORT_RPC_ERRORS`]: the TCP connect to the
+/// peer neither completed nor failed inside its deadline.
+pub const TRANSPORT_RPC_KIND_TIMEOUT_CONNECT: &str = "timeout_connect";
+/// `kind` label for [`MESH_TRANSPORT_RPC_ERRORS`]: the peer mTLS handshake
+/// did not complete inside its deadline.
+pub const TRANSPORT_RPC_KIND_TIMEOUT_TLS: &str = "timeout_tls";
+/// `kind` label for [`MESH_TRANSPORT_RPC_ERRORS`]: the request frame did
+/// not drain into the socket inside its deadline, which is what a peer
+/// that accepts a connection and then stops reading looks like.
+pub const TRANSPORT_RPC_KIND_TIMEOUT_WRITE: &str = "timeout_write";
+/// `kind` label for [`MESH_TRANSPORT_RPC_ERRORS`]: the response frame did
+/// not arrive inside its deadline, which is what a peer that accepts a
+/// connection and then never answers looks like.
+pub const TRANSPORT_RPC_KIND_TIMEOUT_READ: &str = "timeout_read";
+
+/// Inbound mesh RPC connections refused or torn down by an admission or
+/// deadline control on the server half of the transport.
+///
+/// Labels: `reason` (`connection_limit` | `handshake_timeout` |
+/// `handshake_failed` | `idle_timeout` | `frame_timeout` |
+/// `write_timeout`).
+///
+/// Every one of those is a connection this node decided not to keep, so a
+/// nonzero rate is either an attack or a capacity signal and both want an
+/// operator. The peer address is deliberately *not* a label: it is
+/// attacker-chosen and would mint one series per source. It goes in the
+/// (rate-limited) log line instead, so the counter says how much and the
+/// log says who.
+/// Registered with `.ok()` rather than the `.expect()` the older families
+/// above use, mirroring `AI_PRICE_CEILING` in
+/// `crates/sbproxy-ai/src/ai_metrics.rs`: the production unwrap/expect
+/// ratchet is at its baseline and one metric family is not worth a panic
+/// path on a node that is already serving. `None` means the family could
+/// not be registered, and the single call site skips the increment.
+pub static MESH_TRANSPORT_INBOUND_REJECTED: LazyLock<Option<IntCounterVec>> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        Opts::new(
+            "mesh_transport_inbound_rejected_total",
+            "Inbound cache RPC connections refused or torn down by an admission or deadline control"
+        ),
+        &["reason"]
+    )
+    .ok()
+});
+
+/// `reason` label for [`MESH_TRANSPORT_INBOUND_REJECTED`]: the node was
+/// already serving its maximum inbound connections, so this one was closed
+/// without a per-connection task ever being spawned.
+pub const INBOUND_REJECT_CONNECTION_LIMIT: &str = "connection_limit";
+/// `reason` label for [`MESH_TRANSPORT_INBOUND_REJECTED`]: the peer was
+/// admitted but its TLS handshake, including the wait for a handshake
+/// slot, ran past the admission deadline.
+pub const INBOUND_REJECT_HANDSHAKE_TIMEOUT: &str = "handshake_timeout";
+/// `reason` label for [`MESH_TRANSPORT_INBOUND_REJECTED`]: the peer's TLS
+/// handshake completed and was rejected (no client certificate, or one
+/// the mesh CA did not sign).
+pub const INBOUND_REJECT_HANDSHAKE_FAILED: &str = "handshake_failed";
+/// `reason` label for [`MESH_TRANSPORT_INBOUND_REJECTED`]: an admitted
+/// connection began no request frame inside the idle deadline, so its
+/// admission slot was reclaimed.
+pub const INBOUND_REJECT_IDLE_TIMEOUT: &str = "idle_timeout";
+/// `reason` label for [`MESH_TRANSPORT_INBOUND_REJECTED`]: a request frame
+/// announced its length and then did not deliver its body inside the frame
+/// deadline.
+pub const INBOUND_REJECT_FRAME_TIMEOUT: &str = "frame_timeout";
+/// `reason` label for [`MESH_TRANSPORT_INBOUND_REJECTED`]: the response
+/// frame did not drain into the socket inside the write deadline, which is
+/// what a peer that issues a request and then stops reading looks like.
+pub const INBOUND_REJECT_WRITE_TIMEOUT: &str = "write_timeout";
 
 /// Duration of successful cross-node cache RPCs, by operation.
 ///

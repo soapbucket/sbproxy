@@ -9,6 +9,16 @@ use anyhow::Result;
 use crate::traits::{ActionHandler, AuthProvider, PolicyEnforcer, TransformHandler};
 use crate::{PluginError, PluginResult};
 
+/// Resolve the one registration claiming `name`, or refuse.
+///
+/// A name claimed twice is a linking mistake, not a preference: picking
+/// the first match silently binds whichever crate the linker happened to
+/// emit first, and that order is not something an operator controls or
+/// can see. The count is the most the error can say about which two.
+/// Both registrations are `&'static` statics carrying nothing but a name
+/// and a function pointer, so nothing at runtime knows which crate
+/// submitted either one; the answer lives in the dependency graph of the
+/// binary that linked them.
 fn unique_registration<T: 'static>(
     mut registrations: impl Iterator<Item = &'static T>,
     kind: &str,
@@ -16,8 +26,11 @@ fn unique_registration<T: 'static>(
 ) -> Option<PluginResult<&'static T>> {
     let registration = registrations.next()?;
     if registrations.next().is_some() {
+        // Two are already in hand; the rest of the iterator is the
+        // remainder of the claims.
+        let claims = 2 + registrations.count();
         return Some(Err(PluginError::Config(format!(
-            "duplicate {kind} plugin registration: {name}"
+            "duplicate {kind} plugin registration: {name} ({claims} registrations linked)"
         ))));
     }
     Some(Ok(registration))
@@ -144,12 +157,29 @@ inventory::collect!(AuthPluginRegistration);
 /// example because `config` does not deserialize into the provider's
 /// config type or fails the provider's validation. A missing
 /// registration is reported as the outer `None`, not as `Err`.
+///
+/// It is also `Err`, without running any factory, when more than one
+/// crate linked into this binary registers `name`. Authentication is the
+/// one channel where picking a winner by link order is a security
+/// outcome rather than a convenience: the origin gets whichever provider
+/// the linker emitted first, and nothing in the config, the logs, or the
+/// admin surface says which. The error names the kind, the name, and how
+/// many claims there are; which crates they came from is a question only
+/// the binary's dependency graph answers, since a registration carries a
+/// name and a function pointer and nothing else.
 pub fn build_auth_plugin(
     name: &str,
     config: serde_json::Value,
 ) -> Option<Result<Box<dyn AuthProvider>>> {
-    let reg = inventory::iter::<AuthPluginRegistration>().find(|r| r.name == name)?;
-    Some((reg.factory)(config))
+    let registration = match unique_registration(
+        inventory::iter::<AuthPluginRegistration>().filter(|item| item.name == name),
+        "auth",
+        name,
+    )? {
+        Ok(registration) => registration,
+        Err(error) => return Some(Err(error.into())),
+    };
+    Some((registration.factory)(config))
 }
 
 /// List all registered Auth plugin names from the typed channel.
@@ -316,6 +346,22 @@ mod tests {
         }
     }
 
+    struct FixtureAuth;
+
+    impl AuthProvider for FixtureAuth {
+        fn auth_type(&self) -> &str {
+            "fixture_auth"
+        }
+
+        fn authenticate(
+            &self,
+            _req: &http::Request<bytes::Bytes>,
+            _ctx: &mut dyn std::any::Any,
+        ) -> Pin<Box<dyn Future<Output = PluginResult<crate::AuthDecision>> + Send + '_>> {
+            Box::pin(async { Ok(crate::AuthDecision::allow_anonymous()) })
+        }
+    }
+
     struct FixtureAction;
 
     impl ActionHandler for FixtureAction {
@@ -360,6 +406,13 @@ mod tests {
     }
 
     inventory::submit! {
+        AuthPluginRegistration {
+            name: "fixture_auth",
+            factory: |_config| Ok(Box::new(FixtureAuth)),
+        }
+    }
+
+    inventory::submit! {
         PolicyPluginRegistration {
             name: "duplicate_fixture_policy",
             factory: |_config| panic!("duplicate factory must not run"),
@@ -397,6 +450,20 @@ mod tests {
     inventory::submit! {
         ActionPluginRegistration {
             name: "duplicate_fixture_action",
+            factory: |_config| panic!("duplicate factory must not run"),
+        }
+    }
+
+    inventory::submit! {
+        AuthPluginRegistration {
+            name: "duplicate_fixture_auth",
+            factory: |_config| panic!("duplicate factory must not run"),
+        }
+    }
+
+    inventory::submit! {
+        AuthPluginRegistration {
+            name: "duplicate_fixture_auth",
             factory: |_config| panic!("duplicate factory must not run"),
         }
     }
@@ -556,21 +623,62 @@ mod tests {
                 "duplicate_fixture_policy",
                 serde_json::Value::Null,
             )),
-            "duplicate policy plugin registration: duplicate_fixture_policy"
+            "duplicate policy plugin registration: duplicate_fixture_policy \
+             (2 registrations linked)"
         );
         assert_eq!(
             config_message(build_transform_plugin(
                 "duplicate_fixture_transform",
                 serde_json::Value::Null,
             )),
-            "duplicate transform plugin registration: duplicate_fixture_transform"
+            "duplicate transform plugin registration: duplicate_fixture_transform \
+             (2 registrations linked)"
         );
         assert_eq!(
             config_message(build_action_plugin(
                 "duplicate_fixture_action",
                 serde_json::Value::Null,
             )),
-            "duplicate action plugin registration: duplicate_fixture_action"
+            "duplicate action plugin registration: duplicate_fixture_action \
+             (2 registrations linked)"
         );
+    }
+
+    /// Auth was the one typed channel that took the first match. Two
+    /// crates claiming `saml` meant the linker chose the origin's
+    /// authenticator, silently, and both factories look identical from
+    /// the config file. The refusal has to happen at build time, before
+    /// either factory runs, or the winner has already been constructed.
+    #[test]
+    fn the_auth_registry_refuses_a_duplicate_name_instead_of_taking_the_first() {
+        // `.map(|_| ())` before `expect_err`: the Ok side is a
+        // `Box<dyn AuthProvider>`, which has no `Debug`, and `expect_err`
+        // needs one to render the value it did not want.
+        let error = build_auth_plugin("duplicate_fixture_auth", serde_json::Value::Null)
+            .expect("duplicate name has registrations")
+            .map(|_| ())
+            .expect_err("a duplicate claim is refused rather than built");
+
+        let plugin_error = error
+            .downcast_ref::<PluginError>()
+            .expect("the refusal stays a PluginError through anyhow, as compile_auth expects");
+        match plugin_error {
+            PluginError::Config(message) => assert_eq!(
+                message,
+                "duplicate auth plugin registration: duplicate_fixture_auth \
+                 (2 registrations linked)"
+            ),
+            other => panic!("expected a config error, got {other}"),
+        }
+    }
+
+    /// A single claim still builds. Without this the test above passes
+    /// on an implementation that refuses every auth plugin.
+    #[test]
+    fn the_auth_registry_still_builds_a_uniquely_named_plugin() {
+        let provider = build_auth_plugin("fixture_auth", serde_json::Value::Null)
+            .expect("fixture auth is registered")
+            .expect("a unique claim builds");
+        assert_eq!(provider.auth_type(), "fixture_auth");
     }
 }

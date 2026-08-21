@@ -409,6 +409,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "mesh_transport_inbound_rejected_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("MESH_TRANSPORT_INBOUND_REJECTED"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["reason"],
+        description: "Inbound cache RPC connections refused or torn down by an admission or deadline bound, by reason (connection_limit, handshake_timeout, handshake_failed, idle_timeout, frame_timeout, write_timeout). Any sustained connection_limit rate means peers are being turned away; the peer address is in the log line, never in a label.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "mesh_transport_rpc_duration_seconds",
         kind: MetricKind::Histogram,
         writer: Writer::Recorder("MESH_TRANSPORT_RPC_DURATION"),
@@ -427,7 +438,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["kind"],
-        description: "Cross-node cache RPC failures, by transport phase.",
+        description: "Cross-node cache RPC failures, by transport phase. The five timeout_ kinds (timeout_lock, timeout_connect, timeout_tls, timeout_write, timeout_read) are the deadline half of the same set: a peer that answered with nothing rather than with a refusal.",
         dead_reason: None,
     },
     MetricCapability {

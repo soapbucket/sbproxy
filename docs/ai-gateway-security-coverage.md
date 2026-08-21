@@ -1,6 +1,6 @@
 # AI gateway security coverage
 
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-21*
 
 This page proves what the gateway enforces in the AI traffic path, not what a
 feature list claims: every row below points at a named test or a signal you
@@ -163,10 +163,12 @@ readable from the admin API.
 
 Config: the top-level `egress:` block arms six of the ten through five
 sub-blocks (`ai_providers`, `usage_sinks` covers both usage sinks and
-webhooks, `model_artifacts`, `token_exchange` for the non-MCP resolver,
-`telemetry`), each `mode: deny_by_default`. OpenAPI-backed MCP tools and
-the dual-LLM quarantine judge arm from a per-server or per-action
-`egress:` block instead. Extension bundle hooks are always armed
+webhooks including the `events:` sink, `model_artifacts`,
+`token_exchange` for every token endpoint, the non-MCP resolver's and
+the MCP run-as-user exchange's alike, `telemetry`), each
+`mode: deny_by_default`. OpenAPI-backed MCP tools and the dual-LLM
+quarantine judge arm from a per-server or per-action `egress:` block
+instead. Extension bundle hooks are always armed
 automatically from the bundle's own outbound grant. Engine artifact
 downloads pass no authorizer today and cannot be armed by any config.
 Signal: `GET /api/egress`,

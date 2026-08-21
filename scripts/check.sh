@@ -287,6 +287,20 @@ batch_unwrap_ratchet() {
   bash "$ROOT/scripts/check-unwrap-ratchet.sh"
 }
 
+# CI: ci.yml test lane, "no new operator URL at a log line" (WOR-2629,
+# WOR-2640). Two counts. `raw-url` is a URL-named tracing field that did
+# not go through sbproxy_security::url_redact; `raw-request-error` is
+# `error = %e` next to an outbound reqwest call, whose Display ends with
+# " for url ({url})" and so writes the whole URL with no url field in
+# sight. The second is at zero, which means "no site of the shape the
+# proximity detector can see" and not "no reqwest URL reaches a log"; the
+# scanner's module header sets out both sets. Runs the scanner's own
+# fixtures and the ratchet's, because a detector that stopped detecting
+# reads like a clean tree.
+batch_log_url_ratchet() {
+  bash "$ROOT/scripts/check-log-url-ratchet.sh"
+}
+
 # CI: ci.yml guards lane and docs-ci.yml, "spec citation hygiene".
 batch_spec_citations() {
   bash "$ROOT/scripts/check-spec-citations.sh"
@@ -353,6 +367,7 @@ run_batch "read-only source and doc scans" \
   batch_tracker_placeholders "no internal tracker placeholders" \
   batch_pub_item_ratchet "pub items whose only consumer is a test (ratchet)" \
   batch_unwrap_ratchet "unwrap/expect/panic in production code (ratchet)" \
+  batch_log_url_ratchet "operator URLs at log lines (ratchet)" \
   batch_spec_citations "spec citation hygiene" \
   batch_env_mutation "no process-global env mutation outside test helpers" \
   batch_notice_coverage "NOTICE covers Apache-2.0-only crates" \
