@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -1591,7 +1591,7 @@ origins:
 | `allowed_models` | list | empty (allow all) | Allow-list of model names. |
 | `blocked_models` | list | | Block-list of model names. Takes precedence over allow-list. |
 | `data_posture` | object | unset | Data-handling posture requirement: `require_zdr` (default `false`) and `allow_data_collection` (default `true`). A hard provider-eligibility filter applied before any routing strategy runs, composed with the per-request `x-sbproxy-require-zdr` / `x-sbproxy-disallow-data-collection` headers (most restrictive wins). A request left with no eligible provider fails closed naming the constraint and the excluded providers; a block that excludes every configured provider is refused at config load. See [ai-gateway.md](ai-gateway.md#provider-data-posture). |
-| `max_body_size` | int | | Maximum request body size in bytes. |
+| `max_body_size` | int | `67108864` (64 MiB) | Maximum request body size in bytes the gateway accepts, checked while the body arrives rather than once it is buffered. An oversize declared `Content-Length` is refused before the first read, and a chunked upload that declares nothing is refused on the chunk that crosses the cap. Either way the answer is `413` and no provider is contacted, so nothing reaches the response cache or the idempotency store. The same number bounds the buffered upstream response. Unset means 64 MiB rather than unlimited, `0` reads as unset, and values above 1 GiB are clamped to 1 GiB. |
 | `guardrails` | object | | Input/output guardrails pipeline. |
 | `budget` | object | | Budget enforcement configuration. |
 | `model_rate_limits` | map | | Per-model rate limit overrides keyed by model name. |
@@ -3382,7 +3382,7 @@ policies:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `max_body_size` | int | unset | Maximum request body size in bytes. |
+| `max_body_size` | int | unset | Maximum request body size in bytes. Checked against a declared `Content-Length` in the request phase and against the running total as chunks arrive, so a chunked upload that declares nothing is caught too. It also bounds what a linked Rust action plugin buffers before it runs: that action answers from the request phase and returns, so it never reaches the streaming check and applies this cap itself. Left unset it still buffers no more than 64 MiB, and a value above 1 GiB is clamped there. A proxied request has no body cap without this field. `type: ai_proxy` has the same problem and its own key, [`max_body_size` on the action](#ai_proxy), which is the one it reads. |
 | `max_header_count` | int | unset | Maximum number of request headers. Alias: `max_headers_count`. |
 | `max_header_size` | int or string | unset | Maximum size of a single header value. Strings like `"4KB"` or `"1MB"` are accepted. |
 | `max_url_length` | int | unset | Maximum URL length in characters. |

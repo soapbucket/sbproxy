@@ -5,6 +5,7 @@
 //! `use super::*` re-imports the parent module's private items and
 //! `use` aliases, so the moved code needs no rewiring.
 
+use super::downstream_body::{buffered_body_limit, read_capped_request_body, BufferedPolicyGate};
 use super::*;
 use crate::key_plane::key_store_entrypoint;
 #[cfg(test)]
@@ -572,16 +573,6 @@ fn upstream_response_is_successful_stream(status: u16, content_type: Option<&str
                 media_type.eq_ignore_ascii_case("text/event-stream")
                     || media_type.eq_ignore_ascii_case("application/x-ndjson")
             })
-}
-
-const DEFAULT_BUFFERED_AI_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024;
-const MAX_BUFFERED_AI_RESPONSE_BODY_BYTES: usize = 1024 * 1024 * 1024;
-
-fn buffered_ai_response_body_limit(configured: Option<usize>) -> usize {
-    configured
-        .filter(|maximum| *maximum > 0)
-        .unwrap_or(DEFAULT_BUFFERED_AI_RESPONSE_BODY_BYTES)
-        .min(MAX_BUFFERED_AI_RESPONSE_BODY_BYTES)
 }
 
 /// Compare the canonical request captured immediately after native inbound
@@ -4623,12 +4614,19 @@ pub(super) async fn handle_ai_proxy(
             method,
             http::Method::PUT | http::Method::PATCH
         ) {
-            let body_bytes = {
-                let mut buf = bytes::BytesMut::new();
-                while let Some(chunk) = session.read_request_body().await? {
-                    buf.extend_from_slice(&chunk);
-                }
-                buf.freeze()
+            // Capped on the way in for the same reason the POST path is
+            // (WOR-2616): this action answers from `request_filter`, so
+            // `request_body_filter`'s streaming cap never runs behind it.
+            let Some(body_bytes) = read_capped_request_body(
+                session,
+                ctx,
+                buffered_body_limit(config.max_body_size),
+                "AI request body too large",
+                BufferedPolicyGate::Ignore,
+            )
+            .await?
+            else {
+                return Ok(());
             };
             if body_bytes.is_empty() {
                 (None, Vec::new())
@@ -4947,12 +4945,23 @@ pub(super) async fn handle_ai_proxy(
     // then fails with a spurious 400 (WOR-795 body-buffering fix). The AI
     // dispatch builds its own upstream request, so draining here does not
     // affect forwarding.
-    let body_bytes = {
-        let mut buf = bytes::BytesMut::new();
-        while let Some(chunk) = session.read_request_body().await? {
-            buf.extend_from_slice(&chunk);
-        }
-        buf.freeze()
+    //
+    // `max_body_size` is the cap, applied while the body arrives rather
+    // than once it is all in memory, and it applies whether or not an
+    // operator configured one (WOR-2616). This sits ahead of provider
+    // dispatch, guardrails, idempotency capture, and the multipart
+    // branch, so a refusal contacts no upstream and writes no cache or
+    // idempotency record by construction rather than by extra guards.
+    let Some(body_bytes) = read_capped_request_body(
+        session,
+        ctx,
+        buffered_body_limit(config.max_body_size),
+        "AI request body too large",
+        BufferedPolicyGate::Ignore,
+    )
+    .await?
+    else {
+        return Ok(());
     };
 
     // WOR-229: stash the native body so the dispatcher can
@@ -5236,11 +5245,10 @@ pub(super) async fn handle_ai_proxy(
                 surface_label,
             );
         }
-        let maximum = config
-            .max_body_size
-            .filter(|maximum| *maximum > 0)
-            .unwrap_or(64 * 1024 * 1024)
-            .min(1024 * 1024 * 1024);
+        // The cap the inbound read already applied. The model-rewrite
+        // below can grow the multipart body, so it is bounded against
+        // the same number rather than a second inlined copy of it.
+        let maximum = buffered_body_limit(config.max_body_size);
         let mut forwarded_body = body_bytes.clone();
         let mut requested_model =
             crate::model_plane::multipart_model(body_bytes.as_ref(), &request_content_type)
@@ -9333,11 +9341,7 @@ pub(super) async fn handle_ai_proxy(
                                 .get("region")
                                 .cloned()
                                 .or_else(|| ctx.request_geo.clone());
-                            let maximum = config
-                                .max_body_size
-                                .filter(|maximum| *maximum > 0)
-                                .unwrap_or(64 * 1024 * 1024)
-                                .min(1024 * 1024 * 1024);
+                            let maximum = buffered_body_limit(config.max_body_size);
                             let managed = crate::server::model_host::distributed_managed_upstream(
                                 crate::server::model_host::ManagedDistributedRequest {
                                     origin: &origin,
@@ -9782,7 +9786,7 @@ pub(super) async fn handle_ai_proxy(
                     last_format,
                     hostname,
                     None,
-                    Some(buffered_ai_response_body_limit(config.max_body_size)),
+                    Some(buffered_body_limit(config.max_body_size)),
                     recorder,
                     router_sink,
                     Some(ctx),
@@ -15235,26 +15239,51 @@ mod external_guardrail_context_tests {
         content_type: &str,
         body: Vec<u8>,
     ) -> (Session, DownstreamClient) {
+        let mut wire = format!(
+            "{method} {path} HTTP/1.1\r\nHost: ai.test\r\ncontent-type: {content_type}\r\nIdempotency-Key: guardrail-test\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        wire.extend_from_slice(&body);
+        downstream_wire_session(wire).await
+    }
+
+    /// A downstream request whose body arrives chunked, so it declares
+    /// no `Content-Length` at all.
+    ///
+    /// The declared-length refusal and the streaming refusal are
+    /// separate code paths, and a `request_limit` policy only ever sees
+    /// the first: a client that frames its upload chunked tells the
+    /// gateway nothing about its size up front.
+    async fn downstream_chunked_session(
+        method: &str,
+        path: &str,
+        content_type: &str,
+        chunks: &[Vec<u8>],
+    ) -> (Session, DownstreamClient) {
+        let mut wire = format!(
+            "{method} {path} HTTP/1.1\r\nHost: ai.test\r\ncontent-type: {content_type}\r\nIdempotency-Key: guardrail-test\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        for chunk in chunks {
+            wire.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            wire.extend_from_slice(chunk);
+            wire.extend_from_slice(b"\r\n");
+        }
+        wire.extend_from_slice(b"0\r\n\r\n");
+        downstream_wire_session(wire).await
+    }
+
+    async fn downstream_wire_session(wire: Vec<u8>) -> (Session, DownstreamClient) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind downstream fixture");
         let address = listener.local_addr().expect("downstream address");
-        let method = method.to_string();
-        let path = path.to_string();
-        let content_type = content_type.to_string();
         let mut client = DownstreamClient::new(tokio::spawn(async move {
             let mut stream = tokio::net::TcpStream::connect(address)
                 .await
                 .expect("connect downstream fixture");
-            let request = format!(
-                "{method} {path} HTTP/1.1\r\nHost: ai.test\r\ncontent-type: {content_type}\r\nIdempotency-Key: guardrail-test\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                body.len()
-            );
-            stream
-                .write_all(request.as_bytes())
-                .await
-                .expect("write request headers");
-            stream.write_all(&body).await.expect("write request body");
+            stream.write_all(&wire).await.expect("write request");
             // Half-close after the request. An early policy refusal never
             // reads the body, and a close with unread data in the socket
             // buffer is what turns the server's FIN into an RST; the RST
@@ -16351,6 +16380,205 @@ origins:
         assert_eq!(response_json(&response), upstream_error);
         assert_single_body_aware_provider_diagnostic(&warnings, "openai", 400);
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    // --- WOR-2616: the AI gateway's inbound body cap ---
+
+    /// The OpenAI fixture config with an explicit inbound body cap.
+    fn capped_proxy_config(
+        upstream_url: &str,
+        max_body_size: usize,
+    ) -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }],
+            "max_body_size": max_body_size
+        }))
+        .expect("capped proxy config")
+    }
+
+    /// A syntactically valid chat request padded to `bytes` or so, so a
+    /// body that clears the cap still parses and reaches the upstream.
+    fn padded_chat_request(bytes: usize) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "x".repeat(bytes)}]
+        }))
+        .expect("padded request JSON")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ai_post_refuses_a_chunked_body_past_max_body_size() {
+        // Chunked framing declares no `Content-Length`, so nothing the
+        // admission phase can read says how big this is. Before
+        // WOR-2616 the POST drain buffered all of it and the request
+        // reached the provider; `request_body_filter`'s streaming cap
+        // never ran because the AI action answers from `request_filter`.
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture(
+            serde_json::to_vec(&serde_json::json!({
+                "id": "chatcmpl-1",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+            }))
+            .expect("upstream JSON"),
+            "application/json",
+        )
+        .await;
+        let config = capped_proxy_config(&upstream_url, 1024);
+        let payload = padded_chat_request(4096);
+        let chunks = payload
+            .chunks(512)
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<Vec<u8>>>();
+        let (mut session, client) =
+            downstream_chunked_session("POST", "/v1/chat/completions", "application/json", &chunks)
+                .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("an oversize body is a refusal, not a transport error");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 413"), "{response:?}");
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            0,
+            "a refused body must not reach the provider"
+        );
+        assert_eq!(context.response_status, Some(413));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ai_post_refuses_an_oversize_declared_length_before_reading() {
+        // The honest client hears no before it sends the bytes.
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture(
+            serde_json::to_vec(&serde_json::json!({"id": "chatcmpl-1"})).expect("upstream JSON"),
+            "application/json",
+        )
+        .await;
+        let config = capped_proxy_config(&upstream_url, 1024);
+        let (mut session, client) = downstream_bytes_session(
+            "/v1/chat/completions",
+            "application/json",
+            padded_chat_request(4096),
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("an oversize declared length is a refusal");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 413"), "{response:?}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ai_put_refuses_a_chunked_body_past_max_body_size() {
+        // The method-aware branch drains its own body separately from
+        // the POST path, so it needs its own proof.
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture(
+            serde_json::to_vec(&serde_json::json!({"id": "file-1"})).expect("upstream JSON"),
+            "application/json",
+        )
+        .await;
+        let config = capped_proxy_config(&upstream_url, 1024);
+        // Valid JSON on purpose: without the cap this parses, dispatches,
+        // and the fixture below counts the hit.
+        let (mut session, client) = downstream_chunked_session(
+            "PUT",
+            "/v1/files/file-1",
+            "application/json",
+            &[padded_chat_request(4096)],
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("an oversize body is a refusal, not a transport error");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 413"), "{response:?}");
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            0,
+            "a refused body must not reach the provider"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ai_post_still_forwards_a_chunked_body_inside_the_cap() {
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture(
+            serde_json::to_vec(&serde_json::json!({
+                "id": "chatcmpl-1",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+            }))
+            .expect("upstream JSON"),
+            "application/json",
+        )
+        .await;
+        let config = capped_proxy_config(&upstream_url, 65_536);
+        let payload = padded_chat_request(4096);
+        let chunks = payload
+            .chunks(512)
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<Vec<u8>>>();
+        let (mut session, client) =
+            downstream_chunked_session("POST", "/v1/chat/completions", "application/json", &chunks)
+                .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("a body inside the cap dispatches");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            context.request_body_bytes,
+            payload.len() as u64,
+            "the access log's bytes_in must count what the gateway read"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -19076,11 +19304,10 @@ mod request_policy_tests {
 mod compression_selection_tests {
     use super::{
         ai_policy_input_tokens_est, ai_policy_prompt_fingerprint, bind_compression_selection,
-        buffered_ai_response_body_limit, compression_header_value,
-        compression_selection_bypasses_cache, compression_selection_outcome,
-        native_bypass_body_changed, native_bypass_is_safe, resolve_compression_selection_intent,
-        upstream_response_is_successful_stream, CompressionSelectionError,
-        CompressionSelectionSource, ResolvedRequestKey,
+        buffered_body_limit, compression_header_value, compression_selection_bypasses_cache,
+        compression_selection_outcome, native_bypass_body_changed, native_bypass_is_safe,
+        resolve_compression_selection_intent, upstream_response_is_successful_stream,
+        CompressionSelectionError, CompressionSelectionSource, ResolvedRequestKey,
     };
     use http::{HeaderMap, HeaderValue};
     use sbproxy_ai::compression::CompressionSelector;
@@ -19375,13 +19602,10 @@ mod compression_selection_tests {
 
     #[test]
     fn buffered_stream_fallback_always_has_a_bounded_body_limit() {
-        assert_eq!(buffered_ai_response_body_limit(None), 64 * 1024 * 1024);
-        assert_eq!(buffered_ai_response_body_limit(Some(0)), 64 * 1024 * 1024);
-        assert_eq!(buffered_ai_response_body_limit(Some(1024)), 1024);
-        assert_eq!(
-            buffered_ai_response_body_limit(Some(usize::MAX)),
-            1024 * 1024 * 1024
-        );
+        assert_eq!(buffered_body_limit(None), 64 * 1024 * 1024);
+        assert_eq!(buffered_body_limit(Some(0)), 64 * 1024 * 1024);
+        assert_eq!(buffered_body_limit(Some(1024)), 1024);
+        assert_eq!(buffered_body_limit(Some(usize::MAX)), 1024 * 1024 * 1024);
     }
 
     #[test]

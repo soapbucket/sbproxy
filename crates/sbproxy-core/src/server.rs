@@ -5945,6 +5945,15 @@ fn apply_generated_response_phases(
 mod callbacks;
 use callbacks::*;
 
+// --- Bounded downstream body reads ---
+//
+// Shared by every action that finishes inside `request_filter` and so
+// never reaches `request_body_filter`'s streaming cap (WOR-2616,
+// WOR-2628). Named rather than glob re-imported: the dispatch
+// submodules import the items they call by name, so a reader can see
+// where a body cap came from.
+mod downstream_body;
+
 // --- AI proxy helpers ---
 pub(crate) mod ai_classifier;
 
