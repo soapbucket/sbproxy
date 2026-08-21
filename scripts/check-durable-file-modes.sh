@@ -98,12 +98,44 @@ EXEMPT=(
   "crates/sbproxy-ai/src/handler.rs"
 )
 
-# Production code only. Everything from the first column-zero
-# `#[cfg(test)]` onward is a test module, and a test that pre-creates a
-# fixture at `0o644` to prove the tightening works is exactly what this
-# change added.
+# Production code only. A test that pre-creates a fixture at `0o644` to
+# prove the tightening works is exactly what this change added, so the
+# test code has to come out before the rules run.
+#
+# The first version of this stopped at the first column-zero
+# `#[cfg(test)]` and treated everything after it as test code. That is
+# true of the trailing `mod tests`, and false of a `#[cfg(test)]`
+# *helper* sitting among the production items, which several files in
+# this workspace have. The cost was not theoretical: it truncated
+# `value_ledger.rs` at line 90 and `key_plane.rs` at line 754, which
+# put the redb `Database::create` this change exists to protect, and
+# the one directory in GUARDED_FILES, outside the scanned region. Both
+# read as covered and neither was; deleting either fix left the script
+# green.
+#
+# So a `#[cfg(test)] mod` still ends the production region, because
+# that is the trailing test module by convention, and any other
+# `#[cfg(test)]` item is skipped by brace balance and scanning
+# continues after it. Items that carry no brace (`#[cfg(test)] use
+# ...;`) end at their semicolon.
 production_region() {
-  awk '/^#\[cfg\(test\)\]/ { exit } /^#\[cfg\(all\(test/ { exit } { print NR "\t" $0 }' "$1"
+  awk '
+    /^#\[cfg\(test\)\]/ || /^#\[cfg\(all\(test/ { pending = 1; next }
+    pending {
+      pending = 0
+      if ($0 ~ /^(pub(\([^)]*\))? )?mod /) { exit }
+      skipping = 1; depth = 0; opened = 0
+    }
+    skipping {
+      n = gsub(/\{/, "{"); m = gsub(/\}/, "}")
+      if (n > 0) opened = 1
+      depth += n - m
+      if (opened && depth <= 0) skipping = 0
+      else if (!opened && $0 ~ /;[[:space:]]*$/) skipping = 0
+      next
+    }
+    { print NR "\t" $0 }
+  ' "$1"
 }
 
 # Rule A: no direct std file or directory creation in a guarded crate.
@@ -296,6 +328,36 @@ mod tests {
 EOF
   expect "a test-module fixture is not a violation" 0 scan_guarded_file "$scratch/bad/tested.rs"
 
+  # A `#[cfg(test)]` helper among the production items must not end the
+  # scan. Stopping there is what hid `value_ledger.rs` and
+  # `key_plane.rs` from the rules that were supposed to cover them.
+  cat >"$scratch/bad/helper_first.rs" <<'EOF'
+#[cfg(test)]
+fn seed_for_test(path: &std::path::Path) {
+    let _ = std::fs::File::create(path);
+}
+
+pub fn open(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().create(true).append(true).open(path)
+}
+EOF
+  expect "a test helper does not hide the production sink after it" 1 \
+    scan_guarded_file "$scratch/bad/helper_first.rs"
+
+  cat >"$scratch/bad/helper_first_db.rs" <<'EOF'
+#[cfg(test)]
+fn seed_for_test(path: &std::path::Path) {
+    let _ = std::fs::File::create(path);
+}
+
+fn open(path: &Path) -> anyhow::Result<Database> {
+    let database = Database::create(path)?;
+    Ok(database)
+}
+EOF
+  expect "a test helper does not hide the database after it" 1 \
+    scan_db_constructors "$scratch/bad/helper_first_db.rs"
+
   # Rule B: create-then-chmod is the window this whole change is about.
   cat >"$scratch/bad/window.rs" <<'EOF'
 fn open_with_mode(mut options: std::fs::OpenOptions, path: &Path) -> io::Result<File> {
@@ -388,7 +450,7 @@ EOF
     echo "self-test failed: the detector is narrower than the enforcer" >&2
     return 1
   fi
-  echo "self-test passed: 12 fixtures"
+  echo "self-test passed: 14 fixtures"
   return 0
 }
 
