@@ -570,7 +570,38 @@ policies:
 
 The point is that the allowlist, role table, or routing map lives in its own config value, separate from the module. An operator edits `data.allowed_methods` without reading a line of Rego, and the policy logic never changes when the table does. `data` must be a JSON object (the rule indexes into it by key), and it is capped at one megabyte serialized: base data is a config-embedded table, not a bulk dataset, and a document that large belongs behind a data source rather than inline. Because `data` is ordinary config, editing it is a config change like any other, applied on the next reload.
 
-One shape is refused at config load: a `data` document that defines a value at the exact path the query names. Rego resolves the base document over a rule's own value at the same path, so a `data` of `{sbproxy: {allow: true}}` under a `data.sbproxy.allow` query would silently override the `allow` rule and make every request identical while the rule body still runs. Keep base data under a key the queried rule does not produce; a sibling like `data.sbproxy.roles` next to an `allow` rule is fine.
+**A `data` key may not collide with any rule the module defines.** Rego resolves the base document over a rule's own value at the same path, and it does so per rule rather than per query. A `data` of `{sbproxy: {allow: true}}` under a `data.sbproxy.allow` query overrides the `allow` rule outright, and a `data` of `{sbproxy: {trusted: true}}` overrides a `trusted` helper that `allow` reads, which is worse: the query still evaluates, the decision still looks computed, and the rule that stopped running says nothing about having stopped. A `deny` rule shadowed that way fails open.
+
+So the config is refused at load rather than warned about at request time, and the refusal covers every rule head in the module, not just the one the query names:
+
+```
+policy `rego`: base data defines `data.sbproxy.trusted`, and the module defines a rule at
+that path, so Rego resolves the base document there and the rule never evaluates. The query
+`data.sbproxy.allow` reaches it: data.sbproxy.allow -> data.sbproxy.trusted. Move the base
+data under a key no rule in the module produces.
+```
+
+The three shapes that refuse:
+
+| Base data | Rule the module defines | Why |
+|---|---|---|
+| `data.sbproxy.allow` | `data.sbproxy.allow` | Same path. The rule never contributes a value; `null` counts as a value here. |
+| `data.sbproxy.allow.reason` | `data.sbproxy.allow` | Defining something under the rule's path defines the rule's path. |
+| `data.sbproxy` set to a scalar | `data.sbproxy.allow` | A non-object above a rule leaves the rule nowhere to resolve. |
+
+A partial rule (`limits[method] := ...`) is the one shape the check cannot compare precisely. When the rule produces a `GET` key, Rego indexes `data.sbproxy.limits.GET`, one segment deeper than anything the source names, so which base keys collide depends on values the rule computes per request. Load time sees only `data.sbproxy.limits`, and three outcomes follow from what sits there:
+
+| Base data at `data.sbproxy.limits` | Result |
+|---|---|
+| Absent, or an empty object | Loads. An empty object holds no key that can beat a computed one. |
+| An object with any key | Refused. Every key the base document carries wins over the rule's, and load time cannot tell a key the rule produces from one it never will. |
+| A scalar | Refused. No key the rule produces has anywhere to land; Regorus otherwise reports this mid evaluation as `previous value is not an object`. |
+
+The middle row refuses configs that would have worked. Base data of `{sbproxy: {limits: {POST: "no"}}}` beside a rule that only ever produces `GET` merges cleanly in Rego, and it now refuses at load. The trade is deliberate: being wrong the other way is silent, shows up as a rule that stopped contributing its key, and fails open, while this refusal arrives at boot and is fixed by moving the table. The message for this shape says the base keys win rather than saying the rule never evaluates, because the second claim is not one the check can make.
+
+A function that takes parameters (`permitted(method)`) is not stored under `data` and cannot be shadowed. A function with no parameters (`audit_enabled()`) is stored under `data` and is shadowed exactly like a rule.
+
+What still loads is a sibling: an object at `data.sbproxy` holding keys no rule produces, like `data.sbproxy.roles` next to an `allow` rule, merges with the rules beneath it and is the intended way to carry a table inside the package namespace. Keeping the table at the top level, the way `data.allowed_methods` does above, avoids the question entirely.
 
 ### The two things Rego does not inherit
 

@@ -1459,7 +1459,16 @@ impl TlsFingerprintConfig {
 /// bag, runs the rule-pack scorer, and stores the verdict on the request
 /// context for the scripting bridges (`request.agent.*`) and the
 /// `trust_tier` combiner.
+///
+/// WOR-2181: unknown keys are refused. A misspelled `rule_pack_paths:`
+/// used to deserialize silently and leave the scorer running against
+/// an empty pack, which scores every request as unsigned-anonymous.
+/// The deny only turns that into an error; what makes the error reach
+/// the operator is [`Self::from_extensions`] refusing the config
+/// rather than warning, which it does whenever the block asks for the
+/// scorer to be on.
 #[derive(Debug, Clone, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AgentDetectConfig {
     /// Master switch. `false` (the default) disables the scorer.
     #[serde(default)]
@@ -1478,25 +1487,57 @@ pub struct AgentDetectConfig {
 
 impl AgentDetectConfig {
     /// Build from the parsed `proxy.extensions.agent_detect` block.
-    /// Returns the disabled default when the block is absent or fails to
-    /// parse; a parse error warns rather than failing the whole compile.
-    /// (Unlike [`TlsFingerprintConfig::from_extensions`], which since
-    /// WOR-1161 hard-fails a malformed block that declares
-    /// `enabled: true`.)
+    ///
+    /// Returns `Ok(Default::default())` (disabled) when the block is
+    /// absent, which is the shape of every config that does not use
+    /// agent detection and stays a non-event.
+    ///
+    /// A block that fails to parse while asking for the scorer to be on
+    /// is a hard compile error (WOR-2181), mirroring
+    /// [`TlsFingerprintConfig::from_extensions`]. The operator asked
+    /// for detection, so warning and returning the disabled default
+    /// would run the proxy with the control off while the config says
+    /// it is on. Denying unknown fields without this would have made
+    /// the situation worse rather than better: a typo that used to be
+    /// dropped (leaving the scorer on with the rest of the block
+    /// intact) would have become a parse error and switched the whole
+    /// scorer off.
+    ///
+    /// A malformed block that does not ask for the scorer keeps the
+    /// warn-and-disable path, since disabled is what it asked for.
     pub fn from_extensions(
         extensions: &std::collections::HashMap<String, serde_yaml::Value>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let Some(block) = extensions.get("agent_detect") else {
-            return Self::default();
+            return Ok(Self::default());
         };
         match serde_yaml::from_value::<AgentDetectConfig>(block.clone()) {
-            Ok(cfg) => cfg,
+            Ok(cfg) => Ok(cfg),
             Err(e) => {
+                // Read the stated intent off the raw block rather than
+                // the parse that just failed: a bare `agent_detect:
+                // true` or an `enabled:` key that reads as true means
+                // the operator wanted the scorer on.
+                let wants_detection = block.as_bool() == Some(true)
+                    || match block.get("enabled") {
+                        Some(v) => {
+                            v.as_bool() == Some(true)
+                                || v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("true"))
+                        }
+                        None => false,
+                    };
+                if wants_detection {
+                    anyhow::bail!(
+                        "proxy.extensions.agent_detect has `enabled: true` but failed to \
+                         parse: {e}. Refusing to start with agent detection silently \
+                         disabled; fix or remove the block."
+                    );
+                }
                 tracing::warn!(
                     error = %e,
                     "proxy.extensions.agent_detect failed to parse; agent detection disabled",
                 );
-                Self::default()
+                Ok(Self::default())
             }
         }
     }
@@ -2775,7 +2816,7 @@ impl CompiledPipeline {
         // migration also fills from legacy features.tls_fingerprint).
         let tls_fingerprint_config =
             TlsFingerprintConfig::from_extensions(&config.server.extensions)?;
-        let agent_detect_config = AgentDetectConfig::from_extensions(&config.server.extensions);
+        let agent_detect_config = AgentDetectConfig::from_extensions(&config.server.extensions)?;
 
         // --- Page Shield raw-report opt-in ---
         // CSP reports default to redacted-only structured logs. The
@@ -7771,7 +7812,8 @@ origins: {}
         // No proxy.extensions.agent_detect at all: disabled default.
         let yaml = "proxy:\n  http_bind_port: 8080\norigins: {}\n";
         let cfg = sbproxy_config::compile_config(yaml).expect("compile");
-        let ad = AgentDetectConfig::from_extensions(&cfg.server.extensions);
+        let ad =
+            AgentDetectConfig::from_extensions(&cfg.server.extensions).expect("absent block is ok");
         assert!(!ad.enabled);
         assert!(ad.rule_pack_path.is_none());
         assert!(ad.onnx_model_path.is_none());
@@ -7790,7 +7832,8 @@ proxy:
 origins: {}
 "#;
         let cfg = sbproxy_config::compile_config(yaml).expect("compile");
-        let ad = AgentDetectConfig::from_extensions(&cfg.server.extensions);
+        let ad = AgentDetectConfig::from_extensions(&cfg.server.extensions)
+            .expect("well-formed block parses");
         assert!(ad.enabled);
         assert_eq!(
             ad.rule_pack_path.as_deref(),
@@ -7799,6 +7842,107 @@ origins: {}
         assert_eq!(
             ad.onnx_model_path.as_deref(),
             Some("/etc/sbproxy/ja4-catboost.onnx")
+        );
+    }
+
+    /// WOR-2181. A typo in an `enabled: true` block refuses the
+    /// config. Two things had to change together for this: the struct
+    /// denies unknown fields, and `from_extensions` hard-fails instead
+    /// of warning. Before either, `rule_pack_paths:` was dropped and
+    /// the scorer ran against an empty pack, scoring every request as
+    /// unsigned-anonymous while the config named a rule pack.
+    #[test]
+    fn agent_detect_unknown_key_refuses_an_enabled_block() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  extensions:
+    agent_detect:
+      enabled: true
+      rule_pack_paths: /etc/sbproxy/agents.yml
+origins: {}
+"#;
+        let cfg = sbproxy_config::compile_config(yaml).expect("the envelope still compiles");
+        let err = AgentDetectConfig::from_extensions(&cfg.server.extensions)
+            .expect_err("an enabled block with a typo must not resolve to the disabled default");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("rule_pack_paths"),
+            "the error must name the key the operator typed: {text}"
+        );
+        assert!(
+            text.contains("agent_detect"),
+            "the error must name the block: {text}"
+        );
+    }
+
+    /// The other side of the same switch: a block that does not ask
+    /// for the scorer keeps the warn-and-disable path, because
+    /// disabled is the outcome it asked for.
+    #[test]
+    fn agent_detect_unknown_key_on_a_disabled_block_still_warns_and_disables() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  extensions:
+    agent_detect:
+      enabled: false
+      rule_pack_paths: /etc/sbproxy/agents.yml
+origins: {}
+"#;
+        let cfg = sbproxy_config::compile_config(yaml).expect("the envelope still compiles");
+        let ad = AgentDetectConfig::from_extensions(&cfg.server.extensions)
+            .expect("a block that asks for nothing must not refuse the config");
+        assert!(!ad.enabled);
+    }
+
+    /// A correctly spelled enabled block still reaches the scorer
+    /// through the whole pipeline compile, not just the parser. A deny
+    /// that refused working configs would be the worse bug.
+    #[test]
+    fn agent_detect_enabled_block_survives_the_pipeline_compile() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  extensions:
+    agent_detect:
+      enabled: true
+      rule_pack_path: /etc/sbproxy/agents.yml
+origins: {}
+"#;
+        let cfg = sbproxy_config::compile_config(yaml).expect("compile");
+        let pipeline =
+            CompiledPipeline::from_config_for_validation(cfg).expect("pipeline compiles");
+        assert!(pipeline.agent_detect_config.enabled);
+        assert_eq!(
+            pipeline.agent_detect_config.rule_pack_path.as_deref(),
+            Some("/etc/sbproxy/agents.yml")
+        );
+    }
+
+    /// The refusal reaches the pipeline compile, which is the call
+    /// site an operator's `serve`, `validate`, and hot reload all go
+    /// through.
+    #[test]
+    fn agent_detect_typo_refuses_the_pipeline_compile() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  extensions:
+    agent_detect:
+      enabled: true
+      rule_pack_paths: /etc/sbproxy/agents.yml
+origins: {}
+"#;
+        let cfg = sbproxy_config::compile_config(yaml).expect("the envelope still compiles");
+        // CompiledPipeline has no Debug, so Option::expect replaces expect_err.
+        let err = CompiledPipeline::from_config_for_validation(cfg)
+            .err()
+            .expect("the pipeline compile must carry the refusal, not just the parser");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("rule_pack_paths"),
+            "the error must name the key: {text}"
         );
     }
 

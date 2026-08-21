@@ -50,3 +50,6 @@ __pycache__/
 .env.*
 !.env.example
 
+
+# graphify context graph output (local analysis artifact)
+graphify-out/

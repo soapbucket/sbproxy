@@ -18,6 +18,7 @@ ten-minute build.
 | Tracker placeholders | `grep -rn 'WOR-XXX' crates/ --include='*.rs' --include='*.toml'` (any hit fails) |
 | pub-item ratchet | `bash scripts/check-pub-item-ratchet.sh` |
 | unwrap/expect/panic ratchet | `bash scripts/check-unwrap-ratchet.sh` |
+| Operator URLs at log lines | `bash scripts/check-log-url-ratchet.sh` |
 | Spec citations | `bash scripts/check-spec-citations.sh` |
 | Env mutation | `bash scripts/check-env-mutation.sh` |
 | NOTICE (Apache-2.0-only) | `bash scripts/check-notice.sh` |

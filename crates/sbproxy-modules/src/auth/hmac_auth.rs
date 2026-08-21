@@ -110,6 +110,11 @@ fn default_required_components() -> Vec<String> {
 /// Deliberately not `pub`, and deliberately without a `Debug` derive:
 /// the secret must never reach a log line, an error string, or a
 /// debug dump. The provider's own `Debug` prints key ids only.
+///
+/// Permissive on unknown keys while `HmacAuthConfig` around it
+/// refuses them (WOR-2181): serde rejects `deny_unknown_fields`
+/// together with the flattened `attrs` below at compile time. Do not
+/// add it here; it will not build.
 #[derive(Deserialize, Clone)]
 struct HmacKeyEntry {
     /// Identifier the signer advertises as the RFC 9421 `keyid`
@@ -129,7 +134,13 @@ struct HmacKeyEntry {
 }
 
 /// Raw config shape for [`HmacAuth::from_config`].
+///
+/// WOR-2181: unknown keys are refused, so a misspelled
+/// `clock_skew_second:` fails the config instead of leaving the
+/// replay window at its default. `type:` is stripped by
+/// `crate::auth::provider_config_from_value` before this parses.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HmacAuthConfig {
     /// Accepted signing keys. At least one entry is required and every
     /// `key_id` must be unique.
@@ -214,9 +225,10 @@ impl HmacAuth {
     /// Build the provider from JSON config, resolving every secret
     /// through the central secret resolver and refusing an empty or
     /// duplicate key set. Error strings name the offending `key_id`
-    /// and never the configured secret value.
+    /// and never the configured secret value. Unknown keys are refused
+    /// (WOR-2181).
     pub fn from_config(value: serde_json::Value) -> anyhow::Result<Self> {
-        let cfg: HmacAuthConfig = serde_json::from_value(value)?;
+        let cfg: HmacAuthConfig = crate::auth::provider_config_from_value(value)?;
         if cfg.keys.is_empty() {
             anyhow::bail!("hmac_auth requires at least one entry in `keys`");
         }

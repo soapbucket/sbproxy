@@ -322,6 +322,30 @@ jobs:
       - name: no new unwrap/expect/panic in production code (WOR-2252)
         run: bash scripts/check-unwrap-ratchet.sh
 
+      # The third ratchet of the same family, and the same reason for
+      # living in this job: pure python over the source tree, sharing the
+      # ratchet vocabulary with the two steps above.
+      #
+      # An operator URL at a log line is a credential in whatever system
+      # collects those logs: the password sits in the authority and a
+      # Slack or Teams webhook's secret sits in the path. The second count
+      # this script holds is at zero rather than at a backlog, because
+      # `error = %e` on a `reqwest::Error` writes the request URL out of
+      # the error's own Display with no `url` field in sight, and every
+      # site the detector can see was converted (WOR-2629, WOR-2640).
+      #
+      # "Every site the detector can see" is the whole claim. The
+      # detector is a proximity heuristic over a fifteen-line window,
+      # extended one hop to same-file helpers that make the request
+      # themselves. It resolves no imports and reads no types, so a
+      # reqwest error laundered through another crate is outside it. The
+      # scanner's module header carries the seen and unseen sets in full,
+      # and the step below runs that scanner's own fixtures plus this
+      # script's, so neither can quietly stop detecting and read as a
+      # clean tree.
+      - name: no new operator URL at a log line (WOR-2629)
+        run: bash scripts/check-log-url-ratchet.sh
+
       - name: install.sh verifies its download (WOR-1914)
         run: sh scripts/tests/install_verify.sh
 
