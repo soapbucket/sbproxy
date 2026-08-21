@@ -386,6 +386,42 @@ OpenAPI tool calls, never its token endpoint.
 **What to do before upgrading.** Add every MCP token endpoint host to
 `egress.token_exchange.hosts` alongside the non-MCP ones already there.
 
+### `acme.storage_backend` on a shared store now refuses to start when it cannot be opened
+
+**Who this reaches.** Any config with `proxy.acme.enabled: true` and
+`storage_backend` set to `file`, `redis`, `s3`, `gcs`, or `azure`, where the
+value in `storage_path` does not actually open: a DSN the Redis parser
+rejects, a bucket URL the object store cannot parse, a shared directory that
+is not mounted in this container. A config whose backend opens is unaffected,
+and so is every pod-local backend (`redb`, `sqlite`, `memory`).
+
+**What changes.** Each of those open failures used to log one `warn` reading
+"certs will NOT persist (in-memory fallback)" and hand back an in-memory
+store. Persistence was the smaller half of what that cost. The in-memory
+store implements neither of `KVStore`'s lock methods, so it inherits the
+single-node defaults, which acquire unconditionally. Every replica therefore
+won its own issuance lease and its own fencing generation, opened its own
+ACME order for the same hostname, and published its HTTP-01 token where no
+peer could read it. The proxy now refuses to start instead, with an error
+naming the backend.
+
+**What an operator sees when it bites.** The process exits at startup rather
+than serving, and the error reads `acme.storage_backend '<backend>' is a
+shared certificate store and could not be opened`. No part of `storage_path`
+is in the message: a Redis DSN carries a password and an object-store URL can
+carry a query credential, so the message names the backend and the failure,
+never the value. Under Kubernetes this is a pod that does not become ready,
+which is visible immediately, rather than a fleet that looks healthy until
+the CA rate-limits the domain days later.
+
+**What to do before upgrading.** Grep the running proxies' startup logs for
+`certs will NOT persist (in-memory fallback)`. That warn line is the old
+build's only report of this condition, and a proxy that emitted it on a shared
+backend is a proxy that will not start on the new build. Fix the backend, or
+move to a pod-local `storage_backend` and a single replica. The new
+`sbproxy_cert_store_degraded{backend}` gauge covers the pod-local half from
+here on; the shared half no longer has a degraded state to report.
+
 ---
 
 ## Selected field stability reference

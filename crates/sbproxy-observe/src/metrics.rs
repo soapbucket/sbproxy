@@ -4869,6 +4869,41 @@ pub fn record_cert_expiry(host: &str, seconds_until_expiry: f64) {
         .set(seconds_until_expiry);
 }
 
+/// Publish whether the certificate store this process is running on is the
+/// one the config asked for, on `sbproxy_cert_store_degraded{backend}`.
+///
+/// `1` means the configured backend could not be opened and the process fell
+/// back to an in-memory store; `0` means it opened. `backend` is the
+/// configured `acme.storage_backend`, a closed set.
+///
+/// The series is published on the successful path too, deliberately. A gauge
+/// that only appears when something is wrong cannot be told apart from a
+/// scrape that never happened, and this one is the only signal for a failure
+/// mode with no other symptom until the CA rate-limits the domain: an
+/// in-memory store inherits the `KVStore` single-node lock defaults, so every
+/// replica wins its own ACME issuance lease and opens its own order.
+///
+/// Set once, at startup, from the certificate-store open path. Shared
+/// backends refuse to start rather than degrade, so a `1` here is a pod-local
+/// backend that could not open its file.
+pub fn set_cert_store_degraded(backend: &str, degraded: bool) {
+    use prometheus::{register_int_gauge_vec, IntGaugeVec};
+    use std::sync::OnceLock;
+    static G: OnceLock<IntGaugeVec> = OnceLock::new();
+    let gauge = G.get_or_init(|| {
+        register_int_gauge_vec!(
+            "sbproxy_cert_store_degraded",
+            "1 when the configured certificate store could not be opened and an              in-memory fallback is in use, 0 when the configured backend opened",
+            &["backend"],
+        )
+        .expect("cert store degraded gauge registers")
+    });
+    let backend = sanitize_label("backend", backend);
+    gauge
+        .with_label_values(&[backend.as_str()])
+        .set(i64::from(degraded));
+}
+
 /// WOR-1024: record the age of the cached OCSP staple for `host` on
 /// `sbproxy_ocsp_staple_age_seconds{host}`. A stale staple (over
 /// 24 hours) signals an OCSP refresh failure that has not yet

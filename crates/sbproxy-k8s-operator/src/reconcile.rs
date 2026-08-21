@@ -24,7 +24,7 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::ObjectMeta;
 use kube::Resource;
 
-use crate::crd::{ClusteringSpec, SBProxy, SBProxyConfig};
+use crate::crd::{ClusteringSpec, SBProxy, SBProxyConfig, SBProxyStatus};
 
 // --- Hot-reload decision ---
 
@@ -178,8 +178,7 @@ pub fn running_config_hash(sbproxy: &SBProxy) -> Option<&str> {
     sbproxy
         .status
         .as_ref()
-        .map(|s| s.config_hash.as_str())
-        .filter(|h| !h.is_empty())
+        .and_then(SBProxyStatus::delivered_config_hash)
 }
 
 /// The hash to stamp on the pod template of the workload about to be applied.
@@ -1190,7 +1189,7 @@ pub fn rolled_out_status_patch(config_hash: &str) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crd::{SBProxyConfigSpec, SBProxySpec, SBProxyStatus};
+    use crate::crd::{SBProxyConfigSpec, SBProxySpec};
     use kube::api::ObjectMeta;
 
     fn fixture_sbproxy() -> SBProxy {

@@ -198,6 +198,22 @@ pub struct SBProxyStatus {
     pub last_error: String,
 }
 
+impl SBProxyStatus {
+    /// The config hash the operator has finished delivering, or `None` when
+    /// nothing has been delivered yet.
+    ///
+    /// The emptiness rule lives here rather than at the call site because it
+    /// is a property of the field: `configHash` is
+    /// `skip_serializing_if = "String::is_empty"`, so a CR carrying a status
+    /// for `lastError` alone round-trips back with `config_hash` as `""`.
+    /// Treating that as a delivered hash would compare a real hash against
+    /// an empty string on every pass, which reads as "the config changed"
+    /// forever.
+    pub fn delivered_config_hash(&self) -> Option<&str> {
+        Some(self.config_hash.as_str()).filter(|hash| !hash.is_empty())
+    }
+}
+
 // --- SBProxyConfig ---
 
 /// A versioned `sb.yml` document, mounted into pods owned by an [`SBProxy`]
