@@ -114,11 +114,11 @@ spec:
             - image
             type: object
           status:
-            description: 'Status reported by the operator, so `kubectl get sbproxy -o yaml` answers two different questions: what the operator has seen, and what is actually running.'
+            description: 'Status reported by the operator, so `kubectl get sbproxy -o yaml` answers two different questions: what the operator has seen, and what it has finished delivering.'
             nullable: true
             properties:
               configHash:
-                description: Hash of the `SBProxyConfig.spec.config` that is running on the pods. Written only after the ConfigMap, Service, and workload have all been applied, or after every pod has accepted a hot reload. Empty until the first rollout completes. When this trails `observedConfigHash`, a rollout is in progress or is failing; check `lastError`.
+                description: Hash of the `SBProxyConfig.spec.config` the operator has finished delivering. Written only after the ConfigMap, Service, and workload have all been applied, or after every pod has accepted a hot reload. Empty until the first rollout completes. A rolling restart is still asynchronous after the apply lands, so pair this with the workload's own rollout status when you need to know the pods have caught up. When this trails `observedConfigHash`, the operator could not finish delivering; check `lastError` and the operator log.
                 type: string
               lastError:
                 description: Last error observed during reconcile, if any. Cleared only once a rollout completes, so an empty value and a `configHash` that matches `observedConfigHash` together mean the fleet is on the config you applied.

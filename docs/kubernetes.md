@@ -50,6 +50,8 @@ So `configHash` equal to `observedConfigHash` with an empty `lastError` is the f
 
 Config-only changes prefer the hot-reload branch; a cluster-topology change (replica count, ports, flipping `clustering.enabled`) always takes the rollout path, because those are process-owned identity and never swap on a live reload. See [Hot-reload (recommended)](#hot-reload-recommended) and [Clustered proxies](#clustered-proxies) below for what each branch actually does to the pods.
 
+A pass over an unchanged `SBProxy` writes nothing and reloads nothing. Deciding that needs the two hashes above rather than the pod template's `sbproxy.dev/config-hash` annotation: a successful hot reload deliberately leaves that annotation alone, since changing it is the rolling restart the reload exists to avoid. The operator reads `status.configHash` for "what have the pods been given" and keeps the annotation at whatever the pods were started with until something actually has to roll them.
+
 ## Install the chart
 
 The Helm chart lives at `deploy/helm/sbproxy/`. It installs the CRDs, the operator Deployment, the ServiceAccount, and the RBAC the operator needs. By default that RBAC is a namespaced Role and RoleBinding, so the operator can only touch its own namespace.

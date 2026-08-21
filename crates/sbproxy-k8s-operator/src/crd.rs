@@ -167,16 +167,19 @@ pub struct ResourceRequirements {
 }
 
 /// Status reported by the operator, so `kubectl get sbproxy -o yaml` answers
-/// two different questions: what the operator has seen, and what is actually
-/// running.
+/// two different questions: what the operator has seen, and what it has
+/// finished delivering.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SBProxyStatus {
-    /// Hash of the `SBProxyConfig.spec.config` that is running on the pods.
-    /// Written only after the ConfigMap, Service, and workload have all been
-    /// applied, or after every pod has accepted a hot reload. Empty until the
-    /// first rollout completes. When this trails `observedConfigHash`, a
-    /// rollout is in progress or is failing; check `lastError`.
+    /// Hash of the `SBProxyConfig.spec.config` the operator has finished
+    /// delivering. Written only after the ConfigMap, Service, and workload
+    /// have all been applied, or after every pod has accepted a hot reload.
+    /// Empty until the first rollout completes. A rolling restart is still
+    /// asynchronous after the apply lands, so pair this with the workload's
+    /// own rollout status when you need to know the pods have caught up.
+    /// When this trails `observedConfigHash`, the operator could not finish
+    /// delivering; check `lastError` and the operator log.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub config_hash: String,
 

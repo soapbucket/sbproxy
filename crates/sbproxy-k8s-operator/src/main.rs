@@ -669,25 +669,38 @@ async fn reconcile_deployment_workload(
     // clustering later reuses the same key, and the owner reference
     // still cascades it on SBProxy deletion.
 
-    let desired_deploy = reconcile::desired_deployment(sbproxy, hash);
-
     // --- Decide hot-reload vs rollout-restart ---
     let deploy_api: Api<Deployment> = Api::namespaced(ctx.client.clone(), ns);
+    let existing_deploy = deploy_api
+        .get_opt(&reconcile::deployment_name(sbproxy))
+        .await
+        .unwrap_or(None);
+    let template_hash = existing_deploy
+        .as_ref()
+        .and_then(reconcile::previous_config_hash);
+    // What the pods are serving, which after a hot reload is ahead of what
+    // their template says they were started with.
+    let running_hash = reconcile::running_config_hash(sbproxy);
+
+    // The pod template only moves when the pods have to. Building the
+    // desired Deployment around that hash rather than around `hash` is what
+    // keeps the pass after a hot reload from rolling the fleet for a config
+    // it is already running.
+    let desired_deploy = reconcile::desired_deployment(
+        sbproxy,
+        reconcile::rollout_config_hash(template_hash.as_deref(), running_hash, hash),
+    );
     let deploy_name = desired_deploy
         .metadata
         .name
         .as_deref()
         .ok_or(ReconcileError::MissingName)?;
-    let existing_deploy = deploy_api.get_opt(deploy_name).await.unwrap_or(None);
-    let prev_hash = existing_deploy
-        .as_ref()
-        .and_then(reconcile::previous_config_hash);
 
     let hot_reload_eligible = reconcile::should_hot_reload(
         sbproxy,
         existing_deploy.as_ref(),
         &desired_deploy,
-        prev_hash.as_deref(),
+        running_hash,
         hash,
     );
 
@@ -708,11 +721,14 @@ async fn reconcile_deployment_workload(
                     config_revision = %hash,
                     "hot-reloaded all proxy pods via /admin/reload"
                 );
-                // Skip the Deployment patch entirely so the pod
-                // template's config-hash annotation stays stale
-                // until the next "real" Deployment edit. The
-                // ConfigMap is already up to date for any pod that
-                // restarts for unrelated reasons.
+                // Skip the Deployment patch entirely: the pod template's
+                // config-hash annotation is the rolling-restart trigger, so
+                // advancing it here would restart the pods a reload just
+                // spared. `status.configHash`, stamped by the caller once
+                // this returns Ok, is what records the delivery, and it is
+                // what gate 4 above reads on the next pass. The ConfigMap is
+                // already up to date for any pod that restarts for unrelated
+                // reasons.
                 return Ok(Action::requeue(Duration::from_secs(300)));
             }
             // `hot_reload_error`, not `e`: `HotReloadError::Request`
@@ -824,23 +840,33 @@ async fn reconcile_clustered_workload(
     }
 
     // --- Decide hot-reload vs rollout-restart, then apply ---
-    let desired_sts = reconcile::desired_statefulset(sbproxy, hash);
     let sts_api: Api<StatefulSet> = Api::namespaced(ctx.client.clone(), ns);
+    let existing_sts = sts_api
+        .get_opt(&reconcile::statefulset_name(sbproxy))
+        .await
+        .unwrap_or(None);
+    let template_hash = existing_sts
+        .as_ref()
+        .and_then(reconcile::previous_config_hash_statefulset);
+    let running_hash = reconcile::running_config_hash(sbproxy);
+
+    // Same reasoning as the Deployment path: the template hash is the roll
+    // trigger, so it holds still while the pods already run the config.
+    let desired_sts = reconcile::desired_statefulset(
+        sbproxy,
+        reconcile::rollout_config_hash(template_hash.as_deref(), running_hash, hash),
+    );
     let sts_name = desired_sts
         .metadata
         .name
         .as_deref()
         .ok_or(ReconcileError::MissingName)?;
-    let existing_sts = sts_api.get_opt(sts_name).await.unwrap_or(None);
-    let prev_hash = existing_sts
-        .as_ref()
-        .and_then(reconcile::previous_config_hash_statefulset);
 
     let hot_reload_eligible = reconcile::should_hot_reload_statefulset(
         sbproxy,
         existing_sts.as_ref(),
         &desired_sts,
-        prev_hash.as_deref(),
+        running_hash,
         hash,
     );
 
