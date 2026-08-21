@@ -1,6 +1,6 @@
 # Transforms
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 A transform edits a response body before it reaches the client. Reach for one when the shape an upstream returns is not the shape a caller needs: trimming fields from a JSON payload, converting HTML to Markdown for an LLM, capping a body size, or running a sandboxed script or WASM module over the bytes. Transforms never touch the request; for that, see the request modifier and forward-rule sections of [configuration.md](configuration.md).
 
@@ -247,7 +247,7 @@ No example directory ships this transform; the snippet is built directly from `S
 |-------|------|---------|-------------|
 | `remove_selectors` | list | `[]` | Tag names or `#id` selectors to strip. |
 | `inject` | list | `[]` | `{position, content}` entries. `position` is `head_end`, `body_start`, or `body_end`. |
-| `rewrite_attributes` | list | `[]` | `{selector, attribute, value}` entries. When no matching tag already carries the attribute, only the *first* matching tag is stamped, not every one; see [the worked example's known-limitation note](../examples/transform-html/README.md#known-limitation-rewrite_attributes-only-touches-the-first-new-match) (WOR-2533). |
+| `rewrite_attributes` | list | `[]` | `{selector, attribute, value}` entries. Every tag the selector matches is stamped: a tag that already carries the attribute has its value replaced, and a tag that does not gets the attribute added. |
 | `format_options` | object | none | Optional post-manipulation HTML optimization (see `optimize_html` below for the sub-fields). |
 
 ```yaml

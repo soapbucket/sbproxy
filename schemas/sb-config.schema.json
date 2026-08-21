@@ -2038,7 +2038,7 @@
       "type": "object",
       "properties": {
         "directory": {
-          "description": "Cache directory. Omission uses the platform default.",
+          "description": "Cache directory, as an absolute path. Omission uses the platform default: `$HF_HOME`, then `/var/lib/sbproxy/models` when this process can write there, then `~/.cache/sbproxy/models`.\n\nA relative path is refused at load. The engine subprocess that reads this cache has its own working directory and requires an absolute snapshot path, and in a split-role cluster each node reads the key from its own file, so a relative value names a different directory per process. Interpolate a variable such as `${HOME}` when the location is per-host.",
           "default": null,
           "type": [
             "string",
