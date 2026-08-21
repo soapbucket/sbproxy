@@ -5438,6 +5438,10 @@ pub(super) async fn handle_ai_proxy(
             )
         };
         if let Some(block) = block {
+            sbproxy_observe::metrics::record_prompt_injection_block(
+                "ai_body",
+                ctx.tenant_id.as_ref(),
+            );
             warn!("AI proxy: body-aware prompt injection policy blocked request");
             sbproxy_ai::tracing_spans::record_error(
                 &ai_span,

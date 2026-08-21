@@ -2633,6 +2633,75 @@ pub fn record_http_framing_block(reason: &str, tenant: &str) {
         .inc();
 }
 
+/// Record one `prompt_injection_v2` block, labeled by the scan path that
+/// produced it (WOR-2530).
+///
+/// `scan_path` is a closed four-value set, one per place the policy can
+/// deny: `header_scan` (the synchronous request-line and header scan in
+/// the `request_filter` enforcer), `body_scan` (the buffered request body
+/// on the generic proxy path), `ai_body` (the AI dispatch prompt
+/// segments), and `a2a` (agent-to-agent message parts).
+///
+/// The label is the point. Those four paths drifted: three wrote the
+/// operator's configured `block_body` and `block_content_type` verbatim
+/// and one wrapped the body in `{"error": ...}` with a hardcoded
+/// `application/json`. Nothing in `/metrics` told them apart, so which
+/// path had blocked a given request was not an answerable question, and
+/// the asymmetry survived until someone compared two responses by hand.
+///
+/// `tenant` is operator-supplied and passes through the cardinality
+/// limiter. A block is a security verdict about one tenant's traffic, so
+/// this family is listed in `TENANT_SCOPED_METRICS`.
+pub fn record_prompt_injection_block(scan_path: &str, tenant: &str) {
+    use prometheus::{register_counter_vec, CounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<CounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_counter_vec!(
+            "sbproxy_prompt_injection_blocks_total",
+            "Requests blocked by the prompt_injection_v2 policy, by scan path",
+            &["scan_path", "tenant"],
+        )
+        .expect("counter vec registers")
+    });
+    let tenant_san = sanitize_label("tenant", tenant);
+    counter
+        .with_label_values(&[scan_path, tenant_san.as_str()])
+        .inc();
+}
+
+/// Record one Content-Security-Policy header emitted by the
+/// `security_headers` policy, by `mode` (`enforce` or `report_only`).
+///
+/// A CSP that is configured and silently never shipped is
+/// indistinguishable from a working one by reading the config file, which
+/// is how a dropped `content_security_policy` survived in an example
+/// config and in the docs (WOR-2526). This counter is the difference: an
+/// operator who configured a CSP and watches this series sit at zero
+/// knows the header is not reaching browsers. The `mode` label carries
+/// the second half of that bug, where a `report_only` policy was emitted
+/// as an enforcing one.
+///
+/// `tenant` is operator-supplied and passes through the cardinality
+/// limiter.
+pub fn record_security_headers_csp_emitted(mode: &str, tenant: &str) {
+    use prometheus::{register_counter_vec, CounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<CounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_counter_vec!(
+            "sbproxy_security_headers_csp_emitted_total",
+            "Content-Security-Policy headers emitted by the security_headers policy, by mode",
+            &["mode", "tenant"],
+        )
+        .expect("counter vec registers")
+    });
+    let tenant_san = sanitize_label("tenant", tenant);
+    counter
+        .with_label_values(&[mode, tenant_san.as_str()])
+        .inc();
+}
+
 /// Record one WebSocket upgrade refusal or tunnel teardown initiated
 /// by the gateway (WOR-2552).
 ///

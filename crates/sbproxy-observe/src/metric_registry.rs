@@ -3235,6 +3235,24 @@ pub const METRICS: &[MetricCapability] = &[
     // dropped from a document that still serves, plus the serialize fallbacks
     // in that manifest and in tdmrep, which substitute an empty document that
     // reads as a deliberate "this origin advertises nothing".
+    // WOR-2530. The scan_path label is load-bearing, not decoration. The
+    // policy can deny from four places and three of them wrote the operator's
+    // configured block body and content type while the fourth wrapped the
+    // body in an `{"error": ...}` envelope with a hardcoded
+    // `application/json`. With no label there was one merged series, so
+    // "which path blocked this" was not a question /metrics could answer and
+    // the drift stayed invisible.
+    MetricCapability {
+        name: "sbproxy_prompt_injection_blocks_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_prompt_injection_block"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["scan_path", "tenant"],
+        description: "Requests blocked by the prompt_injection_v2 policy, by scan path (header_scan, body_scan, ai_body, a2a).",
+        dead_reason: None,
+    },
     MetricCapability {
         name: "sbproxy_projection_render_failures_total",
         kind: MetricKind::Counter,
@@ -3505,6 +3523,24 @@ pub const METRICS: &[MetricCapability] = &[
              sbproxy-model-host, out of this lane's file allowlist; wire the decision call \
              there or delete under WOR-1898",
         ),
+    },
+    // WOR-2526. A configured Content-Security-Policy that ships nothing reads
+    // exactly like a working one from the config file, which is how a dropped
+    // CSP survived in a shipped example and in the reference docs. This
+    // counter is the difference between "configured" and "delivered": flat at
+    // zero on an origin whose config sets content_security_policy is the
+    // signal. The mode label carries the second half of that bug, where a
+    // report_only policy was emitted as an enforcing one.
+    MetricCapability {
+        name: "sbproxy_security_headers_csp_emitted_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_security_headers_csp_emitted"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["mode", "tenant"],
+        description: "Content-Security-Policy headers emitted by the security_headers policy, by mode (enforce, report_only).",
+        dead_reason: None,
     },
     MetricCapability {
         name: "sbproxy_silent_degradations_total",
@@ -3868,8 +3904,19 @@ pub const TENANT_SCOPED_METRICS: &[&str] = &[
     "sbproxy_meter_receipts_total",
     "sbproxy_meter_units_total",
     "sbproxy_policy_audit_events_dropped_total",
+    // WOR-2530. A prompt-injection block is a security verdict about one
+    // tenant's traffic, the same reasoning as the framing and egress
+    // counters above. Merged across tenants it answers "something was
+    // blocked somewhere", which no operator of a multi-tenant deployment
+    // can act on.
+    "sbproxy_prompt_injection_blocks_total",
     "sbproxy_rate_limit_suspend_total",
     "sbproxy_rate_limit_total",
+    // WOR-2526. Whether a browser hardening header actually reached clients
+    // is a per-origin, and therefore per-tenant, question. One merged series
+    // cannot tell an operator which tenant's origins are serving responses
+    // with no CSP.
+    "sbproxy_security_headers_csp_emitted_total",
     "sbproxy_semantic_cache_results_total",
     "sbproxy_usage_bridge_enqueued_total",
     "sbproxy_usage_bridge_gap_total",

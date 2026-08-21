@@ -1,6 +1,6 @@
 # gRPC over HTTP/2 cleartext (h2c)
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-20*
 
 Proxies plaintext gRPC traffic to an upstream gRPC server. gRPC requires HTTP/2 end-to-end, so the proxy's plain HTTP listener must speak HTTP/2 cleartext (h2c). The `proxy.http2_cleartext: true` flag enables Pingora's h2c preface detection on the listener so that connections that begin with the HTTP/2 connection preface are upgraded to h2 transparently. Connections that begin with a normal HTTP/1.1 request line continue to be served as HTTP/1.1, so a single listener can carry both protocols.
 
@@ -28,7 +28,13 @@ grpcurl -plaintext -authority grpc.example.com \
 
 The `-authority grpc.example.com` flag tells grpcurl to set the HTTP/2 `:authority` pseudo-header to `grpc.example.com`, which is how the proxy picks the right origin config.
 
-The unary invoke reliably works end to end through the proxy. `list` (server reflection) does not in current testing: reflection's `ServerReflectionInfo` is a bidirectional-streaming RPC, and proxying it through the `grpc` action currently 502s upstream-side with `stream error received: not a result of an error`, which grpcurl surfaces client-side as a garbled `ResourceExhausted` framing error. A plain unary call to a known method (skip `list`, pass `-proto` instead of relying on reflection) is unaffected.
+Both commands work end to end. `list` is worth calling out because server reflection's `ServerReflectionInfo` is a bidirectional-streaming RPC, so a working `list` is a working bidi stream: the proxy forces HTTP/2 upstream and forwards the length-prefixed frames untouched in both directions. Checked against a grpc-go server with reflection registered, `grpcurl describe` returns byte-identical output through the proxy and straight at the upstream.
+
+An earlier revision of this page reported `list` failing with a framing error. That is no longer what the proxy does, and the note is removed rather than kept as a caveat: a page that warns you off a working feature costs you the feature.
+
+### One composition to avoid
+
+Attaching a body-reading policy to this origin (`content_digest`, `request_validator`, `openapi_validation`, `body_threat_protection`, or body-aware `prompt_injection_v2`) stalls every streaming RPC on it, `list` included. Those policies need the complete request body, so the proxy holds the request until the client half-closes, and a streaming client will not half-close until it has read a response that cannot arrive. Unary calls are unaffected because they half-close immediately. Nothing refuses the combination at config load, and the stall reads like an upstream problem, so it is worth knowing before you reach for it. See [routing.md](../../docs/routing.md#grpc-limits).
 
 ## What this exercises
 

@@ -2072,6 +2072,22 @@ async fn send_idempotency_cache_hit(
 /// escaped rather than interpolated into a hand-built JSON string. A
 /// quote or backslash in the message would otherwise break the envelope
 /// or inject sibling fields.
+/// Classify a resolved `security_headers` entry as a CSP emission, and in
+/// which mode.
+///
+/// Both response paths (proxied and generated) call this on every header
+/// the policy resolved so `sbproxy_security_headers_csp_emitted_total`
+/// counts the header that actually reaches the client rather than the one
+/// the config asked for. Those two were not the same thing before
+/// WOR-2526, and the config file could not tell you which you had.
+pub(super) fn csp_emission_mode(name: &str) -> Option<&'static str> {
+    match name {
+        "content-security-policy" => Some("enforce"),
+        "content-security-policy-report-only" => Some("report_only"),
+        _ => None,
+    }
+}
+
 pub(super) fn error_json_body(message: &str) -> String {
     serde_json::json!({ "error": message }).to_string()
 }
@@ -5740,6 +5756,12 @@ fn apply_generated_response_phases(
                 let path = session.req_header().uri.path();
                 let (headers, nonce) = sec.resolved_headers_for_request(path);
                 for (name, value) in headers {
+                    if let Some(mode) = csp_emission_mode(&name) {
+                        sbproxy_observe::metrics::record_security_headers_csp_emitted(
+                            mode,
+                            ctx.tenant_id.as_ref(),
+                        );
+                    }
                     let _ = header.insert_header(name, &value);
                 }
                 if let Some(n) = nonce {

@@ -162,8 +162,10 @@ Validation runs in `request_body_filter`, which only executes for a request the
 proxy forwards. Pair `openapi_validation` with a `static` action and the policy
 compiles, appears in the verdict stream, and validates nothing: the static
 response is produced before the body is ever read, so every body is accepted.
-The same applies to the other body-reading policies, `content_digest` and
-`request_validator`.
+The same applies to `request_validator`, and to `content_digest` on every branch
+that needs the body. `content_digest`'s one header-phase branch is the exception:
+`on_missing: require` decides from the request headers, so it refuses behind a
+`static` action too.
 
 The example uses a `proxy` action for that reason. If you are testing this
 policy against a stub origin and every malformed body returns success, check
