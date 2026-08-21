@@ -7830,6 +7830,7 @@ dependencies = [
  "redb 2.6.3",
  "redis",
  "sbproxy-security",
+ "sbproxy-util",
  "sbproxy-vault",
  "serde",
  "serde_json",
