@@ -678,6 +678,7 @@ fn concealment_class_label(label: &str) -> &'static str {
         "tag_block" => "tag_block",
         "bidi_control" => "bidi_control",
         "zero_width" => "zero_width",
+        "variation_selector" => "variation_selector",
         _ => "other_control",
     }
 }

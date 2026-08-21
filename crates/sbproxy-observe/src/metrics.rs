@@ -5388,7 +5388,8 @@ pub fn record_mcp_poison_indicator(
 ///
 /// `field` is the advertised field (`name`, `title`, `description`), `class`
 /// the concealment class (`tag_block`, `bidi_control`, `zero_width`,
-/// `other_control`), and `kind` whether the finding appeared or cleared.
+/// `variation_selector`, `other_control`), and `kind` whether the finding
+/// appeared or cleared.
 ///
 /// Every label is a closed set chosen by this gateway. Deliberately none of
 /// them is the tool or server name: those are upstream-controlled strings and
