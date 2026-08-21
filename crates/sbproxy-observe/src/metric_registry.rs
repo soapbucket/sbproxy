@@ -1723,6 +1723,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_cert_store_degraded",
+        kind: MetricKind::Gauge,
+        writer: Writer::Recorder("set_cert_store_degraded"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["backend"],
+        description: "1 when the configured certificate store could not be opened and an in-memory fallback is in use, 0 when the configured backend opened.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_circuit_breaker_transitions_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_circuit_breaker"),
