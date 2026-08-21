@@ -386,6 +386,57 @@ OpenAPI tool calls, never its token endpoint.
 **What to do before upgrading.** Add every MCP token endpoint host to
 `egress.token_exchange.hosts` alongside the non-MCP ones already there.
 
+### `mcp.rbac_policies[].tool_quotas[].rate.per` is now validated at load
+
+**Who this reaches.** Any config with an `mcp` action whose `rbac_policies`
+declare a `tool_quotas[]` rule with a `per:` value the duration parser cannot
+read. The accepted suffixes are `ms`, `s`, `m`, `h`, and `d`; `per: 1hour`,
+`per: 60`, and `per: 1 hour` are all outside them. A config whose windows all
+use a documented suffix is unaffected.
+
+**What changes.** Nothing validated the string. The value was read for the
+first time on the request path, where a parse failure was treated as "this
+tool has no quota" and every `tools/call` passed, with no log line and no
+counter, so the operator's dashboard showed the quota configured and zero
+rejections. The action now refuses the config with an error naming the policy
+label, the tool, and the string it could not read. The request-path branch
+survives as a backstop and now denies the call instead of allowing it.
+
+**What an operator sees when it bites.** Startup or reload fails with
+`mcp action: rbac_policies['<label>']: tool_quotas rule for tool '<tool>' has
+an unparseable rate.per '<value>'`, listing the accepted suffixes. A reload
+leaves the previous generation serving.
+
+**What to do before upgrading.** Grep your configs for `per:` under
+`tool_quotas` and confirm every value ends in one of the five suffixes. A
+quota that has never rejected anything is the one to check first: under the
+old behavior an unreadable window and an unreached limit looked identical.
+
+### `proxy.scripting.lua.sandbox.allow_patterns: false` now also gates `string.gsub`
+
+**Who this reaches.** Any config that sets `allow_patterns: false` and whose
+Lua scripts call `string.gsub`. A config leaving `allow_patterns` at its
+`true` default is unaffected, and so is one whose scripts never call `gsub`.
+
+**What changes.** The gate stubbed `string.find`, `string.match`, and
+`string.gmatch` and left `string.gsub` reachable, so the knob whose stated
+purpose is containing the pattern engine left the same C-level matcher open.
+`gsub` is stubbed now, alongside the other three, which is the whole set of
+`string` functions that take a pattern.
+
+**What an operator sees when it bites.** The script fails with
+`Lua pattern API disabled by sandbox
+(proxy.scripting.lua.sandbox.allow_patterns)`, the same error the other three
+already raised, and the request fails closed the way any Lua error on that
+surface does.
+
+**What to do before upgrading.** Grep your Lua for `gsub`. Rewrite the call
+with `string.sub` and plain-text search, or set `allow_patterns: true` and
+accept that the pattern engine is on. Note what the flag buys either way:
+`max_execution_ms` cannot preempt a backtracking pattern, because the matcher
+runs inside the C string library where the interrupt the timer relies on never
+fires. Refusing the call is the only containment there is.
+
 ---
 
 ## Selected field stability reference

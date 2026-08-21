@@ -1,6 +1,6 @@
 # MCP gateway
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 SBproxy ships an MCP (Model Context Protocol) gateway that speaks
 JSON-RPC 2.0 over HTTP POST. Configure the `mcp` action on an origin
@@ -456,7 +456,16 @@ WARN mcp.catalog kind=added field=description classes=tag_block
 
 Counted on `sbproxy_mcp_concealed_text_findings_total{field, class,
 kind}`, where `class` is one of `tag_block`, `bidi_control`,
-`zero_width`, or `other_control`.
+`zero_width`, `variation_selector`, or `other_control`.
+
+`variation_selector` covers `U+FE00` to `U+FE0F` and `U+E0100` to
+`U+E01EF`, 256 invisible code points wide enough to carry a byte each
+and the channel current smuggling work uses. `U+FE0F` is also the
+emoji presentation selector, so a description ending in an emoji is
+reported under this class. That is deliberate: nothing in the code
+point tells presentation apart from payload, and the class is separate
+from `zero_width` precisely so an operator can see which findings are
+the noisy ones.
 
 Ordinary text in any language is never a finding. An Arabic or Hebrew
 description contains right-to-left characters by nature; only the
@@ -1014,6 +1023,19 @@ rbac_policies:
 
 The store is per-action and lives in process memory; SIGHUP reload
 rebuilds the action and resets the counters.
+
+A `per:` value outside `ms / s / m / h / d` is a hard config error
+naming the policy and the rule, so a typo like `per: 1hour` refuses
+the config instead of loading a quota nothing enforces.
+
+The store tracks one window per `(tenant_id, principal_id, tool_name)`
+and `principal_id` comes from the caller's virtual key or `sub`, so
+the number of windows follows traffic rather than the policy. Windows
+that have fully aged out are reclaimed automatically. A process
+holding 100,000 live windows at once refuses `tools/call` for any
+principal it has no window for, rather than admitting it unmetered;
+the refusal is the same `-32099` a caller over quota gets, and a
+`warn` line names the tool.
 
 Source: `crates/sbproxy-extension/src/mcp/access_control.rs:ToolAccessPolicy`.
 

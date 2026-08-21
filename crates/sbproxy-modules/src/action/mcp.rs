@@ -4391,6 +4391,26 @@ impl McpAction {
             }
         }
 
+        // A `tool_quotas[].rate.per` nothing can parse is a quota that
+        // does not exist. `ToolAccessPolicy` is plain serde with no
+        // validate hook, so `per: "1hour"` used to compile clean and
+        // then be read for the first time on the request path, where
+        // the check treated the parse failure as "no quota" and let
+        // every call through. Refuse it here, at the one place a
+        // policy the MCP action will enforce is compiled, and name the
+        // rule so the operator does not have to guess which row is
+        // wrong. Iterated in sorted label order so the message a given
+        // config produces does not depend on hash iteration order.
+        let mut labels: Vec<&String> = cfg.rbac_policies.keys().collect();
+        labels.sort();
+        for label in labels {
+            if let Some(policy) = cfg.rbac_policies.get(label) {
+                policy.validate_quota_windows().map_err(|error| {
+                    anyhow::anyhow!("mcp action: rbac_policies['{label}']: {error}")
+                })?;
+            }
+        }
+
         // WOR-2384 fix round 1, item 1 (critical): federation's
         // OUTBOUND leg speaks only `LEGACY_PROTOCOL_VERSION` today.
         // `fetch_server_capabilities` requests `LATEST_PROTOCOL_VERSION`
@@ -6914,6 +6934,63 @@ mod tests {
             err.contains("rbac"),
             "error must point at the missing rbac label, got: {err}",
         );
+    }
+
+    /// A `tool_quotas[].rate.per` the duration parser cannot read is
+    /// refused at compile, not accepted and then ignored at runtime.
+    ///
+    /// The seam is `McpAction::from_parsed`. `ToolAccessPolicy` is
+    /// plain serde with no validate hook, so before this guard the
+    /// config below compiled clean, `sbproxy validate` accepted it,
+    /// and every `tools/call execute_sql` then ran unlimited because
+    /// the request-path check read the parse failure as "no quota".
+    #[test]
+    fn rejects_unparseable_tool_quota_window() {
+        let value = json!({
+            "type": "mcp",
+            "rbac_policies": {
+                "analyst": {
+                    "default_allow": true,
+                    "tool_quotas": [
+                        { "tool_name": "execute_sql", "rate": { "per": "1hour", "max": 10 } }
+                    ]
+                }
+            },
+            "federated_servers": [
+                { "origin": "postgres.example.com", "prefix": "db", "rbac": "analyst" }
+            ]
+        });
+        let err = McpAction::from_config(value).unwrap_err().to_string();
+        assert!(err.contains("analyst"), "error must name the policy: {err}");
+        assert!(
+            err.contains("execute_sql"),
+            "error must name the quota rule: {err}",
+        );
+        assert!(
+            err.contains("1hour"),
+            "error must quote the string it refused: {err}",
+        );
+    }
+
+    /// The documented suffixes still compile, so the guard above is a
+    /// refusal of bad input rather than of quotas.
+    #[test]
+    fn accepts_documented_tool_quota_window() {
+        let value = json!({
+            "type": "mcp",
+            "rbac_policies": {
+                "analyst": {
+                    "default_allow": true,
+                    "tool_quotas": [
+                        { "tool_name": "execute_sql", "rate": { "per": "1h", "max": 10 } }
+                    ]
+                }
+            },
+            "federated_servers": [
+                { "origin": "postgres.example.com", "prefix": "db", "rbac": "analyst" }
+            ]
+        });
+        McpAction::from_config(value).expect("a documented suffix compiles");
     }
 
     /// Deliberate allow-all stays expressible under WOR-2314: bind
