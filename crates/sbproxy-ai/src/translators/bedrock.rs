@@ -17,10 +17,15 @@
 //! Streaming responses are handled by the native stream translator in
 //! `format::native_streams`, which parses Bedrock stream events into
 //! the shared hub stream before the inbound route re-emits them.
-//! SigV4 request signing is handled at the HTTP transport layer (the
-//! `Authorization` header set by operator config or a future signing
-//! middleware); it is not part of the JSON body translation contract
-//! this module owns.
+//! SigV4 request signing is handled at the HTTP transport layer, by
+//! `crate::aws_sigv4` at the `client::send_governed` transport boundary,
+//! and it is not part of the JSON body translation contract this module
+//! owns. The dependency runs the other way and is load bearing: a SigV4
+//! signature covers a SHA-256 of the request body, so the body this
+//! module produces is the body that gets hashed. Anything that mutates
+//! a Bedrock request after translation has to do it above the signing
+//! boundary, or the signature will not match what is sent and the
+//! failure will arrive as a 403 that reads like a permissions problem.
 
 use serde_json::{json, Map, Value};
 

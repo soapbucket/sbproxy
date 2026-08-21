@@ -7,13 +7,15 @@
 //! # The defect this closes
 //!
 //! [`crate::events::EventBus`] fans out to handler closures **on the
-//! publisher's thread**, in registration order, with the handler map
-//! held under a lock for the whole fan-out. That is fine for a closure
-//! that increments a counter and wrong for anything that touches a
-//! socket: a handler that POSTs to a SIEM makes every request that
-//! trips a policy wait for that SIEM. Nothing crossed the process
-//! boundary before this module, so the shape had never been paid for,
-//! and shipping a synchronous webhook would have been worse than
+//! publisher's thread**, in registration order, over the subscriber
+//! snapshot it takes when `publish` is entered. The handler map is
+//! unlocked before the first handler runs, so one slow handler no longer
+//! stalls every other publisher, but it still stalls its own. That is
+//! fine for a closure that increments a counter and wrong for anything
+//! that touches a socket: a handler that POSTs to a SIEM makes the
+//! request that trips a policy wait for that SIEM. Nothing crossed the
+//! process boundary before this module, so the shape had never been paid
+//! for, and shipping a synchronous webhook would have been worse than
 //! shipping nothing.
 //!
 //! So this is not a bus handler. Publishing is a bitmask test and one

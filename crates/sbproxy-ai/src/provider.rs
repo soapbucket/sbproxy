@@ -110,6 +110,27 @@ pub struct ProviderConfig {
     /// epic; this field is the config surface it reads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serve: Option<sbproxy_model_host::ModelHostConfig>,
+    /// Sign this provider's requests with AWS Signature
+    /// Version 4 instead of forwarding a static credential. Required
+    /// by Bedrock and SageMaker, which do not accept a bearer token.
+    /// Presence of this block is what selects the signer, so a
+    /// provider entry either sets `api_key` or sets this, never both.
+    /// `region` is required and is the credential scope; it is never
+    /// inferred from `base_url`, matching the AWS SDKs, where an
+    /// endpoint override leaves the signing region alone. When
+    /// `base_url` is unset, `region` also fills the `{region}`
+    /// placeholder in the provider catalog's default endpoint. See
+    /// `sbproxy_ai::aws_sigv4`.
+    #[serde(default)]
+    // Boxed deliberately, and a plain comment rather than rustdoc
+    // because this rustdoc ships as the operator-facing schema
+    // description and an operator does not care where the bytes live.
+    // `AwsSigV4Config` is 256 bytes and almost every entry leaves it
+    // unset, so inlining it grew every `ProviderConfig` by 50% and,
+    // with it, every async state machine holding one across an await.
+    // That was enough to overflow the Pingora worker thread's stack on
+    // the AI request path.
+    pub aws_sigv4: Option<Box<crate::aws_sigv4::AwsSigV4Config>>,
 }
 
 fn default_weight() -> u32 {
@@ -212,14 +233,33 @@ impl ProviderConfig {
     /// Get the effective base URL for this provider.
     ///
     /// Priority: explicit `base_url` > registry default > fallback localhost.
+    ///
+    /// WOR-2648: the AWS catalog entries default to the templates
+    /// `https://bedrock-runtime.{region}.amazonaws.com` and
+    /// `https://runtime.sagemaker.{region}.amazonaws.com`, and nothing
+    /// used to substitute that placeholder, which is why a literal
+    /// `{region}` reached the upstream and 404'd. An `aws_sigv4:` block
+    /// supplies the region, so it fills the placeholder here, the same
+    /// way APISIX's `host_template` and Kong's `upstream_url_format`
+    /// build a Bedrock host from a configured region. This is gated on
+    /// the block being present, so a provider without one keeps the
+    /// previous behavior byte for byte, and an explicit `base_url`
+    /// still wins outright, which is what makes a VPC endpoint
+    /// reachable without changing the region a signature is scoped to.
     pub fn effective_base_url(&self) -> String {
-        if let Some(ref url) = self.base_url {
-            return url.clone();
+        let url = match self.base_url {
+            Some(ref url) => url.clone(),
+            None => {
+                let ptype = self.provider_type.as_deref().unwrap_or(&self.name);
+                get_provider_info(ptype)
+                    .map(|info| info.default_base_url)
+                    .unwrap_or_else(|| "http://localhost:8080/v1".to_string())
+            }
+        };
+        match self.aws_sigv4.as_ref() {
+            Some(sigv4) if url.contains("{region}") => url.replace("{region}", sigv4.region.trim()),
+            _ => url,
         }
-        let ptype = self.provider_type.as_deref().unwrap_or(&self.name);
-        get_provider_info(ptype)
-            .map(|info| info.default_base_url)
-            .unwrap_or_else(|| "http://localhost:8080/v1".to_string())
     }
 
     /// Validate an operator-supplied `base_url` for SSRF safety.
@@ -258,6 +298,59 @@ impl ProviderConfig {
         } else {
             sbproxy_security::ssrf::validate_url(url)
         }
+    }
+
+    /// Validate an `aws_sigv4:` block against the rest of the entry.
+    ///
+    /// Checks the block's own rules (a non-empty `region`, a resolvable
+    /// signing service, a credential source whose required fields are
+    /// present) plus the cross-field rules that only make sense here:
+    ///
+    /// - `api_key` and `aws_sigv4` are mutually exclusive. Both set is
+    ///   an operator who believes one of them is doing something it is
+    ///   not, and the signer overwrites `Authorization` either way, so
+    ///   the static credential would be silently discarded.
+    /// - `accept_native_credentials_for` is refused. That key hands a
+    ///   caller-owned key to a destination in place of `api_key`, and a
+    ///   signed provider has no `api_key` to replace; a tenant cannot
+    ///   supply an AWS signature through it.
+    /// - A locally served (`serve:`) or `managed_model` provider is
+    ///   refused, because neither dials AWS at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operator-facing reason the entry was rejected. The
+    /// message names configuration keys and never a credential value.
+    pub fn validate_aws_sigv4(&self) -> Result<(), String> {
+        let Some(sigv4) = self.aws_sigv4.as_ref() else {
+            return Ok(());
+        };
+        if self.api_key.is_some() {
+            return Err(
+                "`api_key` and `aws_sigv4` are mutually exclusive: a SigV4 provider \
+                 computes its own `Authorization` header, so a static credential set \
+                 alongside it would be discarded"
+                    .to_string(),
+            );
+        }
+        if self.accept_native_credentials_for.is_some() {
+            return Err(
+                "`accept_native_credentials_for` cannot be combined with `aws_sigv4`: \
+                 it substitutes a caller-owned key for `api_key`, which a signed \
+                 provider does not use"
+                    .to_string(),
+            );
+        }
+        if self.serve.is_some() || self.is_managed_model() {
+            return Err(
+                "`aws_sigv4` is for an upstream AWS endpoint; a locally served or \
+                 managed_model provider never dials one"
+                    .to_string(),
+            );
+        }
+        sigv4
+            .validate(self.effective_provider_type())
+            .map_err(|error| error.to_string())
     }
 
     /// Get the auth header name and formatted value for this provider.
@@ -334,7 +427,12 @@ mod tests {
             no_prompt_training: false,
             data_posture: None,
             serve: None,
+            aws_sigv4: None,
         }
+    }
+
+    fn sigv4_provider(json: serde_json::Value) -> ProviderConfig {
+        serde_json::from_value(json).expect("fixture provider parses")
     }
 
     #[test]
@@ -549,7 +647,7 @@ mod tests {
     #[test]
     fn effective_base_url_together() {
         let p = make_provider("together");
-        assert_eq!(p.effective_base_url(), "https://api.together.xyz/v1");
+        assert_eq!(p.effective_base_url(), "https://api.together.ai/v1");
     }
 
     #[test]
@@ -617,5 +715,134 @@ mod tests {
         assert!(provider_with_base_url("http://127.0.0.1:11434/v1", true)
             .validate_base_url()
             .is_ok());
+    }
+
+    #[test]
+    fn a_sigv4_region_fills_the_catalog_endpoint_template() {
+        // The catalog default is the literal template
+        // `https://bedrock-runtime.{region}.amazonaws.com`, and before
+        // WOR-2648 nothing substituted it, so the placeholder reached
+        // the upstream and 404'd. The region on the signing block is
+        // the only value in the config that can fill it.
+        let bedrock = sigv4_provider(serde_json::json!({
+            "name": "bedrock",
+            "aws_sigv4": {"region": "eu-west-1"},
+        }));
+        assert_eq!(
+            bedrock.effective_base_url(),
+            "https://bedrock-runtime.eu-west-1.amazonaws.com"
+        );
+        let sagemaker = sigv4_provider(serde_json::json!({
+            "name": "sagemaker",
+            "aws_sigv4": {"region": "ap-southeast-2"},
+        }));
+        assert_eq!(
+            sagemaker.effective_base_url(),
+            "https://runtime.sagemaker.ap-southeast-2.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn an_explicit_base_url_wins_and_does_not_change_the_signing_region() {
+        // This is the PrivateLink case the AWS SDKs handle the same
+        // way: the endpoint moves, the credential scope does not.
+        let vpce = sigv4_provider(serde_json::json!({
+            "name": "bedrock",
+            "base_url": "https://vpce-0a1b.bedrock-runtime.us-east-1.vpce.amazonaws.com",
+            "aws_sigv4": {"region": "us-east-1"},
+        }));
+        assert_eq!(
+            vpce.effective_base_url(),
+            "https://vpce-0a1b.bedrock-runtime.us-east-1.vpce.amazonaws.com"
+        );
+        assert_eq!(
+            vpce.aws_sigv4.as_ref().map(|s| s.region.as_str()),
+            Some("us-east-1")
+        );
+    }
+
+    #[test]
+    fn the_placeholder_still_survives_without_a_signing_block() {
+        // Substitution is gated on the block, so an entry that does not
+        // sign behaves exactly as it did before this feature.
+        let bare = make_provider("bedrock");
+        assert_eq!(
+            bare.effective_base_url(),
+            "https://bedrock-runtime.{region}.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn api_key_and_aws_sigv4_are_mutually_exclusive() {
+        let both = sigv4_provider(serde_json::json!({
+            "name": "bedrock",
+            "api_key": "Bearer whatever",
+            "aws_sigv4": {"region": "us-east-1"},
+        }));
+        let error = both
+            .validate_aws_sigv4()
+            .expect_err("both credentials set is refused");
+        assert!(error.contains("mutually exclusive"), "{error}");
+    }
+
+    #[test]
+    fn a_signed_provider_refuses_the_native_credential_swap() {
+        let swap = sigv4_provider(serde_json::json!({
+            "name": "bedrock",
+            "accept_native_credentials_for": "bedrock",
+            "aws_sigv4": {"region": "us-east-1"},
+        }));
+        let error = swap
+            .validate_aws_sigv4()
+            .expect_err("a caller-owned key cannot replace a signature");
+        assert!(error.contains("accept_native_credentials_for"), "{error}");
+    }
+
+    #[test]
+    fn a_signing_block_on_a_non_aws_provider_type_needs_an_explicit_service() {
+        let odd = sigv4_provider(serde_json::json!({
+            "name": "mystery",
+            "provider_type": "openai",
+            "aws_sigv4": {"region": "us-east-1"},
+        }));
+        let error = odd
+            .validate_aws_sigv4()
+            .expect_err("no default signing service for a non-AWS provider type");
+        assert!(error.contains("aws_sigv4.service"), "{error}");
+
+        let named = sigv4_provider(serde_json::json!({
+            "name": "mystery",
+            "provider_type": "openai",
+            "aws_sigv4": {"region": "us-east-1", "service": "execute-api"},
+        }));
+        named
+            .validate_aws_sigv4()
+            .expect("an explicit service is accepted");
+    }
+
+    #[test]
+    fn a_provider_without_a_signing_block_validates_trivially() {
+        make_provider("openai")
+            .validate_aws_sigv4()
+            .expect("no block, nothing to check");
+    }
+
+    #[test]
+    fn json_schema_carries_the_aws_sigv4_surface() {
+        // The committed ai-proxy-provider schema is what an editor
+        // autocompletes against, and a security-relevant block that is
+        // absent from it is one an operator will mistype in silence.
+        let schema = schemars::schema_for!(ProviderConfig);
+        let json = serde_json::to_string(&schema).expect("schema serializes");
+        for needle in [
+            "\"aws_sigv4\"",
+            "AwsSigV4Config",
+            "AwsCredentialsConfig",
+            "AwsCredentialSource",
+            "\"secret_access_key\"",
+            "\"assume_role\"",
+        ] {
+            assert!(json.contains(needle), "schema is missing {needle}");
+        }
     }
 }

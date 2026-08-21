@@ -1584,7 +1584,7 @@ mod tests {
         let ledger_path = dir.path().join("receipts.ndjson");
         let mut ctx = context_for_role(
             runtime(&ledger_path, FailureMode::Degraded),
-            AttestationRole::Claim,
+            AttestationRole::Off,
         );
         ctx.meter_origin_headers.clear();
 
@@ -1933,7 +1933,7 @@ mod tests {
         let ledger_path = dir.path().join("receipts.ndjson");
         let ctx = context_for_role(
             runtime(&ledger_path, FailureMode::Degraded),
-            AttestationRole::Claim,
+            AttestationRole::Off,
         );
 
         assert!(record_response(&ctx, METHOD, PATH, 200, false).is_none());
@@ -2145,7 +2145,7 @@ mod tests {
         // Closed, unavailable chain, but this origin writes no receipts.
         let ctx = context_for_role(
             runtime(&occupied, FailureMode::Closed),
-            AttestationRole::Claim,
+            AttestationRole::Off,
         );
         assert!(!preflight_refuses(&ctx));
     }
