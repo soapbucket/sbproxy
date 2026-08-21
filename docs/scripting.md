@@ -1236,6 +1236,8 @@ Declining is the cheap common case and means "the static config applies unchange
 
 **`admit_event` and `stale_while_revalidate` compose.** The revalidation refresh runs the event against the response it just fetched, from the same small request-side scope the initial request used, so an override or a refusal from `admit_event` still applies to what the background refresh writes back. The two were refused together before this evaluation path existed; that restriction is gone.
 
+**Neither event runs on the connection loop.** Both are evaluated on a separate worker pool, so a script that spends its whole CPU budget (`max_execution_ms`, 100 ms by default) delays its own request and nothing else. Two consequences worth knowing: the write-back for an origin with an `admit_event` is dispatched one scheduling hop later than for an origin without one, and an origin with neither event is unchanged, because the hop is only paid when a script exists to run.
+
 Both events run under the sandboxes in [§4.6](#46-sandbox-limits) and [§5.1](#51-sandbox-limits), with a fresh VM per evaluation. Evaluations are counted on `sbproxy_decision_event_total{event="cache.key"}` and `{event="cache.admit"}`, and the two faults are counted differently on purpose: `cache.admit` fails open, so it records `outcome="allow"` plus `sbproxy_decision_event_fail_open_total`, while `cache.key` fails closed on the cache and records `outcome="error"`, or `outcome="timeout"` when the script ran out of its CPU budget, with no fail-open counter. The field-level reference for the block is in [configuration.md](configuration.md#response-cache).
 
 ---

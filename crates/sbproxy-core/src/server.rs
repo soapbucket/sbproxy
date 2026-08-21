@@ -1680,13 +1680,40 @@ fn spawn_swr_revalidation(
         // revert to the origin's default.
         let mut swr_secs = stale_entry.swr_secs;
         if let Some(scope) = admit_scope.as_ref() {
-            let plan = crate::server::proxy_http::evaluate_cache_admit_for(
-                &pipeline,
-                scope,
-                status,
-                &headers,
-                body.len(),
-            );
+            // WOR-2404: the event is an operator script with a CPU
+            // budget and no await points, and this task shares a reactor
+            // with live request traffic. Running it inline here stalls
+            // that traffic for the script's whole budget, on a refresh
+            // nobody is waiting for, so it goes to the blocking pool.
+            let admit_pipeline = pipeline.clone();
+            let admit_scope_owned = scope.clone();
+            let admit_headers = headers.clone();
+            let admit_body_len = body.len();
+            let plan = match tokio::task::spawn_blocking(move || {
+                crate::server::proxy_http::evaluate_cache_admit_for(
+                    &admit_pipeline,
+                    &admit_scope_owned,
+                    status,
+                    &admit_headers,
+                    admit_body_len,
+                )
+            })
+            .await
+            {
+                Ok(plan) => plan,
+                Err(join_error) => {
+                    // The refresh serves nobody, so a lost evaluation
+                    // keeps the stale entry rather than writing back
+                    // under a plan that was never computed. The live
+                    // path fails open here because a client is waiting;
+                    // this one has no client to fail open for.
+                    tracing::warn!(
+                        error = %join_error,
+                        "swr: admit_event evaluation task failed to join; keeping the stale entry"
+                    );
+                    return;
+                }
+            };
             if !plan.store {
                 tracing::debug!(
                     url = %full_url,
@@ -5149,7 +5176,12 @@ async fn check_buffered_dynamic_policies(
 /// engine; otherwise the steady state is a cheap Arc clone. Building
 /// lazily (never at pipeline-compile time) means the engine always sees
 /// the operator's installed limits, not the boot-time defaults.
-fn shared_lua_engine() -> anyhow::Result<std::sync::Arc<sbproxy_extension::lua::LuaEngine>> {
+///
+/// `pub(crate)` rather than private because the decision-event path
+/// (`crate::decision_script`) reuses it for the same reason the
+/// modifiers do (WOR-2404).
+pub(crate) fn shared_lua_engine(
+) -> anyhow::Result<std::sync::Arc<sbproxy_extension::lua::LuaEngine>> {
     use sbproxy_extension::lua::{active_sandbox_config, LuaEngine, SandboxConfig};
     #[allow(clippy::type_complexity)]
     static CACHE: std::sync::LazyLock<
