@@ -742,7 +742,7 @@ pub struct CompiledForwardRule {
     /// of captured params.
     pub parameters: Vec<Parameter>,
     /// Optional identifier from the rule's inline `origin.id`, used in
-    /// metrics and logs (the `rule` label on
+    /// metrics and logs (the `route` label on
     /// `sbproxy_deprecated_requests_total` prefers it over the rule
     /// index).
     pub id: Option<String>,

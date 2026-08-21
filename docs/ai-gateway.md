@@ -1363,8 +1363,9 @@ flowchart TD
     READ -->|"now >= expiry"| BASE["Effective budget =\nbase caps alone"]
     RESTART["Process restart"] --> READ
     BASE --> SWEEP["Next admin read retires the\nlapsed grant from the record"]
-    SWEEP --> AUDIT2["key_audit:\nbudget_override_expire"]
-    CLEAR["Operator ends it early:\nDELETE .../budget-override"] --> BASE
+    SWEEP --> AUDIT2["key_audit: budget_override_expire\n(time ended it; no actor)"]
+    CLEAR["Operator ends it early:\nDELETE .../budget-override"] --> AUDIT3["key_audit: budget_override_clear\n(naming the operator)"]
+    AUDIT3 --> BASE
 ```
 
 Three properties fall out of evaluating the expiry at read time rather
@@ -1399,10 +1400,17 @@ raise is live, `GET /admin/keys/{id}` shows the untouched `budget`, the
 console's Keys page renders the same three as a "raised" badge with a
 countdown and a Clear raise action.
 
-Both ends of the raise's life land in the `key_audit` trail:
-`budget_override_grant` names the operator who granted it, and
-`budget_override_expire` is written when an admin read first observes the
-lapsed grant and retires it from the record. Overrides are granted at
+Three points in the raise's life land in the `key_audit` trail, and the
+difference between the last two is what makes the trail reconcilable.
+`budget_override_grant` names the operator who granted the raise.
+`budget_override_clear` names the operator who ended a live one early
+through `DELETE`. `budget_override_expire` is the unattributed,
+time-driven end, written when an admin read (or a `DELETE` arriving
+after the fact) first observes the lapsed grant and retires it from the
+record. A compliance rule that reconciles every raise against its
+termination has to match `clear` OR `expire`; matching only `expire`
+leaves every operator-cancelled raise looking like it is still
+running. Overrides are granted at
 runtime only; a key seeded from `key_management.seed` gets its override
 dropped if the seed re-applies on reload, the same as any other runtime
 mutation of a config-sourced record.

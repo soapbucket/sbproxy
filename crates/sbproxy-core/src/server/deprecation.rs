@@ -39,7 +39,7 @@ use sbproxy_config::CompiledDeprecation;
 pub(crate) struct ResolvedDeprecation<'a> {
     /// The compiled block whose headers apply.
     pub config: &'a CompiledDeprecation,
-    /// `rule` label for `sbproxy_deprecated_requests_total`: the
+    /// `route` label for `sbproxy_deprecated_requests_total`: the
     /// forward rule's id (or index), the OpenAPI path template for a
     /// spec-driven match, or `""` for a whole-origin block.
     pub rule_label: String,
@@ -160,6 +160,63 @@ pub(crate) fn gone_body(dep: &CompiledDeprecation) -> serde_json::Value {
     serde_json::Value::Object(body)
 }
 
+/// Stable `event_type` for a post-sunset refusal, on the audit record
+/// and on any SIEM rule written against it.
+const GONE_AUDIT_EVENT_TYPE: &str = "api_deprecation";
+
+/// Log and audit one `410 Gone` refusal.
+///
+/// Shaped exactly like the other proxy refusals that reach a SIEM (see
+/// `body_threat_protection` in `proxy_http.rs`): a `policy_violation`
+/// entry chaining tenant, key context, and the accountable key id, so a
+/// rule shaped "which key is still calling the retired API" has
+/// something to key on.
+///
+/// `reason` is proxy-authored and reaches third-party webhook sinks
+/// verbatim through the `policy_denied` bridge, so it is built from a
+/// constant, the compiled sunset string, and the announcement's rule
+/// label. All three come from the operator's own config or from a spec
+/// the operator loaded; no request byte reaches it.
+fn audit_gone_refusal(
+    ctx: &RequestContext,
+    resolved: &ResolvedDeprecation<'_>,
+    method: Option<&str>,
+    now: i64,
+) {
+    let rule = if resolved.rule_label.is_empty() {
+        "<origin>"
+    } else {
+        resolved.rule_label.as_str()
+    };
+    let sunset = resolved.config.sunset_header.as_deref().unwrap_or("unset");
+    warn!(
+        target: "sbproxy::api_deprecation",
+        hostname = %ctx.hostname,
+        tenant = %ctx.tenant_id,
+        request_id = %ctx.request_id,
+        rule,
+        sunset,
+        now,
+        "refused: this route is past its announced sunset and the origin says after_sunset: gone"
+    );
+    sbproxy_observe::SecurityAuditEntry::policy_violation(
+        GONE_AUDIT_EVENT_TYPE,
+        format!("route retired at sunset {sunset}; announcement: {rule}"),
+        410,
+        Some(ctx.hostname.to_string()),
+        ctx.client_ip,
+        Some(ctx.request_id.to_string()),
+        method.map(str::to_string),
+    )
+    .with_tenant_id(ctx.tenant_id.to_string())
+    .with_key_context(
+        ctx.native_key_provider.clone(),
+        ctx.inbound_key_mode.as_str(),
+    )
+    .with_api_key_id(ctx.accountable_key_id())
+    .emit();
+}
+
 /// Route-settlement gate, called once per request from the top of
 /// `handle_action` (both settlement sites route through it: a matched
 /// forward rule and the origin's own action).
@@ -169,6 +226,17 @@ pub(crate) fn gone_body(dep: &CompiledDeprecation) -> serde_json::Value {
 /// with `410 Gone` when the covering block says `after_sunset: gone`.
 /// Returns `Ok(true)` when the 410 was written (short-circuit),
 /// `Ok(false)` to continue serving.
+///
+/// The refusal is enforcement, so it reaches the evidence channels every
+/// other proxy refusal reaches rather than only the counter: a
+/// [`sbproxy_observe::SecurityAuditEntry::policy_violation`] carries it
+/// to the `security_audit` tracing target, the admin console's audit
+/// ring, the hash-chained file under `audit.sink: chain`, and the
+/// `events:` egress as a `policy_denied` event, and a `warn!` names the
+/// origin and the announcement in the ordinary log. Without them an
+/// operator asked "who did we cut off, and when" had only
+/// `sbproxy_requests_total{status="410"}`, which cannot tell a gateway
+/// refusal from an upstream 410.
 pub(crate) async fn enforce_at_route(
     session: &mut Session,
     pipeline: &CompiledPipeline,
@@ -185,20 +253,29 @@ pub(crate) async fn enforce_at_route(
         ) else {
             return Ok(false);
         };
-        let origin_label = pipeline
-            .config
-            .origins
-            .get(origin_idx)
-            .map(|origin| origin.hostname.as_str())
-            .unwrap_or("");
+        let gone = refuse_as_gone(resolved.config, now);
+        // `ctx.hostname` rather than the configured `origin.hostname`,
+        // so this family's `origin` label means what it means on
+        // `sbproxy_requests_total`. Under a wildcard origin the two
+        // differ, and the migration tracker an operator actually writes,
+        // `sum by (origin) (rate(deprecated[5m])) / sum by (origin)
+        // (rate(requests[5m]))`, joins on the label rather than on the
+        // config.
         sbproxy_observe::metrics::record_deprecated_request(
-            origin_label,
+            ctx.hostname.as_str(),
             &resolved.rule_label,
             past_sunset(resolved.config, now),
+            gone,
         );
-        if !refuse_as_gone(resolved.config, now) {
+        if !gone {
             return Ok(false);
         }
+        audit_gone_refusal(
+            ctx,
+            &resolved,
+            Some(session.req_header().method.as_str()),
+            now,
+        );
         gone_body(resolved.config).to_string().into_bytes()
     };
 
@@ -330,5 +407,99 @@ link: https://developer.example.com/deprecation
         assert_eq!(body["error"], "gone");
         assert_eq!(body["successor"], "https://api.example.com/v2/");
         assert_eq!(body["sunset"], "Mon, 01 Jun 2020 00:00:00 GMT");
+    }
+
+    /// Fix round on the #1177 review, red-first: the `410 Gone`
+    /// refusal produced a counter and nothing else. No audit record, no
+    /// event, no log line at any level, while its sibling refusal in
+    /// the same union (`body_threat_protection`'s 400) emits a
+    /// `policy_violation` that bridges to `policy_denied` on the
+    /// `events:` feed.
+    ///
+    /// An operator asked "who did we cut off, and when" had only
+    /// `sbproxy_requests_total{status="410"}`, which cannot tell a
+    /// gateway refusal from an upstream 410. This asserts the record
+    /// reaches the normalized channel with the attribution a SIEM rule
+    /// needs, and that its reason names the announcement rather than
+    /// echoing anything the caller sent.
+    #[test]
+    fn a_gone_refusal_reaches_the_audit_channel_with_attribution() {
+        const REQUEST_ID: &str = "req-gone-audit-1";
+        let dep = compiled(
+            "deprecated: 2020-01-01\nsunset: 2020-06-01\nafter_sunset: gone\nsuccessor: https://api.example.com/v2/\n",
+        );
+        let resolved = ResolvedDeprecation {
+            config: &dep,
+            rule_label: "legacy-v1".to_string(),
+        };
+        let mut ctx = RequestContext::new();
+        ctx.hostname = "api.local".into();
+        ctx.tenant_id = "acme".into();
+        ctx.request_id = REQUEST_ID.into();
+        ctx.client_ip = Some("203.0.113.9".parse().expect("test ip"));
+
+        audit_gone_refusal(&ctx, &resolved, Some("GET"), 1_600_000_000);
+
+        let events = sbproxy_observe::audit_ring::recent_audit_events(
+            64,
+            Some("security"),
+            Some(GONE_AUDIT_EVENT_TYPE),
+            None,
+        );
+        let entry = events
+            .iter()
+            .find(|event| event.request_id.as_deref() == Some(REQUEST_ID))
+            .expect(
+                "a 410 refusal must reach the security audit channel; a refusal nobody can see \
+                 is not enforcement",
+            );
+        assert_eq!(entry.tenant_id.as_deref(), Some("acme"));
+        let detail = entry.detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("Mon, 01 Jun 2020 00:00:00 GMT"),
+            "the reason must name the sunset that retired the route: {detail}"
+        );
+        assert!(
+            detail.contains("legacy-v1"),
+            "the reason must name which announcement refused: {detail}"
+        );
+    }
+
+    /// The whole-origin announcement has no rule id, and the record
+    /// still has to say which announcement fired rather than leaving
+    /// the field blank in a SIEM.
+    #[test]
+    fn a_whole_origin_gone_refusal_names_the_origin_announcement() {
+        const REQUEST_ID: &str = "req-gone-audit-2";
+        let dep = compiled("deprecated: 2020-01-01\nsunset: 2020-06-01\nafter_sunset: gone\n");
+        let resolved = ResolvedDeprecation {
+            config: &dep,
+            rule_label: String::new(),
+        };
+        let mut ctx = RequestContext::new();
+        ctx.hostname = "api.local".into();
+        ctx.request_id = REQUEST_ID.into();
+
+        audit_gone_refusal(&ctx, &resolved, Some("POST"), 1_600_000_000);
+
+        let events = sbproxy_observe::audit_ring::recent_audit_events(
+            64,
+            Some("security"),
+            Some(GONE_AUDIT_EVENT_TYPE),
+            None,
+        );
+        let entry = events
+            .iter()
+            .find(|event| event.request_id.as_deref() == Some(REQUEST_ID))
+            .expect("the whole-origin refusal is audited too");
+        assert!(
+            entry
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("<origin>"),
+            "an origin-wide announcement is named, not left empty: {:?}",
+            entry.detail
+        );
     }
 }

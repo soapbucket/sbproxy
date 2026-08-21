@@ -3015,7 +3015,7 @@ origins:
         let counter = || {
             sbproxy_observe::metrics::metrics()
                 .deprecated_requests_total
-                .with_label_values(&["dep-rules.test", "v1-legacy", "false"])
+                .with_label_values(&["dep-rules.test", "v1-legacy", "false", "served"])
                 .get()
         };
         let before = counter();
@@ -3025,7 +3025,10 @@ origins:
             &pipeline,
             Some(0),
             b"GET /v1/jobs HTTP/1.1\r\nHost: dep-rules.test\r\nconnection: close\r\n\r\n",
-            |ctx| ctx.forward_rule_idx = Some(0),
+            |ctx| {
+                ctx.hostname = "dep-rules.test".into();
+                ctx.forward_rule_idx = Some(0);
+            },
         )
         .await;
         assert!(result.expect("v1 static action must dispatch"));
@@ -3042,7 +3045,10 @@ origins:
             &pipeline,
             Some(0),
             b"GET /v2/jobs HTTP/1.1\r\nHost: dep-rules.test\r\nconnection: close\r\n\r\n",
-            |ctx| ctx.forward_rule_idx = Some(1),
+            |ctx| {
+                ctx.hostname = "dep-rules.test".into();
+                ctx.forward_rule_idx = Some(1);
+            },
         )
         .await;
         assert!(result.expect("v2 static action must dispatch"));
@@ -3072,15 +3078,27 @@ origins:
       body: "still here"
 "#,
         );
-        let counter = || {
+        // `served` and `gone` are the same `past_sunset="true"` series
+        // without the outcome label, which is the conflation the fix
+        // round removed: an operator running both postures could not
+        // count who was actually being cut off.
+        let counter = |outcome: &str| {
             sbproxy_observe::metrics::metrics()
                 .deprecated_requests_total
-                .with_label_values(&["dep-straggler.test", "", "true"])
+                .with_label_values(&["dep-straggler.test", "", "true", outcome])
                 .get()
         };
-        let before = counter();
+        let before = counter("served");
+        let before_gone = counter("gone");
 
-        let (result, wire) = exchange(&pipeline.actions[0], &pipeline, Some(0)).await;
+        let (result, wire) = exchange_with(
+            &pipeline.actions[0],
+            &pipeline,
+            Some(0),
+            DEFAULT_TEST_REQUEST,
+            |ctx| ctx.hostname = "dep-straggler.test".into(),
+        )
+        .await;
 
         assert!(result.expect("static action must dispatch"));
         let response = String::from_utf8(wire)
@@ -3094,7 +3112,16 @@ origins:
             response.contains("sunset: mon, 01 jun 2020 00:00:00 gmt"),
             "headers still announce the (elapsed) sunset: {response}"
         );
-        assert_eq!(counter(), before + 1, "past_sunset label must be true");
+        assert_eq!(
+            counter("served"),
+            before + 1,
+            "a straggler served past sunset counts as past_sunset=true, outcome=served"
+        );
+        assert_eq!(
+            counter("gone"),
+            before_gone,
+            "the default posture served this request; nothing may land on outcome=gone"
+        );
     }
 
     #[tokio::test]
@@ -3116,7 +3143,32 @@ origins:
 "#,
         );
 
-        let (result, wire) = exchange(&pipeline.actions[0], &pipeline, Some(0)).await;
+        // Fix round on the #1177 review: the refusal is enforcement, so
+        // it has to be countable AS a refusal and it has to reach the
+        // audit channel. Before the fix `past_sunset="true"` was the
+        // only signal and it counted served and refused hits on one
+        // series, and the 410 reached no audit channel, no event, and
+        // no log line at any level.
+        let counter = |outcome: &str| {
+            sbproxy_observe::metrics::metrics()
+                .deprecated_requests_total
+                .with_label_values(&["dep-gone.test", "", "true", outcome])
+                .get()
+        };
+        let before_gone = counter("gone");
+        let before_served = counter("served");
+
+        let (result, wire) = exchange_with(
+            &pipeline.actions[0],
+            &pipeline,
+            Some(0),
+            DEFAULT_TEST_REQUEST,
+            |ctx| {
+                ctx.hostname = "dep-gone.test".into();
+                ctx.request_id = "req-gone-dispatch-1".into();
+            },
+        )
+        .await;
 
         assert!(result.expect("the gate must short-circuit the request"));
         let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
@@ -3124,6 +3176,28 @@ origins:
         assert!(
             lower.starts_with("http/1.1 410"),
             "past-sunset `gone` must answer 410: {response}"
+        );
+        assert_eq!(
+            counter("gone"),
+            before_gone + 1,
+            "a 410 refusal must be countable as a refusal, not folded in with served hits"
+        );
+        assert_eq!(
+            counter("served"),
+            before_served,
+            "a refused request must never land on outcome=served"
+        );
+        let audited = sbproxy_observe::audit_ring::recent_audit_events(
+            64,
+            Some("security"),
+            Some("api_deprecation"),
+            None,
+        );
+        assert!(
+            audited
+                .iter()
+                .any(|event| event.request_id.as_deref() == Some("req-gone-dispatch-1")),
+            "the 410 refusal must reach the security audit channel from the real gate, not              only from a direct call to the helper"
         );
         assert!(
             !response.contains("unreachable"),

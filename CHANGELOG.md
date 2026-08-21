@@ -21,9 +21,13 @@ the next version cut.
   read, so it survives restarts and needs no sweeper. Read responses
   and the console's Keys page show the base budget, the override with
   its countdown and grantor, and the enforced `effective_budget`;
-  `DELETE` on the same path ends a raise early. Grant and expiry both
-  land in the `key_audit` trail (`budget_override_grant` naming the
-  operator, `budget_override_expire`). See the temp-override section
+  `DELETE` on the same path ends a raise early. Three points in the
+  raise's life land in the `key_audit` trail: `budget_override_grant`
+  and `budget_override_clear` name the operator who granted or ended
+  one, and `budget_override_expire` is the unattributed, time-driven
+  end. All three routes are counted on
+  `sbproxy_key_operations_total{operation, outcome}` alongside the
+  other key mutations. See the temp-override section
   of [docs/ai-gateway.md](docs/ai-gateway.md) and
   [examples/temp-budget-override/](examples/temp-budget-override/).
 

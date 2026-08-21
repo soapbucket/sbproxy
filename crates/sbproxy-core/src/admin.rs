@@ -1113,19 +1113,49 @@ fn collect_target_health(pipeline: &crate::pipeline::CompiledPipeline) -> Vec<Or
 /// startup path exactly once.
 pub(crate) fn install_target_health_metrics_source() {
     sbproxy_observe::metrics::set_target_health_source(|| {
-        let pipeline = crate::reload::current_pipeline();
-        let mut samples = Vec::new();
-        for origin in collect_target_health(&pipeline) {
-            for row in &origin.targets {
-                samples.push(sbproxy_observe::metrics::TargetHealthSample {
-                    origin: origin.origin_id.clone(),
-                    target: row.url.clone(),
-                    state: row.metric_state(),
-                });
-            }
-        }
-        samples
+        target_health_samples(&collect_target_health(&crate::reload::current_pipeline()))
     });
+}
+
+/// Project one pipeline walk onto the gauge's sample list.
+///
+/// A free function rather than a closure body so the collision rule
+/// below is testable without a live pipeline.
+///
+/// The `target` label is the configured URL when that URL is unique
+/// within its origin, which is the normal case and the readable one.
+/// When an origin configures the same URL more than once, every
+/// colliding row takes the load balancer's own `url#index` identifier
+/// instead, the same string [`sbproxy_modules::action::loadbalancer`]
+/// hands the outlier detector. Two same-URL targets are a real config
+/// (weighting, or a blue/green pair addressed through one host), and
+/// keying the label on the URL alone collapsed them onto one series:
+/// last write won, an outlier-ejected target read as healthy, and
+/// `GET /api/health/targets` went on rendering both rows with distinct
+/// `index` values. That is precisely the disagreement between the two
+/// surfaces this gauge promises cannot happen.
+fn target_health_samples(
+    origins: &[OriginTargetHealth],
+) -> Vec<sbproxy_observe::metrics::TargetHealthSample> {
+    let mut samples = Vec::new();
+    for origin in origins {
+        for row in &origin.targets {
+            let collides = origin
+                .targets
+                .iter()
+                .any(|other| other.index != row.index && other.url == row.url);
+            samples.push(sbproxy_observe::metrics::TargetHealthSample {
+                origin: origin.origin_id.clone(),
+                target: if collides {
+                    format!("{}#{}", row.url, row.index)
+                } else {
+                    row.url.clone()
+                },
+                state: row.metric_state(),
+            });
+        }
+    }
+    samples
 }
 
 /// Emit the `GET /api/health/targets` JSON snapshot from the live
@@ -7627,6 +7657,71 @@ mod tests {
             row(true, true, Some("half_open")).metric_state(),
             TARGET_HEALTH_EXCLUDED
         );
+    }
+
+    /// Fix round on the #1177 review, red-first: keying the gauge's
+    /// `target` label on `row.url` alone collapsed two same-URL targets
+    /// into one series. The load balancer refuses that assumption in
+    /// its own identifier (`target_id` is `url#index` "so two targets
+    /// with the same URL stay distinguishable"), and two same-URL
+    /// targets are a real config: a weighted pair, or blue and green
+    /// addressed through one host.
+    ///
+    /// Before the fix both rows wrote
+    /// `with_label_values(&["lb.local", "http://a:8080"])`, last write
+    /// won, and the ejected target read healthy on `/metrics` while
+    /// `GET /api/health/targets` still showed it ejected at its own
+    /// `index`. That is exactly the disagreement between the two
+    /// surfaces the registry description, `docs/observability.md`, and
+    /// the example README all promise cannot happen.
+    #[test]
+    fn same_url_targets_get_distinct_health_gauge_series() {
+        use sbproxy_observe::metrics::{TARGET_HEALTH_EXCLUDED, TARGET_HEALTH_HEALTHY};
+        let row = |index: usize, url: &str, ejected: bool| TargetHealthRow {
+            index,
+            url: url.to_string(),
+            healthy: true,
+            outlier_ejected: ejected,
+            breaker_state: None,
+            weight: 1,
+            backup: false,
+            group: None,
+        };
+        let origins = vec![OriginTargetHealth {
+            hostname: "lb.local".to_string(),
+            origin_id: "lb.local".to_string(),
+            targets: vec![
+                row(0, "http://a:8080", true),
+                row(1, "http://a:8080", false),
+                row(2, "http://b:8080", false),
+            ],
+        }];
+
+        let samples = target_health_samples(&origins);
+        let labels: Vec<&str> = samples.iter().map(|s| s.target.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["http://a:8080#0", "http://a:8080#1", "http://b:8080"],
+            "colliding URLs take the load balancer's own url#index id; a unique URL stays \
+             readable"
+        );
+
+        // The ejected row is still readable as ejected, which is the
+        // whole failure the collapse hid.
+        assert_eq!(samples[0].state, TARGET_HEALTH_EXCLUDED);
+        assert_eq!(samples[1].state, TARGET_HEALTH_HEALTHY);
+        assert_eq!(samples[2].state, TARGET_HEALTH_HEALTHY);
+
+        // Every sample is a distinct (origin, target) pair, so nothing
+        // can be overwritten by a later `set`.
+        let mut pairs: Vec<(&str, &str)> = samples
+            .iter()
+            .map(|s| (s.origin.as_str(), s.target.as_str()))
+            .collect();
+        pairs.sort_unstable();
+        let before = pairs.len();
+        pairs.dedup();
+        assert_eq!(before, pairs.len(), "two rows still share one gauge series");
     }
 
     #[test]
