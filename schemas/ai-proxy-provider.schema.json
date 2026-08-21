@@ -223,7 +223,7 @@
           ]
         },
         "cache_dir": {
-          "description": "Directory for the content-addressed weight cache. `None` uses the platform default (`$HF_HOME` / `~/.cache/sbproxy/models`).",
+          "description": "Directory for the content-addressed weight cache, as an absolute path. `None` uses the platform default (`$HF_HOME` / `~/.cache/sbproxy/models`). A relative path is refused at config load: the engine subprocess that reads this cache has its own working directory and requires an absolute snapshot path, so a relative value fails only after a full model download.",
           "default": null,
           "type": [
             "string",
