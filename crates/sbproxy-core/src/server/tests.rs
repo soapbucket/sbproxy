@@ -6284,7 +6284,10 @@ fn two_tenants_do_not_share_a_response_cache_entry() {
 #[test]
 fn accept_encoding_partitions_by_capability_not_by_spelling() {
     let cfg = cache_cfg_with_vary(&[]);
-    let encoding = |value: &str| {
+    // `&'static str`: `cache_key_request` holds its header slice for the
+    // life of the request it builds, so a borrowed literal is what it
+    // wants and a shorter lifetime cannot escape the closure.
+    let encoding = |value: &'static str| {
         plan_key(
             &cache_key_request(&[("accept-encoding", value)]),
             &cfg,
