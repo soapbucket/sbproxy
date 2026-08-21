@@ -51,7 +51,10 @@ Findings: <n> Blocker, <n> Major, <n> Minor
 Verification: <how the fixes were re-checked>
 
 - <Blocker|Major|Minor> - `path/to/file.rs:LINE` - one-line claim.
-  <Fixed|Accepted|Filed>, plus the reason when it was not fixed.
+  Then what happened to it: Fixed, Landed in #NNNN, Partly addressed,
+  Deferred, Accepted, Declined, Filed, Not fixed here, Not replicated.
+  Write the honest one and give the reason whenever it was not simply
+  fixed; the whole vocabulary is in CLAUDE.md under "Code review".
 
 One list item per finding, and the item count per severity has to match
 the Findings line. When the review turned nothing up the whole block is
