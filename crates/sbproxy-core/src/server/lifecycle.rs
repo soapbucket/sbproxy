@@ -1519,6 +1519,52 @@ fn reload_from_config_yaml_locked(
     )
 }
 
+/// Emit one bounded WARN when the OpenAPI document this config produces
+/// cannot describe part of it.
+///
+/// Emission never guesses. A verb OpenAPI 3.0 has no Path Item field for,
+/// and a forward rule that loses a path-and-method contest to an earlier
+/// one, are both published under an `x-sbproxy-` extension rather than
+/// folded onto something untrue. The document is therefore right and
+/// nothing is dropped, but standard tooling reads operations and not
+/// extensions, so an operator can still end up with a generated client
+/// that is missing a route they configured.
+///
+/// `sbproxy_openapi::build` cannot be the one to say so: it runs on every
+/// fetch of `/.well-known/openapi.json`, which takes no credential, so a
+/// warn in there is a log-flood primitive any client can pull. These are
+/// properties of the config rather than of a request, which is why the
+/// place to say it is here, once per config, on the boot and reload
+/// paths that already emit `log_capture_header_warnings`.
+///
+/// One line, not one per finding: a config with many origins and many
+/// paths can produce hundreds. The count carries the scale and a capped
+/// sample carries enough to find the first one. The sample rides in a
+/// structured field rather than the message text, so the subscriber
+/// escapes the config-supplied path keys inside it.
+fn log_openapi_emission_warnings(compiled: &sbproxy_config::CompiledConfig) {
+    // How many findings the sample names before it stops.
+    const SAMPLE_LIMIT: usize = 10;
+
+    let findings = sbproxy_openapi::emission_warnings(compiled);
+    if findings.is_empty() {
+        return;
+    }
+    let sample = findings
+        .iter()
+        .take(SAMPLE_LIMIT)
+        .map(sbproxy_openapi::EmissionWarning::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    tracing::warn!(
+        count = findings.len(),
+        sample = %sample,
+        "the emitted OpenAPI document cannot describe part of this config and publishes an \
+         x-sbproxy- extension in place of the operation; a client generated from it will be \
+         missing those routes",
+    );
+}
+
 /// Prepare and publish one already compiled configuration. Callers hold
 /// `CONFIG_RELOAD_LOCK` and may supply an already validated bundle candidate.
 fn reload_compiled_config_locked(
@@ -1535,6 +1581,7 @@ fn reload_compiled_config_locked(
     if let Some(al) = compiled.access_log.as_ref() {
         log_capture_header_warnings(al);
     }
+    log_openapi_emission_warnings(&compiled);
 
     // --- Phase 1: reject-only checks, before anything installs ---
 
@@ -2436,6 +2483,10 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     if let Some(al) = compiled.access_log.as_ref() {
         log_capture_header_warnings(al);
     }
+    // Boot needs this as much as reload does: an operator who starts with
+    // a colliding config would otherwise hear nothing until the first
+    // reload, which may never come.
+    log_openapi_emission_warnings(&compiled);
     let port = compiled.server.http_bind_port;
     // WOR-2199: one address for both public listeners. Validated at
     // config compile, so formatting it into a socket address here cannot
@@ -7718,5 +7769,133 @@ egress:
             entries[0].degraded,
             vec!["key plane".to_string(), "sink dispatcher".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod openapi_emission_warning_tests {
+    use super::log_openapi_emission_warnings;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    struct SharedLogGuard(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedLogGuard {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("warning capture")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogWriter {
+        type Writer = SharedLogGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedLogGuard(Arc::clone(&self.0))
+        }
+    }
+
+    /// Run the reload-time warning against one config with a subscriber
+    /// of this thread's own, so the assertion reads the line rather than
+    /// whatever global subscriber another test installed.
+    fn captured_warnings(yaml: &str) -> String {
+        let compiled = sbproxy_config::compile_config(yaml).expect("config compiles");
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(SharedLogWriter(Arc::clone(&captured)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_openapi_emission_warnings(&compiled);
+        });
+        let bytes = captured.lock().expect("warning capture").clone();
+        String::from_utf8(bytes).expect("warning output is UTF-8")
+    }
+
+    const COLLIDING: &str = r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "api.example.com":
+    allowed_methods: ["GET"]
+    action: { type: proxy, url: "http://127.0.0.1:9/" }
+    forward_rules:
+      - rules:
+          - path: { exact: /users }
+        origin:
+          id: api-users
+          action: { type: proxy, url: "http://127.0.0.1:9/" }
+  "web.example.com":
+    allowed_methods: ["GET"]
+    action: { type: proxy, url: "http://127.0.0.1:9/" }
+    forward_rules:
+      - rules:
+          - path: { exact: /users }
+        origin:
+          id: web-users
+          action: { type: proxy, url: "http://127.0.0.1:9/" }
+"#;
+
+    const CLEAN: &str = r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "api.example.com":
+    allowed_methods: ["GET"]
+    action: { type: proxy, url: "http://127.0.0.1:9/" }
+    forward_rules:
+      - rules:
+          - path: { exact: /users }
+        origin:
+          id: api-users
+          action: { type: proxy, url: "http://127.0.0.1:9/" }
+"#;
+
+    #[test]
+    fn a_config_whose_document_loses_an_operation_warns_once_and_names_the_path() {
+        // Both hosts expose GET /users, so the all-hosts document holds
+        // one of the two operations and parks the other under an
+        // extension no generator reads. Silence here means the operator's
+        // only signal is a missing route in a generated client.
+        let logged = captured_warnings(COLLIDING);
+        assert!(
+            logged.contains("/users"),
+            "the warn has to name the path; got {logged}"
+        );
+        // `operation_id` builds these from the origin id, which config
+        // compilation sets to the hostname, so naming both operations
+        // also names both hosts. Attribution is the point: "two rules
+        // collide somewhere" is not a thing anyone can act on.
+        assert!(
+            logged.contains("api.example.com_get_api-users")
+                && logged.contains("web.example.com_get_web-users"),
+            "and both operations, so the loss is attributable; got {logged}"
+        );
+        assert!(
+            logged.contains("count=1"),
+            "one finding, reported as a count rather than as a line per finding; got {logged}"
+        );
+        assert_eq!(
+            logged.lines().count(),
+            1,
+            "one line per config, however many findings; got {logged}"
+        );
+    }
+
+    #[test]
+    fn a_config_whose_document_says_everything_warns_not_at_all() {
+        let logged = captured_warnings(CLEAN);
+        assert!(logged.is_empty(), "got {logged}");
     }
 }
