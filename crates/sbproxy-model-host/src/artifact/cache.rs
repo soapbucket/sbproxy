@@ -320,6 +320,18 @@ impl ArtifactCache {
                 "artifact cache root must not be empty".to_string(),
             ));
         }
+        // Backstop for the roots config validation never sees: `--cache-dir`,
+        // `$HF_HOME`, the admin gc and remove routes, and `models pull`,
+        // which compiles the config but never runs its validator. Snapshot
+        // paths are built by joining onto this root, and the engine driver
+        // refuses a relative one, so catching it here fails before the
+        // download instead of after it (WOR-2534).
+        if !root.is_absolute() {
+            return Err(ArtifactError::InvalidArtifact(format!(
+                "artifact cache root {} must be an absolute path",
+                root.display()
+            )));
+        }
         for directory in ["blobs/sha256", "snapshots", "metadata", "partials", "locks"] {
             let path = root.join(directory);
             fs::create_dir_all(&path)
@@ -1306,5 +1318,38 @@ fn io_error(operation: &'static str, path: &Path, source: io::Error) -> Artifact
         operation,
         path: path.to_path_buf(),
         source,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_relative_cache_root_is_refused_before_anything_is_downloaded() {
+        let error =
+            ArtifactCache::open("relative/models").expect_err("a relative cache root is refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("must be an absolute path"),
+            "the message should name the rule: {message}"
+        );
+        assert!(
+            !std::path::Path::new("relative/models").exists(),
+            "the refusal happens before any directory is created"
+        );
+    }
+
+    #[test]
+    fn an_empty_cache_root_is_still_refused() {
+        let error = ArtifactCache::open("").expect_err("an empty cache root is refused");
+        assert!(error.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn an_absolute_cache_root_opens() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let cache = ArtifactCache::open(directory.path().join("cache")).expect("open");
+        assert!(cache.root().join("snapshots").is_dir());
     }
 }

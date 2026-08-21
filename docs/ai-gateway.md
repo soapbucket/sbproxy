@@ -933,7 +933,29 @@ Clients always speak the OpenAI chat completions shape; sbproxy rewrites the bod
 | AWS Bedrock Converse | bidirectional, non-streaming | shipped |
 | AWS Bedrock Converse stream | native stream to hub stream | shipped |
 
-For Anthropic, the request hoists `system` role messages to the top-level `system` field, defaults `max_tokens` when missing, strips OpenAI-only knobs (`logit_bias`, `n`, `presence_penalty`, `frequency_penalty`, `response_format`, `seed`, `user`), and rewrites the path from `/v1/chat/completions` to `/v1/messages`. The response converts text and tool_use blocks back into the OpenAI `choices[].message.content` and `tool_calls` shape, maps `stop_reason` to `finish_reason`, and renames `usage.input_tokens` / `output_tokens` to `prompt_tokens` / `completion_tokens`.
+For Anthropic, the request hoists `system` and `developer` role messages to the top-level `system` field, defaults `max_tokens` when missing, maps `user` onto Anthropic's `metadata.user_id`, strips OpenAI-only knobs (`logit_bias`, `n`, `presence_penalty`, `frequency_penalty`, `response_format`, `seed`), and rewrites the path from `/v1/chat/completions` to `/v1/messages`. The response converts text and tool_use blocks back into the OpenAI `choices[].message.content` and `tool_calls` shape, surfaces `thinking` blocks as `message.reasoning_content`, maps `stop_reason` to `finish_reason`, and renames `usage.input_tokens` / `output_tokens` to `prompt_tokens` / `completion_tokens`.
+
+The whole tool surface is translated, not just the tool definitions. Anthropic has no `tool` role and no top-level `tool_calls` key, so a multi-turn tool conversation needs all three of these to reach the provider at once:
+
+| OpenAI shape the client sends | Anthropic shape the provider gets |
+|---|---|
+| `tools: [{type: function, function: {name, description, parameters}}]` | `tools: [{name, description, input_schema}]` |
+| an assistant turn's `tool_calls` | `tool_use` content blocks on that turn, with `arguments` parsed into `input` |
+| a `role: "tool"` turn with `tool_call_id` | a `user` turn holding one `tool_result` block keyed by `tool_use_id` |
+
+A definition already carrying `input_schema` is Anthropic's own and passes through untouched, so a `/v1/messages` client whose body took the internal round trip and one that skipped it send the same tools upstream.
+
+What the Anthropic request direction still cannot carry, and how you see it: every drop below records a lossiness note, counted on `sbproxy_ai_translation_dropped_total{surface="anthropic_translator", field}` and named in the same one-warn-per-request line the inbound seams use. The `anthropic_translator` surface is deliberately not an inbound surface value, so it adds a row to a drop-rate panel rather than changing one.
+
+| Dropped | Field label | What the caller loses |
+|---|---|---|
+| `logit_bias`, `n`, `presence_penalty`, `frequency_penalty`, `response_format`, `seed` | `anthropic.request.{key}` | the sampling control or structured-output shape the request asked for. `n: 1` and an explicit `null` are not counted, because neither changes the reply |
+| a `tool_choice` shape Anthropic has no name for | `anthropic.request.tool_choice` | the model chooses tools as if it were `auto` |
+| a `user` value that is not a string | `anthropic.request.user` | end-user attribution the provider never sees |
+| a tool definition with no function name | `anthropic.request.tools` | that one tool, rather than the whole request, which Anthropic would refuse over it |
+| a `system` or `developer` turn carrying no text | `anthropic.request.system` | those instructions, since Anthropic's `system` field is text only |
+
+Two gaps are still open and are not surfaced this way, because nothing is dropped: an `image_url` content part and the deprecated `role: "function"` turn are both forwarded verbatim and answered with the provider's 400. Multimodal parts need a base64 conversion and an egress decision about remote image URLs; the deprecated role carries no `tool_call_id` to key a `tool_result` with.
 
 For Gemini, chat completions are rewritten to `generateContent`: roles become Gemini `contents`, system messages become `systemInstruction`, sampling options move under `generationConfig`, and Gemini candidates plus `usageMetadata` are converted back into OpenAI choices and usage. Gemini embeddings translate OpenAI `/v1/embeddings` requests to Gemini embedding calls and normalize the response back to OpenAI embedding objects.
 
@@ -2255,20 +2277,31 @@ aggregated warn per request:
 WARN AI proxy: request fields dropped in translation surface="messages" origin="ai.example.com" tenant="acme" dropped=3 fields="anthropic.metadata, anthropic.messages.content.text.cache_control" first_note="metadata dropped: the canonical request does not carry it, so the provider never sees the request metadata (user_id included)"
 ```
 
-Grep that message to find them. `surface` uses the same values as
-`sbproxy_ai_surface_requests_total`, so a drop-rate panel divides cleanly:
+Grep that message to find them. On the inbound seams `surface` uses the same
+values as `sbproxy_ai_surface_requests_total`, so a drop-rate panel divides
+cleanly:
 
 ```promql
 sum by (surface) (rate(sbproxy_ai_translation_dropped_total[5m]))
   / sum by (surface) (rate(sbproxy_ai_surface_requests_total[5m]))
 ```
 
+One more leg reports here, and it deliberately uses a `surface` value no
+inbound surface can produce, so it adds a row to that panel instead of
+skewing one. `anthropic_translator` is the provider leg: the canonical body
+being rewritten into Anthropic's Messages shape on its way upstream, after
+routing has already chosen the provider. Its rows read
+`anthropic.request.*`, and its warn carries an empty `origin` and `tenant`,
+because the provider translator runs on the body alone and has neither in
+scope.
+
 `field` is a bounded class label (`anthropic.messages.content`,
-`responses.tools`, `responses.text`, ...), never a client-supplied string, so a
-hostile body cannot mint metric series. `origin` and `tenant` ride the warn
-rather than the counter for the same reason. One request emits one warn no
-matter how many fields it dropped, and that warn names at most eight distinct
-field labels, so a large body cannot turn into a log flood.
+`responses.tools`, `responses.text`, `anthropic.request.seed`, ...), never a
+client-supplied string, so a hostile body cannot mint metric series. `origin`
+and `tenant` ride the warn rather than the counter for the same reason. One
+request emits one warn no matter how many fields it dropped, and that warn
+names at most eight distinct field labels, so a large body cannot turn into a
+log flood.
 
 Two fields go the other way and are now forwarded rather than dropped:
 
@@ -2991,7 +3024,7 @@ The proxy exposes aggregate AI usage as Prometheus metrics. The `/metrics` endpo
 | `sbproxy_ai_data_posture_filter_total` | Counter | `constraint`, `outcome`, `tenant` | Requests whose provider candidate set the data-posture constraint narrowed (`outcome="filtered"`) or refused outright (`outcome="refused"`). See [Provider data posture](#provider-data-posture) |
 | `sbproxy_ai_failovers_total` | Counter | `from_provider`, `to_provider`, `reason` | Provider failover events |
 | `sbproxy_ai_guardrail_blocks_total` | Counter | `category` | Guardrail block events (pii, injection, jailbreak, etc.) |
-| `sbproxy_ai_translation_dropped_total` | Counter | `surface`, `field` | Request fields dropped translating an inbound `/v1/messages` or `/v1/responses` body into the canonical chat shape. `surface` matches `sbproxy_ai_surface_requests_total`, so the ratio is a drop rate; `field` is a bounded class (`anthropic.messages.content`, `responses.text`, ...). The matching log line is `AI proxy: request fields dropped in translation`, which carries the origin and tenant |
+| `sbproxy_ai_translation_dropped_total` | Counter | `surface`, `field` | Request fields dropped in translation: an inbound `/v1/messages` or `/v1/responses` body becoming the canonical chat shape, or that canonical body becoming an Anthropic Messages body on the way upstream. On the inbound seams `surface` matches `sbproxy_ai_surface_requests_total`, so the ratio is a drop rate; the provider leg reports under `anthropic_translator`, which no inbound surface uses. `field` is a bounded class (`anthropic.messages.content`, `responses.text`, `anthropic.request.seed`, ...). The matching log line is `AI proxy: request fields dropped in translation`, which carries the origin and tenant on the inbound seams |
 | `sbproxy_ai_safety_guardrail_verdicts_total` | Counter | `guardrail`, `class`, `backend`, `verdict` | Toxicity, jailbreak, and content-safety evaluations, including whether keyword or classifier mode produced the verdict |
 | `sbproxy_ai_reasoning_policy_attempts_total` | Counter | `provider`, `outcome` | Per-provider concise-reasoning result: `native`, `prompt_fallback`, `off`, `tool_bypass`, or `code_bypass` |
 | `sbproxy_ai_cache_results_total` | Counter | `provider`, `cache_type`, `result` | AI response cache results (`cache_type` is `exact` or `semantic`, `result` is `hit` or `miss`) |

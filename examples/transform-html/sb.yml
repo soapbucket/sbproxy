@@ -7,10 +7,7 @@
 #   - removes the upstream `<h1>` element
 #   - injects a stylesheet at the end of <head>
 #   - injects a banner at the start of <body>
-#   - stamps a `data-rewritten` attribute on the first matching `<p>`
-#     (rewrite_attributes only touches the first tag when the attribute
-#     is not already present on any match; see the README's "Known
-#     limitation" section)
+#   - stamps a `data-rewritten` attribute on every matching `<p>`
 #
 # Run:
 #   make run CONFIG=examples/transform-html/sb.yml
@@ -19,7 +16,7 @@
 #   # Original upstream response
 #   curl -s https://test.sbproxy.dev/html
 #
-#   # Proxied response: no h1, banner injected, first <p> tagged
+#   # Proxied response: no h1, banner injected, every <p> tagged
 #   curl -s -H 'Host: html.local' http://127.0.0.1:8080/html
 
 proxy:
