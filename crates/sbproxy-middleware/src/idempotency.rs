@@ -824,6 +824,44 @@ mod tests {
     }
 
     #[test]
+    fn check_request_records_under_the_caches_own_backend_label() {
+        // The seam, not the recorder: `backend_label` existing proves
+        // nothing until `check_request` is the thing that passes it. It
+        // used to pass the literal "default" at all five sites, so a
+        // deployment running one origin on memory and another on redis
+        // rendered both as one series and an unreachable store looked
+        // like normal cold traffic.
+        //
+        // Presence assertions only. The registry is process-global and
+        // these counters never decrease, so this holds under a parallel
+        // runner where an exact value would not.
+        let store = shared_store();
+        let headers = h(&[("Idempotency-Key", "seam-check")]);
+        check_request(&InMemoryIdempotencyCache::new(), "", &headers, b"{}");
+        check_request(&kv_cache(&store, "t", "o"), "", &headers, b"{}");
+
+        // Scanned line by line rather than with one `contains` over the
+        // whole scrape, because the encoder's label order is not this
+        // test's business and the `backend` label is on two families.
+        let scrape = sbproxy_observe::metrics::metrics().render();
+        let rows: Vec<&str> = scrape
+            .lines()
+            .filter(|line| line.starts_with("sbproxy_idempotency_cache_results_total{"))
+            .collect();
+        for backend in ["memory", "kv"] {
+            let needle = format!("backend=\"{backend}\"");
+            assert!(
+                rows.iter().any(|row| row.contains(&needle)),
+                "check_request did not record under backend={backend}: {rows:?}"
+            );
+        }
+        assert!(
+            !rows.iter().any(|row| row.contains("backend=\"default\"")),
+            "the constant label is back: {rows:?}"
+        );
+    }
+
+    #[test]
     fn in_memory_cache_is_bounded_under_unique_keys() {
         // WOR-1693: inserting far past the cap must not grow the cache
         // without bound. Each key is unique (as real idempotency keys

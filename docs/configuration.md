@@ -2691,8 +2691,9 @@ authority included: `https://api.example.com/v1/orders?page=2`, not
 `/v1/orders?page=2`. Sign it the way any conformant RFC 9421 library
 does and the proxy reconstructs the same string. Earlier releases
 derived the path and query alone; a signature in that older shape is
-still accepted for a deprecation window, and the proxy logs once per
-process when one arrives. `@request-target`, for the same reason, is
+still accepted for a deprecation window, counted on
+`sbproxy_signature_legacy_derivation_total{component}` and logged once
+per process with the verifier's key id. `@request-target`, for the same reason, is
 the bare request target (`/v1/orders?page=2`) rather than
 draft-cavage's `GET /v1/orders?page=2`.
 

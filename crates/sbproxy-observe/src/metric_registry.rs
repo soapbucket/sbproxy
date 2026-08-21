@@ -3630,6 +3630,23 @@ pub const METRICS: &[MetricCapability] = &[
         description: "Content-Security-Policy headers emitted by the security_headers policy, by mode (enforce, report_only).",
         dead_reason: None,
     },
+    // The deprecation window on the pre-RFC-9421 derivations of
+    // `@target-uri` and `@request-target` cannot close on a log line:
+    // acceptance is announced once per process, which says a signer
+    // somewhere has not moved and nothing about whether that is still
+    // true. This is the series an operator watches to zero before the
+    // fallback is removed.
+    MetricCapability {
+        name: "sbproxy_signature_legacy_derivation_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_signature_legacy_derivation"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["component"],
+        description: "RFC 9421 signatures accepted only against the pre-conformance derivation of a request-target component, by component.",
+        dead_reason: None,
+    },
     MetricCapability {
         name: "sbproxy_silent_degradations_total",
         kind: MetricKind::Counter,

@@ -171,8 +171,10 @@ clock drift needs.
 authority included (`https://blog.example/article`). Sign it with any
 conformant RFC 9421 library and the proxy reconstructs the same string.
 Earlier releases derived the path alone, and a signature in that older shape
-is still accepted for a deprecation window; the proxy logs once per process
-when one arrives.
+is still accepted for a deprecation window. Every acceptance counts on
+`sbproxy_signature_legacy_derivation_total{component}` and the proxy logs one
+`warn` per process naming the verifier's key id, so you can tell whether any
+signer still depends on the old shape before the fallback is removed.
 
 ## Agent-class resolver relationship
 

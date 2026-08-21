@@ -56,9 +56,11 @@
 //! Verification accepts the old derivation as a fallback for a
 //! deprecation window: a signature covering one of the two that fails
 //! against the conformant base is retried against the legacy one, with
-//! the same key and after the same freshness check, and a success there
-//! logs the deprecation once per process. Signing always produces the
-//! conformant base.
+//! the same key and after the same freshness check. A success there
+//! counts `sbproxy_signature_legacy_derivation_total{component}` and
+//! logs the deprecation once per process, naming the verifier's key id;
+//! the counter is what tells an operator whether the window can close.
+//! Signing always produces the conformant base.
 //!
 //! One more candidate exists for a request line in origin form, which
 //! carries no scheme: an `http::Request` has no connection behind it,
@@ -502,7 +504,7 @@ impl MessageSignatureVerifier {
                 };
                 if ok {
                     if dialect == BaseDialect::Legacy {
-                        warn_legacy_target_derivation();
+                        record_legacy_target_derivation(input, &self.config.key_id);
                     }
                     break;
                 }
@@ -624,20 +626,36 @@ fn covers_any(input: &SignatureInputEntry, names: &[&str]) -> bool {
     })
 }
 
-/// Say once per process that a signer is still on the pre-RFC-9421
-/// derivation.
+/// Record that a signer is still on the pre-RFC-9421 derivation.
 ///
-/// Once, not per request: this fires on the hot path of every request
-/// from a signer that has not moved yet, and the point is to tell the
-/// operator the deprecation applies to them, which one line does.
-fn warn_legacy_target_derivation() {
+/// Counted every time, logged once. The count is the number that lets
+/// the deprecation window close: a line logged once per process says
+/// some signer somewhere has not moved and nothing about whether that
+/// is still true this week, and per-request it would be a log flood on
+/// the hot path of every request from a signer that has not moved yet.
+/// The line names the first `keyid` seen so the operator has somewhere
+/// to start; `sbproxy_signature_legacy_derivation_total{component}` has
+/// the rest.
+fn record_legacy_target_derivation(input: &SignatureInputEntry, key_id: &str) {
+    // Closed set, and the label has to be `&'static str`: these are the
+    // only two components whose derivation moved.
+    for component in ["@target-uri", "@request-target"] {
+        if covers_any(input, &[component]) {
+            sbproxy_observe::metrics::record_signature_legacy_derivation(component);
+        }
+    }
     static WARNED: std::sync::Once = std::sync::Once::new();
     WARNED.call_once(|| {
         tracing::warn!(
+            // The verifier's own configured key id, not the one the
+            // wire claimed, so this names an operator's key rather than
+            // echoing a caller-supplied string into the log.
+            keyid = %key_id,
             "message signature verified only against the pre-RFC-9421 derivation of \
              `@target-uri` / `@request-target`; the signer should move to a conformant \
              RFC 9421 library. Acceptance of the old derivation is a deprecation window \
-             and will be removed. Logged once per process."
+             and will be removed. Logged once per process; every occurrence is counted \
+             on sbproxy_signature_legacy_derivation_total"
         );
     });
 }
@@ -1683,6 +1701,18 @@ mod tests {
                 .verify_request(&req),
             VerifyVerdict::Ok { .. }
         ));
+
+        // The window can only close on evidence, and the log line is
+        // emitted once per process. Presence assertion only: the
+        // registry is process-global and counters never decrease.
+        let scrape = sbproxy_observe::metrics::metrics().render();
+        assert!(
+            scrape
+                .lines()
+                .filter(|line| line.starts_with("sbproxy_signature_legacy_derivation_total{"))
+                .any(|line| line.contains("component=\"@target-uri\"")),
+            "taking the legacy fallback must be scrapeable: {scrape}"
+        );
     }
 
     #[test]

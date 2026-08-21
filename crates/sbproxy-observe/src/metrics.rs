@@ -3401,6 +3401,32 @@ pub fn record_bot_auth_nonce_replay(policy: &str) {
     counter.with_label_values(&[policy]).inc();
 }
 
+/// Record an RFC 9421 signature that verified only against the
+/// pre-conformance derivation of a request-target component, on
+/// `sbproxy_signature_legacy_derivation_total{component}`.
+///
+/// `component` is `@target-uri` or `@request-target`, both compile-time
+/// constants on the call path, so the series set is closed at two.
+///
+/// This is the one number that says whether the deprecation window can
+/// close. The acceptance is otherwise a single `warn` line logged once
+/// per process, which tells an operator that some signer somewhere has
+/// not moved and nothing about whether that is still true today.
+pub fn record_signature_legacy_derivation(component: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_signature_legacy_derivation_total",
+            "RFC 9421 signatures accepted only against the pre-conformance derivation of a request-target component",
+            &["component"],
+        )
+        .expect("signature legacy derivation counter registers")
+    });
+    counter.with_label_values(&[component]).inc();
+}
+
 /// Count JWKS refreshes triggered synchronously by an unknown JWT `kid`.
 ///
 /// `result` is intentionally closed by convention: `success`, `failure`,
@@ -7524,6 +7550,23 @@ mod tests {
             out.contains("reason=\"wildcard_with_credentials\""),
             "reason label missing"
         );
+    }
+
+    #[test]
+    fn record_signature_legacy_derivation_emits_counter() {
+        record_signature_legacy_derivation("@target-uri");
+        record_signature_legacy_derivation("@request-target");
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_signature_legacy_derivation_total"),
+            "legacy derivation counter missing from render"
+        );
+        for component in ["@target-uri", "@request-target"] {
+            assert!(
+                out.contains(&format!("component=\"{component}\"")),
+                "component={component} label missing"
+            );
+        }
     }
 
     // --- body + compression ---

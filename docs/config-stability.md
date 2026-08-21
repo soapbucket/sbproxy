@@ -527,11 +527,16 @@ signer built against the old shape keeps verifying and the proxy logs the
 deprecation once per process.
 
 **What an operator sees when it bites.** Nothing immediately: both bases
-verify. The old one stops being accepted in a future release.
+verify. Every acceptance of the old derivation counts on
+`sbproxy_signature_legacy_derivation_total{component}` and logs one
+`warn` per process naming the verifier's key id. The old one stops being
+accepted in a future release.
 
 **What to do before upgrading.** Move signers onto a conformant RFC 9421
-library. Outbound signatures the proxy produces are already on the new
-derivation.
+library, and watch
+`sbproxy_signature_legacy_derivation_total` go to zero before the release
+that removes the fallback. Outbound signatures the proxy produces are
+already on the new derivation.
 
 ---
 
