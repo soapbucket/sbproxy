@@ -3497,6 +3497,225 @@ fn set_body_model(body: &mut serde_json::Value, model: &str) {
     }
 }
 
+/// The closed metric labels one `semantic_route` decision produces
+/// (WOR-2564).
+///
+/// One value carries both so the two counters cannot disagree: the
+/// decisions counter's outcome and, for every disposition that did not
+/// pin a match, the routing-fallback counter's reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SemanticRouteDecision {
+    /// Label for `sbproxy_ai_semantic_route_decisions_total{outcome}`.
+    outcome: &'static str,
+    /// Label for `sbproxy_ai_routing_fallbacks_total{reason}`, `None`
+    /// when the decision pinned its matched deployment.
+    fallback_reason: Option<&'static str>,
+}
+
+impl SemanticRouteDecision {
+    /// A decision that pinned the matched deployment.
+    const MATCHED: Self = Self {
+        outcome: "matched",
+        fallback_reason: None,
+    };
+
+    /// Tick both counters for this decision.
+    ///
+    /// An unavailable embedder is deliberately a counted fallback rather
+    /// than a failed request, so an embedding outage on a
+    /// `semantic_route` origin reads as a fallback rate instead of as
+    /// silence.
+    fn record(self) {
+        sbproxy_ai::ai_metrics::record_semantic_route_decision(self.outcome);
+        if let Some(reason) = self.fallback_reason {
+            sbproxy_ai::ai_metrics::record_routing_fallback("semantic_route", reason);
+        }
+    }
+}
+
+/// The candidate index of `name`, when it survived this request's
+/// eligibility filters.
+///
+/// Reads the order rather than the full provider list on purpose: a
+/// `semantic_route` disposition may only ever narrow the set it is
+/// given, so a deployment credential policy, model eligibility, the
+/// training opt-out, or health already removed is not reinstated.
+fn eligible_provider_index(
+    providers: &[sbproxy_ai::ProviderConfig],
+    provider_order: &[usize],
+    name: &str,
+) -> Option<usize> {
+    provider_order
+        .iter()
+        .copied()
+        .find(|&index| providers.get(index).is_some_and(|p| p.name == name))
+}
+
+/// The best-scoring deployment and its cosine score, for the outcomes
+/// that scored one.
+///
+/// `NoPrompt` and `EmbedderUnavailable` never reach the similarity
+/// histogram: neither produced a score, and observing a zero there would
+/// drag the distribution an operator tunes `min_similarity` against.
+fn scored_semantic_route_outcome(
+    outcome: &sbproxy_ai::routing::semantic_route::SemanticRouteOutcome,
+) -> Option<(&str, f32)> {
+    use sbproxy_ai::routing::semantic_route::SemanticRouteOutcome;
+    match outcome {
+        SemanticRouteOutcome::Matched {
+            deployment, score, ..
+        } => Some((deployment.as_str(), *score)),
+        SemanticRouteOutcome::BelowFloor {
+            best_deployment,
+            best_score,
+        } => Some((best_deployment.as_str(), *best_score)),
+        SemanticRouteOutcome::NoPrompt | SemanticRouteOutcome::EmbedderUnavailable => None,
+    }
+}
+
+/// Apply one `semantic_route` decision to a request's candidate order
+/// (WOR-2564).
+///
+/// This is the strategy's whole enforcement table in one place, so every
+/// dispatch surface reaches the same disposition: the JSON body path
+/// that embeds a prompt, the multipart surfaces (transcription, image
+/// edit, image variation, file upload), and the method-aware verbs
+/// (DELETE/HEAD/PUT/PATCH/OPTIONS). The promptless surfaces hand in
+/// [`SemanticRouteOutcome::NoPrompt`] without embedding anything,
+/// because a form upload has no user message and must never pay for an
+/// embedding call to learn that. A mechanism narrower than this would
+/// leave those requests off the decisions counter and ignore the
+/// operator's declared default for them, which is exactly the shape of a
+/// strategy whose enforcement is narrower than its promise.
+///
+/// `Matched` pins the winning deployment when it survived this request's
+/// eligibility filters. Every other outcome, and a match whose
+/// deployment did not survive, pins the declared `fallback` when that is
+/// eligible and otherwise leaves the order untouched for the strategy's
+/// round-robin select arm, which is what an origin with no declared
+/// `fallback` asked for.
+///
+/// `routing_detail` receives the bounded operator-facing reason the
+/// admin routing-decisions row renders. It carries provider names,
+/// exemplar ordinals, and scores; never exemplar text, never caller
+/// input. That record, not a log line, is the durable per-request
+/// account of the decision: the two expected dispositions (a match and
+/// a below-floor miss) log at `debug` because they fire on every
+/// request and `release_max_level_info` compiles them out of a release
+/// build anyway, while the two that mean something went wrong (an
+/// ineligible target, an unavailable embedder) log at `warn` because a
+/// fail-open an operator cannot see is the same as no fallback at
+/// all.
+///
+/// [`SemanticRouteOutcome::NoPrompt`]: sbproxy_ai::routing::semantic_route::SemanticRouteOutcome::NoPrompt
+fn apply_semantic_route_outcome(
+    semantic: &sbproxy_ai::routing::semantic_route::SemanticRouteConfig,
+    providers: &[sbproxy_ai::ProviderConfig],
+    outcome: &sbproxy_ai::routing::semantic_route::SemanticRouteOutcome,
+    provider_order: &mut Vec<usize>,
+    routing_detail: &mut Option<String>,
+) -> SemanticRouteDecision {
+    use sbproxy_ai::routing::semantic_route::SemanticRouteOutcome;
+    let floor = semantic.min_similarity;
+    let fallback_reason = match outcome {
+        SemanticRouteOutcome::Matched {
+            deployment,
+            exemplar,
+            score,
+        } => match eligible_provider_index(providers, provider_order, deployment) {
+            Some(index) => {
+                let matched_exemplar = exemplar
+                    .map(|ordinal| format!("exemplar {ordinal}"))
+                    .unwrap_or_else(|| "centroid".to_string());
+                tracing::debug!(
+                    event = "ai.semantic_route.route",
+                    deployment = %deployment,
+                    exemplar = %exemplar
+                        .map(|ordinal| ordinal.to_string())
+                        .unwrap_or_else(|| "centroid".to_string()),
+                    score = *score,
+                    floor = floor,
+                    "semantic routing selected deployment"
+                );
+                *routing_detail = Some(format!(
+                    "matched {deployment} {matched_exemplar} at {score:.3} (floor {floor:.3})"
+                ));
+                *provider_order = vec![index];
+                return SemanticRouteDecision::MATCHED;
+            }
+            None => {
+                tracing::warn!(
+                    event = "ai.semantic_route.route_miss",
+                    deployment = %deployment,
+                    score = *score,
+                    "semantic routing matched a deployment that is not eligible for this \
+                     request; falling back"
+                );
+                *routing_detail = Some(format!(
+                    "matched {deployment} at {score:.3} but it is not eligible for this request"
+                ));
+                "target_ineligible"
+            }
+        },
+        SemanticRouteOutcome::BelowFloor {
+            best_deployment,
+            best_score,
+        } => {
+            tracing::debug!(
+                event = "ai.semantic_route.fallback",
+                reason = "below_floor",
+                best_deployment = %best_deployment,
+                best_score = *best_score,
+                floor = floor,
+                "no exemplar cleared the similarity floor; routing to the default"
+            );
+            *routing_detail = Some(format!(
+                "below floor: closest {best_deployment} at {best_score:.3} (floor {floor:.3})"
+            ));
+            "below_floor"
+        }
+        SemanticRouteOutcome::NoPrompt => {
+            tracing::debug!(
+                event = "ai.semantic_route.fallback",
+                reason = "no_prompt",
+                "request carries no user message to embed; routing to the default"
+            );
+            *routing_detail = Some("no user message to embed".to_string());
+            // `missing_signal` is the shared routing-fallback reason the
+            // prefix-affinity and outcome-aware strategies already use
+            // for "the signal this strategy routes on was absent".
+            "missing_signal"
+        }
+        SemanticRouteOutcome::EmbedderUnavailable => {
+            // A request-client error can carry an endpoint, so only a
+            // fixed failure class is logged from this path, matching the
+            // semantic cache's fail-open log discipline.
+            tracing::warn!(
+                event = "ai.semantic_route.fallback",
+                reason = "embed_error",
+                failure = "embedding_unavailable",
+                "semantic routing embedder unavailable (fail-open to the default)"
+            );
+            *routing_detail = Some("embedder unavailable; routed to the default".to_string());
+            "embed_error"
+        }
+    };
+    if let Some(index) = semantic
+        .fallback
+        .as_deref()
+        .and_then(|fallback| eligible_provider_index(providers, provider_order, fallback))
+    {
+        *provider_order = vec![index];
+    }
+    SemanticRouteDecision {
+        outcome: match fallback_reason {
+            "missing_signal" => "no_prompt",
+            other => other,
+        },
+        fallback_reason: Some(fallback_reason),
+    }
+}
+
 pub(super) async fn handle_ai_proxy(
     session: &mut Session,
     config: &AiHandlerConfig,
@@ -4343,6 +4562,18 @@ pub(super) async fn handle_ai_proxy(
                 provider_candidates = eligible;
             }
         }
+        // WOR-2564: DELETE/HEAD/PUT/PATCH/OPTIONS carry no user message
+        // either, so they take the same promptless disposition.
+        if let Some(semantic) = router.semantic_route_config() {
+            apply_semantic_route_outcome(
+                semantic,
+                &config.providers,
+                &sbproxy_ai::routing::semantic_route::SemanticRouteOutcome::NoPrompt,
+                &mut provider_candidates,
+                &mut ctx.admin_routing_detail,
+            )
+            .record();
+        }
         let provider_idx = router
             .select_with_candidates(&config.providers, &provider_candidates)
             .ok_or_else(|| {
@@ -4940,6 +5171,19 @@ pub(super) async fn handle_ai_proxy(
         if provider_order.is_empty() {
             send_error(session, 503, "no healthy eligible AI provider").await?;
             return Ok(());
+        }
+        // WOR-2564: a multipart body carries no user message, so
+        // semantic routing takes its promptless disposition here rather
+        // than embedding a form upload.
+        if let Some(semantic) = router.semantic_route_config() {
+            apply_semantic_route_outcome(
+                semantic,
+                &config.providers,
+                &sbproxy_ai::routing::semantic_route::SemanticRouteOutcome::NoPrompt,
+                &mut provider_order,
+                &mut ctx.admin_routing_detail,
+            )
+            .record();
         }
         let is_failover = matches!(config.routing, sbproxy_ai::RoutingStrategy::FallbackChain);
         if is_failover {
@@ -7763,6 +8007,74 @@ pub(super) async fn handle_ai_proxy(
                 );
             }
         }
+    }
+    // WOR-2564: semantic (embedding-similarity) routing. When configured,
+    // embed the request's final user message through the strategy's
+    // embedding source and pin the routing set to the deployment whose
+    // declared exemplars it matches best, when that score clears the
+    // configured floor. Everything else is a fallback, never a failure:
+    // a below-floor score, a request with no user message, and an
+    // unavailable embedder all pin the declared `fallback` deployment
+    // when it is eligible and otherwise leave the order for the
+    // strategy's round-robin select arm below, so this strategy can
+    // narrow a selection but can never hang or fail the request. Every
+    // disposition ticks
+    // `sbproxy_ai_semantic_route_decisions_total{outcome}`, and the
+    // fallback ones additionally tick
+    // `sbproxy_ai_routing_fallbacks_total{strategy="semantic_route"}`,
+    // so an embedder outage is a visible fallback rate, not silence.
+    //
+    // The match score and winning exemplar are surfaced twice: on the
+    // `ai.semantic_route.route` tracing event, and on
+    // `ctx.admin_routing_detail`, which the admin request log renders
+    // next to the strategy and the selected target so the
+    // routing-decisions row shows which declared specialty fired rather
+    // than only the provider it landed on. The exemplar is reported by
+    // its ordinal in the rule's declared list; exemplar text is
+    // operator-authored prose that stays out of logs the way
+    // `SemanticRouteRule`'s Debug keeps it out.
+    //
+    // Skipped when a routing policy already returned a cascade plan:
+    // that plan names its own tiers and dispatches without consulting
+    // `provider_order`, so embedding here would buy a narrowing nothing
+    // reads and still charge the request an embedding call.
+    if let Some(semantic) = router
+        .semantic_route_config()
+        .filter(|_| routing_policy_cascade.is_none())
+    {
+        // The query text alone. `extract_semantic_prompt` additionally
+        // digests the whole canonical request so the semantic cache can
+        // fence reuse; routing needs only the text, and paying for that
+        // digest on every request of a `semantic_route` origin would be
+        // a hot-path cost with no reader.
+        let prompt = semantic_query_text(&body);
+        let ai_client = AI_CLIENT.load_full();
+        let embed = |text: String| {
+            let client = ai_client.clone();
+            async move {
+                sbproxy_ai::routing::semantic_route::embed_route_text(
+                    semantic,
+                    &client,
+                    &config.providers,
+                    allowed_providers,
+                    blocked_providers,
+                    &text,
+                )
+                .await
+            }
+        };
+        let outcome = sbproxy_ai::routing::semantic_route::decide(semantic, &prompt, embed).await;
+        if let Some((deployment, score)) = scored_semantic_route_outcome(&outcome) {
+            sbproxy_ai::ai_metrics::record_semantic_route_similarity(deployment, score);
+        }
+        apply_semantic_route_outcome(
+            semantic,
+            &config.providers,
+            &outcome,
+            &mut provider_order,
+            &mut ctx.admin_routing_detail,
+        )
+        .record();
     }
     if is_failover {
         provider_order.sort_by_key(|&i| config.providers[i].priority.unwrap_or(u32::MAX));
@@ -17623,6 +17935,279 @@ fn ai_management_response_with_policy(
             Some(serde_json::json!({ "status": "healthy" }))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod semantic_route_dispatch_tests {
+    use super::{apply_semantic_route_outcome, scored_semantic_route_outcome};
+    use sbproxy_ai::routing::semantic_route::{SemanticRouteConfig, SemanticRouteOutcome};
+
+    fn prov(name: &str) -> sbproxy_ai::ProviderConfig {
+        serde_json::from_value(serde_json::json!({"name": name, "api_key": "x"}))
+            .expect("ProviderConfig fixture")
+    }
+
+    fn semantic(fallback: Option<&str>) -> SemanticRouteConfig {
+        let mut routing = serde_json::json!({
+            "min_similarity": 0.75,
+            "routes": [
+                {"deployment": "code-pool", "exemplars": ["Review this pull request"]},
+                {"deployment": "chat-pool", "exemplars": ["Chat about everyday topics"]}
+            ],
+            "embedding": {"provider": "embedder", "model": "text-embedding-3-small"}
+        });
+        if let Some(fallback) = fallback {
+            routing["fallback"] = serde_json::Value::String(fallback.to_string());
+        }
+        let config: SemanticRouteConfig =
+            serde_json::from_value(routing).expect("semantic_route fixture parses");
+        config.validate().expect("semantic_route fixture validates");
+        config
+    }
+
+    fn matched(deployment: &str, score: f32) -> SemanticRouteOutcome {
+        SemanticRouteOutcome::Matched {
+            deployment: deployment.to_string(),
+            exemplar: Some(1),
+            score,
+        }
+    }
+
+    #[test]
+    fn a_match_pins_its_deployment_and_reports_the_exemplar_and_score() {
+        let providers = vec![prov("code-pool"), prov("chat-pool"), prov("embedder")];
+        let mut order = vec![0, 1, 2];
+        let mut detail = None;
+        let decision = apply_semantic_route_outcome(
+            &semantic(Some("chat-pool")),
+            &providers,
+            &matched("code-pool", 0.834),
+            &mut order,
+            &mut detail,
+        );
+        assert_eq!(order, vec![0], "the matched deployment is pinned");
+        assert_eq!(decision.outcome, "matched");
+        assert_eq!(
+            decision.fallback_reason, None,
+            "a pinned match is not a routing fallback"
+        );
+        // WOR-2564's admin acceptance: the routing-decisions row shows
+        // which declared specialty fired, not only the provider.
+        assert_eq!(
+            detail.as_deref(),
+            Some("matched code-pool exemplar 1 at 0.834 (floor 0.750)")
+        );
+    }
+
+    #[test]
+    fn a_below_floor_score_falls_through_to_the_declared_secondary() {
+        // The ticket's second acceptance line: below-floor is a normal
+        // outcome routed to the declared default, never an error.
+        let providers = vec![prov("code-pool"), prov("chat-pool")];
+        let mut order = vec![0, 1];
+        let mut detail = None;
+        let decision = apply_semantic_route_outcome(
+            &semantic(Some("chat-pool")),
+            &providers,
+            &SemanticRouteOutcome::BelowFloor {
+                best_deployment: "code-pool".to_string(),
+                best_score: 0.581,
+            },
+            &mut order,
+            &mut detail,
+        );
+        assert_eq!(order, vec![1], "the declared fallback deployment is pinned");
+        assert_eq!(decision.outcome, "below_floor");
+        assert_eq!(decision.fallback_reason, Some("below_floor"));
+        assert_eq!(
+            detail.as_deref(),
+            Some("below floor: closest code-pool at 0.581 (floor 0.750)")
+        );
+    }
+
+    #[test]
+    fn an_unavailable_embedder_falls_through_instead_of_failing() {
+        let providers = vec![prov("code-pool"), prov("chat-pool")];
+        let mut order = vec![0, 1];
+        let mut detail = None;
+        let decision = apply_semantic_route_outcome(
+            &semantic(Some("chat-pool")),
+            &providers,
+            &SemanticRouteOutcome::EmbedderUnavailable,
+            &mut order,
+            &mut detail,
+        );
+        assert_eq!(order, vec![1]);
+        assert_eq!(decision.outcome, "embed_error");
+        assert_eq!(
+            decision.fallback_reason,
+            Some("embed_error"),
+            "an embedder outage has to read as a fallback rate, not as silence"
+        );
+    }
+
+    #[test]
+    fn a_promptless_surface_pins_the_declared_fallback() {
+        // A multipart upload and a DELETE both reach this without a user
+        // message. The operator declared where those go; honoring it here
+        // is what keeps the strategy's enforcement as wide as its promise.
+        let providers = vec![prov("code-pool"), prov("chat-pool"), prov("embedder")];
+        let mut order = vec![0, 1, 2];
+        let mut detail = None;
+        let decision = apply_semantic_route_outcome(
+            &semantic(Some("chat-pool")),
+            &providers,
+            &SemanticRouteOutcome::NoPrompt,
+            &mut order,
+            &mut detail,
+        );
+        assert_eq!(order, vec![1], "the declared fallback deployment is pinned");
+        assert_eq!(detail.as_deref(), Some("no user message to embed"));
+        assert_eq!(decision.outcome, "no_prompt");
+        assert_eq!(
+            decision.fallback_reason,
+            Some("missing_signal"),
+            "an absent routing signal reports as the shared missing_signal reason"
+        );
+    }
+
+    #[test]
+    fn a_promptless_surface_without_a_declared_fallback_leaves_the_order() {
+        let providers = vec![prov("code-pool"), prov("chat-pool")];
+        let mut order = vec![0, 1];
+        let mut detail = None;
+        apply_semantic_route_outcome(
+            &semantic(None),
+            &providers,
+            &SemanticRouteOutcome::NoPrompt,
+            &mut order,
+            &mut detail,
+        );
+        assert_eq!(
+            order,
+            vec![0, 1],
+            "with no declared default the eligible order stands for round-robin"
+        );
+        assert_eq!(detail.as_deref(), Some("no user message to embed"));
+    }
+
+    #[test]
+    fn an_ineligible_fallback_never_reinstates_a_filtered_provider() {
+        // `chat-pool` was filtered out of this request's candidate set by
+        // credential policy or health. A fallback must narrow the set it
+        // is given, never widen it back.
+        let providers = vec![prov("code-pool"), prov("chat-pool")];
+        let mut order = vec![0];
+        let mut detail = None;
+        apply_semantic_route_outcome(
+            &semantic(Some("chat-pool")),
+            &providers,
+            &SemanticRouteOutcome::NoPrompt,
+            &mut order,
+            &mut detail,
+        );
+        assert_eq!(order, vec![0], "an ineligible fallback is not reinstated");
+    }
+
+    #[test]
+    fn a_match_on_an_ineligible_deployment_falls_back_and_says_so() {
+        // The winning specialty was filtered out by credential policy,
+        // model eligibility, the training opt-out, or health. Composition
+        // follows cost_quality's rule: narrow, never widen.
+        let providers = vec![prov("code-pool"), prov("chat-pool")];
+        let mut order = vec![1];
+        let mut detail = None;
+        let decision = apply_semantic_route_outcome(
+            &semantic(Some("chat-pool")),
+            &providers,
+            &matched("code-pool", 0.912),
+            &mut order,
+            &mut detail,
+        );
+        assert_eq!(order, vec![1]);
+        assert_eq!(decision.outcome, "target_ineligible");
+        assert_eq!(decision.fallback_reason, Some("target_ineligible"));
+        assert_eq!(
+            detail.as_deref(),
+            Some("matched code-pool at 0.912 but it is not eligible for this request")
+        );
+    }
+
+    #[test]
+    fn only_the_scored_outcomes_reach_the_similarity_histogram() {
+        assert_eq!(
+            scored_semantic_route_outcome(&matched("code-pool", 0.9)),
+            Some(("code-pool", 0.9))
+        );
+        assert_eq!(
+            scored_semantic_route_outcome(&SemanticRouteOutcome::BelowFloor {
+                best_deployment: "chat-pool".to_string(),
+                best_score: 0.4,
+            }),
+            Some(("chat-pool", 0.4)),
+            "near misses are the distribution an operator tunes the floor against"
+        );
+        for unscored in [
+            SemanticRouteOutcome::NoPrompt,
+            SemanticRouteOutcome::EmbedderUnavailable,
+        ] {
+            assert_eq!(
+                scored_semantic_route_outcome(&unscored),
+                None,
+                "an outcome that scored nothing must not observe a zero: {unscored:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_decision_label_is_one_the_metric_recorders_accept() {
+        // Both recorders fold an unrecognized label to `unknown`, which
+        // would silently retire a real outcome. Pin the vocabulary here
+        // so a renamed disposition fails this test rather than reading as
+        // `unknown` on a dashboard.
+        let providers = vec![prov("code-pool"), prov("chat-pool")];
+        for outcome in [
+            matched("code-pool", 0.9),
+            matched("no-such-pool", 0.9),
+            SemanticRouteOutcome::BelowFloor {
+                best_deployment: "code-pool".to_string(),
+                best_score: 0.1,
+            },
+            SemanticRouteOutcome::NoPrompt,
+            SemanticRouteOutcome::EmbedderUnavailable,
+        ] {
+            let mut order = vec![0, 1];
+            let mut detail = None;
+            let decision = apply_semantic_route_outcome(
+                &semantic(Some("chat-pool")),
+                &providers,
+                &outcome,
+                &mut order,
+                &mut detail,
+            );
+            assert!(
+                matches!(
+                    decision.outcome,
+                    "matched" | "below_floor" | "no_prompt" | "embed_error" | "target_ineligible"
+                ),
+                "decision outcome {:?} is outside the closed vocabulary",
+                decision.outcome
+            );
+            assert!(
+                decision.fallback_reason.is_none_or(|reason| matches!(
+                    reason,
+                    "missing_signal" | "below_floor" | "embed_error" | "target_ineligible"
+                )),
+                "fallback reason {:?} is outside the closed vocabulary",
+                decision.fallback_reason
+            );
+            assert!(
+                detail.is_some(),
+                "every disposition owes the admin row a reason: {outcome:?}"
+            );
+            decision.record();
+        }
     }
 }
 

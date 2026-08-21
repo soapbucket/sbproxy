@@ -12,6 +12,22 @@ the next version cut.
 
 ### Added
 
+- **`semantic_route`: semantic (embedding-similarity) AI routing.** A
+  new AI gateway routing strategy that routes on what the request
+  means: each deployment declares its specialty as exemplar prompts or
+  precomputed centroids, the proxy embeds the request's final user
+  message through the configured embedding source (the semantic
+  cache's `provider` / `sidecar` / `openai` source shapes), and the
+  best cosine match above `min_similarity` pins that deployment.
+  Below-floor scores, promptless requests, and embedder failures all
+  fall to the declared `fallback` deployment (or round-robin), counted
+  on `sbproxy_ai_semantic_route_decisions_total{outcome}` and
+  `sbproxy_ai_routing_fallbacks_total`, never failing the request. A
+  missing embedding source or an unknown deployment name refuses at
+  config compile. See the `semantic_route` section of
+  [docs/ai-gateway.md](docs/ai-gateway.md) and
+  [examples/semantic-routing/](examples/semantic-routing/).
+
 - **`hmac_auth`: signed-request authentication.** A new auth provider
   for machine callers that prove possession of a shared secret by
   signing each request (RFC 9421 HTTP Message Signatures,

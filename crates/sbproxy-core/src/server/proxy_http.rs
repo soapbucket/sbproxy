@@ -6985,6 +6985,7 @@ impl ProxyHttp for SbProxy {
                 failover_to: ctx.admin_failover_to.clone(),
                 load_balancer_strategy: ctx.admin_load_balancer_strategy.clone(),
                 load_balancer_target: ctx.admin_load_balancer_target.clone(),
+                routing_detail: ctx.admin_routing_detail.clone(),
                 provider: ctx.ai_provider.clone(),
                 model: ctx.ai_model.clone(),
                 tokens_in: ctx.ai_tokens_in,

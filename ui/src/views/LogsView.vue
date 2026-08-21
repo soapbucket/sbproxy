@@ -370,6 +370,7 @@ function detailFields(request: RequestLog): DetailField[] {
   push("Failover to", request.failover_to);
   push("Load balancer", request.load_balancer_strategy);
   push("Selected target", request.load_balancer_target);
+  push("Routing detail", request.routing_detail);
   push("Guardrail", request.guardrail_category);
   push("Guardrail action", request.guardrail_action);
   // WOR-2093 key accountability.

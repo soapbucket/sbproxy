@@ -1998,6 +1998,8 @@ export interface RequestLog {
   failover_to?: string;
   load_balancer_strategy?: string;
   load_balancer_target?: string;
+  /** Why the strategy picked that target, when it decides per request. */
+  routing_detail?: string;
   provider?: string;
   model?: string;
   tokens_in?: number;
