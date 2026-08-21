@@ -4136,6 +4136,8 @@ async fn refuse_over_price_ceiling(
     );
     let bytes = price_ceiling_refusal_body(ceiling_usd, ctx.request_id.as_str(), excluded);
     send_response(session, 402, "application/json", &bytes).await
+}
+
 /// The closed metric labels one `semantic_route` decision produces
 /// (WOR-2564).
 ///

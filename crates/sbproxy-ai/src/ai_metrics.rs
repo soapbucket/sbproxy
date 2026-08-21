@@ -582,6 +582,10 @@ pub(crate) fn translation_dropped_value(surface: &str, field: &str) -> u64 {
     AI_TRANSLATION_DROPPED
         .with_label_values(&[surface, field])
         .get() as u64
+}
+
+// --- Per-request price ceiling (WOR-2559) ---
+
 /// Registered without `.unwrap()` (mirroring
 /// `MULTIPART_INSPECTION_SKIPPED`) because the production unwrap/expect
 /// ratchet in `scripts/check-unwrap-ratchet.sh` is at its baseline and

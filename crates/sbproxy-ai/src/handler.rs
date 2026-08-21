@@ -1188,6 +1188,9 @@ impl AiHandlerConfig {
                         .any(|provider| provider.name.as_str() == name.as_str()),
                     "ai `{key}` names provider `{name}`, which does not match any \
                      `providers[].name` on this action"
+                );
+            }
+        }
         // WOR-2559: a ceiling of zero or below cannot admit any request
         // whose estimate is a real cost, so it would blackhole the origin
         // at 402 for every chat request, which is what a typed `-0.05` or
