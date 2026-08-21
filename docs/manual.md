@@ -1,6 +1,6 @@
 # SBproxy Runtime Manual
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 Vendor: Soap Bucket LLC - [www.soapbucket.com](https://www.soapbucket.com)
 
@@ -196,6 +196,9 @@ sbproxy audit verify <path> [--channel security|config|key|admin]
                         [--signing-seed-hex <hex>] [--format text|json]
 sbproxy admin hash-password [--password <value> | --password-stdin]
 sbproxy doctor [<config>] [--format text|json] [--strict]
+sbproxy connect [<client>...] [--base-url <url>] [--model <id>] [--dry-run]
+                        [--format text|json]
+sbproxy disconnect [<client>...] [--dry-run] [--format text|json]
 sbproxy service install <catalog-id> [--name <alias>] [--variant <id>]
                               [--engine auto|vllm|sglang|llama_cpp|mistralrs]
                               [--accel auto|cuda|metal|cpu]
@@ -229,6 +232,8 @@ The full subcommand set, one line each:
 | `audit` | Audit-trail tools: `audit verify` re-derives a tamper-evident audit chain from genesis and reports the first record that does not check out; `--channel` picks the trail (`security` by default, or `config`, `key`, `admin`). |
 | `admin` | Admin-account maintenance: `hash-password` prints the `password_hash` value for `proxy.admin.operators[].password_hash`. |
 | `doctor` | Diagnose what this binary can do on the current host. |
+| `connect` | Point the coding agents installed on this machine at this gateway. Detects Codex, Claude Code, Cursor, Cline, and Copilot; writes `$CODEX_HOME/sbproxy.config.toml` (a Codex profile of its own, never your `config.toml`) through a temp file and a rename, taking a one-time `.sbproxy.bak` copy first; prints the exports or the settings-screen fields for the rest. `--dry-run` shows the unified diff and writes nothing. No credential is read or written: the config names the environment variable each client reads its key from. See [use-case-connect-coding-agents.md](use-case-connect-coding-agents.md). |
+| `disconnect` | Remove what `connect` wrote and name what to clear by hand. The `.sbproxy.bak` copy is left in place. |
 | `service` | Install, remove, or check a per-user `launchd` agent (macOS only) that runs a certified catalog model in the background; reuses the same secure config generation as `run`. |
 | `completions` | Print a shell-completion script for the requested shell. |
 | `version` | Print the version line. Synonym for `--version`. |

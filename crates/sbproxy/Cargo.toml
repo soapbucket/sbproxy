@@ -176,6 +176,10 @@ serde_json.workspace = true
 # already in the lock graph (via serde_json), so this adds no new deps.
 serde = { workspace = true, features = ["derive"] }
 
+# WOR-2653: `connect` rewrites `$CODEX_HOME/sbproxy.config.toml` in place
+# without losing comments or any key it does not own.
+toml_edit.workspace = true
+
 # WOR-180 step 5: `apply` takes an exclusive flock(2) on
 # <yaml_path>.applylock so two concurrent operators do not race the
 # same reload. fs2 is the cross-platform flock wrapper used by
