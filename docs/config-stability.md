@@ -222,13 +222,24 @@ helper rule several references away from the query compiled clean and then made
 that helper a constant: the query still evaluated, the decision still looked
 computed, and a `deny` rule that stopped running failed open with nothing in
 the logs to say so. The check now compares against every rule head the module
-defines. Three shapes refuse where two of them did not before:
+defines. Four shapes refuse where three of them did not before:
 
 | Base data | Rule the module defines | Previously |
 |---|---|---|
 | `data.<pkg>.<helper>` | a rule at that path that is not the query's | compiled, helper silently dead |
 | `data.<pkg>.<rule>` set to JSON `null` | a rule at that path | compiled, rule silently dead |
 | `data.<pkg>` set to a scalar | a rule beneath that path | refused at load with an opaque `previous value is not an object` from the interpreter, or compiled with the rule dead if the query never reached it |
+| `data.<pkg>.<table>` holding any key | a partial rule computing its own keys at that path (`table[k] := ...`) | compiled and behaved correctly whenever the base keys and the computed keys were disjoint |
+
+The fourth row is the one where a config that was working refuses, and it is
+the only one. Rego indexes a partial rule by the key it computes, so a base
+table of `{"POST": "no"}` beside a rule that only ever produces `GET` merged
+and both entries were readable. Load time sees the fixed part of the path and
+no further, so it cannot separate that document from `{"GET": "no"}` beside the
+same rule, which kills the rule's only output and says nothing. The check keeps
+the wide side, because that second document is the silent failure this whole
+change exists to catch, and it fails open. An empty object at the same path
+still loads, since no key there can beat a computed one.
 
 The refusal names the data path, the rule it landed on, and the reference chain
 from the query to that rule:
