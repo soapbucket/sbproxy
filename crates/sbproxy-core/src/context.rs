@@ -451,6 +451,12 @@ pub struct RequestContext {
     /// keep every value small and already-redacted: this map reaches
     /// the admin API unfiltered.
     pub ai_route_detail: serde_json::Map<String, serde_json::Value>,
+    /// Zone-locality verdict of the load balancer selection
+    /// (WOR-2328): `"local"` when selection narrowed to the proxy's
+    /// own zone, `"spilled"` when no same-zone target was healthy and
+    /// selection widened across zones, `None` when the locality stage
+    /// did not engage.
+    pub admin_zone_locality: Option<&'static str>,
 
     // --- Concurrent limit guards ---
     /// Permits issued by `ConcurrentLimitPolicy` for this request. The
@@ -1760,6 +1766,7 @@ impl RequestContext {
             ai_route_candidates: Vec::new(),
             ai_route_attempted: Vec::new(),
             ai_route_detail: serde_json::Map::new(),
+            admin_zone_locality: None,
             concurrent_limit_guards: Vec::new(),
             concurrent_limit_denial_body: None,
             agent_budget_guards: Vec::new(),

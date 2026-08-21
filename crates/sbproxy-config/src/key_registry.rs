@@ -143,7 +143,9 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
     // the only available one: the key is `routing`, the key is read, and it
     // was one accepted *value* of it that did nothing, a shape no
     // reader-based check can see. Target zones were the remaining pin
-    // until WOR-2498 flipped them to the refusal route too (see below).
+    // until WOR-2498 flipped them to the refusal route, and WOR-2328
+    // then closed the loop by shipping zone-aware selection and
+    // re-admitting the key as `stable` (see below).
     //
     // Two more keys took the refusal route for the same reason (WOR-2319).
     // Both live under `origins.*.transforms[]`, which `ConfigFile` types as
@@ -248,11 +250,22 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
     // `algorithm: ring_hash` as the replacement, so an entry here would
     // classify a field that no longer parses.
     //
-    // `origins.*.action.targets[].zone` is deliberately absent for the
-    // same reason (WOR-2498). It was the last `config_only` pin on this
-    // surface: a label that read as zone-aware routing and steered
-    // nothing. `from_config_for_origin` refuses an authored `zone:` at
-    // config compile with a message naming the algorithms that do ship.
+    // `origins.*.action.targets[].zone` completed the round trip
+    // (WOR-2328): pinned `config_only` as a display label, then
+    // removed and refused at config compile (WOR-2498) because a
+    // label that reads as zone-aware routing must not steer nothing,
+    // and finally re-admitted `stable` when zone-aware selection
+    // shipped. The consumer is the locality stage in
+    // `select_target_for_request`; `locality.min_pool_size` is its
+    // Envoy-style deactivation guard.
+    stable(
+        "origins.*.action.locality.min_pool_size",
+        "sbproxy_modules::action::loadbalancer::locality_filter",
+    ),
+    stable(
+        "origins.*.action.targets[].zone",
+        "sbproxy_modules::action::loadbalancer::locality_filter",
+    ),
     config_only(
         "origins.*.agent_skills[].max_clock_skew_secs",
         "Nothing signs an Agent Skills response, so there is no freshness header for this \
@@ -1074,6 +1087,13 @@ pub const CONFIG_KEY_OVERRIDES: &[ConfigKeyCapability] = &[
         "proxy.tenants[].observability.log.sinks[].output.type",
         "sbproxy_core::server::lifecycle::compile_one_sink",
     ),
+    // WOR-2328: the proxy's own zone identity, resolved once per
+    // pipeline compilation (config first, then the `SB_ZONE`
+    // environment variable) and bound to every compiled load balancer,
+    // where `locality_filter` prefers same-zone targets. The read is
+    // `ProxyServerConfig::resolve_zone`, an inherent method the
+    // reader scan cannot see, so the binding site is named instead.
+    stable("proxy.zone", "sbproxy_core::pipeline::bind_zone_identity"),
     stable("source.kind", "sbproxy_config::source::load_with_depth"),
 ];
 
@@ -1141,9 +1161,10 @@ const fn rooted(kind: &'static str, name: &'static str) -> ModuleCoverage {
 /// re-derive it:
 ///
 /// * `origins.*.action`: every key had a live reader except `targets[].zone`,
-///   which was pinned under WOR-2328 until WOR-2498 removed the field and
-///   made the load balancer refuse it at config compile, the `sticky:`
-///   treatment. Two looked dead and are not.
+///   which was pinned under WOR-2328, removed and refused at config compile
+///   by WOR-2498 (the `sticky:` treatment), and finally wired for real when
+///   WOR-2328 shipped zone-aware selection; it is `stable` above now, read
+///   by `locality_filter`. Two looked dead and are not.
 ///   `targets[].host_override` reads in `sbproxy_core`'s upstream-host
 ///   selection rather than in the load balancer, so a search scoped to
 ///   `loadbalancer.rs` misses it. `lb_method` is read only by the

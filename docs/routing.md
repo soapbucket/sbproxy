@@ -77,7 +77,7 @@ Runnable: [`examples/forward-rules/`](../examples/forward-rules/), [`examples/bo
 | `ip_hash` / `uri_hash` / `header_hash` / `cookie_hash` | Sticky by client IP, path, a named header, or a named cookie. |
 | `ring_hash` | Ketama-style consistent hashing; removing one of N targets remaps roughly 1/N of keys instead of reshuffling most of them. |
 
-The `sticky:` block from older configs was removed (it never issued an affinity cookie); use `ring_hash` keyed on a cookie your application already sets instead. Zone-aware routing is not implemented: `targets[].zone` never influenced selection and is refused at config compile rather than accepted as an inert label.
+The `sticky:` block from older configs was removed (it never issued an affinity cookie); use `ring_hash` keyed on a cookie your application already sets instead.
 
 **Health, failure, and resilience signals** apply per target and compose:
 
@@ -86,6 +86,48 @@ The `sticky:` block from older configs was removed (it never issued an affinity 
 - **Outlier detection**: ejects a target whose error *rate* crosses `threshold` over a sliding `window_secs`, complementary to the breaker's consecutive-failure trigger. See [Outlier detection](configuration.md#outlier-detection); runnable at [`examples/outlier-detection/`](../examples/outlier-detection/).
 
 When every target is filtered by these signals, the load balancer falls back to the unfiltered list rather than returning 502 to the client.
+
+**Zone-aware routing:** when the proxy knows which zone it is in and targets carry `zone` labels, selection prefers same-zone targets and spills across zones only when no same-zone target is healthy. The proxy's own zone comes from `proxy.zone` in the config; when that is unset, the `SB_ZONE` environment variable fills in, which is the knob a Kubernetes deployment populates from the node's `topology.kubernetes.io/zone` label. Config wins over the environment, so a stray variable can never re-zone a proxy whose config already says where it is.
+
+```yaml
+proxy:
+  zone: us-east-1a
+
+origins:
+  "api.example.com":
+    action:
+      type: load_balancer
+      algorithm: round_robin
+      targets:
+        - url: https://replica-east.internal:8443
+          zone: us-east-1a
+        - url: https://replica-west.internal:8443
+          zone: us-west-2a
+```
+
+Locality is a narrowing stage, not a ninth algorithm. It runs after the health signals above and before the priority filter, so it only ever sees targets that are already eligible, and it composes with every algorithm, registered strategy, and deployment mode rather than replacing them:
+
+```mermaid
+flowchart TD
+    POOL["Pool after deployment-mode\nand backup filtering"] --> HEALTH["Health narrowing:\nactive probes, outlier ejection,\ncircuit breakers"]
+    HEALTH -->|"every target filtered:\nlast-resort full pool,\nlocality stands down"| PRIO
+    HEALTH --> GATE{"proxy.zone or SB_ZONE bound,\npool carries zone labels,\npool at least locality.min_pool_size?"}
+    GATE -->|no| PRIO["Priority filter\n(X-Priority header)"]
+    GATE -->|yes| SAME{"Any healthy target\nin the proxy's own zone?"}
+    SAME -->|"yes: narrow to same-zone\n(zone_locality = local)"| PRIO
+    SAME -->|"no: spill across zones\n(zone_locality = spilled)"| PRIO
+    PRIO --> SEL["Registered strategy,\nor the configured algorithm"]
+    SEL --> T["Selected target"]
+```
+
+The behavior to rely on, in order of what breaks first:
+
+- **Same-zone preference is absolute while the local zone is healthy.** Every request from a proxy in `us-east-1a` lands on a `us-east-1a` target, matching the pre-call region filtering LiteLLM documents and the `prefer_local` half of Envoy's zone-aware routing.
+- **Failover is per-request, not per-config.** The moment the last same-zone target goes unhealthy, requests spill to the other zones; the moment one recovers, traffic snaps back. There is no mode switch to flip and no blackholing when the local zone is down.
+- **A proxy with no zone identity selects exactly as before.** Zone labels without `proxy.zone` or `SB_ZONE` steer nothing (the proxy logs a warning at boot naming the missing knob), and an unlabeled pool ignores the proxy's zone. Single-zone configs are unaffected.
+- **`locality.min_pool_size`** (default 2) deactivates the stage when the pool is smaller, the same guard as Envoy's `min_cluster_size`. The pool is counted before health filtering, as Envoy counts cluster hosts, so a health flap can never toggle the stage on and off. Raise it on large fleets where pinning a small local zone would concentrate too much traffic; the default only excludes single-target pools so that a two-target, two-zone config routes locally out of the box.
+
+Every selection reports its verdict: the admin request log carries `zone_locality` (`local` or `spilled`, absent when the stage did not engage), and `GET /api/health/targets` shows each target's zone beside the proxy's own so an operator can see at a glance whether locality is active. See [admin-api-reference.md](admin-api-reference.md). Runnable, with a forced local-zone-down drill: [`examples/multi-zone/`](../examples/multi-zone/).
 
 **Deployment patterns:** blue-green (`deployment_mode: { mode: blue_green, active: green }`, targets tagged `group: blue`/`green`) and canary (`deployment_mode: { mode: canary, weight: 10 }`, a `group: canary` subset). See [Blue-green deployments](configuration.md#blue-green-deployments) and [Canary deployments](configuration.md#canary-deployments); runnable at [`examples/load-balancer/`](../examples/load-balancer/) and [`examples/load-balancer-deployment/`](../examples/load-balancer-deployment/).
 
@@ -148,6 +190,7 @@ Everything above that reacts to failure (health checks, circuit breaker, outlier
 | [`load-balancer`](../examples/load-balancer/) | Basic algorithm selection |
 | [`load-balancer-deployment`](../examples/load-balancer-deployment/) | Blue-green and canary |
 | [`active-health-checks`](../examples/active-health-checks/) | Active probes |
+| [`multi-zone`](../examples/multi-zone/) | Zone-aware routing with cross-zone spillover |
 | [`circuit-breaker`](../examples/circuit-breaker/) | Consecutive-failure isolation |
 | [`outlier-detection`](../examples/outlier-detection/) | Error-rate ejection |
 | [`service-discovery`](../examples/service-discovery/) | DNS re-resolution and IP rotation |
