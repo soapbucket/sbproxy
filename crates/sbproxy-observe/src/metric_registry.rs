@@ -3342,6 +3342,20 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_prompt_injection_v2_results_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_metric"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        // Registered into the ProxyMetrics registry rather than the global
+        // one: `body_aware_counter()` builds the vec by hand and hands it to
+        // `metrics().registry`.
+        registry: Registry::Proxy,
+        labels: &["action", "label", "detector"],
+        description: "Body-aware prompt-injection detector results, by action taken, detection label, and detector name.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_projection_render_failures_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_projection_render_failure"),
@@ -3664,6 +3678,38 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &[],
         description: "Failed installs of the process-wide telemetry sink dispatcher.",
+        dead_reason: None,
+    },
+    // Both storage families are written by the same `observe_op` wrapper in
+    // `crates/sbproxy-storage/src/metrics.rs`, which every RedisStore trait
+    // method goes through. They shipped as `storage_op_*`, outside both
+    // sanctioned prefixes, which made them invisible twice over: the
+    // coverage guard only looked at sanctioned names, and a scrape config
+    // built from the prefixes this doc sanctions dropped them at the
+    // scrape. Renamed with the registry entries they always owed.
+    MetricCapability {
+        name: "sbproxy_storage_op_duration_seconds",
+        kind: MetricKind::Histogram,
+        // The static rather than `observe_op`: the wrapper is generic
+        // (`fn observe_op<F, T>(`), so the scanner's `fn observe_op(`
+        // definition needle would never match it.
+        writer: Writer::Recorder("STORAGE_OP_DURATION_SECONDS"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        registry: Registry::Default,
+        labels: &["op", "backend", "kind"],
+        description: "Latency of storage backend operations, by operation, backend, and record kind.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_storage_op_errors_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("STORAGE_OP_ERRORS_TOTAL"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        registry: Registry::Default,
+        labels: &["op", "backend", "kind", "error_kind"],
+        description: "Errors returned by storage backend operations, by operation, backend, record kind, and error variant.",
         dead_reason: None,
     },
     MetricCapability {
