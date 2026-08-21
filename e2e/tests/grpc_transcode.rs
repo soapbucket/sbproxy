@@ -262,6 +262,14 @@ fn the_transcoded_request_advertises_identity_message_encoding() {
     // sending nothing leaves a server free to gzip a frame the transcoder
     // then refuses. This asserts the header on the wire the upstream
     // actually received, not the intent at the call site.
+    //
+    // The REST client deliberately sends its own `grpc-accept-encoding:
+    // gzip`. Overriding it is half the claim: on this hop the proxy is
+    // the gRPC client, not a forwarder, so what the caller can read says
+    // nothing about what the transcoder can read. A probe that sent no
+    // header would pass against an implementation that merely defaulted
+    // the value when absent and forwarded a client's `gzip` untouched,
+    // which is the bug wearing the fix's clothes.
     let upstream = spawn_echo_grpc_server();
     let harness = ProxyHarness::start_with_yaml(&transcode_config(&upstream)).expect("start");
 
@@ -270,7 +278,7 @@ fn the_transcoded_request_advertises_identity_message_encoding() {
             "/echo",
             "transcode.localhost",
             &json!({ "message": ACCEPT_ENCODING_PROBE }),
-            &[],
+            &[("grpc-accept-encoding", "gzip")],
         )
         .expect("post");
 

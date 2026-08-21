@@ -446,7 +446,22 @@ the `status` label on `sbproxy_requests_total` and
 `sbproxy_origin_requests_total`, and any downstream client that retries on 5xx
 all see the change at once. Response caching for those
 origins also changes, since a 4xx or 5xx is not stored the way a 200 was.
+Three more surfaces read the status line at the same point and therefore
+also move: the RFC 9209 `Proxy-Status` header, which is stamped on non-2xx
+responses only, so a `proxy_status.enabled` origin starts emitting it on
+failed RPCs; response `assert` policies; and `on_response` callbacks.
 Nothing about the JSON body changed.
+
+One surface deliberately does not move, and it is a change in its own
+right. `fallback_origin.on_status` is no longer consulted at all on an
+origin with `transcode` or `grpc_web: true`. Both translated modes own
+the response body outright, so a fallback that fired there could commit
+the fallback's status and `content-length` while the body downstream
+stayed the translated one, and a body that does not match its declared
+length desynchronizes a keep-alive connection. `on_error` is unaffected:
+it fires before any upstream response exists, so there is no translated
+body to conflict with. If you need a status fallback on a gRPC upstream,
+put it on a plain-passthrough origin in front of it.
 
 **What to do before upgrading.** Re-baseline error-rate alerts on the affected
 origins, and check any client that treated a transcoded call as always-2xx and
