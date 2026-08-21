@@ -1942,8 +1942,8 @@ pub(super) fn absolute_request_uri(
         .unwrap_or_else(|| "/".to_string());
     http::Uri::builder()
         .scheme(scheme)
-        .authority(authority)
-        .path_and_query(path_and_query)
+        .authority(authority.as_str())
+        .path_and_query(path_and_query.as_str())
         .build()
         // An authority the `Host` header carried can be anything a
         // client typed, so the build can fail. Falling back to the
