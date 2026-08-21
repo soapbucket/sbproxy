@@ -2831,11 +2831,21 @@ export const api = {
   // WOR-2578: multi-dimension aggregation of the same filtered ring.
   requestsReport: (groupBy: string[], filters: RequestFilters = {}) =>
     getJson<RequestReportResponse>(requestsReportPath(groupBy, filters)),
-  // WOR-2578: raw export of the filtered view. Returns a URL rather
-  // than fetching: the browser downloads it directly (same-origin
-  // session cookie carries auth), so the SPA never buffers the file.
+  // WOR-2578: the raw export of the filtered view, as a URL for
+  // copying or a right-click save. A bare <a download> on it works,
+  // but it never enters `request()`'s failure handling, so a lapsed
+  // session saves `{"error":"Unauthorized"}` under the name
+  // `requests.csv` with nothing on screen; the console clicks through
+  // `requestsExport` below instead.
   requestsExportUrl: (format: "csv" | "jsonl", filters: RequestFilters = {}) =>
     requestsExportPath(format, filters),
+  // The same bytes through the typed client, so a 401 routes the
+  // operator to sign-in and any other status renders as an error
+  // rather than as a downloaded file. Bounded server-side by
+  // `proxy.admin.max_log_entries`, which is what makes holding the
+  // response acceptable here.
+  requestsExport: (format: "csv" | "jsonl", filters: RequestFilters = {}) =>
+    getText(requestsExportPath(format, filters)),
   // WOR-1870: operator UI settings (trace deep-link template).
   uiSettings: () => getJson<UiSettings>("/api/ui-settings"),
   // WOR-1870: SSE live tail of the request ring. EventSource sends the

@@ -38,10 +38,20 @@ the next version cut.
   audited admin action (`export_request_log`, naming the format, the
   row count, and which filter dimensions were set) and increments the
   new `sbproxy_admin_request_exports_total{format}` and
-  `sbproxy_admin_request_export_rows_total{format}` counters, so a
-  bulk read of the operational log is both recorded and alertable.
+  `sbproxy_admin_request_export_rows_total{format}` counters, so every
+  export is recorded and alertable. That record covers the export
+  route, not every bulk read: `GET /api/requests?limit=<max>` returns
+  the same rows under the same cap with no record and no counter, so a
+  detection built on `export_request_log` alone covers the download
+  button rather than the whole read surface. The response is bounded
+  by the ring cap but materialized rather than streamed, because the
+  admin dispatcher answers with a whole body; what the row-at-a-time
+  encoding avoids is a second copy, not the response itself.
   All three routes share one filter surface, which gains exact
-  `model`, `tenant`, and `user` filters. The admin console's new
+  `model`, `tenant`, and `user` filters, refuses a malformed `status`,
+  `offset`, or `limit` with a `400` instead of ignoring it, and treats
+  an empty filter value as "rows with nothing there", so the report's
+  unattributed group drills through to its own rows like any other. The admin console's new
   Reports view drives them and serializes filter and grouping state
   into URL query params, so a filtered report is a shareable link.
   See the reporting sections of
@@ -61,12 +71,21 @@ the next version cut.
   and reason, alongside the records that verified. A truncated or
   deleted chain file is reported as a failure too: what is left of a
   truncated file links and signs perfectly, so the read compares the
-  walk against the number of records the proxy wrote to that chain. The console's
+  walk against the number of records **this process** wrote to that
+  chain, which means it catches a truncation the running proxy
+  outlived and not one that survived a restart. The console's
   Audit view renders the four channel cards, the merged entry table,
   and a failure banner. GET-only, readable by the `read_only` role;
   a login narrowed with `proxy.admin.operators[].tenant` is refused,
   because the chains are deployment-wide and a per-tenant slice of an
-  audit trail reads as "nothing else happened". Every call is itself
+  audit trail reads as "nothing else happened". Read access is wider
+  than the bounded ring at `GET /api/audit/events` on two axes, both
+  stated in [docs/audit-log.md](docs/audit-log.md): history is the
+  whole chain rather than the last `max_audit_events` records, and
+  each entry carries the chained payload verbatim rather than the
+  ring's `detail` projection. No secrets cross either way; a
+  deployment that wants the trail narrower turns the channel's chain
+  path off or fronts the admin port. Every call is itself
   recorded on the admin channel (`read_audit_chain`, or
   `read_audit_chain_denied` on the refusal). See the audit-chain
   sections of [docs/audit-log.md](docs/audit-log.md),
@@ -75,11 +94,18 @@ the next version cut.
 
 - **New metric `sbproxy_audit_chain_read_total{channel, outcome}`.**
   One increment per chain walked per viewer read, with an `outcome`
-  of `verified`, `broken`, or `unreadable`. A broken chain that only
-  a person looking at the console can see is a finding nobody is on
-  call for, so the verdict leaves the page as well as rendering on
-  it: alert on
+  of `verified`, `broken`, or `unreadable`; a refusal increments all
+  four channels with `denied`, because it refuses all four. A broken
+  chain that only a person looking at the console can see is a finding
+  nobody is on call for, and a tenant-scoped operator probing a
+  deployment-wide security surface is one whose only other record sits
+  inside the chain that operator was refused. Both leave the page:
+  alert on
   `increase(sbproxy_audit_chain_read_total{outcome!="verified"}[15m]) > 0`.
+  That rule does not cover a chain file truncated at the tail and read
+  after a restart: the boot re-baselines on what is left, every link
+  and signature holds, and the read is `verified`. Pre-restart records
+  are covered by `sbproxy audit verify` against an offsite copy.
 
 - **`hmac_auth`: signed-request authentication.** A new auth provider
   for machine callers that prove possession of a shared secret by

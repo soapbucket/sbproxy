@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # Admin reporting: who spent what, as a shareable link and a CSV.
 #
-# Two tenants, four governed keys, two models, and named human callers.
+# Two tenants, three governed keys, two models, and named human callers.
 # That is enough attribution for the admin API's reporting routes to
 # answer the question a finance thread actually asks: which person, on
 # which key, drove which model, and what did it cost.
@@ -14,54 +14,16 @@
 #
 # A filter that selects rows on the first selects exactly the same rows
 # on the other two, so a grouped number always drills through to the
-# rows behind it. See docs/admin-api-reference.md.
+# rows behind it, the unattributed group included. See
+# docs/admin-api-reference.md.
 #
-# Setup (a local OpenAI-shaped fixture stands in for the provider, so
-# this runs with no upstream account):
-#   python3 - <<'PY' &
-#   import http.server, json
-#   class H(http.server.BaseHTTPRequestHandler):
-#       def do_POST(self):
-#           body = json.loads(self.rfile.read(int(self.headers["content-length"])))
-#           out = json.dumps({
-#               "id": "chatcmpl-fixture", "object": "chat.completion",
-#               "model": body.get("model", "gpt-4o-mini"),
-#               "choices": [{"index": 0, "finish_reason": "stop",
-#                            "message": {"role": "assistant", "content": "ok"}}],
-#               "usage": {"prompt_tokens": 120, "completion_tokens": 40,
-#                         "total_tokens": 160},
-#           }).encode()
-#           self.send_response(200)
-#           self.send_header("content-type", "application/json")
-#           self.send_header("content-length", str(len(out)))
-#           self.end_headers()
-#           self.wfile.write(out)
-#       def log_message(self, *a): pass
-#   http.server.HTTPServer(("127.0.0.1", 18080), H).serve_forever()
-#   PY
-#   make run CONFIG=examples/admin-reporting/sb.yml
-#
-# Drive attributed traffic. `X-Sb-User-Id` names the human behind the
-# call; the Authorization bearer selects the governed key; the Host
-# header selects the tenant:
-#   curl -s http://127.0.0.1:8080/v1/chat/completions \
-#     -H 'Host: acme.ai.local' \
-#     -H 'Authorization: Bearer vk-acme-platform' \
-#     -H 'X-Sb-User-Id: dev@acme.test' \
-#     -H 'Content-Type: application/json' \
-#     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Hi"}]}'
-#
-# Report on it, grouping by all four dimensions at once:
-#   curl -s -u "admin:${SB_ADMIN_PASSWORD:-demo-change-me}" \
-#     'http://127.0.0.1:9090/api/requests/report?group_by=model,api_key_id,tenant,user' \
-#     | python3 -m json.tool
-#
-# Export the same filtered view:
-#   curl -s -u "admin:${SB_ADMIN_PASSWORD:-demo-change-me}" \
-#     'http://127.0.0.1:9090/api/requests/export?format=csv&tenant=acme' \
-#     -o acme-requests.csv
-#
-# See README.md for the captured output of each of those calls.
+# README.md carries the whole walkthrough: the local OpenAI-shaped
+# fixture that stands in for the provider, the five calls that drive
+# attributed traffic through it, and the captured output of every
+# report, export, metric and audit record below. It is deliberately the
+# only copy of that fixture. A second copy here drifted from it, and a
+# reader who ran this file's version got totals that did not match a
+# single published number.
 
 proxy:
   http_bind_port: 8080
@@ -99,7 +61,7 @@ origins:
           # OpenAI-shaped provider configuration carries one. Against the
           # real provider this would be ${OPENAI_API_KEY}.
           api_key: ${FIXTURE_API_KEY:-fixture-local-token}
-          base_url: http://127.0.0.1:18080/v1
+          base_url: http://127.0.0.1:18086/v1
           allow_private_base_url: true
           default_model: gpt-4o-mini
           models:
@@ -127,7 +89,7 @@ origins:
         - name: openai
           provider_type: openai
           api_key: ${FIXTURE_API_KEY:-fixture-local-token}
-          base_url: http://127.0.0.1:18080/v1
+          base_url: http://127.0.0.1:18086/v1
           allow_private_base_url: true
           default_model: gpt-4o-mini
           models:

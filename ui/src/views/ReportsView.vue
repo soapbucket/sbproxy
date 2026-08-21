@@ -1,7 +1,12 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { api, type RequestFilters, type RequestReportResponse } from "../api";
+import {
+  api,
+  ApiError,
+  type RequestFilters,
+  type RequestReportResponse,
+} from "../api";
 import { useAsync } from "../composables/useAsync";
 import {
   filterStateFromQuery,
@@ -44,7 +49,18 @@ function currentFilters(): RequestFilters {
   };
 }
 
-const req = useAsync(() => api.requestsReport(groupBy.value, currentFilters()));
+// The committed view: what the table shows, what the URL carries, and
+// what an export downloads, all read from here rather than from the
+// live inputs. `applyFilters` is the only writer. Reading the live refs
+// instead is how a link under-filters: an operator who types a tenant
+// and refreshes narrows the table while the address bar still says
+// "every tenant", and the colleague they send it to sees every tenant.
+const appliedFilters = ref<RequestFilters>({});
+const appliedGroupBy = ref<string[]>(["model"]);
+
+const req = useAsync(() =>
+  api.requestsReport(appliedGroupBy.value, appliedFilters.value),
+);
 const report = computed<RequestReportResponse | null>(() => req.data.value);
 const rows = computed(() => report.value?.rows ?? []);
 const totals = computed(() => report.value?.totals ?? null);
@@ -68,6 +84,8 @@ function syncStateToUrl() {
 }
 
 function applyFilters() {
+  appliedFilters.value = currentFilters();
+  appliedGroupBy.value = [...groupBy.value];
   syncStateToUrl();
   req.run();
 }
@@ -107,16 +125,60 @@ onMounted(() => {
   // shared link degrades to a usable view.
   const dims = groupByFromQuery(state.group_by, FILTER_KEYS);
   if (dims.length) groupBy.value = dims;
+  // Commit before the first fetch so the table, the URL and the export
+  // links all describe the same view from the first paint.
+  appliedFilters.value = currentFilters();
+  appliedGroupBy.value = [...groupBy.value];
   req.run();
 });
 
-// Export the current filtered view (raw rows, not the grouped ones).
-// Plain same-origin links: the session cookie authenticates, and the
-// browser writes the response straight to a file, so the SPA never
-// holds the export in memory. The response is bounded server-side by
-// the ring cap, so the download cannot run away either.
-const exportCsvUrl = computed(() => api.requestsExportUrl("csv", currentFilters()));
-const exportJsonlUrl = computed(() => api.requestsExportUrl("jsonl", currentFilters()));
+// Export the committed filtered view (raw rows, not the grouped ones).
+// The href is real and copyable, and a right-click save still works;
+// the click path goes through the typed client instead, because a bare
+// <a download> never enters `request()`'s failure handling and a lapsed
+// session would save `{"error":"Unauthorized"}` as `requests.csv` with
+// nothing on screen. The response is bounded server-side by the ring
+// cap, so holding it long enough to name the file is bounded too.
+const exportCsvUrl = computed(() =>
+  api.requestsExportUrl("csv", appliedFilters.value),
+);
+const exportJsonlUrl = computed(() =>
+  api.requestsExportUrl("jsonl", appliedFilters.value),
+);
+const exporting = ref<"csv" | "jsonl" | null>(null);
+const exportError = ref<string | null>(null);
+
+const EXPORT_CONTENT_TYPES = {
+  csv: "text/csv",
+  jsonl: "application/x-ndjson",
+} as const;
+
+async function downloadExport(format: "csv" | "jsonl") {
+  exporting.value = format;
+  exportError.value = null;
+  try {
+    const body = await api.requestsExport(format, appliedFilters.value);
+    saveAs(body, `requests.${format}`, EXPORT_CONTENT_TYPES[format]);
+  } catch (e) {
+    exportError.value =
+      e instanceof ApiError
+        ? e.hint
+        : e instanceof Error
+          ? e.message
+          : "The export failed.";
+  } finally {
+    exporting.value = null;
+  }
+}
+
+function saveAs(body: string, filename: string, type: string) {
+  const url = URL.createObjectURL(new Blob([body], { type }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+}
 
 function groupValue(row: { group: Record<string, string> }, dim: string): string {
   return row.group[dim] || "(unattributed)";
@@ -137,9 +199,23 @@ function rowKey(row: { group: Record<string, string> }): string {
     subtitle="Spend and usage over the recent-request ring, grouped by any mix of model, API key, tenant, and user. The URL carries the whole view, so a filtered report is a shareable link."
   >
     <template #actions>
-      <a class="sb-btn" :href="exportCsvUrl" download="requests.csv">Export CSV</a>
-      <a class="sb-btn" :href="exportJsonlUrl" download="requests.jsonl">Export JSONL</a>
-      <button class="sb-btn sb-btn--primary" @click="req.run">Refresh</button>
+      <a
+        class="sb-btn"
+        :href="exportCsvUrl"
+        download="requests.csv"
+        :aria-busy="exporting === 'csv'"
+        @click.prevent="downloadExport('csv')"
+        >Export CSV</a
+      >
+      <a
+        class="sb-btn"
+        :href="exportJsonlUrl"
+        download="requests.jsonl"
+        :aria-busy="exporting === 'jsonl'"
+        @click.prevent="downloadExport('jsonl')"
+        >Export JSONL</a
+      >
+      <button class="sb-btn sb-btn--primary" @click="applyFilters">Refresh</button>
     </template>
   </PageHeader>
 
@@ -191,6 +267,8 @@ function rowKey(row: { group: Record<string, string> }): string {
     </div>
   </section>
 
+  <p v-if="exportError" class="export-error" role="alert">{{ exportError }}</p>
+
   <ErrorState v-if="req.error.value" :error="req.error.value" @retry="req.run" />
   <EmptyState
     v-else-if="!req.loading.value && !rows.length"
@@ -236,6 +314,11 @@ function rowKey(row: { group: Record<string, string> }): string {
 </template>
 
 <style scoped>
+.export-error {
+  margin: 0 0 12px;
+  color: var(--sb-err);
+  font-size: 13px;
+}
 .filter-panel {
   margin-bottom: 16px;
 }

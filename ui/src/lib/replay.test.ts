@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 
+import { ApiError } from "../api";
 import type { ContentSample, RequestLog } from "../api";
 import {
   beginReplay,
+  contentSampleErrorMessage,
   replayAvailabilityNotes,
   replayDispatchMessages,
   replayGaps,
@@ -184,14 +186,51 @@ describe("replayGaps", () => {
   });
 
   it("states the body gap, with the server's reason, when nothing was captured", () => {
+    // The reason comes out of a real ApiError the way production builds
+    // one, rather than being handed in as a literal: the previous
+    // version of this test passed the asserted string in itself, so it
+    // would have passed with the wiring removed entirely.
+    const failure = new ApiError(
+      404,
+      "GET /api/requests/req-abc/content failed (404)",
+      JSON.stringify({
+        error:
+          "no content sample for that request id; capture requires the origin's capture_content flag AND the key policy's allow_content_capture consent",
+      }),
+    );
     const draft = resolveReplayContent(
-      beginReplay({ requestId: "r" }),
+      beginReplay({ requestId: "req-abc" }),
       null,
-      "capture requires the origin's capture_content flag AND the key policy's allow_content_capture consent",
+      contentSampleErrorMessage(failure),
     );
     const text = replayGaps(draft).join(" ");
     expect(text).toContain("could not be reconstructed");
     expect(text).toContain("allow_content_capture");
+    // And the request line the operator cannot act on stays out of it.
+    expect(text).not.toContain("failed (404)");
+  });
+
+  describe("contentSampleErrorMessage", () => {
+    it("prefers the server's error field over the client-assembled message", () => {
+      const failure = new ApiError(
+        403,
+        "GET /api/requests/r/content failed (403)",
+        JSON.stringify({ error: "content inspection requires the admin role" }),
+      );
+      expect(contentSampleErrorMessage(failure)).toBe(
+        "content inspection requires the admin role",
+      );
+    });
+
+    it("falls back to the status hint when the body carries no explanation", () => {
+      const failure = new ApiError(403, "GET /x failed (403)", "");
+      expect(contentSampleErrorMessage(failure)).toContain("Forbidden");
+    });
+
+    it("passes through a plain Error and names the gap for anything else", () => {
+      expect(contentSampleErrorMessage(new Error("boom"))).toBe("boom");
+      expect(contentSampleErrorMessage("nope")).toBe("content sample unavailable");
+    });
   });
 
   it("states that a captured replay sends redacted text, not the original", () => {

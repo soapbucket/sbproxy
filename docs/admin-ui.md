@@ -770,6 +770,95 @@ flowchart LR
     F --> G["Governed pipeline: key policy, budgets,\nrouting, guardrails, like the original run"]
 ```
 
+#### A worked replay
+
+Two flags have to agree before there is a body to replay, so this runs
+both sides. The origin opts in, and the key consents when it is minted:
+
+```yaml
+# /tmp/sbproxy-replay-demo/sb.yml
+origins:
+  "ai.local":
+    action:
+      type: ai_proxy
+      require_governed_key: true
+      # Half of the two-sided gate. The other half is the key policy's
+      # allow_content_capture, set when the key is minted below.
+      capture_content: true
+      providers:
+        - name: openai
+          provider_type: openai
+          api_key: ${FIXTURE_API_KEY:-fixture-local-token}
+          base_url: http://127.0.0.1:18087/v1
+          allow_private_base_url: true
+          default_model: gpt-4o-mini
+          models:
+            - gpt-4o-mini
+```
+
+Mint the consenting key, then drive one two-message call through it:
+
+```bash
+TOKEN=$(curl -s -X POST -u admin:secret -H 'Content-Type: application/json' \
+  -d '{"name":"replay-demo","allow_content_capture":true}' \
+  http://127.0.0.1:9090/admin/keys | jq -r .token)
+
+curl -s -o /dev/null http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Host: ai.local' -H "Authorization: Bearer $TOKEN" \
+  -H 'X-Sb-User-Id: dev@acme.test' -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4o-mini","messages":[
+        {"role":"system","content":"You are a release assistant."},
+        {"role":"user","content":"Summarize the v1.13 changelog."}]}'
+```
+
+"Replay in playground" on that row is a link to this page carrying the
+request id and the three fields the ring retained, and nothing else:
+
+```text
+/playground?replay=01a021dde3d07cb2ac5a663f5039f782&origin=ai.local&model=gpt-4o-mini&key=5c22524e5b2675aa
+```
+
+The page then fills the form from one audited read, the same one the
+Logs page's "View captured content" button makes:
+
+```bash
+curl -s -u admin:secret \
+  'http://127.0.0.1:9090/api/requests/01a021dde3d07cb2ac5a663f5039f782/content' | jq
+```
+
+```json
+{
+    "request_id": "01a021dde3d07cb2ac5a663f5039f782",
+    "api_key_id": "5c22524e5b2675aa",
+    "tenant_id": "__default__",
+    "origin": "ai.local",
+    "model": "gpt-4o-mini",
+    "captured_at": "2026-08-21T01:09:45.082442+00:00",
+    "input_messages": [
+        {
+            "role": "system",
+            "content": "You are a release assistant."
+        },
+        {
+            "role": "user",
+            "content": "Summarize the v1.13 changelog."
+        }
+    ],
+    "output_text": "ok"
+}
+```
+
+Both captured messages load in order and render above the Prompt box.
+The Prompt box holds the last user message, "Summarize the v1.13
+changelog."; editing it replaces that message rather than appending a
+new one, and the system message travels with the dispatch unchanged.
+Note `output_text` is captured too and is not replayed: a replay sends
+input, and the new response is the point of running it.
+
+Turn either flag off and this read answers `404`. The page then states
+which consent is missing, pre-fills only origin, model and key, and
+invents no prompt.
+
 The dispatch is the governed one described above, pre-selected to the
 original request's virtual key when that key is still active. A
 replayed request is a new request: it runs the full policy chain

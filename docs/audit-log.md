@@ -386,6 +386,20 @@ entry counts describe every tenant's activity whatever the payloads say.
 Serving a filtered slice would answer "was there anything else" with
 "no", which is worse than a refusal because somebody will believe it.
 
+The trail is readable by any authenticated operator whose login is not
+narrowed to a tenant, `read_only` included, and that is wider than the
+bounded ring at `GET /api/audit/events` on two axes worth stating
+plainly. History here is the whole chain rather than the last
+`max_audit_events` records, so a `read_only` operator reaches the
+deployment's entire audit history rather than a recent window. And each
+entry carries the chained payload verbatim rather than the ring's
+`detail` projection, so the key channel's `before_fingerprint` and
+`after_fingerprint` maps and the security channel's full field set
+(hostname, method, status code, `key_provider`, `key_mode`) reach that
+operator where previously only `detail` did. No secrets cross either
+way. A deployment that wants the trail narrower than that turns the
+channel's chain path off, or fronts the admin port.
+
 Reading the trail is itself audited, because an auditor must be
 auditable: a served read records `read_audit_chain` on the admin channel
 and a refused one records `read_audit_chain_denied`, each naming the
@@ -396,10 +410,19 @@ asked for, and the next one does.
 
 Each channel walked also increments
 `sbproxy_audit_chain_read_total{channel, outcome}` with an `outcome` of
-`verified`, `broken`, or `unreadable`. That counter, not the console
-banner, is what pages somebody:
+`verified`, `broken`, or `unreadable`, and a refusal increments all four
+channels with `denied`. That counter, not the console banner, is what
+pages somebody:
 `increase(sbproxy_audit_chain_read_total{outcome!="verified"}[15m]) > 0`
-fires whether or not anyone had the page open.
+fires whether or not anyone had the page open, and covers the refusal
+without a second rule.
+
+One thing that rule does not cover, so nobody sizes their response
+wrong: `broken` on a truncated file compares against what *this process*
+wrote. Truncate a chain at the tail and restart the proxy, and the boot
+re-baselines on what is left, every link and signature holds, and the
+read is `verified`. Records written before the last restart are covered
+by `sbproxy audit verify` against an offsite copy, not by this counter.
 
 Here is the whole surface against a demo stack. The config turns all
 four channels on under one signing identity, with the chain files
@@ -523,13 +546,13 @@ curl -s -u admin:secret 'http://127.0.0.1:9090/api/audit/chain?limit=5' | jq
       "channel": "key",
       "event": {
         "actor": "admin",
-        "id": "fa00b38b17391238",
-        "key_epoch": "950c04d2",
+        "id": "057964c716c28e62",
+        "key_epoch": "9df71214",
         "op": "create",
         "resource": "key",
-        "timestamp": "2026-08-20T22:24:42.768924+00:00"
+        "timestamp": "2026-08-21T01:07:04.666044+00:00"
       },
-      "recorded_at": "2026-08-20T22:24:42.769113+00:00",
+      "recorded_at": "2026-08-21T01:07:04.666098+00:00",
       "seq": 0
     },
     {
@@ -539,9 +562,9 @@ curl -s -u admin:secret 'http://127.0.0.1:9090/api/audit/chain?limit=5' | jq
         "action": "admin_action",
         "actor": "admin",
         "detail": "POST /admin/keys",
-        "timestamp": "2026-08-20T22:24:42.719065+00:00"
+        "timestamp": "2026-08-21T01:07:04.647214+00:00"
       },
-      "recorded_at": "2026-08-20T22:24:42.719075+00:00",
+      "recorded_at": "2026-08-21T01:07:04.647233+00:00",
       "seq": 1
     },
     {
@@ -555,9 +578,9 @@ curl -s -u admin:secret 'http://127.0.0.1:9090/api/audit/chain?limit=5' | jq
         "origins_removed": [],
         "prior_revision": "0766cb44897f",
         "source": "api",
-        "timestamp": "2026-08-20T22:24:42.707034+00:00"
+        "timestamp": "2026-08-21T01:07:04.613756+00:00"
       },
-      "recorded_at": "2026-08-20T22:24:42.707096+00:00",
+      "recorded_at": "2026-08-21T01:07:04.616506+00:00",
       "seq": 0
     },
     {
@@ -567,9 +590,9 @@ curl -s -u admin:secret 'http://127.0.0.1:9090/api/audit/chain?limit=5' | jq
         "action": "admin_action",
         "actor": "admin",
         "detail": "POST /admin/reload",
-        "timestamp": "2026-08-20T22:24:42.663840+00:00"
+        "timestamp": "2026-08-21T01:07:04.555142+00:00"
       },
-      "recorded_at": "2026-08-20T22:24:42.663852+00:00",
+      "recorded_at": "2026-08-21T01:07:04.555159+00:00",
       "seq": 0
     },
     {
@@ -582,12 +605,12 @@ curl -s -u admin:secret 'http://127.0.0.1:9090/api/audit/chain?limit=5' | jq
         "key_mode": "none",
         "method": "GET",
         "reason": "WAF: SQL injection detected",
-        "request_id": "01a02146ca987fc2a601fd57c467a69a",
+        "request_id": "01a021db70af79c3a4de58ec184f44f7",
         "status_code": 403,
         "tenant_id": "__default__",
-        "timestamp": "2026-08-20T22:24:42.651715+00:00"
+        "timestamp": "2026-08-21T01:07:04.533433+00:00"
       },
-      "recorded_at": "2026-08-20T22:24:42.651892+00:00",
+      "recorded_at": "2026-08-21T01:07:04.535145+00:00",
       "seq": 0
     }
   ]
@@ -641,9 +664,9 @@ curl -s -u admin:secret 'http://127.0.0.1:9090/api/audit/chain?channel=admin&lim
         "action": "read_audit_chain",
         "actor": "admin",
         "detail": "GET /api/audit/chain channel=all entries=5",
-        "timestamp": "2026-08-20T22:24:52.880186+00:00"
+        "timestamp": "2026-08-21T01:07:05.735858+00:00"
       },
-      "recorded_at": "2026-08-20T22:24:52.880195+00:00",
+      "recorded_at": "2026-08-21T01:07:05.735868+00:00",
       "seq": 2
     },
     {
@@ -653,9 +676,9 @@ curl -s -u admin:secret 'http://127.0.0.1:9090/api/audit/chain?channel=admin&lim
         "action": "admin_action",
         "actor": "admin",
         "detail": "POST /admin/keys",
-        "timestamp": "2026-08-20T22:24:42.719065+00:00"
+        "timestamp": "2026-08-21T01:07:04.647214+00:00"
       },
-      "recorded_at": "2026-08-20T22:24:42.719075+00:00",
+      "recorded_at": "2026-08-21T01:07:04.647233+00:00",
       "seq": 1
     }
   ]
@@ -715,9 +738,9 @@ curl -s -u admin:secret 'http://127.0.0.1:9090/api/audit/chain?channel=admin' | 
         "action": "admin_action",
         "actor": "admin",
         "detail": "POST /admin/reload",
-        "timestamp": "2026-08-20T22:24:42.663840+00:00"
+        "timestamp": "2026-08-21T01:07:04.555142+00:00"
       },
-      "recorded_at": "2026-08-20T22:24:42.663852+00:00",
+      "recorded_at": "2026-08-21T01:07:04.555159+00:00",
       "seq": 0
     }
   ]
@@ -745,13 +768,13 @@ curl -s -u admin:secret 'http://127.0.0.1:9090/api/audit/chain?channel=security'
   "channels": [
     {
       "broken_seq": 0,
-      "chain_entries": 3,
+      "chain_entries": 1,
       "channel": "security",
       "enabled": true,
       "key_id": "sbproxy-audit-2026",
       "ok": false,
       "path": "/tmp/sbproxy-audit-demo/security-audit.jsonl",
-      "reason": "this process wrote 3 records to this chain and the file holds 0: 3 are missing from it",
+      "reason": "this process wrote 1 records to this chain and the file holds 0: 1 are missing from it",
       "total_matched": 0,
       "verified_entries": 0
     },
@@ -1008,12 +1031,16 @@ sbproxy_audit_chain_read_total{channel, outcome}
 
 `channel` is the chain that was walked. `outcome` is `verified` when
 every link and signature held, `broken` when the walk stopped at a bad
-record, and `unreadable` when the file could not be walked at all. One
+record, `unreadable` when the file could not be walked at all, and
+`denied` when the read was refused before any walk started. One
 increment per channel per call to
 [`GET /api/audit/chain`](admin-api-reference.md), so a console that is
 open and refreshing keeps re-asserting the answer rather than caching a
-stale one. The alert to write is
-`increase(sbproxy_audit_chain_read_total{outcome!="verified"}[15m]) > 0`.
+stale one; a refusal increments all four channels, because it refuses
+all four. The alert to write is
+`increase(sbproxy_audit_chain_read_total{outcome!="verified"}[15m]) > 0`,
+which covers `denied` for the same reason it covers `broken`. It does
+not cover a tail truncation that survived a restart; see the note above.
 
 The two families answer different questions and both are needed. The
 emit histogram catches a record that never reached the trail; this

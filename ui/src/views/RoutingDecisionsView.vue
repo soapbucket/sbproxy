@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
-import { useRoute } from "vue-router";
+import { useRoute, useRouter } from "vue-router";
 import { api, type RoutingDecision, type RoutingDecisionFilters } from "../api";
 import { useAsync } from "../composables/useAsync";
+import { filterStateFromQuery, filterStateToQuery } from "../lib/filter-url";
 import { formatMs, formatTime, shortId } from "../lib/format";
 import PageHeader from "../components/PageHeader.vue";
 import StatusBadge from "../components/StatusBadge.vue";
@@ -10,6 +11,7 @@ import ErrorState from "../components/ErrorState.vue";
 import EmptyState from "../components/EmptyState.vue";
 
 const route = useRoute();
+const router = useRouter();
 
 // One ref per filter dimension; empty string means "not filtered".
 const fOrigin = ref("");
@@ -42,12 +44,47 @@ function currentFilters(): RoutingDecisionFilters {
 const req = useAsync(() => api.routingDecisions(currentFilters()));
 const rows = computed<RoutingDecision[]>(() => req.data.value ?? []);
 
+const FILTER_KEYS = [
+  "origin",
+  "strategy",
+  "model",
+  "provider",
+  "window",
+] as const;
+
+// Same contract as the Reports view: the URL is the saved filter, over
+// every dimension the view offers rather than three of the five. A
+// link that carries `?provider=anthropic` has to come back filtered to
+// anthropic, and applying a filter here has to leave a link worth
+// sharing.
+function syncStateToUrl() {
+  router.replace({
+    query: filterStateToQuery({
+      origin: fOrigin.value,
+      strategy: fStrategy.value,
+      model: fModel.value,
+      provider: fProvider.value,
+      window: fWindow.value,
+    }),
+  });
+}
+
+function applyFilters() {
+  syncStateToUrl();
+  req.run();
+}
+
 onMounted(() => {
-  // Deep links from other views pre-seed the server-side filters.
-  const q = route.query;
-  if (typeof q.origin === "string") fOrigin.value = q.origin;
-  if (typeof q.strategy === "string") fStrategy.value = q.strategy;
-  if (typeof q.model === "string") fModel.value = q.model;
+  const state = filterStateFromQuery(route.query, FILTER_KEYS);
+  fOrigin.value = state.origin;
+  fStrategy.value = state.strategy;
+  fModel.value = state.model;
+  fProvider.value = state.provider;
+  // A hand-edited link can name a window this view does not offer;
+  // fall back to "no window" rather than sending a `since` of NaN.
+  fWindow.value = WINDOWS.some((w) => w.value === state.window)
+    ? state.window
+    : "";
   req.run();
 });
 
@@ -57,7 +94,7 @@ function clearFilters() {
   fModel.value = "";
   fProvider.value = "";
   fWindow.value = "";
-  req.run();
+  applyFilters();
 }
 
 // Option sets derived from the data on screen, like the Logs view.
@@ -200,7 +237,7 @@ function extraDetail(decision: RoutingDecision): DetailField[] {
       </select>
     </div>
     <div class="filter-actions">
-      <button class="sb-btn sb-btn--sm sb-btn--primary" @click="req.run">
+      <button class="sb-btn sb-btn--sm sb-btn--primary" @click="applyFilters">
         Apply
       </button>
       <button class="sb-btn sb-btn--sm" @click="clearFilters">Clear</button>
@@ -210,10 +247,10 @@ function extraDetail(decision: RoutingDecision): DetailField[] {
 
   <ErrorState v-if="req.error.value" :error="req.error.value" @retry="req.run" />
   <EmptyState
-    v-else-if="!rows.length"
+    v-else-if="!req.loading.value && !rows.length"
     message="No routing decisions recorded yet. Decisions appear once routed traffic (AI dispatch or a load-balanced origin) flows through the gateway."
   />
-  <div v-else class="table-wrap">
+  <div v-else-if="rows.length" class="table-wrap">
     <table class="sb-table decision-ledger">
       <thead>
         <tr>

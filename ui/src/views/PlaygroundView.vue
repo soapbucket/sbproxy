@@ -12,6 +12,7 @@ import { useAsync } from "../composables/useAsync";
 import { formatMs, formatNumber, formatUsd, shortId } from "../lib/format";
 import {
   beginReplay,
+  contentSampleErrorMessage,
   replayAvailabilityNotes,
   replayDispatchMessages,
   replayGaps,
@@ -136,7 +137,9 @@ async function startReplay() {
   try {
     sample = await api.requestContent(requestId);
   } catch (e) {
-    sampleError = e instanceof Error ? e.message : "content sample unavailable";
+    // The server says which of the two consent flags was missing; a
+    // bare `e.message` is only the request line and the status code.
+    sampleError = contentSampleErrorMessage(e);
   }
   if (replay.value?.requestId !== requestId) return; // superseded or cleared
   const settled = resolveReplayContent(replay.value, sample, sampleError);
@@ -150,7 +153,9 @@ async function startReplay() {
     model: draft.model ? undefined : settled.model,
     keyId: draft.keyId ? undefined : settled.keyId,
   });
-  if (settled.prompt) prompt.value = settled.prompt;
+  // Same rule as the three selections above: what the operator typed
+  // while the fetch was in flight wins over what the sample carried.
+  if (settled.prompt && !prompt.value) prompt.value = settled.prompt;
 }
 
 function applyReplaySelections(draft: ReplayDraft) {
@@ -164,6 +169,16 @@ function applyReplaySelections(draft: ReplayDraft) {
 
 function clearReplay() {
   replay.value = null;
+  // The replay card carries the only disclosure that this text is the
+  // stored redaction rather than the original bytes, so dropping the
+  // card has to drop the text it described. Left loaded, Send would
+  // dispatch redacted content to a live provider with nothing on
+  // screen saying so, and as a single user message rather than the
+  // captured turn sequence, so it would be neither a replay nor a
+  // fresh prompt, and it would bill. The origin, model and key
+  // selections stay: those are plain log metadata, visible on the row
+  // that started this, and not redacted content.
+  prompt.value = "";
   router.replace({ name: "playground" });
 }
 

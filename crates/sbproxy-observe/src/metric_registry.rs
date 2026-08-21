@@ -1466,7 +1466,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["channel", "outcome"],
-        description: "Audit-chain reads served by the console viewer, by verification outcome.",
+        description: "Audit-chain read attempts, by verification outcome (verified, broken, unreadable, denied).",
         dead_reason: None,
     },
     MetricCapability {

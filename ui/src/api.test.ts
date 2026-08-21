@@ -267,6 +267,26 @@ describe("request observability contracts", () => {
     );
     expect(api.requestsExportUrl("jsonl")).toBe("/api/requests/export?format=jsonl");
   });
+
+  it("fetches the export through the client so failures reach the error path", async () => {
+    const fetchMock = stubFetch("timestamp,origin\n2026-08-20T00:00:00Z,ai.local\n");
+
+    const body = await api.requestsExport("csv", { tenant: "acme" });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/requests/export?tenant=acme&format=csv",
+      expect.objectContaining({ method: "GET" }),
+    );
+    expect(body).toContain("ai.local");
+  });
+
+  it("throws an ApiError carrying the server body when the export is refused", async () => {
+    stubFetch('{"error":"Unauthorized"}', 401);
+
+    // The bare <a download> this replaced saved that body as
+    // `requests.csv` with nothing on screen.
+    await expect(api.requestsExport("csv")).rejects.toBeInstanceOf(ApiError);
+  });
 });
 
 describe("api.routingDecisions (WOR-2575)", () => {

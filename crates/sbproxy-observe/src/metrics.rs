@@ -3968,24 +3968,34 @@ pub fn record_admin_request_export(format: &'static str, rows: u64) {
     }
 }
 
-/// Count one audit-chain read served by the console viewer on
+/// Count one audit-chain read attempt on
 /// `sbproxy_audit_chain_read_total{channel, outcome}` (WOR-2579).
 ///
 /// `channel` is one of `security`, `config`, `key`, `admin`. `outcome` is
 /// `verified` when every link and signature held, `broken` when the walk
-/// stopped at a bad record, and `unreadable` when the file could not be
-/// walked at all.
+/// stopped at a bad record, `unreadable` when the file could not be
+/// walked at all, and `denied` when the viewer refused the read before
+/// walking anything. A refusal increments all four channels, because it
+/// refuses all four.
 ///
 /// The reason this exists rather than leaving the verdict on the page: a
 /// broken chain that only a person looking at the console can see is a
-/// finding nobody is on call for. `broken` and `unreadable` are both
-/// alertable from the moment this ships, and `increase(...{outcome!=
-/// "verified"}[15m]) > 0` is the rule an operator wants. Both label
-/// values are closed vocabularies from this crate, never caller input, and
-/// both parameters are `&'static str` so that stays true by construction:
-/// a caller-supplied `String` cannot be passed here at all, which is what
-/// keeps this family off the cardinality limiter honestly rather than by
-/// assertion.
+/// finding nobody is on call for. `broken`, `unreadable` and `denied`
+/// are all alertable from the moment this ships, and
+/// `increase(...{outcome!="verified"}[15m]) > 0` is the rule an operator
+/// wants. Both label values are closed vocabularies from this crate,
+/// never caller input, and both parameters are `&'static str` so that
+/// stays true by construction: a caller-supplied `String` cannot be
+/// passed here at all, which is what keeps this family off the
+/// cardinality limiter honestly rather than by assertion.
+///
+/// What that rule does **not** cover, so nobody sizes their response
+/// wrong: the shortfall comparison behind `broken` counts what *this
+/// process* wrote. A chain file truncated at the tail and then read
+/// after a restart re-baselines on boot, links and signs perfectly, and
+/// reports `verified`. Records written before the last restart are
+/// covered by `sbproxy audit verify` against an offsite copy, not by
+/// this counter.
 pub fn record_audit_chain_read(channel: &'static str, outcome: &'static str) {
     use prometheus::{register_int_counter_vec, IntCounterVec};
     use std::sync::OnceLock;

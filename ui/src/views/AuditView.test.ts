@@ -38,9 +38,24 @@ describe("AuditView chain viewer", () => {
     expect(auditView).toContain(
       'const CHAIN_CHANNELS = ["security", "config", "key", "admin"] as const;',
     );
-    expect(auditView).toContain(
-      "chainStatuses.value[name] ?? { channel: name, enabled: false }",
-    );
+    expect(auditView).toContain("enabled: false,");
+    expect(auditView).toContain("chainStatuses.value[name] ??");
+  });
+
+  it("never keeps rendering a verified verdict a later read did not re-walk", () => {
+    // A `channel=` filter pushes not_walked for the other three, so an
+    // unstamped merge carries the previous verdict forward forever. On
+    // a tamper-evidence surface a stale "verified" is the worst
+    // staleness there is: the config chain could be tampered with while
+    // the operator is filtered to security, and the card would keep
+    // saying verified until somebody cleared the filter.
+    expect(auditView).toContain("function isCarriedForward(card: ChainCard): boolean");
+    expect(auditView).toContain("card.read !== lastRead.value");
+    expect(auditView).toContain('isCarriedForward(card) ? "verified earlier" : "verified"');
+    // And it loses the green while it says so.
+    expect(auditView).toContain('isCarriedForward(card) ? "info" : "ok"');
+    // A failing verdict keeps failing loudly even when carried forward.
+    expect(auditView).toContain("if (card.error || card.ok === false) return \"err\";");
   });
 
   it("pages older history with the server cursor and can walk back", () => {
@@ -54,6 +69,12 @@ describe("AuditView chain viewer", () => {
 
   it("renders errors and the empty state through the shared components", () => {
     expect(auditView).toMatch(/<ErrorState\s+v-if="chainReq\.error\.value"/);
-    expect(auditView).toMatch(/<EmptyState\s+v-else-if="!chainEntries\.length"/);
+    // Guarded on the loader: a chain read re-walks the file from record
+    // one and re-verifies every signature, so an unguarded empty state
+    // tells the operator for the whole of a multi-second walk that
+    // chains are off and to go fix configuration that is already right.
+    expect(auditView).toMatch(
+      /<EmptyState\s+v-else-if="!chainReq\.loading\.value && !chainEntries\.length"/,
+    );
   });
 });

@@ -27,7 +27,21 @@ describe("RoutingDecisionsView", () => {
 
   it("renders errors and the two empty states through the shared components", () => {
     expect(routingDecisionsView).toMatch(/<ErrorState\s+v-if="req\.error\.value"/);
-    expect(routingDecisionsView).toMatch(/<EmptyState\s+v-else-if="!rows\.length"/);
+    expect(routingDecisionsView).toMatch(
+      /<EmptyState\s+v-else-if="!req\.loading\.value && !rows\.length"/,
+    );
+  });
+
+  it("round-trips every filter dimension through the URL, not three of five", () => {
+    // `?provider=anthropic` in a shared link used to be dropped on the
+    // floor and the recipient saw every provider; nothing was ever
+    // written back, so applying a filter left no link worth sharing.
+    expect(routingDecisionsView).toContain("filterStateFromQuery(route.query, FILTER_KEYS)");
+    expect(routingDecisionsView).toContain("filterStateToQuery({");
+    for (const dimension of ["origin", "strategy", "model", "provider", "window"]) {
+      expect(routingDecisionsView).toContain(`"${dimension}",`);
+    }
+    expect(routingDecisionsView).toContain('@click="applyFilters"');
   });
 
   it("shows the decision anatomy: candidates in order, the winner, the traversed chain, and the reason", () => {

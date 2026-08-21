@@ -14,7 +14,11 @@ Three routes read one in-memory ring through one filter parser:
 
 A filter that selects rows on the first selects exactly the same rows on
 the other two, so a grouped number always drills through to the rows
-behind it. See
+behind it, including the unattributed group: a row with no model, no
+key, or no resolved human groups under the empty string, and `?model=`
+selects exactly those rows. In a deployment that resolves no end user
+that group is usually the largest one, and a billing pipeline iterating
+report groups must not lose it. See
 [`docs/admin-api-reference.md`](../../docs/admin-api-reference.md) for
 the route reference and
 [`docs/admin-ui.md`](../../docs/admin-ui.md) for the console view that
@@ -23,7 +27,10 @@ drives them.
 ## Run
 
 A local OpenAI-shaped fixture stands in for the provider, so this runs
-with no upstream account. Start it first:
+with no upstream account. Start it first. It listens on 18086 rather
+than the 18080 most examples use, so this walkthrough and
+[`examples/usage-bridge-queue/`](../usage-bridge-queue/) can run at the
+same time:
 
 ```bash
 python3 - <<'PY' &
@@ -48,7 +55,7 @@ class H(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(out)
     def log_message(self, *a): pass
-http.server.HTTPServer(("127.0.0.1", 18080), H).serve_forever()
+http.server.HTTPServer(("127.0.0.1", 18086), H).serve_forever()
 PY
 
 make run CONFIG=examples/admin-reporting/sb.yml
@@ -222,8 +229,8 @@ head -3 acme-requests.csv
 
 ```text
 timestamp,origin,method,path,status,latency_ms,client_ip,request_id,trace_id,session_id,parent_session_id,cache_status,retry_count,failover_engaged,failover_from,failover_to,load_balancer_strategy,load_balancer_target,provider,model,tokens_in,tokens_out,cost_usd_micros,guardrail_category,guardrail_action,api_key_id,key_mode,key_provider,tenant_id,user_id,error_class,config_revision,policy_version,deny_reason,policy_decisions,properties
-2026-08-20T19:47:14.657182+00:00,acme.ai.local,POST,/v1/chat/completions,200,1.374375,127.0.0.1:57863,01a020b6a05f7e12b2b3f6efbb1a5ddf,02a99aadba6a4a60a59c6b8135d91971,,,disabled,0,false,,,round_robin,openai,openai,gpt-4o-mini,120,40,42,,,cfg:4:acme:13:acme.ai.local:acme-research,minted,,acme,sci@acme.test,,8cb4b33d8ffc,c:8cb4b33d8ffc:ae10235dbb7fdde7,,[],"{""feature"":""literature-scan""}"
-2026-08-20T19:47:14.643759+00:00,acme.ai.local,POST,/v1/chat/completions,200,1.953542,127.0.0.1:57862,01a020b6a05174a3ab6449c93aae65e8,0dcff27495d744dda98b3af634a4b024,,,disabled,0,false,,,round_robin,openai,openai,gpt-4o,900,300,5250,,,cfg:4:acme:13:acme.ai.local:acme-platform,minted,,acme,ops@acme.test,,8cb4b33d8ffc,c:8cb4b33d8ffc:cd949575bc0dca2d,,[],"{""feature"":""incident-triage""}"
+2026-08-21T01:11:55.226687+00:00,acme.ai.local,POST,/v1/chat/completions,200,1.887458,127.0.0.1:64696,01a021dfe05874f1b6ba866697bd518b,6531cb754eae46b5ba1b255f2c61eadb,,,disabled,0,false,,,round_robin,openai,openai,gpt-4o-mini,120,40,42,,,cfg:4:acme:13:acme.ai.local:acme-research,minted,,acme,sci@acme.test,,8cb4b33d8ffc,c:8cb4b33d8ffc:ae10235dbb7fdde7,,[],"{""feature"":""literature-scan""}"
+2026-08-21T01:11:55.214716+00:00,acme.ai.local,POST,/v1/chat/completions,200,1.116375,127.0.0.1:64695,01a021dfe04d7b11960a65be634aca3e,c4f486ae935b41fa854201f66422ad16,,,disabled,0,false,,,round_robin,openai,openai,gpt-4o,900,300,5250,,,cfg:4:acme:13:acme.ai.local:acme-platform,minted,,acme,ops@acme.test,,8cb4b33d8ffc,c:8cb4b33d8ffc:cd949575bc0dca2d,,[],"{""feature"":""incident-triage""}"
 ```
 
 Thirty-six fixed columns, the `globex` row filtered out, and the
@@ -243,15 +250,15 @@ curl -s -u "$SB_ADMIN" \
 
 ```json
 {
-    "timestamp": "2026-08-20T19:47:14.630011+00:00",
+    "timestamp": "2026-08-21T01:11:55.203180+00:00",
     "origin": "acme.ai.local",
     "method": "POST",
     "path": "/v1/chat/completions",
     "status": 200,
-    "latency_ms": 1.991792,
-    "client_ip": "127.0.0.1:57861",
-    "request_id": "01a020b6a04371329c3279a3e40cfb8b",
-    "trace_id": "90f8435c47a144939199bcbd740061a7",
+    "latency_ms": 2.8585,
+    "client_ip": "127.0.0.1:64694",
+    "request_id": "01a021dfe0407331a26b80c75e648ba2",
+    "trace_id": "03db4bd210cc4aaab55079b097ccc623",
     "properties": {
         "feature": "summarize"
     },
@@ -301,7 +308,8 @@ sbproxy_admin_request_exports_total{format="jsonl"} 1
 
 The matching `export_request_log` records are on the admin audit
 channel, naming the operator, the format, the row count, and which
-filter dimensions were set:
+filter dimensions were set. One per export, newest first, and the row
+counts are the same numbers the metric families above carry:
 
 ```bash
 curl -s -u "$SB_ADMIN" \
@@ -311,11 +319,18 @@ curl -s -u "$SB_ADMIN" \
 ```json
 [
     {
-        "timestamp": "2026-08-20T19:50:27.453500+00:00",
+        "timestamp": "2026-08-21T01:11:55.330677+00:00",
         "channel": "admin",
         "kind": "export_request_log",
         "actor": "admin",
-        "detail": "format=csv rows=1 filters=tenant"
+        "detail": "format=jsonl rows=2 filters=user"
+    },
+    {
+        "timestamp": "2026-08-21T01:11:55.318527+00:00",
+        "channel": "admin",
+        "kind": "export_request_log",
+        "actor": "admin",
+        "detail": "format=csv rows=4 filters=tenant"
     }
 ]
 ```

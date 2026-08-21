@@ -67,22 +67,48 @@ const chainEntries = computed<AuditChainEntry[]>(
 
 // Verification statuses stick per channel: a channel-filtered page only
 // walks its own chain, so the other three cards keep their last walked
-// status instead of blanking.
-const chainStatuses = ref<Record<string, AuditChainChannel>>({});
+// status instead of blanking. Each stored status carries the read that
+// produced it, because a carried-forward verdict is not evidence about
+// now: filter to `security`, have `config` tampered with meanwhile, and
+// an unstamped card would keep rendering "verified" until somebody
+// cleared the filter. On a tamper-evidence surface a stale "verified"
+// is the worst staleness there is, so it renders as "verified earlier"
+// in the neutral tone instead.
+type ChainCard = AuditChainChannel & { read: number };
+let readCounter = 0;
+const lastRead = ref(0);
+const chainStatuses = ref<Record<string, ChainCard>>({});
 watch(chainReq.data, (data) => {
   if (!data) return;
+  const read = ++readCounter;
+  lastRead.value = read;
   const next = { ...chainStatuses.value };
   for (const c of data.channels) {
-    if (!c.enabled || c.ok !== undefined || c.error) next[c.channel] = c;
-    else next[c.channel] = { ...(next[c.channel] ?? c), enabled: true };
+    if (!c.enabled || c.ok !== undefined || c.error) {
+      next[c.channel] = { ...c, read };
+    } else {
+      const previous = next[c.channel];
+      next[c.channel] = previous
+        ? { ...previous, enabled: true }
+        : { ...c, read };
+    }
   }
   chainStatuses.value = next;
 });
-const statusCards = computed<AuditChainChannel[]>(() =>
+const statusCards = computed<ChainCard[]>(() =>
   CHAIN_CHANNELS.map(
-    (name) => chainStatuses.value[name] ?? { channel: name, enabled: false },
+    (name) =>
+      chainStatuses.value[name] ?? {
+        channel: name,
+        enabled: false,
+        read: lastRead.value,
+      },
   ),
 );
+/** A verdict from an earlier read that this one did not re-walk. */
+function isCarriedForward(card: ChainCard): boolean {
+  return card.enabled && card.ok !== undefined && card.read !== lastRead.value;
+}
 const brokenChannels = computed(() =>
   statusCards.value.filter((c) => c.enabled && (c.ok === false || c.error)),
 );
@@ -113,19 +139,21 @@ watch([chainChannel, chainActor, chainSince, chainUntil], () => {
   chainReq.run();
 });
 
-function chainCardLabel(card: AuditChainChannel): string {
+function chainCardLabel(card: ChainCard): string {
   if (!card.enabled) return "off";
   if (card.error) return "unreadable";
   if (card.ok === false) return "broken";
-  if (card.ok === true) return "verified";
+  if (card.ok === true) return isCarriedForward(card) ? "verified earlier" : "verified";
   return "enabled";
 }
 function chainCardTone(
-  card: AuditChainChannel,
+  card: ChainCard,
 ): "ok" | "warn" | "err" | "info" | "neutral" {
   if (!card.enabled) return "neutral";
+  // A carried-forward failure keeps failing loudly; only the passing
+  // verdict loses its green when it stops being about this read.
   if (card.error || card.ok === false) return "err";
-  if (card.ok === true) return "ok";
+  if (card.ok === true) return isCarriedForward(card) ? "info" : "ok";
   return "info";
 }
 
@@ -274,10 +302,10 @@ function actionTone(action?: string): "ok" | "warn" | "err" | "neutral" {
       @retry="chainReq.run"
     />
     <EmptyState
-      v-else-if="!chainEntries.length"
+      v-else-if="!chainReq.loading.value && !chainEntries.length"
       message="No chained audit entries match. Chains are opt-in per channel: audit.sink: chain, audit.config_path, audit.key_path, and audit.admin_path each turn one on."
     />
-    <div v-else class="table-wrap">
+    <div v-else-if="chainEntries.length" class="table-wrap">
       <table class="sb-table">
         <thead>
           <tr>

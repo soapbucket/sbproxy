@@ -30,6 +30,29 @@ describe("PlaygroundView replay handoff", () => {
   it("offers a way back to a plain playground form", () => {
     expect(playgroundView).toContain("clearReplay");
   });
+
+  it("keeps the server's explanation when the content sample cannot be read", () => {
+    // `e.message` is the request line and the status code, assembled
+    // client-side. The sentence naming which consent flag was missing
+    // is in ApiError.body, and this view used to throw it away.
+    expect(playgroundView).toContain("sampleError = contentSampleErrorMessage(e);");
+    expect(playgroundView).not.toContain("e instanceof Error ? e.message :");
+  });
+
+  it("does not clobber a prompt typed while the sample was in flight", () => {
+    expect(playgroundView).toContain("if (settled.prompt && !prompt.value)");
+  });
+
+  it("drops the captured text when it drops the disclosure that it is redacted", () => {
+    // The replay card holds the only note saying the loaded text is
+    // the stored redaction; unmounting it while the text stays in the
+    // box makes Send dispatch redacted content to a live provider with
+    // nothing on screen saying so, as one user message rather than the
+    // captured turns, and it bills.
+    expect(playgroundView).toMatch(
+      /function clearReplay\(\) \{[\s\S]*?prompt\.value = "";[\s\S]*?\}/,
+    );
+  });
 });
 
 // WOR-2497 hardened the playground: `/chat` is the ungoverned direct

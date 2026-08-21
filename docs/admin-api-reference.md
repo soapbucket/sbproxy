@@ -4,7 +4,7 @@
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
-lifecycle, the running extension inventory, the request log with its live stream, report, and export, routing decisions, recent sessions, alert
+lifecycle, the running extension inventory, the request log (with its live stream, report, and export), routing decisions, recent sessions, alert
 operations, per-target health, spend and audit, attested-metering summary/receipts/verify, config read/write and hot reload/drift, the local config-revision
 history ring, model-host catalog and deployment lifecycle, the
 response/semantic/key-policy caches, cluster status and the replicated-state
@@ -538,8 +538,16 @@ Supported query parameters: `status` (exact match), `method`
 `offset`, and `limit` (defaults to and is clamped at
 `max_log_entries`). `cache_status` accepts the four values listed above.
 `retried` accepts only `true` or `false`. Property matching is exact after
-URL decoding; `property_value` requires `property_key`. No parameters returns
-the newest entries.
+URL decoding; `property_value` requires `property_key`. `status`,
+`offset`, and `limit` must parse as whole numbers when present; a
+malformed one is a `400` rather than an ignored parameter, so a filter
+never silently widens the result. No parameters returns the newest
+entries.
+
+An empty value means "rows with nothing there" rather than "no filter":
+`?user=` selects the rows the report groups under the unattributed
+`""` key, which is the same set on all three routes. Omit the parameter
+entirely to leave the dimension unfiltered.
 
 The same filter set drives [`/api/requests/report`](#get-apirequestsreport)
 and [`/api/requests/export`](#get-apirequestsexport): one parser serves
@@ -609,11 +617,16 @@ rather than one at a time:
 One parser reads the filter surface for all three request-log routes,
 which is what makes a grouped number drillable: the same query string
 selects the same rows on the snapshot, the report, and the export.
+A row that carries no value on a dimension groups under the empty
+string rather than being dropped, and an empty filter value selects
+that same group, so the unattributed bucket drills through like any
+other. In a deployment that resolves no end user it is usually the
+biggest one.
 
 ```mermaid
 flowchart TD
     A["GET /api/requests*?<filters>"] --> B[Parse the shared filter surface]
-    B -->|bad cache_status, retried, key_mode,<br/>or property_value without property_key| C["400, identical on all three routes"]
+    B -->|bad cache_status, retried, key_mode, status,<br/>offset, limit, or property_value<br/>without property_key| C["400, identical on all three routes"]
     B -->|filters valid| D{Which route?}
     D -->|/api/requests| E["Rows, newest first, offset+limit"]
     D -->|/api/requests/report| F{group_by present,<br/>known, distinct?}
@@ -835,13 +848,20 @@ encoding:
 Every request-log filter applies, plus `offset` and `limit`. `limit`
 defaults to and is clamped at `proxy.admin.max_log_entries`, so no
 export can exceed the bounded ring regardless of what the caller asks
-for. Rows are encoded one at a time as the ring is read, so the
-matching set is never held twice, and the worst-case response is the
-ring itself (default 1000 rows): memory stays bounded by configuration
-rather than by caller behavior. For unbounded durable exports, ship the
-structured access log to your pipeline instead (see
-[access-log.md](access-log.md)); this route exports the operational
-sample the console is looking at.
+for. A malformed `status`, `offset`, or `limit` is a `400` rather than
+an ignored parameter, because a dropped filter on this route hands back
+a wider file than the caller asked for and nothing on the file says so.
+
+Rows are encoded one at a time as the ring is read, so the matching set
+is never held twice. The response itself is materialized rather than
+streamed: the admin dispatcher answers with a whole body, so the
+worst-case response is the ring itself (default 1000 rows, a few
+hundred KB). Memory stays bounded by configuration rather than by
+caller behavior, but it is bounded, not zero, and an operator who
+raises `max_log_entries` raises it proportionally, per concurrent
+export. For unbounded durable exports, ship the structured access log
+to your pipeline instead (see [access-log.md](access-log.md)); this
+route exports the operational sample the console is looking at.
 
 Every export is an audited admin action. It writes an
 `export_request_log` record to the admin audit chain and the audit ring
@@ -849,10 +869,20 @@ alongside `inspect_request_content`, naming the operator, the format,
 the row count, and which filter dimensions were set (names only, never
 operator-typed values, so the record stays bounded). It also increments
 `sbproxy_admin_request_exports_total{format}` and
-`sbproxy_admin_request_export_rows_total{format}`. A bulk read of the
-operational log is the exfiltration shape of the admin surface, so
-export rate and export volume are both alertable from the day the route
-ships.
+`sbproxy_admin_request_export_rows_total{format}`, so export rate and
+export volume are both alertable from the day the route ships.
+
+Scope that record correctly before you build a detection on it: it
+covers **this route**, not every bulk read of the log.
+`GET /api/requests?limit=<max_log_entries>` runs the same parser, the
+same filter and the same ring cap, and returns the same rows as a JSON
+array rather than newline-delimited, with no audit record and no
+counter. One query-string edit, same operator, same credential. The
+export is the download button, not the read surface, and auditing every
+`/api/requests` read instead would put a durable chain record on every
+console poll while a row-count threshold would sit one page size away
+from being bypassed. If you need coverage of the whole read surface,
+put it in front of the admin port.
 
 CSV cells that begin with `=`, `+`, `-`, `@`, a tab, or a carriage
 return gain a leading apostrophe before quoting (the OWASP defense
@@ -875,8 +905,8 @@ curl -s -u "admin:${SB_ADMIN_PASSWORD}" \
 
 ```text
 timestamp,origin,method,path,status,latency_ms,client_ip,request_id,trace_id,session_id,parent_session_id,cache_status,retry_count,failover_engaged,failover_from,failover_to,load_balancer_strategy,load_balancer_target,provider,model,tokens_in,tokens_out,cost_usd_micros,guardrail_category,guardrail_action,api_key_id,key_mode,key_provider,tenant_id,user_id,error_class,config_revision,policy_version,deny_reason,policy_decisions,properties
-2026-08-20T19:47:14.657182+00:00,acme.ai.local,POST,/v1/chat/completions,200,1.374375,127.0.0.1:57863,01a020b6a05f7e12b2b3f6efbb1a5ddf,02a99aadba6a4a60a59c6b8135d91971,,,disabled,0,false,,,round_robin,openai,openai,gpt-4o-mini,120,40,42,,,cfg:4:acme:13:acme.ai.local:acme-research,minted,,acme,sci@acme.test,,8cb4b33d8ffc,c:8cb4b33d8ffc:ae10235dbb7fdde7,,[],"{""feature"":""literature-scan""}"
-2026-08-20T19:47:14.643759+00:00,acme.ai.local,POST,/v1/chat/completions,200,1.953542,127.0.0.1:57862,01a020b6a05174a3ab6449c93aae65e8,0dcff27495d744dda98b3af634a4b024,,,disabled,0,false,,,round_robin,openai,openai,gpt-4o,900,300,5250,,,cfg:4:acme:13:acme.ai.local:acme-platform,minted,,acme,ops@acme.test,,8cb4b33d8ffc,c:8cb4b33d8ffc:cd949575bc0dca2d,,[],"{""feature"":""incident-triage""}"
+2026-08-21T01:11:55.226687+00:00,acme.ai.local,POST,/v1/chat/completions,200,1.887458,127.0.0.1:64696,01a021dfe05874f1b6ba866697bd518b,6531cb754eae46b5ba1b255f2c61eadb,,,disabled,0,false,,,round_robin,openai,openai,gpt-4o-mini,120,40,42,,,cfg:4:acme:13:acme.ai.local:acme-research,minted,,acme,sci@acme.test,,8cb4b33d8ffc,c:8cb4b33d8ffc:ae10235dbb7fdde7,,[],"{""feature"":""literature-scan""}"
+2026-08-21T01:11:55.214716+00:00,acme.ai.local,POST,/v1/chat/completions,200,1.116375,127.0.0.1:64695,01a021dfe04d7b11960a65be634aca3e,c4f486ae935b41fa854201f66422ad16,,,disabled,0,false,,,round_robin,openai,openai,gpt-4o,900,300,5250,,,cfg:4:acme:13:acme.ai.local:acme-platform,minted,,acme,ops@acme.test,,8cb4b33d8ffc,c:8cb4b33d8ffc:cd949575bc0dca2d,,[],"{""feature"":""incident-triage""}"
 ```
 
 The `globex` row is absent because the filter removed it, not because
@@ -894,15 +924,15 @@ curl -s -u "admin:${SB_ADMIN_PASSWORD}" \
 
 ```json
 {
-    "timestamp": "2026-08-20T19:47:14.630011+00:00",
+    "timestamp": "2026-08-21T01:11:55.203180+00:00",
     "origin": "acme.ai.local",
     "method": "POST",
     "path": "/v1/chat/completions",
     "status": 200,
-    "latency_ms": 1.991792,
-    "client_ip": "127.0.0.1:57861",
-    "request_id": "01a020b6a04371329c3279a3e40cfb8b",
-    "trace_id": "90f8435c47a144939199bcbd740061a7",
+    "latency_ms": 2.8585,
+    "client_ip": "127.0.0.1:64694",
+    "request_id": "01a021dfe0407331a26b80c75e648ba2",
+    "trace_id": "03db4bd210cc4aaab55079b097ccc623",
     "properties": {
         "feature": "summarize"
     },
@@ -1484,7 +1514,7 @@ time, plus the merged entry window:
 | Field | Type | Description |
 |---|---|---|
 | `channels[].channel` | string | `security`, `config`, `key`, or `admin`. |
-| `channels[].enabled` | bool | Whether this channel's chain file is configured. Disabled channels carry only these two fields. |
+| `channels[].enabled` | bool | Whether this channel's chain file is configured. Channels this request did not walk, whether disabled or excluded by a `channel=` filter, carry only these two fields. |
 | `channels[].path` | string | The chain file the walk read. |
 | `channels[].key_id` | string | The `kid` the chain signs under. |
 | `channels[].chain_entries` | number | Entries committed to the chain at the moment the read started. |
@@ -1513,9 +1543,13 @@ deployment-wide and a per-tenant slice of an audit trail reads as
 channel (`read_audit_chain`, or `read_audit_chain_denied` on the `403`)
 and counted on
 `sbproxy_audit_chain_read_total{channel, outcome}`, whose `outcome` is
-`verified`, `broken`, or `unreadable`. Alert on the last two: a broken
-chain that only a person looking at the console can see is a finding
-nobody is on call for.
+`verified`, `broken`, `unreadable`, or `denied`. Alert on everything
+that is not `verified`: a broken chain only a person looking at the
+console can see is a finding nobody is on call for, and a scoped
+principal reaching repeatedly for a deployment-wide security surface is
+one nobody would otherwise be prompted to go look for, because the only
+other record of it is inside the chain that principal was refused. A
+refusal increments all four channels, since it refuses all four.
 
 ### `GET /api/egress`
 

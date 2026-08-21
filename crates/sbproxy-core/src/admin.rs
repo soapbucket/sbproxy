@@ -497,6 +497,18 @@ impl RequestLogFilter<'_> {
     /// it), so the three routes cannot drift into selecting different
     /// rows for the same query string. A dimension added here is
     /// filtered on all three.
+    ///
+    /// On the three optional *report* dimensions (`model`,
+    /// `api_key_id`, `user`) an absent value on the row reads as the
+    /// empty string, which is what `report_dimension_value` does when
+    /// it groups. The report's grouper is a fourth reader of these
+    /// fields, and if it folded unattributed rows under `""` while this
+    /// predicate required `Some(..)`, the `""` group (typically the
+    /// largest one in a deployment that does not resolve end users)
+    /// would drill through to an empty export rather than to its own
+    /// rows. The remaining exact-match dimensions keep `Some(..)`
+    /// semantics: nothing groups on them, so there is no group to drill
+    /// through from.
     fn matches(&self, entry: &RequestLogEntry) -> bool {
         self.status.is_none_or(|s| entry.status == s)
             && self
@@ -527,20 +539,24 @@ impl RequestLogFilter<'_> {
             // resolve server-side instead of client-side.
             && self
                 .api_key_id
-                .is_none_or(|id| entry.api_key_id.as_deref() == Some(id))
+                .is_none_or(|id| entry.api_key_id.as_deref().unwrap_or("") == id)
             && self.key_mode.is_none_or(|mode| entry.key_mode == mode)
             && self
                 .session_id
                 .is_none_or(|id| entry.session_id.as_deref() == Some(id))
             // WOR-2578: the four report dimensions, filterable exactly
-            // so a grouped row drills through to the rows behind it.
+            // so a grouped row drills through to the rows behind it,
+            // including the unattributed group. `unwrap_or("")` is what
+            // makes `?user=` select the rows the report folded under
+            // `""` rather than nothing at all; `tenant_id` is a `String`
+            // on the row and is already symmetric.
             && self
                 .model
-                .is_none_or(|model| entry.model.as_deref() == Some(model))
+                .is_none_or(|model| entry.model.as_deref().unwrap_or("") == model)
             && self.tenant.is_none_or(|tenant| entry.tenant_id == tenant)
             && self
                 .user
-                .is_none_or(|user| entry.user_id.as_deref() == Some(user))
+                .is_none_or(|user| entry.user_id.as_deref().unwrap_or("") == user)
     }
 }
 
@@ -2942,8 +2958,33 @@ impl ParsedRequestFilter {
         {
             return Err(admin_error(400, "key_mode must be none, minted, or native"));
         }
+        // A present-but-unparseable numeric param is refused rather
+        // than dropped, matching the four params above. A dropped
+        // `?status=5xx` widens an export to the whole ring (every
+        // tenant, every user) while `applied_dimensions()` honestly
+        // reports `filters=none`, so neither the file nor its audit
+        // record says the filter never applied.
+        fn parse_number<T: std::str::FromStr>(
+            path: &str,
+            name: &str,
+            message: &'static str,
+        ) -> Result<Option<T>, AdminResponse> {
+            match rl_query_param(path, name) {
+                None => Ok(None),
+                Some(raw) => match raw.parse::<T>() {
+                    Ok(value) => Ok(Some(value)),
+                    Err(_) => Err(admin_error(400, message)),
+                },
+            }
+        }
+        let status = parse_number::<u16>(path, "status", "status must be an HTTP status code")?;
+        let offset =
+            parse_number::<usize>(path, "offset", "offset must be a whole number")?.unwrap_or(0);
+        let limit = parse_number::<usize>(path, "limit", "limit must be a whole number")?
+            .unwrap_or(max_log_entries)
+            .min(max_log_entries);
         Ok(Self {
-            status: rl_query_param(path, "status").and_then(|s| s.parse::<u16>().ok()),
+            status,
             method: decoded_query_param(path, "method"),
             path_sub: decoded_query_param(path, "path"),
             guardrail_action: decoded_query_param(path, "guardrail_action"),
@@ -2958,13 +2999,8 @@ impl ParsedRequestFilter {
             model: decoded_query_param(path, "model"),
             tenant: decoded_query_param(path, "tenant"),
             user: decoded_query_param(path, "user"),
-            offset: rl_query_param(path, "offset")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0),
-            limit: rl_query_param(path, "limit")
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(max_log_entries)
-                .min(max_log_entries),
+            offset,
+            limit,
         })
     }
 
@@ -3357,9 +3393,23 @@ fn write_csv_record(out: &mut String, fields: impl Iterator<Item = String>) {
 /// Rows are encoded one at a time as the ring is visited, so the only
 /// full copy that exists is the response itself, and that is capped by
 /// `proxy.admin.max_log_entries` (the parser clamps `limit` to it) no
-/// matter what the caller asks for. Every export is audited: a bulk
-/// read of the operational log is the exfiltration shape of this
-/// surface, and the row count is the number an operator alerts on.
+/// matter what the caller asks for. The response is materialized, not
+/// streamed: `handle_admin_request` answers with a `String`, so every
+/// route on that dispatcher is buffered by construction. What the
+/// one-at-a-time encoding avoids is the *second* copy, a
+/// `Vec<RequestLogEntry>` collected before encoding starts.
+///
+/// Every export is audited, and the row count is the number an
+/// operator alerts on. Scope that record honestly: it covers **this
+/// route**, not every bulk read of the log. `GET /api/requests` runs
+/// the same parser, the same filter and the same ring cap, and returns
+/// the same rows as a JSON array with no audit record and no counter,
+/// so a detection built only on `export_request_log` covers the
+/// download button rather than the whole read surface. Auditing that
+/// route too would put a durable chain record on every console poll,
+/// and a row-count threshold would be one page size away from being
+/// bypassed, so the honest move is to say what is covered rather than
+/// to imply more.
 fn request_export_response(
     state: &AdminState,
     parsed: &ParsedRequestFilter,
@@ -3534,10 +3584,30 @@ impl AuditChainChannelStatus {
 /// `GET /api/audit/chain`: browse the four tamper-evident audit chains,
 /// verified on the way (WOR-2579).
 ///
-/// Read-only by construction. There is no arm here for any other method,
-/// which is what lets a `read_only` operator call it without a role check:
-/// the RBAC gate refuses state-changing routes, and this route cannot
-/// change state. Reading the trail is the job that role exists for.
+/// Read-only by construction. There is no arm here for any other method.
+///
+/// On the role posture, stated rather than assumed: WOR-2579's
+/// acceptance asked for a role gate once console RBAC lands, and this
+/// route ships without one. That is a decision, not an oversight, and
+/// "this route cannot mutate" is not the argument for it, because
+/// LiteLLM's cited restriction is on *read* access. The argument is
+/// that reading the trail is the job the `read_only` role exists for,
+/// and that the bounded ring behind `GET /api/audit/events` already
+/// serves the same five channels to the same operator. The widening
+/// over that ring is real and is two specific axes: history here is
+/// the whole chain rather than the last `max_audit_events` records,
+/// and each entry carries the chained payload verbatim rather than the
+/// ring's `detail` projection. `docs/audit-log.md` says both plainly.
+/// A deployment that wants the trail narrower turns the channel's
+/// chain path off, or fronts the admin port.
+///
+/// The one gate that does ship is on tenant scope, below, and the
+/// sibling reporting routes deliberately took the opposite posture: a
+/// tenant-scoped operator is served a deployment-wide report and
+/// export, exactly as `GET /api/requests` has always served them one.
+/// The asymmetry is intentional. A narrowed *audit* trail reads as
+/// "nothing else happened", which is a worse answer than a refusal; a
+/// narrowed spend report is just a smaller number.
 ///
 /// A verification failure is served as a `200` carrying `ok: false`, never
 /// a `500`. The break is the finding, the records before it are still
@@ -3584,6 +3654,17 @@ fn handle_audit_chain(method: &str, path: &str, state: &AdminState) -> (u16, &'s
             Some("GET /api/audit/chain".to_string()),
         )
         .emit();
+        // The refusal is scrapeable, not only auditable. Without this
+        // the only record of a scoped principal reaching for a
+        // deployment-wide security surface lives inside the chain that
+        // principal was just refused, which takes an admin-role read to
+        // find and nothing to prompt one. One increment per channel, so
+        // the shipped alert
+        // `increase(sbproxy_audit_chain_read_total{outcome!="verified"}[15m]) > 0`
+        // covers the refusal without an operator changing the rule.
+        for channel in AUDIT_CHAIN_CHANNELS {
+            sbproxy_observe::metrics::record_audit_chain_read(channel, "denied");
+        }
         return (
             403,
             "application/json",
@@ -7599,6 +7680,212 @@ mod tests {
         assert_eq!(row[path_col], "'=HYPERLINK(\"http://evil.test\")");
     }
 
+    /// The current `sbproxy_admin_request_exports_total{format}` value,
+    /// read back off the default registry. Zero when the family has not
+    /// registered yet, which is the same thing as never having counted.
+    fn admin_request_exports_total(format: &str) -> u64 {
+        for family in prometheus::gather() {
+            if family.name() != "sbproxy_admin_request_exports_total" {
+                continue;
+            }
+            for metric in family.get_metric() {
+                if metric
+                    .get_label()
+                    .iter()
+                    .any(|pair| pair.name() == "format" && pair.value() == format)
+                {
+                    return metric.get_counter().value() as u64;
+                }
+            }
+        }
+        0
+    }
+
+    /// `GET /api/requests` returns the same rows as `format=jsonl` under
+    /// the same parser, the same filter and the same ring cap, and moves
+    /// neither export counter (WOR-2578).
+    ///
+    /// This pins the boundary the export's audit record actually covers.
+    /// The CHANGELOG used to say a bulk read of the operational log was
+    /// recorded and alertable; the identical bulk read is one query
+    /// string away with neither, so the claim now names the export and
+    /// `docs/admin-api-reference.md` names this route as the unaudited
+    /// equivalent. If that ever changes, this test changes with it
+    /// rather than the sentence going quietly stale.
+    ///
+    /// Counter reads are process-wide, so this pins the delta around one
+    /// call rather than an absolute value; nextest gives each test its
+    /// own process.
+    #[test]
+    fn the_snapshot_route_is_the_unaudited_equivalent_of_the_export() {
+        let state = make_state();
+        for tenant in ["acme", "globex"] {
+            state.log_request(reporting_entry(
+                "gpt-4o",
+                "sbk_alpha",
+                tenant,
+                "dev@acme.test",
+                1,
+                1,
+                1,
+            ));
+        }
+        let auth = basic_auth("admin", "secret");
+
+        let (status, _, snapshot) =
+            handle_admin_request("GET", "/api/requests", &state, Some(&auth), None);
+        assert_eq!(status, 200, "{snapshot}");
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&snapshot).unwrap();
+
+        let before_export = admin_request_exports_total("jsonl");
+        let (status, _, export) = handle_admin_request(
+            "GET",
+            "/api/requests/export?format=jsonl",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 200, "{export}");
+        let exported: Vec<serde_json::Value> = export
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).expect("each JSONL line parses"))
+            .collect();
+        assert_eq!(rows, exported, "the same rows, one route over");
+        assert!(
+            admin_request_exports_total("jsonl") > before_export,
+            "the export counts itself"
+        );
+
+        let before_snapshot = admin_request_exports_total("jsonl");
+        let (status, _, body) =
+            handle_admin_request("GET", "/api/requests", &state, Some(&auth), None);
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            admin_request_exports_total("jsonl"),
+            before_snapshot,
+            "the snapshot route is the unaudited, uncounted equivalent of the export"
+        );
+    }
+
+    /// A row that carries none of the optional report dimensions groups
+    /// under `""`, and the same query string on the export has to return
+    /// the rows behind that number (WOR-2578).
+    ///
+    /// The failure this pins: a billing pipeline iterates the report's
+    /// groups and exports each one, exactly as the docs instruct. Every
+    /// populated group exports correctly and the `""` group, typically
+    /// the largest in a deployment that resolves no end user, comes back
+    /// as a header row on its own. Nothing errors and the biggest bucket
+    /// of spend is silently dropped.
+    #[test]
+    fn an_unattributed_group_drills_through_to_its_own_rows() {
+        let state = make_state();
+        state.log_request(reporting_entry(
+            "gpt-4o",
+            "sbk_alpha",
+            "acme",
+            "dev@acme.test",
+            10,
+            1,
+            100,
+        ));
+        // No model, no governed key, no resolved human subject: a call
+        // refused before it reached a provider, or simply a deployment
+        // that sets no `X-Sb-User-Id` and mints no keys.
+        let mut orphan = reporting_entry("x", "x", "acme", "x", 20, 2, 200);
+        orphan.model = None;
+        orphan.api_key_id = None;
+        orphan.user_id = None;
+        state.log_request(orphan);
+        let auth = basic_auth("admin", "secret");
+
+        for dimension in ["model", "api_key_id", "user"] {
+            let (status, _, body) = handle_admin_request(
+                "GET",
+                &format!("/api/requests/report?group_by={dimension}"),
+                &state,
+                Some(&auth),
+                None,
+            );
+            assert_eq!(status, 200, "{dimension}: {body}");
+            let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let rows = report["rows"].as_array().cloned().unwrap_or_default();
+            let unattributed = rows
+                .iter()
+                .find(|row| row["group"][dimension].as_str() == Some(""))
+                .unwrap_or_else(|| panic!("{dimension}: no unattributed group in {body}"));
+            assert_eq!(
+                unattributed["requests"].as_u64(),
+                Some(1),
+                "{dimension}: {body}"
+            );
+
+            let (status, _, body) = handle_admin_request(
+                "GET",
+                &format!("/api/requests/export?format=jsonl&{dimension}="),
+                &state,
+                Some(&auth),
+                None,
+            );
+            assert_eq!(status, 200, "{dimension}: {body}");
+            assert_eq!(
+                body.lines().filter(|line| !line.is_empty()).count(),
+                1,
+                "{dimension}: the unattributed group must drill through to its own row: {body}"
+            );
+        }
+    }
+
+    /// A present-but-unparseable numeric filter is a 400 rather than a
+    /// silently wider result set (WOR-2578).
+    ///
+    /// `?status=5xx` used to drop the status dimension and hand back the
+    /// whole ring, every tenant and every user, as a file. The audit
+    /// record was honest and unhelpful: `filters=none`, because the
+    /// dimension was never set.
+    #[test]
+    fn request_filters_refuse_a_malformed_numeric_param() {
+        let state = make_state();
+        state.log_request(reporting_entry(
+            "gpt-4o",
+            "sbk_alpha",
+            "acme",
+            "dev@acme.test",
+            10,
+            1,
+            100,
+        ));
+        let auth = basic_auth("admin", "secret");
+        for query in ["status=5xx", "limit=all", "offset=-1", "limit="] {
+            let (status, _, body) = handle_admin_request(
+                "GET",
+                &format!("/api/requests/export?format=csv&{query}"),
+                &state,
+                Some(&auth),
+                None,
+            );
+            assert_eq!(
+                status, 400,
+                "{query} must not silently widen the export: {body}"
+            );
+        }
+        // One parser, so the snapshot and the report refuse them too.
+        for path in ["/api/requests?status=5xx", "/api/requests/report?limit=all"] {
+            let (status, _, body) = handle_admin_request("GET", path, &state, Some(&auth), None);
+            assert_eq!(status, 400, "{path}: {body}");
+        }
+        // And a well-formed one still works.
+        let (status, _, body) = handle_admin_request(
+            "GET",
+            "/api/requests/export?format=csv&status=200&limit=5&offset=0",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 200, "{body}");
+    }
+
     #[test]
     fn spend_group_by_accepts_a_percent_encoded_property_dimension() {
         // A promoted property reads `property:<key>`, and every
@@ -8839,6 +9126,163 @@ mod tests {
             response.contains("acme"),
             "the refusal names the scope that caused it: {response}"
         );
+    }
+
+    /// The refusal above is scrapeable, not only auditable (WOR-2579).
+    ///
+    /// Without this the only record of a scoped principal reaching for a
+    /// deployment-wide security surface is inside the chain that
+    /// principal was just refused, which takes an admin-role read to
+    /// find and nothing to prompt one. The shipped alert
+    /// `increase(sbproxy_audit_chain_read_total{outcome!="verified"}[15m]) > 0`
+    /// has to cover it unchanged, which is why the outcome lands on this
+    /// family rather than on a new one.
+    #[tokio::test]
+    async fn a_refused_audit_chain_read_moves_the_alertable_counter() {
+        let before = audit_chain_read_total("security", "denied");
+        let state = AdminState::new(AdminConfig {
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+            operators: vec![AdminOperator {
+                username: "reseller".to_string(),
+                password_hash: sbproxy_keystore::crypto::hash_secret(
+                    "reseller-secret",
+                    &crate::key_plane::default_admin_operator_pepper(),
+                ),
+                role: AdminRole::Admin,
+                tenant: Some("acme".to_string()),
+            }],
+            ..AdminConfig::default()
+        });
+        let (token, _) = state
+            .session_signer
+            .mint("reseller", AdminRole::Admin, 3600, unix_now());
+
+        let response = send_admin_request(
+            state,
+            format!("GET /api/audit/chain HTTP/1.1\r\nCookie: sb_admin_session={token}\r\n\r\n"),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+
+        // Strictly greater rather than exactly one more: the counter is
+        // process-wide and a shared-process runner may move it too.
+        assert!(
+            audit_chain_read_total("security", "denied") > before,
+            "a refused chain read must leave the page as well as render on it"
+        );
+    }
+
+    /// WOR-2578's two new routes are read surfaces, so a `read_only`
+    /// operator gets the same 200 an admin does.
+    ///
+    /// Pinned by name because the audit-chain viewer that shipped in the
+    /// same batch argued the opposite way on the tenant axis, and the
+    /// posture nobody tests is the posture that flips unnoticed.
+    #[tokio::test]
+    async fn the_report_and_the_export_allow_a_read_only_operator() {
+        for path in [
+            "/api/requests/report?group_by=model",
+            "/api/requests/export?format=csv",
+        ] {
+            let state = AdminState::new(AdminConfig {
+                username: "admin".to_string(),
+                password: "secret".to_string(),
+                max_log_entries: 100,
+                operators: vec![AdminOperator {
+                    username: "reader".to_string(),
+                    password_hash: sbproxy_keystore::crypto::hash_secret(
+                        "reader-secret",
+                        &crate::key_plane::default_admin_operator_pepper(),
+                    ),
+                    role: AdminRole::ReadOnly,
+                    tenant: None,
+                }],
+                ..AdminConfig::default()
+            });
+            let (token, _) =
+                state
+                    .session_signer
+                    .mint("reader", AdminRole::ReadOnly, 3600, unix_now());
+
+            let response = send_admin_request(
+                state,
+                format!("GET {path} HTTP/1.1\r\nCookie: sb_admin_session={token}\r\n\r\n"),
+            )
+            .await;
+            assert!(
+                response.starts_with("HTTP/1.1 200 OK"),
+                "{path}: {response}"
+            );
+        }
+    }
+
+    /// And a tenant-scoped operator is served the whole deployment on
+    /// both, exactly as `GET /api/requests` has always served them one.
+    ///
+    /// The asymmetry with `/api/audit/chain` is deliberate rather than
+    /// inherited: a narrowed audit trail reads as "nothing else
+    /// happened", which is a worse answer than a refusal, while a
+    /// narrowed spend report is just a smaller number. Recorded in code
+    /// so the decision is a decision rather than an omission (WOR-2578).
+    #[tokio::test]
+    async fn the_report_and_the_export_serve_a_tenant_scoped_operator_every_tenant() {
+        for path in [
+            "/api/requests/report?group_by=tenant",
+            "/api/requests/export?format=csv",
+        ] {
+            let state = AdminState::new(AdminConfig {
+                username: "admin".to_string(),
+                password: "secret".to_string(),
+                max_log_entries: 100,
+                operators: vec![AdminOperator {
+                    username: "reseller".to_string(),
+                    password_hash: sbproxy_keystore::crypto::hash_secret(
+                        "reseller-secret",
+                        &crate::key_plane::default_admin_operator_pepper(),
+                    ),
+                    role: AdminRole::Admin,
+                    tenant: Some("acme".to_string()),
+                }],
+                ..AdminConfig::default()
+            });
+            state.log_request(reporting_entry(
+                "gpt-4o",
+                "k-acme",
+                "acme",
+                "dev@acme.test",
+                1,
+                1,
+                1,
+            ));
+            state.log_request(reporting_entry(
+                "gpt-4o",
+                "k-globex",
+                "globex",
+                "dev@globex.test",
+                1,
+                1,
+                1,
+            ));
+            let (token, _) =
+                state
+                    .session_signer
+                    .mint("reseller", AdminRole::Admin, 3600, unix_now());
+
+            let response = send_admin_request(
+                state,
+                format!("GET {path} HTTP/1.1\r\nCookie: sb_admin_session={token}\r\n\r\n"),
+            )
+            .await;
+            assert!(
+                response.starts_with("HTTP/1.1 200 OK"),
+                "{path}: {response}"
+            );
+            assert!(
+                response.contains("globex"),
+                "{path}: the reporting routes are deployment-wide for every role: {response}"
+            );
+        }
     }
 
     /// Reading the trail is itself recorded on the admin chain, naming

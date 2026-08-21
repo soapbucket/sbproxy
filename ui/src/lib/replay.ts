@@ -10,6 +10,7 @@
 // through the governed `/admin/api/playground/dispatch` route, so the
 // replayed request runs the full policy chain like the original did.
 
+import { ApiError } from "../api";
 import type { CapturedMessage, ContentSample, RequestLog } from "../api";
 
 /** The handoff a log row can seed: everything here rides the URL. */
@@ -77,6 +78,46 @@ export function beginReplay(seed: ReplaySeed): ReplayDraft {
  * one, the draft records the server's reason and reconstructs nothing:
  * an absent body stays absent.
  */
+/**
+ * The sentence to show when the content-sample read failed.
+ *
+ * `ApiError.message` is assembled client-side out of the method, the
+ * path and the status code, and that is all a bare `e.message` would
+ * ever render: "GET /api/requests/req-abc/content failed (404)". The
+ * server's explanation rides in `body`, and it is the half an operator
+ * can act on, because it names which of the two consent flags
+ * (`capture_content` on the origin, `allow_content_capture` on the key
+ * policy) was not set. Prefer it, fall back to the status hint, and
+ * only then to the raw message.
+ */
+export function contentSampleErrorMessage(error: unknown): string {
+  if (error instanceof ApiError) {
+    return serverErrorText(error.body) ?? error.hint;
+  }
+  if (error instanceof Error) return error.message;
+  return "content sample unavailable";
+}
+
+/**
+ * The `error` field out of an admin JSON error body, or the body
+ * itself when it is short plain text. Anything unparseable and long is
+ * dropped rather than pasted into the page.
+ */
+function serverErrorText(body: string): string | null {
+  const raw = body.trim();
+  if (!raw) return null;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && "error" in parsed) {
+      const message = (parsed as { error: unknown }).error;
+      if (typeof message === "string" && message.trim()) return message.trim();
+    }
+  } catch {
+    // Not JSON; fall through to the plain-text case.
+  }
+  return raw.length <= 400 ? raw : null;
+}
+
 export function resolveReplayContent(
   draft: ReplayDraft,
   sample: ContentSample | null,
