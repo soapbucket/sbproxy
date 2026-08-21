@@ -16,7 +16,7 @@
 //! **The first reason is that a separate profile file beats editing a shared
 //! one.** `codex --profile <name>` layers `$CODEX_HOME/<name>.config.toml` on
 //! top of the user's `config.toml` (verified against codex-cli 0.149.0:
-//! `codex --help` documents the flag as "Layer $CODEX_HOME/<name>.config.toml
+//! `codex --help` documents the flag as "Layer `$CODEX_HOME/<name>.config.toml`
 //! on top of the base user config"). So this verb creates a file that did not
 //! exist, that nothing else owns, and that `disconnect` can simply delete. A
 //! real `~/.codex/config.toml` carries trust decisions, marketplace
@@ -74,11 +74,11 @@
 //! key order, and every unrelated table survive even in a file the operator
 //! has hand-edited. Anything that cannot be edited structurally (a
 //! `model_providers` that is not a table) is refused with a message naming the
-//! key, never overwritten. [`apply`] re-reads the file and refuses if it
+//! key, never overwritten. `apply` re-reads the file and refuses if it
 //! changed since the plan was built, so a diff the operator approved is the
 //! diff that lands.
 //!
-//! [`replace_atomically`] stages a sibling temp file, fsyncs it, renames it
+//! `replace_atomically` stages a sibling temp file, fsyncs it, renames it
 //! over the destination, and fsyncs the directory. The destination is never
 //! opened for writing, so no reader ever sees a truncated config.
 //!
@@ -86,7 +86,7 @@
 //! A failure before it is a failure: the destination still holds every old
 //! byte and the run says so. A failure of the directory fsync *after* it is
 //! not, because the new bytes are already there;
-//! [`Durability::NotSynced`] carries that case so the run reports a write
+//! `Durability::NotSynced` carries that case so the run reports a write
 //! that landed and is not yet crash-proof rather than a write that did not
 //! happen. `sync_all` on macOS is `F_FULLFSYNC`, which answers ENOTSUP on an
 //! SMB- or FUSE-mounted home, so this is somebody's every run rather than a
@@ -102,7 +102,7 @@
 //! A removal needs its own copy, and for a while it did not have one. The
 //! `.bak` holds the file as it was before the *first* `connect`, so a
 //! `disconnect` that leaned on it deleted every hand edit made since. So
-//! [`Destination::Remove`] carries the path it stages the current bytes at,
+//! `Destination::Remove` carries the path it stages the current bytes at,
 //! `<path>.sbproxy.removed`, and carries it unconditionally: a removal cannot
 //! be constructed without somewhere for its bytes to go, which is why a third
 //! direction added later cannot quietly reintroduce the hole. `apply` copies
@@ -952,7 +952,7 @@ impl Durability {
 ///
 /// The result splits at the rename: `Err` means the destination still holds
 /// every old byte, `Ok(Durability::NotSynced)` means it holds the new ones and
-/// the directory fsync did not answer. See [`Durability`].
+/// the directory fsync did not answer. See `Durability`.
 fn replace_atomically(
     path: &Path,
     contents: &str,
@@ -961,7 +961,7 @@ fn replace_atomically(
     replace_atomically_with(path, contents, mode, sync_dir)
 }
 
-/// [`replace_atomically`] with the directory sync passed in.
+/// `replace_atomically` with the directory sync passed in.
 ///
 /// The seam exists because the failure it guards is not producible in a temp
 /// directory: `sync_all` answers ENOTSUP on an SMB or FUSE mount and nothing
@@ -1032,7 +1032,7 @@ fn replace_atomically_with(
 
 /// Remove `path` and make the removal durable.
 ///
-/// Splits at the unlink for the same reason [`replace_atomically`] splits at
+/// Splits at the unlink for the same reason `replace_atomically` splits at
 /// the rename: once the file is gone, a directory sync that will not answer
 /// does not put it back.
 fn remove_durably(path: &Path) -> anyhow::Result<Durability> {
