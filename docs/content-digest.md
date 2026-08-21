@@ -1,11 +1,29 @@
 # content_digest policy
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-20*
 
 The `content_digest` policy verifies an inbound request body against the digest the client advertises in the `Content-Digest:` header (RFC 9530). On mismatch, malformed header, missing header, or unsupported algorithm, the proxy rejects the request with the configured status. The intended audience is integrity-critical inboxes: webhook receivers, agent endpoints, payment callbacks, audit-ingest paths.
 
 The policy honors `Content-Digest:` first and falls back to `Repr-Digest:` if `Content-Digest:` is absent. RFC 9530 §2 makes the two interchangeable for inbound traffic that does not decode `Content-Encoding`. SHA-256 and SHA-512 are supported; unknown algorithms fall through to the configured failure mode.
 
-Verification runs in `request_body_filter` once the body is fully buffered. The pairing enforcer sets `ctx.validate_request_body = true` so the proxy buffers the body for hashing; bypass it on routes that do not need this check.
+## When each decision runs
+
+The policy makes two decisions and they become answerable at different points in the request, so the proxy settles them in different phases.
+
+**The header is absent.** Nothing about that verdict depends on the body, so `on_missing: require` refuses in the header phase, before the proxy picks an upstream peer. The upstream is never dialed. This matters for more than latency: pointed at an upstream that is slow or unreachable, a refusal that waited for the connection would hand the client the upstream's failure instead of the policy's verdict, and would hold the connection slot for the whole dial.
+
+**The header is present.** Whether it matches needs the body, so the pairing enforcer sets `ctx.validate_request_body = true` and verification runs in `request_body_filter` once the body is fully buffered. That phase is reached after the upstream connection is established. The body bytes never reach the upstream, but the dial has already happened, and that is inherent to deciding on the body rather than something the policy can avoid. Bypass the policy on routes that do not need the check.
+
+```mermaid
+flowchart TD
+    A[Request headers] --> B{Content-Digest or Repr-Digest present?}
+    B -- no --> C{on_missing}
+    C -- require --> D[Refuse with missing_status<br/>upstream never dialed]
+    C -- skip --> E[Forward unverified]
+    B -- yes --> F[Buffer body<br/>upstream peer already selected]
+    F --> G{Digest matches?}
+    G -- yes --> H[Forward<br/>content_digest_verified = true]
+    G -- no --> I[Refuse with status<br/>body never reaches upstream]
+```
 
 ## Config
 
@@ -47,10 +65,10 @@ origins:
 | Condition | Behavior |
 |---|---|
 | Header present, digest matches | Pass; sets `ctx.content_digest_verified = true` |
-| Header present, digest mismatch | Reject with `status` |
+| Header present, digest mismatch | Reject with `status` after the body is buffered; the upstream is dialed but never sees the body |
 | Header present, algorithm not in the configured `algorithms` set | Reject with `status` |
 | Header present, parse error | Reject with `status` |
-| Header absent, `on_missing: require` | Reject with `missing_status` (defaults to `status`) |
+| Header absent, `on_missing: require` | Reject with `missing_status` (defaults to `status`), in the header phase, before the upstream is dialed |
 | Header absent, `on_missing: skip` | Pass through unverified |
 
 ## Calling it
@@ -135,9 +153,17 @@ mismatch and `422` on a missing header.
 
 `ctx.content_digest_verified = true` propagates the verification result to downstream phases. HTTP Message Signatures audit can attest that the body matches the signed digest component without re-hashing, and billing surfaces that quote by body size get an integrity guarantee for free. The flag is consumed inside the proxy; it does not leak to clients.
 
+## Watching it
+
+Every refusal increments `sbproxy_policy_triggers_total{policy_type="content_digest",action="deny"}`, whichever phase decided it, and logs on the `sbproxy::content_digest` target with a `reason` naming the outcome: `missing_required`, `mismatch`, `malformed`, `unsupported_algorithm`, or `body_over_cap`. Alert on the counter; use the reason to tell a misconfigured sender apart from a tampered body.
+
+The policy audit event bus is narrower. It records the verdict of the policy chain, which runs in the header phase, so `sbproxy_policy_audit_events_total{policy_id="content_digest"}` reports `deny` for a missing-header refusal and `allow` for a request whose header was present, including one the body filter went on to refuse. Use the trigger counter, not the audit counter, to count digest failures.
+
 ## Out of scope
 
-RFC 9530 §6.4 trailer-section digests are not supported because Pingora 0.8's `ProxyHttp` trait does not expose an `request_trailer_filter` hook. Clients that send the digest in the trailer section are treated as if the header is absent, so `on_missing: require` rejects them (the safer default).
+RFC 9530 §6.4 trailer-section digests are not supported because Pingora 0.8's `ProxyHttp` trait does not expose an `request_trailer_filter` hook. Clients that send the digest in the trailer section are treated as if the header is absent, so `on_missing: require` rejects them in the header phase (the safer default), and it rejects them before reading any trailer that might have carried the digest.
+
+A header value that is not valid UTF-8 counts as absent for the same reason: it cannot be parsed as an RFC 9530 structured-fields dictionary, so both phases treat it as no header at all rather than as a malformed one.
 
 ## See also
 

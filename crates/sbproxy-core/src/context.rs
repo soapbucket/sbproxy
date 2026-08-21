@@ -440,6 +440,18 @@ pub struct RequestContext {
     /// this separately from the decision message so the response phase
     /// can emit it verbatim.
     pub concurrent_limit_denial_body: Option<String>,
+    /// Configured `content_digest` rejection envelope `(body,
+    /// content_type)` for a refusal decided in the header phase.
+    ///
+    /// WOR-2528: `on_missing: require` is decidable from the request
+    /// headers alone, so the enforcer refuses there rather than
+    /// waiting for the body filter, which Pingora reaches only after
+    /// the upstream connection is up. The enforcer trait's decision
+    /// carries a status and a message but not the operator's
+    /// `error_body` / `error_content_type`, so it parks the rendered
+    /// envelope here for the response phase to emit verbatim. Same
+    /// shape as `concurrent_limit_denial_body` above.
+    pub content_digest_denial: Option<(String, String)>,
     /// Permits issued by `AgentBudgetPolicy`. Same lifecycle
     /// as `concurrent_limit_guards`: each guard tracks an in-flight
     /// agent-keyed slot and releases it when the request finishes.
@@ -1697,6 +1709,7 @@ impl RequestContext {
             admin_load_balancer_target: None,
             concurrent_limit_guards: Vec::new(),
             concurrent_limit_denial_body: None,
+            content_digest_denial: None,
             agent_budget_guards: Vec::new(),
             agent_budget_token_sinks: Vec::new(),
             validate_request_body: false,

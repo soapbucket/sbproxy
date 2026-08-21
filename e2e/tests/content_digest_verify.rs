@@ -10,7 +10,9 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use sbproxy_e2e::ProxyHarness;
@@ -26,6 +28,15 @@ struct StubUpstream {
     port: u16,
     captured: Arc<Mutex<Vec<u8>>>,
     shutdown: Arc<Mutex<bool>>,
+    /// TCP connections the listener accepted, readiness probe
+    /// included. WOR-2528 asserts on the delta from a baseline taken
+    /// right after `start()` so the probe does not skew the count.
+    connects: Arc<AtomicUsize>,
+    /// Connections that delivered a complete HTTP request header
+    /// block. A bare TCP probe never reaches this counter, so a
+    /// non-zero value means the proxy really dialed and spoke to the
+    /// upstream for a request.
+    requests: Arc<AtomicUsize>,
 }
 
 impl StubUpstream {
@@ -34,8 +45,12 @@ impl StubUpstream {
         let port = listener.local_addr().unwrap().port();
         let captured = Arc::new(Mutex::new(Vec::new()));
         let shutdown = Arc::new(Mutex::new(false));
+        let connects = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(AtomicUsize::new(0));
         let captured_clone = captured.clone();
         let shutdown_clone = shutdown.clone();
+        let connects_clone = connects.clone();
+        let requests_clone = requests.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 if *shutdown_clone.lock().unwrap() {
@@ -45,9 +60,11 @@ impl StubUpstream {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
+                connects_clone.fetch_add(1, Ordering::SeqCst);
                 let cap = captured_clone.clone();
+                let req_count = requests_clone.clone();
                 std::thread::spawn(move || {
-                    let _ = handle_conn(&mut stream, cap);
+                    let _ = handle_conn(&mut stream, cap, req_count);
                 });
             }
         });
@@ -67,6 +84,8 @@ impl StubUpstream {
             port,
             captured,
             shutdown,
+            connects,
+            requests,
         }
     }
 
@@ -76,6 +95,17 @@ impl StubUpstream {
 
     fn captured_body(&self) -> Vec<u8> {
         self.captured.lock().unwrap().clone()
+    }
+
+    /// TCP connections accepted so far.
+    fn connects(&self) -> usize {
+        self.connects.load(Ordering::SeqCst)
+    }
+
+    /// Requests whose header block fully arrived. This is the
+    /// "did the proxy actually talk to the upstream" counter.
+    fn requests(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
     }
 }
 
@@ -89,11 +119,17 @@ impl Drop for StubUpstream {
 fn handle_conn(
     stream: &mut std::net::TcpStream,
     captured: Arc<Mutex<Vec<u8>>>,
+    requests: Arc<AtomicUsize>,
 ) -> std::io::Result<()> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
+    let mut counted_header = false;
     loop {
         if let Some(end) = find_headers_end(&buf) {
+            if !counted_header {
+                requests.fetch_add(1, Ordering::SeqCst);
+                counted_header = true;
+            }
             let header_str = String::from_utf8_lossy(&buf[..end]).to_string();
             let content_len = parse_content_length(&header_str);
             if buf.len() >= end + 4 + content_len {
@@ -384,5 +420,179 @@ fn missing_header_with_skip_is_forwarded() {
         upstream.captured_body(),
         body,
         "skip mode must forward the body intact when no digest is supplied"
+    );
+}
+
+// ---------------------------------------------------------------
+// WOR-2528: `on_missing: require` must refuse at the edge.
+//
+// The refusal was correct and the timing was not. The check ran in
+// `request_body_filter`, which Pingora reaches only after
+// `upstream_peer` has picked a peer and the upstream connection is
+// established, so a request the proxy had already decided to refuse
+// paid a full upstream dial first. Against an upstream that does not
+// answer, the client waits out the connect timeout for a verdict the
+// proxy could have returned from the request headers alone. That is
+// an availability bug, not a cosmetic one: the connection slot is
+// held for the whole dial.
+//
+// Both tests below fail on the pre-fix build. The first fails on the
+// counter: the upstream receives a request the proxy has already
+// decided to refuse. The second fails on the verdict: pointed at an
+// upstream it cannot reach, the pre-fix proxy answers 502 rather than
+// the policy's 400, so the operator's fail-closed control is replaced
+// by an upstream error on the way out. Against an upstream that is
+// slow to connect rather than quick to refuse, the same ordering
+// produces the multi-minute wait the ticket reported.
+// ---------------------------------------------------------------
+
+/// A digest-required origin pointed at TEST-NET-1 (RFC 5737 §3),
+/// reserved for documentation and routed nowhere.
+///
+/// What the connect does depends on the host's routing table: this
+/// machine answers "no route" in about 15 ms, a machine that silently
+/// drops the SYN waits out the connect timeout instead. Either way the
+/// dial is one the proxy had no business making, so the test asserts
+/// on the two things that do not vary: the client gets the policy's
+/// verdict rather than the upstream's failure, and it gets it without
+/// waiting on a network round trip.
+fn config_require_unreachable_upstream() -> String {
+    r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "digest.localhost":
+    policies:
+      - type: content_digest
+    action:
+      type: proxy
+      url: "http://192.0.2.1:80"
+"#
+    .to_string()
+}
+
+#[test]
+fn missing_header_with_require_never_dials_upstream() {
+    let upstream = StubUpstream::start();
+    let harness = ProxyHarness::start_with_yaml(&config_require(&upstream.url())).expect("start");
+
+    // Baseline after readiness probing so the harness's own probe and
+    // the stub's startup probe are excluded from the delta.
+    let connects_before = upstream.connects();
+    assert_eq!(
+        upstream.requests(),
+        0,
+        "no HTTP request should have reached the stub before the test body"
+    );
+
+    let body = b"{\"hello\":\"world\"}".to_vec();
+    let resp = harness
+        .post_bytes(
+            "/payload",
+            "digest.localhost",
+            "application/json",
+            body.clone(),
+            // No content-digest header at all: the policy can decide
+            // from the request headers, with no body and no upstream.
+            &[],
+        )
+        .expect("post");
+
+    assert_eq!(resp.status, 400, "missing digest under require is a 400");
+    // Give a late upstream connection a chance to land before we
+    // assert it did not happen; a race that only sometimes dials is
+    // still the bug.
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        upstream.requests(),
+        0,
+        "the upstream must never see a request the proxy already refused"
+    );
+    assert_eq!(
+        upstream.connects(),
+        connects_before,
+        "the upstream must not even be dialed for a header-phase refusal"
+    );
+}
+
+#[test]
+fn missing_header_with_require_answers_without_the_upstream() {
+    let harness =
+        ProxyHarness::start_with_yaml(&config_require_unreachable_upstream()).expect("start");
+    let body = b"{\"hello\":\"world\"}".to_vec();
+
+    let started = Instant::now();
+    let result = harness.post_bytes(
+        "/payload",
+        "digest.localhost",
+        "application/json",
+        body,
+        &[],
+    );
+    let elapsed = started.elapsed();
+
+    let resp = result.unwrap_or_else(|e| {
+        panic!(
+            "the refusal must not wait on the upstream: request failed after {elapsed:?} with {e}"
+        )
+    });
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "a header-phase refusal must not pay for an upstream dial; \
+         took {elapsed:?} and answered {}",
+        resp.status
+    );
+    assert_eq!(
+        resp.status, 400,
+        "the policy's own verdict must reach the client, not the upstream's failure; \
+         got {} after {elapsed:?}",
+        resp.status
+    );
+    let body_text = String::from_utf8_lossy(&resp.body);
+    assert!(
+        body_text.contains("required but absent"),
+        "envelope must name the reason; got: {body_text}"
+    );
+}
+
+#[test]
+fn missing_header_with_require_honours_configured_error_body() {
+    // The header-phase refusal is a different code path from the
+    // body-phase one it replaces, so the operator-configured
+    // `error_body` / `error_content_type` have to survive the move.
+    let upstream = StubUpstream::start();
+    let yaml = format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "digest.localhost":
+    policies:
+      - type: content_digest
+        on_missing: require
+        missing_status: 428
+        error_body: "digest required"
+        error_content_type: "text/plain"
+    action:
+      type: proxy
+      url: "{}"
+"#,
+        upstream.url()
+    );
+    let harness = ProxyHarness::start_with_yaml(&yaml).expect("start");
+    let resp = harness
+        .post_bytes(
+            "/payload",
+            "digest.localhost",
+            "application/json",
+            b"{}".to_vec(),
+            &[],
+        )
+        .expect("post");
+    assert_eq!(resp.status, 428, "missing_status must be honored");
+    assert_eq!(
+        String::from_utf8_lossy(&resp.body),
+        "digest required",
+        "configured error_body must be emitted byte for byte"
     );
 }

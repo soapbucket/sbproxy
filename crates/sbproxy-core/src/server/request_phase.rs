@@ -8,34 +8,59 @@
 use super::*;
 use crate::key_plane::key_store_entrypoint;
 
-struct ConcurrentLimitDenialResponse {
+/// A denial whose body and content type the policy configured, rather
+/// than the generic `{"error": ...}` envelope the dispatcher renders.
+struct ConfiguredDenialResponse {
     status: u16,
-    content_type: &'static str,
+    content_type: String,
     body: String,
 }
 
-fn take_concurrent_limit_denial_response(
+/// Pull the configured rejection envelope for policies that park one
+/// on the context during the header phase.
+///
+/// Two policies do this today and for the same reason: the
+/// `PolicyEnforcer` decision carries a status and a message but no
+/// body or content type, so a policy with an operator-configured
+/// `error_body` has nowhere else to put it.
+///
+/// * `concurrent_limit` parks a body.
+/// * `content_digest` parks a body and a content type (WOR-2528),
+///   because moving its `on_missing: require` refusal out of the body
+///   filter and into the header phase had to keep `error_body` and
+///   `error_content_type` working exactly as they did before the move.
+fn take_configured_denial_response(
     ctx: &mut RequestContext,
     status: u16,
     message: &str,
     policy_type: &str,
-) -> Option<ConcurrentLimitDenialResponse> {
-    if policy_type != "concurrent_limit" {
-        return None;
+) -> Option<ConfiguredDenialResponse> {
+    match policy_type {
+        "concurrent_limit" => {
+            let body = ctx
+                .concurrent_limit_denial_body
+                .take()
+                .unwrap_or_else(|| error_json_body(message));
+            Some(ConfiguredDenialResponse {
+                status,
+                content_type: "application/json".to_string(),
+                body,
+            })
+        }
+        "content_digest" => {
+            let (body, content_type) = ctx.content_digest_denial.take()?;
+            Some(ConfiguredDenialResponse {
+                status,
+                content_type,
+                body,
+            })
+        }
+        _ => None,
     }
-    let body = ctx
-        .concurrent_limit_denial_body
-        .take()
-        .unwrap_or_else(|| error_json_body(message));
-    Some(ConcurrentLimitDenialResponse {
-        status,
-        content_type: "application/json",
-        body,
-    })
 }
 
 #[cfg(test)]
-mod concurrent_limit_denial_response_tests {
+mod configured_denial_response_tests {
     use super::*;
 
     #[test]
@@ -45,7 +70,7 @@ mod concurrent_limit_denial_response_tests {
         ctx.concurrent_limit_denial_body = Some(configured.to_string());
 
         let response =
-            take_concurrent_limit_denial_response(&mut ctx, 529, configured, "concurrent_limit")
+            take_configured_denial_response(&mut ctx, 529, configured, "concurrent_limit")
                 .expect("concurrent-limit response");
 
         assert_eq!(response.status, 529);
@@ -58,7 +83,7 @@ mod concurrent_limit_denial_response_tests {
     fn default_message_keeps_the_generic_json_envelope() {
         let mut ctx = RequestContext::new();
 
-        let response = take_concurrent_limit_denial_response(
+        let response = take_configured_denial_response(
             &mut ctx,
             503,
             "too many concurrent requests",
@@ -72,6 +97,43 @@ mod concurrent_limit_denial_response_tests {
             response.body,
             "{\"error\":\"too many concurrent requests\"}"
         );
+    }
+
+    #[test]
+    fn content_digest_envelope_carries_its_own_content_type() {
+        // WOR-2528: the header-phase refusal has to emit the
+        // operator's `error_body` and `error_content_type`, not the
+        // generic JSON envelope the dispatcher would otherwise render.
+        let mut ctx = RequestContext::new();
+        ctx.content_digest_denial = Some(("digest required".to_string(), "text/plain".to_string()));
+
+        let response = take_configured_denial_response(
+            &mut ctx,
+            428,
+            "Content-Digest header required but absent",
+            "content_digest",
+        )
+        .expect("content-digest response");
+
+        assert_eq!(response.status, 428);
+        assert_eq!(response.content_type, "text/plain");
+        assert_eq!(response.body, "digest required");
+        assert!(ctx.content_digest_denial.is_none());
+    }
+
+    #[test]
+    fn content_digest_without_a_parked_envelope_falls_through() {
+        // A `content_digest` denial that did not come from the
+        // header-phase check leaves the slot empty; the dispatcher's
+        // generic envelope must still be used rather than an empty body.
+        let mut ctx = RequestContext::new();
+        assert!(take_configured_denial_response(&mut ctx, 400, "nope", "content_digest").is_none());
+    }
+
+    #[test]
+    fn unrelated_policies_are_untouched() {
+        let mut ctx = RequestContext::new();
+        assert!(take_configured_denial_response(&mut ctx, 403, "nope", "waf").is_none());
     }
 }
 
@@ -3839,13 +3901,12 @@ pub(super) async fn request_filter(
             )
             .with_api_key_id(ctx.accountable_key_id())
             .emit();
-            if let Some(response) =
-                take_concurrent_limit_denial_response(ctx, status, &msg, policy_type)
+            if let Some(response) = take_configured_denial_response(ctx, status, &msg, policy_type)
             {
                 send_response(
                     session,
                     response.status,
-                    response.content_type,
+                    &response.content_type,
                     response.body.as_bytes(),
                 )
                 .await?;
