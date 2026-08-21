@@ -2308,6 +2308,34 @@ The `authentication` block is a sibling of `action`, not nested inside it. It co
 
 Anything else falls through to the inventory-based auth plugin registry, so a linked third-party crate can register additional types (`oauth`, `oauth_introspection`, `oauth_client_credentials`, `ext_authz`, `biscuit`, `saml`, ...) without patching the proxy. Plugins register on the typed `AuthPluginRegistration` channel and surface through the standard `authentication.type` config field.
 
+### Unknown keys are refused
+
+Every one of the eleven configurable built-in providers refuses a key it
+does not recognize, at `serve`, `validate`, and hot reload. The error names
+the key you wrote and lists the ones the provider accepts:
+
+```
+unknown field `require_dp0p`, expected `tokens` or `require_dpop`
+```
+
+This closes a fail-open. Until it landed, an unrecognized key was dropped
+silently and the setting it was meant to be took its default, so
+`require_dp0p: true` on a bearer block served every request with DPoP
+proof-of-possession off while the config read as though it were on. The
+same held for `require_mtls_bound` on `jwt`, and for every other optional
+switch on every other provider.
+
+Two things stay open on purpose. `noop` has no configuration to check, so a
+stray key on a `noop` block is still accepted. And the per-credential
+entries inside `api_keys:`, `tokens:`, `users:`, and `hmac_auth`'s `keys:`
+stay permissive, because each one flattens the free-form attribution
+metadata (`project`, `team`, `tags`, ...) into the same mapping and there is
+no way to tell an unknown key from an intended one there.
+
+Upgrading: a config that carried a stray key inside an `authentication`
+block used to boot and now fails to compile. See
+[config-stability.md](config-stability.md#unknown-keys-inside-an-authentication-block).
+
 ### Accepting more than one provider
 
 `authentication` also takes a list of two or more provider blocks. Providers run in declared order and the first one that accepts the request wins. This is the shape of a credential migration (keep accepting legacy API keys while callers move to JWTs on the same origin) and of mixed-client origins (services present tokens, crawlers present signatures).
@@ -2427,6 +2455,10 @@ origins:
 | `tokens` | list | required | Accepted bearer tokens (each entry is either the raw secret or `{secret, dpop_jkt, ...}`) |
 | `require_dpop` | bool | `false` | When `true`, every accepted token MUST come with a valid RFC 9449 DPoP proof whose `jkt` matches the token entry's `dpop_jkt` metadata. Tokens without `dpop_jkt` metadata fail closed. |
 
+Any other key on a `bearer` block is rejected at config load. Misspelling
+`require_dpop` used to leave DPoP off silently; see
+[Unknown keys are refused](#unknown-keys-are-refused).
+
 #### Sender-constrained Bearer (RFC 9449)
 
 DPoP binds an opaque bearer token to a proof-of-possession key
@@ -2485,6 +2517,10 @@ origins:
 | `jwe.decryption_key` | string | | PEM private key for decrypting JWE (RFC 7516) encrypted tokens before the usual signature checks. See "Encrypted tokens" below. |
 
 The list must contain at least one entry; an empty list rejects all tokens. Bearer tokens must be supplied via `Authorization: Bearer <jwt>`.
+
+Any other key on a `jwt` block is rejected at config load. Misspelling
+`require_dpop` or `require_mtls_bound` used to leave that binding off
+silently; see [Unknown keys are refused](#unknown-keys-are-refused).
 
 #### Sender-constrained JWT (RFC 9449 + RFC 8705)
 
