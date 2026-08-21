@@ -136,6 +136,26 @@ Field schema:
 | `file` | `path`, `max_size_mb`, `max_backups`, `compress` | Reuses the access-log rotation + gzip stack. Defaults: 100 MiB rotation, 7 backups, gzip on. |
 | `otlp` | `endpoint`, `transport`, `timeout_secs` | Wraps `opentelemetry_otlp::LogExporter` behind a batch processor. Inherits `service_name`, `resource_attrs`, and (when omitted) `transport` from the top-level `telemetry:` block. |
 
+#### When a `file` sink cannot write
+
+Every way a file sink can lose a record is counted on
+`sbproxy_telemetry_dropped_total{kind="file_sink",reason}`, so a sink that
+has silently stopped growing is visible without reading the log stream it
+stopped writing to. The reasons are closed:
+
+| `reason` | What happened | Record |
+|---|---|---|
+| `mkdir_failed` | The parent directory could not be created | Lost |
+| `open_failed` | The file could not be opened for append (a permission change, a path that is now a directory) | Lost |
+| `write_error` | The append itself failed after a successful open: a full volume, a read-only remount, a failing disk | Lost |
+| `rotate_failed` | Rotation at `max_size_mb` failed | Kept, appended to the over-size file |
+
+Each of these also logs one WARN naming the path and the OS error, rate-limited
+to one per minute per sink path: the failures persist until an operator fixes
+them and the write path runs once per record, so an unthrottled warning would
+be a second log flood on top of the first problem. Alert on the counter, not on
+the line.
+
 ### Sink scopes
 
 Sinks can be declared at three scopes, each with a different filter:
