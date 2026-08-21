@@ -1236,6 +1236,14 @@ Declining is the cheap common case and means "the static config applies unchange
 
 **`admit_event` and `stale_while_revalidate` compose.** The revalidation refresh runs the event against the response it just fetched, from the same small request-side scope the initial request used, so an override or a refusal from `admit_event` still applies to what the background refresh writes back. The two were refused together before this evaluation path existed; that restriction is gone.
 
+**Neither event normally runs on the connection loop.** Both are evaluated on a separate worker pool, so a script that spends its whole CPU budget (`max_execution_ms`, 100 ms by default) occupies a pool thread instead of the worker that owns the connection, and the other connections that worker is serving keep moving.
+
+Three consequences worth knowing.
+
+- An origin with neither event is unchanged, because the scheduling hop is only paid when a script exists to run.
+- For an origin with an `admit_event`, the cache write-back is dispatched one hop later than before. `admit_event` decides whether a response is stored, never whether it is served, so nothing the client is waiting for moves with it.
+- The `admit_event` deferral is capped at 64 evaluations in flight across the whole process, because each one holds a copy of the response body until the script returns and nothing downstream is waiting to push back. Past the cap the event runs on the connection loop after all, which is slower but bounded, and which keeps a refusal from being skipped under load. A script expensive enough to reach that cap shows up on `sbproxy_decision_event_duration_seconds{event="cache.admit"}` before it gets there.
+
 Both events run under the sandboxes in [§4.6](#46-sandbox-limits) and [§5.1](#51-sandbox-limits), with a fresh VM per evaluation. Evaluations are counted on `sbproxy_decision_event_total{event="cache.key"}` and `{event="cache.admit"}`, and the two faults are counted differently on purpose: `cache.admit` fails open, so it records `outcome="allow"` plus `sbproxy_decision_event_fail_open_total`, while `cache.key` fails closed on the cache and records `outcome="error"`, or `outcome="timeout"` when the script ran out of its CPU budget, with no fail-open counter. The field-level reference for the block is in [configuration.md](configuration.md#response-cache).
 
 ---
