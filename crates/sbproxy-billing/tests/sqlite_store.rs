@@ -1208,3 +1208,50 @@ mod recovery {
         }
     }
 }
+
+/// WOR-2626: the settlement database and both WAL sidecars must be
+/// owner-only.
+///
+/// The database is pre-created world-readable rather than left to the
+/// ambient umask, so this is red before the fix whatever the runner's
+/// umask is: without the pre-creation step in `open_with_config` the
+/// mode stays `0o644`, and SQLite copies the main database's mode onto
+/// the `-wal` and `-shm` files it opens, so all three land wide.
+///
+/// The sidecars are the point. They are the only place a committed but
+/// uncheckpointed settlement row lives, and nothing else in the code
+/// path can reach them: SQLite creates them, so the only lever is the
+/// mode of the file it derives them from.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_database_and_its_wal_sidecars_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("settlement.sqlite3");
+    drop(std::fs::File::create(&path).expect("pre-create the database"));
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+        .expect("loosen the pre-created database");
+
+    let clock = TestClock::new(START_MS);
+    let store = handle(&path, &clock);
+    // A committed write, so the WAL is really in play and both
+    // sidecars exist while the handle is open.
+    let _ = finalized_intent(&store, "tenant-1", "req-1", "request-key").await;
+
+    for suffix in ["", "-wal", "-shm"] {
+        let candidate = directory.path().join(format!("settlement.sqlite3{suffix}"));
+        let mode = std::fs::metadata(&candidate)
+            .unwrap_or_else(|error| panic!("stat {}: {error}", candidate.display()))
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode,
+            0o600,
+            "{} is {mode:o}, not owner-only",
+            candidate.display()
+        );
+    }
+    drop(store);
+}

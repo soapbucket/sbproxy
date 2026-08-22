@@ -1,6 +1,7 @@
 //! Redis [`KeyStore`] backend and cache tier.
 //!
-//! Two roles, both over the same async multiplexed connection:
+//! Two roles, both over the same reconnecting multiplexed connection.
+//! The link type below is where that reconnect contract is written down:
 //!
 //! * [`RedisKeyStore`] is a `KeyStore` over Redis hashes (`keys` and
 //!   `credentials`), usable as the source of truth for a replica fleet or as a
@@ -19,7 +20,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use redis::{aio::MultiplexedConnection, AsyncCommands, Client};
+use redis::{
+    aio::{ConnectionManager, ConnectionManagerConfig},
+    AsyncCommands, Client,
+};
 use sbproxy_security::url_redact::redacted_url_with_path;
 use tokio::sync::Mutex;
 
@@ -41,6 +45,32 @@ const CACHE_CRED_PREFIX: &str = "sbproxy:keystore:cache:cred:";
 const INVALIDATE_ALL: &str = "*";
 /// How many keys one `SCAN` iteration asks for while clearing the tier.
 const CACHE_SCAN_COUNT: usize = 512;
+
+/// Dial budget for one connection attempt, first connect or reconnect.
+///
+/// The handle this replaced had no dial deadline at all, so a black-holed
+/// Redis address parked a key resolution on the request path for the OS
+/// connect timeout. Two seconds is generous for a same-region or
+/// cross-AZ dial and short enough that the caller's own deadline wins.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Redials inside one connection attempt, on top of the first dial.
+///
+/// Zero, on purpose, and the number is load bearing. A key resolution is
+/// on the request path, and when Redis is genuinely down the useful
+/// answer is the error, now, so `key_management.failure_posture` decides
+/// what the request gets. Sleeping first only converts an outage into a
+/// slow outage.
+///
+/// The redis crate's own default is six redials whose delay starts at one
+/// second and then multiplies by its `factor` up to a one-minute ceiling,
+/// so a dial against a dead Redis can sit for minutes before it answers.
+/// That is why this is set rather than left alone.
+///
+/// Nothing is lost by refusing to retry here: the connection manager
+/// starts a fresh attempt on the next command that needs one, so a Redis
+/// that comes back is picked up by the next request rather than by a
+/// sleep this one paid for.
+const RECONNECT_RETRIES: usize = 0;
 
 /// Write a record, bump the global revision, and publish invalidation as
 /// one Redis server-side operation (WOR-2639).
@@ -93,7 +123,47 @@ redis.call('PUBLISH', KEYS[3], ARGV[1])
 return {'applied', ARGV[4]}
 "#;
 
-/// A lazily-connected, shareable multiplexed Redis link.
+/// A lazily-connected, shareable multiplexed Redis link that survives the
+/// loss of its socket.
+///
+/// # Why a connection manager and not a bare multiplexed connection
+///
+/// This used to cache a `redis::aio::MultiplexedConnection`, and nothing
+/// in this file ever wrote `None` back into the cache. That type does not
+/// reconnect: once its socket dies, the pipeline task behind it is gone
+/// and every later `send_recv` fails at the channel send with a
+/// `BrokenPipe`, forever. One Redis restart, one failover, one
+/// `CLIENT KILL`, or one idle `timeout` therefore broke every key
+/// resolution for the life of the process, and the pub/sub invalidation
+/// subscriber made it worse rather than better: it does reconnect, and on
+/// reconnect it drops L1, so every subsequent resolution missed into the
+/// dead handle. Under `key_management.failure_posture: allow` or
+/// `degraded` that is a key plane failing open permanently rather than
+/// transiently.
+///
+/// [`ConnectionManager`] is the type the redis crate provides for exactly
+/// this, and it is already how `sbproxy-cache`'s reserve and
+/// `sbproxy-platform`'s async KV store hold their connections, so this is
+/// the third user of one pattern rather than a second pattern. The
+/// alternative considered was tagging the cached handle with a generation
+/// and clearing it on an I/O error, which is what `sbproxy-platform` adds
+/// on top of its manager. It is not needed here: that generation tag
+/// exists to evict a connection whose in-flight command was abandoned by
+/// a whole-operation deadline, and nothing in this file imposes one.
+/// The manager's own reconnect is generation-safe by the same reasoning,
+/// through a compare-and-swap rather than a counter: a caller that sees a
+/// dropped connection swaps a new shared connect future in only if the
+/// future it just failed against is still the current one, so two callers
+/// failing concurrently produce one dial, and neither can discard the
+/// other's fresh replacement.
+///
+/// # What a caller sees across a reconnect
+///
+/// The command in flight when the socket dies fails, once, with the I/O
+/// error. Commands issued after that await the single shared reconnect
+/// and then run on the new socket, so the error is bounded to the
+/// requests that were actually in flight. Callers do not need to retry;
+/// the next call already lands on the replacement.
 struct RedisLink {
     url: String,
     /// Origin and database index of `url`, rendered once at construction.
@@ -105,7 +175,23 @@ struct RedisLink {
     /// least fires on every transient outage, so a missed one is a
     /// high-volume password leak, not a rare one (WOR-2640).
     label: String,
-    conn: Mutex<Option<MultiplexedConnection>>,
+    conn: Mutex<Option<ConnectionManager>>,
+}
+
+/// The dial budget every link in this file connects and reconnects under.
+///
+/// The backoff knobs beside these two are deliberately left alone: they
+/// only shape the delay *between* redials, and this config takes none.
+///
+/// No response timeout is set on purpose either. A command deadline is a
+/// separate behavior change with its own blast radius here: `list_keys`
+/// and `list_credentials` are `HGETALL` over a whole fleet's key set, and
+/// a deadline short enough to be useful on the request path would refuse
+/// them. The dial is bounded; the command is not.
+fn reconnect_config() -> ConnectionManagerConfig {
+    ConnectionManagerConfig::new()
+        .set_number_of_retries(RECONNECT_RETRIES)
+        .set_connection_timeout(CONNECT_TIMEOUT)
 }
 
 impl RedisLink {
@@ -118,10 +204,16 @@ impl RedisLink {
         }
     }
 
-    /// Return the cached connection, establishing it on first use. The guard is
-    /// never held across the connect await so concurrent callers do not
-    /// serialize behind whichever one is connecting.
-    async fn conn(&self) -> Result<MultiplexedConnection> {
+    /// Return the cached connection manager, establishing it on first use.
+    ///
+    /// The guard is never held across the connect await so concurrent
+    /// callers do not serialize behind whichever one is connecting. Once
+    /// the manager is cached it is never cleared, and does not need to
+    /// be: a manager whose socket died reconnects itself, which is the
+    /// whole reason it is a manager. Only the *first* connection is
+    /// established here, so a Redis that is unreachable at boot still
+    /// costs one dial per call rather than a permanently poisoned entry.
+    async fn conn(&self) -> Result<ConnectionManager> {
         {
             let guard = self.conn.lock().await;
             if let Some(c) = guard.as_ref() {
@@ -130,8 +222,7 @@ impl RedisLink {
         }
         let client = Client::open(self.url.as_str())
             .with_context(|| format!("invalid redis url '{}'", self.label))?;
-        let c = client
-            .get_multiplexed_async_connection()
+        let c = ConnectionManager::new_with_config(client, reconnect_config())
             .await
             .with_context(|| format!("connecting to redis at '{}'", self.label))?;
         let mut guard = self.conn.lock().await;
@@ -877,10 +968,12 @@ mod tests {
     #[tokio::test]
     async fn redis_link_error_names_the_origin_not_the_password() {
         let link = RedisLink::new("http://aclname:topsecret@cache.internal:6379/3");
-        let err = link
-            .conn()
-            .await
-            .expect_err("a non-redis scheme cannot open");
+        // `let Err(..) else` rather than `expect_err`: the Ok half is a
+        // `ConnectionManager`, which is not `Debug`, so `expect_err` will
+        // not compile against it.
+        let Err(err) = link.conn().await else {
+            panic!("a non-redis scheme cannot open");
+        };
         let msg = format!("{err:#}");
         assert!(!msg.contains("topsecret"), "password leaked: {msg}");
         assert!(!msg.contains("aclname"), "username leaked: {msg}");
@@ -903,6 +996,292 @@ mod tests {
         assert!(
             msg.contains("http://cache.internal:6379/3"),
             "expected the redacted origin in the error, got: {msg}"
+        );
+    }
+
+    // --- A dropped socket must not outlive itself ---
+
+    /// A stand-in Redis that speaks just enough RESP2 to answer the
+    /// commands this file issues, and hangs up on its first client the
+    /// way a restart, a failover, or `CLIENT KILL` does.
+    ///
+    /// `sbproxy-storage`'s Redis backend carries a copy of this, because
+    /// the same defect lived in both files and a shared test double
+    /// would mean a crate edge between them that production does not
+    /// have.
+    mod fake_redis {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::{TcpListener, TcpStream};
+
+        /// Handle on a running stand-in server.
+        pub(super) struct FakeRedis {
+            /// A `redis://` URL a client can dial.
+            pub(super) url: String,
+            accepted: Arc<AtomicUsize>,
+        }
+
+        impl FakeRedis {
+            /// Bind on loopback and serve until the test ends. The first
+            /// client connection is closed as soon as it has been
+            /// answered once; later connections are served for as long
+            /// as they live.
+            pub(super) async fn start() -> Self {
+                let listener = TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind a loopback port");
+                let addr = listener.local_addr().expect("read the bound port");
+                let accepted = Arc::new(AtomicUsize::new(0));
+                let counter = Arc::clone(&accepted);
+                tokio::spawn(async move {
+                    loop {
+                        let Ok((socket, _)) = listener.accept().await else {
+                            return;
+                        };
+                        let nth = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                        tokio::spawn(serve(socket, nth == 1));
+                    }
+                });
+                Self {
+                    url: format!("redis://{addr}"),
+                    accepted,
+                }
+            }
+
+            /// How many client connections the server has accepted. Two
+            /// or more means the client really did redial.
+            pub(super) fn accepted(&self) -> usize {
+                self.accepted.load(Ordering::SeqCst)
+            }
+        }
+
+        async fn serve(socket: TcpStream, hang_up_after_one_command: bool) {
+            let (read, mut write) = socket.into_split();
+            let mut reader = BufReader::new(read);
+            let mut answered = 0usize;
+            while let Ok(Some(args)) = read_command(&mut reader).await {
+                let name = args
+                    .first()
+                    .map(|arg| arg.to_ascii_uppercase())
+                    .unwrap_or_default();
+                if write.write_all(reply_for(&name)).await.is_err() {
+                    return;
+                }
+                // `CLIENT SETINFO` is the redis crate's own handshake,
+                // not a caller's command. Hanging up on it would fail
+                // the connect rather than break an established one,
+                // which is a different scenario from the one under test.
+                if name == "CLIENT" {
+                    continue;
+                }
+                answered += 1;
+                if hang_up_after_one_command && answered == 1 {
+                    let _ = write.shutdown().await;
+                    return;
+                }
+            }
+        }
+
+        fn reply_for(command: &str) -> &'static [u8] {
+            match command {
+                // Nil bulk string: a lookup that succeeded and found
+                // nothing, which is all these tests need it to mean.
+                "GET" | "HGET" => b"$-1\r\n",
+                "DEL" | "EXISTS" | "PUBLISH" => b":0\r\n",
+                _ => b"+OK\r\n",
+            }
+        }
+
+        /// Read one RESP array-of-bulk-strings command. `Ok(None)` is a
+        /// clean end of stream.
+        async fn read_command<R>(reader: &mut R) -> std::io::Result<Option<Vec<String>>>
+        where
+            R: AsyncBufRead + Unpin,
+        {
+            let Some(header) = read_line(reader).await? else {
+                return Ok(None);
+            };
+            let Some(count) = header
+                .strip_prefix('*')
+                .and_then(|n| n.parse::<usize>().ok())
+            else {
+                // Inline command: whitespace separated, no length prefixes.
+                return Ok(Some(
+                    header.split_whitespace().map(str::to_string).collect(),
+                ));
+            };
+            let mut args = Vec::with_capacity(count);
+            for _ in 0..count {
+                let Some(len_line) = read_line(reader).await? else {
+                    return Ok(None);
+                };
+                let Some(len) = len_line
+                    .strip_prefix('$')
+                    .and_then(|n| n.parse::<usize>().ok())
+                else {
+                    return Ok(None);
+                };
+                // Length plus the trailing CRLF.
+                let mut buf = vec![0u8; len + 2];
+                reader.read_exact(&mut buf).await?;
+                buf.truncate(len);
+                args.push(String::from_utf8_lossy(&buf).into_owned());
+            }
+            Ok(Some(args))
+        }
+
+        async fn read_line<R>(reader: &mut R) -> std::io::Result<Option<String>>
+        where
+            R: AsyncBufRead + Unpin,
+        {
+            let mut line = String::new();
+            if reader.read_line(&mut line).await? == 0 {
+                return Ok(None);
+            }
+            Ok(Some(line.trim_end_matches(['\r', '\n']).to_string()))
+        }
+
+        /// Bind a listener that accepts and then says nothing, holding
+        /// every socket open. A client dialling this completes its TCP
+        /// connect and then waits forever on the handshake reply, which
+        /// is what an address black-holed by a firewall or a wedged
+        /// Redis looks like from here.
+        pub(super) async fn start_black_hole() -> String {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind a loopback port");
+            let addr = listener.local_addr().expect("read the bound port");
+            tokio::spawn(async move {
+                loop {
+                    let Ok((socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    // Held open rather than dropped: closing it would
+                    // let the client fail fast for the wrong reason.
+                    tokio::spawn(async move {
+                        let _held = socket;
+                        std::future::pending::<()>().await;
+                    });
+                }
+            });
+            format!("redis://{addr}")
+        }
+    }
+
+    /// How long the recovery loops below are willing to wait, and how
+    /// often they retry. A redial against a listener on loopback is
+    /// immediate, so this is a wide margin for a loaded CI box rather
+    /// than an expected wait.
+    const RECOVERY_ATTEMPTS: usize = 80;
+    const RECOVERY_PAUSE: Duration = Duration::from_millis(25);
+
+    /// The regression this file exists to prevent (H5).
+    ///
+    /// A `MultiplexedConnection` does not reconnect, and nothing here
+    /// ever cleared the cached one, so a single Redis restart, failover,
+    /// or `CLIENT KILL` turned every later key resolution into the same
+    /// `BrokenPipe` for the life of the process. Under
+    /// `key_management.failure_posture: allow` or `degraded` that is a
+    /// key plane failing open permanently rather than transiently, which
+    /// is why this is not merely an availability test.
+    ///
+    /// Against the pre-fix code the loop below never sees an `Ok`: the
+    /// dead handle is still cached and answers every attempt with the
+    /// same error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lookup_after_the_socket_dies_reaches_a_new_socket() {
+        let server = fake_redis::FakeRedis::start().await;
+        let store = RedisKeyStore::new(&server.url);
+
+        // Lands on the socket the server is about to close.
+        assert!(
+            store
+                .get_key("before")
+                .await
+                .expect("the first lookup is answered")
+                .is_none(),
+            "the stand-in answers a nil record"
+        );
+
+        // The caller in flight when the socket dies sees one error; the
+        // callers after it must land on a replacement socket.
+        let mut recovered = false;
+        for _ in 0..RECOVERY_ATTEMPTS {
+            if store.get_key("after").await.is_ok() {
+                recovered = true;
+                break;
+            }
+            tokio::time::sleep(RECOVERY_PAUSE).await;
+        }
+        assert!(
+            recovered,
+            "the store never recovered from a dropped socket; a cached \
+             connection that cannot reconnect is a permanent outage, not \
+             a transient one"
+        );
+        assert!(
+            server.accepted() >= 2,
+            "the store answered without redialling, so the recovery above \
+             did not come from a new connection"
+        );
+    }
+
+    /// The cache tier shares the link, so it shares the recovery.
+    ///
+    /// Worth its own case because the tier swallows its own errors: a
+    /// tier that silently answers "miss" forever after a Redis blip is
+    /// indistinguishable from a cold cache, and the L1 clear the
+    /// invalidation subscriber performs on every reconnect is what makes
+    /// that miss stream expensive rather than merely wasteful.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_cache_tier_serves_again_after_the_socket_dies() {
+        let server = fake_redis::FakeRedis::start().await;
+        let tier = RedisCacheTier::new(&server.url);
+
+        assert!(
+            tier.get_key("before").await.is_none(),
+            "a nil reply is a miss"
+        );
+
+        let record = KeyRecord::new("after", "h", ts());
+        for _ in 0..RECOVERY_ATTEMPTS {
+            tier.put_key(&record, Duration::from_secs(30)).await;
+            if server.accepted() >= 2 {
+                break;
+            }
+            tokio::time::sleep(RECOVERY_PAUSE).await;
+        }
+        assert!(
+            server.accepted() >= 2,
+            "the tier never redialled after its socket was closed, so \
+             every later write went nowhere"
+        );
+    }
+
+    /// The dial this fix put a deadline on.
+    ///
+    /// The handle this replaced dialled with no timeout at all, so an
+    /// address that accepts and then stalls parked a key resolution on a
+    /// worker for as long as the peer felt like holding it. The posture
+    /// in `key_management.failure_posture` cannot decide anything for a
+    /// request that never gets an answer.
+    ///
+    /// Against the pre-fix code the inner call never returns and the
+    /// outer deadline below is what fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dial_that_never_answers_gives_up_on_its_own() {
+        let url = fake_redis::start_black_hole().await;
+        let store = RedisKeyStore::new(url);
+        let outcome = tokio::time::timeout(CONNECT_TIMEOUT * 3, store.get_key("k1")).await;
+        let inner = outcome.expect(
+            "the dial has to give up on its own; a resolution that never returns is a \
+             pinned worker, not a slow lookup",
+        );
+        assert!(
+            inner.is_err(),
+            "a stalled handshake cannot report a successful lookup"
         );
     }
 }

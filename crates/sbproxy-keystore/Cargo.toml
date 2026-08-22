@@ -20,6 +20,7 @@ secrets-manager = ["dep:sbproxy-vault"]
 
 [dependencies]
 sbproxy-security.workspace = true
+sbproxy-util.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
@@ -36,9 +37,21 @@ rand.workspace = true
 
 # Optional backends.
 redb = { workspace = true, optional = true }
-redis = { workspace = true, optional = true }
+# `connection-manager` is what makes a dropped socket recoverable: the
+# bare multiplexed connection this crate used to cache never reconnects.
+redis = { workspace = true, optional = true, features = ["connection-manager"] }
 futures = { workspace = true, optional = true }
 sbproxy-vault = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+# `net` and `io-util` are for the RESP stand-in server the reconnect
+# tests dial; the rest is what the crate already needs.
+tokio = { workspace = true, features = [
+  "rt",
+  "rt-multi-thread",
+  "macros",
+  "sync",
+  "time",
+  "net",
+  "io-util",
+] }

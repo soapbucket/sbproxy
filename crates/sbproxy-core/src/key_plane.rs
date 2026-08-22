@@ -963,7 +963,12 @@ fn build_store(cfg: &KeyManagementConfig) -> Result<Arc<dyn KeyStore>> {
     match cfg.store.backend {
         KeyStoreBackend::Embedded => {
             if let Some(parent) = std::path::Path::new(&cfg.store.path).parent() {
-                std::fs::create_dir_all(parent)
+                // Owner-only: this directory holds the redb database of
+                // encrypted upstream credentials, and a directory a stranger
+                // can traverse discloses the database's name and size even
+                // when the file itself is 0o600. Directories that already
+                // exist keep the mode their operator chose.
+                sbproxy_util::secure_fs::create_dir_all_owner_only(parent)
                     .with_context(|| format!("create keystore directory '{}'", parent.display()))?;
             }
             // `open_shared`, not `open`: reload builds this candidate while

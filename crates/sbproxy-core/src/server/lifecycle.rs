@@ -352,6 +352,33 @@ fn audit_reload_outcome(source: &str, config_path: &str, result: &anyhow::Result
     }
 }
 
+/// WOR-2626: say once per opened sink file what this build can
+/// actually enforce on its mode.
+///
+/// On Unix that is `0o600` and the line is startup evidence an operator
+/// can point at. On a target with no POSIX permission bits the file
+/// inherits the containing directory's ACL instead, which is a real
+/// difference in what the deployment protects and belongs in the log
+/// rather than only in the documentation. The path is not repeated
+/// here: it is operator configuration and the failure paths below
+/// already carry it.
+fn log_sink_file_protection(sink: &'static str) {
+    use sbproxy_util::secure_fs::{enforcement, ModeEnforcement};
+
+    match enforcement() {
+        ModeEnforcement::Posix { file_mode, .. } => {
+            let mode = format!("{file_mode:04o}");
+            tracing::info!(sink, mode = %mode, "sink file is owner-only");
+        }
+        ModeEnforcement::InheritedAcl => {
+            tracing::warn!(
+                sink,
+                "this platform has no file permission bits; the sink file inherits its directory's ACL",
+            );
+        }
+    }
+}
+
 /// WOR-1186: build the configured session-ledger sink and register it
 /// process-wide. The `file` sink needs a `path`; a missing or
 /// unopenable path falls back to the logging sink with a warning so a
@@ -367,7 +394,10 @@ fn install_session_ledger_sink(cfg: &sbproxy_config::types::SessionLedgerConfig)
     let sink: Arc<dyn SessionLedgerSink> = match cfg.sink {
         SessionLedgerSinkKind::File => match cfg.path.as_deref() {
             Some(path) => match FileLedgerSink::create(std::path::Path::new(path)) {
-                Ok(s) => Arc::new(s),
+                Ok(s) => {
+                    log_sink_file_protection("session_ledger");
+                    Arc::new(s)
+                }
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
@@ -651,7 +681,10 @@ fn build_request_event_sink(
         )),
         RequestEventSinkKind::File => match cfg.path.as_deref() {
             Some(path) => match FileEventSink::create(std::path::Path::new(path)) {
-                Ok(sink) => Some((Arc::new(sink) as Arc<dyn RequestEventSink>, "file")),
+                Ok(sink) => {
+                    log_sink_file_protection("request_events");
+                    Some((Arc::new(sink) as Arc<dyn RequestEventSink>, "file"))
+                }
                 Err(e) => {
                     tracing::warn!(
                         error = %e,

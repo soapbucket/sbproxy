@@ -149,11 +149,14 @@ pub struct FileLedgerSink {
 
 impl FileLedgerSink {
     /// Open `path` for appending (creating it if absent).
+    ///
+    /// The file is owner-only (`0o600`). A ledger record names the
+    /// session, the tenant, and the tools it called, and the file name
+    /// itself is often per-tenant. A file that already exists at a
+    /// looser mode is tightened rather than inherited; see
+    /// [`sbproxy_util::secure_fs`].
     pub fn create(path: &std::path::Path) -> std::io::Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let file = sbproxy_util::secure_fs::open_append_owner_only(path)?;
         Ok(Self {
             writer: Mutex::new(std::io::BufWriter::new(file)),
         })
@@ -428,5 +431,34 @@ mod tests {
         // Absent optionals are omitted, not null.
         assert!(json.get("agent_id").is_none());
         assert!(json.get("result").is_none());
+    }
+
+    /// WOR-2626: ledger records name sessions, tenants, and the tool
+    /// arguments they carried, so the artifact must be owner-only.
+    ///
+    /// The file is pre-created world-readable rather than left to the
+    /// ambient umask, so this is red before the fix whatever the
+    /// runner's umask is, and it proves the tightening half of the
+    /// contract rather than only the creation half.
+    #[cfg(unix)]
+    #[test]
+    fn the_ledger_file_is_owner_only_even_when_it_already_existed() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("session-ledger.ndjson");
+        std::fs::write(&path, b"").expect("pre-create the ledger");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen the pre-created ledger");
+
+        let sink = FileLedgerSink::create(&path).expect("open the ledger sink");
+        drop(sink);
+
+        let mode = std::fs::metadata(&path)
+            .expect("stat the ledger")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "session ledger is {mode:o}, not owner-only");
     }
 }

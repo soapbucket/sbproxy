@@ -2,6 +2,40 @@
 //!
 //! Scans strings for known secret patterns and replaces them with `[REDACTED]`.
 //! Prevents accidental leakage of API keys, tokens, and passwords in logs.
+//!
+//! # What this module does and does not catch
+//!
+//! Every pattern here is one of two shapes.
+//!
+//! * *Shape* patterns match a credential by its own bytes, with no
+//!   surrounding context: `sk-ant-...`, `sk-...`, `sk_live_...`,
+//!   `ghp_...`, `AKIA...`, `Bearer <token>`, `Basic <creds>`.
+//! * *Keyed* patterns match a credential by the name in front of it,
+//!   because the value has no recognizable shape of its own:
+//!   `secret...`, `api_key`, `password`, and the schema's own key /
+//!   secret / token names (`RE_CREDENTIAL_KEY`, `RE_BARE_TOKEN`).
+//!
+//! A credential that is neither a known shape nor under a known name
+//! is returned as written. In particular there is no JWT pattern: a
+//! bare `eyJ...` compact JWS is only masked when it follows `Bearer `
+//! or sits under one of the keyed names. `docs/access-log.md` states
+//! the same limit, because the field-key denylist in
+//! [`crate::logging`] is what actually covers a header value by name,
+//! and it only runs when the line still parses.
+//!
+//! # Structure survives redaction
+//!
+//! `redact_secrets` runs over already-rendered JSON log lines and over
+//! the YAML `GET /admin/config` hands back, so every keyed pattern
+//! captures (key, separator, value) and returns groups 1 and 2 byte
+//! for byte. A mask that eats the `":"` between a key and its value
+//! does not merely read wrong: the line stops being JSON,
+//! [`crate::logging::redact_json_line`] fails its `serde_json::from_str`
+//! and silently skips the whole field-key denylist for that line, so a
+//! `prompt` or `cookie` later in the same record ships verbatim. A
+//! redactor that destroys the evidence it was protecting is worse than
+//! one that does nothing; the shared replacement that enforces this is
+//! `keyed_credential_replacement`.
 
 use regex::Regex;
 use std::sync::LazyLock;
@@ -36,9 +70,14 @@ static RE_AWS_ACCESS: LazyLock<Regex> =
 
 /// AWS secret access keys: 40-char base64 string preceded by a label containing
 /// the word "secret" (any case), followed by any non-alphanumeric separator chars.
-/// The label can be up to 30 chars (e.g. `SECRET_ACCESS_KEY`).
+/// The label runs to 26 chars (`secret` plus 20, e.g. `SECRET_ACCESS_KEY`).
+///
+/// Groups: label, separator, value; see
+/// [`keyed_credential_replacement`]. The separator class is wide
+/// enough to cover a JSON `":"`, so it used to be consumed along with
+/// the label and the line stopped parsing.
 static RE_AWS_SECRET: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)secret[a-zA-Z0-9_]{0,20}[^a-zA-Z0-9]{1,5}[a-zA-Z0-9/+=]{40}")
+    Regex::new(r"(?i)(secret[a-zA-Z0-9_]{0,20})([^a-zA-Z0-9]{1,5})([a-zA-Z0-9/+=]{40})")
         .expect("valid regex")
 });
 
@@ -51,8 +90,16 @@ static RE_BASIC: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"Basic [a-zA-Z0-9+/=]{10,}").expect("valid regex"));
 
 /// Generic `api_key = "..."` / `api-key: ...` patterns.
+///
+/// Groups: key, separator, value; see
+/// [`keyed_credential_replacement`]. The separator class matches the
+/// whole `":"` run in a rendered JSON line, so a captured `x-api-key`
+/// request header (`access_log.capture_headers.request`) used to come
+/// out as `{"request_headers":{"x-api_key=[REDACTED]"},...}`: not
+/// JSON, and every denylisted field after it in the record shipped
+/// verbatim as a result.
 static RE_API_KEY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)api[_\-]?key["'\s:=]+[a-zA-Z0-9_\-]{16,}"#).expect("valid regex")
+    Regex::new(r#"(?i)(api[_\-]?key)(["'\s:=]+)([a-zA-Z0-9_\-]{16,})"#).expect("valid regex")
 });
 
 /// Credential-bearing keys this product's own schema defines
@@ -73,6 +120,45 @@ static RE_API_KEY: LazyLock<Regex> = LazyLock::new(|| {
 /// contains them, and JSON structure must survive redaction.
 /// Groups: key, separator, value; see
 /// [`keyed_credential_replacement`].
+///
+/// # This list is not exhaustive, and cannot be
+///
+/// The name alternation is an allowlist of names that mean the same
+/// thing everywhere the redactor can see them. Two credential-bearing
+/// config keys are deliberately absent because their names do not:
+///
+/// * `proxy.secrets.backends[].auth.external_id` is the AWS STS
+///   `AssumeRole` external id, an unguessable value shared with the
+///   trusting account. The same name is also the payment lane's own
+///   obligation id (`StripeChargeRequest::external_id`, copied from
+///   `requirement_id`), which is the join key an operator reconciles
+///   settlements on. Masking by name would trade a config leak for an
+///   evidence gap in the settlement records.
+/// * `proxy.secrets.backends[].auth.secret_id` is the Vault AppRole
+///   secret id, a live credential. `secret_id` is also the AWS
+///   SecretsManager parameter naming *which secret to read*, which is
+///   metadata an operator needs in an error message.
+///
+/// Neither pair is separable here. This module is a line-level regex
+/// pass with no notion of which document a line came from, and the
+/// leak surface for both is `GET /admin/config`, which redacts raw
+/// YAML *text*: there is no parsed tree, so the field-key walk in
+/// [`crate::logging`] and any key-path variant of it cannot reach it
+/// either. The serde spellings do differ today (`external_id` in the
+/// config, `externalId` on the payment wire), but that is one
+/// `#[serde(rename)]` in a crate this pattern does not depend on and
+/// would not be told about.
+///
+/// The layer that has the path is `sbproxy-config`, whose key registry
+/// already enumerates both keys by their full path. A schema-driven
+/// mask there would cover every backend-auth credential at once
+/// instead of one name at a time; that is the fix, not another
+/// alternation branch. Until then the control for these two is the
+/// documented one: put a `${VAR}` or `vault://` reference in the
+/// field, which [`is_secret_reference`] preserves verbatim, and rely
+/// on the config file's own `0600` permissions. `docs/configuration.md`
+/// already tells operators that masking is by recognized shape and key
+/// name and that an unrecognized name comes back as written.
 static RE_CREDENTIAL_KEY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?i)\b(session[_-]?token|master[_-]?key|signing[_-]?key|shared[_-]?key|virtual[_-]?key|challenge[_-]?binding[_-]?key|signing[_-]?secret|client[_-]?secret)(["'\s]*[:=]["'\s]*)([^\s"',;]{4,})"#,
@@ -91,16 +177,32 @@ static RE_BARE_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Generic `password = "..."` / `password: ...` patterns.
 ///
-/// Split into the label-plus-separator run and the value so the value can
-/// be inspected before anything is replaced: see [`is_secret_reference`].
-/// Sibling patterns get away with a single group because their value
-/// character classes happen to exclude the reference syntax; this one
-/// matches `\S`, so it has to check.
-/// The value run is `\S{4,}`: short real passwords (`hunter2`) must
-/// still be masked, while staying above YAML's one-character block
-/// and quote indicators (`|`, `>`, `-`, `"`) so structure survives.
-static RE_PASSWORD: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"(?i)(password["'\s:=]+)(\S{4,})"#).expect("valid regex"));
+/// Groups: key, separator, value, so the value can be inspected before
+/// anything is replaced ([`is_secret_reference`]) and the separator can
+/// be handed back verbatim ([`keyed_credential_replacement`]).
+///
+/// The value run stops at whitespace, quotes, commas and semicolons:
+/// the same stop set [`RE_CREDENTIAL_KEY`] uses, for the same reason.
+/// Those four characters are structure in JSON, in YAML flow style and
+/// in logfmt, so a run that swallows them takes the rest of the line
+/// with it. The previous `\S{4,}` did exactly that: on a compact JSON
+/// line it matched from the password value to the next space, and
+/// `{"upstream_password":"hunter2xyz","authorization":"..."}` collapsed
+/// to a single broken string.
+///
+/// The stated cost of the stop set, repeated in `docs/access-log.md`:
+/// a password that literally contains `"`, `'`, `,` or `;` is masked
+/// only up to that character, and the remainder is emitted. A
+/// line-level regex cannot tell that tail from the document structure
+/// around it, so the denylist in [`crate::logging`] (which keys on the
+/// field name and never reads the value) is the control for those.
+///
+/// Minimum length 4 so short real passwords (`hunter2`) are still
+/// masked, while staying above YAML's one-character block and quote
+/// indicators (`|`, `>`, `-`, `"`).
+static RE_PASSWORD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)(password)(["'\s:=]+)([^\s"',;]{4,})"#).expect("valid regex")
+});
 
 /// Whether `value` names a secret rather than being one.
 ///
@@ -119,15 +221,20 @@ static RE_PASSWORD: LazyLock<Regex> =
 /// it, and the drift indicator still read "in sync" because it compares
 /// hashes of the redacted content.
 ///
-/// `RE_API_KEY` was unaffected only by luck: its value class is
-/// `[a-zA-Z0-9_\-]`, which cannot match `$`, `{`, or `}`.
+/// `RE_API_KEY` and `RE_AWS_SECRET` need no reference check of their
+/// own: their value classes (`[a-zA-Z0-9_\-]` and `[a-zA-Z0-9/+=]`)
+/// cannot match `$`, `{`, `}`, or the `:` in `env:` / `vault://`, so a
+/// reference never reaches them as a value in the first place.
 ///
 /// The check is deliberately whole-value. `${VAR}suffix` is not a
 /// reference, the resolver passes it through literally (and warns), so it
 /// stays redactable.
 fn is_secret_reference(value: &str) -> bool {
-    // Trailing YAML/JSON punctuation the `\S` run may have absorbed, so
-    // `password: "${VAR}",` is recognised as the reference it is.
+    // Defensive: every caller's value class already stops at these,
+    // so a captured value cannot carry them today. Kept because the
+    // check is also the public-ish contract for "is this a
+    // reference", and a future caller with a wider class must not
+    // silently start redacting `"${VAR}",`.
     let value = value.trim_end_matches([',', '"', '\'', ';']);
     if value.starts_with("${") && value.ends_with('}') {
         return true;
@@ -150,55 +257,79 @@ fn is_secret_reference(value: &str) -> bool {
     })
 }
 
-/// Replacement for the keyed credential patterns: mask an inline
-/// value, keep a resolver reference, and keep anything an earlier
-/// pattern already masked (`master_key: sk-ant-[REDACTED]` must not
-/// double-mask, and `token: Bearer [REDACTED]` is already done).
-fn keyed_credential_replacement(caps: &regex::Captures<'_>) -> String {
-    let value = &caps[3];
-    if is_secret_reference(value)
-        || value.contains("[REDACTED]")
-        || value.eq_ignore_ascii_case("bearer")
-        || value.eq_ignore_ascii_case("basic")
-    {
-        caps[0].to_string()
-    } else {
-        // The separator survives verbatim: these keys appear inside
-        // JSON log lines (`"virtual_key":"..."`), where consuming the
-        // quote-colon-quote run corrupts the line for every consumer
-        // downstream. Masking only the value keeps the credential out
-        // and the structure intact in every format at once.
-        format!("{}{}[REDACTED]", &caps[1], &caps[2])
-    }
+/// Whether a keyed pattern's captured value is one the mask actually
+/// replaces.
+///
+/// The single predicate behind both [`keyed_credential_replacement`]
+/// (the enforcer) and [`contains_secret`] (the detector), so the two
+/// cannot drift: a value handed back verbatim must not be reported as
+/// a secret, and a value that is reported must be one the redactor
+/// really removes.
+fn masks_value(value: &str) -> bool {
+    // A resolver reference names a secret rather than being one, and
+    // an earlier pattern's output is already masked
+    // (`master_key: sk-ant-[REDACTED]` must not double-mask,
+    // `token: Bearer [REDACTED]` is already done).
+    !is_secret_reference(value)
+        && !value.contains("[REDACTED]")
+        && !value.eq_ignore_ascii_case("bearer")
+        && !value.eq_ignore_ascii_case("basic")
 }
 
-/// Apply the password redaction, leaving secret references intact.
-fn redact_passwords(input: &str) -> String {
-    RE_PASSWORD
-        .replace_all(input, |caps: &regex::Captures<'_>| {
-            let value = &caps[2];
-            if is_secret_reference(value) {
-                // Whole match back verbatim, separator included.
-                caps[0].to_string()
-            } else {
-                // Unchanged output for an actual inline secret. The
-                // separator is deliberately still consumed: a config
-                // carrying an inline secret is not meant to survive a
-                // GET-edit-PUT round trip, and the resulting parse
-                // failure is the loud signal WOR-2316 chose over
-                // silently writing `[REDACTED]` back as the password.
-                "password=[REDACTED]".to_string()
-            }
-        })
-        .into_owned()
+/// Replacement shared by every keyed pattern: [`RE_AWS_SECRET`],
+/// [`RE_API_KEY`], [`RE_CREDENTIAL_KEY`], [`RE_BARE_TOKEN`] and
+/// [`RE_PASSWORD`]. Each captures (key, separator, value); groups 1
+/// and 2 come back byte for byte and only group 3 is masked.
+///
+/// Handing the separator back is the whole point. These keys appear
+/// inside JSON log lines (`"virtual_key":"..."`,
+/// `"x-api-key":"..."`) and inside the YAML `GET /admin/config`
+/// returns, where the `":"` or `: ` between key and value is
+/// structure. Consuming it produced a line that no longer parsed, and
+/// [`crate::logging::redact_json_line`] answers a parse failure by
+/// returning the string unchanged, which skips the entire field-key
+/// denylist (`prompt`, `messages`, `cookie`, bundle secret vars) for
+/// that record. One mangled `api_key` therefore un-redacted every
+/// other secret on the line.
+///
+/// A GET-edit-PUT round trip through `/admin/config` now returns a
+/// document that still parses, with `[REDACTED]` where the inline
+/// secret was. That matches what the credential-key patterns have
+/// always done for `master_key`, `client_secret` and the rest, and
+/// WOR-2333's loud-failure requirement survives it: unquoted
+/// `[REDACTED]` is a one-element YAML flow sequence, not a string, so
+/// saving the redacted document back fails on a type mismatch that
+/// names the field instead of on a generic "failed to parse config
+/// YAML". The earlier `password`-only behavior (deliberately
+/// emitting a broken separator so the save failed) bought a worse
+/// version of the same signal at the cost of corrupting every log
+/// line that mentioned the word.
+fn keyed_credential_replacement(caps: &regex::Captures<'_>) -> String {
+    if masks_value(&caps[3]) {
+        format!("{}{}[REDACTED]", &caps[1], &caps[2])
+    } else {
+        caps[0].to_string()
+    }
 }
 
 // --- Public API ---
 
 /// Redact secrets from a string. Returns a new string with secrets replaced.
 ///
-/// Applies all known patterns in priority order. The result is suitable for
-/// safe emission in log lines or error messages.
+/// Applies all twelve patterns in priority order. The result is
+/// suitable for safe emission in log lines or error messages.
+///
+/// Two properties callers depend on, both pinned by tests:
+///
+/// * **Every match is replaced, not the first.** Each pass is
+///   `replace_all`, and each pass runs over the previous pass's whole
+///   output, so a line carrying three secrets comes out with three
+///   masks.
+/// * **The document survives.** No pattern consumes a delimiter it
+///   only matched as a boundary, so a JSON line still parses as JSON
+///   and a YAML document still parses as YAML afterwards. That is what
+///   lets `logging::redact_json_line` run the field-key denylist on
+///   the result.
 pub fn redact_secrets(input: &str) -> String {
     // Work through a scratch buffer so each replacement sees the previous output.
     // Ordering matters: more-specific patterns (Anthropic) come before more-general
@@ -208,13 +339,15 @@ pub fn redact_secrets(input: &str) -> String {
     let s = RE_OPENAI.replace_all(&s, "sk-[REDACTED]");
     let s = RE_GITHUB.replace_all(&s, "gh_[REDACTED]");
     let s = RE_AWS_ACCESS.replace_all(&s, "AKIA[REDACTED]");
-    let s = RE_AWS_SECRET.replace_all(&s, "secret=[REDACTED]");
+    let s = RE_AWS_SECRET.replace_all(&s, keyed_credential_replacement);
     let s = RE_BEARER.replace_all(&s, "Bearer [REDACTED]");
     let s = RE_BASIC.replace_all(&s, "Basic [REDACTED]");
-    let s = RE_API_KEY.replace_all(&s, "api_key=[REDACTED]");
+    let s = RE_API_KEY.replace_all(&s, keyed_credential_replacement);
     let s = RE_CREDENTIAL_KEY.replace_all(&s, keyed_credential_replacement);
     let s = RE_BARE_TOKEN.replace_all(&s, keyed_credential_replacement);
-    redact_passwords(&s)
+    RE_PASSWORD
+        .replace_all(&s, keyed_credential_replacement)
+        .into_owned()
 }
 
 /// Check if a string contains any known secret patterns.
@@ -231,18 +364,23 @@ pub fn contains_secret(input: &str) -> bool {
         || RE_BEARER.is_match(input)
         || RE_BASIC.is_match(input)
         || RE_API_KEY.is_match(input)
-        // A reference is not a secret, so it must not count as one here
-        // either. Reusing the capture keeps this in step with
-        // `redact_passwords` rather than letting the two drift.
+        // A reference is not a secret, so it must not count as one
+        // here either. These three run their captured value through
+        // the same `masks_value` the replacement uses, so for the
+        // keyed patterns this answer is exactly "would
+        // `redact_secrets` change this", never wider and never
+        // narrower. The two keyed patterns above stay on `is_match`
+        // because their value classes cannot express a reference or a
+        // prior mask: neither can hold `$`, `{`, `[`, or a `:`.
         || RE_PASSWORD
             .captures_iter(input)
-            .any(|caps| !is_secret_reference(&caps[2]))
+            .any(|caps| masks_value(&caps[3]))
         || RE_CREDENTIAL_KEY
             .captures_iter(input)
-            .any(|caps| !is_secret_reference(&caps[3]))
+            .any(|caps| masks_value(&caps[3]))
         || RE_BARE_TOKEN
             .captures_iter(input)
-            .any(|caps| !is_secret_reference(&caps[3]))
+            .any(|caps| masks_value(&caps[3]))
 }
 
 // --- Tests ---
@@ -335,7 +473,8 @@ mod tests {
         let input = "secret: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
         let output = redact_secrets(input);
         assert!(!output.contains("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"));
-        assert!(output.contains("secret=[REDACTED]"));
+        // Label and separator come back verbatim; only the value is masked.
+        assert_eq!(output, "secret: [REDACTED]");
     }
 
     #[test]
@@ -343,7 +482,9 @@ mod tests {
         let input = "SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
         let output = redact_secrets(input);
         assert!(!output.contains("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"));
-        assert!(output.contains("secret=[REDACTED]"));
+        // The label the operator wrote survives, so the line still
+        // says which credential was masked.
+        assert_eq!(output, "SECRET_ACCESS_KEY=[REDACTED]");
     }
 
     #[test]
@@ -367,7 +508,7 @@ mod tests {
         let input = r#"{"api_key": "my_secret_api_key_1234567890abcdef"}"#;
         let output = redact_secrets(input);
         assert!(!output.contains("my_secret_api_key_1234567890abcdef"));
-        assert!(output.contains("api_key=[REDACTED]"));
+        assert_eq!(output, r#"{"api_key": "[REDACTED]"}"#);
     }
 
     #[test]
@@ -375,7 +516,9 @@ mod tests {
         let input = "api-key=my_secret_api_key_1234567890abcdef";
         let output = redact_secrets(input);
         assert!(!output.contains("my_secret_api_key_1234567890abcdef"));
-        assert!(output.contains("api_key=[REDACTED]"));
+        // The hyphenated spelling the operator wrote is not rewritten
+        // to the underscore one.
+        assert_eq!(output, "api-key=[REDACTED]");
     }
 
     #[test]
@@ -383,7 +526,7 @@ mod tests {
         let input = "password: supersecretpassword123";
         let output = redact_secrets(input);
         assert!(!output.contains("supersecretpassword123"));
-        assert!(output.contains("password=[REDACTED]"));
+        assert_eq!(output, "password: [REDACTED]");
     }
 
     #[test]
@@ -433,9 +576,11 @@ mod tests {
         let input = r#"{"api_key": "abcdefghijklmnopqrstuvwxyz123456", "user": "alice"}"#;
         let output = redact_secrets(input);
         assert!(!output.contains("abcdefghijklmnopqrstuvwxyz123456"));
-        assert!(output.contains("api_key=[REDACTED]"));
-        // Non-secret fields preserved.
+        assert!(output.contains(r#""api_key": "[REDACTED]""#), "{output}");
+        // Non-secret fields preserved, and the line is still a document.
         assert!(output.contains("alice"));
+        let parsed: serde_json::Value = serde_json::from_str(&output).expect("still valid JSON");
+        assert_eq!(parsed["user"], "alice");
     }
 
     #[test]
@@ -540,7 +685,7 @@ mod tests {
         let input = "password: hunter2-actual-secret";
         let output = redact_secrets(input);
         assert!(!output.contains("hunter2-actual-secret"));
-        assert!(output.contains("password=[REDACTED]"));
+        assert_eq!(output, "password: [REDACTED]");
         assert!(contains_secret(input));
     }
 
@@ -553,7 +698,7 @@ mod tests {
         let input = "password: p$ssw0rd-with-braces{}";
         let output = redact_secrets(input);
         assert!(!output.contains("p$ssw0rd-with-braces"));
-        assert!(output.contains("password=[REDACTED]"));
+        assert_eq!(output, "password: [REDACTED]");
     }
 
     #[test]
@@ -562,7 +707,7 @@ mod tests {
         // through literally and warns. Whole-value only, so this stays
         // redactable.
         let input = "password: ${SB_ADMIN_PASSWORD}-suffix";
-        assert!(redact_secrets(input).contains("password=[REDACTED]"));
+        assert_eq!(redact_secrets(input), "password: [REDACTED]");
     }
 
     // --- Phase-2 review: the product's own credential keys ---
@@ -645,7 +790,7 @@ mod tests {
         let input = "password: hunter2";
         let output = redact_secrets(input);
         assert!(!output.contains("hunter2"), "{output}");
-        assert!(output.contains("password=[REDACTED]"));
+        assert_eq!(output, "password: [REDACTED]");
     }
 
     #[test]
@@ -707,9 +852,171 @@ mod tests {
 
     #[test]
     fn a_quoted_reference_survives_its_punctuation() {
-        // JSON and quoted YAML put the closing quote and comma inside the
-        // `\S` run, so the trailing-punctuation trim is load bearing.
+        // JSON and quoted YAML put the closing quote and comma right
+        // after the value, so the value run has to stop at them.
         let input = r#"{"password": "${SB_ADMIN_PASSWORD}", "port": 9901}"#;
         assert_eq!(redact_secrets(input), input);
+    }
+
+    // --- The mask must not eat the key separator ---
+    //
+    // `RE_API_KEY`, `RE_AWS_SECRET` and `RE_PASSWORD` used to replace
+    // the whole key-separator-value run with a flat `key=[REDACTED]`
+    // token. Two consequences, and the second is the serious one: the
+    // emitted line stopped being JSON, and `redact_json_line` answers
+    // a parse failure by returning the string untouched, so the whole
+    // field-key denylist was skipped for that record.
+    //
+    // Asserting only that the secret is gone passes on both sides of
+    // the fix and proves nothing. Each of these asserts on structure.
+
+    #[test]
+    fn a_captured_api_key_header_keeps_the_line_parseable() {
+        // `access_log.capture_headers.request: ["x-api-key"]` is an
+        // anticipated configuration, and headers are captured
+        // lowercased with hyphens. The old output was
+        // `{"request_headers":{"x-api_key=[REDACTED]"},...}`.
+        let line = r#"{"request_headers":{"x-api-key":"abcdefghijklmnop1234"},"status":200}"#;
+        let out = redact_secrets(line);
+        let parsed: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("redacted line is not JSON ({e}): {out}"));
+        assert_eq!(
+            parsed["request_headers"]["x-api-key"], "[REDACTED]",
+            "{out}"
+        );
+        assert_eq!(parsed["status"], 200, "{out}");
+        assert!(!out.contains("abcdefghijklmnop1234"), "{out}");
+    }
+
+    #[test]
+    fn a_secret_labeled_value_keeps_the_line_parseable() {
+        // `RE_AWS_SECRET`'s separator class `[^a-zA-Z0-9]{1,5}` covers
+        // the JSON `":"` run, so it took the key with it and the old
+        // output was `{"secret=[REDACTED]","status":200}`.
+        let line = r#"{"secret_hash":"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY","status":200}"#;
+        let out = redact_secrets(line);
+        let parsed: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("redacted line is not JSON ({e}): {out}"));
+        assert_eq!(parsed["secret_hash"], "[REDACTED]", "{out}");
+        assert_eq!(parsed["status"], 200, "{out}");
+    }
+
+    #[test]
+    fn an_inline_password_no_longer_swallows_the_rest_of_the_line() {
+        // The old value run was `\S{4,}`, and a compact JSON line has
+        // no spaces in it, so the match ran from the password value to
+        // the end of the record.
+        let line = r#"{"upstream_password":"hunter2xyz","tenant":"acme","status":200}"#;
+        let out = redact_secrets(line);
+        let parsed: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("redacted line is not JSON ({e}): {out}"));
+        assert_eq!(parsed["upstream_password"], "[REDACTED]", "{out}");
+        assert_eq!(parsed["tenant"], "acme", "{out}");
+        assert_eq!(parsed["status"], 200, "{out}");
+    }
+
+    #[test]
+    fn three_secrets_on_one_line_are_all_masked() {
+        // The scan does not stop at the first hit: every pass is
+        // `replace_all`, and each pass runs over the previous pass's
+        // whole output. The old result was
+        // `{"x-api_key=[REDACTED]","upstream_password=[REDACTED] [REDACTED]","status":200}`
+        // -- two of the three key names gone, the third field erased.
+        let line = concat!(
+            r#"{"x-api-key":"abcdefghijklmnop1234","#,
+            r#""upstream_password":"hunter2xyz","#,
+            r#""authorization":"Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.abc","#,
+            r#""status":200}"#
+        );
+        let out = redact_secrets(line);
+        let parsed: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("redacted line is not JSON ({e}): {out}"));
+        assert_eq!(parsed["x-api-key"], "[REDACTED]", "{out}");
+        assert_eq!(parsed["upstream_password"], "[REDACTED]", "{out}");
+        assert_eq!(parsed["authorization"], "Bearer [REDACTED]", "{out}");
+        assert_eq!(parsed["status"], 200, "{out}");
+    }
+
+    #[test]
+    fn a_redacted_yaml_flow_mapping_still_parses() {
+        // The other document format this pass runs over. Flow style is
+        // where the comma in the value stop set earns its place: the
+        // old output was `admin: {password=[REDACTED] port: 9901}`,
+        // which is not YAML at all.
+        //
+        // Note what the marker becomes: unquoted `[REDACTED]` is a
+        // one-element flow *sequence*, not a string. That is the same
+        // thing `master_key: [REDACTED]` has always produced, and it
+        // is the property that keeps a GET-edit-PUT round trip honest
+        // -- the document parses, and the save then fails on a type
+        // mismatch that names the field, rather than on a generic
+        // "failed to parse config YAML".
+        let input = "admin: {password: hunter2, port: 9901}";
+        let out = redact_secrets(input);
+        assert_eq!(out, "admin: {password: [REDACTED], port: 9901}");
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&out).unwrap_or_else(|e| panic!("not YAML ({e}): {out}"));
+        assert_eq!(parsed["admin"]["port"].as_u64(), Some(9901));
+        // The marker is a sequence, so it is deliberately not a string.
+        assert_eq!(parsed["admin"]["password"].as_str(), None, "{out}");
+    }
+
+    #[test]
+    fn a_password_containing_a_comma_is_masked_only_up_to_the_comma() {
+        // The stated cost of the value stop set, pinned so it is a
+        // known limit rather than a surprise. A line-level regex
+        // cannot tell a comma inside an unquoted YAML scalar from the
+        // comma that ends a JSON member or a flow entry, and guessing
+        // wrong destroys the document. `docs/access-log.md` tells
+        // operators the same thing.
+        let out = redact_secrets("password: p@ss,word-tail");
+        assert_eq!(out, "password: [REDACTED],word-tail");
+    }
+
+    /// A tripwire, not a wish. `external_id` and `secret_id` are
+    /// credential-bearing config keys the name alternation deliberately
+    /// leaves out, because each name is also a non-secret identifier
+    /// elsewhere in the product: `external_id` is the settlement
+    /// obligation id operators reconcile on, and `secret_id` is the
+    /// AWS SecretsManager parameter naming which secret to read.
+    /// Widening the alternation would trade a config-read leak for an
+    /// evidence gap. Read the note on `RE_CREDENTIAL_KEY` before
+    /// changing this; the fix that works is a key-path mask in
+    /// `sbproxy-config`, which is the layer that knows the path.
+    #[test]
+    fn two_overloaded_credential_names_are_left_out_on_purpose() {
+        for input in [
+            "external_id: 7f3c9a21b4e64d80",
+            "secret_id: 3e1b9c74-5a2f-4c8d-9b17-6e0a2d4f8c31",
+        ] {
+            assert_eq!(
+                redact_secrets(input),
+                input,
+                "if this now masks, the reasoning on RE_CREDENTIAL_KEY has to change with it"
+            );
+        }
+    }
+
+    #[test]
+    fn contains_secret_answers_exactly_what_redact_secrets_would_change() {
+        // Detector and enforcer share `masks_value`, so they cannot
+        // drift. The password arm read capture group 2 while the
+        // replacement read group 3; adding the separator group without
+        // moving the index would have made every `password:` line
+        // report a secret whether or not one was there.
+        for input in [
+            "password: hunter2",
+            "password: ${SB_ADMIN_PASSWORD}",
+            "token: env:SB_UPSTREAM_TOKEN",
+            "master_key: 6fa459eaee8a3ca4894edb77e160355e",
+            "client_secret: vault://primary/oidc?key=client_secret",
+            "GET /health HTTP/1.1 200 OK",
+        ] {
+            assert_eq!(
+                contains_secret(input),
+                redact_secrets(input) != input,
+                "detector and enforcer disagree on: {input}"
+            );
+        }
     }
 }

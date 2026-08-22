@@ -849,11 +849,23 @@ pub fn apply_redaction(json: &str, sink: Sink) -> String {
     apply_redaction_for(json, sink, None, None)
 }
 
-/// Sink-agnostic line redaction: the ten secret regexes plus the
+/// Sink-agnostic line redaction: the twelve secret regexes plus the
 /// field-key denylist (`prompt`, `messages`, `tool_arguments`, ...),
 /// without the per-tenant operator rules that `apply_redaction_for`
 /// layers on. For emitters that write JSON lines outside the
 /// StructuredLog path (request events, access log). WOR-2473.
+///
+/// # The two layers are not independent
+///
+/// The denylist runs only when the secret pass left something that
+/// still parses. A pattern that consumed a key separator therefore did
+/// not just mangle its own field: it dropped the denylist for the
+/// entire record, and `prompt` / `cookie` / a bundle secret var later
+/// on the same line shipped verbatim. Three patterns did exactly that
+/// until they were given capture groups; the module docs on
+/// [`crate::redact`] carry the rule. The `Err` arm here is a floor for
+/// genuinely non-JSON input (a `tracing` text line), not a tolerated
+/// outcome for a rendered record.
 pub fn redact_json_line(input: &str) -> String {
     let secrets_scrubbed = crate::redact::redact_secrets(input);
     match serde_json::from_str::<serde_json::Value>(&secrets_scrubbed) {
@@ -1448,6 +1460,64 @@ mod tests {
     fn redact_json_line_on_non_json_still_scrubs_secrets() {
         let out = redact_json_line("bearer sk-abc123def456ghi789jkl012");
         assert!(!out.contains("sk-abc123def456ghi789jkl012"), "{out}");
+    }
+
+    /// A captured `x-api-key` header used to leave the rendered line
+    /// unparseable, and this function answers a parse failure by
+    /// returning the string as it stands, so the field-key denylist
+    /// never ran and the `prompt` on the same record shipped verbatim.
+    /// Both halves are asserted: the line is still JSON, and the
+    /// second secret is still masked. A test that only checked the api
+    /// key was gone passed before the fix as well.
+    #[test]
+    fn a_captured_api_key_header_does_not_disable_the_denylist_for_the_line() {
+        let line = concat!(
+            r#"{"request_headers":{"x-api-key":"abcdefghijklmnop1234"},"#,
+            r#""prompt":"steal the plans","status":200}"#
+        );
+        let out = redact_json_line(line);
+        let parsed: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("redacted access-log line is not JSON ({e}): {out}"));
+        assert_eq!(parsed["prompt"], "[REDACTED:PROMPT_BODY]", "{out}");
+        assert!(!out.contains("steal the plans"), "{out}");
+        assert!(!out.contains("abcdefghijklmnop1234"), "{out}");
+        assert_eq!(parsed["status"], 200, "{out}");
+    }
+
+    /// The same coupling for the other two patterns that ate their
+    /// separator. One denylisted field on each line, so a skipped
+    /// denylist is visible.
+    #[test]
+    fn a_keyed_secret_earlier_in_the_line_does_not_cost_the_prompt() {
+        for (label, line) in [
+            (
+                "aws secret label",
+                concat!(
+                    r#"{"secret_hash":"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY","#,
+                    r#""prompt":"steal the plans"}"#
+                ),
+            ),
+            (
+                "password",
+                r#"{"upstream_password":"hunter2xyz","prompt":"steal the plans"}"#,
+            ),
+            (
+                "api key",
+                r#"{"api_key":"abcdefghijklmnop1234","prompt":"steal the plans"}"#,
+            ),
+        ] {
+            let out = redact_json_line(line);
+            let parsed: serde_json::Value = serde_json::from_str(&out)
+                .unwrap_or_else(|e| panic!("{label}: redacted line is not JSON ({e}): {out}"));
+            assert_eq!(
+                parsed["prompt"], "[REDACTED:PROMPT_BODY]",
+                "{label}: denylist did not run: {out}"
+            );
+            assert!(
+                !out.contains("steal the plans"),
+                "{label}: prompt survived: {out}"
+            );
+        }
     }
 
     #[test]

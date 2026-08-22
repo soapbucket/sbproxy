@@ -433,13 +433,16 @@ impl<P: LedgerPayload> UsageLedger<P> {
             // Replay any existing chain to restore head + dedup set.
             let (seq, head, seen) = replay_head::<P>(&path)?;
 
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .map_err(|e| {
-                    anyhow::anyhow!("usage ledger: cannot open {}: {e}", path.display())
-                })?;
+            // Owner-only (`0o600`). The chain is the billing record:
+            // per-tenant counts, the signature over them, and enough
+            // structure that a reader who can also write could learn
+            // where to forge. A file that already exists at a looser
+            // mode is tightened rather than inherited, and the open
+            // fails if it cannot be, because a ledger nobody else can
+            // read is the whole point of signing it.
+            let file = sbproxy_util::secure_fs::open_append_owner_only(&path).map_err(|e| {
+                anyhow::anyhow!("usage ledger: cannot open {}: {e}", path.display())
+            })?;
 
             Ok(Self {
                 path,
@@ -1680,5 +1683,46 @@ mod tests {
         assert_eq!(ledger.head().0, 1);
         assert_eq!(log.lock().writes.len(), 1);
         assert_eq!(log.lock().syncs, 1);
+    }
+
+    /// WOR-2626: the signed ledger is a billing record, so it must not
+    /// be readable by other accounts on the host.
+    ///
+    /// The file is pre-created world-readable rather than left to the
+    /// ambient umask, so the assertion is red before the fix on any
+    /// runner rather than only on one whose umask happens to be
+    /// `0o022`. It covers both halves of the contract at once: a
+    /// pre-existing loose file is tightened, and an append to it still
+    /// lands.
+    #[cfg(unix)]
+    #[test]
+    fn the_ledger_file_is_owner_only_even_when_it_already_existed() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = temp_path("owner-only");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"").expect("pre-create the ledger");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen the pre-created ledger");
+
+        let ledger = UsageLedger::<TestPayload>::open(&path, None).expect("open the ledger");
+        let appended = ledger
+            .append_checked(&event(Some("r1"), 1.0))
+            .expect("append one entry");
+        assert!(appended.is_some(), "a fresh key is not a duplicate");
+
+        let mode = std::fs::metadata(&path)
+            .expect("stat the ledger")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "ledger is {mode:o}, not owner-only");
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("read the ledger")
+                .contains("r1"),
+            "tightening the mode must not cost the entry"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
