@@ -1,5 +1,5 @@
 # Observability
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 SBproxy ships metrics, logs, and traces from one process. This guide covers the Wave 1 substrate: the SLO catalog, the metric label budget, the log schema and redaction policy, the trace propagation contract, the health endpoints, the dashboards, and the reference Compose stack you can boot in one command.
 
@@ -135,6 +135,42 @@ Field schema:
 | `stderr` | (none) | Useful for routing the audit channel separately from access on systemd-journald. |
 | `file` | `path`, `max_size_mb`, `max_backups`, `compress` | Reuses the access-log rotation + gzip stack. Defaults: 100 MiB rotation, 7 backups, gzip on. |
 | `otlp` | `endpoint`, `transport`, `timeout_secs` | Wraps `opentelemetry_otlp::LogExporter` behind a batch processor. Inherits `service_name`, `resource_attrs`, and (when omitted) `transport` from the top-level `telemetry:` block. |
+
+#### When a `file` sink cannot write
+
+Every way a file sink can lose a record is counted on
+`sbproxy_telemetry_dropped_total{kind="file_sink",reason}`, so a sink that
+has silently stopped growing is visible without reading the log stream it
+stopped writing to. The reasons are closed:
+
+| `reason` | What happened | Record |
+|---|---|---|
+| `mkdir_failed` | The parent directory could not be created | Lost |
+| `open_failed` | The file could not be opened for append (a permission change, a path that is now a directory) | Lost |
+| `write_error` | The append itself failed after a successful open: a full volume, a read-only remount, a failing disk | Lost |
+| `rotate_failed` | Rotation at `max_size_mb` failed | Kept, appended to the over-size file |
+
+`rotate_failed` rides the same family because the sink is degraded and an
+operator has to act, but it is the one reason that did not lose anything, so
+the alert for data loss excludes it:
+
+```promql
+sum by (reason) (
+  rate(sbproxy_telemetry_dropped_total{kind="file_sink", reason!="rotate_failed"}[5m])
+) > 0
+```
+
+Alert on `rotate_failed` separately. It means the active file is growing past
+`max_size_mb` with nothing pruning it, which ends as a full volume and then as
+`write_error`.
+
+Each of these also logs one WARN naming the path and the OS error, rate-limited
+to one per minute per sink path and per failure kind: the failures persist
+until an operator fixes them and the write path runs once per record, so an
+unthrottled warning would be a second log flood on top of the first problem.
+Keying the throttle on the kind as well as the path is what stops a rotation
+failure from swallowing the append failure a second later. Alert on the
+counter, not on the line.
 
 ### Sink scopes
 

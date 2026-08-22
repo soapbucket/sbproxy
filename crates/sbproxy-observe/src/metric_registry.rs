@@ -1734,6 +1734,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_cert_store_degraded",
+        kind: MetricKind::Gauge,
+        writer: Writer::Recorder("set_cert_store_degraded"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["backend"],
+        description: "1 when the configured certificate store could not be opened and an in-memory fallback is in use, 0 when the configured backend opened.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_circuit_breaker_transitions_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_circuit_breaker"),
@@ -1929,6 +1940,17 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["sha"],
         description: "Commit the config source resolved to; always 1, the commit is the label.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_cors_refusals_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_cors_refusal"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["reason"],
+        description: "Responses the CORS middleware refused to add headers to, by reason.",
         dead_reason: None,
     },
     MetricCapability {
@@ -3628,6 +3650,23 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["mode", "tenant"],
         description: "Content-Security-Policy headers emitted by the security_headers policy, by mode (enforce, report_only).",
+        dead_reason: None,
+    },
+    // The deprecation window on the pre-RFC-9421 derivations of
+    // `@target-uri` and `@request-target` cannot close on a log line:
+    // acceptance is announced once per process, which says a signer
+    // somewhere has not moved and nothing about whether that is still
+    // true. This is the series an operator watches to zero before the
+    // fallback is removed.
+    MetricCapability {
+        name: "sbproxy_signature_legacy_derivation_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_signature_legacy_derivation"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["component"],
+        description: "RFC 9421 signatures accepted only against the pre-conformance derivation of a request-target component, by component.",
         dead_reason: None,
     },
     MetricCapability {

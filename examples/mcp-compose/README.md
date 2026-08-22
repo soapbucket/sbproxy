@@ -122,7 +122,8 @@ tail -n 3 mcp-compose-events.ndjson | jq -c '{event_type, data: {tool: .data["ge
 Every call above, dispatched or refused, is a line here:
 `mcp_governance_decision` records for the two `greet_and_echo` calls
 and the RBAC-denied `ping` call, each carrying
-`sbproxy.evidence.seq`, a per-tenant gapless counter.
+`sbproxy.evidence.seq`, a counter that is gapless per tenant within one
+emitting process (`sbproxy.evidence.instance` names that process).
 `events.fail_closed` covers the same type, so a sink outage would have
 refused the call rather than serving it with no evidence behind it.
 

@@ -1015,8 +1015,15 @@ fn sign_for_path(secret_hex: &str, key_id: &str, target_uri: &str) -> (String, S
     use sha2::Sha256;
     type HmacSha256 = hmac::Hmac<Sha256>;
 
+    // `created` is live: the verifier's freshness window is symmetric,
+    // so a signature pinned to a fixed past epoch is refused as stale
+    // before any of the path binding these tests are about is reached.
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the epoch")
+        .as_secs();
     let raw_input = format!(
-            "sig1=(\"@method\" \"@target-uri\");created=1700000000;keyid=\"{key_id}\";alg=\"hmac-sha256\""
+            "sig1=(\"@method\" \"@target-uri\");created={created};keyid=\"{key_id}\";alg=\"hmac-sha256\""
         );
     let entry = sbproxy_middleware::signatures::parse_signature_input(&raw_input)
         .unwrap()
@@ -1143,6 +1150,73 @@ async fn bot_auth_includes_query_string_in_target_uri() {
     assert!(
         matches!(result, AuthResult::Allow { .. }),
         "expected Allow when path+query matches signed @target-uri"
+    );
+}
+
+#[test]
+fn signature_verification_request_carries_the_listener_scheme() {
+    // The seam the RFC 9421 `@target-uri` fix turns on. The middleware
+    // derives the absolute URI and cannot see the listener's TLS state
+    // from an `http::Request`, so this layer stamps the scheme and the
+    // `Host` authority onto the origin-form request line before handing
+    // the request over. Without the stamp, a TLS-terminated request
+    // derives `http://` and no conformant partner's signature verifies.
+    let mut headers = http::HeaderMap::new();
+    headers.insert("host", "api.example.com".parse().unwrap());
+    let uri: http::Uri = "/v1/orders?page=2".parse().unwrap();
+
+    assert_eq!(
+        super::ai_support::absolute_request_uri(&uri, &headers, "https").to_string(),
+        "https://api.example.com/v1/orders?page=2"
+    );
+    assert_eq!(
+        super::ai_support::absolute_request_uri(&uri, &headers, "http").to_string(),
+        "http://api.example.com/v1/orders?page=2"
+    );
+
+    // And the derivation the verifier runs reads that absolute URI.
+    let req = http::Request::builder()
+        .method("GET")
+        .uri(super::ai_support::absolute_request_uri(
+            &uri, &headers, "https",
+        ))
+        .body(bytes::Bytes::new())
+        .unwrap();
+    let entry =
+        sbproxy_middleware::signatures::parse_signature_input(r#"sig1=("@target-uri");keyid="k""#)
+            .unwrap()
+            .pop()
+            .unwrap()
+            .1;
+    let base = sbproxy_middleware::signatures::build_signature_base(&req, &entry).unwrap();
+    assert!(
+        base.starts_with("\"@target-uri\": https://api.example.com/v1/orders?page=2\n"),
+        "got: {base}"
+    );
+}
+
+#[test]
+fn signature_verification_request_does_not_repoint_an_absolute_uri() {
+    // A `Host` header must never override an authority the request line
+    // already carries, or a client could sign one host and be verified
+    // against another.
+    let mut headers = http::HeaderMap::new();
+    headers.insert("host", "shadow.example".parse().unwrap());
+    let uri: http::Uri = "https://api.example.com/v1/orders".parse().unwrap();
+    assert_eq!(
+        super::ai_support::absolute_request_uri(&uri, &headers, "http").to_string(),
+        "https://api.example.com/v1/orders"
+    );
+}
+
+#[test]
+fn signature_verification_request_without_an_authority_stays_origin_form() {
+    // HTTP/1.0 with no `Host`: there is no absolute URI to assemble.
+    let headers = http::HeaderMap::new();
+    let uri: http::Uri = "/health".parse().unwrap();
+    assert_eq!(
+        super::ai_support::absolute_request_uri(&uri, &headers, "https").to_string(),
+        "/health"
     );
 }
 

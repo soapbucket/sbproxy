@@ -1553,7 +1553,10 @@ impl AgentDetectConfig {
 /// [`sbproxy_middleware::idempotency::KvIdempotencyCache`] wrapping
 /// the cluster L2 store.
 pub struct CompiledIdempotency {
-    /// Cache backend trait object. Workspace-scoped per call.
+    /// Cache backend trait object, already namespaced to this origin:
+    /// the memory backend by being allocated per origin, the KV backend
+    /// by carrying the origin's tenant and origin id in every key it
+    /// writes into the shared store.
     pub cache: Arc<dyn sbproxy_middleware::idempotency::IdempotencyCache>,
     /// Request header carrying the idempotency key. Defaults to
     /// `Idempotency-Key` but the operator can override per origin.
@@ -2719,7 +2722,7 @@ impl CompiledPipeline {
                     continue;
                 }
             };
-            let compiled = compile_origin_idempotency(cfg, &config)
+            let compiled = compile_origin_idempotency(cfg, &config, origin)
                 .map_err(|e| anyhow::anyhow!("origin {}: {}", origin.origin_id, e))?;
             idempotencies.push(Some(Arc::new(compiled)));
         }
@@ -3182,9 +3185,17 @@ impl CompiledPipeline {
 /// state across configs. `Redis` backend wraps the cluster L2 store
 /// declared at `proxy.l2_store`; if that is absent the function
 /// returns an error rather than silently downgrading.
+///
+/// The Redis backend is handed `origin`'s tenant and origin id, which is
+/// what keeps two origins sharing one store out of each other's
+/// keyspace. It must be a value the operator controls and the compiler
+/// actually fills: `CompiledOrigin::workspace_id` is neither (nothing in
+/// the tree ever assigns it), which is how every origin in a cluster
+/// came to share one flat namespace.
 fn compile_origin_idempotency(
     cfg: &sbproxy_config::IdempotencyConfig,
     config: &CompiledConfig,
+    origin: &sbproxy_config::CompiledOrigin,
 ) -> anyhow::Result<CompiledIdempotency> {
     let ttl_secs = cfg
         .ttl_secs
@@ -3220,7 +3231,10 @@ fn compile_origin_idempotency(
                 )
             })?;
             Arc::new(sbproxy_middleware::idempotency::KvIdempotencyCache::new(
-                kv, ttl_secs,
+                kv,
+                ttl_secs,
+                origin.tenant_id.as_str(),
+                origin.origin_id.as_str(),
             ))
         }
     };
