@@ -4971,6 +4971,38 @@ fn apply_semantic_route_outcome(
     }
 }
 
+/// Derive one caller-scoped prompt-cache lease identity for a request.
+///
+/// Reads the caller's own cache key: `prompt_cache_key` first, then `user`,
+/// which SDKs sent for the same steering purpose before `prompt_cache_key`
+/// existed. Nothing on this path writes either field, so a caller who sends
+/// neither is never given one and never gets a lease.
+///
+/// The caller-chosen string is only one of five hashed inputs. Tenant,
+/// credential, origin, and surface come from the request context, so
+/// guessing another tenant's key buys nothing.
+fn cache_affinity_key_for_request(
+    ctx: &RequestContext,
+    origin: &str,
+    api_surface: &str,
+    body: &serde_json::Value,
+) -> Option<sbproxy_ai::CacheAffinityKey> {
+    let caller_key = ["prompt_cache_key", "user"]
+        .into_iter()
+        .find_map(|field| body.get(field).and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|caller_key| !caller_key.is_empty())?;
+    Some(sbproxy_ai::CacheAffinityKey::derive(
+        sbproxy_ai::CacheAffinityKeyInput {
+            tenant_id: ctx.tenant_id.as_str(),
+            credential_identity: ctx.principal.api_key_id(),
+            origin,
+            api_surface,
+            caller_key,
+        },
+    ))
+}
+
 pub(super) async fn handle_ai_proxy(
     session: &mut Session,
     config: &AiHandlerConfig,
@@ -10001,6 +10033,52 @@ pub(super) async fn handle_ai_proxy(
             }
         }
     }
+    // WOR-2651: prompt-cache affinity is a preference layered over whatever
+    // the strategy just picked, not a strategy of its own. It runs after the
+    // primary-selection block rather than inside it because that block's body
+    // is gated on `is_prefix_affinity()`; a hook inside would have been dead
+    // under round_robin and every other strategy, which is exactly the
+    // composition this feature is for.
+    //
+    // "Whatever the strategy picked" excludes the four that own their
+    // ordering outright, which is the same set the block above skips plus
+    // `fallback_chain`. A cascade's tiers, cost_quality's cheap/frontier
+    // split, an authored routing-policy plan, and a priority-sorted failover
+    // chain are all orderings the operator wrote down on purpose; a lease
+    // jumping that queue would quietly defeat the strategy rather than
+    // compose with it. Nothing is recorded on those origins either, so the
+    // table never fills with leases no lookup will read.
+    let cache_affinity_applies = config.cache_affinity.is_some()
+        && !is_failover
+        && routing_policy_cascade.is_none()
+        && router.cascade_config().is_none()
+        && router.cost_quality_config().is_none();
+    // The key is derived once and reused at the record site below, so the
+    // lease is written under the same identity it was read under.
+    let cache_affinity_key = cache_affinity_applies
+        .then(|| cache_affinity_key_for_request(ctx, hostname, surface_label, &body))
+        .flatten();
+    if cache_affinity_applies {
+        match cache_affinity_key.as_ref() {
+            Some(key) => {
+                if let Some(preferred) = router.select_cache_affinity(
+                    &config.providers,
+                    key,
+                    model.as_str(),
+                    &provider_order,
+                ) {
+                    if let Some(pos) = provider_order.iter().position(|&i| i == preferred) {
+                        let p = provider_order.remove(pos);
+                        provider_order.insert(0, p);
+                    }
+                }
+            }
+            // Counted, not silent: an operator who turned affinity on and
+            // sees only this outcome is looking at callers that send no
+            // cache key, not at a broken table.
+            None => sbproxy_ai::ai_metrics::record_cache_affinity_decision("missing_signal"),
+        }
+    }
     // WOR-2556: typed fallback triggers. Resolve each authored list to
     // provider indices constrained to this request's eligible set (a
     // typed list re-aims a reroute, it never widens what the credential
@@ -10418,6 +10496,7 @@ pub(super) async fn handle_ai_proxy(
                         ctx.ai_tokens_in = Some(prompt_tokens);
                         ctx.ai_tokens_out = Some(completion_tokens);
                         ctx.ai_tokens_cached = (cached_input > 0).then_some(cached_input);
+                        ctx.ai_tokens_cache_write = (cache_creation > 0).then_some(cache_creation);
                     }
                     let cost_micros = emit_ai_billing_event(
                         hostname,
@@ -11519,6 +11598,13 @@ pub(super) async fn handle_ai_proxy(
                 if (200..300).contains(&status) {
                     if let Some(prefix) = routing_prefix {
                         router.record_prefix(provider_idx, prefix);
+                    }
+                    // The logical model, matching what `select_cache_affinity`
+                    // compared against above. A provider's own `model_map`
+                    // rename is not known at selection time, so leasing on the
+                    // renamed value would never match on the next request.
+                    if let Some(key) = cache_affinity_key {
+                        router.record_cache_affinity(provider_idx, key, model.as_str());
                     }
                 }
                 last_resp = Some(resp);
@@ -13226,6 +13312,7 @@ pub(super) async fn relay_ai_response_with_cache(
                 ctx.ai_tokens_in = Some(prompt_tokens);
                 ctx.ai_tokens_out = Some(completion_tokens);
                 ctx.ai_tokens_cached = (cached_input > 0).then_some(cached_input);
+                ctx.ai_tokens_cache_write = (cache_creation > 0).then_some(cache_creation);
                 let project = ctx.principal.attrs.project.as_deref().unwrap_or("");
                 let user = ctx.principal.attrs.user.as_deref().unwrap_or("");
                 if ctx.principal.attrs.tags.is_empty() {
@@ -13386,6 +13473,7 @@ pub(super) async fn relay_ai_response_with_cache(
                 ctx.ai_tokens_in = Some(prompt_tokens);
                 ctx.ai_tokens_out = Some(completion_tokens);
                 ctx.ai_tokens_cached = (cached_input > 0).then_some(cached_input);
+                ctx.ai_tokens_cache_write = (cache_creation > 0).then_some(cache_creation);
                 let usage = sbproxy_ai::budget::AiUsage::Tokens {
                     input: prompt_tokens,
                     output: completion_tokens,
@@ -17914,6 +18002,230 @@ origins:
                 .iter()
                 .any(|e| e.tenant_id.as_deref() == Some("tenant-b")),
             "the cross-tenant inject_mcp miss must be an audited event, not only a log line: {events:?}"
+        );
+    }
+
+    /// An upstream that answers `accepts` requests instead of one.
+    ///
+    /// The single-shot fixtures above cannot express "the same provider
+    /// served both requests", which is the whole claim a routing-affinity
+    /// test has to make.
+    async fn repeating_upstream_fixture(
+        body: &'static str,
+        accepts: usize,
+    ) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind repeating upstream");
+        let address = listener.local_addr().expect("repeating upstream address");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&hits);
+        tokio::spawn(async move {
+            for _ in 0..accepts {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                observed.fetch_add(1, Ordering::SeqCst);
+                drain_upstream_request(&mut stream).await;
+                let response = format!(
+                    "HTTP/1.1 200 Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{address}/v1"), hits)
+    }
+
+    fn two_provider_affinity_config(
+        first_url: String,
+        second_url: String,
+        cache_affinity: bool,
+    ) -> sbproxy_ai::AiHandlerConfig {
+        let mut action = serde_json::json!({
+            "providers": [
+                {
+                    "name": "provider-one",
+                    "provider_type": "openai",
+                    "base_url": first_url,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key"
+                },
+                {
+                    "name": "provider-two",
+                    "provider_type": "openai",
+                    "base_url": second_url,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key"
+                }
+            ],
+            "routing": "round_robin"
+        });
+        if cache_affinity {
+            action["cache_affinity"] = serde_json::json!({});
+        }
+        sbproxy_ai::AiHandlerConfig::from_config(action).expect("affinity proxy config")
+    }
+
+    async fn dispatch_chat_request(config: &sbproxy_ai::AiHandlerConfig, body: serde_json::Value) {
+        let (mut session, client) = downstream_session(body).await;
+        let mut context = crate::context::RequestContext::new();
+        context.tenant_id = "tenant-a".into();
+        super::handle_ai_proxy(
+            &mut session,
+            config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("affinity request dispatches");
+        drop(session);
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+    }
+
+    /// WOR-2651: the control for the affinity test below.
+    ///
+    /// It asserts the premise rather than narrating it. Without it, an
+    /// affinity test that saw both requests land on one provider could be
+    /// measuring a broken second fixture instead of a working lease.
+    #[tokio::test]
+    async fn two_requests_without_a_cache_key_alternate_providers_under_round_robin() {
+        let (first_url, first_hits) = repeating_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+            2,
+        )
+        .await;
+        let (second_url, second_hits) = repeating_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+            2,
+        )
+        .await;
+        let config = two_provider_affinity_config(first_url, second_url, true);
+
+        for _ in 0..2 {
+            dispatch_chat_request(
+                &config,
+                serde_json::json!({
+                    "model": "fixture-model",
+                    "messages": [{"role": "user", "content": "same prompt"}]
+                }),
+            )
+            .await;
+        }
+
+        assert_eq!(
+            (
+                first_hits.load(Ordering::SeqCst),
+                second_hits.load(Ordering::SeqCst)
+            ),
+            (1, 1),
+            "round robin must alternate when no caller cache key is present, \
+             otherwise the affinity test below proves nothing"
+        );
+    }
+
+    /// WOR-2651: prompt-cache affinity has to compose with every strategy.
+    ///
+    /// The existing prefix-affinity hook is gated on
+    /// `Router::is_prefix_affinity`, so a lease evaluated inside that gate
+    /// would never run under `round_robin`. This exercises the
+    /// strategy-independent reorder that runs after the primary selection
+    /// block instead.
+    #[tokio::test]
+    async fn two_requests_with_one_cache_key_reach_one_provider_under_round_robin() {
+        let (first_url, first_hits) = repeating_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+            2,
+        )
+        .await;
+        let (second_url, second_hits) = repeating_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+            2,
+        )
+        .await;
+        let config = two_provider_affinity_config(first_url, second_url, true);
+
+        for _ in 0..2 {
+            dispatch_chat_request(
+                &config,
+                serde_json::json!({
+                    "model": "fixture-model",
+                    "prompt_cache_key": "tenant-a-session-7",
+                    "messages": [{"role": "user", "content": "same prompt"}]
+                }),
+            )
+            .await;
+        }
+
+        let mut served = [
+            first_hits.load(Ordering::SeqCst),
+            second_hits.load(Ordering::SeqCst),
+        ];
+        served.sort_unstable();
+        assert_eq!(
+            served,
+            [0, 2],
+            "the second request must return to the provider that already holds \
+             this caller's warm prompt cache"
+        );
+    }
+
+    /// WOR-2651: the gateway leases on a key the caller sent and never
+    /// invents one. A synthesized `prompt_cache_key` would silently change
+    /// what the upstream caches and bills for.
+    #[tokio::test]
+    async fn the_gateway_never_adds_a_cache_key_the_caller_did_not_send() {
+        let (upstream_url, hits, captured) = capturing_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        )
+        .await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "provider-one",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }],
+            "routing": "round_robin",
+            "cache_affinity": {}
+        }))
+        .expect("affinity proxy config");
+
+        // `user` is present, so a lease *is* derived for this request. That
+        // is the interesting case: the key the gateway leases on must stay
+        // inside the gateway.
+        dispatch_chat_request(
+            &config,
+            serde_json::json!({
+                "model": "fixture-model",
+                "user": "caller-42",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }),
+        )
+        .await;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let upstream_request = captured.await.expect("capturing upstream task");
+        let request_text = String::from_utf8(upstream_request).expect("upstream request UTF-8");
+        let body: serde_json::Value = serde_json::from_str(
+            request_text
+                .split_once("\r\n\r\n")
+                .expect("upstream request body")
+                .1,
+        )
+        .expect("upstream JSON body");
+        assert!(
+            body.get("prompt_cache_key").is_none(),
+            "the gateway must not write a prompt cache key the caller omitted: {body}"
+        );
+        assert_eq!(
+            body["user"], "caller-42",
+            "the caller's own field must reach the upstream unchanged"
         );
     }
 

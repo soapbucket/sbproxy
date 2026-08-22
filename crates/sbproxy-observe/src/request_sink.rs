@@ -403,6 +403,7 @@ mod tests {
         event.tokens_in = Some(10);
         event.tokens_out = Some(2);
         event.tokens_cached = Some(1);
+        event.tokens_cache_write = Some(4);
         event.cost_usd_micros = Some(3);
         event.status_code = Some(200);
         event.error_class = Some("upstream_5xx".to_string());
@@ -444,6 +445,7 @@ mod tests {
                 "status_code",
                 "tenant_id",
                 "timestamp_ms",
+                "tokens_cache_write",
                 "tokens_cached",
                 "tokens_in",
                 "tokens_out",

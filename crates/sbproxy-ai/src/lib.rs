@@ -111,8 +111,9 @@ pub use reasoning::{
 };
 pub use routing::{FilteredSelectionFallback, PeakEwmaConfig, Router, RoutingStrategy};
 pub use routing_state::{
-    normalize_prefix, PrefixAffinityConfig, PrefixAffinityConfigError, PrefixDigest,
-    ReplicaRoutingState,
+    normalize_prefix, CacheAffinityConfig, CacheAffinityConfigError, CacheAffinityKey,
+    CacheAffinityKeyInput, CacheAffinityLookup, PrefixAffinityConfig, PrefixAffinityConfigError,
+    PrefixDigest, ReplicaRoutingState,
 };
 pub use semantic_cache::{
     decode_entry, encode_entry, select_exact_hit, semantic_configuration_digest,

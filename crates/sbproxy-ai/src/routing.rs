@@ -14,7 +14,10 @@ use serde::{Deserialize, Deserializer};
 
 use crate::provider::ProviderConfig;
 use crate::provider_ratelimit::{ProviderQuotaSnapshot, ProviderRateLimitTracker};
-use crate::routing_state::{PrefixAffinityConfig, PrefixDigest, ReplicaRoutingState};
+use crate::routing_state::{
+    CacheAffinityConfig, CacheAffinityKey, CacheAffinityLookup, PrefixAffinityConfig, PrefixDigest,
+    ReplicaRoutingState,
+};
 
 /// Explicit reason a policy-filtered selection fell back to round-robin.
 ///
@@ -1487,6 +1490,92 @@ impl Router {
         let provider = providers.get(picked)?;
         crate::ai_metrics::record_lb_decision(self.strategy_name(), &provider.name);
         Some(picked)
+    }
+
+    /// Arm caller-keyed prompt-cache affinity for this router.
+    ///
+    /// Builder-shaped like [`Self::with_circuit_breakers`] and attached by
+    /// the origin's `cache_affinity` block and by nothing else, so a router
+    /// whose operator did not ask for affinity allocates no lease tables.
+    /// Bounds are validated at config load, so a rejection here means the
+    /// load-time check was bypassed. The router stays usable with affinity
+    /// off and logs the reason rather than panicking a live proxy.
+    #[must_use]
+    pub fn with_cache_affinity(mut self, config: CacheAffinityConfig) -> Self {
+        let provider_count = self.latencies.len();
+        if let Err(error) = self
+            .replica_state
+            .enable_cache_affinity(provider_count, config)
+        {
+            tracing::error!(
+                %error,
+                "ai prompt-cache affinity bounds rejected; affinity stays disabled"
+            );
+        }
+        self
+    }
+
+    /// Whether caller-keyed prompt-cache affinity is armed on this router.
+    #[must_use]
+    pub fn cache_affinity_enabled(&self) -> bool {
+        self.replica_state.cache_affinity_enabled()
+    }
+
+    /// Prefer the provider already holding this caller's warm prompt cache.
+    ///
+    /// Returns an index from `candidate_indices` only. The list is first
+    /// narrowed by [`Self::eligible_candidate_indices`], so health, circuit
+    /// breakers, outlier ejection, and everything the dispatcher already
+    /// filtered on keep winning: this is a preference over the strategy's
+    /// pick, never a pin. `None` leaves the strategy's ordering untouched.
+    ///
+    /// Every call records exactly one
+    /// `sbproxy_ai_cache_affinity_decisions_total` outcome, so the counter
+    /// totals the requests that carried a cache key.
+    pub fn select_cache_affinity(
+        &self,
+        providers: &[ProviderConfig],
+        key: &CacheAffinityKey,
+        resolved_model: &str,
+        candidate_indices: &[usize],
+    ) -> Option<usize> {
+        if !self.replica_state.cache_affinity_enabled() {
+            return None;
+        }
+        let eligible = self.eligible_candidate_indices(providers, candidate_indices);
+        match self
+            .replica_state
+            .select_cache_holder(key, resolved_model, &eligible)
+        {
+            CacheAffinityLookup::Hit(provider_idx) => {
+                crate::ai_metrics::record_cache_affinity_decision("hit");
+                Some(provider_idx)
+            }
+            CacheAffinityLookup::Miss => {
+                crate::ai_metrics::record_cache_affinity_decision("miss");
+                None
+            }
+            CacheAffinityLookup::Ineligible => {
+                crate::ai_metrics::record_cache_affinity_decision("ineligible");
+                None
+            }
+            CacheAffinityLookup::ModelChanged => {
+                crate::ai_metrics::record_cache_affinity_decision("model_changed");
+                None
+            }
+        }
+    }
+
+    /// Record that an accepted response left one provider holding this
+    /// caller's warm prompt cache for `resolved_model`.
+    pub fn record_cache_affinity(
+        &self,
+        provider_idx: usize,
+        key: CacheAffinityKey,
+        resolved_model: &str,
+    ) {
+        self.replica_state
+            .record_cache_holder(provider_idx, key, resolved_model);
     }
 
     /// Record that an accepted response populated one provider's prefix cache.
@@ -3295,6 +3384,86 @@ mod tests {
                 Some(normalized_prefix("strict candidate")),
                 &[1],
             ),
+            None
+        );
+    }
+
+    // --- WOR-2651: caller-keyed prompt-cache affinity ---
+
+    fn affinity_key(caller_key: &str) -> crate::routing_state::CacheAffinityKey {
+        crate::routing_state::CacheAffinityKey::derive(
+            crate::routing_state::CacheAffinityKeyInput {
+                tenant_id: "tenant-a",
+                credential_identity: "key-1",
+                origin: "ai.test",
+                api_surface: "chat_completions",
+                caller_key,
+            },
+        )
+    }
+
+    /// Affinity is a preference, never a pin. The lease holder still has to
+    /// clear the resilience filter the dispatcher already applied, or a
+    /// single ejected provider would keep serving every request its lease
+    /// names.
+    #[test]
+    fn an_unhealthy_lease_holder_is_skipped() {
+        let providers = vec![
+            make_provider("healthy", 1, None, true),
+            make_provider("lease-holder", 1, None, true),
+        ];
+        let router = Router::new(RoutingStrategy::RoundRobin, providers.len())
+            .with_cache_affinity(crate::routing_state::CacheAffinityConfig::default());
+        let key = affinity_key("session-7");
+        router.record_cache_affinity(1, key, "gpt-4o");
+
+        assert_eq!(
+            router.select_cache_affinity(&providers, &key, "gpt-4o", &[0, 1]),
+            Some(1)
+        );
+
+        router.set_provider_health(1, false);
+        assert_eq!(
+            router.select_cache_affinity(&providers, &key, "gpt-4o", &[0, 1]),
+            None,
+            "an ejected lease holder must leave the strategy's own pick in place"
+        );
+    }
+
+    /// The lease composes with the strategy rather than replacing it: the
+    /// router is a plain round robin and still answers the lookup.
+    #[test]
+    fn cache_affinity_answers_under_a_non_affinity_strategy() {
+        let providers = vec![
+            make_provider("a", 1, None, true),
+            make_provider("b", 1, None, true),
+        ];
+        let router = Router::new(RoutingStrategy::RoundRobin, providers.len())
+            .with_cache_affinity(crate::routing_state::CacheAffinityConfig::default());
+        assert!(router.cache_affinity_enabled());
+        let key = affinity_key("session-7");
+        assert_eq!(
+            router.select_cache_affinity(&providers, &key, "gpt-4o", &[0, 1]),
+            None
+        );
+        router.record_cache_affinity(0, key, "gpt-4o");
+        assert_eq!(
+            router.select_cache_affinity(&providers, &key, "gpt-4o", &[0, 1]),
+            Some(0)
+        );
+    }
+
+    /// An origin without the config key gets no lease table, so the lookup
+    /// short-circuits before it can allocate or record anything.
+    #[test]
+    fn an_unconfigured_router_never_leases() {
+        let providers = vec![make_provider("a", 1, None, true)];
+        let router = Router::new(RoutingStrategy::RoundRobin, providers.len());
+        assert!(!router.cache_affinity_enabled());
+        let key = affinity_key("session-7");
+        router.record_cache_affinity(0, key, "gpt-4o");
+        assert_eq!(
+            router.select_cache_affinity(&providers, &key, "gpt-4o", &[0]),
             None
         );
     }

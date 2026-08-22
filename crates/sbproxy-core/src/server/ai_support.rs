@@ -2089,9 +2089,19 @@ pub(super) fn emit_ai_billing_event(
     // join on provider+model. The recorder skips zero counts, so an
     // image / audio event records its USD cost without phantom token
     // rows.
-    let (input_tokens, output_tokens) = match &usage {
-        sbproxy_ai::budget::AiUsage::Tokens { input, output, .. } => (*input, *output),
-        _ => (0, 0),
+    // WOR-2651: the cache subsets travel with the usage and were being
+    // dropped here, so a prompt-cache hit showed up in dollars (the cost
+    // math already discounts it) and nowhere in tokens. They are subsets of
+    // `input`, not additions to it, so a sum across the `direction` label
+    // double counts; each direction is its own series for that reason.
+    let (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens) = match &usage {
+        sbproxy_ai::budget::AiUsage::Tokens {
+            input,
+            output,
+            cached_input,
+            cache_creation,
+        } => (*input, *output, *cached_input, *cache_creation),
+        _ => (0, 0, 0, 0),
     };
     let model_label = model.as_deref().unwrap_or("");
     ai_span.record("gen_ai.system", provider_name);
@@ -2113,8 +2123,8 @@ pub(super) fn emit_ai_billing_event(
         tags,
         input_tokens,
         output_tokens,
-        0,
-        0,
+        cache_read_tokens,
+        cache_write_tokens,
         0,
         cost_usd,
     );
@@ -4983,6 +4993,78 @@ mod budget_window_tests {
             healthy_score < failing_score,
             "the succeeding provider must win even though it costs more \
              (healthy {healthy_score}, failing {failing_score})"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cache_token_attribution_tests {
+    /// One `sbproxy_ai_tokens_attributed_total` series, selected by the
+    /// dimensions this test sets. Absent series read as zero, which is what
+    /// a direction nobody has recorded yet looks like.
+    fn attributed_tokens(model: &str, direction: &str) -> f64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "sbproxy_ai_tokens_attributed_total")
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        let labeled = |name: &str, want: &str| {
+                            metric
+                                .get_label()
+                                .iter()
+                                .any(|label| label.name() == name && label.value() == want)
+                        };
+                        labeled("model", model) && labeled("direction", direction)
+                    })
+                    .map(|metric| metric.get_counter().value())
+                    .sum()
+            })
+            .unwrap_or_default()
+    }
+
+    /// WOR-2651: the billing choke point destructured `input` and `output`
+    /// and threw the two cache subsets away, then passed literal zeros for
+    /// them. A prompt-cache hit therefore showed up in dollars, because
+    /// `estimate_token_cost` already discounts both, and nowhere in tokens.
+    ///
+    /// The seam is `emit_ai_billing_event`'s argument list, not
+    /// `record_ai_request_attributed`, which has accepted both counts since
+    /// it was written.
+    #[test]
+    fn cache_read_and_write_tokens_reach_the_attributed_metric() {
+        let model = "cache-token-wiring-fixture";
+        let before_read = attributed_tokens(model, "cache_read");
+        let before_write = attributed_tokens(model, "cache_write");
+
+        super::emit_ai_billing_event(
+            "ai.test",
+            "chat_completions",
+            "anthropic",
+            Some(model.to_string()),
+            sbproxy_ai::budget::AiUsage::Tokens {
+                input: 1_000,
+                output: 20,
+                cached_input: 700,
+                cache_creation: 120,
+            },
+            0.0,
+            Vec::new(),
+            &sbproxy_ai::attribution::AttributionTags::default(),
+            "tenant-cache",
+            "key-cache",
+            &std::collections::BTreeMap::new(),
+            sbproxy_ai::budget::AgentIdentity::default(),
+            &tracing::Span::none(),
+            sbproxy_ai::budget::TokenDebit::Measured,
+        );
+
+        assert_eq!(attributed_tokens(model, "cache_read") - before_read, 700.0);
+        assert_eq!(
+            attributed_tokens(model, "cache_write") - before_write,
+            120.0
         );
     }
 }

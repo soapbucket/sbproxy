@@ -347,11 +347,19 @@ routing:
 
 ### sticky
 
-Pins a user or session to the same provider. Falls back to round_robin for the initial pick.
+`strategy: sticky` behaves as `round_robin` today. The session-affinity map
+exists in the router and nothing on the request path supplies it a session key,
+so every request takes the round-robin fallback and no session is ever pinned.
+The strategy is accepted rather than refused so existing configs keep loading.
+
+For caller affinity that does work, use
+[prompt-cache affinity](#prompt-cache-affinity) below: it keys on a cache key
+the caller already sends, scopes it to the tenant and credential, and composes
+with whatever strategy you have configured, including `round_robin`.
 
 ```yaml
 routing:
-  strategy: sticky
+  strategy: sticky   # equivalent to round_robin
 ```
 
 ### random
@@ -2004,13 +2012,128 @@ At compile time each `ai_provider` credential is lowered onto the runtime key re
 
 ## Caching
 
-Two caches run on the serving path: the semantic cache and the idempotency middleware, both described below. Cache hit and miss counts land in `sbproxy_ai_cache_results_total`.
+Two caches run on the serving path: the semantic cache and the idempotency middleware, both described below. A third control, prompt-cache affinity, caches nothing itself; it routes a caller back to the provider whose own prompt cache is already warm for them. Cache hit and miss counts land in `sbproxy_ai_cache_results_total`.
 
 ### Exact replay
 
 For byte-identical replay of retried requests, use the idempotency middleware
 below. The gateway does not have a separate exact-prompt-cache configuration
 surface. For near-duplicate prompts, use the semantic cache.
+
+### Prompt-cache affinity
+
+Providers cache prompt prefixes on their own side and bill the cached part at a
+discount. That cache lives on one provider, so a caller who is routed somewhere
+else on their next turn pays full price for a prefix that is already warm
+elsewhere. `cache_affinity` remembers which provider served a caller's cache key
+and prefers that provider next time.
+
+This is not a routing strategy. It layers over the strategy you already
+configured, `round_robin` included, and only moves a live lease holder to the
+front of the order that strategy produced.
+
+Four strategies are the exception, because they own their ordering outright:
+`fallback_chain` sorts by declared priority, `cascade` walks tiers in cost
+order, `cost_quality` splits cheap against frontier per request, and a
+`routing_policy` plan names its providers. Each of those is an order an
+operator wrote down on purpose, so a lease would defeat it rather than compose
+with it. On those origins no lease is read and none is recorded.
+
+```yaml
+origins:
+  - match: { host: ai.internal }
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai-a
+          provider_type: openai
+          api_key: ${OPENAI_API_KEY}
+        - name: openai-b
+          provider_type: openai
+          api_key: ${OPENAI_API_KEY_B}
+      routing:
+        strategy: round_robin
+      cache_affinity:
+        ttl_secs: 300
+        max_keys_per_provider: 1024
+```
+
+`cache_affinity` sits beside `routing:`, not inside it. Written inside, config
+load refuses it and says so.
+
+The call. The caller sends its own key, the same one OpenAI reads to steer a
+request at the machine holding its warm cache:
+
+```bash
+curl https://ai.internal/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"gpt-5","prompt_cache_key":"agent-run-8f21",
+       "messages":[{"role":"system","content":"<12k of instructions>"},
+                   {"role":"user","content":"first question"}]}'
+```
+
+The outcome. Round robin would have sent the second turn to `openai-b`. The
+lease sends it back to `openai-a`, and the second response reports cache-read
+tokens where the first reported none:
+
+| turn | provider | `usage.prompt_tokens_details.cached_tokens` |
+|---|---|---|
+| 1 | `openai-a` | 0 |
+| 2 | `openai-a` | 12,032 |
+
+Those tokens are also counted on
+`sbproxy_ai_tokens_attributed_total{direction="cache_read"}`, and the cache
+writes on `direction="cache_write"`.
+
+```mermaid
+flowchart TD
+    A[request] --> B{prompt_cache_key or user present?}
+    B -- no --> M[strategy's own pick, outcome=missing_signal]
+    B -- yes --> C{live lease for this key?}
+    C -- no --> N[strategy's own pick, outcome=miss]
+    C -- yes --> D{holder still eligible?}
+    D -- "no (ejected, unhealthy, filtered)" --> O[strategy's own pick, outcome=ineligible]
+    D -- yes --> E{resolved model unchanged?}
+    E -- no --> P[lease dropped, outcome=model_changed]
+    E -- yes --> Q[holder moves to the front, outcome=hit]
+```
+
+The key the gateway leases on is `prompt_cache_key`, or `user` when that is
+absent. Nothing on the request path writes either field, so a caller who sends
+neither gets no lease and is routed by the strategy alone, and a caller who
+sends one has it forwarded unchanged.
+
+The lease is scoped, not global. Its identity is a digest over the tenant, the
+credential, the origin, the API surface, and the caller's key, so one tenant
+sending another tenant's key string never inherits their lease. The surface is
+part of that scope because provider prompt caches are per endpoint: the same key
+on `/v1/chat/completions` and on `/v1/responses` names two upstream caches, so
+it names two leases.
+
+It is a preference, never a pin. An unhealthy, breaker-open, ejected, or
+policy-ineligible holder is skipped and the strategy's own pick stands. A lease
+recorded against a different resolved model is dropped rather than followed,
+because the warm prefix on that provider is for a model this request is no
+longer asking for.
+
+State is process-local and bounded, the same as `prefix_affinity`: each replica
+learns its own directory, nothing is looked up across the cluster mesh, and
+nothing survives a restart. Behind a load balancer the hit rate is per gateway
+instance. Defaults are a five-minute TTL and 1,024 leases per provider; set
+`ttl_secs` near the provider's own prompt-cache lifetime, since a lease that
+outlives the upstream cache steers traffic for no benefit.
+
+`sbproxy_ai_cache_affinity_decisions_total{outcome}` carries the five outcomes
+in the diagram, and
+`sbproxy_ai_cache_affinity_evictions_total{reason}` counts removals by `ttl`,
+`capacity`, and `model_changed`. They are deliberately separate from the
+`prefix_affinity` counters: the two tables key on different things, and you need
+to be able to tell which one is working.
+
+`cache_affinity` and `routing.strategy: prefix_affinity` solve neighboring
+problems and compose. Prefix affinity keys on the prompt content, for
+self-hosted replicas reusing a local KV cache. Cache affinity keys on a
+caller-chosen string, for vendor prompt caches you are billed against.
 
 ### Semantic cache
 
