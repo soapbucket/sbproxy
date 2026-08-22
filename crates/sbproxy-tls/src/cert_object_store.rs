@@ -419,8 +419,8 @@ mod tests {
     /// filesystem name. Clearing it takes the builder down its fsspec
     /// branch, where the account host is rejected as a container name for
     /// containing a dot, `parse_url` returns `Unable to recognise URL`,
-    /// and `open_cert_backend` falls back to an in-memory cert store that
-    /// re-issues on every restart.
+    /// and `open_cert_backend` refuses to start (azure is a shared backend,
+    /// so a failure to open it is fatal rather than a fallback).
     #[test]
     fn an_azure_filesystem_name_survives_into_the_builder() {
         // No credentials are needed to reach this point: the Azure

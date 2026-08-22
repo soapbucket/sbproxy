@@ -1074,7 +1074,11 @@ pub(super) async fn request_filter(
     // hot-path read).
     #[cfg(feature = "agent-class")]
     {
-        if let Some(resolver) = reload::agent_class_resolver() {
+        // Clone the Arc out of the ArcSwap guard before resolving: the
+        // resolver call can await, and a guard held across an await
+        // pins a reload's old resolver for the length of a DNS query.
+        let resolver = reload::agent_class_resolver().map(|g| std::sync::Arc::clone(&g));
+        if let Some(resolver) = resolver {
             let user_agent = session
                 .req_header()
                 .headers
@@ -1083,14 +1087,20 @@ pub(super) async fn request_filter(
             // Auth runs below. If bot_auth verifies a keyid, the
             // request is restamped with that stronger signal before
             // upstream headers and metrics read the context.
-            crate::agent_class::stamp_request_context(
+            //
+            // Offloaded, not inline: resolver step 2 does a
+            // forward-confirmed PTR lookup against a zone the client
+            // owns, and that lookup is synchronous. Only a request that
+            // actually needs the lookup pays the blocking-pool hop.
+            crate::agent_class::stamp_request_context_offloaded(
                 ctx,
                 &resolver,
                 None,
                 false,
                 ctx.client_ip,
                 user_agent,
-            );
+            )
+            .await;
         }
     }
 
@@ -1991,7 +2001,12 @@ pub(super) async fn request_filter(
                     } else {
                         bytes::Bytes::new()
                     };
-                    let Some(req) = build_signature_verification_request(session, signed_body)
+                    // The listener's TLS state is the only place the
+                    // real scheme exists for an HTTP/1.1 request line,
+                    // and RFC 9421's `@target-uri` needs it.
+                    let scheme = if ctx.tls_terminated { "https" } else { "http" };
+                    let Some(req) =
+                        build_signature_verification_request(session, signed_body, scheme)
                     else {
                         warn!(
                             hostname = %ctx.hostname,
@@ -3460,20 +3475,29 @@ pub(super) async fn request_filter(
             if auth_succeeded && decided_auth_type == "bot_auth" {
                 #[cfg(feature = "agent-class")]
                 if let Some(keyid) = bot_auth_keyid.as_deref() {
-                    if let Some(resolver) = reload::agent_class_resolver() {
+                    // Guard dropped before the await; see the first
+                    // stamping site above.
+                    let resolver =
+                        reload::agent_class_resolver().map(|g| std::sync::Arc::clone(&g));
+                    if let Some(resolver) = resolver {
                         let user_agent = session
                             .req_header()
                             .headers
                             .get(http::header::USER_AGENT)
                             .and_then(|v| v.to_str().ok());
-                        crate::agent_class::stamp_request_context(
+                        // A verified keyid usually settles the verdict
+                        // at step 1, in which case this offloads
+                        // nothing. It only reaches DNS when the catalog
+                        // does not recognize the keyid.
+                        crate::agent_class::stamp_request_context_offloaded(
                             ctx,
                             &resolver,
                             Some(keyid),
                             false,
                             ctx.client_ip,
                             user_agent,
-                        );
+                        )
+                        .await;
                     }
                 }
             }

@@ -16606,6 +16606,10 @@ mod external_guardrail_context_tests {
             self.puts.fetch_add(1, Ordering::SeqCst);
             *self.stored.lock().expect("idempotency stored lock") = Some(response);
         }
+
+        fn backend_label(&self) -> &'static str {
+            "memory"
+        }
     }
 
     /// Bind a counting embedding endpoint that never returns a vector.

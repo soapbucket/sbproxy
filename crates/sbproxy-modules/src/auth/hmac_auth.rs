@@ -43,10 +43,13 @@
 //!
 //! Timestamp window, per the ticket's analysis and APISIX's model
 //! (`clock_skew`, default 300 s): the `created` signature parameter is
-//! mandatory, a `created` more than `clock_skew_seconds` in the past
-//! is refused as stale, and the underlying verifier refuses a
-//! `created` more than `clock_skew_seconds` in the future and any
-//! elapsed `expires`. AWS SigV4 (`X-Amz-Date`, 5-15 minute windows)
+//! mandatory here, and the underlying verifier enforces the window in
+//! both directions with the same `clock_skew_seconds`, refusing a
+//! `created` more than that far in the past as stale, one more than
+//! that far in the future, and any elapsed `expires`. This module used
+//! to re-implement the stale half itself, because the verifier had only
+//! the future half; it owns neither now, so `bot_auth` gets the same
+//! bound. AWS SigV4 (`X-Amz-Date`, 5-15 minute windows)
 //! and Stripe webhook signatures (`t=` timestamp, 5 minute default
 //! tolerance) use the same defense; GitHub's `X-Hub-Signature-256`
 //! omits it and is the weaker shape. A single-use nonce ledger
@@ -336,35 +339,19 @@ impl HmacAuth {
         };
         // Replay defense is the created-timestamp window, so a
         // signature without `created` has no freshness bound and is
-        // refused outright.
-        let Some(created) = created else {
+        // refused outright. This half stays here because RFC 9421 makes
+        // `created` optional and the verifier cannot know that this
+        // provider requires it.
+        //
+        // The staleness half used to be re-implemented here, because
+        // `check_freshness` in the verifier enforced only the future
+        // direction. It enforces both now, with the same
+        // `clock_skew_seconds` this provider passes it, so the window is
+        // owned in one place and `bot_auth` gets it too.
+        if created.is_none() {
             return HmacVerdict::Failed {
                 key_id: kid,
                 reason: "missing required `created` parameter".to_string(),
-            };
-        };
-
-        // Staleness: `created` more than the window in the past is a
-        // replay candidate and is refused before any crypto runs. The
-        // future direction and `expires` are enforced inside the
-        // verifier with the same window.
-        let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            Ok(d) => d.as_secs() as i64,
-            Err(_) => {
-                return HmacVerdict::Failed {
-                    key_id: kid,
-                    reason: "system clock before epoch".to_string(),
-                }
-            }
-        };
-        let skew = i64::try_from(self.clock_skew_seconds).unwrap_or(i64::MAX);
-        if created < now.saturating_sub(skew) {
-            return HmacVerdict::Failed {
-                key_id: kid,
-                reason: format!(
-                    "signature created timestamp is stale: created={created}, window={}s",
-                    self.clock_skew_seconds
-                ),
             };
         }
 

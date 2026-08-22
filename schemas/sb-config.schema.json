@@ -8743,7 +8743,7 @@
           "type": "boolean"
         },
         "algorithms": {
-          "description": "Allowed algorithms in priority order (e.g. `[\"br\", \"gzip\"]`).",
+          "description": "Allowed algorithms in priority order (e.g. `[\"br\", \"gzip\"]`). The first entry the client's `Accept-Encoding` accepts is the one served, so list your preferred codec first. Valid entries are `zstd`, `br`, and `gzip`; any other name fails config load. Leave the list empty to take the built-in order, best ratio first: `zstd`, then `br`, then `gzip`.",
           "default": [],
           "type": "array",
           "items": {

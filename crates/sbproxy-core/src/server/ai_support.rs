@@ -1902,6 +1902,52 @@ pub(super) fn map_upstream_failure(e: &Error) -> (u16, Option<&'static str>) {
     }
 }
 
+/// Rebuild an origin-form request URI as the absolute URI RFC 9421
+/// §2.2.2 defines `@target-uri` as.
+///
+/// The scheme is not on an HTTP/1.1 request line and the authority is
+/// only in the `Host` header, so the middleware that derives
+/// `@target-uri` cannot see either. This is the layer that can: the
+/// caller knows whether the listener terminated TLS. Stamping both onto
+/// the URI here means the verifier reconstructs the same absolute URI a
+/// conformant signer signed, instead of guessing.
+///
+/// Returns the URI unchanged when it already carries a scheme (HTTP/2,
+/// where pingora fills the pseudo-headers in) or when nothing names an
+/// authority (HTTP/1.0 with no `Host`), because there is nothing to
+/// assemble then.
+pub(super) fn absolute_request_uri(
+    uri: &http::Uri,
+    headers: &http::HeaderMap,
+    scheme: &str,
+) -> http::Uri {
+    if uri.scheme().is_some() {
+        return uri.clone();
+    }
+    let Some(authority) = uri.authority().map(|a| a.as_str().to_string()).or_else(|| {
+        headers
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    }) else {
+        return uri.clone();
+    };
+    let path_and_query = uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    http::Uri::builder()
+        .scheme(scheme)
+        .authority(authority.as_str())
+        .path_and_query(path_and_query.as_str())
+        .build()
+        // An authority the `Host` header carried can be anything a
+        // client typed, so the build can fail. Falling back to the
+        // origin form keeps verification on the derivation it had
+        // before rather than failing the request here.
+        .unwrap_or_else(|_| uri.clone())
+}
+
 /// Build the `http::Request<bytes::Bytes>` view of the inbound
 /// Pingora session that the RFC 9421 verifier expects.
 ///
@@ -1911,13 +1957,19 @@ pub(super) fn map_upstream_failure(e: &Error) -> (u16, Option<&'static str>) {
 /// whose signature covers no body component, and the drained replay
 /// buffer when it does; a partial body would be worse than no body,
 /// because it fails a signature that is in fact valid.
+///
+/// `scheme` is `https` when the listener terminated TLS (or a trusted
+/// proxy said so) and `http` otherwise. It is stamped onto the
+/// reconstructed URI so `@target-uri` and `@scheme` derive the values
+/// the client's own signer used.
 pub(super) fn build_signature_verification_request(
     session: &Session,
     body: bytes::Bytes,
+    scheme: &str,
 ) -> Option<http::Request<bytes::Bytes>> {
     let req_header = session.req_header();
     let method = req_header.method.clone();
-    let uri = req_header.uri.clone();
+    let uri = absolute_request_uri(&req_header.uri, &req_header.headers, scheme);
     let mut builder = http::Request::builder().method(method).uri(uri);
     if let Some(hmap) = builder.headers_mut() {
         for (name, value) in &req_header.headers {

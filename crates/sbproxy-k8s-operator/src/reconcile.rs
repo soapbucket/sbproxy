@@ -24,7 +24,7 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::ObjectMeta;
 use kube::Resource;
 
-use crate::crd::{ClusteringSpec, SBProxy, SBProxyConfig};
+use crate::crd::{ClusteringSpec, SBProxy, SBProxyConfig, SBProxyStatus};
 
 // --- Hot-reload decision ---
 
@@ -34,20 +34,33 @@ use crate::crd::{ClusteringSpec, SBProxy, SBProxyConfig};
 /// Hot-reload is preferred when:
 /// 1. The `SBProxy` has `spec.adminAuthSecretRef` set (so the
 ///    operator can authenticate against `/admin/reload`).
-/// 2. There is an existing Deployment (we can read the previous
-///    config hash from its pod-template annotations).
+/// 2. There is an existing Deployment (a first apply has to create
+///    the pods before anything can be reloaded into them).
 /// 3. Only the underlying `sb.yml` changed (the existing
 ///    Deployment's image, replicas, resources match the desired
 ///    Deployment).
+/// 4. The config the pods are serving is not already the new one.
 ///
 /// When any of those conditions fails we fall back to the
 /// rollout-restart path so a config-incompatible pod is never left
 /// running.
+///
+/// The `running_config_hash` argument comes from [`running_config_hash`],
+/// which reads `status.configHash`, and is deliberately not the pod
+/// template's `sbproxy.dev/config-hash` annotation. A hot reload does not
+/// touch the pod template, by design: changing it is what rolls the pods,
+/// which is the restart the reload exists to avoid. Gate 4 read that
+/// annotation until now, so it compared the new config against a value that
+/// could never advance on the hot-reload path. It was therefore permanently
+/// true, and every 300s requeue plus every watch event on the SBProxy,
+/// ConfigMap, Service, Deployment, or SBProxyConfig reloaded the whole fleet
+/// again, rebuilding each handler chain and dropping warmed per-process
+/// state for a config the pods already ran.
 pub fn should_hot_reload(
     sbproxy: &SBProxy,
     existing_deploy: Option<&Deployment>,
     desired_deploy: &Deployment,
-    previous_config_hash: Option<&str>,
+    running_config_hash: Option<&str>,
     new_config_hash: &str,
 ) -> bool {
     // Gate 1: adminAuthSecretRef must be configured.
@@ -74,10 +87,11 @@ pub fn should_hot_reload(
 
     // Gate 4: the config actually changed. Hot-reload is wasted
     // work otherwise.
-    match previous_config_hash {
-        Some(prev) => prev != new_config_hash,
-        // No previous hash recorded => treat as a config change so
-        // the reload still flushes any drift.
+    match running_config_hash {
+        Some(running) => running != new_config_hash,
+        // No hash recorded yet (a first reconcile, or a Deployment created
+        // by an operator old enough to predate the field) => treat as a
+        // config change so the reload still flushes any drift.
         None => true,
     }
 }
@@ -139,7 +153,65 @@ pub fn previous_config_hash(deploy: &Deployment) -> Option<String> {
 
 /// Annotation key stamped onto pod templates so that updating the underlying
 /// config triggers a rolling restart.
+///
+/// It records the config the pods were *started* with, which is not always
+/// the config they are serving: a hot reload swaps the config inside the
+/// running processes and deliberately leaves this alone, because changing it
+/// is the rolling restart. [`running_config_hash`] is the one to read when
+/// the question is what the fleet is actually running.
 pub const CONFIG_HASH_ANNOTATION: &str = "sbproxy.dev/config-hash";
+
+/// The hash of the `sb.yml` the operator has finished delivering to this
+/// `SBProxy`, or `None` when nothing has been delivered yet.
+///
+/// Read off `status.configHash`, which the reconcile writes only once the
+/// ConfigMap, Service, and workload have all been applied, or once every pod
+/// has accepted a hot reload. That is the whole reason the field is the right
+/// source for the hot-reload decision and the pod-template annotation is not:
+/// it advances on both delivery paths, and the annotation advances on only
+/// one of them.
+///
+/// A status write is best effort, so a dropped one leaves this trailing by a
+/// pass and costs one redundant hot reload. That is a bounded degradation in
+/// the same direction the old code was wrong in, not a new failure mode.
+///
+/// [`SBProxyStatus::delivered_config_hash`] also refuses a `configHash` with
+/// no `observedConfigHash` beside it, which is the shape a pre-upgrade
+/// operator left behind when it stamped the hash before applying anything.
+/// Note what that implies for an install whose CRD has not been upgraded
+/// alongside the operator image: the apiserver prunes the unknown
+/// `observedConfigHash` field, this reads `None` on every pass, and the
+/// fleet is hot-reloaded once per requeue again. Loud and wasteful rather
+/// than silently stuck, and it stops the moment the CRD is applied.
+pub fn running_config_hash(sbproxy: &SBProxy) -> Option<&str> {
+    sbproxy
+        .status
+        .as_ref()
+        .and_then(SBProxyStatus::delivered_config_hash)
+}
+
+/// The hash to stamp on the pod template of the workload about to be applied.
+///
+/// Usually the new config hash, which is what makes a config edit roll the
+/// pods. The exception is the pass right after a successful hot reload: the
+/// pods are already serving `new_config_hash` while their template still
+/// carries whatever they were started with, and re-stamping the current hash
+/// would change the pod template and roll the whole fleet for a config it is
+/// already running, undoing exactly what the hot reload bought.
+///
+/// So when the pods already run the new config and a template hash exists,
+/// keep the template hash. Every other case, including a first apply and a
+/// hot reload that failed, uses the new hash and rolls.
+pub fn rollout_config_hash<'a>(
+    existing_template_hash: Option<&'a str>,
+    running_config_hash: Option<&str>,
+    new_config_hash: &'a str,
+) -> &'a str {
+    match (existing_template_hash, running_config_hash) {
+        (Some(template), Some(running)) if running == new_config_hash => template,
+        _ => new_config_hash,
+    }
+}
 
 /// Label that marks every owned object so kubectl filtering and the operator's
 /// own list-watch selectors are consistent.
@@ -889,7 +961,7 @@ pub fn should_hot_reload_statefulset(
     sbproxy: &SBProxy,
     existing: Option<&StatefulSet>,
     desired: &StatefulSet,
-    previous_config_hash: Option<&str>,
+    running_config_hash: Option<&str>,
     new_config_hash: &str,
 ) -> bool {
     if sbproxy.spec.admin_auth_secret_ref.is_none() {
@@ -902,8 +974,8 @@ pub fn should_hot_reload_statefulset(
     if !statefulset_spec_matches_except_config_hash(existing, desired) {
         return false;
     }
-    match previous_config_hash {
-        Some(prev) => prev != new_config_hash,
+    match running_config_hash {
+        Some(running) => running != new_config_hash,
         None => true,
     }
 }
@@ -1094,6 +1166,35 @@ pub fn check_acme_storage_for_replicas(sbproxy: &SBProxy, config_yaml: &str) -> 
     ))
 }
 
+// --- Status patches ---
+//
+// The `SBProxy` status carries two hashes because a reconcile pass has two
+// interesting moments and operators ask about both. Keeping the two patch
+// bodies here, named for the moment each belongs to, is what stops the
+// "rolled out" claim from drifting back to the top of the pass: the early
+// call site has no way to spell `configHash`.
+
+/// Status patch for the point in the pass where the config has been read,
+/// rendered, and validated, and nothing has been applied yet.
+///
+/// Deliberately does not carry `configHash` and does not clear `lastError`.
+/// Both are documented as end-of-rollout signals: an operator who sees
+/// `configHash: H1` with an empty `lastError` reads that as "the pods are on
+/// H1". Writing them here made a 403 on the very next ConfigMap patch report
+/// a completed rollout while every pod kept serving the previous config.
+pub fn observed_status_patch(config_hash: &str) -> serde_json::Value {
+    serde_json::json!({ "status": { "observedConfigHash": config_hash } })
+}
+
+/// Status patch for the point where the ConfigMap, Service, and workload have
+/// all been applied, or every pod has accepted a hot reload.
+///
+/// This is the only producer of `configHash`, and the only place `lastError`
+/// is cleared.
+pub fn rolled_out_status_patch(config_hash: &str) -> serde_json::Value {
+    serde_json::json!({ "status": { "configHash": config_hash, "lastError": "" } })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1231,6 +1332,16 @@ mod tests {
         sbp
     }
 
+    fn fixture_clustered_sbproxy_with_admin_auth() -> SBProxy {
+        let mut sbp = fixture_clustered_sbproxy();
+        sbp.spec.admin_auth_secret_ref = Some(crate::crd::AdminAuthSecretRef {
+            name: "demo-admin".to_string(),
+            key: "authorization".to_string(),
+        });
+        sbp.spec.admin_port = 9090;
+        sbp
+    }
+
     #[test]
     fn should_hot_reload_false_without_admin_auth() {
         let sbp = fixture_sbproxy(); // no admin_auth_secret_ref
@@ -1319,6 +1430,207 @@ mod tests {
             Some("same-hash"),
             "same-hash"
         ));
+    }
+
+    // --- Hot-reload idempotence ---
+
+    /// The status a pass leaves behind once it has finished delivering a
+    /// config by either route: `observedConfigHash` from the pre-apply write
+    /// and `configHash` from the post-apply one.
+    fn delivered(sbp: &SBProxy, config_hash: &str) -> SBProxy {
+        let mut sbp = sbp.clone();
+        sbp.status = Some(SBProxyStatus {
+            config_hash: config_hash.to_string(),
+            // Written first on every pass that reaches the rolled-out patch,
+            // so a real CR never carries one without the other.
+            observed_config_hash: config_hash.to_string(),
+            ..Default::default()
+        });
+        sbp
+    }
+
+    /// The status shape an operator build that predates `observedConfigHash`
+    /// left behind: `configHash` stamped straight after validation, so it
+    /// says "seen", not "delivered".
+    fn seen_by_a_pre_upgrade_operator(sbp: &SBProxy, config_hash: &str) -> SBProxy {
+        let mut sbp = sbp.clone();
+        sbp.status = Some(SBProxyStatus {
+            config_hash: config_hash.to_string(),
+            ..Default::default()
+        });
+        sbp
+    }
+
+    #[test]
+    fn the_pass_after_a_hot_reload_does_not_reload_the_fleet_again() {
+        // The wiring this fixes, spelled out. Pass 1 hot-reloaded H0 -> H1
+        // and deliberately skipped the Deployment patch, because advancing
+        // the pod template is the rolling restart the reload existed to
+        // avoid. So the template still reads H0 and always will.
+        let sbp = fixture_sbproxy_with_admin_auth();
+        let existing = desired_deployment(&sbp, "H0");
+        let template_hash = previous_config_hash(&existing);
+        assert_eq!(template_hash.as_deref(), Some("H0"));
+
+        // Pass 2, 300 seconds later, with nothing changed.
+        let sbp = delivered(&sbp, "H1");
+        let running = running_config_hash(&sbp);
+        let desired = desired_deployment(
+            &sbp,
+            rollout_config_hash(template_hash.as_deref(), running, "H1"),
+        );
+
+        // The old caller passed the pod-template annotation here. It is
+        // permanently H0 on this path, so gate 4 was permanently true and
+        // every requeue and every watch event reloaded the whole fleet
+        // again, rebuilding each handler chain and dropping warmed state.
+        let gated_on_template = should_hot_reload(
+            &sbp,
+            Some(&existing),
+            &desired,
+            template_hash.as_deref(),
+            "H1",
+        );
+        assert!(
+            gated_on_template,
+            "the pod-template annotation is exactly the value that can never \
+             advance on the hot-reload path"
+        );
+
+        // Reading what was actually delivered makes the pass idempotent.
+        assert!(
+            !should_hot_reload(&sbp, Some(&existing), &desired, running, "H1"),
+            "a second identical pass must do no work"
+        );
+
+        // And the apply that follows must not roll the pods either: the pod
+        // template it sends has to be byte-identical to the live one.
+        assert_eq!(
+            serde_json::to_value(&existing).unwrap()["spec"]["template"],
+            serde_json::to_value(&desired).unwrap()["spec"]["template"],
+            "re-stamping the current hash would restart the fleet for a \
+             config it is already running"
+        );
+    }
+
+    #[test]
+    fn a_further_config_edit_after_a_hot_reload_still_reloads() {
+        // The fix must not turn into "never reload again". H1 was delivered;
+        // the user edits the config to H2.
+        let sbp = delivered(&fixture_sbproxy_with_admin_auth(), "H1");
+        let existing = desired_deployment(&sbp, "H0");
+        let running = running_config_hash(&sbp);
+        let desired = desired_deployment(
+            &sbp,
+            rollout_config_hash(previous_config_hash(&existing).as_deref(), running, "H2"),
+        );
+        assert!(should_hot_reload(
+            &sbp,
+            Some(&existing),
+            &desired,
+            running,
+            "H2"
+        ));
+    }
+
+    #[test]
+    fn a_config_the_pods_have_not_been_given_still_rolls_them() {
+        // Nothing delivered yet, or a hot reload that failed: the template
+        // hash moves, which is what the rolling restart is triggered by.
+        assert_eq!(rollout_config_hash(Some("H0"), None, "H1"), "H1");
+        assert_eq!(rollout_config_hash(Some("H0"), Some("H0"), "H1"), "H1");
+        assert_eq!(rollout_config_hash(None, None, "H1"), "H1");
+        // Delivered by a hot reload: hold the template still.
+        assert_eq!(rollout_config_hash(Some("H0"), Some("H1"), "H1"), "H0");
+        // No template to hold onto (a first apply) uses the new hash even
+        // when status claims delivery, so the annotation is never absent.
+        assert_eq!(rollout_config_hash(None, Some("H1"), "H1"), "H1");
+    }
+
+    #[test]
+    fn running_config_hash_ignores_an_empty_status_field() {
+        let sbp = fixture_sbproxy_with_admin_auth();
+        assert_eq!(running_config_hash(&sbp), None, "no status at all");
+        // `configHash` is `skip_serializing_if = "String::is_empty"`, so a CR
+        // that has a status for `lastError` alone deserializes to an empty
+        // string here. Treating that as a delivered hash would compare a
+        // real hash against "" and reload forever.
+        assert_eq!(running_config_hash(&delivered(&sbp, "")), None);
+        assert_eq!(running_config_hash(&delivered(&sbp, "H1")), Some("H1"));
+    }
+
+    #[test]
+    fn a_config_hash_written_before_the_field_meant_delivered_is_not_trusted() {
+        // The upgrade hazard. The previous operator stamped `configHash`
+        // straight after validation, so a CR whose last pre-upgrade pass
+        // then failed its ConfigMap apply carries a hash the pods never
+        // received. Read as delivered, gate 4 goes false and
+        // `rollout_config_hash` pins the pod template where it is, so the
+        // apply is a no-op and the fleet stays on the old config while
+        // `kubectl get sbproxy` reads healthy: `configHash` set, no
+        // `lastError`. Nothing short of a pod restart moves it.
+        let sbp = seen_by_a_pre_upgrade_operator(&fixture_sbproxy_with_admin_auth(), "H1");
+        assert_eq!(
+            running_config_hash(&sbp),
+            None,
+            "a hash with no observedConfigHash beside it was written under the \
+             old meaning and says nothing about what the pods have"
+        );
+
+        let existing = desired_deployment(&sbp, "H0");
+        let template_hash = previous_config_hash(&existing);
+        let running = running_config_hash(&sbp);
+        let desired = desired_deployment(
+            &sbp,
+            rollout_config_hash(template_hash.as_deref(), running, "H1"),
+        );
+        assert!(
+            should_hot_reload(&sbp, Some(&existing), &desired, running, "H1"),
+            "the first pass after the upgrade has to deliver H1 rather than \
+             assume it already landed"
+        );
+        // And if the reload cannot run, the template moves and the pods roll.
+        assert_eq!(
+            rollout_config_hash(template_hash.as_deref(), running, "H1"),
+            "H1"
+        );
+    }
+
+    #[test]
+    fn the_clustered_path_is_idempotent_the_same_way() {
+        let sbp = fixture_clustered_sbproxy_with_admin_auth();
+        let existing = desired_statefulset(&sbp, "H0");
+        let template_hash = previous_config_hash_statefulset(&existing);
+
+        let sbp = delivered(&sbp, "H1");
+        let running = running_config_hash(&sbp);
+        let desired = desired_statefulset(
+            &sbp,
+            rollout_config_hash(template_hash.as_deref(), running, "H1"),
+        );
+
+        let gated_on_template = should_hot_reload_statefulset(
+            &sbp,
+            Some(&existing),
+            &desired,
+            template_hash.as_deref(),
+            "H1",
+        );
+        assert!(
+            gated_on_template,
+            "same defect, same shape, on the StatefulSet path"
+        );
+        assert!(!should_hot_reload_statefulset(
+            &sbp,
+            Some(&existing),
+            &desired,
+            running,
+            "H1"
+        ));
+        assert_eq!(
+            serde_json::to_value(&existing).unwrap()["spec"]["template"],
+            serde_json::to_value(&desired).unwrap()["spec"]["template"]
+        );
     }
 
     #[test]
@@ -1738,5 +2050,50 @@ mod tests {
         // A document that does not parse belongs to validate_config_yaml,
         // which reports it with the parser's own message.
         assert!(check_acme_storage_for_replicas(&sbp, "origins:\n  x: [unterminated").is_ok());
+    }
+
+    // --- Status patches ---
+
+    #[test]
+    fn the_pre_apply_status_patch_cannot_claim_a_rollout() {
+        // The failure this prevents: validation passes, the ConfigMap apply
+        // then 403s, and `kubectl get sbproxy demo -o yaml` shows
+        // `configHash: H1` with an empty `lastError`, which the CRD documents
+        // as "the rollout happened". The pods are still on H0.
+        let patch = observed_status_patch("H1");
+        let status = patch.get("status").expect("a status patch");
+
+        assert_eq!(
+            status.get("observedConfigHash").and_then(|v| v.as_str()),
+            Some("H1"),
+            "the pre-apply write says the operator has seen H1"
+        );
+        assert!(
+            status.get("configHash").is_none(),
+            "configHash is the rolled-out signal and must not be written before \
+             anything is applied"
+        );
+        assert!(
+            status.get("lastError").is_none(),
+            "a merge patch with lastError: \"\" clears a real error before the \
+             pass that would have fixed it has run"
+        );
+    }
+
+    #[test]
+    fn the_post_apply_status_patch_stamps_the_hash_and_clears_the_error() {
+        let patch = rolled_out_status_patch("H1");
+        let status = patch.get("status").expect("a status patch");
+
+        assert_eq!(
+            status.get("configHash").and_then(|v| v.as_str()),
+            Some("H1")
+        );
+        assert_eq!(status.get("lastError").and_then(|v| v.as_str()), Some(""));
+        assert!(
+            status.get("observedConfigHash").is_none(),
+            "the pre-apply write already recorded it; re-writing it here would \
+             hide a pass that stamped one and not the other"
+        );
     }
 }

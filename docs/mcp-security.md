@@ -1,6 +1,6 @@
 # MCP security
 
-*Last modified: 2026-08-17*
+*Last modified: 2026-08-21*
 
 For a row-by-row scorecard against the OWASP MCP Top 10, coverage stated
 plainly as full, partial, or out of gateway scope, see
@@ -611,18 +611,28 @@ this event's actual field names.
 | With what arguments | `sbproxy.tool.arguments_hash` (dispatched calls only, salted digest) / `gen_ai.tool.call.arguments` (opt-in, verbatim, every tool-invocation record, dispatched or refused) | tool-invocation records |
 | What was decided, and why | `sbproxy.decision.verdict`, `sbproxy.decision.reason` | every record |
 | Under which rule | `sbproxy.decision.rule_id` | records where a named rule fired |
-| When, in order, without gaps | `sbproxy.evidence.seq`, `timestamp` (envelope) | every record |
+| When, in order, without gaps | `sbproxy.evidence.seq`, `sbproxy.evidence.instance`, `timestamp` (envelope) | every record |
 | What the tool contract was before/after | `sbproxy.tool.digest.old`, `sbproxy.tool.digest.new` | definition-change records |
 | What the registry status was before/after | `sbproxy.registry.status.old`, `sbproxy.registry.status.new` | registry-change records |
 
-The gapless property on `sbproxy.evidence.seq` is per tenant. Tool-invocation
-records carry the caller's own tenant, so gaps are detectable within one
-tenant's own traffic. Definition-change and registry-change records have no
-caller (they come from a background catalog refresh or a config reload, not a
-request) and share one sequence under the empty-tenant bucket; do not expect
-per-record-kind gaplessness across that shared bucket, only across each
-tenant's own tool-invocation stream and the shared background-event stream
-each on their own terms.
+The gapless property on `sbproxy.evidence.seq` is per tenant **and per
+emitting process**. The counter lives in proxy memory, so every replica and
+every restart begins a new sequence at 1; `sbproxy.evidence.instance` names
+the process that minted the number, and a hole is only a hole within one
+`(sbproxy.evidence.instance, sbproxy.tenant.id)` pair. Group on the tenant
+alone across two replicas and you get `1, 1, 2, 2, 3, 3`, which hides both
+holes and duplicates; group on it across a restart and a fresh counter reads
+as a rollback. A run whose tail was cut off is the case the sequence cannot
+tell you about at all: a replica killed mid-stream and one shut down cleanly
+both leave a sequence that simply stops.
+
+Tool-invocation records carry the caller's own tenant, so gaps are detectable
+within one tenant's own traffic on one instance. Definition-change and
+registry-change records have no caller (they come from a background catalog
+refresh or a config reload, not a request) and share one sequence under the
+empty-tenant bucket; do not expect per-record-kind gaplessness across that
+shared bucket, only across each tenant's own tool-invocation stream and the
+shared background-event stream each on their own terms.
 
 "Who approved that access" splits in two. Which rule authorized a call is on
 the record (`sbproxy.decision.rule_id`, `sbproxy.decision.reason`). Who
@@ -665,8 +675,9 @@ so it lands beside every other denial you already collect. The session
 ledger records per-session activity; see [mcp.md](mcp.md).
 
 **Still yours.** Retention, correlation, and alerting. `sbproxy.evidence.seq`
-is a gapless per-tenant counter while emission is enabled, which is what
-makes SIEM-side retention safe to rely on: your consumer can prove it has
+is a gapless counter per tenant per emitting process while emission is
+enabled, which is what makes SIEM-side retention safe to rely on: a consumer
+grouping on `(sbproxy.evidence.instance, sbproxy.tenant.id)` can prove it has
 every record rather than trusting that it does. See [events.md](events.md#retention).
 The gateway emits; your SIEM decides what matters and how long to keep it.
 

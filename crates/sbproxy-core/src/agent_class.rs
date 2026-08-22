@@ -19,8 +19,9 @@
 #![cfg(feature = "agent-class")]
 
 use std::net::IpAddr;
+use std::sync::Arc;
 
-use sbproxy_modules::policy::agent_class::{AgentClassResolver, ResolveInputs};
+use sbproxy_modules::policy::agent_class::{AgentClassResolver, ResolveInputs, Resolved};
 
 use crate::context::RequestContext;
 
@@ -33,7 +34,7 @@ use crate::context::RequestContext;
 ///
 /// `anonymous_bot_auth` should be `true` when a Web Bot Auth
 /// signature was present and structurally valid but advertised a
-/// `keyid` no catalog entry recognises.
+/// `keyid` no catalog entry recognizes.
 pub fn stamp_request_context(
     ctx: &mut RequestContext,
     resolver: &AgentClassResolver,
@@ -48,7 +49,91 @@ pub fn stamp_request_context(
         client_ip,
         user_agent,
     };
-    let resolved = resolver.resolve(&inputs);
+    apply(ctx, resolver.resolve(&inputs));
+}
+
+/// Same stamping as [`stamp_request_context`], except a resolution that
+/// would issue a live DNS query is moved onto Tokio's blocking pool
+/// first.
+///
+/// Resolver step 2 (forward-confirmed reverse DNS) reaches the network
+/// through a synchronous port, and the reverse zone it queries belongs
+/// to the client being identified. On a verdict-cache miss that call
+/// blocks whichever thread runs it, and in `request_filter` that thread
+/// is one of the proxy's async workers: a handful of clients whose
+/// reverse zones answer slowly, or not at all, would otherwise be
+/// enough to pin every worker the process has.
+/// `sbproxy-security::agent_verify` bounds how long a single wait can
+/// run; this decides where it runs.
+///
+/// The offload is conditional because a blocking-pool hop is not free
+/// and nothing else in the resolver chain can block: steps 1 and 3 read
+/// in-memory state. `AgentClassResolver::resolve_would_query_dns`
+/// decides, and a test in that module pins the predicate to the
+/// resolver's actual behavior rather than to a reading of its source.
+///
+/// Callers with no Tokio runtime (log replay, unit tests) resolve
+/// inline, which is what they did before.
+pub async fn stamp_request_context_offloaded(
+    ctx: &mut RequestContext,
+    resolver: &Arc<AgentClassResolver>,
+    bot_auth_keyid: Option<&str>,
+    anonymous_bot_auth: bool,
+    client_ip: Option<IpAddr>,
+    user_agent: Option<&str>,
+) {
+    let inputs = ResolveInputs {
+        bot_auth_keyid,
+        anonymous_bot_auth,
+        client_ip,
+        user_agent,
+    };
+    if !resolver.resolve_would_query_dns(&inputs) || tokio::runtime::Handle::try_current().is_err()
+    {
+        stamp_request_context(
+            ctx,
+            resolver,
+            bot_auth_keyid,
+            anonymous_bot_auth,
+            client_ip,
+            user_agent,
+        );
+        return;
+    }
+
+    // The blocking task outlives this borrow, so the two string inputs
+    // have to be owned. Only the DNS path pays for that.
+    let keyid = bot_auth_keyid.map(str::to_owned);
+    let ua = user_agent.map(str::to_owned);
+    let resolver = Arc::clone(resolver);
+    let outcome = tokio::task::spawn_blocking(move || {
+        resolver.resolve(&ResolveInputs {
+            bot_auth_keyid: keyid.as_deref(),
+            anonymous_bot_auth,
+            client_ip,
+            user_agent: ua.as_deref(),
+        })
+    })
+    .await;
+    match outcome {
+        Ok(resolved) => apply(ctx, resolved),
+        Err(error) => {
+            // Leave the context unstamped rather than invent a verdict.
+            // An unstamped context is a state the rest of the pipeline
+            // already handles: it is what it sees when no resolver is
+            // installed at all.
+            tracing::warn!(
+                target: "sbproxy::agent_class",
+                %error,
+                "agent-class resolution task failed; request left unclassified"
+            );
+        }
+    }
+}
+
+/// Stamp a finished verdict onto the context. Shared by the inline and
+/// offloaded entry points so the two cannot stamp different field sets.
+fn apply(ctx: &mut RequestContext, resolved: Resolved) {
     ctx.agent_id = Some(resolved.agent_id);
     ctx.agent_vendor = Some(resolved.vendor);
     ctx.agent_purpose = Some(resolved.purpose);

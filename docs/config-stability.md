@@ -395,6 +395,38 @@ because a chain whose entries are not durable cannot answer the dispute it
 exists for: a truncated hash chain verifies clean, so the lost entries leave
 no marker anywhere.
 
+### `agent_classes.resolver.rdns_enabled` now runs under fixed lookup bounds
+
+**Who this reaches.** Any config that leaves `agent_classes.resolver.rdns_enabled`
+at its default `true` and whose crawlers publish more than four PTR names for a
+single address. A config that sets it to `false`, or whose crawler zones publish
+one PTR per address as vendors do, resolves exactly as before.
+
+**What changes.** Resolver step 2 queries a zone the client being identified
+controls, and it previously followed that zone wherever it led: every PTR name
+it returned got its own forward lookup, serially, with the host resolver's
+default timeout and no ceiling on the total. Five bounds now apply. At most four
+PTR names per address are forward-confirmed; each query is capped at two
+seconds; the forward-confirm loop stops issuing new lookups once two seconds of
+it have elapsed; at most 32 queries are in flight process-wide; and a DNS
+failure is cached for 30 seconds instead of being re-queried on the next
+request. Nothing about the config schema changes.
+
+**What an operator sees when it bites.** A crawler that used to resolve with an
+`rdns` agent-id source resolves from its `User-Agent` instead, which is the same
+degradation path an unreachable resolver has always taken. The agent is still
+classified; only the source stamp and the confidence change. A policy that keys
+on the rDNS source specifically stops matching for that vendor. The
+in-flight cap can produce the same demotion transiently, under a burst of
+traffic from addresses the verdict cache has never seen; the next request from
+that address, 30 seconds later, verifies normally.
+
+**What to do before upgrading.** If a crawler you verify by rDNS publishes more
+than four PTR names per address, verify it by Web Bot Auth `keyid` instead
+(resolver step 1, and higher confidence than rDNS), or accept the UA-based
+classification. There is no knob to raise the cap: it is a bound on what a
+remote party can spend of your request path.
+
 ### `egress.token_exchange` now gates the MCP run-as-user token exchange
 
 **Who this reaches.** Any config with `egress.token_exchange` set to
@@ -537,6 +569,194 @@ the IP-filter policy is the load balancer's rather than the client's.
 **What to do before upgrading.** Turn PROXY protocol off on the load balancer
 in front of SBproxy and pass the client address in a header
 (`X-Forwarded-For`) instead.
+
+### Redis-backed idempotency entries move to a new keyspace
+
+**Who this reaches.** Any origin with `idempotency.backend: redis`. The
+`memory` backend keeps its entries in process and is unaffected.
+
+**What changes.** The storage key was `sbproxy:idem::<Idempotency-Key>`
+for every origin in the cluster, because the workspace segment it was
+scoped by is a field nothing ever fills. It now carries the owning
+origin's `tenant_id` and origin id in length-delimited segments. That
+closes the cross-origin read, and it also means entries written by the
+old build are not readable by the new one. They are not deleted either:
+they sit in the store until their TTL (24 h by default) expires them.
+
+**What an operator sees when it bites.** For the first request under any
+given `Idempotency-Key` after the upgrade, the proxy reports a miss and
+contacts the upstream, even if the pre-upgrade build had already cached a
+response for that key. A client retrying across the restart therefore
+gets its request executed a second time. On a rolling upgrade the two
+builds do not share entries at all, so the window lasts until the last
+old node is drained.
+
+**What to do before upgrading.** Treat it as a cache flush on a path
+where a repeat is a real repeat. Drain in-flight idempotent retries
+before the restart on anything that settles money, or accept one
+re-execution per key. Nothing in the config changes.
+
+### `compression.algorithms` now selects in the order you wrote
+
+**Who this reaches.** Any origin with a `compression.algorithms` list of
+more than one codec, where a client accepts more than one of them. An
+origin with an empty list, or one codec, or one whose clients accept only
+one, sees no change.
+
+**What changes.** The list was documented as a priority order on three
+surfaces and read as a membership set by the negotiator, which then
+walked its own hardcoded `zstd` > `br` > `gzip` ladder. It is a priority
+order now: the list is walked as authored and the first entry the client
+accepts is the one served. `algorithms: [gzip, br]` sent Brotli to a
+browser that accepts both and sends gzip after the upgrade.
+
+**What an operator sees when it bites.** The `Content-Encoding` on
+responses changes to the codec listed first, and
+`sbproxy_compression_decisions_total` moves between codecs. Nothing
+fails.
+
+**What to do before upgrading.** Read your `algorithms` lists as the
+preference they now are. If a list was written to mean "these three are
+allowed, pick the best", reorder it to `[zstd, br, gzip]` or empty it,
+which selects the same way it always did.
+
+Two smaller refusals ride along, both load-time. An entry naming no codec
+(`algorithms: [deflate]`) fails config compile instead of silently
+disabling compression for the origin, and a client `Accept-Encoding`
+qvalue of zero is honored as the refusal RFC 9110 §12.5.3 says it is, so
+a client sending `identity;q=1, *;q=0` gets an uncompressed response
+where it used to get zstd it could not decode.
+
+### `cors.allowed_origins: ["*"]` with `allow_credentials: true` fails config load
+
+**Who this reaches.** Any origin whose `cors:` block sets both. Nothing
+else.
+
+**What changes.** Browsers reject that pair per the Fetch standard, and
+the CORS middleware has always refused to emit any header for it. The
+refusal was a runtime no-op plus one `warn` line per request, so
+`sbproxy validate` exited 0 on a config that served a broken browser app
+forever. It fails config compile now, and the runtime guard that remains
+logs once per process and counts every occurrence on
+`sbproxy_cors_refusals_total{reason="wildcard_with_credentials"}`.
+
+**What an operator sees when it bites.** The proxy refuses to start (or
+refuses the reload) naming the origin and both keys.
+
+**What to do before upgrading.** Run `sbproxy validate` against your
+config. If it names this pair, list the origins you actually mean in
+`allowed_origins`, or drop `allow_credentials`.
+
+### A plain `OPTIONS` request now reaches the upstream
+
+**Who this reaches.** Any origin with a `cors:` block whose upstream
+implements `OPTIONS` itself: a discovery endpoint answering with
+`Allow:`, a capability document, anything WebDAV.
+
+**What changes.** The proxy treated every `OPTIONS` carrying an `Origin`
+header as a CORS preflight, answered 204 from the edge, and never
+contacted the upstream. `Origin` rides on every cross-origin request of
+every method, so adding a `cors:` block silently deleted that endpoint. A
+preflight is now what the Fetch standard defines it as: an `OPTIONS`
+request carrying `Access-Control-Request-Method`. Everything else is a
+normal request and is proxied.
+
+**What an operator sees when it bites.** `OPTIONS` requests that used to
+return an empty 204 now return whatever the upstream returns. A browser
+preflight is unaffected, because a browser always sends
+`Access-Control-Request-Method`.
+
+**What to do before upgrading.** Nothing, unless something depended on
+the proxy answering a non-preflight `OPTIONS` without the upstream.
+
+### RFC 9421 signature verification refuses a stale `created`
+
+**Who this reaches.** Any origin with `authentication: {type: bot_auth}`
+or a `message_signatures:` verifier. `hmac_auth` already enforced this
+by hand and is unchanged in behavior.
+
+**What changes.** The freshness check refused a `created` in the future
+and an `expires` in the past, and had no lower bound on `created` at all.
+A captured `Signature-Input` / `Signature` pair with no `expires` and no
+`nonce` therefore verified forever: an unexpiring bearer token for
+whatever identity it carried. The window is symmetric now, which is what
+`clock_skew_seconds` has always been documented as: `created` may be at
+most `clock_skew_seconds` old and at most `clock_skew_seconds` in the
+future. `expires` can only shorten that window, never extend it.
+
+**What an operator sees when it bites.** A signer whose clock is behind,
+or whose signatures are minted well before they are sent, gets a 401
+whose reason names the stale timestamp.
+
+**What to do before upgrading.** If your signers legitimately mint a
+signature more than 30 seconds before sending it, raise
+`clock_skew_seconds` on that origin to cover the real gap.
+
+### `@target-uri` is the absolute URI RFC 9421 defines
+
+**Who this reaches.** Any signer or verifier whose covered component set
+includes `@target-uri` or `@request-target`. The shipped Web Bot Auth
+wiring covers `@authority`, `@method`, and `@path`, so a config that took
+those defaults is unaffected.
+
+**What changes.** `@target-uri` emitted the origin-form request target
+(`/v1/orders`) where RFC 9421 §2.2.2 defines it as the full absolute URI
+(`https://api.example.com/v1/orders`), so no conformant peer could
+interoperate in either direction. `@request-target` emitted
+`GET /v1/orders`, which is draft-cavage's shape, where RFC 9421 §2.2.5 is
+the request target alone. Both are correct now. For a deprecation
+window, inbound verification retries the old derivation when the
+conformant base fails and the covered set names one of the two, so a
+signer built against the old shape keeps verifying and the proxy logs the
+deprecation once per process.
+
+**What an operator sees when it bites.** Nothing immediately: both bases
+verify. Every acceptance of the old derivation counts on
+`sbproxy_signature_legacy_derivation_total{component}` and logs one
+`warn` per process naming the verifier's key id. The old one stops being
+accepted in a future release.
+
+**What to do before upgrading.** Move signers onto a conformant RFC 9421
+library, and watch
+`sbproxy_signature_legacy_derivation_total` go to zero before the release
+that removes the fallback. Outbound signatures the proxy produces are
+already on the new derivation.
+
+### `acme.storage_backend` on a shared store now refuses to start when it cannot be opened
+
+**Who this reaches.** Any config with `proxy.acme.enabled: true` and
+`storage_backend` set to `file`, `redis`, `s3`, `gcs`, or `azure`, where the
+value in `storage_path` does not actually open: a DSN the Redis parser
+rejects, a bucket URL the object store cannot parse, a shared directory that
+is not mounted in this container. A config whose backend opens is unaffected,
+and so is every pod-local backend (`redb`, `sqlite`, `memory`).
+
+**What changes.** Each of those open failures used to log one `warn` reading
+"certs will NOT persist (in-memory fallback)" and hand back an in-memory
+store. Persistence was the smaller half of what that cost. The in-memory
+store implements neither of `KVStore`'s lock methods, so it inherits the
+single-node defaults, which acquire unconditionally. Every replica therefore
+won its own issuance lease and its own fencing generation, opened its own
+ACME order for the same hostname, and published its HTTP-01 token where no
+peer could read it. The proxy now refuses to start instead, with an error
+naming the backend.
+
+**What an operator sees when it bites.** The process exits at startup rather
+than serving, and the error reads `acme.storage_backend '<backend>' is a
+shared certificate store and could not be opened`. No part of `storage_path`
+is in the message: a Redis DSN carries a password and an object-store URL can
+carry a query credential, so the message names the backend and the failure,
+never the value. Under Kubernetes this is a pod that does not become ready,
+which is visible immediately, rather than a fleet that looks healthy until
+the CA rate-limits the domain days later.
+
+**What to do before upgrading.** Grep the running proxies' startup logs for
+`certs will NOT persist (in-memory fallback)`. That warn line is the old
+build's only report of this condition, and a proxy that emitted it on a shared
+backend is a proxy that will not start on the new build. Fix the backend, or
+move to a pod-local `storage_backend` and a single replica. The new
+`sbproxy_cert_store_degraded{backend}` gauge covers the pod-local half from
+here on; the shared half no longer has a degraded state to report.
 
 ### Durable sink files are created `0o600` and existing ones are tightened
 
@@ -710,7 +930,7 @@ them turns an `sbproxy plan` reload into a restart.
 | `allowed_headers` | `allow_headers` | array | `[]` | **stable** |
 | `expose_headers` | - | array | `[]` | **stable** |
 | `max_age` | - | integer | - | **stable** |
-| `allow_credentials` | - | boolean | false | **stable** |
+| `allow_credentials` | - | boolean | false | **stable**, **refused** with `allowed_origins: ["*"]` |
 | `enable` | `enabled` | boolean | - | **refused** at `false` |
 
 CORS is on for an origin exactly when that origin has a `cors:` block.
@@ -732,9 +952,13 @@ checked together. Delete the block to turn CORS off.
 | Field | Alias | Type | Default | Stability |
 |---|---|---|---|---|
 | `enabled` | `enable` | boolean | true | **stable** |
-| `algorithms` | - | array | `[]` | **stable** |
+| `algorithms` | - | array | `[]` | **stable**, entries **refused** outside `zstd`/`br`/`gzip` |
 | `min_size` | - | integer | 0 | **stable** |
 | `level` | - | integer | - | **beta** |
+
+`algorithms` is a priority order. The list is walked as authored and the
+first entry the client's `Accept-Encoding` accepts is served; an empty
+list takes the built-in `zstd` > `br` > `gzip` order.
 
 `level` is applied to whichever encoder the client negotiates, clamped
 into that algorithm's native range (gzip 0-9, brotli 0-11, zstd 1-22).

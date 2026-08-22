@@ -180,19 +180,24 @@ impl AcmeExpiryReader {
 /// days later instead of as a config mistake at boot.
 /// `check_acme` in `sbproxy-config` rejects the same value at plan time so
 /// the error normally arrives before the config is ever applied.
+///
+/// A *shared* backend that cannot be opened is an error for the same reason
+/// and a larger one. See `SHARED_CERT_BACKENDS`.
 fn open_cert_backend(acme: Option<&sbproxy_config::AcmeConfig>) -> Result<Arc<dyn KVStore>> {
     use sbproxy_platform::storage::{RedbKVStore, SqliteKVStore};
     let Some(acme) = acme else {
         return Ok(Arc::new(MemoryKVStore::new(0)));
     };
-    let store: Arc<dyn KVStore> = match acme.storage_backend.as_str() {
+    let backend_name = acme.storage_backend.as_str();
+    let store: Arc<dyn KVStore> = match backend_name {
         "memory" => Arc::new(MemoryKVStore::new(0)),
         "redb" => {
             let dir = acme.storage_path.trim_end_matches('/');
             if let Err(e) = std::fs::create_dir_all(dir) {
-                warn!(path = %dir, error = %e,
-                    "cert store: cannot create storage dir; certs will NOT persist (in-memory fallback)");
-                return Ok(Arc::new(MemoryKVStore::new(0)));
+                return cert_backend_open_failed(
+                    backend_name,
+                    &format!("cannot create storage dir {dir}: {e}"),
+                );
             }
             let file = format!("{dir}/certstore.redb");
             match RedbKVStore::new(&file) {
@@ -201,9 +206,10 @@ fn open_cert_backend(acme: Option<&sbproxy_config::AcmeConfig>) -> Result<Arc<dy
                     Arc::new(s)
                 }
                 Err(e) => {
-                    warn!(path = %file, error = %e,
-                        "cert store: redb open failed; certs will NOT persist (in-memory fallback)");
-                    Arc::new(MemoryKVStore::new(0))
+                    return cert_backend_open_failed(
+                        backend_name,
+                        &format!("opening {file} failed: {e}"),
+                    )
                 }
             }
         }
@@ -212,9 +218,10 @@ fn open_cert_backend(acme: Option<&sbproxy_config::AcmeConfig>) -> Result<Arc<dy
             // switch the two without also moving the path.
             let dir = acme.storage_path.trim_end_matches('/');
             if let Err(e) = std::fs::create_dir_all(dir) {
-                warn!(path = %dir, error = %e,
-                    "cert store: cannot create storage dir; certs will NOT persist (in-memory fallback)");
-                return Ok(Arc::new(MemoryKVStore::new(0)));
+                return cert_backend_open_failed(
+                    backend_name,
+                    &format!("cannot create storage dir {dir}: {e}"),
+                );
             }
             let file = format!("{dir}/certstore.sqlite");
             match SqliteKVStore::new(&file) {
@@ -223,9 +230,10 @@ fn open_cert_backend(acme: Option<&sbproxy_config::AcmeConfig>) -> Result<Arc<dy
                     Arc::new(s)
                 }
                 Err(e) => {
-                    warn!(path = %file, error = %e,
-                        "cert store: sqlite open failed; certs will NOT persist (in-memory fallback)");
-                    Arc::new(MemoryKVStore::new(0))
+                    return cert_backend_open_failed(
+                        backend_name,
+                        &format!("opening {file} failed: {e}"),
+                    )
                 }
             }
         }
@@ -235,11 +243,15 @@ fn open_cert_backend(acme: Option<&sbproxy_config::AcmeConfig>) -> Result<Arc<dy
             // stampeding the CA (WOR-1774).
             let cfg = match sbproxy_platform::storage::RedisConfig::from_dsn(&acme.storage_path) {
                 Ok(cfg) => cfg,
+                // No `{e}`: the DSN is operator config and an operator can
+                // write credentials into it, so the parser's message, which
+                // quotes the input, does not reach the log (WOR-2640).
                 Err(_) => {
-                    warn!(
-                        "cert store: invalid Redis connection configuration; certs will NOT persist (in-memory fallback)"
-                    );
-                    return Ok(Arc::new(MemoryKVStore::new(0)));
+                    return cert_backend_open_failed(
+                        backend_name,
+                        "the connection DSN in acme.storage_path is not valid Redis \
+                         connection configuration",
+                    )
                 }
             };
             info!("cert store backend: redis (shared, cluster-safe)");
@@ -255,9 +267,10 @@ fn open_cert_backend(acme: Option<&sbproxy_config::AcmeConfig>) -> Result<Arc<dy
                     Arc::new(s)
                 }
                 Err(e) => {
-                    warn!(path = %acme.storage_path, error = %e,
-                        "cert store: file backend open failed; certs will NOT persist (in-memory fallback)");
-                    Arc::new(MemoryKVStore::new(0))
+                    return cert_backend_open_failed(
+                        backend_name,
+                        &format!("opening {} failed: {e}", acme.storage_path),
+                    )
                 }
             }
         }
@@ -277,9 +290,10 @@ fn open_cert_backend(acme: Option<&sbproxy_config::AcmeConfig>) -> Result<Arc<dy
                     Arc::new(s)
                 }
                 Err(e) => {
-                    warn!(url = %store_origin, error = %e,
-                        "cert store: object-store backend open failed; certs will NOT persist (in-memory fallback)");
-                    Arc::new(MemoryKVStore::new(0))
+                    return cert_backend_open_failed(
+                        backend_name,
+                        &format!("opening {store_origin} failed: {e}"),
+                    )
                 }
             }
         }
@@ -290,7 +304,92 @@ fn open_cert_backend(acme: Option<&sbproxy_config::AcmeConfig>) -> Result<Arc<dy
             ));
         }
     };
+    sbproxy_observe::metrics::set_cert_store_degraded(backend_name, false);
     Ok(store)
+}
+
+/// Certificate-store backends whose entire purpose is that every replica
+/// reads and writes the same store.
+///
+/// Falling back to `MemoryKVStore` on one of these is not the persistence
+/// downgrade the log line used to describe. `MemoryKVStore` overrides neither
+/// `KVStore::try_lock` nor `KVStore::renew_lock`, so it inherits the
+/// single-node trait defaults, both of which are an unconditional `Ok(true)`.
+/// Every replica therefore wins its own issuance lease and its own fencing
+/// generation: three pods open three ACME orders for the same hostname and
+/// publish three HTTP-01 tokens to three stores no peer can read, so roughly
+/// two thirds of the CA's validation fetches land on a pod that has never
+/// seen the token, and the account burns through Let's Encrypt's limit of
+/// five duplicate certificates per hostname set per week. Nothing in
+/// `/metrics` told that apart from a CA outage.
+///
+/// The operator's `check_acme_storage_for_replicas` guard does not cover it
+/// either: that guard reads the *configured* backend, and the configured
+/// backend here is a shared one. What failed is opening it.
+///
+/// So a shared backend that cannot be opened refuses to start. The operator
+/// asked for mutual exclusion across the fleet and cannot be given it, and a
+/// pod that will not start is a far cheaper failure than a rate-limited
+/// domain days later.
+///
+/// The refusal itself keys off `POD_LOCAL_CERT_BACKENDS` rather than this
+/// list, so a backend added to `open_cert_backend` later and classified in
+/// neither place refuses to start rather than degrading. This list only
+/// decides the wording, and
+/// `every_backend_is_classified_shared_or_pod_local` keeps it honest.
+const SHARED_CERT_BACKENDS: [&str; 5] = ["file", "redis", "s3", "gcs", "azure"];
+
+/// Certificate-store backends that live and die with a single process.
+///
+/// A failure to open one of these still degrades to in-memory, because a
+/// single node has no peer to be mutually excluded from and refusing to serve
+/// traffic over a cert store is a worse trade there. It is no longer silent:
+/// the log is at `error!` and names the backend, and
+/// `sbproxy_cert_store_degraded{backend}` goes to 1 so it can be alerted on.
+/// The cost of the degradation is still real, which is that certificates are
+/// re-issued on every restart.
+const POD_LOCAL_CERT_BACKENDS: [&str; 3] = ["memory", "redb", "sqlite"];
+
+/// Decide what a failure to open the configured certificate store means.
+///
+/// Shared backend: an `Err`, which `TlsState::init` propagates, so the
+/// process refuses to start. Pod-local backend: an in-memory store, at
+/// `error!` and with the degraded gauge set.
+///
+/// `detail` must not carry anything an operator could have written a secret
+/// into. `acme.storage_path` is exactly that (a Redis DSN carries a password,
+/// an object-store URL can carry a query credential), so callers pass either
+/// a filesystem path, a redacted origin, or no path at all.
+fn cert_backend_open_failed(backend: &str, detail: &str) -> Result<Arc<dyn KVStore>> {
+    // Fail closed on anything not explicitly pod-local, rather than open on
+    // anything explicitly shared. A backend added to `open_cert_backend`
+    // later and left out of both lists then refuses to start instead of
+    // taking the degrade branch and quietly removing mutual exclusion, which
+    // is the failure this whole function exists to stop.
+    if !POD_LOCAL_CERT_BACKENDS.contains(&backend) {
+        let classification = if SHARED_CERT_BACKENDS.contains(&backend) {
+            "is a shared certificate store"
+        } else {
+            "is not classified as a pod-local certificate store"
+        };
+        return Err(anyhow::anyhow!(
+            "acme.storage_backend '{backend}' {classification} and could not be \
+             opened ({detail}). Refusing to start: an in-memory fallback would \
+             give every replica its own issuance lease, so each one would open its own \
+             ACME order for the same hostname and publish an HTTP-01 token no other \
+             replica can read. Fix the backend, or set acme.storage_backend to a \
+             pod-local one (redb, sqlite, memory) and run a single replica."
+        ));
+    }
+    sbproxy_observe::metrics::set_cert_store_degraded(backend, true);
+    error!(
+        backend = %backend,
+        detail = %detail,
+        "cert store: the configured backend could not be opened; running on an \
+         in-memory store, so certificates will NOT persist and will be re-issued on \
+         every restart"
+    );
+    Ok(Arc::new(MemoryKVStore::new(0)))
 }
 
 // --- Fleet issuance lease timing (WOR-2633) ---
@@ -1225,21 +1324,103 @@ mod tests {
     }
 
     #[test]
-    fn redis_cert_backend_rejects_invalid_full_dsn_without_network_io() {
+    fn an_unopenable_shared_cert_backend_refuses_to_start() {
+        // The DSN is rejected by `RedisConfig::from_dsn` before any socket is
+        // opened, so this stays offline. It used to log one warn and hand
+        // back a MemoryKVStore, which overrides neither `try_lock` nor
+        // `renew_lock` and so inherits the unconditional `Ok(true)` trait
+        // defaults: every replica would win its own issuance lease, open its
+        // own order for the same hostname, and publish an HTTP-01 token to a
+        // store no peer can read. The operator's replica guard cannot catch
+        // it either, because the *configured* backend is shared and it is the
+        // open that failed.
         let sentinel = "rediss://default:sentinel-acme-password@sentinel-acme-host.invalid:6380/-1";
         let acme = acme_with_storage("redis", sentinel);
 
-        let backend = open_cert_backend(Some(&acme)).expect("a known backend opens");
+        // `Arc<dyn KVStore>` withholds `Debug`, so `expect_err` cannot name
+        // the Ok value and this has to discard it first.
+        let err = open_cert_backend(Some(&acme))
+            .err()
+            .expect("a shared backend that cannot be opened must refuse to start");
 
+        let message = format!("{err:#}");
+        assert!(message.contains("redis"), "{message}");
+        assert!(message.contains("shared certificate store"), "{message}");
+        assert!(
+            !message.contains("sentinel-acme-password"),
+            "the DSN carries a password and must never reach the message: {message}"
+        );
+    }
+
+    #[test]
+    fn an_unopenable_object_store_cert_backend_refuses_to_start() {
+        // The other shared family, so the refusal is pinned as a property of
+        // the classification rather than of one match arm.
+        let acme = acme_with_storage("s3", "not-a-url");
+        let err = open_cert_backend(Some(&acme))
+            .err()
+            .expect("an object-store backend that cannot be opened must refuse to start");
+        assert!(format!("{err:#}").contains("shared certificate store"));
+    }
+
+    #[test]
+    fn an_unopenable_pod_local_cert_backend_degrades_loudly_instead() {
+        // A single node has no peer to be mutually excluded from, so this one
+        // still falls back. What changed is that it is now visible: the gauge
+        // says the process is not running the store it was configured with.
+        //
+        // A path that cannot be a directory forces the open to fail without
+        // depending on filesystem permissions.
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        let path = file.path().to_str().expect("utf-8 temp path").to_string();
+        let acme = acme_with_storage("redb", &format!("{path}/certstore"));
+
+        let backend = open_cert_backend(Some(&acme))
+            .expect("a pod-local backend degrades rather than refusing to start");
         backend
             .put(b"certificate-key", b"certificate-value")
-            .expect("invalid Redis config must retain the in-memory fallback posture");
+            .expect("the in-memory fallback is usable");
+
+        let rendered = sbproxy_observe::metrics::metrics().render();
+        assert!(
+            rendered.contains("sbproxy_cert_store_degraded"),
+            "the fallback has to be alertable, not one warn line at boot: {rendered}"
+        );
+        assert!(
+            rendered.contains("sbproxy_cert_store_degraded{backend=\"redb\"} 1"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn every_backend_is_classified_shared_or_pod_local() {
+        // `cert_backend_open_failed` decides refuse-versus-degrade off
+        // POD_LOCAL_CERT_BACKENDS, so an unclassified backend already fails
+        // closed and SHARED_CERT_BACKENDS only picks the wording. This test
+        // is the second half: it keeps the two lists exhaustive against the
+        // match arms so the wording stays right and a backend that should
+        // have been pod-local is not left refusing to start by accident.
+        //
+        // What this cannot see: an arm added to `open_cert_backend` whose
+        // name is not also added to `known` below. It is a consistency check
+        // between three lists in this file, not a parse of the match. The
+        // fail-closed default is what makes that blind spot safe rather than
+        // merely unlikely.
+        let known = [
+            "memory", "redb", "sqlite", "redis", "file", "s3", "gcs", "azure",
+        ];
+        for backend in known {
+            let shared = SHARED_CERT_BACKENDS.contains(&backend);
+            let pod_local = POD_LOCAL_CERT_BACKENDS.contains(&backend);
+            assert!(
+                shared ^ pod_local,
+                "{backend} must be classified in exactly one of the two lists"
+            );
+        }
         assert_eq!(
-            backend
-                .get(b"certificate-key")
-                .expect("read fallback certificate state")
-                .as_deref(),
-            Some(b"certificate-value".as_slice())
+            SHARED_CERT_BACKENDS.len() + POD_LOCAL_CERT_BACKENDS.len(),
+            known.len(),
+            "a backend in a list but not in `known` means this test stopped covering an arm"
         );
     }
 
