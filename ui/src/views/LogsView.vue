@@ -103,6 +103,18 @@ onMounted(() => {
   // Arrived from a spend row: pre-filter to the origin that produced it.
   const origin = route.query.origin;
   if (typeof origin === "string") fOrigin.value = origin;
+  // Arrived from the price-ceiling readout on Spend, which links its
+  // refusal count at the 402s that produced it.
+  const status = route.query.status;
+  if (typeof status === "string") fStatus.value = status;
+  // Arrived from a spend breakdown grouped by a promoted property. Both
+  // halves are seeded, because the server only applies the value when it
+  // also has the key. Every one of these lands in a visible input, so the
+  // operator can see and clear the filter the link applied.
+  const propertyKey = route.query.property_key;
+  if (typeof propertyKey === "string") fPropertyKey.value = propertyKey;
+  const propertyValue = route.query.property_value;
+  if (typeof propertyValue === "string") fPropertyValue.value = propertyValue;
   req.run();
   loadLogLevel();
   loadUiSettings();
