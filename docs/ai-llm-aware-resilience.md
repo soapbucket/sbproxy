@@ -140,6 +140,86 @@ Transport-level failures (connection refused, DNS) carry no HTTP status
 to classify and do not feed this axis; the generic failover chain
 handles them as before.
 
+## Pre-header streaming budget
+
+A provider that refuses a connection fails over in milliseconds. A
+provider that accepts the connection and then goes quiet does not: the
+only thing bounding it is `providers[].timeout_ms`, and that budget has
+to be long enough for a legitimate completion, so it is the wrong
+instrument. `resilience.pre_header_timeout_ms` is the right one. It
+bounds connect through the provider's response headers on streaming
+requests, and an elapse hands the request to the next candidate.
+
+```yaml
+action:
+  type: ai_proxy
+  routing: fallback_chain
+  resilience:
+    pre_header_timeout_ms: 2000
+  providers:
+    - name: primary
+      priority: 1
+      timeout_ms: 180000
+    - name: secondary
+      priority: 2
+      timeout_ms: 180000
+```
+
+The failover it takes is labeled, so it does not disappear into the
+generic transport bucket:
+
+```
+sbproxy_ai_failovers_total{from_provider="primary",to_provider="secondary",reason="pre_header_timeout"} 1
+```
+
+The other `reason` values on that counter are `http_<status>` for an
+availability failover, `transport` for a connection-level failure,
+`managed_cold_fallback` for a managed local model that could not be
+brought up, and the typed reroute reasons the sections above cover.
+
+Two limits worth knowing before you size it. The key is ignored on
+non-streaming requests, which have no partial output to protect and keep
+waiting out `timeout_ms`. And it cannot extend an attempt beyond the
+gateway's 30-second HTTP client default, so a value above 30000 buys
+nothing. A `0` is refused at config load, because a zero budget would
+fail every streaming request over the whole candidate list.
+
+### After the commit point
+
+Once the provider answers with `200 text/event-stream` (or
+`application/x-ndjson`), the request is committed to that provider. The
+dispatch loop has closed by then and the relay is writing bytes the
+caller is already reading, so a later candidate cannot replace them. A
+stall, a reset, or a guardrail block past that point ends the stream
+rather than failing over.
+
+Those endings used to be invisible unless the origin had a budget
+recorder wired. They now tick
+`sbproxy_ai_stream_post_commit_failures_total{provider, cause}`, whatever
+else is configured. `cause` is one of three:
+
+| `cause` | What happened | What to do about it |
+|---|---|---|
+| `upstream_timeout` | Reading the next chunk hit a transport timeout, so `timeout_ms` or the 30-second client default cut a generation that was still running | Raise `timeout_ms` on that provider, or accept truncated long completions |
+| `upstream_error` | The provider's stream ended in a reset or a truncated body | Provider-side fault; correlate with `sbproxy_ai_provider_errors_total` |
+| `guardrail` | An output guardrail or a stream-safety verdict ended the stream | Working as configured. Read it against `sbproxy_ai_stream_guardrail_violations_total` |
+
+The counter cannot see a caller that disconnects mid-stream: the failed
+downstream write ends the relay before the counter is reached, so a
+client cancel is counted nowhere in this family rather than being
+guessed at as one of the three above. It also does not fire for an
+extension `close` hook that blocks after the upstream stream already
+finished, since it keys on the upstream stream not reaching its end.
+
+Read the two counters together. A rising
+`sbproxy_ai_failovers_total{reason="pre_header_timeout"}` means a
+provider is going quiet before it commits, and the budget is doing its
+job. A rising
+`sbproxy_ai_stream_post_commit_failures_total{cause="upstream_timeout"}`
+means the opposite problem: the provider answers fine and then gets cut
+off mid-generation by a budget sized too tight for the completions this
+origin actually serves.
+
 ## Typed fallback triggers
 
 The generic chain answers "the provider is unavailable, try the next

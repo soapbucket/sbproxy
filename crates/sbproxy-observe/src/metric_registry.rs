@@ -1407,6 +1407,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_ai_stream_post_commit_failures_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_stream_post_commit_failure"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        registry: Registry::Default,
+        labels: &["provider", "cause"],
+        description: "Streaming responses that failed after the gateway committed to a provider, by cause: `upstream_timeout` (a transport budget cut a running generation), `upstream_error` (a reset or truncated provider stream), `guardrail` (the gateway ended the stream on an output guardrail or stream-safety verdict). Failover is impossible past the commit point, so these are the failures `sbproxy_ai_failovers_total` can never carry. A caller that disconnects mid-stream is not counted: the failed downstream write aborts the relay before the counter is reached.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_ai_surface_request_duration_seconds",
         kind: MetricKind::Histogram,
         writer: Writer::Recorder("record_surface_latency"),

@@ -9535,6 +9535,16 @@ pub(super) async fn handle_ai_proxy(
         .map(|r| r.content_policy_fallback)
         .unwrap_or(false);
 
+    // The pre-header streaming budget. Resolved once here, beside the
+    // other `resilience` reads, because the attempt loop below is inside
+    // a `for` and re-reading per attempt would say the same thing three
+    // times. `None` leaves the loop byte-for-byte as it was.
+    let pre_header_timeout = config
+        .resilience
+        .as_ref()
+        .and_then(|r| r.pre_header_timeout_ms)
+        .map(std::time::Duration::from_millis);
+
     // WOR-2556: a configured typed fallback list opens the sequential
     // loop the same way `content_policy_fallback` does, or the reroute
     // it aims could never take a second attempt. Configuration, not the
@@ -11042,58 +11052,79 @@ pub(super) async fn handle_ai_proxy(
             provider = %provider.name,
             attempt = attempt,
         );
+        // The pre-header budget bounds exactly this binding, and only
+        // for a streaming request. The inner future resolves at the
+        // provider's response headers (`forward_request_impl` hands back
+        // a `reqwest::Response` before any body byte is read), so
+        // `tokio::time::timeout` around it is a headers-only deadline
+        // with nothing to reconcile against `providers[].timeout_ms`,
+        // which reqwest measures through end-of-body. An elapse is
+        // turned into an ordinary `Err` so the arm below fails over
+        // through its existing `continue` rather than growing a second
+        // control path.
+        //
+        // The attempt is boxed because the AI request path runs on a
+        // Pingora worker with the std 2MB stack and was already close to
+        // it: `Timeout<F>` would otherwise add `F` plus a timer to the
+        // frame. Boxed, the frame carries a pointer, which is smaller
+        // than what was there before.
+        let pre_header_budget = pre_header_timeout.filter(|_| is_stream);
         let result: anyhow::Result<reqwest::Response> =
-            run_routed_provider_attempt(&router, provider_idx, async {
-                if distributed_managed {
-                    let managed_body = serde_json::to_vec(&attempt_body)
-                        .map(bytes::Bytes::from)
-                        .map_err(anyhow::Error::from);
-                    match managed_body {
-                        Ok(managed_body) => {
-                            let origin = ctx
-                                .origin_idx
-                                .and_then(|index| ctx.pipeline.config.origins.get(index))
-                                .map(|origin| origin.origin_id.to_string())
-                                .unwrap_or_else(|| ctx.hostname.to_string());
-                            let prefix_key = extract_prefix_key(&attempt_body, 1024);
-                            let requested_adapter = attempt_body
-                                .get("adapter")
-                                .or_else(|| attempt_body.get("lora_adapter"))
-                                .and_then(serde_json::Value::as_str)
-                                .map(str::to_string);
-                            let preferred_region = ctx
-                                .principal
-                                .attrs
-                                .metadata
-                                .get("region")
-                                .cloned()
-                                .or_else(|| ctx.request_geo.clone());
-                            let maximum = buffered_body_limit(config.max_body_size);
-                            let managed = crate::server::model_host::distributed_managed_upstream(
-                                crate::server::model_host::ManagedDistributedRequest {
-                                    origin: &origin,
-                                    provider,
-                                    requested_model: (!model.is_empty()).then_some(model.as_str()),
-                                    request_id: ctx.request_id.as_str(),
-                                    tenant_id: ctx.tenant_id.as_str(),
-                                    governed_key_id: ctx.principal.api_key_id(),
-                                    policy_revision: &peer_policy_revision,
-                                    path: &path,
-                                    body: managed_body,
-                                    content_type: Some("application/json"),
-                                    priority: crate::server::model_host::lane_class_for(
-                                        ctx.ai_lane_priority,
-                                    ),
-                                    prefix_key: &prefix_key,
-                                    preferred_region: preferred_region.as_deref(),
-                                    requested_adapter: requested_adapter.as_deref(),
-                                    max_body_bytes: maximum,
-                                    quota_attempt,
-                                },
-                            )
-                            .instrument(attempt_span)
-                            .await;
-                            match managed {
+            {
+                let attempt_future =
+                    Box::pin(run_routed_provider_attempt(&router, provider_idx, async {
+                        if distributed_managed {
+                            let managed_body = serde_json::to_vec(&attempt_body)
+                                .map(bytes::Bytes::from)
+                                .map_err(anyhow::Error::from);
+                            match managed_body {
+                                Ok(managed_body) => {
+                                    let origin = ctx
+                                        .origin_idx
+                                        .and_then(|index| ctx.pipeline.config.origins.get(index))
+                                        .map(|origin| origin.origin_id.to_string())
+                                        .unwrap_or_else(|| ctx.hostname.to_string());
+                                    let prefix_key = extract_prefix_key(&attempt_body, 1024);
+                                    let requested_adapter = attempt_body
+                                        .get("adapter")
+                                        .or_else(|| attempt_body.get("lora_adapter"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::to_string);
+                                    let preferred_region = ctx
+                                        .principal
+                                        .attrs
+                                        .metadata
+                                        .get("region")
+                                        .cloned()
+                                        .or_else(|| ctx.request_geo.clone());
+                                    let maximum = buffered_body_limit(config.max_body_size);
+                                    let managed =
+                                        crate::server::model_host::distributed_managed_upstream(
+                                            crate::server::model_host::ManagedDistributedRequest {
+                                                origin: &origin,
+                                                provider,
+                                                requested_model: (!model.is_empty())
+                                                    .then_some(model.as_str()),
+                                                request_id: ctx.request_id.as_str(),
+                                                tenant_id: ctx.tenant_id.as_str(),
+                                                governed_key_id: ctx.principal.api_key_id(),
+                                                policy_revision: &peer_policy_revision,
+                                                path: &path,
+                                                body: managed_body,
+                                                content_type: Some("application/json"),
+                                                priority: crate::server::model_host::lane_class_for(
+                                                    ctx.ai_lane_priority,
+                                                ),
+                                                prefix_key: &prefix_key,
+                                                preferred_region: preferred_region.as_deref(),
+                                                requested_adapter: requested_adapter.as_deref(),
+                                                max_body_bytes: maximum,
+                                                quota_attempt,
+                                            },
+                                        )
+                                        .instrument(attempt_span)
+                                        .await;
+                                    match managed {
                                 Ok(Some(upstream)) => {
                                     local_public_model = Some(upstream.public_model);
                                     ctx.managed_model_permit = upstream.local_permit;
@@ -11117,39 +11148,48 @@ pub(super) async fn handle_ai_proxy(
                                     Err(anyhow::Error::new(error))
                                 }
                             }
-                        }
-                        Err(error) => Err(error),
-                    }
-                } else {
-                    async {
-                        if let Some((bypass_body, native_path)) = upstream_call {
-                            AI_CLIENT
-                                .load()
-                                .forward_native_bypass_with_quota(
-                                    provider,
-                                    &method_str,
-                                    native_path,
-                                    bypass_body,
-                                    quota_attempt,
-                                )
-                                .await
+                                }
+                                Err(error) => Err(error),
+                            }
                         } else {
-                            AI_CLIENT
-                                .load()
-                                .forward_request_with_quota(
-                                    provider,
-                                    &path,
-                                    &attempt_body,
-                                    quota_attempt,
-                                )
-                                .await
+                            async {
+                                if let Some((bypass_body, native_path)) = upstream_call {
+                                    AI_CLIENT
+                                        .load()
+                                        .forward_native_bypass_with_quota(
+                                            provider,
+                                            &method_str,
+                                            native_path,
+                                            bypass_body,
+                                            quota_attempt,
+                                        )
+                                        .await
+                                } else {
+                                    AI_CLIENT
+                                        .load()
+                                        .forward_request_with_quota(
+                                            provider,
+                                            &path,
+                                            &attempt_body,
+                                            quota_attempt,
+                                        )
+                                        .await
+                                }
+                            }
+                            .instrument(attempt_span)
+                            .await
                         }
-                    }
-                    .instrument(attempt_span)
-                    .await
+                    }));
+                match pre_header_budget {
+                    Some(budget) => match tokio::time::timeout(budget, attempt_future).await {
+                        Ok(inner) => inner,
+                        Err(_elapsed) => Err(anyhow::Error::new(PreHeaderTimeoutElapsed {
+                            budget_ms: u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
+                        })),
+                    },
+                    None => attempt_future.await,
                 }
-            })
-            .await;
+            };
         ctx.ai_serve_model = local_public_model.clone();
 
         match result {
@@ -11542,6 +11582,11 @@ pub(super) async fn handle_ai_proxy(
                     &provider.name,
                     ai_metric_error_kind_for_span_error_type(last_error_type),
                 );
+                // Read before the error is moved into `last_error`. A
+                // wedged provider and a refused connection both arrive
+                // here, and an operator sizing `pre_header_timeout_ms`
+                // needs to tell which of the two the budget is producing.
+                let pre_header_elapsed = e.downcast_ref::<PreHeaderTimeoutElapsed>().is_some();
                 last_error = Some(e);
                 if ctx.managed_fallback_reason.is_some() && attempt + 1 < provider_order.len() {
                     let to_provider = provider_order
@@ -11567,10 +11612,18 @@ pub(super) async fn handle_ai_proxy(
                 sbproxy_ai::ai_metrics::record_failover(
                     &provider.name,
                     &to_provider,
-                    "transport",
+                    if pre_header_elapsed {
+                        "pre_header_timeout"
+                    } else {
+                        "transport"
+                    },
                     ctx.tenant_id.as_str(),
                 );
                 // WOR-2556: a transport failover is the generic trigger.
+                // A pre-header elapse is one too: the admin
+                // `failover_trigger` set stays closed, because the
+                // distinction an operator needs is already on the
+                // metric's `reason` label.
                 record_generic_failover_trigger(ctx);
                 continue;
             }
@@ -11920,7 +11973,41 @@ fn record_ai_transport_failure(
     }
 }
 
+/// A streaming attempt that ran out its `resilience.pre_header_timeout_ms`
+/// budget before the provider sent response headers.
+///
+/// Carried as an `anyhow` cause rather than as a separate control-flow
+/// arm so the elapse lands in the dispatch loop's existing `Err` arm and
+/// inherits its failover, its per-provider error accounting, and its
+/// `continue`. The `Err` arm downcasts to this type for one decision
+/// only: whether the handover it is about to count is labeled
+/// `pre_header_timeout` or `transport`.
+#[derive(Debug)]
+struct PreHeaderTimeoutElapsed {
+    budget_ms: u64,
+}
+
+impl std::fmt::Display for PreHeaderTimeoutElapsed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "provider did not send response headers within the {}ms \
+             resilience.pre_header_timeout_ms budget",
+            self.budget_ms
+        )
+    }
+}
+
+impl std::error::Error for PreHeaderTimeoutElapsed {}
+
 fn ai_transport_error_type(error: &anyhow::Error) -> &'static str {
+    // A pre-header budget elapse is a timeout the same way reqwest's own
+    // is; classifying it as a generic provider error would send it to
+    // `record_provider_error`'s wrong bucket and put the wrong error type
+    // on the span.
+    if error.downcast_ref::<PreHeaderTimeoutElapsed>().is_some() {
+        return sbproxy_ai::tracing_spans::error_type::TIMEOUT;
+    }
     if error
         .downcast_ref::<reqwest::Error>()
         .is_some_and(reqwest::Error::is_timeout)
@@ -15048,6 +15135,12 @@ pub(super) async fn relay_ai_stream(
     // SSE body never lands in memory.
     let mut stream = resp.bytes_stream();
     let mut upstream_complete = false;
+    // Which upstream read failure ended the stream, when one did. Read
+    // once after the loop to label
+    // `sbproxy_ai_stream_post_commit_failures_total`; a timeout there
+    // means a whole-call budget cut a generation that was still running,
+    // which is a different operator action from a reset.
+    let mut upstream_stream_error: Option<&'static str> = None;
     // WOR-895: track TTFT + output throughput. `stream_started` anchors
     // the generation window; `first_token_at` is set on the first chunk
     // that carries any payload. Both feed `sbproxy_ai_ttft_seconds` +
@@ -15559,6 +15652,11 @@ pub(super) async fn relay_ai_stream(
                     ai_metric_error_kind_for_span_error_type(kind),
                 );
                 warn!(error = %e, "AI proxy: error reading SSE chunk from upstream");
+                upstream_stream_error = Some(if e.is_timeout() {
+                    "upstream_timeout"
+                } else {
+                    "upstream_error"
+                });
                 break;
             }
             None => {
@@ -15822,6 +15920,26 @@ pub(super) async fn relay_ai_stream(
                 break;
             }
         }
+    }
+
+    // Everything reaching this relay has already been committed to a
+    // provider: the dispatcher only calls it once
+    // `upstream_response_is_successful_stream` accepted the response, and
+    // the attempt loop has closed by then. So a stream that did not run
+    // to its natural end here can never be failed over, and this counter
+    // is where that failure is visible. Counted before the close-out
+    // writes below, because a failed downstream write leaves this
+    // function on `?` and would otherwise swallow an upstream cause the
+    // operator needs.
+    if !upstream_complete {
+        let cause = upstream_stream_error.unwrap_or(if safety_blocked || output_guard_blocked {
+            "guardrail"
+        } else {
+            // Every other way out of the chunk loop leaves through `?`,
+            // so this is a floor rather than a live branch.
+            "upstream_error"
+        });
+        sbproxy_ai::ai_metrics::record_stream_post_commit_failure(router_sink.provider_name, cause);
     }
 
     if let Some(block) = pending_builtin_block.take() {
@@ -22417,6 +22535,369 @@ origins:
                 );
             }
         }
+    }
+
+    // --- Pre-header streaming budget ---
+
+    /// An upstream that accepts a connection, reads the whole request,
+    /// and then never answers. The socket stays open, so nothing on the
+    /// upstream side can end the attempt: only a gateway-side budget can.
+    async fn wedged_upstream_fixture() -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind wedged upstream");
+        let address = listener.local_addr().expect("wedged upstream address");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&hits);
+        tokio::spawn(async move {
+            // Held rather than dropped. A dropped `TcpStream` sends FIN,
+            // which reqwest reports as a connection error, and the test
+            // would then pass on the wrong mechanism.
+            let mut held = Vec::new();
+            loop {
+                match listener.accept().await {
+                    Ok((mut stream, _)) => {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        drain_upstream_request(&mut stream).await;
+                        held.push(stream);
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        (format!("http://{address}/v1"), hits)
+    }
+
+    /// An upstream that commits to a stream (`200 text/event-stream`),
+    /// writes one chunked SSE frame, and then drops the connection
+    /// without the terminating zero-length chunk. The client-side body
+    /// therefore ends in a transport error rather than at its natural
+    /// end, which is the post-commit failure this counter exists for.
+    async fn truncated_stream_upstream_fixture() -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind truncated stream upstream");
+        let address = listener
+            .local_addr()
+            .expect("truncated stream upstream address");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&hits);
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept upstream request");
+            observed.fetch_add(1, Ordering::SeqCst);
+            drain_upstream_request(&mut stream).await;
+            let frame = concat!(
+                "data: {\"id\":\"chatcmpl-truncated\",\"object\":\"chat.completion.chunk\",",
+                "\"created\":1,\"model\":\"requested-model\",\"choices\":[{\"index\":0,",
+                "\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                 transfer-encoding: chunked\r\n\r\n{:x}\r\n{}\r\n",
+                frame.len(),
+                frame
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write committed stream prefix");
+            stream.flush().await.expect("flush committed stream prefix");
+            // No `0\r\n\r\n`: the body is cut mid-stream.
+            drop(stream);
+        });
+        (format!("http://{address}/v1"), hits)
+    }
+
+    /// A wedged primary and a working SSE secondary, with the
+    /// primary's whole-call `timeout_ms` deliberately far above the
+    /// pre-header budget so the two budgets are distinguishable by the
+    /// clock alone.
+    fn pre_header_timeout_config(
+        wedged_url: &str,
+        stream_url: &str,
+        pre_header_timeout_ms: Option<u64>,
+        wedged_timeout_ms: u64,
+    ) -> sbproxy_ai::AiHandlerConfig {
+        let mut action = serde_json::json!({
+            "providers": [
+                {
+                    "name": "primary",
+                    "provider_type": "openai",
+                    "base_url": wedged_url,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key",
+                    "priority": 1,
+                    "timeout_ms": wedged_timeout_ms
+                },
+                {
+                    "name": "secondary",
+                    "provider_type": "openai",
+                    "base_url": stream_url,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key",
+                    "priority": 2
+                }
+            ],
+            "routing": {"strategy": "fallback_chain"}
+        });
+        if let Some(budget) = pre_header_timeout_ms {
+            action["resilience"] = serde_json::json!({"pre_header_timeout_ms": budget});
+        }
+        sbproxy_ai::AiHandlerConfig::from_config(action).expect("pre-header timeout config")
+    }
+
+    /// One `sbproxy_ai_failovers_total` series, or 0 when nothing has
+    /// created it yet.
+    ///
+    /// `prometheus::gather()` reads a process-global registry and the
+    /// sibling tests in this module can run in the same process, so
+    /// callers assert a strict increase rather than an exact value.
+    fn failovers_count(reason: &str) -> f64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "sbproxy_ai_failovers_total")
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        metric
+                            .get_label()
+                            .iter()
+                            .any(|label| label.name() == "reason" && label.value() == reason)
+                    })
+                    .map(|metric| metric.get_counter().value())
+                    .sum()
+            })
+            .unwrap_or_default()
+    }
+
+    /// One `sbproxy_ai_stream_post_commit_failures_total` series, or 0
+    /// when nothing has created it yet. Same process-global caveat as
+    /// [`failovers_count`].
+    fn stream_post_commit_failures_count(provider: &str, cause: &str) -> f64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "sbproxy_ai_stream_post_commit_failures_total")
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        let labelled = |name: &str, want: &str| {
+                            metric
+                                .get_label()
+                                .iter()
+                                .any(|label| label.name() == name && label.value() == want)
+                        };
+                        labelled("provider", provider) && labelled("cause", cause)
+                    })
+                    .map(|metric| metric.get_counter().value())
+                    .sum()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The seam: the `tokio::time::timeout` wrapped around the dispatch
+    /// loop's attempt binding.
+    ///
+    /// The wedged provider's own `timeout_ms` is 5000, so without the
+    /// pre-header budget the failover cannot happen for five seconds
+    /// (and without any `timeout_ms` at all it would be the client
+    /// default's thirty). With a 200ms budget the handover is inside the
+    /// bound asserted here.
+    #[tokio::test]
+    async fn a_wedged_provider_fails_over_before_the_client_timeout() {
+        let (wedged_url, wedged_hits) = wedged_upstream_fixture().await;
+        let (stream_url, stream_hits) =
+            upstream_bytes_fixture(openai_tool_call_stream(), "text/event-stream").await;
+        let config = pre_header_timeout_config(&wedged_url, &stream_url, Some(200), 5_000);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let started = std::time::Instant::now();
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the wedged candidate is abandoned and the next one serves");
+        let elapsed = started.elapsed();
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(wedged_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            stream_hits.load(Ordering::SeqCst),
+            1,
+            "the second candidate serves the stream"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the pre-header budget, not the provider's whole-call timeout_ms, \
+             has to end the wedged attempt; took {elapsed:?}"
+        );
+    }
+
+    /// The seam: the failover reason at the dispatch loop's `Err` arm.
+    /// Every timeout was labeled `transport` before, which put a wedged
+    /// provider on the same series as a refused connection.
+    #[tokio::test]
+    async fn a_pre_header_timeout_is_labeled_as_such() {
+        let (wedged_url, _wedged_hits) = wedged_upstream_fixture().await;
+        let (stream_url, _stream_hits) =
+            upstream_bytes_fixture(openai_tool_call_stream(), "text/event-stream").await;
+        let config = pre_header_timeout_config(&wedged_url, &stream_url, Some(200), 5_000);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let labeled_before = failovers_count("pre_header_timeout");
+        let transport_before = failovers_count("transport");
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the wedged candidate is abandoned and the next one serves");
+        drop(session);
+        let _ = live_downstream_body(client).await;
+
+        assert!(
+            failovers_count("pre_header_timeout") > labeled_before,
+            "a handover taken on the pre-header budget carries its own reason"
+        );
+        assert_eq!(
+            failovers_count("transport"),
+            transport_before,
+            "and it is not also counted as a generic transport failure"
+        );
+    }
+
+    /// The seam: the `is_stream` gate on the budget.
+    ///
+    /// A buffered request has no commit point to protect and no partial
+    /// output to lose, so the pre-header budget must not touch it. The
+    /// assertion is a floor rather than a ceiling on purpose: the
+    /// wedged provider's own 800ms `timeout_ms` is what ends this
+    /// attempt, and a budget applied to a non-streaming request would
+    /// end it four times sooner.
+    #[tokio::test]
+    async fn a_non_streaming_request_is_not_bounded_by_the_pre_header_budget() {
+        let (wedged_url, wedged_hits) = wedged_upstream_fixture().await;
+        let (json_url, json_hits) =
+            upstream_bytes_fixture(canonical_chat_response("buffered"), "application/json").await;
+        let config = pre_header_timeout_config(&wedged_url, &json_url, Some(200), 800);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let started = std::time::Instant::now();
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the buffered request still fails over on the provider timeout");
+        let elapsed = started.elapsed();
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(wedged_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(json_hits.load(Ordering::SeqCst), 1);
+        assert!(
+            elapsed >= Duration::from_millis(500),
+            "a non-streaming request keeps waiting out providers[].timeout_ms; \
+             a 200ms pre-header budget must not reach it, but this took {elapsed:?}"
+        );
+    }
+
+    /// The seam: `upstream_response_is_successful_stream` as the commit
+    /// point, and the post-commit counter that reports what happens
+    /// past it.
+    ///
+    /// The no-failover half of this passes on main with no change: the
+    /// dispatch loop has already closed by the time the relay is called,
+    /// so a candidate switch is structurally impossible and this is a
+    /// regression lock rather than evidence of new behavior. The counter
+    /// half is what is new.
+    #[tokio::test]
+    async fn a_stall_after_upstream_headers_does_not_fail_over() {
+        let (truncated_url, truncated_hits) = truncated_stream_upstream_fixture().await;
+        let (stream_url, stream_hits) =
+            upstream_bytes_fixture(openai_tool_call_stream(), "text/event-stream").await;
+        let config = pre_header_timeout_config(&truncated_url, &stream_url, Some(200), 5_000);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let failures_before = stream_post_commit_failures_count("primary", "upstream_error");
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("a committed stream that dies is relayed as far as it got");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "the commit already put stream headers on the wire: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(truncated_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            stream_hits.load(Ordering::SeqCst),
+            0,
+            "no candidate switch is possible once the response was accepted as a stream"
+        );
+        assert!(
+            stream_post_commit_failures_count("primary", "upstream_error") > failures_before,
+            "the failure past the commit point is counted where an operator can see it"
+        );
     }
 }
 

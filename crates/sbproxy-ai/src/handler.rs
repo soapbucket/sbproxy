@@ -775,6 +775,37 @@ pub struct AiResilienceConfig {
     /// more permissive model after a stricter one. Off by default.
     #[serde(default)]
     pub content_policy_fallback: bool,
+    /// Milliseconds a streaming request may wait for the provider's
+    /// response headers before the gateway gives up on that candidate and
+    /// tries the next one.
+    ///
+    /// This bounds connect through upstream response headers only. Once
+    /// the provider answers with a streaming content type the request is
+    /// committed to that provider: a stall after that point ends the
+    /// stream rather than failing over, because a later candidate cannot
+    /// replace output the caller is already receiving. Those stalls are
+    /// counted on `sbproxy_ai_stream_post_commit_failures_total`, and a
+    /// failover taken on this budget is labeled
+    /// `sbproxy_ai_failovers_total{reason="pre_header_timeout"}`.
+    ///
+    /// This is a different budget from `providers[].timeout_ms`, which is
+    /// measured from connect through the end of the response body and so
+    /// cuts a streaming completion off mid-stream. Set both: this one to
+    /// fail off a wedged provider quickly, that one to cap the whole
+    /// call.
+    ///
+    /// Applies to streaming requests only, and must be above zero when
+    /// set. Unset leaves streaming requests bounded solely by
+    /// `providers[].timeout_ms` and the gateway's 30-second client
+    /// default, during which no failover happens.
+    ///
+    /// Worst case before the caller sees an error is
+    /// `(pre_header_timeout_ms + backoff) x candidate count`, since the
+    /// dispatch loop visits each configured provider at most once. The
+    /// 30-second client default is a ceiling on each attempt: a value
+    /// above it does not extend one.
+    #[serde(default)]
+    pub pre_header_timeout_ms: Option<u64>,
 }
 
 /// LLM-aware failover actions (WOR-1545).
@@ -1201,6 +1232,19 @@ impl AiHandlerConfig {
                 );
             }
         }
+        // The same silent-swallow failure, one level out. `timeout_ms`
+        // lives on `providers[]`, so an operator reaching for a second
+        // timeout key reasonably guesses the action level; `resilience:`
+        // is where this one is read. `AiHandlerConfig` sets no
+        // `deny_unknown_fields` either, so without this the key is
+        // dropped in silence and every streaming request keeps waiting
+        // out the 30-second client default with no failover.
+        anyhow::ensure!(
+            value.get("pre_header_timeout_ms").is_none(),
+            "ai `pre_header_timeout_ms` is not read at the action level and would be \
+             silently ignored: it is `resilience.pre_header_timeout_ms`, a key inside \
+             the `resilience:` block rather than a sibling of it"
+        );
         let mut config: Self = serde_json::from_value(value)?;
         // WOR-2556: a typed fallback list is an aimed allowlist. A name
         // matching no provider would leave the trigger configured and
@@ -1232,6 +1276,22 @@ impl AiHandlerConfig {
                     "ai max_price_per_request must be a positive USD amount, got {ceiling}. \
                      A ceiling at or below zero refuses every request, since no priced \
                      candidate estimates below it. Remove the key to disable the ceiling."
+                );
+            }
+        }
+        // A zero pre-header budget elapses before any provider can
+        // answer, so every streaming request would burn the whole
+        // candidate list and return an error. That reads as an outage,
+        // not as a tuning mistake, so it fails at load the way a zero
+        // `prefix_affinity.ttl` does.
+        if let Some(resilience) = config.resilience.as_ref() {
+            if resilience.pre_header_timeout_ms == Some(0) {
+                anyhow::bail!(
+                    "ai resilience.pre_header_timeout_ms must be above zero. A zero budget \
+                     elapses before any provider can send response headers, so every \
+                     streaming request would fail over through the whole candidate list \
+                     and return an error. Remove the key to leave streaming requests \
+                     bounded only by providers[].timeout_ms."
                 );
             }
         }
@@ -3060,6 +3120,54 @@ mod tests {
         }))
         .expect("a positive ceiling is a valid config");
         assert_eq!(config.max_price_per_request, Some(0.05));
+    }
+
+    /// The seam is the validator's caller: `from_config_inner` has to
+    /// reach the key, not just own it.
+    #[test]
+    fn a_zero_pre_header_timeout_is_refused_at_load() {
+        let error = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "resilience": {"pre_header_timeout_ms": 0},
+        }))
+        .expect_err("a zero pre-header budget must refuse the config")
+        .to_string();
+        assert!(error.contains("pre_header_timeout_ms"), "{error}");
+    }
+
+    #[test]
+    fn a_positive_pre_header_timeout_is_accepted() {
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "resilience": {"pre_header_timeout_ms": 750},
+        }))
+        .expect("a positive pre-header budget is a valid config");
+        assert_eq!(
+            config
+                .resilience
+                .as_ref()
+                .and_then(|resilience| resilience.pre_header_timeout_ms),
+            Some(750)
+        );
+    }
+
+    /// The seam is the misplacement loop. `AiHandlerConfig` sets no
+    /// `deny_unknown_fields`, so before this an action-level
+    /// `pre_header_timeout_ms` was swallowed: `sbproxy validate` exited
+    /// 0 and every streaming request kept waiting out the client
+    /// default with no failover and nothing in the logs.
+    #[test]
+    fn a_pre_header_timeout_at_the_action_level_is_refused() {
+        let error = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "pre_header_timeout_ms": 750,
+        }))
+        .expect_err("the key is not read at the action level")
+        .to_string();
+        assert!(
+            error.contains("resilience.pre_header_timeout_ms"),
+            "{error}"
+        );
     }
 
     #[test]

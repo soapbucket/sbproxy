@@ -74,6 +74,69 @@ The second is multipart: an audio transcription, image edit, or image variation 
 
 Two more per-provider fields bound dispatch. `timeout_ms` caps one attempt's wall clock, measured from connect through the end of the response body, so it cuts a streaming completion off mid-stream if the stream outlives it; pick it with your slowest legitimate stream in mind, not your median. `max_retries` re-dispatches on retryable failures, each attempt with a fresh timeout window, so the worst case a client waits on one provider is `(timeout_ms + backoff) x (max_retries + 1)` before routing moves on.
 
+That is one provider. A fallback chain multiplies it again, because the dispatch loop visits each configured candidate at most once: worst case across the whole request is `(timeout_ms + backoff) x (max_retries + 1) x candidate count`. Four providers at `timeout_ms: 30000` is a two-minute wait before the caller sees an error. Nobody sizes for that on purpose, which is what the next section is about.
+
+#### Bounding a wedged provider on a streaming request
+
+`timeout_ms` is the wrong instrument for a provider that accepts the connection and then goes quiet. It cannot be short, because it also has to cover a legitimate three-minute completion, and while it runs no failover happens. Set `resilience.pre_header_timeout_ms` instead. It bounds connect through the provider's response headers on streaming requests only, and an elapse fails over to the next candidate:
+
+```yaml
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      routing: fallback_chain
+      resilience:
+        pre_header_timeout_ms: 2000
+      providers:
+        - name: primary
+          api_key: ${OPENAI_API_KEY}
+          priority: 1
+          timeout_ms: 180000
+        - name: secondary
+          api_key: ${BACKUP_API_KEY}
+          priority: 2
+          timeout_ms: 180000
+```
+
+The two budgets measure different spans of the same request:
+
+```mermaid
+gantt
+    title One streaming attempt, and which key bounds what
+    dateFormat X
+    axisFormat %s
+    section Request
+    connect + TLS            :a1, 0, 1
+    provider thinking        :a2, 1, 2
+    response headers arrive  :milestone, m1, 3, 0
+    SSE events to the client :a3, 3, 9
+    section Budgets
+    pre_header_timeout_ms (failover allowed) :crit, b1, 0, 3
+    timeout_ms (no failover past the header) :b2, 0, 9
+```
+
+`pre_header_timeout_ms` ends at the milestone. `timeout_ms` runs past it to the last byte. The milestone is the commit point: once the provider answers `200 text/event-stream` the gateway is relaying bytes the caller is already reading, and no later candidate can take them back. A stall after that ends the stream, and it is counted on `sbproxy_ai_stream_post_commit_failures_total` rather than on the failover counter.
+
+Send a streaming request at a primary that never answers:
+
+```bash
+curl -N -sS http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Host: ai.example.com' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+The caller gets `secondary`'s stream about two seconds in. Without the key it waits out `timeout_ms`, three minutes here, and then gets the same stream. The failover is on the metric either way, but only the bounded one carries the reason:
+
+```
+sbproxy_ai_failovers_total{from_provider="primary",to_provider="secondary",reason="pre_header_timeout"} 1
+```
+
+Two things this key does not do. It never applies to a non-streaming request: a buffered call has no partial output to protect, so it keeps waiting out `timeout_ms`. And it cannot extend an attempt past the gateway's 30-second HTTP client default, so `pre_header_timeout_ms: 60000` gets you 30 seconds.
+
+With it set, the worst case above becomes `(pre_header_timeout_ms + backoff) x candidate count` for a provider that never answers, while a provider that does answer still gets its full `timeout_ms` to finish generating.
+
 ### Native providers
 70 native providers ship in-tree. The split: 63 entries are OpenAI-format passthrough, 3 (Anthropic, Gemini, Bedrock) carry in-tree translators, and 4 custom-format entries (SageMaker, Oracle OCI, Watsonx, Writer) pass through untranslated, so clients must send those four their native body shape. You bring your own key per provider and the `model` field passes straight through, so the gateway reaches 200+ models (and any model a provider ships next) without enumerating them. Direct adapters include `openai`, `anthropic`, `gemini`, `azure`, `bedrock`, `cohere`, `mistral`, `groq`, `deepseek`, `together`, `fireworks`, `cerebras`, `sambanova`, `nvidia`, `vertex`, `databricks`, `huggingface`, `vllm`, and `openrouter`. For the AWS entries, SBproxy signs the request itself: add `aws_sigv4:` to a `bedrock` or `sagemaker` provider and the gateway computes the SigV4 `Authorization` header per request, with credentials from the standard AWS provider chain, a static key pair, or a renewed STS role session.
 
