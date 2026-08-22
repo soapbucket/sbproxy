@@ -1101,8 +1101,9 @@ storage backend the gateway reads and writes through is answering.
   operations** panel: operations completed, operations that returned an
   error, the p95 across every backend and operation, the slowest
   `backend / op` pair, and failures broken out by error kind. Those come
-  from `storage_op_duration_seconds` and `storage_op_errors_total`,
-  which every backend call is wrapped in.
+  from `sbproxy_storage_op_duration_seconds` and
+  `sbproxy_storage_op_errors_total`, which every backend call is wrapped
+  in.
 - **Mutations:** `DELETE /admin/model-host/artifacts/{digest}` (remove
   one artifact, blocked with a stated reason if it is configured,
   resident, pinned, leased, or file-locked), `POST /admin/model-host/gc`

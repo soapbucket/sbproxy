@@ -20,15 +20,15 @@ function histogram(
   return [
     ...buckets.map(
       ([le, value]) =>
-        `storage_op_duration_seconds_bucket${labels(`,le="${le}"`)} ${value}`,
+        `sbproxy_storage_op_duration_seconds_bucket${labels(`,le="${le}"`)} ${value}`,
     ),
-    `storage_op_duration_seconds_sum${labels("")} ${sum}`,
-    `storage_op_duration_seconds_count${labels("")} ${count}`,
+    `sbproxy_storage_op_duration_seconds_sum${labels("")} ${sum}`,
+    `sbproxy_storage_op_duration_seconds_count${labels("")} ${count}`,
   ];
 }
 
 const SCRAPE = [
-  "# TYPE storage_op_duration_seconds histogram",
+  "# TYPE sbproxy_storage_op_duration_seconds histogram",
   ...histogram(
     "get",
     "redis",
@@ -55,18 +55,21 @@ const SCRAPE = [
     0.3,
     40,
   ),
-  "# TYPE storage_op_errors_total counter",
-  'storage_op_errors_total{op="get",backend="redis",kind="ephemeral",error_kind="backend"} 3',
-  'storage_op_errors_total{op="put",backend="redis",kind="persistent",error_kind="timeout"} 1',
+  "# TYPE sbproxy_storage_op_errors_total counter",
+  'sbproxy_storage_op_errors_total{op="get",backend="redis",kind="ephemeral",error_kind="backend"} 3',
+  'sbproxy_storage_op_errors_total{op="put",backend="redis",kind="persistent",error_kind="timeout"} 1',
 ].join("\n");
 
 describe("storage backend operations", () => {
   it("reads the families the storage crate actually exports", () => {
-    // Neither name carries the sbproxy_ or mesh_ prefix that the metric
-    // drift guard scans, so nothing in the Rust build fails if they are
-    // renamed. These two assertions are the whole safety net.
-    expect(STORAGE_OP_DURATION_FAMILY).toBe("storage_op_duration_seconds");
-    expect(STORAGE_OP_ERRORS_FAMILY).toBe("storage_op_errors_total");
+    // Both names are in the Rust metric registry, so a rename fails a
+    // guard over there. Nothing over there reads this file, so the rename
+    // still reaches the console as a blanked panel. These two assertions
+    // are the whole safety net on this side, and they earned it: the
+    // sbproxy_ prefix landed on both families while this panel was being
+    // written, and the panel read the old names until it was caught.
+    expect(STORAGE_OP_DURATION_FAMILY).toBe("sbproxy_storage_op_duration_seconds");
+    expect(STORAGE_OP_ERRORS_FAMILY).toBe("sbproxy_storage_op_errors_total");
   });
 
   it("counts operations off the histogram _count, never the buckets", () => {
@@ -119,7 +122,7 @@ describe("storage backend operations", () => {
     // never failed publishes latency and no error family at all. That is
     // a real zero and must be shown as one.
     const clean = [
-      "# TYPE storage_op_duration_seconds histogram",
+      "# TYPE sbproxy_storage_op_duration_seconds histogram",
       ...histogram(
         "get",
         "in_memory",
@@ -145,8 +148,8 @@ describe("storage backend operations", () => {
     const report = storageOps(
       parsePrometheus(
         [
-          "# TYPE storage_op_errors_total counter",
-          'storage_op_errors_total{op="get",backend="redis",kind="ephemeral",error_kind="unavailable"} 9',
+          "# TYPE sbproxy_storage_op_errors_total counter",
+          'sbproxy_storage_op_errors_total{op="get",backend="redis",kind="ephemeral",error_kind="unavailable"} 9',
         ].join("\n"),
       ),
     );

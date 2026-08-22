@@ -240,9 +240,9 @@ describe("storage backend operations panel", () => {
     expect(collapse(storageView)).toContain("</template> <StorageBackendOps");
   });
 
-  it("names both storage families, which no build guard watches", () => {
-    expect(STORAGE_OP_DURATION_FAMILY).toBe("storage_op_duration_seconds");
-    expect(STORAGE_OP_ERRORS_FAMILY).toBe("storage_op_errors_total");
+  it("names both storage families under their sanctioned prefix", () => {
+    expect(STORAGE_OP_DURATION_FAMILY).toBe("sbproxy_storage_op_duration_seconds");
+    expect(STORAGE_OP_ERRORS_FAMILY).toBe("sbproxy_storage_op_errors_total");
     expect(backendOps).toContain("storageOps(props.families)");
   });
 
@@ -282,7 +282,7 @@ describe("storage backend operations panel", () => {
     expect(backendOps).toContain('label="Backend operations"');
     expect(backendOps).toContain('label="Failed operations"');
     expect(backendOps).toContain('label="Slowest 5% of calls"');
-    expect(backendOps).not.toContain("storage_op_duration_seconds{");
+    expect(backendOps).not.toContain("sbproxy_storage_op_duration_seconds{");
   });
 
   it("renders errors and the retry through the shared components", () => {

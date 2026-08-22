@@ -1,7 +1,8 @@
 /*
  * Storage backend operations, derived from the Prometheus scrape.
  *
- * `storage_op_duration_seconds` and `storage_op_errors_total` are wrapped
+ * `sbproxy_storage_op_duration_seconds` and
+ * `sbproxy_storage_op_errors_total` are wrapped
  * around every call a storage backend makes (`crates/sbproxy-storage/src/
  * metrics.rs`, `observe_op`). They answer a question the Storage page could
  * not answer before: whether the backend behind the gateway is answering,
@@ -27,11 +28,16 @@
  *    `+Inf` one) and every `_sum` to the real counts and produce a number
  *    that means nothing. Operation totals come off `_count` only.
  *
- * Neither family carries the `sbproxy_` or `mesh_` prefix that
- * `crates/sbproxy-capability/src/scan.rs` sanctions, so neither appears in
- * the metric registry or in `docs/metrics-stability.md`, and the drift
- * guard cannot see a rename. The tests beside this file pin both names for
- * that reason.
+ * Both families were renamed into the sanctioned `sbproxy_` prefix that
+ * `crates/sbproxy-capability/src/scan.rs` recognizes, and both are now in
+ * `crates/sbproxy-observe/src/metric_registry.rs` and
+ * `docs/metrics-stability.md`. That rename is why the names here are
+ * pinned by assertions rather than left as bare literals: the registry
+ * and the drift guard catch a rename on the Rust side, and nothing on
+ * either side reaches into this file, so a rename that landed while this
+ * panel was being written would blank it in silence. It did land while
+ * this panel was being written, and it did blank it, which is the reason
+ * the pins are worth their line count.
  */
 
 import {
@@ -42,9 +48,9 @@ import {
 } from "./metrics";
 
 /** Histogram family: latency of every storage backend operation. */
-export const STORAGE_OP_DURATION_FAMILY = "storage_op_duration_seconds";
+export const STORAGE_OP_DURATION_FAMILY = "sbproxy_storage_op_duration_seconds";
 /** Counter family: storage backend operations that returned an error. */
-export const STORAGE_OP_ERRORS_FAMILY = "storage_op_errors_total";
+export const STORAGE_OP_ERRORS_FAMILY = "sbproxy_storage_op_errors_total";
 
 /** One `backend / op` latency row. */
 export interface StorageOpLatencyRow {
