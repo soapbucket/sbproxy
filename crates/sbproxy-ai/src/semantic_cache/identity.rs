@@ -78,14 +78,14 @@ const GENERATED_AUTH_TAG: &str = "generated-auth";
 /// endian integer, the field bytes, and one zero byte. Integers use their
 /// fixed field width in big endian form and child digests are fed as raw
 /// bytes, never as hexadecimal text.
-struct FieldDigest {
+pub(crate) struct FieldDigest {
     /// Running SHA-256 state over the encoded fields.
     hasher: Sha256,
 }
 
 impl FieldDigest {
     /// Open an encoding under one fixed domain label.
-    fn new(domain: &[u8]) -> Self {
+    pub(crate) fn new(domain: &[u8]) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(domain);
         hasher.update([0u8]);
@@ -101,7 +101,7 @@ impl FieldDigest {
     }
 
     /// Append one UTF-8 text field.
-    fn text(&mut self, field: &str) -> &mut Self {
+    pub(crate) fn text(&mut self, field: &str) -> &mut Self {
         self.bytes(field.as_bytes())
     }
 
@@ -178,7 +178,7 @@ impl FieldDigest {
     }
 
     /// Close the encoding and return the digest.
-    fn finish(self) -> [u8; 32] {
+    pub(crate) fn finish(self) -> [u8; 32] {
         self.hasher.finalize().into()
     }
 }

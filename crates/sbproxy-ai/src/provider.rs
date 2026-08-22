@@ -101,6 +101,26 @@ pub struct ProviderConfig {
     /// declaration. See `sbproxy_ai::data_posture`.
     #[serde(default)]
     pub data_posture: Option<crate::data_posture::DataPostureOverride>,
+    /// Upstream service tier this destination requests: `flex`,
+    /// `standard`, or `priority`. Unset sends no tier field at all and
+    /// the vendor serves on its own default.
+    ///
+    /// This is the operator's decision, not the caller's. A caller that
+    /// sets a tier on the request body has it replaced by this value, or
+    /// removed when this is unset, because raising the tier raises the
+    /// bill and the operator pays it.
+    ///
+    /// The tier is a property of this entry, not of a request. To run two
+    /// tiers of one vendor, declare two `providers[]` entries with the
+    /// same `provider_type` and different tiers; the router then treats
+    /// them as two candidates with independent weights, health, and
+    /// realized latency.
+    ///
+    /// A tier the provider catalog does not record for this vendor is
+    /// refused at config load rather than dropped at request time, so an
+    /// entry that can never serve the tier you asked for never boots.
+    #[serde(default)]
+    pub service_tier: Option<crate::service_tier::ServiceTier>,
     /// WOR-1652: optional local model-serving block. When set, the
     /// gateway itself hosts the models (pull weights, fit an engine to
     /// the GPU, supervise it) and registers them as local providers
@@ -426,6 +446,7 @@ mod tests {
             allow_private_base_url: false,
             no_prompt_training: false,
             data_posture: None,
+            service_tier: None,
             serve: None,
             aws_sigv4: None,
         }

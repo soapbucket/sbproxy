@@ -578,24 +578,28 @@ fn upstream_response_is_successful_stream(status: u16, content_type: Option<&str
 /// Compare the canonical request captured immediately after native inbound
 /// parsing with the body that is about to be dispatched. Provider model
 /// mapping is intentionally ignored because `make_native_bypass_body` applies
-/// the resolved model to the native body. Any other top-level change means a
-/// request transform would be lost by replaying the original native bytes.
+/// the resolved model to the native body. `tier_field` is ignored for the same
+/// reason and no other: the operator's service tier is written into
+/// `attempt_body` before this comparison runs, and `make_native_bypass_body`
+/// re-applies it to the native bytes, so counting it as a lost transform would
+/// disable the bypass for every tiered entry and make the tier the one thing
+/// the bypass could not carry. Any other top-level change means a request
+/// transform really would be lost by replaying the original native bytes.
 fn native_bypass_body_changed(
     baseline: &serde_json::Value,
     attempt_body: &serde_json::Value,
+    tier_field: Option<&str>,
 ) -> bool {
     let (Some(baseline), Some(attempt)) = (baseline.as_object(), attempt_body.as_object()) else {
         return baseline != attempt_body;
     };
-    let baseline_len = baseline
-        .keys()
-        .filter(|key| key.as_str() != "model")
-        .count();
-    let attempt_len = attempt.keys().filter(|key| key.as_str() != "model").count();
+    let reapplied = |key: &str| key == "model" || tier_field == Some(key);
+    let baseline_len = baseline.keys().filter(|key| !reapplied(key)).count();
+    let attempt_len = attempt.keys().filter(|key| !reapplied(key)).count();
     baseline_len != attempt_len
         || baseline
             .iter()
-            .filter(|(key, _)| key.as_str() != "model")
+            .filter(|(key, _)| !reapplied(key))
             .any(|(key, value)| attempt.get(key) != Some(value))
 }
 
@@ -5366,6 +5370,93 @@ fn apply_semantic_route_outcome(
         },
         fallback_reason: Some(fallback_reason),
     }
+}
+
+/// Make the request's service tier the operator's choice, not the caller's.
+///
+/// A caller's `service_tier` is removed first, unconditionally: raising the
+/// tier raises the bill and the operator pays it, and on the OpenAI-chat
+/// surface the field otherwise reaches the upstream verbatim because that
+/// surface never round-trips through the canonical hub request. The
+/// provider entry's own tier is then written in the vendor's wire spelling,
+/// on the surfaces that document the field.
+///
+/// Both halves are needed. Writing without stripping would leave a caller's
+/// tier in place on a provider that declares none; stripping without writing
+/// would make the config key inert.
+///
+/// Every outcome that changed the request is counted on
+/// `sbproxy_ai_service_tier_decisions_total`, because a caller silently losing
+/// the tier they asked for is otherwise invisible: this surface emits no
+/// lossiness note the way the hub translators do.
+///
+/// Returns the `(wire field, wire value)` pair it wrote, so the native bypass
+/// can re-apply the same pair to the inbound bytes it replays without
+/// resolving the catalog a second time.
+fn apply_operator_service_tier(
+    provider: &sbproxy_ai::provider::ProviderConfig,
+    surface: &sbproxy_ai::handler::AiSurface,
+    attempt_body: &mut serde_json::Value,
+) -> Option<(String, String)> {
+    let object = attempt_body.as_object_mut()?;
+    // The one field name every vendor with a tier axis uses today, and the
+    // one the catalog declares. Stripping it on every JSON surface rather
+    // than only the tier-capable ones is the fail-closed half: a vendor that
+    // honors it somewhere undocumented still cannot be steered by a caller.
+    let caller_tier = object.remove("service_tier");
+    let operator_tier = surface
+        .supports_service_tier()
+        .then(|| sbproxy_ai::service_tier::resolved_wire_tier(provider))
+        .flatten();
+    match operator_tier {
+        Some((field, value)) => {
+            object.insert(field.clone(), serde_json::Value::String(value.clone()));
+            sbproxy_ai::ai_metrics::record_service_tier_decision(if caller_tier.is_some() {
+                "caller_tier_replaced"
+            } else {
+                "operator_tier_applied"
+            });
+            Some((field, value))
+        }
+        None => {
+            if caller_tier.is_some() {
+                sbproxy_ai::ai_metrics::record_service_tier_decision("caller_tier_stripped");
+            }
+            None
+        }
+    }
+}
+
+/// Derive one caller-scoped prompt-cache lease identity for a request.
+///
+/// Reads the caller's own cache key: `prompt_cache_key` first, then `user`,
+/// which SDKs sent for the same steering purpose before `prompt_cache_key`
+/// existed. Nothing on this path writes either field, so a caller who sends
+/// neither is never given one and never gets a lease.
+///
+/// The caller-chosen string is only one of five hashed inputs. Tenant,
+/// credential, origin, and surface come from the request context, so
+/// guessing another tenant's key buys nothing.
+fn cache_affinity_key_for_request(
+    ctx: &RequestContext,
+    origin: &str,
+    api_surface: &str,
+    body: &serde_json::Value,
+) -> Option<sbproxy_ai::CacheAffinityKey> {
+    let caller_key = ["prompt_cache_key", "user"]
+        .into_iter()
+        .find_map(|field| body.get(field).and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|caller_key| !caller_key.is_empty())?;
+    Some(sbproxy_ai::CacheAffinityKey::derive(
+        sbproxy_ai::CacheAffinityKeyInput {
+            tenant_id: ctx.tenant_id.as_str(),
+            credential_identity: ctx.principal.api_key_id(),
+            origin,
+            api_surface,
+            caller_key,
+        },
+    ))
 }
 
 pub(super) async fn handle_ai_proxy(
@@ -10561,6 +10652,52 @@ pub(super) async fn handle_ai_proxy(
             }
         }
     }
+    // WOR-2651: prompt-cache affinity is a preference layered over whatever
+    // the strategy just picked, not a strategy of its own. It runs after the
+    // primary-selection block rather than inside it because that block's body
+    // is gated on `is_prefix_affinity()`; a hook inside would have been dead
+    // under round_robin and every other strategy, which is exactly the
+    // composition this feature is for.
+    //
+    // "Whatever the strategy picked" excludes the four that own their
+    // ordering outright, which is the same set the block above skips plus
+    // `fallback_chain`. A cascade's tiers, cost_quality's cheap/frontier
+    // split, an authored routing-policy plan, and a priority-sorted failover
+    // chain are all orderings the operator wrote down on purpose; a lease
+    // jumping that queue would quietly defeat the strategy rather than
+    // compose with it. Nothing is recorded on those origins either, so the
+    // table never fills with leases no lookup will read.
+    let cache_affinity_applies = config.cache_affinity.is_some()
+        && !is_failover
+        && routing_policy_cascade.is_none()
+        && router.cascade_config().is_none()
+        && router.cost_quality_config().is_none();
+    // The key is derived once and reused at the record site below, so the
+    // lease is written under the same identity it was read under.
+    let cache_affinity_key = cache_affinity_applies
+        .then(|| cache_affinity_key_for_request(ctx, hostname, surface_label, &body))
+        .flatten();
+    if cache_affinity_applies {
+        match cache_affinity_key.as_ref() {
+            Some(key) => {
+                if let Some(preferred) = router.select_cache_affinity(
+                    &config.providers,
+                    key,
+                    model.as_str(),
+                    &provider_order,
+                ) {
+                    if let Some(pos) = provider_order.iter().position(|&i| i == preferred) {
+                        let p = provider_order.remove(pos);
+                        provider_order.insert(0, p);
+                    }
+                }
+            }
+            // Counted, not silent: an operator who turned affinity on and
+            // sees only this outcome is looking at callers that send no
+            // cache key, not at a broken table.
+            None => sbproxy_ai::ai_metrics::record_cache_affinity_decision("missing_signal"),
+        }
+    }
     // WOR-2556: typed fallback triggers. Resolve each authored list to
     // provider indices constrained to this request's eligible set (a
     // typed list re-aims a reroute, it never widens what the credential
@@ -10977,6 +11114,7 @@ pub(super) async fn handle_ai_proxy(
                         ctx.ai_tokens_in = Some(prompt_tokens);
                         ctx.ai_tokens_out = Some(completion_tokens);
                         ctx.ai_tokens_cached = (cached_input > 0).then_some(cached_input);
+                        ctx.ai_tokens_cache_write = (cache_creation > 0).then_some(cache_creation);
                     }
                     let cost_micros = emit_ai_billing_event(
                         hostname,
@@ -11143,6 +11281,9 @@ pub(super) async fn handle_ai_proxy(
             let mut provider = config.providers[idx].clone();
             apply_native_provider_credential(&mut provider, native_api_key.as_deref());
             let mut attempt_body = body.clone();
+            // The raced path never takes the native bypass, so the resolved
+            // pair has no second consumer here.
+            let _ = apply_operator_service_tier(&provider, &surface, &mut attempt_body);
             let resolved_model = if !model.is_empty() {
                 let mapped = provider.map_model(&model);
                 if mapped != model {
@@ -11428,6 +11569,7 @@ pub(super) async fn handle_ai_proxy(
 
         // Map model name for this provider.
         let mut attempt_body = body.clone();
+        let operator_tier = apply_operator_service_tier(provider, &surface, &mut attempt_body);
         let resolved_model = if !model.is_empty() {
             let mapped = provider.map_model(&model);
             if mapped != model {
@@ -11504,7 +11646,13 @@ pub(super) async fn handle_ai_proxy(
             || !native_request_is_losslessly_governable
             || native_bypass_canonical_baseline
                 .as_ref()
-                .is_some_and(|baseline| native_bypass_body_changed(baseline, &attempt_body));
+                .is_some_and(|baseline| {
+                    native_bypass_body_changed(
+                        baseline,
+                        &attempt_body,
+                        operator_tier.as_ref().map(|(field, _)| field.as_str()),
+                    )
+                });
         let bypass = if !native_bypass_is_safe(
             is_stream,
             request_transform_selected,
@@ -11525,7 +11673,16 @@ pub(super) async fn handle_ai_proxy(
                 // substituted in) to the upstream's `/v1/messages`
                 // path. The OpenAI Chat hub body that lives in
                 // `attempt_body` is discarded for this iteration.
-                match make_native_bypass_body(&native_request_bytes_for_bypass, &resolved_model) {
+                // The bypass rebuilds the request from the inbound bytes, so
+                // the operator tier written into `attempt_body` above never
+                // reaches it; `operator_tier` carries it across.
+                match make_native_bypass_body(
+                    &native_request_bytes_for_bypass,
+                    &resolved_model,
+                    operator_tier
+                        .as_ref()
+                        .map(|(field, value)| (field.as_str(), value.as_str())),
+                ) {
                     Ok(body) => {
                         sbproxy_ai::ai_metrics::record_native_bypass(
                             sbproxy_ai::format::NativeBypass::AnthropicMessages.inbound_label(),
@@ -12106,6 +12263,13 @@ pub(super) async fn handle_ai_proxy(
                 if (200..300).contains(&status) {
                     if let Some(prefix) = routing_prefix {
                         router.record_prefix(provider_idx, prefix);
+                    }
+                    // The logical model, matching what `select_cache_affinity`
+                    // compared against above. A provider's own `model_map`
+                    // rename is not known at selection time, so leasing on the
+                    // renamed value would never match on the next request.
+                    if let Some(key) = cache_affinity_key {
+                        router.record_cache_affinity(provider_idx, key, model.as_str());
                     }
                 }
                 last_resp = Some(resp);
@@ -13866,6 +14030,7 @@ pub(super) async fn relay_ai_response_with_cache(
                 ctx.ai_tokens_in = Some(prompt_tokens);
                 ctx.ai_tokens_out = Some(completion_tokens);
                 ctx.ai_tokens_cached = (cached_input > 0).then_some(cached_input);
+                ctx.ai_tokens_cache_write = (cache_creation > 0).then_some(cache_creation);
                 let project = ctx.principal.attrs.project.as_deref().unwrap_or("");
                 let user = ctx.principal.attrs.user.as_deref().unwrap_or("");
                 if ctx.principal.attrs.tags.is_empty() {
@@ -14026,6 +14191,7 @@ pub(super) async fn relay_ai_response_with_cache(
                 ctx.ai_tokens_in = Some(prompt_tokens);
                 ctx.ai_tokens_out = Some(completion_tokens);
                 ctx.ai_tokens_cached = (cached_input > 0).then_some(cached_input);
+                ctx.ai_tokens_cache_write = (cache_creation > 0).then_some(cache_creation);
                 let usage = sbproxy_ai::budget::AiUsage::Tokens {
                     input: prompt_tokens,
                     output: completion_tokens,
@@ -18586,6 +18752,361 @@ origins:
                 .any(|e| e.tenant_id.as_deref() == Some("tenant-b")),
             "the cross-tenant inject_mcp miss must be an audited event, not only a log line: {events:?}"
         );
+    }
+
+    /// An upstream that answers `accepts` requests instead of one.
+    ///
+    /// The single-shot fixtures above cannot express "the same provider
+    /// served both requests", which is the whole claim a routing-affinity
+    /// test has to make.
+    async fn repeating_upstream_fixture(
+        body: &'static str,
+        accepts: usize,
+    ) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind repeating upstream");
+        let address = listener.local_addr().expect("repeating upstream address");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&hits);
+        tokio::spawn(async move {
+            for _ in 0..accepts {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                observed.fetch_add(1, Ordering::SeqCst);
+                drain_upstream_request(&mut stream).await;
+                let response = format!(
+                    "HTTP/1.1 200 Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{address}/v1"), hits)
+    }
+
+    fn two_provider_affinity_config(
+        first_url: String,
+        second_url: String,
+        cache_affinity: bool,
+    ) -> sbproxy_ai::AiHandlerConfig {
+        let mut action = serde_json::json!({
+            "providers": [
+                {
+                    "name": "provider-one",
+                    "provider_type": "openai",
+                    "base_url": first_url,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key"
+                },
+                {
+                    "name": "provider-two",
+                    "provider_type": "openai",
+                    "base_url": second_url,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key"
+                }
+            ],
+            "routing": "round_robin"
+        });
+        if cache_affinity {
+            action["cache_affinity"] = serde_json::json!({});
+        }
+        sbproxy_ai::AiHandlerConfig::from_config(action).expect("affinity proxy config")
+    }
+
+    async fn dispatch_chat_request(config: &sbproxy_ai::AiHandlerConfig, body: serde_json::Value) {
+        let (mut session, client) = downstream_session(body).await;
+        let mut context = crate::context::RequestContext::new();
+        context.tenant_id = "tenant-a".into();
+        super::handle_ai_proxy(
+            &mut session,
+            config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("affinity request dispatches");
+        drop(session);
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+    }
+
+    /// WOR-2651: the control for the affinity test below.
+    ///
+    /// It asserts the premise rather than narrating it. Without it, an
+    /// affinity test that saw both requests land on one provider could be
+    /// measuring a broken second fixture instead of a working lease.
+    #[tokio::test]
+    async fn two_requests_without_a_cache_key_alternate_providers_under_round_robin() {
+        let (first_url, first_hits) = repeating_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+            2,
+        )
+        .await;
+        let (second_url, second_hits) = repeating_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+            2,
+        )
+        .await;
+        let config = two_provider_affinity_config(first_url, second_url, true);
+
+        for _ in 0..2 {
+            dispatch_chat_request(
+                &config,
+                serde_json::json!({
+                    "model": "fixture-model",
+                    "messages": [{"role": "user", "content": "same prompt"}]
+                }),
+            )
+            .await;
+        }
+
+        assert_eq!(
+            (
+                first_hits.load(Ordering::SeqCst),
+                second_hits.load(Ordering::SeqCst)
+            ),
+            (1, 1),
+            "round robin must alternate when no caller cache key is present, \
+             otherwise the affinity test below proves nothing"
+        );
+    }
+
+    /// WOR-2651: prompt-cache affinity has to compose with every strategy.
+    ///
+    /// The existing prefix-affinity hook is gated on
+    /// `Router::is_prefix_affinity`, so a lease evaluated inside that gate
+    /// would never run under `round_robin`. This exercises the
+    /// strategy-independent reorder that runs after the primary selection
+    /// block instead.
+    #[tokio::test]
+    async fn two_requests_with_one_cache_key_reach_one_provider_under_round_robin() {
+        let (first_url, first_hits) = repeating_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+            2,
+        )
+        .await;
+        let (second_url, second_hits) = repeating_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+            2,
+        )
+        .await;
+        let config = two_provider_affinity_config(first_url, second_url, true);
+
+        for _ in 0..2 {
+            dispatch_chat_request(
+                &config,
+                serde_json::json!({
+                    "model": "fixture-model",
+                    "prompt_cache_key": "tenant-a-session-7",
+                    "messages": [{"role": "user", "content": "same prompt"}]
+                }),
+            )
+            .await;
+        }
+
+        let mut served = [
+            first_hits.load(Ordering::SeqCst),
+            second_hits.load(Ordering::SeqCst),
+        ];
+        served.sort_unstable();
+        assert_eq!(
+            served,
+            [0, 2],
+            "the second request must return to the provider that already holds \
+             this caller's warm prompt cache"
+        );
+    }
+
+    /// WOR-2651: the gateway leases on a key the caller sent and never
+    /// invents one. A synthesized `prompt_cache_key` would silently change
+    /// what the upstream caches and bills for.
+    #[tokio::test]
+    async fn the_gateway_never_adds_a_cache_key_the_caller_did_not_send() {
+        let (upstream_url, hits, captured) = capturing_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        )
+        .await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "provider-one",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }],
+            "routing": "round_robin",
+            "cache_affinity": {}
+        }))
+        .expect("affinity proxy config");
+
+        // `user` is present, so a lease *is* derived for this request. That
+        // is the interesting case: the key the gateway leases on must stay
+        // inside the gateway.
+        dispatch_chat_request(
+            &config,
+            serde_json::json!({
+                "model": "fixture-model",
+                "user": "caller-42",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }),
+        )
+        .await;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let upstream_request = captured.await.expect("capturing upstream task");
+        let request_text = String::from_utf8(upstream_request).expect("upstream request UTF-8");
+        let body: serde_json::Value = serde_json::from_str(
+            request_text
+                .split_once("\r\n\r\n")
+                .expect("upstream request body")
+                .1,
+        )
+        .expect("upstream JSON body");
+        assert!(
+            body.get("prompt_cache_key").is_none(),
+            "the gateway must not write a prompt cache key the caller omitted: {body}"
+        );
+        assert_eq!(
+            body["user"], "caller-42",
+            "the caller's own field must reach the upstream unchanged"
+        );
+    }
+
+    /// WOR-2652: the security regression test.
+    ///
+    /// Before this change a caller POSTing `{"service_tier": "priority"}`
+    /// to `/v1/chat/completions` reached the upstream verbatim, because
+    /// that surface never round-trips through the canonical hub request.
+    /// Raising the tier raises the bill, and the operator pays it.
+    #[tokio::test]
+    async fn a_caller_service_tier_is_replaced_by_the_operator_tier() {
+        let before = service_tier_decisions("caller_tier_replaced");
+        let (upstream_url, hits, captured) = capturing_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        )
+        .await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai-flex",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "service_tier": "flex"
+            }]
+        }))
+        .expect("service tier proxy config");
+
+        dispatch_chat_request(
+            &config,
+            serde_json::json!({
+                "model": "fixture-model",
+                "service_tier": "priority",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }),
+        )
+        .await;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let body = captured_upstream_json(captured).await;
+        assert_eq!(
+            body["service_tier"], "flex",
+            "the operator's tier must overwrite the caller's: {body}"
+        );
+        // The caller silently loses the tier they paid to ask for, and this
+        // surface emits no lossiness note, so the counter is the only thing
+        // an operator can see the enforcement on.
+        assert_eq!(
+            service_tier_decisions("caller_tier_replaced") - before,
+            1.0,
+            "overwriting a caller's tier must be scrapeable"
+        );
+    }
+
+    /// One `sbproxy_ai_service_tier_decisions_total` disposition. Absent
+    /// series read as zero, which is what a disposition nobody has recorded
+    /// yet looks like.
+    fn service_tier_decisions(disposition: &str) -> f64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "sbproxy_ai_service_tier_decisions_total")
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        metric.get_label().iter().any(|label| {
+                            label.name() == "disposition" && label.value() == disposition
+                        })
+                    })
+                    .map(|metric| metric.get_counter().value())
+                    .sum()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The other half of the same decision. An entry that declares no tier
+    /// must strip the caller's, or the config key would only work as an
+    /// upgrade and a caller could still escalate on every untiered entry.
+    #[tokio::test]
+    async fn a_caller_service_tier_is_stripped_when_the_entry_declares_none() {
+        let before = service_tier_decisions("caller_tier_stripped");
+        let (upstream_url, hits, captured) = capturing_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        )
+        .await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai-default",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }]
+        }))
+        .expect("untiered proxy config");
+
+        dispatch_chat_request(
+            &config,
+            serde_json::json!({
+                "model": "fixture-model",
+                "service_tier": "priority",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }),
+        )
+        .await;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let body = captured_upstream_json(captured).await;
+        assert!(
+            body.get("service_tier").is_none(),
+            "an entry with no tier must send no tier field: {body}"
+        );
+        assert_eq!(
+            service_tier_decisions("caller_tier_stripped") - before,
+            1.0,
+            "stripping a caller's tier must be scrapeable"
+        );
+    }
+
+    async fn captured_upstream_json(
+        captured: tokio::task::JoinHandle<Vec<u8>>,
+    ) -> serde_json::Value {
+        let upstream_request = captured.await.expect("capturing upstream task");
+        let request_text = String::from_utf8(upstream_request).expect("upstream request UTF-8");
+        serde_json::from_str(
+            request_text
+                .split_once("\r\n\r\n")
+                .expect("upstream request body")
+                .1,
+        )
+        .expect("upstream JSON body")
     }
 
     /// WOR-2312: a global alias resolves before provider selection, which
@@ -25406,15 +25927,45 @@ mod compression_selection_tests {
         });
         let mut mapped = baseline.clone();
         mapped["model"] = serde_json::Value::String("provider-model".to_string());
-        assert!(!native_bypass_body_changed(&baseline, &mapped));
+        assert!(!native_bypass_body_changed(&baseline, &mapped, None));
 
         let mut redacted = mapped.clone();
         redacted["messages"][0]["content"] = serde_json::Value::String("[REDACTED]".to_string());
-        assert!(native_bypass_body_changed(&baseline, &redacted));
+        assert!(native_bypass_body_changed(&baseline, &redacted, None));
 
         let mut injected = mapped;
         injected["tools"] = serde_json::json!([{"name": "lookup"}]);
-        assert!(native_bypass_body_changed(&baseline, &injected));
+        assert!(native_bypass_body_changed(&baseline, &injected, None));
+    }
+
+    /// WOR-2652: the operator's tier is written into `attempt_body` before
+    /// this comparison runs and re-applied to the native bytes by
+    /// `make_native_bypass_body`, so counting it as a lost transform would
+    /// disable the bypass for exactly the entries the tier is configured on,
+    /// leaving the tier plumbing in `make_native_bypass_body` unreachable.
+    #[test]
+    fn native_body_comparison_ignores_the_reapplied_service_tier() {
+        let baseline = serde_json::json!({
+            "model": "public-model",
+            "messages": [{"role": "user", "content": "original"}],
+        });
+        let mut tiered = baseline.clone();
+        tiered["service_tier"] = serde_json::Value::String("flex".to_string());
+        assert!(native_bypass_body_changed(&baseline, &tiered, None));
+        assert!(!native_bypass_body_changed(
+            &baseline,
+            &tiered,
+            Some("service_tier")
+        ));
+
+        // The carve-out is one field wide. Anything else still vetoes.
+        let mut also_edited = tiered;
+        also_edited["messages"][0]["content"] = serde_json::Value::String("edited".to_string());
+        assert!(native_bypass_body_changed(
+            &baseline,
+            &also_edited,
+            Some("service_tier")
+        ));
     }
 
     #[test]

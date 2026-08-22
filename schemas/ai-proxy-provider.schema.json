@@ -166,6 +166,18 @@
         }
       ]
     },
+    "service_tier": {
+      "description": "Upstream service tier this destination requests: `flex`, `standard`, or `priority`. Unset sends no tier field at all and the vendor serves on its own default.\n\nThis is the operator's decision, not the caller's. A caller that sets a tier on the request body has it replaced by this value, or removed when this is unset, because raising the tier raises the bill and the operator pays it.\n\nThe tier is a property of this entry, not of a request. To run two tiers of one vendor, declare two `providers[]` entries with the same `provider_type` and different tiers; the router then treats them as two candidates with independent weights, health, and realized latency.\n\nA tier the provider catalog does not record for this vendor is refused at config load rather than dropped at request time, so an entry that can never serve the tier you asked for never boots.",
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ServiceTier"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "serve": {
       "description": "WOR-1652: optional local model-serving block. When set, the gateway itself hosts the models (pull weights, fit an engine to the GPU, supervise it) and registers them as local providers ahead of any cloud fallback, instead of proxying `base_url` to an already-running server. `None` keeps the proxy-only behavior. The lifecycle half (spawn/evict) ships in phases of the model-host epic; this field is the config surface it reads.",
       "anyOf": [
@@ -212,6 +224,14 @@
         }
       },
       "additionalProperties": false
+    },
+    "ServiceTier": {
+      "type": "string",
+      "enum": [
+        "flex",
+        "standard",
+        "priority"
+      ]
     },
     "ModelHostConfig": {
       "description": "The `serve:` block: the local models plus host-wide policy.",

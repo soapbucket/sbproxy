@@ -4884,7 +4884,7 @@ fn wor_229_bypass_body_empty_model_returns_original_bytes() {
     let original = bytes::Bytes::from_static(
         br#"{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"hi"}]}"#,
     );
-    let out = super::make_native_bypass_body(&original, "").unwrap();
+    let out = super::make_native_bypass_body(&original, "", None).unwrap();
     // Empty resolved_model means the router did not map; passing
     // the original bytes through verbatim preserves the byte
     // forward guarantee of the bypass.
@@ -4896,7 +4896,7 @@ fn wor_229_bypass_body_same_model_returns_original_bytes() {
     let original = bytes::Bytes::from_static(
         br#"{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"hi"}]}"#,
     );
-    let out = super::make_native_bypass_body(&original, "claude-3-5-sonnet").unwrap();
+    let out = super::make_native_bypass_body(&original, "claude-3-5-sonnet", None).unwrap();
     // No mutation needed when the resolved model already matches
     // the body's model. The original bytes flow through.
     assert_eq!(out.as_ref(), original.as_ref());
@@ -4907,7 +4907,8 @@ fn wor_229_bypass_body_remaps_model_when_router_chose_different() {
     let original = bytes::Bytes::from_static(
         br#"{"model":"sonnet-alias","messages":[{"role":"user","content":"hi"}]}"#,
     );
-    let out = super::make_native_bypass_body(&original, "claude-3-5-sonnet-20241022").unwrap();
+    let out =
+        super::make_native_bypass_body(&original, "claude-3-5-sonnet-20241022", None).unwrap();
     let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(
         parsed["model"].as_str().unwrap(),
@@ -4919,8 +4920,42 @@ fn wor_229_bypass_body_remaps_model_when_router_chose_different() {
 #[test]
 fn wor_229_bypass_body_propagates_parse_errors() {
     let invalid = bytes::Bytes::from_static(b"{not valid json");
-    let err = super::make_native_bypass_body(&invalid, "claude-3-5-sonnet").unwrap_err();
+    let err = super::make_native_bypass_body(&invalid, "claude-3-5-sonnet", None).unwrap_err();
     assert!(err.is_syntax() || err.is_data());
+}
+
+/// WOR-2652: the bypass rebuilds the request from the inbound bytes, so
+/// the operator tier written into `attempt_body` never reaches it. Without
+/// the tier argument, a tiered Anthropic entry would forward whatever the
+/// caller sent on the one surface the gateway forwards byte for byte.
+#[test]
+fn bypass_body_writes_the_operator_tier_over_the_callers() {
+    let original = bytes::Bytes::from_static(
+        br#"{"model":"claude-3-5-sonnet","service_tier":"priority","messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    let out = super::make_native_bypass_body(
+        &original,
+        "claude-3-5-sonnet",
+        Some(("service_tier", "default")),
+    )
+    .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(parsed["service_tier"].as_str().unwrap(), "default");
+    assert_eq!(parsed["model"].as_str().unwrap(), "claude-3-5-sonnet");
+}
+
+#[test]
+fn bypass_body_stays_a_byte_forward_when_the_tier_already_matches() {
+    let original = bytes::Bytes::from_static(
+        br#"{"model":"claude-3-5-sonnet","service_tier":"default","messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    let out = super::make_native_bypass_body(
+        &original,
+        "claude-3-5-sonnet",
+        Some(("service_tier", "default")),
+    )
+    .unwrap();
+    assert_eq!(out.as_ref(), original.as_ref());
 }
 
 // --- WOR-525: ARDP discovery JSON shape ---

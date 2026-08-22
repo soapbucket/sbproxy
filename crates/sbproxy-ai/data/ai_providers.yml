@@ -27,6 +27,15 @@
 #         data_region  : optional vendor-declared processing region;
 #                        reserved for zone/locality-aware selection and
 #                        not consulted by the posture filter.
+#   - service_tiers   : the vendor's service-tier vocabulary, if it sells
+#       one. `field` is the request field the vendor reads; `flex`,
+#       `standard`, and `priority` are its wire spellings for the
+#       gateway's three canonical tiers. Omit a tier the vendor does not
+#       sell, and omit the whole block for a vendor with no tier axis: a
+#       provider entry naming a tier its catalog entry does not declare
+#       is refused at config load rather than served on a tier nobody
+#       chose. Only vendors whose vocabulary has been read off their own
+#       API reference are declared here.
 #       Entries with no vendor commitment carry the pessimistic default
 #       spelled out, so a posture-constrained deployment fails closed
 #       rather than optimistically routing to an unknown posture.
@@ -51,6 +60,17 @@ providers:
     data_posture:
       retains_data: true
       zdr_available: true
+    # Wire vocabulary of the `service_tier` request field documented in
+    # the OpenAI chat-completions API reference. `default` is the
+    # vendor's spelling of the ordinary tier; `flex` and `priority` are
+    # its cheaper and faster capacity pools. No price factors are
+    # declared here: a billing number belongs in `model_prices` where an
+    # operator can see and correct it, not in a shipped artifact.
+    service_tiers:
+      field: service_tier
+      flex: flex
+      standard: default
+      priority: priority
 
   - name: anthropic
     display_name: Anthropic

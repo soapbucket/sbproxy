@@ -287,6 +287,42 @@ static AI_PREFIX_AFFINITY_EVICTIONS: LazyLock<CounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Caller-keyed prompt-cache affinity selections by lease outcome.
+static AI_CACHE_AFFINITY_DECISIONS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_cache_affinity_decisions_total",
+            "Caller-keyed prompt-cache affinity selections by lease outcome"
+        ),
+        &["outcome"]
+    )
+    .unwrap()
+});
+
+/// Bounded cache-affinity lease table removals by cause.
+static AI_CACHE_AFFINITY_EVICTIONS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_cache_affinity_evictions_total",
+            "Leases removed from the bounded prompt-cache affinity table"
+        ),
+        &["reason"]
+    )
+    .unwrap()
+});
+
+/// Requests whose upstream service tier the operator's entry decided.
+static AI_SERVICE_TIER_DECISIONS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_service_tier_decisions_total",
+            "Upstream attempts whose service tier the operator's provider entry decided"
+        ),
+        &["disposition"]
+    )
+    .unwrap()
+});
+
 /// Semantic-route selections by closed decision outcome (WOR-2564).
 /// `matched` pinned a deployment; every other outcome is a fallback
 /// disposition, mirrored on `sbproxy_ai_routing_fallbacks_total`.
@@ -1291,6 +1327,65 @@ pub fn record_prefix_affinity_eviction(reason: &str) {
     };
     AI_PREFIX_AFFINITY_EVICTIONS
         .with_label_values(&[reason])
+        .inc();
+}
+
+/// Record whether caller-keyed prompt-cache affinity found a live lease.
+///
+/// The outcome vocabulary is closed and deliberately distinct from
+/// [`record_prefix_affinity_decision`]: the two tables key on different
+/// things (a caller-chosen string against a prompt prefix), and an operator
+/// has to be able to tell which one is working.
+///
+/// `hit` reordered the candidate list. `miss` found no lease. `ineligible`
+/// found a live lease whose holder health, resilience, or policy had already
+/// removed from the candidate set. `model_changed` found a lease recorded
+/// against a different resolved model and dropped it. `missing_signal` means
+/// the request carried no cache key for the gateway to lease on.
+pub fn record_cache_affinity_decision(outcome: &str) {
+    let outcome = match outcome {
+        "hit" | "miss" | "missing_signal" | "ineligible" | "model_changed" => outcome,
+        _ => "unknown",
+    };
+    AI_CACHE_AFFINITY_DECISIONS
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+/// Record removal from the bounded cache-affinity lease table.
+pub fn record_cache_affinity_eviction(reason: &str) {
+    let reason = match reason {
+        "ttl" | "capacity" | "model_changed" => reason,
+        _ => "unknown",
+    };
+    AI_CACHE_AFFINITY_EVICTIONS
+        .with_label_values(&[reason])
+        .inc();
+}
+
+/// Record that the operator's provider entry decided one attempt's upstream
+/// service tier.
+///
+/// Counted once per upstream attempt, not once per request, because the
+/// decision is per destination: two entries in a failover chain can carry
+/// two different tiers.
+///
+/// Nothing is recorded for the ordinary case where the caller sent no tier
+/// and the entry declares none, so an untiered deployment keeps a flat zero
+/// here rather than a counter that tracks its whole request rate.
+///
+/// `caller_tier_replaced` overwrote a caller-supplied tier with the entry's.
+/// `caller_tier_stripped` removed a caller-supplied tier from an entry that
+/// declares none, so the vendor serves on its own default.
+/// `operator_tier_applied` wrote the entry's tier onto a request that asked
+/// for none.
+pub fn record_service_tier_decision(disposition: &str) {
+    let disposition = match disposition {
+        "caller_tier_replaced" | "caller_tier_stripped" | "operator_tier_applied" => disposition,
+        _ => "unknown",
+    };
+    AI_SERVICE_TIER_DECISIONS
+        .with_label_values(&[disposition])
         .inc();
 }
 

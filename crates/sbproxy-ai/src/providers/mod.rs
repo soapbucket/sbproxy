@@ -110,6 +110,12 @@ pub struct ProviderInfo {
     /// the pessimistic default.
     #[serde(default)]
     pub data_posture: CatalogDataPosture,
+    /// Service tiers this vendor's API sells, and the wire spelling of
+    /// each. Absent means the vendor has no tier axis the gateway knows
+    /// about, so a provider entry asking for one is refused at config
+    /// load. See [`crate::service_tier`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tiers: Option<crate::service_tier::CatalogServiceTiers>,
 }
 
 fn default_true() -> bool {
@@ -211,6 +217,8 @@ struct YamlProvider {
     supports_chat: bool,
     #[serde(default)]
     data_posture: CatalogDataPosture,
+    #[serde(default)]
+    service_tiers: Option<crate::service_tier::CatalogServiceTiers>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -438,6 +446,7 @@ fn build_registry(override_path: Option<&Path>) -> anyhow::Result<Registry> {
             supports_embeddings: entry.supports_embeddings,
             supports_chat: entry.supports_chat,
             data_posture: entry.data_posture,
+            service_tiers: entry.service_tiers,
         };
         let idx = providers.len();
         providers.push(info);

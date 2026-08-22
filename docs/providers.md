@@ -135,6 +135,29 @@ The entries with a non-pessimistic declaration:
 
 The five entries with `retains_data: true, zdr_available: true` retain on a stock account, so they satisfy `require_zdr` only once you declare the agreement you hold. The nine with `retains_data: false` store nothing to begin with and satisfy it as they stand. Bedrock moved from the second group to the first in this pass, which is a fail-closed change: an origin that required ZDR and configured only Bedrock now gets refused at config load instead of routing to a provider whose no-retention default no longer covers every model it serves. Every other entry carries the pessimistic default, `retains_data: true, zdr_available: false`, spelled out in the YAML: with no published commitment recorded, a posture-constrained origin fails closed rather than optimistically routing there. If your own agreement with a vendor differs (a signed ZDR addendum, say), declare it on your provider entry with `data_posture.zdr: true` / `data_posture.retains_data: false`, or ship a corrected catalog via `proxy.ai_providers_file`. A locally served (`serve:`) or `managed_model` provider is treated as zero-data-retention by construction.
 
+## Declared service tiers
+
+A catalog entry may also declare a `service_tiers` block: the request field the vendor reads a tier from, and its wire spelling for each of the gateway's three canonical tiers (`flex`, `standard`, `priority`). A provider entry's `service_tier:` is translated through this block on the way to the wire.
+
+| Name | `flex` | `standard` | `priority` | Basis |
+|------|--------|------------|------------|-------|
+| `openai` | `flex` | `default` | `priority` | `service_tier` on the chat-completions request (OpenAI API reference). |
+
+Every other entry declares no block, which means the gateway has no tier it knows how to ask that vendor for. A provider entry naming one is refused at config load rather than booted and served on a tier nobody chose. That is deliberate conservatism, not a claim that those vendors have no tiers: the values above ship in an operator-facing artifact and drive what reaches a paid API, so only vocabulary read off a vendor's own API reference is declared here.
+
+To add one, override the catalog with `proxy.ai_providers_file` and give the vendor a `service_tiers` block. Omit any tier the vendor does not sell:
+
+```yaml
+  - name: my-vendor
+    # ... the rest of the entry ...
+    service_tiers:
+      field: service_tier
+      standard: on_demand
+      flex: flex
+```
+
+See [ai-gateway.md](ai-gateway.md#service-tier) for how the tier is enforced on the request path.
+
 ## Configuring a provider
 
 ```yaml

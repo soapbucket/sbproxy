@@ -175,6 +175,11 @@ pub struct RequestEvent {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub tokens_cached: Option<u32>,
 
+    /// Provider cache write tokens (Anthropic `cache_creation_input_tokens`).
+    /// Absent for providers that report only cache reads.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tokens_cache_write: Option<u32>,
+
     /// Estimated cost in micro-USD (1e-6 USD). Integer to keep
     /// ClickHouse aggregation exact.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -234,6 +239,7 @@ impl RequestEvent {
             tokens_in: None,
             tokens_out: None,
             tokens_cached: None,
+            tokens_cache_write: None,
             cost_usd_micros: None,
             status_code: None,
             error_class: None,
@@ -284,6 +290,7 @@ mod tests {
             tokens_in: Some(800),
             tokens_out: Some(150),
             tokens_cached: Some(200),
+            tokens_cache_write: Some(120),
             cost_usd_micros: Some(4_500),
             status_code: Some(200),
             error_class: None,
@@ -326,6 +333,7 @@ mod tests {
         assert_eq!(decoded.properties, original.properties);
         assert_eq!(decoded.cost_usd_micros, original.cost_usd_micros);
         assert_eq!(decoded.tokens_cached, original.tokens_cached);
+        assert_eq!(decoded.tokens_cache_write, original.tokens_cache_write);
     }
 
     #[test]

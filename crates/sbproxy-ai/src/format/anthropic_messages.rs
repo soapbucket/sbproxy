@@ -420,8 +420,10 @@ impl ChatFormat for AnthropicMessagesFormat {
                     &mut hub.lossiness,
                     "anthropic.service_tier",
                     "anthropic.service_tier".into(),
-                    "service_tier dropped: the provider serves the request on \
-                     its default tier"
+                    "service_tier dropped: the tier is the operator's choice, \
+                     not the caller's, because it sets the price. The \
+                     destination's configured `service_tier` governs, and the \
+                     vendor's own default applies when it declares none"
                         .into(),
                 ),
                 "container" => note_drop(

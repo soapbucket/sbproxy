@@ -55,6 +55,34 @@ pub struct AiHandlerConfig {
     /// Strategy used to select a provider for each request.
     #[serde(default = "default_strategy", deserialize_with = "deserialize_routing")]
     pub routing: RoutingStrategy,
+    /// Route a caller's repeated requests back to the provider that already
+    /// holds their warm prompt cache.
+    ///
+    /// When a request carries a prompt cache key (`prompt_cache_key`, or
+    /// `user` when that is absent), the gateway remembers which provider
+    /// served it and prefers that provider for the caller's next request
+    /// with the same key. It is a preference, never a pin: an unhealthy,
+    /// ejected, or policy-ineligible provider is still skipped, and a
+    /// request whose resolved model changed starts a fresh lease.
+    ///
+    /// This composes with `routing.strategy` rather than replacing it. The
+    /// strategy still picks; affinity only moves a live lease holder to the
+    /// front of the order it produced. The four strategies that own their
+    /// ordering outright are the exception and are left alone:
+    /// `fallback_chain`, `cascade`, `cost_quality`, and a `routing_policy`
+    /// plan all express an order the operator wrote down, so a lease is
+    /// neither read nor recorded on those origins.
+    ///
+    /// The lease is scoped to the tenant, the credential, the origin, and
+    /// the API surface, so one caller's key can never steer another's
+    /// routing. Nothing writes the key; a request that does not send one is
+    /// routed by the configured strategy alone.
+    ///
+    /// State lives in this gateway process only. It does not survive a
+    /// restart and is not shared between replicas. Unset disables the
+    /// feature.
+    #[serde(default)]
+    pub cache_affinity: Option<crate::routing_state::CacheAffinityConfig>,
     /// Data-handling posture requirement gating provider eligibility.
     ///
     /// Evaluated as a hard candidate-set filter before any routing
@@ -634,6 +662,15 @@ impl AiHandlerConfig {
                         .with_model_groups(
                             self.model_groups.iter().map(|group| group.name.as_str()),
                         );
+                if let Some(cache_affinity) = self.cache_affinity {
+                    router = router.with_cache_affinity(cache_affinity);
+                    tracing::info!(
+                        providers = self.providers.len(),
+                        ttl_secs = cache_affinity.ttl_secs,
+                        max_keys_per_provider = cache_affinity.max_keys_per_provider,
+                        "ai prompt-cache affinity armed"
+                    );
+                }
                 if let Some(resilience) = self.resilience.as_ref() {
                     if let Some(breaker) = resilience.circuit_breaker.as_ref() {
                         let failure_threshold = breaker.failure_threshold.max(1);
@@ -1137,6 +1174,16 @@ where
     let obj = value.as_object().ok_or_else(|| {
         Error::custom("routing must be either a strategy name string or an object")
     })?;
+    // `cache_affinity` composes with every strategy, so it is a sibling of
+    // `routing:`, not a field inside it. Authored here it would otherwise
+    // deserialize as an unknown strategy variant and refuse with a message
+    // that names the wrong problem.
+    if obj.contains_key("cache_affinity") {
+        return Err(Error::custom(
+            "cache_affinity is not a routing field; move it up one level so it \
+             sits beside `routing:` on the ai action",
+        ));
+    }
     let strategy_raw = obj
         .get("strategy")
         .ok_or_else(|| Error::custom("routing object is missing the required `strategy` field"))?;
@@ -1599,6 +1646,13 @@ impl AiHandlerConfig {
             provider
                 .validate_base_url()
                 .map_err(|e| anyhow::anyhow!("ai provider {:?} base_url: {e}", provider.name))?;
+            // WOR-2652: an entry that names a tier its vendor does not sell
+            // would boot green and then serve every request on a tier the
+            // operator did not choose, which shows up on the invoice rather
+            // than in a log.
+            crate::service_tier::validate_provider_tier(provider).map_err(|error| {
+                anyhow::anyhow!("ai provider {:?} service tier: {error}", provider.name)
+            })?;
             // WOR-1818: an unresolved `${VAR}` left by env interpolation
             // would reach the wire verbatim as a bearer token and read as
             // a provider auth outage at request time. Fail at config load
@@ -2104,6 +2158,20 @@ impl AiSurface {
     /// Only prompt-completion surfaces carry the canonical message body and
     /// completion semantics required by provider reasoning controls.
     pub fn supports_reasoning_policy(&self) -> bool {
+        matches!(
+            self,
+            AiSurface::ChatCompletions | AiSurface::Messages | AiSurface::Responses
+        )
+    }
+
+    /// Whether an upstream service tier can be requested on this surface.
+    ///
+    /// The three conversational JSON surfaces, which are the ones the
+    /// vendors document a `service_tier` field on. A tier written into an
+    /// embeddings or image body would be a field the endpoint never asked
+    /// for, so the operator's tier is not applied there; a caller's is
+    /// still stripped everywhere. See [`crate::service_tier`].
+    pub fn supports_service_tier(&self) -> bool {
         matches!(
             self,
             AiSurface::ChatCompletions | AiSurface::Messages | AiSurface::Responses
@@ -2877,6 +2945,7 @@ mod tests {
         let config = AiHandlerConfig {
             providers: Vec::new(),
             routing: RoutingStrategy::RoundRobin,
+            cache_affinity: None,
             data_posture: None,
             context_window_fallbacks: Vec::new(),
             content_policy_fallbacks: Vec::new(),
@@ -2932,6 +3001,7 @@ mod tests {
         let config = AiHandlerConfig {
             providers: Vec::new(),
             routing: RoutingStrategy::RoundRobin,
+            cache_affinity: None,
             data_posture: None,
             context_window_fallbacks: Vec::new(),
             content_policy_fallbacks: Vec::new(),
@@ -2987,6 +3057,7 @@ mod tests {
         let config = AiHandlerConfig {
             providers: Vec::new(),
             routing: RoutingStrategy::RoundRobin,
+            cache_affinity: None,
             data_posture: None,
             context_window_fallbacks: Vec::new(),
             content_policy_fallbacks: Vec::new(),
@@ -3043,6 +3114,7 @@ mod tests {
         let config = AiHandlerConfig {
             providers: Vec::new(),
             routing: RoutingStrategy::RoundRobin,
+            cache_affinity: None,
             data_posture: None,
             context_window_fallbacks: Vec::new(),
             content_policy_fallbacks: Vec::new(),
@@ -3825,6 +3897,61 @@ mod tests {
             }
         }));
         assert!(invalid.is_err(), "zero TTL must fail config loading");
+    }
+
+    /// WOR-2651: `cache_affinity` composes with every strategy, so it is a
+    /// sibling of `routing:`. Authored inside it, the block would otherwise
+    /// refuse with "unknown variant", which names the wrong problem.
+    #[test]
+    fn cache_affinity_is_a_sibling_of_routing_not_a_field_inside_it() {
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "routing": "round_robin",
+            "cache_affinity": {"ttl_secs": 60, "max_keys_per_provider": 32}
+        }))
+        .expect("cache affinity beside routing");
+        let affinity = config.cache_affinity.expect("cache affinity parsed");
+        assert_eq!(affinity.ttl_secs, 60);
+        assert_eq!(affinity.max_keys_per_provider, 32);
+        assert!(config.router().cache_affinity_enabled());
+
+        let misplaced = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "routing": {"strategy": "round_robin", "cache_affinity": {}}
+        }))
+        .expect_err("cache_affinity under routing is refused");
+        assert!(
+            misplaced.to_string().contains("not a routing field"),
+            "{misplaced}"
+        );
+    }
+
+    /// WOR-2652: the load-time half. The unit tests in
+    /// `crate::service_tier` cover the check itself; this one proves it is
+    /// wired into config compilation, which is the part a covered-but-
+    /// unwired function would pass without.
+    #[test]
+    fn a_provider_tier_the_vendor_does_not_sell_is_refused_at_config_load() {
+        let error = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "claude",
+                "provider_type": "anthropic",
+                "api_key": "sk-test",
+                "service_tier": "flex"
+            }]
+        }))
+        .expect_err("anthropic declares no service-tier vocabulary");
+        assert!(error.to_string().contains("service tier"), "{error}");
+
+        AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai-flex",
+                "provider_type": "openai",
+                "api_key": "sk-test",
+                "service_tier": "flex"
+            }]
+        }))
+        .expect("openai sells a flex tier");
     }
 
     #[test]
