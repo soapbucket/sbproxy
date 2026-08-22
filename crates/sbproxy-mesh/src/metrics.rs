@@ -635,12 +635,21 @@ pub const TRANSPORT_RPC_KIND_TIMEOUT_READ: &str = "timeout_read";
 /// `handshake_failed` | `idle_timeout` | `frame_timeout` |
 /// `write_timeout`).
 ///
-/// Every one of those is a connection this node decided not to keep, so a
+/// Five of those are a connection this node decided not to keep, so a
 /// nonzero rate is either an attack or a capacity signal and both want an
-/// operator. The peer address is deliberately *not* a label: it is
-/// attacker-chosen and would mint one series per source. It goes in the
-/// (rate-limited) log line instead, so the counter says how much and the
-/// log says who.
+/// operator. `idle_timeout` is the exception and is not alertable on its
+/// own: the client half only re-evaluates its own connection recycle when
+/// it next issues a request, so a peer pair with nothing to say for the
+/// whole idle window is reclaimed here as a matter of course, and a quiet
+/// cluster moves that value by itself. Alert on `reason!="idle_timeout"`,
+/// and count the reclaims separately if capacity planning wants them.
+///
+/// The peer address is deliberately *not* a label: it is attacker-chosen
+/// and would mint one series per source. It goes in the (rate-limited) log
+/// line instead, so the counter says how much and the log says who. The
+/// five alertable reasons log at `warn` there; the idle reclaim logs at
+/// `debug`, because a line per normal reclaim on a quiet fleet is how the
+/// other five stop being read.
 /// Registered with `.ok()` rather than the `.expect()` the older families
 /// above use, mirroring `AI_PRICE_CEILING` in
 /// `crates/sbproxy-ai/src/ai_metrics.rs`: the production unwrap/expect

@@ -77,6 +77,16 @@ impl EphemeralKv for MockEphemeralKv {
     async fn put(&self, key: &str, value: Bytes, ttl: Duration) -> Result<(), StorageError> {
         check_key(key)?;
         check_value(&value)?;
+        // Same refusal the Redis backend makes, so a caller that passes
+        // a zero TTL fails the same way in a test as in production. The
+        // mock deliberately does NOT copy Redis's one-second floor: it
+        // keeps the full `Duration`, so sub-second TTLs are honored
+        // exactly here and tests can expire an entry in milliseconds.
+        if ttl.is_zero() {
+            return Err(StorageError::InvalidConfig(
+                "ephemeral put requires a non-zero ttl".into(),
+            ));
+        }
         let expires_at = Instant::now()
             .checked_add(ttl)
             .ok_or_else(|| StorageError::InvalidConfig("ttl overflow".into()))?;
@@ -565,6 +575,32 @@ mod tests {
             .unwrap();
         sleep(Duration::from_millis(40)).await;
         assert!(store.get("temp").await.unwrap().is_none());
+    }
+
+    /// The mock refuses a zero TTL exactly as `RedisStore` does, so a
+    /// caller cannot pass a test on the mock and then be rejected in
+    /// production. It keeps sub-second TTLs, which Redis cannot, and
+    /// the test above depends on that, so the two backends agree on
+    /// zero and are documented to differ below one second.
+    #[tokio::test]
+    async fn ephemeral_put_refuses_a_zero_ttl() {
+        let store = MockEphemeralKv::new();
+        let err = store
+            .put("k", Bytes::from_static(b"v"), Duration::ZERO)
+            .await
+            .expect_err("a zero ttl is refused");
+        assert!(
+            matches!(err, StorageError::InvalidConfig(_)),
+            "expected InvalidConfig, got {err:?}"
+        );
+        // Nothing was written on the way to the refusal.
+        assert!(store.get("k").await.unwrap().is_none());
+        // One millisecond is still accepted here: the mock's
+        // granularity is the full Duration.
+        store
+            .put("k", Bytes::from_static(b"v"), Duration::from_millis(1))
+            .await
+            .expect("a sub-second ttl is fine on the mock");
     }
 
     #[tokio::test]

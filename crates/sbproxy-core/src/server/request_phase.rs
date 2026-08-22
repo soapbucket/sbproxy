@@ -741,7 +741,15 @@ async fn drain_body_for_signature_verification(
 ///
 /// `None` with no bypass means the event is absent and the static
 /// `vary:` decides, which is what a deployment without the event does.
-fn evaluate_cache_key(
+///
+/// **Async because the script is not.** An operator script runs to its
+/// CPU budget (`max_execution_ms`, 100 ms by default) with no await
+/// points in it, so evaluating it inline on the reactor stalls every
+/// other connection this worker owns for as long as it runs. The
+/// evaluation goes to `spawn_blocking`; the decode, the metrics, and the
+/// audit emission stay here, because those are microseconds and they
+/// need the request context (WOR-2404).
+async fn evaluate_cache_key(
     ctx: &crate::context::RequestContext,
     req: &pingora_http::RequestHeader,
     cache_cfg: &sbproxy_config::ResponseCacheConfig,
@@ -773,7 +781,34 @@ fn evaluate_cache_key(
         "origin": origin,
     });
 
-    let plan = match crate::decision_script::evaluate(script, &context) {
+    // The hop to the blocking pool is paid only by an origin that
+    // configured `key_event`: the absent case returned above, before
+    // anything was cloned or built. An origin without the event keeps
+    // the request path it had.
+    let script_for_task = script.clone();
+    let evaluated = match tokio::task::spawn_blocking(move || {
+        crate::decision_script::evaluate(&script_for_task, &context)
+    })
+    .await
+    {
+        Ok(result) => result,
+        // The blocking task did not come back: the engine panicked, or
+        // the runtime is shutting down under it. Neither is a decision,
+        // so it takes the fault arm below and bypasses the cache like
+        // any other fault. Falling through to the static `vary:` here
+        // would be the coarser-key leak the doc comment above describes.
+        Err(join_error) => {
+            tracing::warn!(
+                target: "sbproxy::decision",
+                event = "cache.key",
+                error = %join_error,
+                "cache.key evaluation task failed to join; bypassing the cache"
+            );
+            Err(crate::decision_script::ScriptFault::Error)
+        }
+    };
+
+    let plan = match evaluated {
         Err(fault) => {
             // No fail-open counter here, deliberately. Since a fault
             // bypasses the cache entirely, this event fails *closed*:
@@ -3374,6 +3409,7 @@ pub(super) async fn request_filter(
                         origin.error_pages.as_deref(),
                         origin.problem_details.as_ref(),
                         &path,
+                        &[],
                     )
                     .await?;
                     return Ok(true);
@@ -3571,6 +3607,7 @@ pub(super) async fn request_filter(
                         origin.error_pages.as_deref(),
                         origin.problem_details.as_ref(),
                         &path,
+                        &[],
                     )
                     .await?;
                     return Ok(true);
@@ -3610,7 +3647,24 @@ pub(super) async fn request_filter(
                             .get("host")
                             .and_then(|v| v.to_str().ok()),
                     );
-                    send_error_with_extra_headers(session, status, msg, &augmented).await?;
+                    // WOR-2525: route through the same body chooser the
+                    // bare `Deny` arm uses. A denial that carries a
+                    // challenge is still a denial, so an origin that
+                    // authored an `error_pages` 401 or turned on
+                    // `problem_details` must get that body here too;
+                    // `send_error_with_extra_headers` would have
+                    // silently replaced both with `{"error": ...}`.
+                    let path = session.req_header().uri.path().to_string();
+                    send_error_with_pages(
+                        session,
+                        status,
+                        msg,
+                        origin.error_pages.as_deref(),
+                        origin.problem_details.as_ref(),
+                        &path,
+                        &augmented,
+                    )
+                    .await?;
                     return Ok(true);
                 }
                 AuthResult::DigestChallenge(challenge) => {
@@ -4276,7 +4330,42 @@ pub(super) async fn request_filter(
                 // under the refusal it was set for.
                 send_response(session, status, &content_type, body.as_bytes()).await?;
             } else {
-                send_error(session, status, &msg).await?;
+                // WOR-2529: every denial the arms above did not claim
+                // gets the origin's own error shape. `send_error` wrote
+                // `{"error": msg}` as `application/json` no matter what
+                // the origin configured, so `error_pages` and
+                // `problem_details` covered authentication denials and
+                // upstream failures but not a single policy denial, and
+                // `include_detail: false` did not suppress anything on
+                // this path (the WAF appends its rule id to `msg`).
+                //
+                // The special-case arms deliberately stay ahead of this
+                // one: each carries a spec-pinned body and headers, so
+                // the precedence is the one `error_pages` already had,
+                // an authored or spec body wins and the renderer takes
+                // the rest.
+                //
+                // What this still cannot see, because it is only the
+                // policy chain's fall-through: refusals emitted before
+                // the chain runs (bot_detection's 403 above, the 405
+                // for a disallowed method, the well-known and callback
+                // endpoints), the unmatched-Host 404 (no origin is
+                // resolved yet, so there is no config to read), and the
+                // AI-surface denials in `ai_dispatch` / `action_dispatch`,
+                // each of which calls `send_error` directly. Widening
+                // those is a separate change; `docs/configuration.md`
+                // states the same boundary for operators.
+                let path = session.req_header().uri.path().to_string();
+                send_error_with_pages(
+                    session,
+                    status,
+                    &msg,
+                    origin.error_pages.as_deref(),
+                    origin.problem_details.as_ref(),
+                    &path,
+                    &[],
+                )
+                .await?;
             }
             return Ok(true);
         }
@@ -4409,7 +4498,7 @@ pub(super) async fn request_filter(
                 // it, which is why this is a separate event from
                 // `cache.admit` rather than one cache policy.
                 let (key_plan, key_event_bypass) =
-                    evaluate_cache_key(ctx, session.req_header(), cache_cfg);
+                    evaluate_cache_key(ctx, session.req_header(), cache_cfg).await;
                 let key = crate::server::build_response_cache_key_with_plan(
                     "",
                     ctx.tenant_id.as_str(),
@@ -7232,7 +7321,7 @@ mod cache_key_audit_tests {
     use sbproxy_observe::decision::DecisionEvent;
 
     /// Refuses the lookup and says why, so the plan arm runs and the
-    /// reason is something an assertion can recognise.
+    /// reason is something an assertion can recognize.
     const KEY_EVENT_ORIGIN: &str = r#"
 origins:
   "api.audit.test":
@@ -7273,8 +7362,8 @@ origins:
             .expect("the fixture enables the cache")
     }
 
-    #[test]
-    fn the_cache_key_emit_site_publishes_only_when_the_config_asks() {
+    #[tokio::test]
+    async fn the_cache_key_emit_site_publishes_only_when_the_config_asks() {
         // The seam, not the helper. Every other test in this change is
         // green with the six lines in `evaluate_cache_key` deleted: the
         // rule has tests, the scopes have tests, the constructor has
@@ -7295,7 +7384,7 @@ origins:
             "req-cache-key-on",
         );
         let cfg = cache_cfg(&ctx);
-        let (plan, _bypass) = evaluate_cache_key(&ctx, &req(), &cfg);
+        let (plan, _bypass) = evaluate_cache_key(&ctx, &req(), &cfg).await;
         assert!(
             plan.is_some(),
             "the fixture script returns a plan, which is the arm that publishes"
@@ -7326,7 +7415,7 @@ origins:
         // And the gate is read here rather than only in isolation.
         let ctx = ctx_for("", "req-cache-key-off");
         let cfg = cache_cfg(&ctx);
-        let (plan, _bypass) = evaluate_cache_key(&ctx, &req(), &cfg);
+        let (plan, _bypass) = evaluate_cache_key(&ctx, &req(), &cfg).await;
         assert!(
             plan.is_some(),
             "the cache decision itself does not depend on whether it is audited"
@@ -7339,5 +7428,96 @@ origins:
                 );
             }
         }
+    }
+}
+
+/// The `cache.key` event runs off the reactor (WOR-2404).
+#[cfg(test)]
+mod cache_key_reactor_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    /// A script that cannot finish. The Lua sandbox aborts it at
+    /// `max_execution_ms` (100 ms by default), so the evaluation occupies
+    /// a whole thread for that long with no await point anywhere in it.
+    /// That is the shape of the hazard: not a script that misbehaves, but
+    /// a script that spends its entire configured budget.
+    const SPINNING_KEY_EVENT: &str = r#"
+origins:
+  "api.spin.test":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "ok"
+    response_cache:
+      enabled: true
+      key_event:
+        engine: lua
+        source: "local n = 0 while true do n = n + 1 end"
+"#;
+
+    fn spinning_ctx() -> crate::context::RequestContext {
+        let config = sbproxy_config::compile_config(SPINNING_KEY_EVENT).expect("fixture config");
+        let pipeline = crate::pipeline::CompiledPipeline::from_config_for_validation(config)
+            .expect("fixture pipeline");
+        let mut ctx = crate::context::RequestContext::new();
+        ctx.pipeline = std::sync::Arc::new(pipeline);
+        ctx.origin_idx = Some(0);
+        ctx.hostname = compact_str::CompactString::new("api.spin.test");
+        ctx.tenant_id = compact_str::CompactString::new("acme-corp");
+        ctx.request_id = compact_str::CompactString::new("req-spin");
+        ctx
+    }
+
+    /// The seam: `evaluate_cache_key` must not hold the reactor while an
+    /// operator's script burns its CPU budget.
+    ///
+    /// A `current_thread` runtime is the whole instrument. On it, the
+    /// counter task can only advance if `evaluate_cache_key` yields, and
+    /// the only thing it has to yield for is the `spawn_blocking` the fix
+    /// adds. Restore the inline call and the counter reads zero: the
+    /// spawned task is never polled, because `tokio::spawn` on a
+    /// current-thread runtime does nothing until the current future
+    /// awaits. That is a different failure from "the test is slow", and
+    /// it is why this asserts on another task's progress rather than on
+    /// elapsed time, which a loaded CI box can make say anything.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_spinning_cache_key_script_does_not_stall_the_reactor() {
+        let ticks = Arc::new(AtomicU64::new(0));
+        let counter = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            // Bounded so the task cannot outlive the test if the
+            // evaluation returns instantly for some other reason.
+            for _ in 0..1_000_000_u64 {
+                counter.fetch_add(1, Ordering::Relaxed);
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let ctx = spinning_ctx();
+        let cfg = ctx.pipeline.config.origins[0]
+            .response_cache
+            .clone()
+            .expect("the fixture enables the cache");
+        let req =
+            pingora_http::RequestHeader::build("GET", b"/v1/thing", None).expect("request header");
+
+        let (plan, bypass) = evaluate_cache_key(&ctx, &req, &cfg).await;
+
+        assert!(
+            plan.is_none() && bypass,
+            "a script that never returns faults, and a faulted cache.key bypasses the cache"
+        );
+        let advanced = ticks.load(Ordering::Relaxed);
+        assert!(
+            advanced > 0,
+            "the reactor made no progress while the cache.key script ran, so the script ran on \
+             it: every other connection this worker owns was blocked for the script's whole \
+             budget"
+        );
+
+        ticker.abort();
     }
 }

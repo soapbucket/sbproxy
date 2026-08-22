@@ -12,7 +12,7 @@ This guide owns the end-to-end picture: provider setup, wire compatibility, rout
 
 ## Provider setup
 
-Configure one or more providers under the `action` block. Each provider needs a name, API key, and model list. Callers of hosted providers should send an explicit `model`. A `default_model` can select among locally served models and appears in model metadata, but the hosted dynamic-routing path does not inject one into a request that omitted `model`:
+Configure one or more providers under the `action` block. Each provider needs a name, API key, and model list. A request that omits `model` falls back to the origin's `default_model`, on the hosted dispatch path as well as the locally served one, provided the origin names exactly one (see [Defaulting the model](#defaulting-the-model) below):
 
 **Fragment:** This is one `origins` entry; it needs a sibling top-level `proxy:` block (at minimum `proxy.http_bind_port`) to be a runnable `sb.yml`. See [Full example](#full-example) below or [`examples/ai-gateway-quickstart/`](../examples/ai-gateway-quickstart/) for a complete file.
 
@@ -32,7 +32,45 @@ origins:
         strategy: round_robin
 ```
 
-API keys support environment variable interpolation with `${VAR_NAME}` syntax. Never put raw keys in config files. `default_model` is a per-provider field, not an `action`-level one; an action-level `default_model` key is ignored. Context compression also requires the request's effective `model` to be non-empty, so hosted requests that omit it do not run the compression pipeline.
+API keys support environment variable interpolation with `${VAR_NAME}` syntax. Never put raw keys in config files.
+
+#### Defaulting the model
+
+`default_model` is a per-provider field, not an `action`-level one; an action-level `default_model` key is ignored. A request that omits `model` takes the origin's default when every enabled provider that names one names the same one. Providers that name nothing abstain, and a provider with `enabled: false` gets no vote, because a request can never land on it. Two enabled providers naming different defaults leave the request modelless rather than routing it to whichever is listed first, which is a choice the operator did not make.
+
+Getting a concrete model in there is not cosmetic. Every model-aware gate in the pipeline is written as "if a model was named": the `allowed_models` and `blocked_models` lists, a virtual key's per-key model scoping, model-scoped budgets, provider eligibility, and the context-compression pipeline. A request with no model skips all of them. Against an upstream that infers the model itself, an Azure deployment-scoped `base_url` or a single-model vLLM or Ollama, omitting `model` therefore reached the provider with the allowlist and the block list never consulted. With a default in place the request is gated on the model it will actually run:
+
+```yaml
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      blocked_models: [retired-model]
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          models: [gpt-4o]
+          default_model: retired-model
+```
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Host: ai.example.com' \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"hi"}]}'
+```
+
+```text
+403
+```
+
+The provider is never contacted. Before this, the same request reached it with an empty `model`.
+
+Two carve-outs, called out rather than left to be discovered.
+
+The fallback applies on the three chat-shaped surfaces only: `POST /v1/chat/completions`, `POST /v1/messages`, and `POST /v1/responses`. `default_model` names a chat model, and the other JSON surfaces on the same origin have their own model vocabularies. `POST /v1/moderations` and `POST /v1/images/generations` in particular treat `model` as optional and default it upstream, so writing a chat model into one of those bodies would turn a request the provider accepts into a 400. Those surfaces still forward no `model`, and their model gates still do not run.
+
+The second is multipart: an audio transcription, image edit, or image variation request that carries no `model` form field is still forwarded without one, for the same reason. The multipart rewrite can replace a `model` part and cannot add one.
 
 Two more per-provider fields bound dispatch. `timeout_ms` caps one attempt's wall clock, measured from connect through the end of the response body, so it cuts a streaming completion off mid-stream if the stream outlives it; pick it with your slowest legitimate stream in mind, not your median. `max_retries` re-dispatches on retryable failures, each attempt with a fresh timeout window, so the worst case a client waits on one provider is `(timeout_ms + backoff) x (max_retries + 1)` before routing moves on.
 
@@ -78,6 +116,29 @@ state, ready and desired replica counts, and bounded capability names. The list
 omits worker identity, engine ports, and private endpoints. It does not call an
 ordinary provider's native model-list endpoint or reproduce provider-specific
 model metadata.
+
+Each entry's `capabilities` array names the surfaces this gateway will forward
+for that model and that the provider catalog records the vendor as exposing.
+Both halves have to agree. The first is the same per-provider surface matrix
+that decides whether a request is served or answered with 501, so nothing named
+here comes back 501. The second keeps a listing from claiming an endpoint on a
+vendor's behalf just because its wire format implies one. Whether the upstream
+then answers 200 is the upstream's business.
+
+So the array is never wider than the 501 gate, and it is often narrower. Every
+provider with `format: openai` is forwarded the whole OpenAI path set, but its
+listing names only what the catalog knows that vendor serves: a DeepSeek model
+lists `chat_completions`, `messages`, `responses`, and `streaming`, and not
+`image_generation`. Absence is not a refusal. The request is still forwarded and
+the upstream decides. Where several providers serve one public model name, a
+capability appears when at least one of them has it.
+
+The names are the surface labels from
+[Supported endpoints](#supported-endpoints), narrowed to the ones a caller
+reaches by naming a model, plus `streaming`. Account-scoped surfaces (`models`,
+`files`, `batches`, `assistants`, `threads`, `fine_tuning`) belong to the
+provider rather than to any one model, so they are left out. `GET /model/info`
+and `GET /model_group/info` carry the same array.
 
 Successful completions add `x-sbproxy-logical-model` and an allowlisted
 `x-sbproxy-route-class` of `local`, `peer`, or `external`. Managed availability
@@ -2208,13 +2269,17 @@ Every inbound request to an `action: ai_proxy` origin is classified into an `AiS
 
 Provider capability is the source of truth for which surfaces a configured provider can serve. The matrix lives in `crates/sbproxy-ai/src/api_routes.rs::provider_supports_surface` and keys on the provider type: the entry's `provider_type`, falling back to `name` when no type is set. A custom-named entry such as `name: team-openai` with `provider_type: openai` therefore keeps the full OpenAI surface set; the display name never narrows or widens capability. When no configured provider supports the requested surface, the proxy returns **501 Not Implemented** before any upstream call. The universal surfaces are chat completions, Anthropic Messages, OpenAI Responses, and models. Unknown surfaces fall through to the existing dispatch and 404 at the upstream.
 
+This matrix is a permission, not an advertisement. It answers on the wire format, so every entry with `format: openai` is forwarded the whole OpenAI path set; narrowing that would 501 an aggregator that does serve the surface. The model listings (`GET /v1/models`, `GET /model/info`, `GET /model_group/info`) publish the intersection of this matrix with the provider catalog's `supports_streaming`, `supports_embeddings`, and `supports_chat` keys in `crates/sbproxy-ai/data/ai_providers.yml`. A published `capabilities` array can therefore never name a surface this gate refuses, and can be narrower than the gate in two ways: the catalog may carry no per-vendor claim for the surface, and the array is a union across the providers serving that one model while the gate scans every allowed provider on the origin.
+
+The `Providers (today)` column below is the advertised set: which entries name each surface in a model listing, and what a reader should expect to see. The gate is wider than this column, in the safe direction.
+
 | Surface label | Method(s) | Path(s) | Providers (today) |
 |---|---|---|---|
-| `chat_completions` | POST | `/v1/chat/completions` | All |
-| `messages` | POST | `/v1/messages` | All |
-| `responses` | POST | `/v1/responses` | All, with stateless boundaries (see "Responses API boundaries" below) |
-| `models` | GET | `/v1/models`, `/v1/models/{id}` | All |
-| `embeddings` | POST | `/v1/embeddings` | OpenAI, Gemini, Cohere |
+| `chat_completions` | POST | `/v1/chat/completions` | All, except the `supports_chat: false` entries (Voyage, Jina, Mixedbread) |
+| `messages` | POST | `/v1/messages` | Same as `chat_completions`; the gateway translates down to it |
+| `responses` | POST | `/v1/responses` | Same as `chat_completions`, with stateless boundaries (see "Responses API boundaries" below) |
+| `models` | GET | `/v1/models`, `/v1/models/{id}` | All (account-scoped, so never in a model's `capabilities`) |
+| `embeddings` | POST | `/v1/embeddings` | The 32 entries with `supports_embeddings: true` on the `openai` or `google` formats (OpenAI, Gemini, Vertex, Cohere, Azure, Mistral, and 26 more). Bedrock and the `Custom` formats carry the flag but are not forwarded |
 | `assistants` | POST, GET, DELETE | `/v1/assistants[/{id}[/files[/{file_id}]]]` | OpenAI |
 | `threads` | POST, GET, DELETE | `/v1/threads[/{id}[/messages[/{id}] \| /runs[/{id}[/cancel]]]]`, `/v1/threads/runs` | OpenAI |
 | `batches` | POST, GET | `/v1/batches[/{id}[/cancel]]` | OpenAI |
@@ -2231,14 +2296,14 @@ Provider capability is the source of truth for which surfaces a configured provi
 
 ### Response shape contract
 
-"Supported" in the table above means the gateway accepts the surface and routes it. It does NOT mean the gateway normalizes the response. Per-surface translation behavior:
+Being named in the table above means the gateway accepts the surface, routes it, and advertises it on a model listing. It does NOT mean the gateway normalizes the response, and it is not the full set of what gets forwarded: the wire-format matrix admits more (see above). Per-surface translation behavior:
 
 | Surface | Response shape |
 |---|---|
 | `chat_completions` | normalized to / from the OpenAI shape on Anthropic and Google (gemini) formats; passthrough on OpenAI-compatible upstreams |
 | `messages`, `responses` | accepted in their native client shapes and governed through the chat hub. Successful generations return in the shape the client used. Provider error envelopes keep the provider's status and body. A safe Anthropic-to-Anthropic request can use the native bypass described below. |
 | `models` | `GET /v1/models` and `GET /models` are served locally for every AI origin as an OpenAI `{"object": "list", "data": [...]}` logical listing. Other model endpoints use the ordinary GET dispatch path and have no unified response shape. |
-| everything else | passthrough on the providers listed in the table; clients see the upstream's native response shape |
+| everything else | passthrough wherever the wire-format matrix forwards it; clients see the upstream's native response shape |
 
 The local list contract is deliberate: it gives clients one topology-free
 discovery shape across ordinary and managed providers without pretending to
@@ -2263,7 +2328,7 @@ What the gateway does not do is hold server-side response state, and it refuses 
 - `store: true` is refused with a 400, because the response id would never be retrievable from the gateway. `store: false`, or omitting the field, works: the stateless translation persists nothing, which is exactly what it asks for.
 - An `mcp` tool block is refused with a 400. It asks the model provider to contact an MCP server directly, bypassing the gateway's MCP governance (RBAC, sessions, audit, egress inventory). Front the server with a `type: mcp` action and point the client at that origin instead.
 - Every other non-`function` tool block (`file_search`, `web_search_preview`, `code_interpreter`, `image_generation`, and any unrecognized type) is dropped, never forwarded upstream, counted on `sbproxy_ai_translation_dropped_total`, and named in the request's one aggregated `AI proxy: request fields dropped in translation` warn. That warn lists at most eight distinct field labels; past eight, a drop is still counted but no longer named, so the log line cannot grow with the request body.
-- A `prompt` object (`{"id": ..., "version": ..., "variables": ...}`) is served from the gateway's own prompt store: `id` names a stored prompt on the origin, `version` picks a stored version label, and omitting `version` resolves the pinned default. The rendered template is prepended to `instructions` before translation, so it reaches every configured provider, not only OpenAI. An `id` or `version` the store does not hold is a 404 with one generic unknown-reference message, so a caller probing versions cannot tell a missing version from a missing prompt; the precise miss is logged server-side at debug level. A malformed object is a 400, and neither falls through to the raw input. A string-valued `prompt` is not the object form; it is dropped and logged with a warning, unchanged. See "Stored prompts and offline optimization" below.
+- A `prompt` object (`{"id": ..., "version": ..., "variables": ...}`) is served from the gateway's own prompt store: `id` names a stored prompt on the origin, `version` picks a stored version label, and omitting `version` resolves the pinned default. The rendered template is prepended to `instructions` before translation, so it reaches every configured provider, not only OpenAI. An `id` or `version` the store does not hold is a 404 with one generic unknown-reference message, so a caller probing versions cannot tell a missing version from a missing prompt; the precise miss is logged server-side at debug level. A malformed object is a 400, and neither falls through to the raw input. A string-valued `prompt` is the `name@version` reference form and resolves against the same store, with no caller variables. See "Stored prompts and offline optimization" below.
 
 The refusals are deliberate. A request that references state the gateway does not hold would otherwise succeed while quietly missing context, and that failure is harder to notice than a 400 that names the field and the fix.
 
@@ -2544,6 +2609,79 @@ run metadata. Runtime versions are added, replaced, and pinned through the
 authenticated Admin API. Use a new version label when you need immutable
 history.
 
+### Which surfaces resolve a reference
+
+`prompt` is a gateway field, not a field of any provider's wire format, so what
+happens to it depends on which inbound surface the request arrived on:
+
+| Inbound surface | `"prompt": "name@version"` (string) | `"prompt": {"id": ...}` (object) |
+|---|---|---|
+| `POST /v1/chat/completions` | Resolved, prepended as a system turn, key stripped. A name a configured store does not hold is a 400. On an origin with no prompt store at all the key passes through untouched, because `prompt` is also a legacy completions field a provider may accept. | Not the reference form. Passed through as-is. |
+| `POST /v1/messages` | Resolved, prepended as a system turn, key stripped before translation. A name a configured store does not hold is a 400; an origin with no prompt store at all answers 404 rather than forwarding the key. | Not the reference form. Dropped in translation and counted on `sbproxy_ai_translation_dropped_total`. |
+| `POST /v1/responses` | As `/v1/messages`. | Resolved against the same store and prepended to `instructions`. An unknown reference is a 404, a malformed object a 400. |
+
+The last column of the middle row is the difference worth knowing. On the two
+native surfaces `prompt` cannot be anything but a gateway reference, so a
+request naming one an origin cannot resolve is a caller error rather than a
+field the provider might want; forwarding it would ship a gateway-only key
+upstream while running the request without the template it named. On the
+canonical chat path the same case stays a pass-through, so an origin with no
+`prompts:` block behaves exactly as it did before the store existed.
+
+A refusal on either native surface publishes an `ai.admission` decision record
+when `observability.log.decision_audit.events.ai.admission` is on, carrying
+`surface` and a `verdict` of `prompt_reference_not_found` or
+`prompt_render_failed`. See [events.md](events.md).
+
+```yaml
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          provider_type: openai
+          api_key: "${OPENAI_API_KEY}"
+          models: [gpt-4o]
+      prompts:
+        templates:
+          greeting:
+            default_version: "1"
+            versions:
+              "1":
+                template: "You are a bot for {{ variables.product }}."
+                variables:
+                  product: "Acme"
+```
+
+```bash
+curl -s http://127.0.0.1:8080/v1/messages \
+  -H 'Host: ai.example.com' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4o","max_tokens":64,
+       "prompt":"greeting@1",
+       "messages":[{"role":"user","content":"hi"}]}'
+```
+
+The upstream receives the rendered template as the leading system turn, and no
+`prompt` key:
+
+```json
+{
+  "model": "gpt-4o",
+  "max_tokens": 64,
+  "messages": [
+    {"role": "system", "content": "You are a bot for Acme."},
+    {"role": "user", "content": "hi"}
+  ]
+}
+```
+
+Before this, the same request reached the provider with no system turn at all:
+the Anthropic translator has no representation for `prompt`, so it noted the
+drop on `sbproxy_ai_translation_dropped_total{surface="messages",field="anthropic.prompt"}`
+and carried on without the template.
+
 On `/v1/responses` the same store serves the OpenAI Responses `prompt`
 object. `id` maps onto the stored prompt name, `version` onto a stored
 version label, and omitting `version` resolves the pinned default:
@@ -2653,8 +2791,9 @@ touch. A version pinning `variables: {role: "customer"}` whose template says
 `variables.role` says. Put a constraint that has to hold regardless of the
 caller in the template text, not in `variables:`. The `"prompt": "name@version"`
 string form carries no variables at all, so the same stored version is
-caller-writable on `/v1/responses` and operator-only on
-`/v1/chat/completions`; there is no per-version variable lock today.
+caller-writable through the object form on `/v1/responses` and operator-only
+everywhere the string form is used, including `/v1/chat/completions` and
+`/v1/messages`; there is no per-version variable lock today.
 
 A malformed prompt object (a non-string `id`, an unknown key, a typed
 content-part variable) is a 400. The string form above is unchanged.

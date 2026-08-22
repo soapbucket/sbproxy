@@ -599,6 +599,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_ai_admission_decisions_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_admission_decision"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["surface", "reason", "outcome"],
+        description: "Pre-provider AI gateway admission decisions: a request refused at the inbound native-format shim before any provider saw it, by inbound surface and bounded reason code.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_ai_audio_seconds_attributed_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_audio_seconds_attributed"),

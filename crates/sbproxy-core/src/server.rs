@@ -183,10 +183,21 @@ pub async fn shutdown_webhook_tasks() {
     WEBHOOK_TASKS.wait().await;
 }
 
-/// Tracks stale-while-revalidate background refreshes so graceful
-/// shutdown can drain them. Same `spawn` -> `close` -> `wait` pattern
-/// as [`WEBHOOK_TASKS`] but a separate tracker so a slow upstream on
-/// one feature does not stall the other.
+/// Tracks background response-cache work so graceful shutdown can drain
+/// it. Same `spawn` -> `close` -> `wait` pattern as [`WEBHOOK_TASKS`]
+/// but a separate tracker so a slow upstream on one feature does not
+/// stall the other.
+///
+/// Two producers: the stale-while-revalidate refresh, and the deferred
+/// `cache.admit` evaluation plus its write-back in `proxy_http`. Both
+/// carry a decision record as well as an entry, so dropping one at
+/// shutdown loses evidence and not only a cache line (WOR-2404).
+///
+/// Worth knowing before relying on it: no caller invokes
+/// [`shutdown_cache_revalidate_tasks`] today, so the tracker makes this
+/// work *drainable* rather than drained. Registering here is still what
+/// makes wiring the drain a one-line change instead of an audit of
+/// every background spawn.
 static CACHE_REVALIDATE_TASKS: std::sync::LazyLock<tokio_util::task::TaskTracker> =
     std::sync::LazyLock::new(tokio_util::task::TaskTracker::new);
 
@@ -1680,13 +1691,40 @@ fn spawn_swr_revalidation(
         // revert to the origin's default.
         let mut swr_secs = stale_entry.swr_secs;
         if let Some(scope) = admit_scope.as_ref() {
-            let plan = crate::server::proxy_http::evaluate_cache_admit_for(
-                &pipeline,
-                scope,
-                status,
-                &headers,
-                body.len(),
-            );
+            // WOR-2404: the event is an operator script with a CPU
+            // budget and no await points, and this task shares a reactor
+            // with live request traffic. Running it inline here stalls
+            // that traffic for the script's whole budget, on a refresh
+            // nobody is waiting for, so it goes to the blocking pool.
+            let admit_pipeline = pipeline.clone();
+            let admit_scope_owned = scope.clone();
+            let admit_headers = headers.clone();
+            let admit_body_len = body.len();
+            let plan = match tokio::task::spawn_blocking(move || {
+                crate::server::proxy_http::evaluate_cache_admit_for(
+                    &admit_pipeline,
+                    &admit_scope_owned,
+                    status,
+                    &admit_headers,
+                    admit_body_len,
+                )
+            })
+            .await
+            {
+                Ok(plan) => plan,
+                Err(join_error) => {
+                    // The refresh serves nobody, so a lost evaluation
+                    // keeps the stale entry rather than writing back
+                    // under a plan that was never computed. The live
+                    // path fails open here because a client is waiting;
+                    // this one has no client to fail open for.
+                    tracing::warn!(
+                        error = %join_error,
+                        "swr: admit_event evaluation task failed to join; keeping the stale entry"
+                    );
+                    return;
+                }
+            };
             if !plan.store {
                 tracing::debug!(
                     url = %full_url,
@@ -2095,19 +2133,51 @@ async fn send_response(
     content_type: &str,
     body: &[u8],
 ) -> Result<()> {
-    let mut header = pingora_http::ResponseHeader::build(status, Some(2)).map_err(|e| {
-        Error::because(
-            ErrorType::InternalError,
-            "failed to build response header",
-            e,
-        )
-    })?;
+    send_response_with_extra_headers(session, status, content_type, body, &[]).await
+}
+
+/// [`send_response`] plus caller-supplied response headers appended
+/// after the framing ones.
+///
+/// Header names and values are copied verbatim. An entry the header
+/// builder refuses is skipped with a warning rather than failing the
+/// whole response, so one malformed challenge from a third-party auth
+/// provider cannot turn a 401 into a dropped connection.
+///
+/// Named `_extra_` rather than mirroring `request_phase`'s own
+/// `send_response_with_headers`: that one is a separate, stricter
+/// helper for the introspect 401, and `request_phase` glob-imports this
+/// module, so two identical names would shadow.
+async fn send_response_with_extra_headers(
+    session: &mut Session,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    extra_headers: &[(String, String)],
+) -> Result<()> {
+    let mut header = pingora_http::ResponseHeader::build(status, Some(2 + extra_headers.len()))
+        .map_err(|e| {
+            Error::because(
+                ErrorType::InternalError,
+                "failed to build response header",
+                e,
+            )
+        })?;
     header
         .insert_header("content-type", content_type)
         .map_err(|e| Error::because(ErrorType::InternalError, "failed to set content-type", e))?;
     header
         .insert_header("content-length", body.len().to_string())
         .map_err(|e| Error::because(ErrorType::InternalError, "failed to set content-length", e))?;
+    for (name, value) in extra_headers {
+        if let Err(e) = header.append_header(name.clone(), value) {
+            warn!(
+                header_name = %name,
+                error = %e,
+                "error response carried an invalid header; skipping",
+            );
+        }
+    }
     // WOR-2295: see `e2e_harness_token` above. The e2e harness's
     // readiness probe hits precisely this path on a freshly booted
     // proxy (its Host header matches no configured origin), so this
@@ -2245,11 +2315,20 @@ async fn send_error_with_extra_headers(
 /// 2. RFC 9457 `application/problem+json` when
 ///    [`sbproxy_config::ProblemDetailsConfig`] is enabled on the
 ///    origin.
-/// 3. Plain-text default (`send_error`).
+/// 3. The `{"error": message}` JSON default, written inline rather
+///    than through `send_error` so the extra headers below reach
+///    this branch too.
 ///
 /// When multiple custom pages match a status and the client expresses
 /// no concrete preference, JSON is preferred, then HTML, then the
 /// first authored entry.
+///
+/// `extra_headers` are appended to whichever body wins. Every branch
+/// gets them because a challenge and a body are independent choices:
+/// authoring an `error_pages` 401 must not cost the origin its
+/// `WWW-Authenticate` header, which is what a body-only emitter would
+/// do (WOR-2525).
+#[allow(clippy::too_many_arguments)]
 async fn send_error_with_pages(
     session: &mut Session,
     status: u16,
@@ -2257,6 +2336,7 @@ async fn send_error_with_pages(
     error_pages: Option<&[sbproxy_config::ErrorPageEntry]>,
     problem_details: Option<&sbproxy_config::ProblemDetailsConfig>,
     request_path: &str,
+    extra_headers: &[(String, String)],
 ) -> Result<()> {
     if let Some(pages) = error_pages {
         let candidates: Vec<&sbproxy_config::ErrorPageEntry> =
@@ -2282,7 +2362,14 @@ async fn send_error_with_pages(
                 chosen.body.clone()
             };
 
-            return send_response(session, status, &chosen.content_type, body.as_bytes()).await;
+            return send_response_with_extra_headers(
+                session,
+                status,
+                &chosen.content_type,
+                body.as_bytes(),
+                extra_headers,
+            )
+            .await;
         }
     }
 
@@ -2290,13 +2377,28 @@ async fn send_error_with_pages(
     if let Some(pd) = problem_details {
         if pd.enabled {
             let body = render_problem_details(status, message, pd, request_path);
-            return send_response(session, status, "application/problem+json", body.as_bytes())
-                .await;
+            return send_response_with_extra_headers(
+                session,
+                status,
+                "application/problem+json",
+                body.as_bytes(),
+                extra_headers,
+            )
+            .await;
         }
     }
 
-    // No matching error page, no problem-details: plain-text default.
-    send_error(session, status, message).await
+    // No matching error page, no problem-details: the plain JSON
+    // default, still carrying the challenge.
+    let body = error_json_body(message);
+    send_response_with_extra_headers(
+        session,
+        status,
+        "application/json",
+        body.as_bytes(),
+        extra_headers,
+    )
+    .await
 }
 
 /// Render an RFC 9457 `application/problem+json` body. The `type` field
@@ -2894,7 +2996,20 @@ async fn check_auth_with_tls_outcome(
                 )
             }
             None => (
-                AuthResult::Deny(401, "unauthorized".to_string()),
+                // WOR-2525: a Basic 401 without `WWW-Authenticate` is
+                // not a Basic denial, it is an opaque one. RFC 9110
+                // section 11.6.1 requires the challenge, and until this
+                // arm carried it the origin's configured `realm` was
+                // parsed and then dropped: no browser prompted and no
+                // client learned which scheme to retry with. In an
+                // `any_of` composition `check_any_of_auth`'s merge loop
+                // reads the header off this variant, so the challenge
+                // joins the composite 401 too.
+                AuthResult::DenyWithHeaders(
+                    401,
+                    "unauthorized".to_string(),
+                    vec![("WWW-Authenticate".to_string(), a.challenge())],
+                ),
                 None,
                 if headers.contains_key(http::header::AUTHORIZATION) {
                     AuthTrustOutcome::InvalidProof
@@ -5149,7 +5264,12 @@ async fn check_buffered_dynamic_policies(
 /// engine; otherwise the steady state is a cheap Arc clone. Building
 /// lazily (never at pipeline-compile time) means the engine always sees
 /// the operator's installed limits, not the boot-time defaults.
-fn shared_lua_engine() -> anyhow::Result<std::sync::Arc<sbproxy_extension::lua::LuaEngine>> {
+///
+/// `pub(crate)` rather than private because the decision-event path
+/// (`crate::decision_script`) reuses it for the same reason the
+/// modifiers do (WOR-2404).
+pub(crate) fn shared_lua_engine(
+) -> anyhow::Result<std::sync::Arc<sbproxy_extension::lua::LuaEngine>> {
     use sbproxy_extension::lua::{active_sandbox_config, LuaEngine, SandboxConfig};
     #[allow(clippy::type_complexity)]
     static CACHE: std::sync::LazyLock<

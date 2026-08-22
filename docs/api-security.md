@@ -1,6 +1,6 @@
 # API security
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 Most API breaches are not clever. They are an endpoint that forgot to check who
 was asking, a limit nobody set, or a field that was never supposed to be
@@ -146,8 +146,15 @@ true` requires the token's `cnf.x5t#S256` to match the inbound client
 certificate (RFC 8705). Both fail closed when the binding metadata is absent,
 which is the behavior you want.
 
-Every auth failure is recorded as a structured `auth_denied` audit event with
-the scheme that rejected it, and never with the credential.
+Every auth failure is recorded as a structured audit event naming the scheme
+that rejected it, and never the credential. The `event_type` says which shape
+the refusal took: `auth_denied` for a plain rejection,
+`auth_denied_with_headers` when the 401 also carries a challenge
+(`basic_auth`, `cap`, an OAuth resource-metadata pointer),
+`auth_digest_challenge` for the digest handshake, and `forward_auth_denied`
+when an external authorizer said no. Match on the `auth_` prefix rather than
+one value; that is what the [events](events.md) bridge does when it turns any
+of them into one `auth_denied` typed event.
 
 See [`examples/auth-jwt/`](../examples/auth-jwt/) for a complete working
 config.

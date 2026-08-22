@@ -37,7 +37,10 @@ use serde::{Deserialize, Serialize};
 /// Embedded gzipped catalog. The build copies the file at
 /// `data/ai_providers.yml.gz` into the binary so a fresh checkout
 /// does not need to know about the file path. Regenerate via
-/// `gzip -k -9 data/ai_providers.yml`.
+/// `gzip -n -9 -c data/ai_providers.yml > data/ai_providers.yml.gz`.
+/// `-n` drops the source filename and mtime from the gzip header, so
+/// the same YAML always compresses to the same bytes and a rebuild does
+/// not show up as a diff.
 const EMBEDDED_PROVIDERS_GZ: &[u8] = include_bytes!("../../data/ai_providers.yml.gz");
 
 /// Known provider metadata.
@@ -61,13 +64,42 @@ pub struct ProviderInfo {
     /// Wire format family this provider's API speaks.
     pub format: ProviderFormat,
     /// Whether the provider supports Server-Sent Events streaming.
+    ///
+    /// A per-vendor claim about the vendor's API, not a gateway
+    /// decision; see the note on [`Self::supports_chat`].
     pub supports_streaming: bool,
     /// Whether the provider exposes an embeddings endpoint.
+    ///
+    /// A per-vendor claim about the vendor's API, not a gateway
+    /// decision; see the note on [`Self::supports_chat`].
     pub supports_embeddings: bool,
     /// Whether the provider exposes a chat-completions endpoint.
     /// Defaults to `true`; set to `false` for embeddings-only or
-    /// reranker-only providers (e.g. Voyage, Jina) so chat configs
-    /// fail closed at validation time instead of 404ing at runtime.
+    /// reranker-only providers (e.g. Voyage, Jina).
+    ///
+    /// This and its two neighbours are claims about the vendor's own
+    /// API. They decide nothing on the request path: whether the
+    /// gateway forwards a surface or answers 501 comes from
+    /// [`crate::api_routes::provider_supports_surface`], which keys on
+    /// the wire format.
+    ///
+    /// What they decide is what a model listing may advertise.
+    /// [`crate::api_routes::surface_capability_names`] publishes the
+    /// intersection of the two, so the array is never wider than the
+    /// gate (nothing named can be refused) and never claims a surface
+    /// on a vendor's behalf that the catalog has no record of. Setting
+    /// one to `false` narrows a listing and changes nothing about what
+    /// is forwarded.
+    ///
+    /// Before WOR-2647 the listing read these alone while the matrix
+    /// answered the request, and the two disagreed on 43 of the 72
+    /// shipped entries in both directions: a bedrock listing advertised
+    /// the `embeddings` surface the request path answers with 501, and
+    /// a vertex listing hid one it serves. Bedrock keeps
+    /// `supports_embeddings: true` because Titan does embed, through a
+    /// shape the gateway does not forward, and the intersection is what
+    /// keeps it off the listing; vertex's entry was simply wrong and
+    /// was corrected.
     #[serde(default = "default_true")]
     pub supports_chat: bool,
     /// Declared data-handling posture of the vendor's API, per its

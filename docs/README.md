@@ -1,6 +1,6 @@
 # SBproxy documentation
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 SBproxy is an open source Enterprise AI Gateway for API, MCP and agent, and AI model traffic. Every feature in this repository ships under Apache-2.0.
 
@@ -45,10 +45,7 @@ with no dependencies.
 - [getting-started-sovereign-multicloud.md](getting-started-sovereign-multicloud.md) - use Kubernetes, sidecars, and secret backends.
 - [use-case-own-openrouter.md](use-case-own-openrouter.md) - run a provider gateway on your own credentials.
 - [use-case-coding-assistant.md](use-case-coding-assistant.md) - point a coding assistant at a local model.
-- [use-case-connect-codex.md](use-case-connect-codex.md) - connect Codex CLI to a governed gateway.
-- [use-case-connect-cursor.md](use-case-connect-cursor.md) - connect Cursor to a governed gateway.
-- [use-case-connect-cline.md](use-case-connect-cline.md) - connect Cline to a governed gateway.
-- [use-case-connect-copilot.md](use-case-connect-copilot.md) - connect GitHub Copilot BYOK to a governed gateway.
+- [use-case-connect-coding-agents.md](use-case-connect-coding-agents.md) - point Codex, Claude Code, Cursor, Cline, and Copilot at a governed gateway with `sbproxy connect`.
 - [use-case-production-ops.md](use-case-production-ops.md) - move from a laptop deployment to operational ownership.
 - [use-case-local-first.md](use-case-local-first.md) - prove a GPU you already bought pays for itself.
 - [use-case-serve-on-l4.md](use-case-serve-on-l4.md) - serve Qwen, GLM, or Gemma on a single cloud L4.

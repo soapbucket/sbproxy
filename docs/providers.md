@@ -96,7 +96,7 @@ The `cloudflare`, `vertex`, `runpod`, `azure_foundry`, and `snowflake` defaults 
 
 [^vertex-oauth]: Vertex AI requires a short-lived OAuth2 access token rather than a static API key. Generate one with `gcloud auth print-access-token` (or your service account flow) and rotate it before expiry. SBproxy forwards the configured `api_key` verbatim as the bearer token.
 
-[^embed-only]: Voyage and Jina expose embeddings (and rerank) endpoints only. Their catalog entries set `supports_chat: false` so chat-completion configs against these providers will fail closed at validation time once the runtime check is wired. Mixedbread used to sit in this group and no longer does: its current API reference documents OpenAI-shaped `/v1/chat/completions` and has dropped the standalone embeddings reference, so refusing chat there had become a false refusal.
+[^embed-only]: Voyage and Jina expose embeddings (and rerank) endpoints only. Their catalog entries record that as `supports_chat: false`, which keeps `chat_completions` off their model listings: `GET /v1/models` shows `["embeddings"]` and nothing else. It is not a gate, though. A chat-completions request against one of them is still forwarded and 404s at the upstream, so keep chat traffic away by leaving chat models out of their `models` list, or with `allowed_models`. Mixedbread used to sit in this group and no longer does: its current API reference documents OpenAI-shaped `/v1/chat/completions`, so refusing chat there had become a false refusal.
 
 [^tgi]: Hugging Face archived the TGI repository on 2026-03-21 and put it in maintenance mode, pointing new deployments at vLLM, SGLang, or `llama.cpp`. The entry stays because an existing TGI server keeps serving on this base; the port matches the published Docker quickstart's host mapping rather than the binary's own default.
 
@@ -151,7 +151,7 @@ origins:
             - claude-haiku-4-5
 ```
 
-`default_model` names the model shown in this provider's `/v1/models` listing and, for a locally served provider (a `serve:` block), the model a request routes to when it omits `model`. A hosted provider like the one above does not get this fallback: dispatch to a hosted provider still needs an explicit `model` from the caller. See [ai-gateway.md](ai-gateway.md#provider-setup) for the caveat in full.
+`default_model` names the model shown in this provider's `/v1/models` listing and the model a request routes to when it omits `model`, on hosted and locally served providers alike. On the hosted path the fallback is origin-wide rather than per-provider, because provider selection has not happened yet when the model is read: it applies only when every enabled provider that names a default names the same one, and only on the chat-shaped surfaces (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`). See [ai-gateway.md](ai-gateway.md#defaulting-the-model) for the rule and its carve-outs in full.
 
 Useful per-provider knobs:
 
@@ -161,7 +161,7 @@ providers:
     api_key: ${OPENAI_API_KEY}
     base_url: https://api.openai.com/v1     # Override default
     models: ["gpt-4o", "gpt-4o-mini"]       # Whitelist
-    default_model: gpt-4o-mini              # Local-serving default and /v1/models metadata; not injected on hosted dispatch
+    default_model: gpt-4o-mini              # Used when a request omits `model`, and shown in /v1/models metadata
     model_map:                              # Rename models on the way out
       fast: gpt-4o-mini
       smart: gpt-4o
@@ -328,12 +328,25 @@ providers:
     auth_header: Authorization     # header carrying the key (required)
     auth_prefix: "Bearer "         # prefix prepended to the key ("" for raw keys, defaults to "")
     format: openai                 # wire format: openai | anthropic | google | bedrock | custom (required)
-    supports_streaming: true
-    supports_embeddings: false
-    supports_chat: true            # set false for embeddings/rerank-only providers
+    supports_streaming: true       # advertised, not enforced, see below
+    supports_embeddings: false     # advertised, not enforced, see below
+    supports_chat: true            # advertised, not enforced, see below
 ```
 
 A malformed override file is rejected and the gateway falls back to the embedded catalog rather than booting with no providers.
+
+The three `supports_*` keys are claims about the vendor's own API. Nothing in
+the request path reads them, so changing one changes nothing about what the
+gateway forwards. That is decided by `format` plus the per-provider surface
+matrix documented under
+[Supported endpoints](ai-gateway.md#supported-endpoints), and a custom entry
+with `format: openai` gets the full OpenAI surface row whatever its
+`supports_embeddings` value says.
+
+What they do decide is what a model listing advertises. `GET /v1/models`
+publishes the intersection of the two, so setting a key to `false` takes the
+surface off the listing and leaves the forwarding alone, and setting it to
+`true` adds the surface only where the matrix already agrees.
 
 ### 3. Add it to the in-tree registry
 

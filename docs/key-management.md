@@ -604,6 +604,7 @@ exists when an operator remembers to set it is not a limit.
 | Inbound idle | 5 minutes | A connection that is admitted and then says nothing, forever, while holding a slot. |
 | Inbound frame body | 30s | A peer that announces a 16 MiB frame and then delivers it one byte at a time. The deadline covers the whole body, so a single byte does not reset it. |
 | Response write | 30s | A peer that issues a request and then stops reading, parking the handler inside the write. |
+| Outbound RPC slot | 5s | A caller queueing behind a wedged peer. The transport holds one connection per peer with one request in flight, so callers wait their turn; failing the queue fast is what keeps one bad peer from occupying every task that wants it. |
 | Outbound connect / TLS / write / response | 3s / 5s / 10s / 10s | A dead or wedged peer stalling a resolution that a request is waiting on. Scanning operations (`purge`, digest, snapshot) get 60s instead of 10s, because they walk the peer's shard rather than looking one key up. |
 | Outbound request, overall | 15s (90s for a scan) | Five phase timeouts that each restart the clock are not a bound on the call. This one is, and every phase is clamped by whichever expires first. |
 
@@ -615,18 +616,29 @@ torn down by one of the deadlines, increments
 (`connection_limit`, `handshake_timeout`, `handshake_failed`,
 `idle_timeout`, `frame_timeout`, `write_timeout`). The peer address is not a
 label, because it is attacker-chosen; it goes in a rate-limited log line
-instead, so the counter says how much and the log says who. Alert on any
-sustained `connection_limit` rate.
+instead, so the counter says how much and the log says who.
+
+Five of those six reasons are worth an alert, and `idle_timeout` is not.
+A quiet cluster reclaims idle connections as a matter of course, so that
+value climbs on its own on a perfectly healthy fleet; it is recorded because
+a sudden jump is still a signal, not because a steady rate is one. Alert on
+`reason!="idle_timeout"`, and on any sustained `connection_limit` rate in
+particular. The reclaim also logs at `debug` rather than `warn` for the same
+reason, so it does not bury the five refusals that do want reading.
 
 Client-side deadlines report on `mesh_transport_rpc_errors_total` under five
 `timeout_` kinds, kept separate from the failure kinds beside them: a
 `connect` is a peer that refused, a `timeout_connect` is a peer that answered
 with nothing, and only the second one means reachable-but-wedged.
 
-The two halves are tuned against each other. A node replaces its own cached
-connection to a peer after 60 seconds of quiet, well before the peer's
-five-minute idle reaper would take the slot back, so a quiet period costs one
-extra handshake rather than one failed RPC.
+The two halves are tuned against each other, and it is worth being precise
+about what that buys. A node replaces its own cached connection to a peer
+after 60 seconds of quiet, but it checks that when it next issues a request
+rather than on a timer, so a link nobody uses for more than five minutes is
+still reclaimed by the peer's reaper. What the 60 seconds guarantees is that
+the client's first request after any such gap is past its own mark too, so it
+dials a fresh connection instead of writing into a socket the peer has
+already closed. A quiet period costs one extra handshake, never a failed RPC.
 
 ## Operational metrics
 

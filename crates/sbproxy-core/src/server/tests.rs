@@ -2126,6 +2126,150 @@ async fn any_of_no_credential_at_all_is_missing_not_suspicious() {
     );
 }
 
+// --- WOR-2525: basic_auth's realm reaches the 401 ---
+//
+// The seam is the `Auth::BasicAuth` denial arm of
+// `check_auth_with_tls_outcome`. Before the fix it returned a bare
+// `AuthResult::Deny(401, "unauthorized")`, which carries no header
+// vector at all, so the emitter in `request_phase` had nothing to
+// stamp and the configured `realm` was parsed and then dropped. These
+// go through `compile_auth` rather than constructing the provider
+// directly so the config key an operator writes is on the path.
+
+/// A scalar `basic_auth` origin that configured a realm.
+fn compiled_basic_auth(realm: Option<&str>) -> sbproxy_modules::Auth {
+    let mut value = serde_json::json!({
+        "type": "basic_auth",
+        "users": [{"username": "admin", "password": "s3cret"}],
+    });
+    if let Some(realm) = realm {
+        value["realm"] = serde_json::Value::String(realm.to_string());
+    }
+    sbproxy_modules::compile::compile_auth(&value).expect("basic_auth must compile")
+}
+
+#[tokio::test]
+async fn basic_auth_denial_carries_the_configured_realm_challenge() {
+    let auth = compiled_basic_auth(Some("Admin Panel"));
+    let headers = http::HeaderMap::new();
+
+    let (result, _principal, outcome) =
+        check_auth_with_tls_outcome(&auth, &headers, None, "GET", "/", test_tenant(), None, None)
+            .await;
+
+    match result {
+        AuthResult::DenyWithHeaders(status, msg, hdrs) => {
+            assert_eq!(status, 401);
+            assert_eq!(msg, "unauthorized");
+            assert_eq!(
+                hdrs,
+                vec![(
+                    "WWW-Authenticate".to_string(),
+                    r#"Basic realm="Admin Panel""#.to_string()
+                )],
+                "the configured realm must reach the challenge header"
+            );
+        }
+        other => panic!(
+            "a basic_auth denial must carry a challenge; got {}",
+            auth_result_label(&other)
+        ),
+    }
+    assert_eq!(
+        outcome,
+        AuthTrustOutcome::Missing,
+        "adding a challenge must not change the trust verdict for an absent credential"
+    );
+}
+
+#[tokio::test]
+async fn basic_auth_denial_without_a_configured_realm_still_challenges() {
+    // RFC 9110 section 11.6.1 makes `realm` mandatory on a Basic
+    // challenge, so an origin that configured none still gets one
+    // rather than falling back to a header-less 401.
+    let auth = compiled_basic_auth(None);
+    let headers = http::HeaderMap::new();
+
+    let (result, _principal, _outcome) =
+        check_auth_with_tls_outcome(&auth, &headers, None, "GET", "/", test_tenant(), None, None)
+            .await;
+
+    match result {
+        AuthResult::DenyWithHeaders(401, _, hdrs) => assert_eq!(
+            hdrs,
+            vec![(
+                "WWW-Authenticate".to_string(),
+                r#"Basic realm="restricted""#.to_string()
+            )]
+        ),
+        other => panic!(
+            "an unconfigured realm must not cost the origin its challenge; got {}",
+            auth_result_label(&other)
+        ),
+    }
+}
+
+#[tokio::test]
+async fn basic_auth_wrong_password_still_challenges_and_stays_invalid_proof() {
+    // A rejected credential is the case where a client most needs to be
+    // told the scheme and realm to retry against, and the offered-proof
+    // trust verdict must survive the variant change.
+    let auth = compiled_basic_auth(Some("Admin Panel"));
+    let mut headers = http::HeaderMap::new();
+    // base64("admin:wrong")
+    headers.insert(
+        http::header::AUTHORIZATION,
+        "Basic YWRtaW46d3Jvbmc=".parse().unwrap(),
+    );
+
+    let (result, _principal, outcome) =
+        check_auth_with_tls_outcome(&auth, &headers, None, "GET", "/", test_tenant(), None, None)
+            .await;
+
+    assert!(
+        matches!(result, AuthResult::DenyWithHeaders(401, _, ref hdrs)
+            if hdrs.iter().any(|(name, value)| name.eq_ignore_ascii_case("www-authenticate")
+                && value.as_str() == r#"Basic realm="Admin Panel""#)),
+        "a rejected password must still be told which scheme and realm to retry with; got {}",
+        auth_result_label(&result)
+    );
+    assert_eq!(outcome, AuthTrustOutcome::InvalidProof);
+}
+
+#[tokio::test]
+async fn basic_auth_challenge_joins_a_merged_any_of_denial() {
+    // The composition seam: `check_any_of_auth` reads challenge headers
+    // off `DenyWithHeaders` only. With basic_auth returning a bare
+    // `Deny`, a `[basic_auth, bearer]` origin exhausted into a
+    // `Deny(401)` with no header at all, so composing basic_auth with
+    // anything erased its challenge as well.
+    let auth = sbproxy_modules::compile::compile_auth(&serde_json::json!([
+        {"type": "basic_auth", "realm": "Admin Panel",
+         "users": [{"username": "admin", "password": "s3cret"}]},
+        {"type": "bearer", "tokens": ["composed-token"]},
+    ]))
+    .expect("a two-provider auth list must compile");
+    let headers = http::HeaderMap::new();
+
+    let (result, _principal) =
+        check_auth(&auth, &headers, None, "GET", "/", test_tenant(), None).await;
+
+    match result {
+        AuthResult::DenyWithHeaders(401, _, hdrs) => {
+            let challenges: Vec<&str> = hdrs
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("www-authenticate"))
+                .map(|(_, value)| value.as_str())
+                .collect();
+            assert_eq!(challenges, vec![r#"Basic realm="Admin Panel""#]);
+        }
+        other => panic!(
+            "the composite 401 must carry the basic slot's challenge; got {}",
+            auth_result_label(&other)
+        ),
+    }
+}
+
 #[tokio::test]
 async fn plugin_protocol_challenge_is_neutral_independent_of_request_shape() {
     let cases = [

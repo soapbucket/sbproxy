@@ -592,7 +592,7 @@ providers:
     auth_prefix: "Bearer "
     format: openai
     supports_streaming: true
-    supports_embeddings: false
+    supports_embeddings: true
     # Customer data is not used to train foundation models; cached
     # inputs and abuse logging can be disabled for zero-retention
     # configurations (Google Cloud Vertex AI data-governance docs).

@@ -75,11 +75,25 @@ impl ChatFormat for OpenAiResponsesFormat {
     }
 
     fn to_hub(&self, bytes: &[u8]) -> Result<(HubRequest, BridgeContext), ChatError> {
-        let raw: Value = serde_json::from_slice(bytes)
-            .map_err(|e| ChatError::bad_request(format!("invalid JSON body: {e}")))?;
-        let obj = raw
-            .as_object()
-            .ok_or_else(|| ChatError::bad_request("request body must be a JSON object"))?;
+        // Written as an explicit match rather than `map_err` so the
+        // reason code and the interpolated parse detail stay visibly
+        // separate: the code is a metric label, the detail is caller
+        // bytes and belongs only in the client message.
+        let raw: Value = match serde_json::from_slice(bytes) {
+            Ok(raw) => raw,
+            Err(e) => {
+                return Err(ChatError::bad_request_coded(
+                    "malformed_json",
+                    format!("invalid JSON body: {e}"),
+                ));
+            }
+        };
+        let Some(obj) = raw.as_object() else {
+            return Err(ChatError::bad_request_coded(
+                "body_not_object",
+                "request body must be a JSON object",
+            ));
+        };
 
         let mut hub = HubRequest {
             model: obj
@@ -109,7 +123,8 @@ impl ChatFormat for OpenAiResponsesFormat {
             .get("previous_response_id")
             .is_some_and(|v| !v.is_null())
         {
-            return Err(ChatError::bad_request(
+            return Err(ChatError::bad_request_coded(
+                "previous_response_id_unsupported",
                 "previous_response_id is not supported: this gateway does not \
                  store response state, so the turns it references would be \
                  silently missing; resend the full conversation history in \
@@ -121,7 +136,8 @@ impl ChatFormat for OpenAiResponsesFormat {
         // {"id": ...} object): it names upstream conversation state the
         // translation to Chat Completions destroys.
         if obj.get("conversation").is_some_and(|v| !v.is_null()) {
-            return Err(ChatError::bad_request(
+            return Err(ChatError::bad_request_coded(
+                "conversation_unsupported",
                 "conversation is not supported: this gateway does not store \
                  conversation state, so the conversation it references would \
                  be silently missing; resend the full conversation history in \
@@ -137,7 +153,8 @@ impl ChatFormat for OpenAiResponsesFormat {
         match obj.get("store") {
             None | Some(Value::Null) | Some(Value::Bool(false)) => {}
             Some(_) => {
-                return Err(ChatError::bad_request(
+                return Err(ChatError::bad_request_coded(
+                    "store_unsupported",
                     "store is not supported: this gateway keeps no response \
                      state, so a stored response could never be retrieved; \
                      omit store or send store: false and keep conversation \
@@ -152,13 +169,17 @@ impl ChatFormat for OpenAiResponsesFormat {
         // stripped, unknown references 404ed there). One that reaches
         // this translator was never resolved, so the request would run
         // without the template it names; refuse rather than drop. A
-        // string (or other non-object) `prompt` is not the bridge's
-        // object form and keeps the pre-bridge note-and-drop behavior
-        // (counted at the translate seam per WOR-2535).
+        // STRING `prompt` is the `name@version` reference form; the
+        // dispatcher lifts it off the body before this translator runs
+        // (WOR-2597), so a string reaching here came from a caller of
+        // this format outside that dispatch path. Any other type keeps
+        // the note-and-drop behavior, counted at the translate seam per
+        // WOR-2535.
         match obj.get("prompt") {
             None | Some(Value::Null) => {}
             Some(Value::Object(_)) => {
-                return Err(ChatError::bad_request(
+                return Err(ChatError::bad_request_coded(
+                    "prompt_object_unresolved",
                     "prompt object was not resolved against the gateway \
                      prompt store: this request path does not bridge \
                      stored-prompt references, so the request would run \
@@ -283,7 +304,8 @@ impl ChatFormat for OpenAiResponsesFormat {
                     // Fail closed. The message deliberately does not
                     // echo server_url or server_label: the URL can carry
                     // credentials.
-                    return Err(ChatError::bad_request(
+                    return Err(ChatError::bad_request_coded(
+                        "tools_mcp_unsupported",
                         "tools: type 'mcp' is not supported: it asks the model \
                          provider to contact an MCP server directly, bypassing \
                          this gateway's MCP governance; front the server with \

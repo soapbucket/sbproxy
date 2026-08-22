@@ -814,6 +814,213 @@ fn resolve_model_alias(
     ))
 }
 
+/// The origin's default model, when every enabled provider that names
+/// one names the same one.
+///
+/// `default_model` is documented on `ProviderConfig` as "Default model
+/// used when the request omits an explicit model", and that rustdoc
+/// ships verbatim as the operator-facing JSON schema. The served and
+/// `/v1/models` paths honored it; the main JSON dispatch path never read
+/// it at all, so a hosted request that omitted `model` carried the empty
+/// string all the way to the wire (WOR-2531).
+///
+/// The empty string is not a harmless placeholder there. `model.is_empty()`
+/// short-circuits `is_model_allowed`, the virtual-key model gate,
+/// model-scoped budgets, provider eligibility, and the compression
+/// runtime, so against an upstream that infers the model itself (an Azure
+/// deployment-scoped `base_url`, a single-model vLLM or Ollama) omitting
+/// `model` reached the provider with the action allowlist,
+/// `blocked_models`, and per-key model scoping all skipped. Substituting
+/// a concrete model is what puts those gates back in the path.
+///
+/// `default_model` is per-provider and provider selection happens
+/// thousands of lines later, so there is no one provider to ask at this
+/// seam. The rule is the one `pick_local_model_name` already states for
+/// the served path: a default applies only when it is unambiguous.
+/// Providers that name nothing abstain; providers disabled for routing
+/// do not get a vote, because a request can never land on one. Two
+/// enabled providers naming different defaults leave the request
+/// modelless exactly as before, which is the honest answer to "which one
+/// did the operator mean".
+///
+/// **Where this does not apply.** The chat-shaped JSON surfaces only,
+/// gated by [`surface_takes_the_origin_default_model`]. A multipart
+/// request (audio transcription, image edits, image variations) that
+/// carries no `model` form field keeps the old behavior, because the
+/// multipart rewrite can replace a `model` part and cannot add one; the
+/// multipart seam carries the long version of that limit. Nothing here
+/// reaches the served or `/v1/models` paths either, which read
+/// `default_model` per provider through `pick_local_model_name` and
+/// `model_discovery` and always did.
+fn unambiguous_default_model(config: &AiHandlerConfig) -> Option<String> {
+    let mut chosen: Option<&str> = None;
+    for provider in config.providers.iter().filter(|p| p.enabled) {
+        let Some(candidate) = provider.default_model.as_ref().map(|m| m.as_str()) else {
+            continue;
+        };
+        match chosen {
+            None => chosen = Some(candidate),
+            Some(existing) if existing == candidate => {}
+            Some(_) => return None,
+        }
+    }
+    chosen.map(str::to_owned)
+}
+
+/// Whether an omitted `model` on this inbound surface may be filled in
+/// from the origin's `default_model`.
+///
+/// `default_model` names a chat-shaped model: it is what the served
+/// path hands `pick_local_model_name` and what `/v1/models` advertises.
+/// Only the three surfaces that carry a canonical chat request can
+/// therefore take it. Every other JSON surface reaching the same
+/// dispatch path (`moderations`, `image_generation`, `embeddings`,
+/// `audio_speech`, ...) has its own model vocabulary, and several of
+/// them treat `model` as optional with a provider-side default of their
+/// own. Writing a chat model into one of those bodies would turn a
+/// request the provider accepts today into an upstream 400, so the
+/// origin default stops here and those surfaces keep the pre-WOR-2531
+/// behavior of forwarding no `model` at all.
+///
+/// The family is the one `semantic_cache_surface_class` already names,
+/// deliberately: `chat_completions`, `messages`, and `responses` are
+/// exactly the surfaces that wrap the same canonical chat request, and
+/// two independent definitions of that set would drift.
+fn surface_takes_the_origin_default_model(surface_label: &'static str) -> bool {
+    semantic_cache_surface_class(surface_label) == "chat"
+}
+
+#[cfg(test)]
+mod default_model_tests {
+    use super::{surface_takes_the_origin_default_model, unambiguous_default_model};
+
+    /// One origin, described as `(provider name, default_model, enabled)`.
+    ///
+    /// `provider_type` is pinned to `openai` on every entry because
+    /// `from_config` refuses a provider whose catalog key is unknown and
+    /// which carries no `base_url`, and these fixtures deliberately have
+    /// neither a real vendor nor an upstream.
+    fn config(providers: &[(&str, Option<&str>, bool)]) -> sbproxy_ai::AiHandlerConfig {
+        let providers: Vec<serde_json::Value> = providers
+            .iter()
+            .map(|(name, default_model, enabled)| {
+                let mut provider = serde_json::json!({
+                    "name": name,
+                    "provider_type": "openai",
+                    "api_key": "fixture-key",
+                    "enabled": enabled,
+                });
+                if let Some(model) = default_model {
+                    provider["default_model"] = serde_json::Value::String((*model).to_owned());
+                }
+                provider
+            })
+            .collect();
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({ "providers": providers }))
+            .expect("AI handler config fixture")
+    }
+
+    #[test]
+    fn one_provider_naming_a_default_supplies_it() {
+        let config = config(&[("openai", Some("gpt-4o"), true)]);
+        assert_eq!(
+            unambiguous_default_model(&config).as_deref(),
+            Some("gpt-4o")
+        );
+    }
+
+    #[test]
+    fn providers_agreeing_on_a_default_supply_it() {
+        let config = config(&[
+            ("openai", Some("gpt-4o"), true),
+            ("azure", Some("gpt-4o"), true),
+        ]);
+        assert_eq!(
+            unambiguous_default_model(&config).as_deref(),
+            Some("gpt-4o")
+        );
+    }
+
+    #[test]
+    fn a_provider_naming_nothing_abstains_rather_than_disagreeing() {
+        // The common shape: one provider carries the default and the
+        // rest say nothing. Reading an absent value as a disagreement
+        // would make the field unusable on any multi-provider origin.
+        let config = config(&[("openai", None, true), ("azure", Some("gpt-4o"), true)]);
+        assert_eq!(
+            unambiguous_default_model(&config).as_deref(),
+            Some("gpt-4o")
+        );
+    }
+
+    #[test]
+    fn disagreeing_providers_supply_nothing() {
+        // Picking the first would route a modelless request to whichever
+        // provider happens to be listed first, which is not a decision
+        // the operator made.
+        let config = config(&[
+            ("openai", Some("gpt-4o"), true),
+            ("azure", Some("gpt-4o-mini"), true),
+        ]);
+        assert_eq!(unambiguous_default_model(&config), None);
+    }
+
+    #[test]
+    fn a_disabled_provider_does_not_get_a_vote() {
+        // A request can never land on a disabled provider, so its
+        // default cannot be the one the operator meant, and letting it
+        // vote would turn an unambiguous origin ambiguous.
+        let config = config(&[
+            ("openai", Some("gpt-4o"), true),
+            ("retired", Some("gpt-4o-mini"), false),
+        ]);
+        assert_eq!(
+            unambiguous_default_model(&config).as_deref(),
+            Some("gpt-4o")
+        );
+    }
+
+    #[test]
+    fn no_provider_naming_one_supplies_nothing() {
+        let config = config(&[("openai", None, true)]);
+        assert_eq!(unambiguous_default_model(&config), None);
+    }
+
+    #[test]
+    fn only_the_chat_shaped_surfaces_take_the_origin_default() {
+        // `default_model` is a chat model. Writing it into a
+        // `/v1/moderations` or `/v1/images/generations` body, both of
+        // which treat `model` as optional and default it provider-side
+        // to something from their own vocabulary, turns a request the
+        // provider accepts into an upstream 400.
+        for surface in [
+            sbproxy_ai::handler::AiSurface::ChatCompletions,
+            sbproxy_ai::handler::AiSurface::Messages,
+            sbproxy_ai::handler::AiSurface::Responses,
+        ] {
+            assert!(
+                surface_takes_the_origin_default_model(surface.label()),
+                "{} carries a canonical chat request",
+                surface.label()
+            );
+        }
+        for surface in [
+            sbproxy_ai::handler::AiSurface::Moderations,
+            sbproxy_ai::handler::AiSurface::Embeddings,
+            sbproxy_ai::handler::AiSurface::ImageGeneration,
+            sbproxy_ai::handler::AiSurface::AudioSpeech,
+            sbproxy_ai::handler::AiSurface::Reranking,
+            sbproxy_ai::handler::AiSurface::Unknown,
+        ] {
+            assert!(
+                !surface_takes_the_origin_default_model(surface.label()),
+                "{} has its own model vocabulary",
+                surface.label()
+            );
+        }
+    }
+}
+
 /// Resolve a JSON request body's `model` field against the alias registry.
 ///
 /// Rewrites the model string and the body together so the request that
@@ -2933,58 +3140,9 @@ fn any_allowed_provider_supports_surface(
             && sbproxy_ai::api_routes::provider_supports_surface_for_modality(
                 provider,
                 surface,
-                served_provider_modality(provider, surface),
+                sbproxy_ai::api_routes::served_provider_modality(provider),
             )
     })
-}
-
-/// The modality of a locally served (`serve:`) provider that could handle
-/// `surface`, or `None` for a non-served provider (WOR-1908). A served
-/// provider is not in the provider catalog, so without this it would
-/// blanket-501 a non-chat surface even while serving an embedder. The
-/// served model's task comes from the built-in catalog (the certified
-/// catalog an embedding model is added to); an operator's custom-catalog
-/// modality is not resolved on this pre-dispatch path and keeps the
-/// chat-only default.
-fn served_provider_modality(
-    provider: &sbproxy_ai::ProviderConfig,
-    surface: &sbproxy_ai::handler::AiSurface,
-) -> Option<sbproxy_model_host::Modality> {
-    // Only the non-universal surfaces need a modality answer; chat/models
-    // are already universal, so skip the catalog work for them.
-    if matches!(
-        surface,
-        sbproxy_ai::handler::AiSurface::ChatCompletions
-            | sbproxy_ai::handler::AiSurface::Models
-            | sbproxy_ai::handler::AiSurface::Messages
-            | sbproxy_ai::handler::AiSurface::Responses
-    ) {
-        return None;
-    }
-    let serve = provider.serve.as_ref()?;
-    let catalog = builtin_catalog();
-    // A served provider hosts one or more models; report the first served
-    // model whose modality is non-chat, so its surface becomes legal. An
-    // explicit `modality:` on the serve entry wins (the only way to declare
-    // it for a raw `hf:` reference, which has no catalog entry); otherwise
-    // fall back to the certified catalog entry's modality.
-    serve
-        .models
-        .iter()
-        .filter_map(|entry| {
-            entry
-                .modality
-                .or_else(|| catalog.get(&entry.model).map(|model| model.modality))
-        })
-        .find(|modality| !modality.uses_kv_cache())
-}
-
-/// The certified built-in catalog, parsed once. Used by the surface gate
-/// to resolve a served model's modality without re-parsing the embedded
-/// YAML per request.
-fn builtin_catalog() -> &'static sbproxy_model_host::Catalog {
-    static BUILTIN: std::sync::OnceLock<sbproxy_model_host::Catalog> = std::sync::OnceLock::new();
-    BUILTIN.get_or_init(sbproxy_model_host::Catalog::builtin)
 }
 
 fn has_allowed_openai_passthrough(
@@ -5485,27 +5643,18 @@ pub(super) async fn handle_ai_proxy(
         // engine is spawned, and `effective_base_url` would fall back to
         // a localhost default, which on a stock config is this gateway's
         // own data plane (a request loop ending in a confusing 502).
-        // Answer the models listing from the serve config, and reject
-        // any other GET with a clear not-ready error instead of dialing
+        // Reject the GET with a clear not-ready error instead of dialing
         // the fallback.
+        //
+        // WOR-2647: this used to answer `/v1/models` and `/models` from
+        // the serve config with a third listing shape, one that carried
+        // no capability names at all. It was unreachable: the models
+        // branch at the top of this GET arm matches the same two paths
+        // (on the same unmutated `path`, which `Uri::path` returns
+        // without a query string) and returns unconditionally, so a
+        // served provider's models already come back from
+        // `logical_model_listing`, which does publish capabilities.
         if provider.serve.is_some() {
-            if matches!(path.trim_end_matches('/'), "/v1/models" | "/models") {
-                let data: Vec<_> = provider
-                    .models
-                    .iter()
-                    .map(|m| {
-                        serde_json::json!({
-                            "id": m.as_str(),
-                            "object": "model",
-                            "owned_by": provider.name.as_str(),
-                        })
-                    })
-                    .collect();
-                let body = serde_json::json!({ "object": "list", "data": data });
-                let bytes = serde_json::to_vec(&body).unwrap_or_default();
-                send_response(session, 200, "application/json", &bytes).await?;
-                return Ok(());
-            }
             let message = format!(
                 "provider {} serves its model locally; `GET {}` has no upstream \
                  to forward to. The engine starts on the first completion request.",
@@ -6024,21 +6173,39 @@ pub(super) async fn handle_ai_proxy(
     // inbound format id is stamped on the request context so the
     // relay path can wrap the response body back into the format the
     // client expects.
+    //
+    // WOR-2597: `"prompt": "name@version"` is this gateway's
+    // stored-prompt reference and belongs to no native wire format, so
+    // both translators drop it and the shared resolver further down,
+    // which reads the already-translated canonical body, never saw one
+    // on `/v1/messages` or `/v1/responses`. The reference is lifted off
+    // the inbound body here and put back on the canonical body after
+    // the parse, which is the only place the resolver looks.
+    let mut lifted_prompt_reference: Option<String> = None;
     let body_bytes = match surface {
         sbproxy_ai::handler::AiSurface::Messages => {
+            let (inbound_bytes, reference) = lift_gateway_prompt_reference(&body_bytes);
             match sbproxy_ai::format::anthropic_messages::translate_anthropic_request_to_openai(
-                body_bytes.as_ref(),
+                inbound_bytes.as_ref(),
                 hostname,
                 translation_tenant,
             ) {
                 Ok(translated) => {
                     ctx.ai_inbound_format = Some("anthropic".into());
                     path = "/v1/chat/completions".into();
+                    lifted_prompt_reference = reference;
                     bytes::Bytes::from(translated)
                 }
                 Err(e) => {
+                    // WOR-2595: the typed record goes out here rather
+                    // than from the terminal logging hook, because the
+                    // reason code does not survive to `logging` and both
+                    // refusal arms `return Ok(())` immediately, which is
+                    // what makes one call here exactly one record.
+                    record_ai_admission_refusal(ctx, surface_label, e.reason());
                     warn!(
                         error = %e,
+                        reason = e.reason(),
                         "AI proxy: failed to parse Anthropic Messages inbound body"
                     );
                     send_error(session, e.status(), e.message()).await?;
@@ -6055,9 +6222,10 @@ pub(super) async fn handle_ai_proxy(
             // to any configured provider. An unknown id or version
             // fails closed with a 404 naming the reference, and a
             // malformed object is a 400; neither falls through to the
-            // raw input. A string `prompt` is not the object form and
-            // keeps its pre-bridge behavior (the translator notes and
-            // drops it). The byte scan keeps the extra JSON parse off
+            // raw input. A string `prompt` is not the object form; it
+            // is the `name@version` reference form, lifted just below
+            // by `lift_gateway_prompt_reference` (WOR-2597). The byte
+            // scan keeps the extra JSON parse off
             // bodies that cannot carry the field; a false positive
             // only costs the parse, and the translator's own
             // unresolved-object refusal backstops anything the scan
@@ -6097,8 +6265,20 @@ pub(super) async fn handle_ai_proxy(
                                 }
                             }
                             Some(Err((status, message))) => {
+                                // The bridge returns prose rather than a
+                                // `ChatError`, so the code is chosen here.
+                                // Its two shapes (an unknown reference,
+                                // and a malformed or unrenderable object)
+                                // split on the status the bridge picked.
+                                let reason = if status == 404 {
+                                    "prompt_reference_not_found"
+                                } else {
+                                    "prompt_object_unrenderable"
+                                };
+                                record_ai_admission_refusal(ctx, surface_label, reason);
                                 warn!(
                                     error = %message,
+                                    reason,
                                     "AI proxy: Responses prompt bridge refused request"
                                 );
                                 send_error(session, status, &message).await?;
@@ -6109,6 +6289,12 @@ pub(super) async fn handle_ai_proxy(
                     }
                 }
             }
+            // The string form of the same reference. The object bridge
+            // above already stripped `prompt` on a hit, so this only
+            // fires for `"prompt": "name@version"`, which the translator
+            // would otherwise note as `responses.prompt` and drop. A
+            // non-string, non-object `prompt` keeps that note.
+            let (inbound_bytes, reference) = lift_gateway_prompt_reference(&inbound_bytes);
             match sbproxy_ai::format::openai_responses::translate_responses_request_to_openai(
                 inbound_bytes.as_ref(),
                 hostname,
@@ -6117,11 +6303,14 @@ pub(super) async fn handle_ai_proxy(
                 Ok(translated) => {
                     ctx.ai_inbound_format = Some("responses".into());
                     path = "/v1/chat/completions".into();
+                    lifted_prompt_reference = reference;
                     bytes::Bytes::from(translated)
                 }
                 Err(e) => {
+                    record_ai_admission_refusal(ctx, surface_label, e.reason());
                     warn!(
                         error = %e,
+                        reason = e.reason(),
                         "AI proxy: failed to parse OpenAI Responses inbound body"
                     );
                     send_error(session, e.status(), e.message()).await?;
@@ -6307,6 +6496,22 @@ pub(super) async fn handle_ai_proxy(
             })?;
             requested_model = Some(route_to.to_string());
         }
+        // WOR-2531 does NOT reach here, and the gap is deliberate. The
+        // JSON path substitutes the origin's unambiguous `default_model`
+        // when the body omits one, which puts the model gates back in
+        // the path. A multipart body cannot take the same treatment:
+        // `rewrite_engine_model` replaces an existing `model` part and
+        // cannot add one (`rewrite_multipart_model` errors when
+        // `multipart_field_range` finds no `model` field), and
+        // `requested_model` being `None` here means exactly that the
+        // part is absent. Calling it anyway would turn a transcription
+        // that works today into a 400 the moment an operator declares a
+        // `default_model` anywhere on the origin, which is a worse
+        // answer than the gap. So on a multipart request with no `model`
+        // form field the allow/block gate below still does not run, the
+        // same as before. Closing it needs a part-insertion helper in
+        // `model_plane`, not a call from here.
+        //
         // WOR-2312: the multipart surfaces (audio transcription, image
         // edits) resolve global aliases too, so one alias means the same
         // model everywhere rather than only on the JSON surfaces. The
@@ -6911,6 +7116,20 @@ pub(super) async fn handle_ai_proxy(
             return Ok(());
         }
     };
+    // WOR-2597: put the lifted stored-prompt reference back on the
+    // canonical body, which is where the shared WOR-800 resolver below
+    // reads it. It cannot escape to a provider from here: the resolver
+    // strips the key on a hit, refuses on a miss, and the native
+    // byte-forward bypass is already unavailable to a body that carried
+    // one, because `prompt` is absent from
+    // `native_request_is_losslessly_governable`'s allowlist.
+    if let Some(reference) = &lifted_prompt_reference {
+        let reference = reference.clone();
+        if let Some(object) = body.as_object_mut() {
+            object.insert("prompt".to_string(), serde_json::Value::String(reference));
+        }
+    }
+
     // Native bypass may only reuse the original client bytes while every
     // content-bearing field still matches this post-parse baseline. Keep the
     // snapshot only for the one native surface that can currently bypass.
@@ -7017,14 +7236,21 @@ pub(super) async fn handle_ai_proxy(
     // library API at sbproxy_ai::prompts) shadows config so an
     // operator can mint or pin a prompt at runtime without a full
     // config reload. A miss on both layers leaves the prompt field
-    // untouched (the request proceeds with no synthesized system
-    // message, same as today's "no `prompt` field" path).
+    // untouched on the canonical chat path (the request proceeds with
+    // no synthesized system message, same as today's "no `prompt`
+    // field" path). WOR-2597: a miss on a reference lifted off a
+    // NATIVE inbound body is a 404 instead, because `prompt` is not a
+    // field of those wire formats and forwarding it would ship a
+    // gateway-only key upstream. See the `None` arms below.
     //
     // The Responses-surface OBJECT form (`"prompt": {"id", ...}`) is
     // bridged earlier, before the inbound shim translated the body to
     // this canonical shape (WOR-2514); by this point a bridged request
     // carries its rendered template in `instructions` and no `prompt`
-    // field at all.
+    // field at all. The STRING form on either native surface is lifted
+    // by `lift_gateway_prompt_reference` at that same shim and put back
+    // on this body after the parse, which is how it reaches this block
+    // at all (WOR-2597).
     if let Some(reference) = body
         .get("prompt")
         .and_then(|v| v.as_str())
@@ -7040,24 +7266,54 @@ pub(super) async fn handle_ai_proxy(
                     .as_ref()
                     .map(|store| store.render(&reference, &request_ctx))
             });
-        if let Some(outcome) = result {
-            match outcome {
-                Ok(rendered) => {
-                    prepend_system_message(&mut body, &rendered.text);
-                    ctx.ai_prompt_name = Some(rendered.name);
-                    ctx.ai_prompt_version = Some(rendered.version);
-                    // Drop the gateway-only `prompt` field so it is not
-                    // forwarded to the provider.
-                    if let Some(obj) = body.as_object_mut() {
-                        obj.remove("prompt");
-                    }
-                }
-                Err(e) => {
-                    warn!(reference = %reference, error = %e, "AI proxy: prompt render failed");
-                    send_error(session, 400, &format!("prompt error: {e}")).await?;
-                    return Ok(());
+        match result {
+            Some(Ok(rendered)) => {
+                prepend_system_message(&mut body, &rendered.text);
+                ctx.ai_prompt_name = Some(rendered.name);
+                ctx.ai_prompt_version = Some(rendered.version);
+                // Drop the gateway-only `prompt` field so it is not
+                // forwarded to the provider.
+                if let Some(obj) = body.as_object_mut() {
+                    obj.remove("prompt");
                 }
             }
+            Some(Err(e)) => {
+                record_ai_admission_refusal(ctx, surface_label, "prompt_render_failed");
+                warn!(
+                    reference = %prompt_reference_for_log(&reference),
+                    error = %e,
+                    "AI proxy: prompt render failed"
+                );
+                send_error(session, 400, &format!("prompt error: {e}")).await?;
+                return Ok(());
+            }
+            // A miss on both layers. On the canonical chat path this
+            // stays a pass-through: `prompt` is a legacy completions
+            // field there, an origin may have no `prompts:` block at
+            // all, and a provider that understands the field has every
+            // right to receive it. WOR-2597: on a native inbound
+            // surface it cannot be either of those things. `prompt` is
+            // not a field of the Anthropic Messages or OpenAI Responses
+            // wire format, so a caller who sent one meant this
+            // gateway's store, and forwarding the key to the provider
+            // would ship a gateway-only field upstream while running
+            // the request without the template it named. Refuse, and
+            // strip the key on the way out so no later path can
+            // forward it.
+            None if lifted_prompt_reference.is_some() => {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.remove("prompt");
+                }
+                record_ai_admission_refusal(ctx, surface_label, "prompt_reference_not_found");
+                warn!(
+                    reference = %prompt_reference_for_log(&reference),
+                    surface = surface_label,
+                    "AI proxy: stored prompt reference not found on a native inbound surface"
+                );
+                send_error(session, 404, "prompt error: unknown prompt reference").await?;
+                return Ok(());
+            }
+            None => {}
         }
     }
 
@@ -7067,6 +7323,29 @@ pub(super) async fn handle_ai_proxy(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+
+    // WOR-2531: the origin's `default_model` applies here, at the one
+    // seam every downstream plane reads its model from, and not at the
+    // per-provider dispatch arms thousands of lines below. Every gate
+    // between here and the wire (`is_model_allowed`, the virtual-key
+    // model gate, model-scoped budgets, provider eligibility, the
+    // compression runtime) short-circuits on an empty model, so a
+    // default applied any later would leave them all skipped for
+    // exactly the requests it was meant to name a model for.
+    //
+    // Gated on the surface, because this seam is shared with every other
+    // JSON surface the AI path serves. `default_model` is a chat model;
+    // `/v1/moderations` and `/v1/images/generations` also reach here with
+    // an optional `model` they default provider-side from their own
+    // vocabulary, and writing a chat model into one of those bodies would
+    // break a request that works today. See
+    // `surface_takes_the_origin_default_model`.
+    if model.is_empty() && surface_takes_the_origin_default_model(surface_label) {
+        if let Some(default_model) = unambiguous_default_model(config) {
+            model = default_model;
+            set_body_model(&mut body, &model);
+        }
+    }
 
     // A governed key's route override defines the effective model for this
     // request. Update both representations before any model gate, budget,
@@ -11755,6 +12034,84 @@ fn record_ai_failure_decision(
     );
 }
 
+/// Record `ai.admission` on the decision family, the AI admission
+/// counter, and, when enabled, the audit feed (WOR-2595).
+///
+/// The funnel behind the five refusals the AI dispatch path can take
+/// before any provider is chosen: the three arms of the inbound
+/// native-format shim (the Anthropic Messages translate, the Responses
+/// stored-prompt bridge, and the Responses translate) and the two
+/// refusal arms of the shared stored-prompt resolver (a render failure,
+/// and a reference lifted off a native body that no prompt layer holds).
+/// Before it, an MCP-governance-bypass attempt (`tools: [{"type":
+/// "mcp", ...}]` on `/v1/responses`) produced one free-text warn and a
+/// bare 400, which is metrically and forensically indistinguishable
+/// from a typo'd JSON body.
+///
+/// **What this cannot see.** Only those five. A request refused later
+/// by the model allow/block gate, a virtual-key policy, a guardrail, a
+/// budget, a rate limiter, or a CEL/Rego policy is that plane's
+/// decision and publishes under that plane's own event; none of them
+/// route through here. On the canonical `/v1/chat/completions` path
+/// there is no inbound shim, so the only refusal that reaches this
+/// funnel from there is a stored-prompt render failure.
+/// `docs/events.md` states the same boundary for operators.
+///
+/// `reason` is a `&'static str` from [`sbproxy_ai::format::ChatError::reason`]
+/// and never the error's message: several of the coded refusals
+/// interpolate caller bytes into the message (a serde parse error, an
+/// unrecognized role name), and both the metric label and
+/// `DecisionDetails` ship unscrubbed. The message reaches the client and
+/// the audit record's scrubbed `reason` prose, and nowhere else.
+fn record_ai_admission_refusal(ctx: &RequestContext, surface: &str, reason: &'static str) {
+    use sbproxy_observe::decision::{
+        DecisionDetails, DecisionEngine, DecisionEvent, DecisionOutcome,
+    };
+
+    sbproxy_ai::ai_metrics::record_admission_decision(surface, reason, "deny");
+
+    let origin_id = ctx
+        .origin_idx
+        .and_then(|idx| ctx.pipeline.config.origins.get(idx))
+        .map(|origin| origin.origin_id.to_string());
+    let origin_for_family = origin_id.as_deref().unwrap_or("__unmatched__");
+    sbproxy_observe::decision::record_decision(
+        DecisionEvent::AiAdmission,
+        DecisionEngine::BuiltIn,
+        DecisionOutcome::Deny,
+        origin_for_family,
+        &ctx.tenant_id,
+    );
+
+    let Some(origin_id) = origin_id else {
+        return;
+    };
+    if !crate::server::proxy_http::audit_publishes(
+        &ctx.pipeline,
+        DecisionEvent::AiAdmission,
+        Some(&ctx.tenant_id),
+        Some(&origin_id),
+    ) {
+        return;
+    }
+    // Prose built from the two bounded codes only, for the same reason
+    // the detail fields are: this string is scrubbed on the way into the
+    // record, but scrubbing is a redaction pass over operator-configured
+    // patterns, not a guarantee about an arbitrary parse error.
+    let audit_reason = format!("{surface} surface refused the request before dispatch: {reason}");
+    crate::policy_bus::emit_decision_audit_detailed(
+        DecisionEvent::AiAdmission,
+        DecisionEngine::BuiltIn,
+        DecisionOutcome::Deny,
+        &ctx.request_id,
+        &origin_id,
+        &origin_id,
+        &ctx.tenant_id,
+        &audit_reason,
+        DecisionDetails::ai_admission(surface, reason),
+    );
+}
+
 /// Record `ai.close` on the decision family and, when enabled, the
 /// audit feed (WOR-2486).
 ///
@@ -15818,6 +16175,75 @@ fn prepend_responses_instructions(body: &mut serde_json::Value, text: &str) {
         "instructions".to_string(),
         serde_json::Value::String(merged),
     );
+}
+
+/// Lift a gateway-only string `prompt` reference out of a native
+/// inbound body, returning the body without it and the reference.
+///
+/// `"prompt": "name@version"` is this gateway's stored-prompt reference,
+/// not a field of the Anthropic Messages or OpenAI Responses wire
+/// formats. Both native translators therefore drop it: the Anthropic
+/// catch-all notes `anthropic.prompt`, the Responses translator notes
+/// `responses.prompt`, and the shared resolver downstream reads the
+/// ALREADY-TRANSLATED canonical body, where the field no longer exists.
+/// A `prompts:` origin plus a `/v1/messages` request naming a stored
+/// prompt therefore ran without the template it asked for, which is
+/// silent context loss.
+///
+/// Lifting the reference before translation and re-inserting it into
+/// the translated body puts it where the resolver looks, without
+/// teaching the hub about a field no provider accepts. `HubRequest`
+/// gains nothing, `REPRESENTED_TOP_LEVEL_KEYS` gains nothing, and the
+/// native-bypass allowlist gains nothing, so the lossless-bypass path
+/// stays disabled for a body carrying this key.
+///
+/// Only a string is lifted. An object-valued `prompt` is the Responses
+/// stored-prompt OBJECT form, bridged separately and refused by the
+/// translator if it was not; any other type keeps its note-and-drop
+/// behavior. A body that is not a JSON object, or whose reserialization
+/// fails, is returned untouched with `None`, so a failure here can only
+/// leave the pre-existing behavior rather than invent a new one.
+/// A stored-prompt reference, bounded for a log field.
+///
+/// The reference is caller bytes taken straight off the request body,
+/// and both refusal arms below name it in a `warn!`. A `name@version`
+/// is tens of characters; nothing stops a client sending the whole body
+/// budget as one string, and a request that costs the caller one POST
+/// should not cost the operator a megabyte of log. The value is
+/// truncated for the log only; resolution still sees it whole, so a
+/// long legitimate name resolves normally.
+fn prompt_reference_for_log(reference: &str) -> std::borrow::Cow<'_, str> {
+    /// Comfortably past any plausible `name@version` and short enough
+    /// that a flood of refusals cannot outrun log rotation.
+    const MAX_LOGGED_REFERENCE_BYTES: usize = 256;
+    sbproxy_util::truncate_utf8_with_marker(reference, MAX_LOGGED_REFERENCE_BYTES, "...[truncated]")
+}
+
+fn lift_gateway_prompt_reference(bytes: &bytes::Bytes) -> (bytes::Bytes, Option<String>) {
+    // Same byte scan the Responses object bridge uses: it keeps the
+    // extra JSON parse off bodies that cannot carry the field, and a
+    // false positive costs only the parse.
+    if !bytes.as_ref().windows(8).any(|w| w == b"\"prompt\"") {
+        return (bytes.clone(), None);
+    }
+    let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(bytes.as_ref()) else {
+        return (bytes.clone(), None);
+    };
+    let Some(object) = parsed.as_object_mut() else {
+        return (bytes.clone(), None);
+    };
+    let Some(reference) = object
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+    else {
+        return (bytes.clone(), None);
+    };
+    object.remove("prompt");
+    match serde_json::to_vec(&parsed) {
+        Ok(rewritten) => (bytes::Bytes::from(rewritten), Some(reference)),
+        Err(_) => (bytes.clone(), None),
+    }
 }
 
 /// WOR-2514: bridge an object-valued Responses `prompt` onto the
@@ -21537,6 +21963,461 @@ origins:
         );
         assert_eq!(chat_hits.load(Ordering::SeqCst), 0);
     }
+
+    // Dispatch-seam tests for the origin default model and the
+    // pre-provider admission record. They sit in this module rather than
+    // beside the error-classification unit tests because they drive real
+    // requests through `handle_ai_proxy`, and the session, upstream, and
+    // proxy-config fixtures that needs are declared here.
+
+    /// WOR-2531: red first, and red on the security half rather than on
+    /// the rule.
+    ///
+    /// `handle_ai_proxy` read `body["model"]` and substituted the EMPTY
+    /// STRING when the request omitted it, and `default_model` appeared
+    /// nowhere in this file. Empty is not a harmless placeholder: the
+    /// model allow/block gate is `if !model.is_empty() &&
+    /// !config.is_model_allowed(&model)`, so a request that omitted
+    /// `model` walked past a `blocked_models` entry naming the very
+    /// model the origin would have used, and reached the provider. On
+    /// main this test sees a 200 and one upstream hit.
+    #[tokio::test]
+    async fn an_omitted_model_takes_the_origin_default_and_faces_the_block_list() {
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"id":"chatcmpl-1"}"#).await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "default_model": "retired-model"
+            }],
+            "blocked_models": ["retired-model"]
+        }))
+        .expect("default-model proxy config");
+
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the blocked default model is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 403"),
+            "the origin's default model is blocked, so the gate must refuse: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            0,
+            "a blocked model must not reach the provider"
+        );
+    }
+
+    /// The positive half: with nothing blocking it, the origin's default
+    /// becomes the request's model everywhere downstream, which is what
+    /// puts a value on the access log, the span, and the model-scoped
+    /// budget key that previously carried none.
+    #[tokio::test]
+    async fn an_omitted_model_takes_the_origin_default_on_the_wire() {
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"id":"chatcmpl-1"}"#).await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "default_model": "gpt-4o"
+            }]
+        }))
+        .expect("default-model proxy config");
+
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the defaulted request is dispatched");
+        drop(session);
+        let _ = live_downstream_body(client).await;
+
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            context.ai_logical_model.as_deref(),
+            Some("gpt-4o"),
+            "the model every downstream plane reads was the empty string before WOR-2531"
+        );
+    }
+
+    /// The boundary the fallback must not cross: two enabled providers
+    /// naming different defaults leave the request modelless, exactly as
+    /// before, rather than routing it to whichever one is listed first.
+    #[tokio::test]
+    async fn disagreeing_defaults_leave_the_request_modelless() {
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"id":"chatcmpl-1"}"#).await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "default_model": "gpt-4o"
+            }, {
+                "name": "second",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "default_model": "gpt-4o-mini"
+            }]
+        }))
+        .expect("ambiguous default-model proxy config");
+
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the ambiguous request is dispatched unchanged");
+        drop(session);
+        let _ = live_downstream_body(client).await;
+
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            context.ai_logical_model, None,
+            "an ambiguous origin must not pick a default for the operator"
+        );
+    }
+
+    /// One `sbproxy_ai_admission_decisions_total` series, or 0 when
+    /// nothing has created it yet.
+    ///
+    /// `prometheus::gather()` reads a process-global registry and the
+    /// sibling tests in this module can run in the same process, so
+    /// callers assert a strict increase rather than an exact value.
+    fn admission_decisions_count(surface: &str, reason: &str) -> f64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "sbproxy_ai_admission_decisions_total")
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        let labelled = |name: &str, want: &str| {
+                            metric
+                                .get_label()
+                                .iter()
+                                .any(|label| label.name() == name && label.value() == want)
+                        };
+                        labelled("surface", surface)
+                            && labelled("reason", reason)
+                            && labelled("outcome", "deny")
+                    })
+                    .map(|metric| metric.get_counter().value())
+                    .sum()
+            })
+            .unwrap_or_default()
+    }
+
+    /// WOR-2595: red first, at the dispatch seam rather than at the
+    /// funnel.
+    ///
+    /// Before this wiring the whole handling of a Responses-shim refusal
+    /// was `warn!` plus `send_error`: no `record_decision`, no audit
+    /// record, and no counter. An MCP-governance-bypass attempt was
+    /// therefore indistinguishable in metrics from a typo'd JSON body,
+    /// both landing on `record_ai_gateway_decision("rejected",
+    /// "client_error")`. This drives a real `POST /v1/responses` through
+    /// `handle_ai_proxy` so it fails if the shim's refusal arm stops
+    /// calling the funnel, not merely if the funnel itself breaks. On
+    /// main the counter family does not exist and the first assertion
+    /// reads 0 against 0.
+    #[tokio::test]
+    async fn responses_mcp_tool_refusal_counts_an_ai_admission_deny() {
+        let config = openai_proxy_config("http://127.0.0.1:9");
+        let request = serde_json::json!({
+            "model": "requested-model",
+            "input": "fixture prompt",
+            "tools": [{
+                "type": "mcp",
+                "server_url": "https://evil.invalid/?token=SECRETTOKEN",
+                "server_label": "internal"
+            }]
+        });
+        let (mut session, client) = downstream_bytes_session(
+            "/v1/responses",
+            "application/json",
+            serde_json::to_vec(&request).expect("request JSON"),
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let before = admission_decisions_count("responses", "tools_mcp_unsupported");
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the MCP tool refusal is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 400"), "{response:?}");
+        assert!(
+            admission_decisions_count("responses", "tools_mcp_unsupported") >= before + 1.0,
+            "the refusal must tick sbproxy_ai_admission_decisions_total\
+             {{surface=\"responses\",reason=\"tools_mcp_unsupported\",outcome=\"deny\"}}"
+        );
+        // The refusal message names the governed alternative and nothing
+        // the caller sent; the URL can carry a credential.
+        let rendered = String::from_utf8_lossy(&response);
+        assert!(
+            !rendered.contains("SECRETTOKEN") && !rendered.contains("server_url"),
+            "the refusal must not echo the caller's MCP server URL: {rendered}"
+        );
+        assert_eq!(
+            context.admin_ai_attempts, 0,
+            "a refused request never reaches a provider"
+        );
+    }
+
+    /// The audit half of the pair above: with `ai.admission` enabled the
+    /// same refusal publishes exactly one typed record, and the record
+    /// carries the bounded surface and reason codes rather than the
+    /// refusal prose.
+    #[tokio::test]
+    async fn responses_mcp_tool_refusal_publishes_ai_admission_when_enabled() {
+        let compiled = sbproxy_config::compile_config(
+            r#"
+proxy:
+  tenants:
+    - id: acme
+  observability:
+    log:
+      decision_audit:
+        enabled: false
+        events:
+          ai.admission: true
+origins:
+  "ai.test":
+    tenant_id: acme
+    action:
+      type: static
+      body: ok
+"#,
+        )
+        .expect("ai.admission fixture config");
+        let pipeline = std::sync::Arc::new(
+            crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+                .expect("ai.admission fixture pipeline"),
+        );
+
+        let config = openai_proxy_config("http://127.0.0.1:9");
+        let request = serde_json::json!({
+            "model": "requested-model",
+            "input": "fixture prompt",
+            "tools": [{
+                "type": "mcp",
+                "server_url": "https://evil.invalid/?token=SECRETTOKEN"
+            }]
+        });
+        let (mut session, client) = downstream_bytes_session(
+            "/v1/responses",
+            "application/json",
+            serde_json::to_vec(&request).expect("request JSON"),
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        context.pipeline = std::sync::Arc::clone(&pipeline);
+        context.origin_idx = Some(0);
+        context.tenant_id = "acme".into();
+        context.request_id = "req-ai-admission".into();
+
+        let (bus, mut rx) = crate::policy_bus::channel(16);
+        crate::policy_bus::init_global_bus(bus);
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            pipeline.as_ref(),
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("the MCP tool refusal is handled");
+        drop(session);
+        let _ = live_downstream_body(client).await;
+
+        let mut ours = Vec::new();
+        while let Ok(record) = rx.try_recv() {
+            if let crate::policy_bus::AuditRecord::Decision(audit) = record {
+                if audit.request_id == "req-ai-admission" {
+                    ours.push(audit);
+                }
+            }
+        }
+        assert_eq!(
+            ours.len(),
+            1,
+            "the refusal returns immediately, so it publishes exactly one record"
+        );
+        let audit = &ours[0];
+        assert_eq!(
+            audit.event,
+            sbproxy_observe::decision::DecisionEvent::AiAdmission
+        );
+        assert_eq!(
+            audit.outcome,
+            sbproxy_observe::decision::DecisionOutcome::Deny
+        );
+        assert_eq!(audit.origin, "ai.test");
+        assert_eq!(audit.tenant, "acme");
+        assert_eq!(audit.details.surface.as_deref(), Some("responses"));
+        assert_eq!(
+            audit.details.verdict.as_deref(),
+            Some("tools_mcp_unsupported")
+        );
+        let rendered = audit.to_ocsf().to_string();
+        assert!(
+            !rendered.contains("SECRETTOKEN") && !rendered.contains("server_url"),
+            "details ship unscrubbed, so the record must carry codes only: {rendered}"
+        );
+    }
+
+    /// The negative case: a request the shim admits with a lossiness
+    /// note must publish no `ai.admission` record at all.
+    ///
+    /// An unsupported non-`mcp` tool block is dropped and counted on
+    /// `sbproxy_ai_translation_dropped_total`, not refused. A guard that
+    /// counted this as an admission denial would report a refusal rate
+    /// that no client ever saw a 400 for.
+    #[tokio::test]
+    async fn an_admitted_lossy_responses_request_publishes_no_ai_admission() {
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture(
+            serde_json::to_vec(&serde_json::json!({
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }]
+            }))
+            .expect("upstream JSON"),
+            "application/json",
+        )
+        .await;
+        let compiled = sbproxy_config::compile_config(
+            r#"
+proxy:
+  observability:
+    log:
+      decision_audit:
+        enabled: true
+origins:
+  "ai.test":
+    action:
+      type: static
+      body: ok
+"#,
+        )
+        .expect("ai.admission negative fixture config");
+        let pipeline = std::sync::Arc::new(
+            crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+                .expect("ai.admission negative fixture pipeline"),
+        );
+
+        let config = openai_proxy_config(&upstream_url);
+        let request = serde_json::json!({
+            "model": "requested-model",
+            "input": "fixture prompt",
+            "tools": [{"type": "web_search_preview"}]
+        });
+        let (mut session, client) = downstream_bytes_session(
+            "/v1/responses",
+            "application/json",
+            serde_json::to_vec(&request).expect("request JSON"),
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        context.pipeline = std::sync::Arc::clone(&pipeline);
+        context.origin_idx = Some(0);
+        context.request_id = "req-ai-admission-lossy".into();
+
+        let (bus, mut rx) = crate::policy_bus::channel(16);
+        crate::policy_bus::init_global_bus(bus);
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            pipeline.as_ref(),
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("the lossy request is admitted");
+        drop(session);
+        let _ = live_downstream_body(client).await;
+
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            1,
+            "the request was admitted, so it reached the provider"
+        );
+        while let Ok(record) = rx.try_recv() {
+            if let crate::policy_bus::AuditRecord::Decision(audit) = record {
+                assert!(
+                    !(audit.request_id == "req-ai-admission-lossy"
+                        && audit.event == sbproxy_observe::decision::DecisionEvent::AiAdmission),
+                    "a dropped-with-a-note field is lossiness, not an admission denial"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -21583,6 +22464,22 @@ fn ai_management_response(
 /// `/model_group/info`, and the `/health[/readiness|/liveliness|/liveness]`
 /// aliases. Returns `None` for any other path so the caller falls through to
 /// normal handling.
+///
+/// WOR-2647: the two model surfaces carry the same `capabilities` array
+/// `/v1/models` does, from the same
+/// [`sbproxy_ai::api_routes::surface_capability_names`]. Three places
+/// that publish per-model facts and derive them three ways is how one of
+/// them goes stale; one derivation is what keeps a listing from
+/// advertising a surface the request path refuses.
+///
+/// A `/model_group/info` group is the union across its deployments,
+/// matching the 501 gate, which admits a surface when any eligible
+/// provider handles it. Each deployment's array is already a subset of
+/// that gate, so the union is too.
+/// `model_group_info_unions_capabilities_across_deployments` pins the
+/// union against last-wins with two entries whose arrays are disjoint;
+/// a fixture of two openai deployments cannot, because both operands
+/// are equal.
 fn ai_management_response_with_policy(
     path: &str,
     config: &sbproxy_ai::handler::AiHandlerConfig,
@@ -21612,6 +22509,7 @@ fn ai_management_response_with_policy(
                     .provider_type
                     .clone()
                     .unwrap_or_else(|| p.name.to_string());
+                let capabilities = sbproxy_ai::api_routes::surface_capability_names(p);
                 for m in p
                     .models
                     .iter()
@@ -21620,37 +22518,40 @@ fn ai_management_response_with_policy(
                     data.push(serde_json::json!({
                         "model_name": m.as_str(),
                         "litellm_provider": provider,
+                        "capabilities": &capabilities,
                     }));
                 }
             }
             Some(serde_json::json!({ "data": data }))
         }
         "/model_group/info" => {
-            use std::collections::BTreeMap;
-            let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            use std::collections::{BTreeMap, BTreeSet};
+            type Group = (Vec<String>, BTreeSet<&'static str>);
+            let mut groups: BTreeMap<String, Group> = BTreeMap::new();
             for p in config
                 .providers
                 .iter()
                 .filter(|provider| provider_allowed(provider))
             {
+                let capabilities = sbproxy_ai::api_routes::surface_capability_names(p);
                 for m in p
                     .models
                     .iter()
                     .filter(|model| model_allowed(model.as_str()))
                 {
-                    groups
-                        .entry(m.as_str().to_string())
-                        .or_default()
-                        .push(p.name.to_string());
+                    let group = groups.entry(m.as_str().to_string()).or_default();
+                    group.0.push(p.name.to_string());
+                    group.1.extend(capabilities.iter().copied());
                 }
             }
             let data: Vec<_> = groups
                 .into_iter()
-                .map(|(model_group, providers)| {
+                .map(|(model_group, (providers, capabilities))| {
                     serde_json::json!({
                         "model_group": model_group,
                         "num_deployments": providers.len(),
                         "providers": providers,
+                        "capabilities": capabilities,
                     })
                 })
                 .collect();
@@ -22131,7 +23032,11 @@ mod model_routing_tests {
             resp["data"],
             serde_json::json!([{
                 "model_name": "claude-haiku-4-5",
-                "litellm_provider": "anthropic"
+                "litellm_provider": "anthropic",
+                // WOR-2647: the same array `/v1/models` publishes, from
+                // the surface matrix the dispatch path enforces. No
+                // `embeddings`: anthropic's non-universal surfaces 501.
+                "capabilities": ["chat_completions", "messages", "responses", "streaming"]
             }])
         );
     }
@@ -22159,7 +23064,54 @@ mod model_routing_tests {
             serde_json::json!([{
                 "model_group": "claude-haiku-4-5",
                 "num_deployments": 1,
-                "providers": ["anthropic"]
+                "providers": ["anthropic"],
+                // WOR-2647: union across the group's deployments, which
+                // is one anthropic entry here.
+                "capabilities": ["chat_completions", "messages", "responses", "streaming"]
+            }])
+        );
+    }
+
+    /// WOR-2647: a group's array is the union across its deployments,
+    /// not whichever one the loop visited last.
+    ///
+    /// The two entries are chosen to be disjoint so the union is
+    /// neither of them: `voyage` is embeddings-only (`supports_chat:
+    /// false`, so no chat, messages, responses or streaming) and
+    /// `anthropic` serves the chat surfaces and no embeddings.
+    /// Replacing the `extend` with an assignment fails here; a
+    /// two-openai fixture would not, because both operands are equal.
+    #[test]
+    fn model_group_info_unions_capabilities_across_deployments() {
+        let cfg: sbproxy_ai::handler::AiHandlerConfig = serde_json::from_value(serde_json::json!({
+            "providers": [
+                {"name": "embedder", "api_key": "k", "provider_type": "voyage", "models": ["shared"]},
+                {"name": "chat", "api_key": "k", "provider_type": "anthropic", "models": ["shared"]}
+            ]
+        }))
+        .expect("AiHandlerConfig fixture");
+
+        // Each deployment on its own, so the union below is visibly
+        // wider than either operand rather than asserted in a vacuum.
+        assert_eq!(
+            sbproxy_ai::api_routes::surface_capability_names(&cfg.providers[0]),
+            ["embeddings"]
+        );
+        assert_eq!(
+            sbproxy_ai::api_routes::surface_capability_names(&cfg.providers[1]),
+            ["chat_completions", "messages", "responses", "streaming"]
+        );
+
+        let resp = super::ai_management_response("/model_group/info", &cfg).unwrap();
+        assert_eq!(
+            resp["data"],
+            serde_json::json!([{
+                "model_group": "shared",
+                "num_deployments": 2,
+                "providers": ["embedder", "chat"],
+                "capabilities": [
+                    "chat_completions", "embeddings", "messages", "responses", "streaming"
+                ]
             }])
         );
     }

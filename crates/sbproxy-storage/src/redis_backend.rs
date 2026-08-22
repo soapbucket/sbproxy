@@ -279,12 +279,36 @@ impl EphemeralKv for RedisStore {
         observe_op("put", BACKEND, "ephemeral", async {
             check_key(key)?;
             check_value(&value)?;
-            // SET key value EX ttl. We pin a minimum of 1s since
-            // Redis SETEX rejects 0; Duration::ZERO is treated as
-            // "evict immediately on next access" via a 1s lower bound,
-            // which matches the practical semantics callers want and
-            // avoids a hard error.
-            let ttl_secs = ttl.as_secs().max(1);
+            // Refused before the connection is opened, so the refusal
+            // is provable without a live Redis.
+            //
+            // This used to clamp anything under a second up to one
+            // second. SETEX rejects 0 outright and counts in whole
+            // seconds, so the clamp made a record outlive the TTL its
+            // caller asked for, which is the one thing EphemeralKv
+            // promises never happens, while MockEphemeralKv kept the
+            // whole Duration and expired it on time. No shipped caller
+            // hits it today: the only consumer is the mesh backend and
+            // it counts in whole seconds. This closes the contract
+            // before a single-use nonce or PKCE verifier arrives and
+            // becomes replayable here but not under test.
+            //
+            // Refusing is the only truthful answer this backend has.
+            // SET ... PX would buy millisecond granularity but zero is
+            // still not expressible, and silently shortening a TTL is a
+            // different lie.
+            //
+            // Reach of this check: whole-second TTLs are untouched, so
+            // it can only fire on a caller that asked for a lifetime
+            // Redis cannot count.
+            if ttl < Duration::from_secs(1) {
+                return Err(StorageError::InvalidConfig(
+                    "ephemeral put ttl must be at least 1s; redis expiry is whole seconds".into(),
+                ));
+            }
+            // SET key value EX ttl. Truncation from here on can only
+            // shorten a TTL, which the trait allows.
+            let ttl_secs = ttl.as_secs();
             let full = self.key_for(key);
             let mut conn = self.connection().await?;
             // `set_ex` is the typed wrapper for SET ... EX.
@@ -886,6 +910,57 @@ mod tests {
         let store = RedisStore::new("redis://user:supersecret@127.0.0.1:6379/0", "ws").unwrap();
         let dbg = format!("{store:?}");
         assert!(!dbg.contains("supersecret"), "Debug must not leak password");
+    }
+
+    // --- TTL contract (no live Redis) ---
+
+    /// A TTL this backend cannot count is refused before it dials, so
+    /// the refusal is the same with Redis up or down.
+    ///
+    /// Port 1 is closed, so any TTL that reaches the connection comes
+    /// back `Disconnected` or `Backend`. `InvalidConfig` therefore
+    /// proves the check ran ahead of `connection()`, which is what makes
+    /// the contract testable in CI at all: every behavioral test in this
+    /// file is `#[ignore]` behind `STORAGE_TEST_REDIS_URL`.
+    #[tokio::test]
+    async fn put_refuses_a_ttl_redis_cannot_count_before_connecting() {
+        let store = RedisStore::new("redis://127.0.0.1:1/0", "ws").expect("URL parses");
+        let refused = [
+            Duration::ZERO,
+            Duration::from_millis(1),
+            Duration::from_millis(999),
+        ];
+        for ttl in refused {
+            let err = EphemeralKv::put(&store, "k", Bytes::from_static(b"v"), ttl)
+                .await
+                .expect_err("a sub-second ttl is refused");
+            assert!(
+                matches!(err, StorageError::InvalidConfig(_)),
+                "ttl {ttl:?} should be refused as InvalidConfig, got {err:?}"
+            );
+        }
+    }
+
+    /// The refusal stops exactly at one second. Anything above it is a
+    /// TTL Redis can express, so it must reach the connection and fail
+    /// there instead, or this guard would be quietly refusing valid
+    /// writes.
+    #[tokio::test]
+    async fn put_lets_a_whole_second_ttl_through_to_the_connection() {
+        let store = RedisStore::new("redis://127.0.0.1:1/0", "ws").expect("URL parses");
+        let ttl = Duration::from_secs(1);
+        let put = EphemeralKv::put(&store, "k", Bytes::from_static(b"v"), ttl);
+        // Bounded so a host that black-holes port 1 rather than refusing
+        // it does not hang the suite. Either way, taking any time at all
+        // out there is itself the proof that the ttl check let this past.
+        match tokio::time::timeout(Duration::from_secs(5), put).await {
+            Err(_) => {}
+            Ok(Err(err)) => assert!(
+                !matches!(err, StorageError::InvalidConfig(_)),
+                "a one-second ttl must not be refused by the ttl check, got {err:?}"
+            ),
+            Ok(Ok(())) => panic!("nothing should be listening on 127.0.0.1:1"),
+        }
     }
 
     // --- Live tests, opt-in via env var ---

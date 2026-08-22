@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-21*
 
-SBproxy hands a SIEM three different things, and this page is the map of how they fit together: typed proxy events (the `events:` block, a closed set of eighteen), decision-audit records (`observability.log.decision_audit`, eighteen pipeline decisions normalized to OCSF), and four audit channels that write to their own tracing targets (`security_audit`, `config_audit`, `key_audit`, and the admin action ring). Two of those four, `security_audit` and `config_audit`, can additionally be hash-chained and Ed25519-signed for tamper evidence.
+SBproxy hands a SIEM three different things, and this page is the map of how they fit together: typed proxy events (the `events:` block, a closed set of eighteen), decision-audit records (`observability.log.decision_audit`, nineteen pipeline decisions normalized to OCSF), and four audit channels that write to their own tracing targets (`security_audit`, `config_audit`, `key_audit`, and the admin action ring). Two of those four, `security_audit` and `config_audit`, can additionally be hash-chained and Ed25519-signed for tamper evidence.
 
 If you only read one section, read [How the four audit channels relate to the event stream](#how-the-four-audit-channels-relate-to-the-event-stream). It is the piece that is easy to miss: `events:` is a delivery mechanism, not a source of truth, and most of what it delivers is a typed copy of a record another channel already produced.
 
@@ -74,15 +74,15 @@ Four of the sixteen wired events are worth being explicit about, because "wired"
 - **`guardrail_triggered`** fires once per guardrail evaluation stage (input, RAG-augmented input, or output) that ends in a block, never per streamed chunk and never on an allow. The data carries `stage`, `guardrail` (which one blocked), `flagged_count` (how many others flagged without blocking), `spans`, and `spans_dropped`. The span fields are populated on a `pii` block: each span is an entity type plus a byte offset and length into the scanned text (positions, never the matched value), capped at 32 with `spans_dropped` counting anything past the cap; every other guardrail publishes them empty. See [observability.md](observability.md#decision-audit-records) for which text the offsets index on each stage.
 - **`credential_resolved`** fires once per actual resolution of an upstream credential's material (an envelope opened, a vault reference dereferenced, or a plaintext record read), never on the per-request cache hit. The data carries `op`, `resource`, `id`, `outcome` (`resolved` or `stale_served`), and, on a fresh resolution only, `source` (`plaintext`, `envelope`, or `vault_ref`). A `stale_served` event is the one worth an alert rule: it means the secret backend was unreachable and the credential kept working from the last known-good value. It fires **once per outage, not once per request in the grace window**: the grace path deliberately does not refresh the cached value's timestamp (a refresh would make it look fresh and cancel the grace deadline), so every request for the length of the window retries and falls back, and only the transition into stale serving publishes. The next successful resolution arms the next one. If you want the per-request count, `sbproxy_credential_resolution_duration_seconds{cache="stale"}` has it as a rate, which is the shape an alert wants anyway. A resolution *refusal* publishes nothing here; the request that needed it is refused, and that refusal is carried by the request-side channels.
 
-## Decision-audit: the other eighteen
+## Decision-audit: the other nineteen
 
 Most of the eighteen typed proxy events map onto request lifecycle and infrastructure facts. The gateway's actual security decisions, "did the WAF block this," "did the AI guardrail block this," "did this MCP tool dispatch succeed," live on a separate, wider channel: `DecisionEvent`, configured under `proxy.observability.log.decision_audit` and documented in full in [observability.md](observability.md#decision-audit-records) and the generated [decision-records.md](decision-records.md).
 
 The short version, because this page is where the two channels need to be told apart:
 
-- **Eighteen named decision points.** `auth`, `policy`, `rate_limit`, `waf`, `cache.key`, `cache.admit`, `route.decide`, `ai.guardrail.input`, `ai.guardrail.output`, `ai.tool_call`, `ai.stream.event`, `ai.close`, `ai.failure`, `transform`, `action`, `log.custom_field`, `mcp.tool`, `payment.lifecycle`.
+- **Nineteen named decision points.** `auth`, `policy`, `rate_limit`, `waf`, `cache.key`, `cache.admit`, `route.decide`, `ai.guardrail.input`, `ai.guardrail.output`, `ai.tool_call`, `ai.stream.event`, `ai.close`, `ai.failure`, `ai.admission`, `transform`, `action`, `log.custom_field`, `mcp.tool`, `payment.lifecycle`.
 - **Six coverage states**, because "wired or not" turned out to be the wrong question for at least four of these:
-  - *Emitted*: publishes its own record. As of this sweep that is `auth`, `cache.key`, `cache.admit`, `route.decide`, `ai.guardrail.input`, `ai.guardrail.output`, `ai.tool_call`, `ai.close`, `ai.failure`, and `mcp.tool`.
+  - *Emitted*: publishes its own record. As of this sweep that is `auth`, `cache.key`, `cache.admit`, `route.decide`, `ai.guardrail.input`, `ai.guardrail.output`, `ai.tool_call`, `ai.close`, `ai.failure`, `ai.admission`, and `mcp.tool`.
   - *SupersededByPolicy*: `waf` and `rate_limit` compile to policy modules, so their decisions already publish as `policy` records carrying a `policy_id`. A second emitter under their own label would double-record one decision.
   - *ConfigDependent*: `policy` always reaches the bus, but arrives as the legacy `policy_verdict_event` shape until `policy_record_format: decision` moves it onto this feed.
   - *DurableElsewhere*: `payment.lifecycle` is recorded by the settlement store, which is non-lossy by design. This queue drops records under load (a sound trade for a security decision, the wrong one for money), so publishing the same event here would offer a second, weaker answer beside an authoritative one.
@@ -92,6 +92,48 @@ The short version, because this page is where the two channels need to be told a
 `ai.close` and `ai.failure` are new to the *Emitted* set as of this sweep. `ai.failure` fires at the one funnel every provider-response failure classification already ran through, carrying `selected_provider` and a closed failure kind (`rate_limited`, `content_filter`, `upstream_5xx`, `provider_error`) under `unmapped`. `ai.close` fires once a streamed response finishes, carrying the terminal `finish_reason`, and is the intentional counterweight to `ai.stream.event`'s refusal: without it, the per-chunk feed that gets refused on volume grounds would have no summary anywhere in SIEM-land either.
 
 `ai.close` carries one honest caveat the others do not. It publishes only for a request whose AI extension chain (JS, Lua, or WASM bundle hooks on `ai.*` events) is non-empty for that generation, because that is the only place the stream's finish-reason aggregate exists today. A deployment with zero AI extension bundles configured never builds that chain, so `ai.close` publishes nothing there even with `decision_audit` enabled and the boot warning silent (the warning cannot see a gap that is config-shaped rather than code-shaped). If you rely on `ai.close`, confirm you have at least one AI extension hook registered, linked or bundle. This is a narrower guarantee than the funnel-per-event shape the other *Emitted* events carry, and it is called out here rather than left for you to discover against a quiet feed.
+
+`ai.admission` is the pre-provider refusal record. It fires at the inbound native-format shim, where `/v1/messages` and `/v1/responses` bodies become the canonical chat shape, on the three arms that refuse a request there (the Anthropic Messages translate, the Responses stored-prompt bridge, and the Responses translate), and at the two refusal arms of the shared stored-prompt resolver (a template that fails to render, and a reference on a native surface that no prompt layer holds). `outcome` is always `deny`. Under `unmapped` it carries `surface` (the inbound surface, drawn from the same vocabulary `sbproxy_ai_surface_requests_total` uses: `messages` or `responses` for a shim refusal, and whatever surface the request arrived on for a resolver refusal, which includes `chat_completions`) and `verdict`, a bounded reason code. The refusal's own message is deliberately absent: several of these codes interpolate caller bytes into the message (a serde parse error, an unrecognized role name) and `unmapped` ships unscrubbed.
+
+The refusal this exists for is `tools_mcp_unsupported`. A `/v1/responses` body carrying `tools: [{"type": "mcp", "server_url": "..."}]` is asking the model provider to reach an MCP server directly, behind the gateway's MCP governance. The gateway refuses it, but before this event the only trace was a bare 400, which reads in a SIEM exactly like a typo'd JSON body:
+
+```yaml
+proxy:
+  observability:
+    log:
+      decision_audit:
+        enabled: true
+        events:
+          ai.admission: true
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: "${OPENAI_API_KEY}"
+```
+
+```bash
+curl -sS -X POST https://ai.example.com/v1/responses \
+  -H 'content-type: application/json' \
+  -d '{"model":"gpt-4o","input":"hi","tools":[{"type":"mcp","server_url":"https://internal/?token=REDACTED"}]}'
+```
+
+The client gets a 400 naming the governed alternative, and one record reaches the audit feed:
+
+```json
+{
+  "class_uid": 6003,
+  "activity_id": 2,
+  "metadata": { "correlation_uid": "01J8..." },
+  "unmapped": { "surface": "responses", "verdict": "tools_mcp_unsupported" }
+}
+```
+
+`sbproxy_ai_admission_decisions_total{surface="responses",reason="tools_mcp_unsupported",outcome="deny"}` increments in the same breath, so the alert can live on the metric and the forensics on the record. Neither carries `server_url`.
+
+What `ai.admission` does not cover: those five arms are the whole of it. A request refused later by the model allow/block gate, a virtual-key policy, a guardrail, a budget, a rate limiter, or a CEL or Rego policy is that plane's decision and publishes under that plane's own event. The canonical `/v1/chat/completions` path has no inbound shim, so the only refusal that reaches this event from there is a stored-prompt render failure. A request that is only *lossy* (an unsupported non-`mcp` tool block, a `prompt` value the translator cannot represent) is admitted, not refused, and leaves its trace on `sbproxy_ai_translation_dropped_total` instead.
 
 `mcp.tool` here covers a successful (or gateway-declined) tool dispatch attribution. It does not cover an MCP request refused before dispatch on RBAC, quota, or a lethal-trifecta session check (tool access, private data, and external communication in one session): those denials are carried by the MCP governance evidence channel, a separate, purpose-built record for exactly that shape of decision, rather than by any channel this page documents.
 

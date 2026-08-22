@@ -92,6 +92,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_agent_detect_score` | Histogram | `stable` | `stable` | none | Agent-detect scorer output score, scaled 0-100. |
 | `sbproxy_agent_detect_total` | Counter | `stable` | `stable` | `agent_id`, `provenance` | Agent-detect scorer verdicts by agent id and provenance. |
 | `sbproxy_agent_skill_digest_mismatch_total` | Counter | `stable` | `beta` | `skill` | Agent Skills artifact digest mismatches detected at serve time. |
+| `sbproxy_ai_admission_decisions_total` | Counter | `stable` | `beta` | `surface`, `reason`, `outcome` | Pre-provider AI gateway admission decisions: a request refused at the inbound native-format shim before any provider saw it, by inbound surface and bounded reason code. |
 | `sbproxy_ai_audio_seconds_attributed_total` | Counter | `stable` | `beta` | `provider`, `model`, `surface`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id` | AI audio seconds consumed (realtime + audio surfaces), partitioned by attribution tag. |
 | `sbproxy_ai_budget_utilization_ratio` | Gauge | `stable` | `stable` | `scope` | Budget utilization as a fraction of the limit; above 1 is over budget. |
 | `sbproxy_ai_cache_results_total` | Counter | `stable` | `stable` | `provider`, `cache_type`, `result` | AI response cache results. |

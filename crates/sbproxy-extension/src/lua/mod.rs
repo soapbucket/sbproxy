@@ -53,10 +53,13 @@ pub fn active_sandbox_config() -> Arc<SandboxConfig> {
 /// guarantee: there is no shared interpreter state across calls.
 ///
 /// The engine carries a [`SandboxConfig`] that pins the wall-clock,
-/// memory, and pattern-API limits applied to every invocation. Use
-/// [`LuaEngine::new`] for the documented defaults or
-/// [`LuaEngine::with_config`] to honor operator overrides from
-/// `proxy.scripting.lua.sandbox` in `sb.yml`.
+/// memory, and pattern-API limits applied to every invocation.
+/// [`LuaEngine::new`] snapshots whatever [`install_sandbox_config`] has
+/// installed, which is the operator's `proxy.scripting.lua.sandbox` in
+/// `sb.yml` once boot has run and the documented defaults before that.
+/// [`LuaEngine::with_config`] takes an explicit snapshot instead, for a
+/// caller that has a `SandboxConfig` in hand and must not race the
+/// process-wide one.
 pub struct LuaEngine {
     config: SandboxConfig,
 }
