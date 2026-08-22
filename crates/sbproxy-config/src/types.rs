@@ -5131,7 +5131,7 @@ impl std::fmt::Debug for L2CacheParams {
 /// promotes the entry back into the hot tier on hit.
 ///
 /// Backend selection is open-ended via [`CacheReserveBackendConfig`]
-/// so the in-tree memory / filesystem / redis backends can be
+/// so the in-tree memory / filesystem / redis / s3 backends can be
 /// extended without touching this schema.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -5202,8 +5202,38 @@ pub enum CacheReserveBackendConfig {
         #[serde(default)]
         key_prefix: Option<String>,
     },
-    /// Catch-all for backends registered out-of-tree (e.g. an
-    /// `s3` backend). The in-tree pipeline ignores these with a
+    /// S3-backed reserve with AWS KMS envelope encryption. A cold,
+    /// cross-region-replicable tier; cross-region replication itself
+    /// is configured at the bucket level, outside this schema.
+    /// Credentials resolve through the standard AWS chain (env,
+    /// profile, IMDS, container credentials), never through this
+    /// config block.
+    S3 {
+        /// Source S3 bucket.
+        bucket: String,
+        /// AWS region the bucket lives in.
+        region: String,
+        /// KMS key ID, ARN, or alias used to wrap/unwrap the
+        /// per-object data key (or, in `sse_kms_bucket_default` mode,
+        /// passed as `ssekms_key_id`).
+        kms_key_id: String,
+        /// Optional key prefix prepended to every object (e.g.
+        /// `"reserve/"`).
+        #[serde(default)]
+        prefix: Option<String>,
+        /// Optional replication target bucket name, surfaced for
+        /// diagnostics only. Cross-region replication is configured
+        /// at the bucket level and this backend never acts on it.
+        #[serde(default)]
+        replication_target_bucket: Option<String>,
+        /// When `true`, upload plaintext and rely on S3 SSE-KMS
+        /// bucket-default encryption instead of local envelope
+        /// encryption. Defaults to `false`.
+        #[serde(default)]
+        sse_kms_bucket_default: bool,
+    },
+    /// Catch-all for backends registered out-of-tree (e.g. a GCS or
+    /// Azure Blob backend). The in-tree pipeline ignores these with a
     /// warning; an out-of-tree startup hook intercepts the variant
     /// before the warning fires.
     #[serde(other)]

@@ -1,9 +1,9 @@
 # Cache Reserve
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-22*
 
 Cache Reserve is a long-tail cold tier sitting under the per-origin response cache. Items evicted from the hot cache are admitted into the reserve subject to a sample rate and size threshold; on a hot miss the proxy consults the reserve before falling through to origin and promotes the entry back into the hot tier on hit.
 
-SBproxy ships three reserve backends out of the box: memory, filesystem, and redis.
+SBproxy ships four reserve backends out of the box: memory, filesystem, redis, and S3.
 
 ## Configuration
 
@@ -37,8 +37,29 @@ origins:
 | `memory` | none | In-process map. For tests and ephemeral single-replica setups; nothing survives a restart. |
 | `filesystem` | `path` | One body file plus a sidecar metadata JSON per key, fanned out by SHA-256 hash. Survives restarts. |
 | `redis` | `redis_url`, optional `key_prefix` | Connection pooling via `ConnectionManager`. Entries self-evict on the server side via `PEXPIREAT`. |
+| `s3` | `bucket`, `region`, `kms_key_id`, optional `prefix`, `replication_target_bucket`, `sse_kms_bucket_default` | A cold, cross-region-replicable tier. AWS KMS envelope encryption by default; see [S3 + KMS](#s3--kms) below. |
 
 The pipeline ignores unknown backend types with a warning.
+
+```yaml
+proxy:
+  cache_reserve:
+    enabled: true
+    backend:
+      type: s3
+      bucket: sbproxy-cache-reserve-prod
+      region: us-west-2
+      kms_key_id: alias/sbproxy-cache-reserve
+      prefix: "reserve/"
+```
+
+#### S3 + KMS
+
+Every `put` calls `KMS:GenerateDataKey` to mint a fresh 256-bit data key, seals the body locally with AES-256-GCM, and stores the KMS-wrapped data key alongside the ciphertext as S3 object metadata. `get` sends the wrapped key back through `KMS:Decrypt` and decrypts in-process. This envelope-encryption pattern keeps KMS request volume bounded to one call per object rather than one per byte, and lets the master key rotate without rewriting object bodies. Deployments that prefer S3's bucket-default SSE-KMS encryption instead can set `sse_kms_bucket_default: true`; in that mode the body uploads in plaintext and S3 encrypts at rest, and neither `put` nor `get` calls KMS.
+
+AWS credentials resolve through the standard chain (environment, shared profile, EC2/ECS instance role, container credentials); nothing under `backend:` carries a secret. Cross-region replication is configured at the bucket level with an S3 replication rule and IAM role; `replication_target_bucket` is a diagnostics-only hint this backend does not act on.
+
+`evict_expired` lists the bucket and issues one `HeadObject` per listed key to read its expiry. That does not scale to a large bucket: past 100,000 objects a log line suggests configuring an S3 lifecycle rule instead of relying on this sweep.
 
 ### Admission filter
 
@@ -248,7 +269,7 @@ Each counter is labeled by `origin`. Watch the hits / (hits + misses) ratio to s
 
 - A failed reserve `put` is logged at `warn` level and does not fail the request. The hot tier already accepted the entry.
 - A failed reserve `get` falls through to origin. The hot tier's value, when present, is returned before the reserve is consulted, so primary hits are unaffected by reserve outages.
-- A failed reserve construction (e.g. invalid Redis URL) is logged at warn and degrades to "no reserve" rather than failing the whole config load. Plain hot-cache behavior resumes.
+- A failed reserve construction (e.g. an invalid Redis URL, or an S3 backend missing `bucket`/`region`/`kms_key_id`) is logged at warn and degrades to "no reserve" rather than failing the whole config load. Plain hot-cache behavior resumes.
 
 ## Tuning
 

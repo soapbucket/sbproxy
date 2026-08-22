@@ -6,12 +6,13 @@
 //!    two [`CacheStore`](crate::CacheStore) implementations into a hot/cold
 //!    pair. It remains the in-process building block when both tiers are
 //!    cheap (memory + filesystem).
-//! 2. The async [`CacheReserveBackend`] trait plus three OSS
-//!    implementations ([`MemoryReserve`], [`FsReserve`], [`RedisReserve`]).
-//!    The trait is the integration point for backends that need to
-//!    perform real I/O (object storage, KMS-wrapped writes). Enterprise
-//!    crates ship their own `impl CacheReserveBackend` (S3 + KMS, GCS,
-//!    Azure Blob) without re-vendoring the OSS data plane.
+//! 2. The async [`CacheReserveBackend`] trait plus four OSS
+//!    implementations ([`MemoryReserve`], [`FsReserve`], [`RedisReserve`],
+//!    [`S3Reserve`]). The trait is the integration point for backends
+//!    that need to perform real I/O (object storage, KMS-wrapped
+//!    writes). Out-of-tree crates can ship their own
+//!    `impl CacheReserveBackend` (GCS, Azure Blob, ...) without
+//!    re-vendoring the OSS data plane.
 //!
 //! The async trait is independent of `CacheStore`. It carries explicit
 //! [`ReserveMetadata`] so backends can persist content type, vary
@@ -22,11 +23,13 @@ mod composer;
 pub mod filesystem;
 pub mod memory;
 pub mod redis;
+pub mod s3;
 
 pub use composer::{ReserveCacheStore, ReserveConfig, ReserveStats};
 pub use filesystem::FsReserve;
 pub use memory::MemoryReserve;
 pub use redis::RedisReserve;
+pub use s3::{S3Reserve, S3ReserveConfig};
 
 use async_trait::async_trait;
 use bytes::Bytes;

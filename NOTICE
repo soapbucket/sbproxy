@@ -216,14 +216,18 @@ Licensed under the Apache License, Version 2.0
 https://github.com/awslabs/aws-sdk-rust
 https://github.com/smithy-lang/smithy-rs
 
-Crates: aws-config, aws-credential-types, aws-runtime,
-aws-sdk-secretsmanager, aws-sdk-sts, aws-sigv4, aws-smithy-async,
+Crates: aws-config, aws-credential-types, aws-runtime, aws-sdk-kms,
+aws-sdk-s3, aws-sdk-secretsmanager, aws-sdk-sts, aws-sigv4,
+aws-smithy-async, aws-smithy-checksums, aws-smithy-eventstream,
 aws-smithy-http, aws-smithy-http-client, aws-smithy-json,
 aws-smithy-observability, aws-smithy-query, aws-smithy-runtime,
 aws-smithy-runtime-api, aws-smithy-runtime-api-macros, aws-smithy-schema,
 aws-smithy-types, aws-smithy-xml, aws-types. Pulled in by
-sbproxy-vault's AWS Secrets Manager backend and by sbproxy-ai's AWS
-SigV4 request signer for Bedrock and SageMaker.
+sbproxy-vault's AWS Secrets Manager backend, sbproxy-ai's AWS SigV4
+request signer for Bedrock and SageMaker, and sbproxy-cache's S3 + KMS
+cache-reserve backend. aws-smithy-mocks and aws-smithy-protocol-test
+are used as dev-dependencies in the cache-reserve backend's test suite
+only.
 
 ===========================================================================
 

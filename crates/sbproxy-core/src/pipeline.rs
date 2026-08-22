@@ -31,7 +31,7 @@ use compact_str::CompactString;
 use sbproxy_cache::{
     CacheReserveBackend, CacheStore, EncryptedCacheStore, FileCacheConfig, FileCacheStore,
     FsReserve, MemcachedConfig, MemcachedStore, MemoryCacheStore, MemoryReserve, RedisCacheStore,
-    RedisReserve,
+    RedisReserve, S3Reserve, S3ReserveConfig,
 };
 use sbproxy_config::{CompiledConfig, Parameter, RequestModifierConfig};
 use sbproxy_extension::bundle::{BundleRegistry, DynamicBundleRegistry};
@@ -799,9 +799,10 @@ impl ReserveAdmission {
 /// Returns `(None, None)` when the block is absent, disabled, or
 /// targets an extension-provided backend the pipeline does not know how
 /// to instantiate. Failures during construction (e.g. an invalid
-/// Redis URL) are logged at `warn` level and surfaced as `(None, None)`
-/// so a misconfigured reserve degrades to plain hot-cache behavior
-/// rather than failing the whole config load.
+/// Redis URL, or an S3 config missing `bucket`/`region`/`kms_key_id`)
+/// are logged at `warn` level and surfaced as `(None, None)` so a
+/// misconfigured reserve degrades to plain hot-cache behavior rather
+/// than failing the whole config load.
 fn build_cache_reserve(
     cfg: &Option<sbproxy_config::CacheReserveConfig>,
 ) -> (
@@ -840,6 +841,27 @@ fn build_cache_reserve(
             Ok(r) => Some(Arc::new(r)),
             Err(e) => {
                 tracing::warn!(error = %e, "cache_reserve redis backend init failed; reserve disabled");
+                None
+            }
+        },
+        sbproxy_config::CacheReserveBackendConfig::S3 {
+            bucket,
+            region,
+            kms_key_id,
+            prefix,
+            replication_target_bucket,
+            sse_kms_bucket_default,
+        } => match S3Reserve::new(S3ReserveConfig {
+            bucket: bucket.clone(),
+            region: region.clone(),
+            kms_key_id: kms_key_id.clone(),
+            prefix: prefix.clone(),
+            replication_target_bucket: replication_target_bucket.clone(),
+            sse_kms_bucket_default: *sse_kms_bucket_default,
+        }) {
+            Ok(r) => Some(Arc::new(r)),
+            Err(e) => {
+                tracing::warn!(error = %e, "cache_reserve s3 backend init failed; reserve disabled");
                 None
             }
         },
@@ -2795,10 +2817,10 @@ impl CompiledPipeline {
         // --- Cache Reserve cold tier ---
         //
         // Built from the top-level `cache_reserve:` block. The OSS
-        // backends (memory / filesystem / redis) are instantiated here;
-        // unknown or extension-provided backends drop through to `None` with a
-        // warning so a pipeline lifecycle hook can swap in its own
-        // implementation post-compile.
+        // backends (memory / filesystem / redis / s3) are instantiated
+        // here; unknown or extension-provided backends drop through to
+        // `None` with a warning so a pipeline lifecycle hook can swap
+        // in its own implementation post-compile.
         let (cache_reserve, cache_reserve_admission) =
             build_cache_reserve(&config.server.cache_reserve);
 

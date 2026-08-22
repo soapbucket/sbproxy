@@ -5478,7 +5478,7 @@
       "additionalProperties": false
     },
     "CacheReserveConfig": {
-      "description": "Top-level Cache Reserve configuration.\n\nCache Reserve is a long-tail cold tier sitting under the per-origin response cache. Items evicted from the hot cache are admitted into the reserve subject to a sample rate and size threshold; on a hot miss the proxy consults the reserve before going to origin and promotes the entry back into the hot tier on hit.\n\nBackend selection is open-ended via [`CacheReserveBackendConfig`] so the in-tree memory / filesystem / redis backends can be extended without touching this schema.",
+      "description": "Top-level Cache Reserve configuration.\n\nCache Reserve is a long-tail cold tier sitting under the per-origin response cache. Items evicted from the hot cache are admitted into the reserve subject to a sample rate and size threshold; on a hot miss the proxy consults the reserve before going to origin and promotes the entry back into the hot tier on hit.\n\nBackend selection is open-ended via [`CacheReserveBackendConfig`] so the in-tree memory / filesystem / redis / s3 backends can be extended without touching this schema.",
       "type": "object",
       "properties": {
         "enabled": {
@@ -5591,7 +5591,59 @@
           "additionalProperties": false
         },
         {
-          "description": "Catch-all for backends registered out-of-tree (e.g. an `s3` backend). The in-tree pipeline ignores these with a warning; an out-of-tree startup hook intercepts the variant before the warning fires.",
+          "description": "S3-backed reserve with AWS KMS envelope encryption. A cold, cross-region-replicable tier; cross-region replication itself is configured at the bucket level, outside this schema. Credentials resolve through the standard AWS chain (env, profile, IMDS, container credentials), never through this config block.",
+          "type": "object",
+          "required": [
+            "bucket",
+            "kms_key_id",
+            "region",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "s3"
+              ]
+            },
+            "bucket": {
+              "description": "Source S3 bucket.",
+              "type": "string"
+            },
+            "region": {
+              "description": "AWS region the bucket lives in.",
+              "type": "string"
+            },
+            "kms_key_id": {
+              "description": "KMS key ID, ARN, or alias used to wrap/unwrap the per-object data key (or, in `sse_kms_bucket_default` mode, passed as `ssekms_key_id`).",
+              "type": "string"
+            },
+            "prefix": {
+              "description": "Optional key prefix prepended to every object (e.g. `\"reserve/\"`).",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "replication_target_bucket": {
+              "description": "Optional replication target bucket name, surfaced for diagnostics only. Cross-region replication is configured at the bucket level and this backend never acts on it.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sse_kms_bucket_default": {
+              "description": "When `true`, upload plaintext and rely on S3 SSE-KMS bucket-default encryption instead of local envelope encryption. Defaults to `false`.",
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Catch-all for backends registered out-of-tree (e.g. a GCS or Azure Blob backend). The in-tree pipeline ignores these with a warning; an out-of-tree startup hook intercepts the variant before the warning fires.",
           "type": "object",
           "required": [
             "type"

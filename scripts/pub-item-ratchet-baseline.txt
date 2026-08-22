@@ -588,3 +588,18 @@ helpers and its own test, live counters `docs/federation.md` and the shipped
 Grafana dashboard both name. The fifth static,
 `WELL_KNOWN_CACHE_REMAINING_SECONDS`, is set directly from `http_route.rs`
 and so is already outside either bucket.
+
+2026-08-22 (WOR-2673): tests-only bucket 295 -> 296.
+`crates/sbproxy-cache/src/reserve/s3.rs`'s `S3Reserve::with_clients` is the
+dependency-injection seam that lets the mock-driven test suite hand the
+backend a pre-built `aws_smithy_mocks` client pair instead of dialing real S3
+and KMS endpoints. It has to be `pub`, not `pub(crate)`, because
+`crates/sbproxy-cache/tests/mock_s3_kms.rs` is a separate compilation unit
+that only sees the crate's public surface, and porting that black-box
+integration file (mirroring the sibling `RedisReserve`/`FsReserve` pattern of
+one file testing internals plus one testing the public contract) was an
+explicit goal of this change. Production construction goes through
+`S3Reserve::new`, which resolves AWS credentials through the standard chain
+lazily on first use instead of taking pre-built clients; `with_clients` has
+no production caller by design, the same way the enterprise implementation
+this backend was ported from kept its equivalent constructor test-only.
