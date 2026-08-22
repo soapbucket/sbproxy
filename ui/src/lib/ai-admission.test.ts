@@ -147,6 +147,33 @@ describe("admission label vocabularies", () => {
     expect(new Set(labels).size).toBe(codes.length);
   });
 
+  it("names the cardinality limiter's sentinel as the lost label it is", () => {
+    // `budget_for_label` in crates/sbproxy-observe/src/cardinality.rs
+    // caps `reason` at 8 accepted values against a 13-code vocabulary,
+    // keyed on the label name alone with no eviction, so `__other__` is
+    // a state this panel reaches and stays in. Prettified it reads
+    // "Other", which looks like a refusal reason and is not one.
+    expect(admissionReasonLabel("__other__")).toBe(
+      "Beyond the label limit, reason not recorded",
+    );
+    expect(admissionSurfaceLabel("__other__")).toBe(
+      "Beyond the label limit, surface not recorded",
+    );
+    expect(admissionOutcomeLabel("__other__")).toBe("not recorded");
+    expect(admissionReasonLabel("__other__")).not.toBe("Other");
+
+    // The count behind the sentinel is real and still belongs in the
+    // total, even though the code behind it is gone.
+    const summary = summarize(
+      [
+        "# TYPE sbproxy_ai_admission_decisions_total counter",
+        'sbproxy_ai_admission_decisions_total{surface="responses",reason="__other__",outcome="deny"} 12',
+      ].join("\n"),
+    );
+    expect(summary?.denials).toBe(12);
+    expect(summary?.rows[0].reason).toBe("__other__");
+  });
+
   it("prettifies an unknown code instead of dropping it", () => {
     expect(admissionSurfaceLabel("audio_transcription")).toBe("Audio transcription");
     expect(admissionReasonLabel("some_future_code")).toBe("Some future code");

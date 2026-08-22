@@ -56,6 +56,21 @@ const REASON_LABELS: Readonly<Record<string, string>> = {
   malformed_request: "Refused as malformed, with no narrower code recorded",
 };
 
+/**
+ * The value the cardinality limiter writes once a label runs out of
+ * budget, from `OTHER_LABEL` in
+ * `crates/sbproxy-observe/src/cardinality.rs`.
+ *
+ * This is not a theoretical case for this family. `budget_for_label`
+ * caps the `reason` label at 8 accepted values, the set is keyed on the
+ * label name alone, and the emitter above has 13 codes, so a proxy that
+ * sees a ninth distinct refusal publishes every later code under this
+ * sentinel and never recovers (the limiter has no eviction). Running it
+ * through the prettifier would print the word "Other", which reads as a
+ * refusal reason and is not one: it is the place the reason was lost.
+ */
+const LIMITER_SENTINEL = "__other__";
+
 /** Snake case to a sentence: `audio_transcription` to `Audio transcription`. */
 function prettify(code: string): string {
   const words = code.replace(/_/g, " ").trim();
@@ -65,11 +80,13 @@ function prettify(code: string): string {
 
 /** Plain name for an inbound AI surface label. */
 export function admissionSurfaceLabel(surface: string): string {
+  if (surface === LIMITER_SENTINEL) return "Beyond the label limit, surface not recorded";
   return SURFACE_LABELS[surface] ?? prettify(surface);
 }
 
 /** Plain name for a bounded refusal reason code. */
 export function admissionReasonLabel(reason: string): string {
+  if (reason === LIMITER_SENTINEL) return "Beyond the label limit, reason not recorded";
   return REASON_LABELS[reason] ?? prettify(reason);
 }
 
@@ -81,6 +98,7 @@ export function admissionReasonLabel(reason: string): string {
 export function admissionOutcomeLabel(outcome: string): string {
   if (outcome === "deny") return "denied";
   if (outcome === "allow" || outcome === "admit") return "admitted";
+  if (outcome === LIMITER_SENTINEL) return "not recorded";
   return prettify(outcome).toLowerCase();
 }
 

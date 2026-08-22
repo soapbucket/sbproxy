@@ -54,8 +54,36 @@ describe("AI performance pre-provider admission refusals (WOR-2595)", () => {
     // attributed requests, no gateway decisions, and no provider rows.
     // Without this clause the page an operator opens to find the
     // refusal renders the empty state instead.
+    //
+    // Gated on the family's total, not on the denied slice: the panel
+    // renders every row the family carries, so an admit-side series
+    // sharing the family (which `admissionSummary` already reads, and
+    // which the label exists for) must not leave the empty state drawn
+    // over a populated panel.
     expect(aiPerformanceView).toMatch(
-      /hasAiTraffic = computed\([\s\S]*?\(admissionDenials\.value \?\? 0\) > 0/,
+      /hasAiTraffic = computed\([\s\S]*?\(admissionTotal\.value \?\? 0\) > 0/,
+    );
+    expect(aiPerformanceView).not.toContain("(admissionDenials.value ?? 0) > 0");
+  });
+
+  it("says the refusals are already inside the gateway rejection count", () => {
+    // A shim refusal sets `ctx.ai_surface`, returns 4xx, and reaches the
+    // logging phase, so `record_ai_gateway_decision("rejected",
+    // "client_error")` fires for the same request that ticked the
+    // admission counter. The two tiles sit side by side, so the page has
+    // to say the numbers nest rather than sum.
+    expect(aiPerformanceView).toContain("not additive with the gateway rejection rate");
+    expect(aiPerformanceView).toContain("client_error");
+    expect(aiPerformanceView).toContain("not an addition");
+  });
+
+  it("prints the counter name from the shared constant, not a second copy", () => {
+    // The name appears twice on this page (the lookup and the
+    // "not reported" paragraph). A literal in the paragraph would keep
+    // reading the old name after a rename that the lookup followed.
+    expect(aiPerformanceView).toContain("{{ AI_ADMISSION_FAMILY }}");
+    expect(aiPerformanceView).not.toContain(
+      '<span class="sb-mono">sbproxy_ai_admission_decisions_total</span>',
     );
   });
 });

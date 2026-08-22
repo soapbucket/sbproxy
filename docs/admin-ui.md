@@ -712,6 +712,20 @@ per-surface breakdown.
   dispatch exports no family at all. The tile reads `not reported` for
   that case rather than `0`, because a flat zero over a measurement
   nobody has ever taken reads as a healthy signal.
+- **Not additive with the gateway rejection rate beside it.** A refusal
+  here is a 4xx on a classified AI surface, so it is also one of the
+  rejections in `sbproxy_ai_gateway_decisions_total{decision="rejected"}`,
+  filed under `client_error`. Reading the two tiles as separate
+  populations double counts. What this panel adds is which inbound
+  surface and which refusal, neither of which the `client_error` bucket
+  can say.
+- **`__other__` in a row is a lost label, not a reason.** The `reason`
+  label is capped at 8 accepted values by the cardinality limiter
+  against a 13-code vocabulary, so a proxy that sees a ninth distinct
+  refusal files every later one under the limiter's sentinel from then
+  on. The panel renders that row as `Beyond the label limit, reason not
+  recorded` rather than as a word that reads like a refusal. The count
+  is still real; only the code behind it is gone.
 
 Triage: a caller reports a 400 that their provider dashboard has no
 record of. Open AI performance. A `Refused before dispatch` count above

@@ -142,6 +142,7 @@ const admission = computed(() =>
   admissionSummary(fam(AI_ADMISSION_FAMILY)),
 );
 const admissionDenials = computed(() => admission.value?.denials);
+const admissionTotal = computed(() => admission.value?.total);
 
 const hasAiTraffic = computed(
   () =>
@@ -150,7 +151,12 @@ const hasAiTraffic = computed(
     providerHealth.value.length > 0 ||
     // A deployment whose only AI activity so far is refusals still has
     // something to show, and it is the thing an operator came to find.
-    (admissionDenials.value ?? 0) > 0,
+    // Gated on the family's whole total rather than on the denied slice:
+    // `outcome` exists so an admit-side series can share the family, and
+    // the panel below renders every row the family carries, so gating on
+    // `denials` would draw the empty state over a populated panel the
+    // day that series arrives.
+    (admissionTotal.value ?? 0) > 0,
 );
 
 function rateTone(rate: number): "ok" | "warn" | "err" {
@@ -232,7 +238,7 @@ const hasCompression = computed(() => compressionTotalRequests.value > 0);
         :value="admissionDenials !== undefined ? formatNumber(admissionDenials) : 'not reported'"
         :sub="
           admissionDenials !== undefined
-            ? 'refused at the inbound surface, no provider called'
+            ? 'a named slice of the rejections beside this, not an addition'
             : 'counted from the first refusal at an inbound AI surface'
         "
         :tone="(admissionDenials ?? 0) > 0 ? 'accent' : 'default'"
@@ -247,6 +253,13 @@ const hasCompression = computed(() => compressionTotalRequests.value > 0);
         nothing in a provider's own dashboard records them. Coverage is the two
         native-format shims and the shared stored-prompt resolver; a refusal by a
         model gate, guardrail, budget, or policy records under that plane instead.
+      </p>
+      <p class="hint">
+        These are not additive with the gateway rejection rate above. Every
+        refusal counted here is also one of those rejections, filed under
+        <span class="sb-mono">client_error</span>, which cannot say which
+        inbound surface it arrived on or which refusal it was. That is what this
+        panel adds.
       </p>
       <template v-if="admission">
         <table v-if="admission.rows.length" class="detail">
@@ -290,7 +303,7 @@ const hasCompression = computed(() => compressionTotalRequests.value > 0);
       </template>
       <p v-else class="hint">
         Not reported. The counter
-        <span class="sb-mono">sbproxy_ai_admission_decisions_total</span> is
+        <span class="sb-mono">{{ AI_ADMISSION_FAMILY }}</span> is
         published on its first increment, so it is absent until one request is
         refused at an inbound AI surface. This is not a zero.
       </p>
