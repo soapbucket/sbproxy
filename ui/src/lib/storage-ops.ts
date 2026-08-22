@@ -17,13 +17,14 @@
  *
  * 2. The error counter increments only on `Err`. A backend that has served
  *    a million reads cleanly publishes the duration family and no error
- *    family at all, and that reads as a real zero, not as a gap. So
- *    presence is decided on the duration family and errors default to 0
- *    once it is there.
+ *    family at all, and that reads as a real zero, not as a gap. So the
+ *    report exists as soon as *either* family is there, and errors default
+ *    to 0 when only the duration family is.
  *
  * 3. The duration family is a histogram, so its samples carry `_bucket`,
  *    `_sum` and `_count` names folded into one family. Summing the family
- *    with `sumSamples` would add buckets to counts and produce a number
+ *    with `sumSamples` would add every cumulative bucket (including the
+ *    `+Inf` one) and every `_sum` to the real counts and produce a number
  *    that means nothing. Operation totals come off `_count` only.
  *
  * Neither family carries the `sbproxy_` or `mesh_` prefix that

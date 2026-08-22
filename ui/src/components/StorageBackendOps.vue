@@ -39,10 +39,11 @@ const p95Text = computed(() => {
   return seconds === undefined ? "not reported" : formatSeconds(seconds);
 });
 
-const backendText = computed(() => {
+const backendsText = computed(() => {
   const backends = report.value?.backends ?? [];
-  if (!backends.length) return "backend not labeled";
-  return backends.join(", ");
+  return backends.length
+    ? `through ${backends.join(", ")}`
+    : "the scrape carries no backend label";
 });
 </script>
 
@@ -75,13 +76,18 @@ const backendText = computed(() => {
         <StatCard
           label="Backend operations"
           :value="formatNumber(report.operations)"
-          :sub="`through ${backendText}`"
+          :sub="backendsText"
         />
+        <!-- Any failure at all takes the accent, not a rate threshold. These
+             are lifetime counters, so a backend that went down ten minutes
+             ago on a node up for a week sits far below any percentage worth
+             alerting on and would otherwise render identically to one that
+             has never failed. -->
         <StatCard
           label="Failed operations"
           :value="formatNumber(report.errors)"
           :sub="`${(report.errorRate * 100).toFixed(2)}% of all operations`"
-          :tone="report.errorRate >= 0.01 ? 'accent' : 'default'"
+          :tone="report.errors > 0 ? 'accent' : 'default'"
         />
         <StatCard
           label="Slowest 5% of calls"
@@ -98,9 +104,12 @@ const backendText = computed(() => {
             :items="report.slowest"
             :format="formatSeconds"
           />
+          <!-- Not "no call has happened yet": the error counter alone can
+               carry the panel, and saying nothing has run beside a nonzero
+               failure count contradicts the tile above. -->
           <p v-else class="sb-faint note">
-            Latency is not reported. The duration histogram appears after the
-            first backend call.
+            Latency is not reported. The duration histogram is absent from this
+            scrape, so there is no p95 to draw.
           </p>
         </div>
         <div>

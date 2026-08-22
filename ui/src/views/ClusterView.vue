@@ -38,6 +38,12 @@ const metricsError = ref<ApiError | null>(null);
 // the two never disagree about how recent they are.
 const scrape = ref<MetricFamily[]>([]);
 const scrapeLoading = ref(false);
+// True once a scrape has parsed. `scrapeLoading` is the in-flight guard for
+// the poll, which is a different question from "has a reading arrived": on a
+// node that has refused nothing the report is undefined either way, so
+// passing the raw in-flight flag down would flip the panel between "reading
+// admission metrics" and its not-reported empty state every fifteen seconds.
+const scrapeLoaded = ref(false);
 const scrapeError = ref<ApiError | null>(null);
 
 function asApiError(error: unknown): ApiError {
@@ -82,6 +88,7 @@ async function loadScrape() {
   scrapeError.value = null;
   try {
     scrape.value = parsePrometheus(await api.metrics());
+    scrapeLoaded.value = true;
   } catch (error) {
     scrapeError.value = asApiError(error);
   } finally {
@@ -166,7 +173,7 @@ usePoll(refresh, 15_000);
     <ClusterNodeRoster :nodes="status.nodes" />
     <ClusterInboundAdmission
       :families="scrape"
-      :loading="scrapeLoading"
+      :loading="scrapeLoading && !scrapeLoaded"
       :error="scrapeError"
       @retry="loadScrape"
     />

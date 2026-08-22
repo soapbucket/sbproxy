@@ -57,6 +57,11 @@ const GC_FIXTURE: GcReport = {
   budget_unsatisfied_bytes: 0,
 };
 
+/** Collapse runs of whitespace so a prose assertion survives a reflow. */
+function collapse(source: string): string {
+  return source.replace(/\s+/g, " ");
+}
+
 function stubFetch(rawBody: string, status = 200) {
   const fetchMock = vi.fn(
     async (_input: RequestInfo | URL, _init?: RequestInit) =>
@@ -230,8 +235,9 @@ describe("storage backend operations panel", () => {
   it("keeps the backend panel outside the files error branch", () => {
     // A node with no model host 404s the files report. Backend health is a
     // different question and is often the one being asked when it does.
-    const filesTemplateEnd = storageView.indexOf("</template>\n\n  <StorageBackendOps");
-    expect(filesTemplateEnd).toBeGreaterThan(-1);
+    // Matched on collapsed whitespace so a reformat of the template cannot
+    // fail this without changing where the panel sits.
+    expect(collapse(storageView)).toContain("</template> <StorageBackendOps");
   });
 
   it("names both storage families, which no build guard watches", () => {
@@ -248,9 +254,28 @@ describe("storage backend operations panel", () => {
 
   it("separates a missing latency reading from a zero one", () => {
     expect(backendOps).toContain("not reported");
-    expect(backendOps).toContain("true\n            zero, not a missing reading");
+    expect(collapse(backendOps)).toContain("true zero, not a missing reading");
     // p95 is undefined when the histogram is absent; never render it as 0.
     expect(backendOps).not.toMatch(/p95Seconds \?\? 0/);
+  });
+
+  it("marks any failure at all, not only a rate over a threshold", () => {
+    // These are lifetime counters. A backend that went down ten minutes ago
+    // on a node up for a week sits below any percentage worth alerting on,
+    // and a rate threshold would render it exactly like a backend that has
+    // never failed.
+    expect(backendOps).toContain("report.errors > 0 ? 'accent' : 'default'");
+    expect(backendOps).not.toContain("errorRate >= 0.01");
+  });
+
+  it("does not claim nothing has run when only the error family is present", () => {
+    // storageOps reports on the error family alone, so the latency note
+    // cannot say the histogram "appears after the first backend call" next
+    // to a tile counting failures.
+    expect(backendOps).not.toContain("appears after the first backend call");
+    expect(collapse(backendOps)).toContain(
+      "The duration histogram is absent from this scrape",
+    );
   });
 
   it("labels the numbers for an operator, not for the exporter", () => {

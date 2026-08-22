@@ -32,8 +32,16 @@ const report = computed(() => inboundAdmission(props.families));
 </script>
 
 <template>
-  <section class="panel" aria-labelledby="cluster-inbound-admission-heading">
-    <h2 id="cluster-inbound-admission-heading">Inbound peer admission</h2>
+  <section class="data-section" aria-labelledby="cluster-inbound-admission-heading">
+    <div class="section-heading">
+      <div>
+        <p class="sb-eyebrow">Who was not let in</p>
+        <h2 id="cluster-inbound-admission-heading">Inbound peer admission</h2>
+      </div>
+      <p class="section-context">
+        Counted on this node since it started, not aggregated over the fleet
+      </p>
+    </div>
 
     <ErrorState
       v-if="error"
@@ -52,9 +60,8 @@ const report = computed(() => inboundAdmission(props.families));
 
     <template v-else>
       <p class="hint">
-        Inbound cache RPC connections this node did not keep, counted since
-        the process started. The peer address is in the node log, never in a
-        label.
+        Inbound cache RPC connections this node did not keep. The peer address
+        is in the node log, never in a label.
       </p>
 
       <div class="tiles">
@@ -76,46 +83,64 @@ const report = computed(() => inboundAdmission(props.families));
         />
       </div>
 
-      <div class="table-wrap" role="region" aria-label="Admission reasons" tabindex="0">
-        <table class="sb-table admission-table">
-          <thead>
-            <tr>
-              <th>Reason</th>
-              <th>Kind</th>
-              <th>Count</th>
-              <th>What it means</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="row in report.rows" :key="row.reason">
-              <th scope="row" class="sb-mono">{{ row.reason }}</th>
-              <td>
-                <StatusBadge
-                  :label="row.refusal ? 'refused' : 'reclaimed'"
-                  :tone="row.refusal ? 'warn' : 'neutral'"
-                />
-              </td>
-              <td class="count">{{ formatNumber(row.count) }}</td>
-              <td class="meaning">{{ row.meaning }}</td>
-            </tr>
-          </tbody>
-        </table>
+      <div class="sb-card table-shell">
+        <div class="table-wrap" role="region" aria-label="Admission reasons" tabindex="0">
+          <table class="sb-table admission-table">
+            <thead>
+              <tr>
+                <th>Reason</th>
+                <th>Kind</th>
+                <th>Count</th>
+                <th>What it means</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in report.rows" :key="row.reason">
+                <th scope="row" class="sb-mono">{{ row.reason }}</th>
+                <td>
+                  <StatusBadge
+                    :label="row.refusal ? 'refused' : 'reclaimed'"
+                    :tone="row.refusal ? 'warn' : 'neutral'"
+                  />
+                </td>
+                <td class="count">{{ formatNumber(row.count) }}</td>
+                <td class="meaning">{{ row.meaning }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
       </div>
     </template>
   </section>
 </template>
 
 <style scoped>
-.panel {
+/* The section heading, context line, and card-wrapped table are the idiom
+   the roster above and the deployment table below already use, so the three
+   read as one page rather than as a panel borrowed from another view. */
+.data-section {
   margin-bottom: var(--sb-space-6);
 }
-.panel h2 {
-  font-size: 13px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: var(--sb-text-muted);
-  margin: 0 0 var(--sb-space-2);
+.section-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--sb-space-4);
+  margin-bottom: var(--sb-space-4);
+}
+.section-heading .sb-eyebrow {
+  margin: 0 0 var(--sb-space-1);
+}
+.section-context {
+  max-width: 50%;
+  margin: 0;
+  color: var(--sb-text-faint);
+  font-size: 0.78rem;
+  text-align: right;
+}
+.table-shell {
+  padding: 0;
+  overflow: hidden;
 }
 .tiles {
   display: grid;

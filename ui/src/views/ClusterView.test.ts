@@ -3,6 +3,11 @@ import { describe, expect, it } from "vitest";
 import admissionPanel from "../components/ClusterInboundAdmission.vue?raw";
 import clusterView from "./ClusterView.vue?raw";
 
+/** Collapse runs of whitespace so a prose assertion survives a reflow. */
+function collapse(source: string): string {
+  return source.replace(/\s+/g, " ");
+}
+
 describe("ClusterView inbound admission", () => {
   it("loads this node's own scrape on the same cadence as the roster", () => {
     expect(clusterView).toContain("api.metrics()");
@@ -39,16 +44,36 @@ describe("ClusterView inbound admission", () => {
 
   it("distinguishes an unreported counter from a zero one", () => {
     expect(admissionPanel).toContain('v-else-if="!report"');
-    expect(admissionPanel).toContain("refused no inbound peer connection");
+    expect(collapse(admissionPanel)).toContain(
+      "refused no inbound peer connection",
+    );
     expect(admissionPanel).toContain("not reported");
     // A zeroed StatCard must never stand in for the absent family.
     expect(admissionPanel).not.toMatch(/report\?\.refusals \?\? 0/);
   });
 
+  it("does not flip the empty panel back to a loading message on every poll", () => {
+    // `scrapeLoading` is the in-flight guard for the 15s poll, which is a
+    // different question from whether a reading has arrived. Handing it to
+    // the panel raw swapped the not-reported empty state for "reading
+    // admission metrics" every fifteen seconds on a node that has refused
+    // nothing, because both branches key off an undefined report.
+    expect(clusterView).toContain(':loading="scrapeLoading && !scrapeLoaded"');
+    expect(clusterView).toContain("scrapeLoaded.value = true");
+  });
+
+  it("uses the section idiom of the roster and rollouts around it", () => {
+    expect(admissionPanel).toContain('class="data-section"');
+    expect(admissionPanel).toContain('class="sb-eyebrow"');
+    expect(admissionPanel).toContain('class="sb-card table-shell"');
+  });
+
   it("separates the routine idle reclaim from a peer being turned away", () => {
     expect(admissionPanel).toContain("Peers turned away");
     expect(admissionPanel).toContain("Idle connections reclaimed");
-    expect(admissionPanel).toContain("routine housekeeping, not a refusal");
+    expect(collapse(admissionPanel)).toContain(
+      "routine housekeeping, not a refusal",
+    );
   });
 
   it("renders errors and the retry through the shared components", () => {
@@ -60,7 +85,9 @@ describe("ClusterView inbound admission", () => {
   it("keeps the attacker-chosen peer address out of the table", () => {
     // The counter deliberately carries no peer label: it would mint one
     // series per source. The copy has to say where the address is instead.
-    expect(admissionPanel).toContain("peer address is in the node log");
+    expect(collapse(admissionPanel)).toContain(
+      "peer address is in the node log",
+    );
     expect(admissionPanel).not.toContain('"peer"');
   });
 });

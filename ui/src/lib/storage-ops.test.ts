@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { parsePrometheus } from "./metrics";
+import { parsePrometheus, sumSamples } from "./metrics";
 import {
   STORAGE_OP_DURATION_FAMILY,
   STORAGE_OP_ERRORS_FAMILY,
@@ -72,9 +72,14 @@ describe("storage backend operations", () => {
   it("counts operations off the histogram _count, never the buckets", () => {
     const report = storageOps(parsePrometheus(SCRAPE));
 
-    // Summing every sample in the folded family would add 325 bucket
-    // observations to the two counts and report 465 operations.
+    // Summing every sample in the folded family adds the cumulative buckets
+    // (465, counting the two +Inf samples) and the two _sum samples (0.45) to
+    // the two real counts, and reports 605.45 operations.
     expect(report?.operations).toBe(140);
+    const duration = parsePrometheus(SCRAPE).find(
+      (family) => family.name === STORAGE_OP_DURATION_FAMILY,
+    );
+    expect(sumSamples(duration)).toBeCloseTo(605.45, 6);
     expect(report?.errors).toBe(4);
     expect(report?.backends).toEqual(["redis"]);
   });
