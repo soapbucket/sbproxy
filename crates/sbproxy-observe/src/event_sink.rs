@@ -155,7 +155,7 @@ const WEBHOOK_SENSITIVE_HEADERS: [&str; 2] = ["x-sbproxy-signature", "x-sbproxy-
 /// request path, once per candidate event, before anything is allocated:
 /// it has to be cheaper than the event it is deciding not to build.
 ///
-/// `u32` holds the eighteen bits [`ALL_EVENT_TYPES`] declares with room to
+/// `u32` holds the nineteen bits [`ALL_EVENT_TYPES`] declares with room to
 /// spare. A nineteenth variant is caught by that array's fixed length
 /// long before it reaches the width of this word. (`u16` held the
 /// original thirteen; the five key-lifecycle types of WOR-2571 pushed

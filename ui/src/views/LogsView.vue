@@ -381,6 +381,9 @@ function detailFields(request: RequestLog): DetailField[] {
   push("Key id", request.api_key_id);
   push("Key mode", request.key_mode);
   push("Key provider", request.key_provider);
+  // Which credential paid for this row: the entry's own key, the
+  // caller's native key, or the operator's fallback credential.
+  push("Credential source", request.credential_source);
   push("Tenant", request.tenant_id);
   push("User", request.user_id);
   // WOR-2094: what the gateway decided, and under which generations.

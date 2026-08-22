@@ -1210,6 +1210,16 @@ pub struct RequestContext {
     /// field to this name, because a local engine reports its weights
     /// file path there, which is not the id any plane routed on.
     pub ai_serve_model: Option<String>,
+    /// Which secret the accepted AI attempt presented upstream
+    /// (WOR-2655). Closed set, an outbound counterpart to the inbound
+    /// `key_mode`: `provider_entry` (the provider entry's own
+    /// `api_key`), `native_caller` (a caller-owned native provider key
+    /// forwarded verbatim), or `fallback` (the operator's
+    /// `fallback_credential_id`, presented after the entry's own key
+    /// was refused). `None` on requests the AI gateway did not
+    /// dispatch. Never carries the credential itself, only which one
+    /// paid.
+    pub ai_credential_source: Option<&'static str>,
     /// Prompt / input tokens reported by the provider response.
     pub ai_tokens_in: Option<u64>,
     /// WOR-1499: estimated prompt tokens computed on the request path
@@ -1935,6 +1945,7 @@ impl RequestContext {
             ai_model: None,
             ai_logical_model: None,
             ai_serve_model: None,
+            ai_credential_source: None,
             ai_tokens_in: None,
             ai_prompt_tokens_est: None,
             ai_prompt_fingerprint: None,

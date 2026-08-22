@@ -1425,6 +1425,12 @@ impl AiHandlerConfig {
                         provider.name
                     )
                 })?;
+            provider.validate_key_failure_posture().map_err(|error| {
+                anyhow::anyhow!(
+                    "ai provider {:?} key failure posture: {error}",
+                    provider.name
+                )
+            })?;
             provider
                 .validate_base_url()
                 .map_err(|e| anyhow::anyhow!("ai provider {:?} base_url: {e}", provider.name))?;

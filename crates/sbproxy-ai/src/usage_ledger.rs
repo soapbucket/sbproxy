@@ -478,6 +478,7 @@ mod tests {
             workflow_id: None,
             logical_model: None,
             served_model: None,
+            credential_source: None,
         }
     }
 

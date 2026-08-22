@@ -9238,6 +9238,7 @@ allow := false if {
             workflow_id: None,
             logical_model: None,
             served_model: None,
+            credential_source: None,
         };
         sinks[0].record(&event);
 

@@ -437,6 +437,12 @@ pub struct RequestLogEntry {
     /// Recognized native provider label; never credential material.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_provider: Option<String>,
+    /// Which secret the AI attempt presented upstream (WOR-2655):
+    /// `provider_entry`, `native_caller`, or `fallback`. The outbound
+    /// counterpart to `key_mode`. Absent on rows the AI gateway did not
+    /// dispatch. Never credential material.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_source: Option<String>,
     /// Origin-scoped tenant label (`__default__` when unset).
     #[serde(skip_serializing_if = "String::is_empty", default)]
     pub tenant_id: String,
@@ -3548,7 +3554,7 @@ impl ExportFormat {
 /// the column index a spreadsheet or a billing importer has already
 /// bound to. Unlike the JSONL shape, a CSV row is positional, so the
 /// order is part of the contract.
-const EXPORT_CSV_COLUMNS: [&str; 36] = [
+const EXPORT_CSV_COLUMNS: [&str; 37] = [
     "timestamp",
     "origin",
     "method",
@@ -3585,6 +3591,10 @@ const EXPORT_CSV_COLUMNS: [&str; 36] = [
     "deny_reason",
     "policy_decisions",
     "properties",
+    // Appended last, because the order is the contract: an existing
+    // importer keyed on column position keeps working and a new one
+    // reads which credential paid for the row.
+    "credential_source",
 ];
 
 /// One row's value in `column`, as text.
@@ -3626,6 +3636,7 @@ fn export_csv_cell(entry: &RequestLogEntry, column: &str) -> String {
         "api_key_id" => text(&entry.api_key_id),
         "key_mode" => entry.key_mode.clone(),
         "key_provider" => text(&entry.key_provider),
+        "credential_source" => text(&entry.credential_source),
         "tenant_id" => entry.tenant_id.clone(),
         "user_id" => text(&entry.user_id),
         "error_class" => text(&entry.error_class),

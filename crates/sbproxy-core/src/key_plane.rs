@@ -268,6 +268,17 @@ pub struct ResolvedCredential {
     pub header: String,
     /// Full header value, scheme prefix already applied.
     pub value: String,
+    /// The bare secret, with no header name and no scheme prefix.
+    ///
+    /// Carried alongside [`Self::value`] rather than derived from it,
+    /// for the callers that write the credential somewhere other than
+    /// this record's own header: an AI provider entry, for one, whose
+    /// vendor decides both the header name and whether a scheme prefix
+    /// belongs there at all (`x-api-key` bare for Anthropic, `Bearer `
+    /// for OpenAI). Stripping the scheme back off `value` at the call
+    /// site would make every such caller re-derive a fact this
+    /// resolution already had.
+    pub material: String,
 }
 
 /// Why a key's bound credential could not be presented.
@@ -448,6 +459,38 @@ impl KeyPlane {
             started.elapsed().as_secs_f64(),
         );
         result
+    }
+
+    /// Resolve a credential into its bare secret, with no header name
+    /// and no scheme prefix.
+    ///
+    /// For callers that present the material under a header the
+    /// *destination* names rather than the one the credential record
+    /// carries. The AI provider fallback is the case: the vendor's
+    /// wire shape belongs to `sbproxy_ai::ProviderConfig::auth_header`,
+    /// and a record seeded with `Bearer ` would otherwise send
+    /// `x-api-key: Bearer sk-...` to Anthropic.
+    ///
+    /// This is a projection of [`Self::resolve_credential_secret`] and
+    /// deliberately not a second resolution path: it calls the same
+    /// entry point, so the resolution histogram is observed once, the
+    /// resolved-secret cache is read and written once, and
+    /// `credential_resolved` publishes exactly as the return-path table
+    /// on the inner function says. A copy of the resolution body here
+    /// would double the typed event for one request.
+    ///
+    /// # Errors
+    ///
+    /// Every [`CredentialResolveError`] variant means "refuse". Same
+    /// set, same meanings, including the cross-tenant refusal.
+    pub async fn resolve_credential_material(
+        &self,
+        id: &str,
+        tenant_id: Option<&str>,
+    ) -> std::result::Result<String, CredentialResolveError> {
+        self.resolve_credential_secret(id, tenant_id)
+            .await
+            .map(|resolved| resolved.material)
     }
 
     /// [`Self::resolve_credential_secret`] minus the metrics wrapper.
@@ -638,6 +681,7 @@ impl KeyPlane {
         let resolved = ResolvedCredential {
             header: record.header.trim().to_ascii_lowercase(),
             value: format!("{}{}", record.scheme, secret),
+            material: secret,
         };
         self.resolved_credentials.lock().insert(
             id.to_string(),
@@ -2456,6 +2500,81 @@ mod resolve_credential_secret_tests {
         assert_eq!(resolved.value, "Bearer abc123");
     }
 
+    /// WOR-2655: the AI provider fallback presents this material under
+    /// the *vendor's* header, not the credential record's, so it needs
+    /// the secret with the record's scheme stripped back off. The
+    /// fixture deliberately uses the default `Bearer ` scheme, which is
+    /// exactly the prefix that would arrive as
+    /// `x-api-key: Bearer sk-...` at Anthropic if this projection were
+    /// wrong.
+    #[tokio::test]
+    async fn resolve_credential_material_yields_the_secret_without_the_scheme() {
+        invalidate_all_resolved_credentials();
+        let p = plane();
+        put(
+            &p,
+            credential(
+                "c-material",
+                CredentialMaterial::Plaintext {
+                    value: "sk-house-openai".into(),
+                },
+            ),
+        )
+        .await;
+
+        let presented = p
+            .resolve_credential_secret("c-material", None)
+            .await
+            .expect("resolves");
+        assert_eq!(
+            presented.value, "Bearer sk-house-openai",
+            "the header form keeps the record's scheme"
+        );
+
+        invalidate_all_resolved_credentials();
+        let material = p
+            .resolve_credential_material("c-material", None)
+            .await
+            .expect("resolves");
+        assert_eq!(material, "sk-house-openai");
+    }
+
+    /// WOR-2655: the cross-tenant refusal is inherited from the shared
+    /// inner resolution rather than re-implemented, so this proves it
+    /// survived the projection. A fallback credential that leaked
+    /// across tenants would hand one tenant's requests another tenant's
+    /// upstream identity and their bill.
+    #[tokio::test]
+    async fn resolve_credential_material_refuses_across_tenants() {
+        invalidate_all_resolved_credentials();
+        let p = plane();
+        let mut rec = credential(
+            "c-tenant-bound",
+            CredentialMaterial::Plaintext {
+                value: "sk-acme-only".into(),
+            },
+        );
+        rec.tenant_id = Some("acme".to_string());
+        put(&p, rec).await;
+
+        assert!(matches!(
+            p.resolve_credential_material("c-tenant-bound", Some("globex"))
+                .await,
+            Err(CredentialResolveError::TenantMismatch)
+        ));
+        // And an unscoped request is not a wildcard either.
+        assert!(matches!(
+            p.resolve_credential_material("c-tenant-bound", None).await,
+            Err(CredentialResolveError::TenantMismatch)
+        ));
+        assert_eq!(
+            p.resolve_credential_material("c-tenant-bound", Some("acme"))
+                .await
+                .expect("the owning tenant resolves it"),
+            "sk-acme-only"
+        );
+    }
+
     #[tokio::test]
     async fn a_missing_credential_is_an_error_not_a_fallback() {
         invalidate_all_resolved_credentials();
@@ -3053,6 +3172,95 @@ mod resolve_credential_secret_tests {
         );
         assert!(
             !content.contains("marker-value"),
+            "resolved material must never reach the typed feed: {content}"
+        );
+    }
+
+    /// WOR-2655, guarding the invariant the material projection
+    /// threatens. `resolve_credential_material` is a projection of
+    /// `resolve_credential_secret`, not a second resolution path, and
+    /// the reason is here: a copied resolution body would publish a
+    /// second `credential_resolved` for the same read, and a
+    /// per-request AI fallback would then put one event on the SIEM
+    /// feed per request instead of one per rotation.
+    ///
+    /// Red if the projection is ever reimplemented: two lines for one
+    /// credential, or a cached second call that publishes. One egress
+    /// install per process, which nextest's process-per-test model
+    /// guarantees.
+    #[tokio::test]
+    async fn resolve_credential_material_publishes_exactly_one_event() {
+        let _serialized = ROTATION_TEST_LOCK.lock().await;
+        invalidate_all_resolved_credentials();
+        sbproxy_vault::reset_process_rotation_for_test();
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("credential-material-events.ndjson");
+        let egress = sbproxy_observe::EventEgress::start(
+            sbproxy_observe::EventSinkTarget::File { path: path.clone() },
+            sbproxy_observe::EventTypeMask::from_types(&[
+                sbproxy_observe::EventType::CredentialResolved,
+            ]),
+            64,
+        )
+        .expect("file egress starts");
+        sbproxy_observe::install_event_egress(egress)
+            .expect("this test's own event egress installs exactly once in its own process");
+
+        let p = plane();
+        let secret_material = "sk-house-material-that-must-not-cross";
+        put(
+            &p,
+            credential(
+                "cred-material-feed",
+                CredentialMaterial::Plaintext {
+                    value: secret_material.into(),
+                },
+            ),
+        )
+        .await;
+        put(
+            &p,
+            credential(
+                "cred-material-marker",
+                CredentialMaterial::Plaintext {
+                    value: "material-marker-value".into(),
+                },
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            p.resolve_credential_material("cred-material-feed", None)
+                .await
+                .expect("resolves"),
+            secret_material
+        );
+        // Ride the cache: this second call must publish nothing.
+        p.resolve_credential_material("cred-material-feed", None)
+            .await
+            .expect("the cached credential resolves");
+        // The marker resolves last, so once its event is on disk a
+        // second event for the first credential had every chance.
+        p.resolve_credential_material("cred-material-marker", None)
+            .await
+            .expect("the marker credential resolves");
+
+        poll_events_file(&path, |line| line.contains("cred-material-marker"))
+            .expect("the marker resolution must reach the egress");
+
+        let content = std::fs::read_to_string(&path).expect("events file is readable");
+        let lines: Vec<&str> = content
+            .lines()
+            .filter(|line| line.contains("cred-material-feed"))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "one actual resolution, one event; the projection must not add a second: {content}"
+        );
+        assert!(
+            !content.contains(secret_material),
             "resolved material must never reach the typed feed: {content}"
         );
     }

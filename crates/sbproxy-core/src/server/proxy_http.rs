@@ -8286,6 +8286,7 @@ impl ProxyHttp for SbProxy {
                 api_key_id: accountable_key_id,
                 key_mode: ctx.inbound_key_mode.as_str().to_string(),
                 key_provider: ctx.native_key_provider.clone(),
+                credential_source: ctx.ai_credential_source.map(str::to_string),
                 tenant_id: ctx.tenant_id.to_string(),
                 user_id: ctx.user_id.clone(),
                 // WOR-2094: explainability columns; every row names the

@@ -239,6 +239,12 @@ pub enum EventType {
     /// (WOR-2571). Fires once per actual resolution, never on the
     /// per-request cache hit.
     CredentialResolved,
+    /// Event name `credential_fallback`. An AI provider refused the
+    /// provider entry's own key with a `401`/`403` and the request was
+    /// retried against the same provider on the operator's
+    /// `fallback_credential_id`. Names the provider, the credential id,
+    /// and whether the retry was served; never any secret.
+    CredentialFallback,
 }
 
 impl ProxyEvent {
@@ -278,10 +284,10 @@ impl ProxyEvent {
 ///
 /// The array length is written out, so a variant added to the enum and
 /// not added here fails to compile. That is deliberate. The failure
-/// mode this prevents is a nineteenth event type that no `events:` sink
+/// mode this prevents is a twentieth event type that no `events:` sink
 /// can ever be told to deliver, which looks exactly like a working sink
 /// to everyone except the operator waiting for the event.
-pub const ALL_EVENT_TYPES: [EventType; 18] = [
+pub const ALL_EVENT_TYPES: [EventType; 19] = [
     EventType::RequestStarted,
     EventType::RequestCompleted,
     EventType::RequestError,
@@ -300,6 +306,7 @@ pub const ALL_EVENT_TYPES: [EventType; 18] = [
     EventType::KeyRotated,
     EventType::KeyBlocked,
     EventType::CredentialResolved,
+    EventType::CredentialFallback,
 ];
 
 impl EventType {
@@ -330,6 +337,7 @@ impl EventType {
             Self::KeyRotated => "key_rotated",
             Self::KeyBlocked => "key_blocked",
             Self::CredentialResolved => "credential_resolved",
+            Self::CredentialFallback => "credential_fallback",
         }
     }
 
@@ -364,6 +372,7 @@ impl EventType {
             Self::KeyRotated => 15,
             Self::KeyBlocked => 16,
             Self::CredentialResolved => 17,
+            Self::CredentialFallback => 18,
         }
     }
 
@@ -405,6 +414,10 @@ impl EventType {
                 | Self::KeyRotated
                 | Self::KeyBlocked
                 | Self::CredentialResolved
+                // The AI provider-key fallback publishes from the one
+                // arm in `sbproxy_core::server::ai_dispatch` that swaps
+                // the credential mid-request.
+                | Self::CredentialFallback
         )
         // `CacheHit` and `CacheMiss` are deliberately absent: wiring
         // them per-request would put an NDJSON line on every configured
@@ -759,6 +772,41 @@ mod tests {
                  route it to another type's bit"
             );
         }
+    }
+
+    /// WOR-2655: the nineteenth type, pinned across all four
+    /// hand-maintained surfaces at once.
+    ///
+    /// The array length is compile-checked; `index()`, `as_str()` and
+    /// `has_emitter()` are hand-written matches that are not checked
+    /// against the array by the compiler. A half-added variant
+    /// compiles, resolves from `events.types:`, and then routes to
+    /// another type's mask bit, which reads as a working sink to
+    /// everyone except the operator waiting for the event.
+    #[test]
+    fn credential_fallback_is_declared_on_every_hand_maintained_surface() {
+        assert_eq!(
+            EventType::CredentialFallback.as_str(),
+            "credential_fallback"
+        );
+        assert_eq!(
+            EventType::from_name("credential_fallback"),
+            Some(EventType::CredentialFallback)
+        );
+        assert!(
+            ALL_EVENT_TYPES.contains(&EventType::CredentialFallback),
+            "an events.types: entry can only name a type the array lists"
+        );
+        assert_eq!(
+            EventType::CredentialFallback.index(),
+            ALL_EVENT_TYPES.len() - 1,
+            "the new variant is appended, so its bit is the last one"
+        );
+        assert!(
+            EventType::CredentialFallback.has_emitter(),
+            "sbproxy_core::server::ai_dispatch publishes it from the \
+             provider-key fallback arm"
+        );
     }
 
     #[test]

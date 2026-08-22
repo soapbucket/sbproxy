@@ -924,6 +924,26 @@ field a source does not read is refused rather than ignored, so a rename would
 surface as a config error rather than as a silently unsigned request.
 `api_key` and `aws_sigv4` on one provider entry are refused together.
 
+### `providers[]` - provider-key failure fallback
+
+| Field | Type | Default | Stability | Notes |
+|---|---|---|---|---|
+| `on_key_failure` | enum | `fallback` | **beta** | `fallback` or `fail_closed`. Decides what a `401`/`403` from this provider does to the request. |
+| `fallback_credential_id` | string | - | **beta** | Names a `key_management.seed.credentials[]` record. Never a secret; resolved per request through the key plane. |
+
+Both are **beta** for their first release. The pair is inert on a config that
+sets neither, and the default's *name* says `fallback` while its *behavior*
+without a credential id is identical to `fail_closed`, which is what makes it
+safe on an existing config. The two are refused together when the posture is
+`fail_closed`, and `fallback_credential_id` is refused on a `serve:`,
+`managed_model`, or `aws_sigv4` entry, because none of those presents a static
+upstream key for it to replace.
+
+The trigger set is the part most likely to move, and it is deliberately the
+narrowest it can be: `401` and `403` only. Widening it would need a precedence
+ruling against the availability failover, which already owns every other
+failure class.
+
 ### Body Modifier (request)
 
 | Field | Type | Stability |

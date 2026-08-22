@@ -2321,6 +2321,7 @@ fn usage_event_from_context(
         // is present exactly when the request never left the box.
         logical_model: ctx.ai_logical_model.clone(),
         served_model: ctx.ai_serve_model.clone(),
+        credential_source: ctx.ai_credential_source.map(str::to_string),
     }
 }
 
