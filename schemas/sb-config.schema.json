@@ -6005,7 +6005,7 @@
       "additionalProperties": false
     },
     "LuaSandboxConfig": {
-      "description": "Sandbox configuration applied to every Lua script invocation.\n\nThree knobs:\n\n* `max_execution_ms` is a wall-clock budget enforced through the Luau interrupt callback. Once exceeded, the script is aborted with an `Error::external` propagated back to the caller. * `max_memory_mb` caps the Lua VM's total allocator footprint. Allocations past the limit fail the script with `Error::MemoryError`, which is far cheaper than letting a runaway script OOM the proxy process. * `allow_patterns` gates the Lua pattern API (`string.find`, `string.match`, `string.gmatch`). The pattern engine has known pathological inputs that can lock a worker, so operators who do not need patterns can drop them entirely.\n\nThe on-the-wire field uses `max_memory_mb` (megabytes) because that is the unit operators reason about; the engine converts to bytes internally.",
+      "description": "Sandbox configuration applied to every Lua script invocation.\n\nThree knobs:\n\n* `max_execution_ms` is a wall-clock budget enforced through the Luau interrupt callback. Once exceeded, the script is aborted with an `Error::external` propagated back to the caller. * `max_memory_mb` caps the Lua VM's total allocator footprint. Allocations past the limit fail the script with `Error::MemoryError`, which is far cheaper than letting a runaway script OOM the proxy process. * `allow_patterns` gates the Lua pattern API (`string.find`, `string.match`, `string.gmatch`, `string.gsub`). The pattern engine has known pathological inputs that can lock a worker, and `max_execution_ms` cannot preempt one because the matcher runs inside the C string library where the interrupt never fires. So operators who do not need patterns can drop them entirely.\n\nThe on-the-wire field uses `max_memory_mb` (megabytes) because that is the unit operators reason about; the engine converts to bytes internally.",
       "type": "object",
       "properties": {
         "max_execution_ms": {
@@ -6023,7 +6023,7 @@
           "minimum": 0.0
         },
         "allow_patterns": {
-          "description": "Whether to expose the Lua pattern API (`string.find`, `string.match`, `string.gmatch`). Default: `true` for back compatibility; flip to `false` to disable pattern matching.",
+          "description": "Whether to expose the Lua pattern API (`string.find`, `string.match`, `string.gmatch`, `string.gsub`). Those four are the whole pattern-taking surface of the `string` table; the rest of it (`upper`, `len`, `sub`, `rep`, and the others) stays available either way. Default: `true` for back compatibility; flip to `false` to disable pattern matching.",
           "default": true,
           "type": "boolean"
         }

@@ -2222,6 +2222,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_key_cache_invalidation_failures_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_key_cache_invalidation_failure"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        registry: Registry::Default,
+        labels: &["scope"],
+        description: "Keystore cache-tier invalidations that did not reach the shared tier or its peers, by scope (key or all).",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_key_lookup_cache_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_key_lookup_cache"),
@@ -2483,6 +2494,17 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &[],
         description: "MCP peer-profile observations that could not be tracked because the peer registry was at capacity, globally or for the caller's tenant.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_mcp_tool_quota_registry_saturated_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_mcp_tool_quota_registry_saturated"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &[],
+        description: "MCP tools/call refused because the per-tool quota store was at capacity, globally or for the caller's tenant.",
         dead_reason: None,
     },
     MetricCapability {
@@ -3151,7 +3173,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["operation", "outcome"],
-        description: "Durable rows the settlement recovery worker moved, by recovery operation and committed outcome.",
+        description: "Durable rows the settlement recovery worker moved, by recovery operation and committed outcome. `outcome=\"failed\"` is the exception and counts sweeps rather than rows: one per sweep of that operation that returned a store error and moved nothing.",
         dead_reason: None,
     },
     MetricCapability {
@@ -3361,6 +3383,32 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["scan_path", "tenant"],
         description: "Requests blocked by the prompt_injection_v2 policy, by scan path (header_scan, body_scan, ai_body, a2a).",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_prompt_injection_v2_results_total",
+        kind: MetricKind::Counter,
+        // `body_aware_counter`, not the `record_metric` that increments it.
+        // Writer matching is textual and unqualified, and `record_metric`
+        // is a name a closure parameter in `sbproxy-core`'s
+        // `compression_value.rs` also carries, so it counts as a call site
+        // for a function that has nothing to do with this family. That is
+        // a live-writer guard that stays green after the real writer loses
+        // its last caller. `body_aware_counter` is unique in the
+        // workspace, is called only from `record_metric`, and builds this
+        // exact vec.
+        writer: Writer::Recorder("body_aware_counter"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        // Registered into the ProxyMetrics registry rather than the global
+        // one: the writer above builds the vec by hand and hands it to
+        // `metrics().registry`. Written without the trailing parenthesis on
+        // purpose. Recorder call sites are counted textually over raw
+        // source, comments included, so `name(` written here would count as
+        // a call and keep the live-writer check green on its own.
+        registry: Registry::Proxy,
+        labels: &["action", "label", "detector"],
+        description: "Body-aware prompt-injection detector results, by action taken, detection label, and detector name.",
         dead_reason: None,
     },
     MetricCapability {
@@ -3703,6 +3751,38 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &[],
         description: "Failed installs of the process-wide telemetry sink dispatcher.",
+        dead_reason: None,
+    },
+    // Both storage families are written by the same `observe_op` wrapper in
+    // `crates/sbproxy-storage/src/metrics.rs`, which every RedisStore trait
+    // method goes through. They shipped as `storage_op_*`, outside both
+    // sanctioned prefixes, which made them invisible twice over: the
+    // coverage guard only looked at sanctioned names, and a scrape config
+    // built from the prefixes this doc sanctions dropped them at the
+    // scrape. Renamed with the registry entries they always owed.
+    MetricCapability {
+        name: "sbproxy_storage_op_duration_seconds",
+        kind: MetricKind::Histogram,
+        // The static rather than `observe_op`: the wrapper is generic
+        // (`fn observe_op<F, T>(`), so the scanner's `fn observe_op(`
+        // definition needle would never match it.
+        writer: Writer::Recorder("STORAGE_OP_DURATION_SECONDS"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        registry: Registry::Default,
+        labels: &["op", "backend", "kind"],
+        description: "Latency of storage backend operations, by operation, backend, and record kind.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_storage_op_errors_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("STORAGE_OP_ERRORS_TOTAL"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        registry: Registry::Default,
+        labels: &["op", "backend", "kind", "error_kind"],
+        description: "Errors returned by storage backend operations, by operation, backend, record kind, and error variant.",
         dead_reason: None,
     },
     MetricCapability {

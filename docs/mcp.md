@@ -1,6 +1,6 @@
 # MCP gateway
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 SBproxy ships an MCP (Model Context Protocol) gateway that speaks
 JSON-RPC 2.0 over HTTP POST. Configure the `mcp` action on an origin
@@ -456,7 +456,20 @@ WARN mcp.catalog kind=added field=description classes=tag_block
 
 Counted on `sbproxy_mcp_concealed_text_findings_total{field, class,
 kind}`, where `class` is one of `tag_block`, `bidi_control`,
-`zero_width`, or `other_control`.
+`zero_width`, `variation_selector`, or `other_control`.
+
+`variation_selector` covers `U+FE00` to `U+FE0F` and `U+E0100` to
+`U+E01EF`, 256 invisible code points wide enough to carry a byte each
+and the channel current smuggling work uses. This class has expected
+false positives and is the one place the paragraph below is bent:
+`U+FE0F` is the emoji presentation selector, and `U+E0100` onward is
+the Ideographic Variation Sequence range that Japanese and Chinese
+text uses to pick a specific glyph. A description ending in an emoji,
+or written in CJK, is reported. That is deliberate, because the code
+point a script needs and the code point a payload rides on are the
+same code point, and the class is kept separate from `zero_width`
+precisely so an operator can tell the noisy findings apart and set a
+baseline for them.
 
 Ordinary text in any language is never a finding. An Arabic or Hebrew
 description contains right-to-left characters by nature; only the
@@ -1014,6 +1027,29 @@ rbac_policies:
 
 The store is per-action and lives in process memory; SIGHUP reload
 rebuilds the action and resets the counters.
+
+A `per:` value outside `ms / s / m / h / d` is a hard config error
+naming the policy and the rule, so a typo like `per: 1hour` refuses
+the config instead of loading a quota nothing enforces.
+
+The store tracks one window per `(tenant_id, principal_id, tool_name)`
+and `principal_id` comes from the caller's virtual key or `sub`, so
+the number of windows follows traffic rather than the policy. Windows
+that have fully aged out are reclaimed automatically. Two ceilings
+bound what is left: 10,000 live windows per tenant, and 100,000 across
+the process. A tenant at its own ceiling is refused a window for any
+principal it has not seen inside the current window, and every other
+tenant is unaffected, so one tenant authenticating under many distinct
+`sub` values cannot starve anyone else. The refusal is fail-closed and
+uses the same `-32099` a caller over quota gets, on the grounds that a
+limiter which cannot count is not a limiter.
+
+Because it looks identical to a real quota rejection on the wire, the
+refusal has its own counter: alert on
+`sbproxy_mcp_tool_quota_registry_saturated_total`, which is non-zero
+only when traffic is being refused for a capacity reason rather than a
+policy one. A `warn` line naming the tool and which ceiling bound is
+logged once per ceiling per process.
 
 Source: `crates/sbproxy-extension/src/mcp/access_control.rs:ToolAccessPolicy`.
 

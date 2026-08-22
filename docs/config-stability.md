@@ -367,6 +367,34 @@ no surface carries the URL.
 find the `webhook` row for your collector, and add that host (and its port, if
 it is not 80 or 443) to `egress.usage_sinks.hosts`.
 
+### The usage ledger now `fsync`s every entry
+
+**Who this reaches.** Any config with a metering role, which is what makes
+the proxy open `proxy.attestation.ledger.path`. A deployment with no metering role
+never writes the file and is unaffected.
+
+**What changes.** Each ledger append now forces its entry to stable storage
+before returning, where before it called `Write::flush`, which `std::fs::File`
+documents as a no-op. Nothing about the file format, the hash chain, or the
+signatures changes; a file written by the previous release replays and
+verifies exactly as it did. What changes is throughput: the ledger's append
+rate is now bounded by how fast the filesystem under `proxy.attestation.ledger.path`
+can `fsync`, and appends are serialized behind one mutex, so a ledger on a
+network filesystem or a spinning disk is a new ceiling on metered request
+rate.
+
+**What an operator sees when it bites.** `sbproxy_meter_append_duration_seconds`
+moves, because it measures the whole critical section including the sync.
+Metering never fails a request, so the symptom is queueing on the metering
+path rather than errors.
+
+**What to do before upgrading.** Put `proxy.attestation.ledger.path` on local
+storage. If the histogram's tail is unacceptable there, the honest answer is
+that this deployment wants an unsigned usage sink rather than a receipt chain,
+because a chain whose entries are not durable cannot answer the dispute it
+exists for: a truncated hash chain verifies clean, so the lost entries leave
+no marker anywhere.
+
 ### `agent_classes.resolver.rdns_enabled` now runs under fixed lookup bounds
 
 **Who this reaches.** Any config that leaves `agent_classes.resolver.rdns_enabled`
@@ -418,6 +446,129 @@ OpenAPI tool calls, never its token endpoint.
 
 **What to do before upgrading.** Add every MCP token endpoint host to
 `egress.token_exchange.hosts` alongside the non-MCP ones already there.
+
+### `mcp.rbac_policies[].tool_quotas[].rate.per` is now validated at load
+
+**Who this reaches.** Any config with an `mcp` action whose `rbac_policies`
+declare a `tool_quotas[]` rule with a `per:` value the duration parser cannot
+read. The accepted suffixes are `ms`, `s`, `m`, `h`, and `d`; `per: 1hour`,
+`per: 60`, and `per: 1 hour` are all outside them. A config whose windows all
+use a documented suffix is unaffected.
+
+**What changes.** Nothing validated the string. The value was read for the
+first time on the request path, where a parse failure was treated as "this
+tool has no quota" and every `tools/call` passed, with no log line and no
+counter, so the operator's dashboard showed the quota configured and zero
+rejections. The action now refuses the config with an error naming the policy
+label, the tool, and the string it could not read. The request-path branch
+survives as a backstop and now denies the call instead of allowing it.
+
+**What an operator sees when it bites.** Startup or reload fails with
+`mcp action: rbac_policies['<label>']: tool_quotas rule for tool '<tool>' has
+an unparseable rate.per '<value>'`, listing the accepted suffixes. A reload
+leaves the previous generation serving.
+
+**What to do before upgrading.** Grep your configs for `per:` under
+`tool_quotas` and confirm every value ends in one of the five suffixes. A
+quota that has never rejected anything is the one to check first: under the
+old behavior an unreadable window and an unreached limit looked identical.
+
+### `proxy.scripting.lua.sandbox.allow_patterns: false` now also gates `string.gsub`
+
+**Who this reaches.** Any config that sets `allow_patterns: false` and whose
+Lua scripts call `string.gsub`. A config leaving `allow_patterns` at its
+`true` default is unaffected, and so is one whose scripts never call `gsub`.
+
+**What changes.** The gate stubbed `string.find`, `string.match`, and
+`string.gmatch` and left `string.gsub` reachable, so the knob whose stated
+purpose is containing the pattern engine left the same C-level matcher open.
+`gsub` is stubbed now, alongside the other three, which is the whole set of
+`string` functions that take a pattern.
+
+**What an operator sees when it bites.** The script fails with
+`Lua pattern API disabled by sandbox
+(proxy.scripting.lua.sandbox.allow_patterns)`, the same error the other three
+already raised, and the request fails closed the way any Lua error on that
+surface does.
+
+**What to do before upgrading.** Grep your Lua for `gsub`. Rewrite the call
+with `string.sub` and plain-text search, or set `allow_patterns: true` and
+accept that the pattern engine is on. Note what the flag buys either way:
+`max_execution_ms` cannot preempt a backtracking pattern, because the matcher
+runs inside the C string library where the interrupt the timer relies on never
+fires. Refusing the call is the only containment there is.
+
+### Circuit breakers now admit one probe at a time in half-open
+
+**Who this reaches.** Any config with a `circuit_breaker:` block on a
+`load_balancer` action, an AI router with circuit breaking enabled, or the AI
+crawl-control HTTP ledger client. A config with no breaker configured is
+unaffected.
+
+**What changes.** Half-open admitted every request that arrived. At high
+concurrency that meant the full request rate was pointed back at the upstream
+the instant `open_duration_secs` lapsed, before any of those requests had
+returned a verdict, once per open duration for as long as the upstream stayed
+down. Half-open now hands out one probe slot at a time: the request that takes
+it goes through, everything else is refused as if the breaker were still open,
+and the slot returns when that probe reports success or failure. A probe whose
+caller never reports an outcome is written off after one more open duration, so
+the breaker cannot get stuck refusing.
+
+**What an operator sees when it bites.** Fewer requests reach a recovering
+upstream, and recovery takes `success_threshold` sequential probes rather than
+one concurrent burst. On a load balancer the breaker is one narrowing stage
+among several and stays advisory: when it filters out every target in the pool,
+the request is still routed rather than failed, so a single-target pool behaves
+as before.
+
+**What to do before upgrading.** Nothing, unless you were relying on a
+recovering upstream absorbing a burst. If your upstream needs more than one
+concurrent probe to warm up, raise `success_threshold` rather than expecting
+concurrency.
+
+### Outlier ejection restarts the endpoint's measurement window
+
+**Who this reaches.** Any config with an `outlier_detection:` block whose
+`window_secs` is longer than its `ejection_duration_secs`, which is the
+default shape (60 s window, 30 s ejection).
+
+**What changes.** The failures that caused an ejection kept counting against
+the endpoint after it was re-admitted, until `window_secs` expired from the
+original window start. A re-admitted endpoint was therefore graded on
+pre-ejection traffic and was usually re-ejected on its first later error, so a
+configured 30 s ejection behaved as a `window_secs`-long one. Ejection now
+zeroes the endpoint's counters and starts a fresh window, so the post-ejection
+probe is graded only on post-ejection traffic.
+
+**What an operator sees when it bites.** Endpoints come back into the pool at
+the cooldown you configured instead of at the end of the window, and a healthy
+endpoint that takes one unrelated 5xx after re-admission stays in the pool.
+Endpoints that are genuinely still broken are re-ejected after `min_requests`
+fresh requests rather than immediately.
+
+**What to do before upgrading.** If you were leaning on the old behavior to
+keep a bad endpoint out for the length of the window, set
+`ejection_duration_secs` to the duration you actually want.
+
+### There is no PROXY protocol configuration key
+
+**Who this reaches.** Anyone deploying behind an AWS NLB, HAProxy, or another
+load balancer configured to send a PROXY protocol preamble.
+
+**What changes.** Nothing in the product. What changes is the claim:
+`comparison.md` listed PROXY protocol v1 as supported. It is not. A v1 parser
+exists in the source tree, no listener calls it, and no configuration key
+enables it. The comparison table now says so.
+
+**What an operator sees when it bites.** Every connection fails. The
+`PROXY TCP4 ...\r\n` line is handed to the HTTP parser as the request line and
+returns 400, and the client address that reaches the access log, the WAF, and
+the IP-filter policy is the load balancer's rather than the client's.
+
+**What to do before upgrading.** Turn PROXY protocol off on the load balancer
+in front of SBproxy and pass the client address in a header
+(`X-Forwarded-For`) instead.
 
 ### Redis-backed idempotency entries move to a new keyspace
 

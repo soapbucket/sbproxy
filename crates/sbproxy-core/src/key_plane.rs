@@ -2559,7 +2559,10 @@ mod resolve_credential_secret_tests {
         );
 
         p.invalidate_resolved_credential("c6");
-        p.cache().invalidate("c6").await;
+        p.cache()
+            .invalidate("c6")
+            .await
+            .expect("no tier attached in this test");
         assert_eq!(
             p.resolve_credential_secret("c6", None).await.unwrap().value,
             "Bearer second",
@@ -2782,7 +2785,10 @@ mod resolve_credential_secret_tests {
             .delete_credential("rotating")
             .await
             .expect("delete the record");
-        p.cache().invalidate("rotating").await;
+        p.cache()
+            .invalidate("rotating")
+            .await
+            .expect("no tier attached in this test");
         assert!(
             matches!(
                 p.resolve_credential_secret("rotating", None).await,

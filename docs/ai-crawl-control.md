@@ -1,5 +1,5 @@
 # AI Crawl Control + Pay Per Crawl
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 ![GPTBot receiving a 402 challenge, then the article after presenting a Crawler-Payment token](assets/ai-crawl-control.gif)
 
@@ -309,7 +309,7 @@ Exponential backoff with full jitter, max 5 attempts, per-attempt deadline 5 s, 
 
 Hard failures (`ledger.token_already_spent`, `ledger.signature_invalid`, `ledger.bad_request`) translate directly to a 402 to the crawler. There is no point retrying a token the ledger already rejected as spent.
 
-The circuit breaker opens after 10 consecutive failures, half-opens after 5 s with one probe, and closes on probe success. While the breaker is open, the client returns a synthetic `ledger.unavailable` error without making the network call. The policy treats that as "ledger is down" and fails closed: the crawler gets a 503 with a `ledger_unavailable` JSON body and a `Retry-After` header. There is no `on_ledger_failure` knob; fail-closed is the fixed behavior, because failing open would hand out the content the paywall exists to price.
+The circuit breaker opens after 10 consecutive failures, half-opens after 5 s and admits one probe at a time, and closes on probe success. While a probe is outstanding, other redeem calls are refused the same way they are while the breaker is open, so a recovering ledger sees one request rather than the full crawl. While the breaker is open, the client returns a synthetic `ledger.unavailable` error without making the network call. The policy treats that as "ledger is down" and fails closed: the crawler gets a 503 with a `ledger_unavailable` JSON body and a `Retry-After` header. There is no `on_ledger_failure` knob; fail-closed is the fixed behavior, because failing open would hand out the content the paywall exists to price.
 
 A ledger `Retry-After` propagates straight to the crawler on that 503 (defaulting to 5 seconds when the ledger did not send one), so the crawler knows when to come back.
 
@@ -386,6 +386,8 @@ policies:
 ```
 
 `agent_id` on a tier matches against the resolver's verdict. The first tier whose route pattern AND agent id both match wins. A tier without `agent_id` matches every agent. `expected_keyids` lets a verified Web Bot Auth signature classify the request even when the User-Agent string is missing or spoofed.
+
+Note the shape of every `expected_user_agent_pattern` above, because the proxy compiles the pattern exactly as you wrote it and adds nothing. The leading `(?i)` is yours: without it the pattern is case-sensitive, `gptbot/2` does not match `GPTBot/\d`, and the request is priced as `unknown` instead. The proxy warns once per such entry at load. The `\b` and the `/\d` are yours too: the match is a substring search, not an anchored one, which is what makes a pattern work against a compound header like `Mozilla/5.0 (compatible; GPTBot/1.2; +https://openai.com/gptbot)`. A bare `MyPartnerBot` with no delimiter therefore also matches `Mozilla/5.0 (compatible; MyPartnerBot-imposter)` and hands that client your partner's tier, so put a boundary the impersonator cannot append after your name. A `User-Agent` is unauthenticated in both directions in any case: `expected_keyids` and `expected_reverse_dns_suffixes` are what verify a crawler, and the UA pattern only classifies one.
 
 The default agent classes ship embedded in the binary. Use `catalog: inline` when you want `sb.yml` to provide a complete catalog with your own `expected_keyids`; use `catalog: builtin` or omit the block to keep the embedded catalog.
 

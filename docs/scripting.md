@@ -990,14 +990,14 @@ proxy:
       sandbox:
         max_execution_ms: 100   # wall-clock budget per invocation
         max_memory_mb: 8        # cap on the Lua VM's allocator footprint
-        allow_patterns: true    # expose string.find / string.match / string.gmatch
+        allow_patterns: true    # expose string.find / match / gmatch / gsub
 ```
 
 | Field | Default | Notes |
 |---|---|---|
 | `max_execution_ms` | `100` | Wall-clock budget per invocation. Scripts that exceed it abort with a sandbox-timeout error and the request fails closed. Set `0` to disable the timer (not recommended). |
 | `max_memory_mb` | `8` | Hard ceiling on the Lua VM's allocator footprint. Allocations past the cap fail the script rather than letting it grow the proxy's resident set. |
-| `allow_patterns` | `true` | Whether to expose the Lua pattern API (`string.find`, `string.match`, `string.gmatch`). The pattern engine has known pathological inputs; flip to `false` if your scripts do not need pattern matching. The rest of `string.*` keeps working either way. |
+| `allow_patterns` | `true` | Whether to expose the Lua pattern API (`string.find`, `string.match`, `string.gmatch`, `string.gsub`). Those four are every function in the `string` table that takes a pattern. The pattern engine has known pathological inputs, and `max_execution_ms` cannot stop one: the matcher runs inside the C string library, where the interrupt the timer relies on never fires. Flip to `false` if your scripts do not need pattern matching. The rest of `string.*` keeps working either way. |
 
 Limits apply to every Lua surface uniformly: request modifiers, response modifiers, JSON transforms, and WAF custom rules. Changes take effect on the next config reload (SIGHUP, admin reload, or filesystem watch) without restarting the process.
 
@@ -1364,7 +1364,7 @@ The four bullets below describe `policies[] type: rego` and `ai_routing_policy` 
 - No network operations.
 - Wall-clock budget (default 100 ms) enforced via the Luau interrupt callback; memory cap (default 8 MB) enforced by the allocator.
 - Deliberately has no instruction metering: the interrupt callback bounds an infinite loop by wall clock, so counting instructions would duplicate a bound that already holds. Setting `max_execution_ms: 0` disables the timer and is not recommended.
-- Available standard library: `string.*` (pattern functions gated by `allow_patterns`), `table.*`, `math.*`, `tonumber`, `tostring`, `type`, `pairs`, `ipairs`, `select`, `pcall`, `error`.
+- Available standard library: `string.*` (the pattern functions `find`, `match`, `gmatch`, and `gsub` gated by `allow_patterns`), `table.*`, `math.*`, `tonumber`, `tostring`, `type`, `pairs`, `ipairs`, `select`, `pcall`, `error`.
 
 ### JavaScript
 

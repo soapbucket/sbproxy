@@ -140,13 +140,17 @@ agent_classes:
   # `expected_user_agent_pattern` is intentionally a sentinel that
   # never matches a real header so the UA-matching path does not also
   # claim them; the resolver entry-point is the TLS fingerprint
-  # signal, not the User-Agent string.
+  # signal, not the User-Agent string. It carries `(?i)` like every
+  # other pattern here, not because case could matter to a string that
+  # matches nothing, but because a pattern compiled verbatim without
+  # that flag is warned about at load and a sentinel is not the thing
+  # an operator should be reading that warning for.
 
   - id: headless-browser
     vendor: Unknown
     purpose: unknown
     contact_url: https://sbproxy.dev/docs/configuration
-    expected_user_agent_pattern: "^__sbproxy_never_matches__$"
+    expected_user_agent_pattern: "(?i)^__sbproxy_never_matches__$"
     expected_reverse_dns_suffixes: []
     expected_keyids: []
     robots_compliance_score: 0.10
@@ -157,7 +161,7 @@ agent_classes:
     vendor: Puppeteer
     purpose: unknown
     contact_url: https://pptr.dev/
-    expected_user_agent_pattern: "^__sbproxy_never_matches__$"
+    expected_user_agent_pattern: "(?i)^__sbproxy_never_matches__$"
     expected_reverse_dns_suffixes: []
     expected_keyids: []
     robots_compliance_score: 0.10
@@ -168,7 +172,7 @@ agent_classes:
     vendor: Playwright
     purpose: unknown
     contact_url: https://playwright.dev/
-    expected_user_agent_pattern: "^__sbproxy_never_matches__$"
+    expected_user_agent_pattern: "(?i)^__sbproxy_never_matches__$"
     expected_reverse_dns_suffixes: []
     expected_keyids: []
     robots_compliance_score: 0.10

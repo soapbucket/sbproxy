@@ -678,6 +678,7 @@ fn concealment_class_label(label: &str) -> &'static str {
         "tag_block" => "tag_block",
         "bidi_control" => "bidi_control",
         "zero_width" => "zero_width",
+        "variation_selector" => "variation_selector",
         _ => "other_control",
     }
 }
@@ -5312,6 +5313,48 @@ mod tests {
             .iter()
             .all(|change| change.kind == "cleared"));
         assert_eq!(cleared.records.len(), 2);
+    }
+
+    /// Every concealment class reaches the metric as itself.
+    ///
+    /// `concealment_class_label` maps the change record's stored string
+    /// back to the closed-set literal the metric takes, and its final arm
+    /// is a catch-all that answers `other_control`. A class added to
+    /// `ConcealmentClass` and forgotten there is therefore reported as
+    /// the old catch-all bucket, silently: the finding still fires, the
+    /// counter still moves, and the label lies. The `variation_selector`
+    /// class was one arm away from exactly that.
+    ///
+    /// The local `label_of` is the tripwire. It has no wildcard, so a new
+    /// variant fails to compile here until it is named, which is when the
+    /// author sees the list below.
+    #[test]
+    fn every_concealment_class_reaches_the_metric_as_itself() {
+        fn label_of(class: ConcealmentClass) -> &'static str {
+            match class {
+                ConcealmentClass::TagBlock => "tag_block",
+                ConcealmentClass::BidiControl => "bidi_control",
+                ConcealmentClass::ZeroWidth => "zero_width",
+                ConcealmentClass::VariationSelector => "variation_selector",
+                ConcealmentClass::OtherControl => "other_control",
+            }
+        }
+
+        for class in [
+            ConcealmentClass::TagBlock,
+            ConcealmentClass::BidiControl,
+            ConcealmentClass::ZeroWidth,
+            ConcealmentClass::VariationSelector,
+            ConcealmentClass::OtherControl,
+        ] {
+            let stored = class.label();
+            assert_eq!(stored, label_of(class), "{class:?}");
+            assert_eq!(
+                concealment_class_label(stored),
+                stored,
+                "{class:?} must not fall through to the catch-all arm",
+            );
+        }
     }
 
     #[test]

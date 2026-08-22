@@ -42,9 +42,17 @@ const IMPLICIT_LABELS: &[&str] = &["job", "instance", "le", "quantile", "__name_
 ///
 /// `sbproxy_` covers the proxy and its gateway surfaces; `mesh_` covers
 /// the clustering substrate (SWIM membership, replication, cross-node
-/// transport). Both [`declared_metrics`] and [`references_in`] recognize
-/// exactly these prefixes: a declaration or query outside them is
-/// invisible to the drift guard.
+/// transport). [`references_in`] recognizes exactly these prefixes, so a
+/// dashboard query outside them is not read as a metric reference.
+///
+/// [`declared_metrics`] deliberately does *not* filter on them. It used
+/// to, and the consequence was a hole the size of the rule: a family
+/// declared as `storage_op_errors_total` was outside the prefix scan, so
+/// [`verify_coverage`] never saw it, never asked for a registry entry,
+/// and never noticed that a scrape config built from the sanctioned
+/// prefixes drops the family at the scrape. The guard has to be at least
+/// as wide as the rule it enforces, so the scan collects every declared
+/// name and `verify_coverage` refuses the unsanctioned prefix by name.
 const SANCTIONED_PREFIXES: &[&str] = &["sbproxy_", "mesh_"];
 
 /// Directories scanned for PromQL: dashboards and alert rules alike.
@@ -1123,13 +1131,19 @@ const METRIC_CTORS: &[&str] = &[
     "Gauge::new(",
 ];
 
-/// Every metric family name declared anywhere under `crates/`, for each
-/// prefix in `SANCTIONED_PREFIXES`.
+/// Every metric family name declared anywhere under `crates/`, whatever
+/// prefix it carries.
 ///
 /// This is the direction that keeps the registry honest as the code grows: a
 /// metric added to `metrics.rs` without a registry entry fails the build,
 /// exactly as a `serve:` schema field added without a capability entry
 /// already does. Without it the table is a snapshot that rots.
+///
+/// The scan walks constructors rather than prefixes, so an unsanctioned
+/// name is collected and then refused by [`verify_coverage`] instead of
+/// slipping past unseen. See `SANCTIONED_PREFIXES` for what that cost
+/// before. Test regions are already stripped from `SourceFile::text`, so a
+/// fixture metric inside a `#[cfg(test)]` module is not a declaration.
 pub fn declared_metrics(root: &Path) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
 
@@ -1137,20 +1151,21 @@ pub fn declared_metrics(root: &Path) -> BTreeSet<String> {
         let text = strip_comments(&source.text);
         let bytes = text.as_bytes();
 
-        for prefix in SANCTIONED_PREFIXES {
-            let quoted = format!("\"{prefix}");
-            for (at, _) in text.match_indices(&quoted) {
-                // The literal must be the first argument of a declaration.
-                let mut j = at;
-                while j > 0 && bytes[j - 1].is_ascii_whitespace() {
-                    j -= 1;
+        for ctor in METRIC_CTORS {
+            for (at, _) in text.match_indices(ctor) {
+                let mut j = at + ctor.len();
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
                 }
-                let head = &text[..j];
-                if !METRIC_CTORS.iter().any(|ctor| head.ends_with(ctor)) {
+                // The name must be the constructor's first argument as a
+                // literal. Anything else (a variable, a `format!`) is not a
+                // declaration this guard can read, and the `METRIC_CTORS`
+                // table's own entries land here as `"Opts::new(""`, whose
+                // next byte is the closing quote and so contributes nothing.
+                if bytes.get(j) != Some(&b'"') {
                     continue;
                 }
-
-                let start = at + 1;
+                let start = j + 1;
                 let mut end = start;
                 while end < bytes.len()
                     && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
@@ -1159,7 +1174,7 @@ pub fn declared_metrics(root: &Path) -> BTreeSet<String> {
                 }
                 // A dynamically composed name (`sbproxy_{lane}_...`) stops at
                 // the brace and is not a literal declaration.
-                if bytes.get(end) == Some(&b'"') {
+                if end > start && bytes.get(end) == Some(&b'"') {
                     out.insert(text[start..end].to_string());
                 }
             }
@@ -1169,13 +1184,37 @@ pub fn declared_metrics(root: &Path) -> BTreeSet<String> {
     out
 }
 
-/// Prove the registry covers every metric the code declares.
+/// Prove the registry covers every metric the code declares, and that
+/// every declared metric carries a sanctioned prefix.
+///
+/// The second half is not decoration. An operator's scrape config and
+/// federation relabel rules come from `docs/metrics-stability.md`, which
+/// sanctions `sbproxy_` and `mesh_` and nothing else, so a family outside
+/// those prefixes is dropped before it reaches a time series. Registering
+/// it would not help: the entry would document a name no scrape keeps.
+/// The name is what has to change, so this refuses the name.
 pub fn verify_coverage(metrics: &[MetricCapability], root: &Path) -> Vec<RegistryError> {
     let declared = declared_metrics(root);
     let registered: BTreeSet<&str> = metrics.iter().map(|m| m.name).collect();
     let mut errors = Vec::new();
 
     for name in &declared {
+        if !SANCTIONED_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
+            errors.push(RegistryError {
+                subject: name.clone(),
+                message: format!(
+                    "is declared in code with an unsanctioned name prefix. Only {} are \
+                     sanctioned, and a scrape config built from docs/metrics-stability.md \
+                     drops everything else, so this family produces no series at all. \
+                     Rename it under a sanctioned prefix and register it.",
+                    SANCTIONED_PREFIXES.join(" and ")
+                ),
+            });
+            continue;
+        }
         if !registered.contains(name.as_str()) {
             errors.push(RegistryError {
                 subject: name.clone(),
@@ -2217,6 +2256,76 @@ mod tests {
                 None
             },
         }
+    }
+
+    /// Write a one-crate repo under a temp root and run the coverage guard.
+    fn coverage_of(source: &str, metrics: &[MetricCapability]) -> Vec<RegistryError> {
+        let temp = tempfile::tempdir().expect("temp repo");
+        let src = temp.path().join("crates/example/src");
+        std::fs::create_dir_all(&src).expect("crate source directory");
+        std::fs::write(src.join("lib.rs"), source).expect("crate root");
+        verify_coverage(metrics, temp.path())
+    }
+
+    /// The hole this scan used to have. `storage_op_errors_total` was
+    /// registered into the Prometheus registry and written on every mesh
+    /// storage call, and the coverage guard could not see it because the
+    /// scan only looked for names that already carried a sanctioned prefix.
+    /// A guard that only inspects the cases that comply is no guard.
+    #[test]
+    fn an_unsanctioned_prefix_is_refused_rather_than_skipped() {
+        let errors = coverage_of(
+            r#"
+pub static C: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(Opts::new("storage_op_errors_total", "x"), &["op"]).unwrap()
+});
+"#,
+            &[],
+        );
+        assert_eq!(errors.len(), 1, "expected exactly one error: {errors:?}");
+        assert_eq!(errors[0].subject, "storage_op_errors_total");
+        assert!(
+            errors[0].message.contains("unsanctioned"),
+            "the refusal must name the prefix rule, not the missing entry: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_sanctioned_declaration_still_only_needs_a_registry_entry() {
+        let source = r#"
+pub static C: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(Opts::new("sbproxy_widget_total", "x"), &["op"]).unwrap()
+});
+"#;
+        let unregistered = coverage_of(source, &[]);
+        assert_eq!(unregistered.len(), 1, "{unregistered:?}");
+        assert!(unregistered[0]
+            .message
+            .contains("missing from the metric registry"));
+
+        let registered = coverage_of(
+            source,
+            &[metric(
+                "sbproxy_widget_total",
+                Writer::Recorder("record_widget"),
+                &["op"],
+            )],
+        );
+        assert!(registered.is_empty(), "{registered:?}");
+    }
+
+    /// `METRIC_CTORS` is itself a list of string literals that contain the
+    /// constructor text, and this scan walks constructor occurrences. The
+    /// byte after each of those is the closing quote, so they yield no name.
+    #[test]
+    fn the_constructor_table_does_not_declare_itself() {
+        let errors = coverage_of(
+            r#"
+const CTORS: &[&str] = &["Opts::new(", "register_counter!(", "IntGauge::new("];
+"#,
+            &[],
+        );
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[test]
