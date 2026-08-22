@@ -1214,13 +1214,19 @@ mod tests {
 
     /// The sharpest case in the finding: an embeddings-only vendor.
     ///
-    /// Voyage, Jina and Mixedbread carry `supports_chat: false` because
-    /// they have no chat endpoint at all. Reading the format-wide matrix
-    /// as an advertisement gave all three the full thirteen names,
-    /// starting with `chat_completions`.
+    /// Voyage and Jina carry `supports_chat: false` because they have no
+    /// chat endpoint at all. Reading the format-wide matrix as an
+    /// advertisement gave them the full thirteen names, starting with
+    /// `chat_completions`.
+    ///
+    /// Mixedbread used to belong here and no longer does: the catalog
+    /// refresh found its current API reference documents an
+    /// OpenAI-shaped `/v1/chat/completions`, so it is deliberately not
+    /// in this list. Keep this loop to vendors whose catalog entry says
+    /// `supports_chat: false`, and check that before adding one.
     #[test]
     fn an_embeddings_only_vendor_advertises_only_embeddings() {
-        for provider_type in ["voyage", "jina", "mixedbread"] {
+        for provider_type in ["voyage", "jina"] {
             let info = crate::providers::get_provider_info(provider_type).expect("catalog entry");
             assert!(!info.supports_chat, "{provider_type} has no chat endpoint");
             // `streaming` rides with chat and is narrowed by the same
