@@ -480,18 +480,40 @@ async fn a_failed_early_sweep_still_lets_the_later_sweeps_drain() {
         .await
         .expect("queue"));
 
-    // Break exactly the table the first stage reads, and nothing the later
-    // stages read. The saboteur connection does not enable foreign keys, so
-    // the drop leaves the attempt row and the envelope row in place, which is
-    // what makes this a per-stage failure rather than a broken database.
-    // Same shape as the storage failure `quote_nonce.rs` injects: it does not
-    // depend on filesystem permissions or on lock contention timing.
+    // Break the table the intent-side sweeps read, and nothing the usage
+    // drain or the envelope purge reads. Same shape as the storage failure
+    // `quote_nonce.rs` injects: it does not depend on filesystem permissions
+    // or on lock contention timing.
+    //
+    // `PRAGMA foreign_keys = OFF` is load-bearing, not decoration. rusqlite's
+    // bundled SQLite is built with `SQLITE_DEFAULT_FOREIGN_KEYS=1`, so a
+    // fresh connection arrives with enforcement already on, and a `DROP
+    // TABLE` prepared under enforcement runs an implicit `DELETE FROM` that
+    // fires the cascades: `payment_intents` -> `payment_attempts` -> this
+    // test's recovery envelope. Sabotage without the pragma therefore deleted
+    // the exact row the purge stage was supposed to delete, and the test read
+    // `envelopes_purged == 0` as a purge that never ran when the purge had
+    // simply been left nothing to find. Turning enforcement off on this one
+    // connection keeps the drop to the single table it names.
     {
         let saboteur = rusqlite::Connection::open(&world.path).expect("open a second connection");
         saboteur
-            .execute_batch("DROP TABLE payment_intents;")
+            .execute_batch("PRAGMA foreign_keys = OFF; DROP TABLE payment_intents;")
             .expect("drop the intent table");
     }
+
+    // The premise, checked instead of claimed in a comment: a sabotage that
+    // also removed the envelope would make the purge assertion below pass or
+    // fail for a reason that has nothing to do with stage independence.
+    assert!(
+        world
+            .store
+            .load_recovery_envelope(prepared.attempt_id())
+            .await
+            .expect("read the envelope back")
+            .is_some(),
+        "the sabotage must leave the expired envelope for the purge stage to find",
+    );
 
     let worker = world.worker();
     world.clock.advance(700_000);
