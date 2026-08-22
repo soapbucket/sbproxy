@@ -331,6 +331,54 @@ fleet starts refusing again without anyone intervening. Pin your image tag when
 you roll out.
 
 
+## Referencing a credential from an AI provider entry
+
+A seeded credential is also nameable from the other direction: an `ai_proxy`
+provider entry can point `fallback_credential_id` at one, and the gateway
+retries that provider on the named credential when the entry's own `api_key`
+is refused with a `401` or `403`.
+
+```yaml
+proxy:
+  key_management:
+    seed:
+      credentials:
+        - id: house-openai
+          provider: openai
+          vault_ref: vault://primary/secret/data/house/openai?key=api_key
+
+origins:
+  api.acme.example.com:
+    tenant_id: acme
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: vault://primary/secret/data/acme/openai?key=api_key
+          fallback_credential_id: house-openai
+```
+
+Two things this gets that a second `api_key` on the entry would not. The
+record resolves per request through the key plane rather than once at action
+build, so rotating it lands without a config reload and a vault outage inside
+the grace window still serves the last known-good value. And the tenant check
+above applies here too: a credential belonging to another tenant is refused at
+resolution, per request, not only when the config was written.
+
+**A credential the inbound key is BOUND to still never falls back.** The two
+mechanisms sit in the same problem space and answer opposite questions. A
+`credential_id` on a key is an identity the caller was granted, so failing over
+off it would hand that key an upstream identity it was never bound to, and it
+fails closed with a 503. `fallback_credential_id` on a provider entry is the
+operator's own alternative to the operator's own `api_key`, so retrying on it
+grants nobody anything they did not already have. Only the second one falls
+back.
+
+For the postures, the precedence against provider failover, and the rule that a
+caller-owned native credential never falls back, see
+[multi-tenant.md](multi-tenant.md#when-a-tenants-provider-key-is-refused).
+
+
 ## Store backends
 
 The store is sbproxy's own mutable system of record. It is distinct from the
@@ -1133,7 +1181,9 @@ Mint, revoke, rotate, and block additionally publish typed events on the
 `events:` egress (`key_minted`, `key_revoked`, `key_rotated`, `key_blocked`),
 so a SIEM alerts on a lifecycle change in real time instead of polling the
 admin API, and `credential_resolved` joins them whenever an upstream
-credential's material is actually read. Subscribe with the `events:` block:
+credential's material is actually read. `credential_fallback` joins them
+when an AI provider entry falls back onto a seeded credential, or fails to.
+Subscribe with the `events:` block:
 
 ```yaml
 events:
@@ -1146,6 +1196,7 @@ events:
     - key_rotated
     - key_blocked
     - credential_resolved
+    - credential_fallback
 ```
 
 A mint, rotate, block, revoke sequence lands in the feed as four NDJSON

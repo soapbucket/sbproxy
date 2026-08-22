@@ -1165,6 +1165,26 @@ content_policy_fallbacks: [permissive]   # provider refused on safety grounds
 
 Each list names providers from the same action's `providers:` (a name matching nothing fails config load). An oversized prompt is caught by the pre-flight token estimate and rerouted to a larger-window provider before anything dispatches, so streaming requests participate too. The estimate runs on the three token-priced chat surfaces, `/v1/chat/completions`, `/v1/messages`, and `/v1/responses`, since the last two reach the trigger already normalized to the canonical chat body; on any other surface the pre-flight half stands down and only a provider that answers with a recognizable context-overflow body trips the trigger. A content-policy refusal reroutes to the aimed list instead of whatever the chain had queued next. A typed reroute is visible on `sbproxy_ai_failovers_total{reason="context_window"|"content_policy"}`. The generic availability hop is on the same counter under a different spelling: `reason="http_<status>"` for a status-code failover, `reason="transport"` for a connection failure, and `reason="managed_cold_fallback"` for a cold managed replica. `generic` is not a value of that label; it is the `failover_trigger` value on the admin console's request log, where the closed set is `context_window`, `content_policy`, and `generic`. Full decision-path diagram, scope notes, and the per-class retry and cooldown interplay are in [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md#typed-fallback-triggers); the runnable, credential-free walkthrough is [examples/typed-fallbacks](../examples/typed-fallbacks/).
 
+### Credential rejection is not a failover
+
+A `401` or `403` from a provider is a statement about the credential, not about the provider, and the two get different machinery. This is the single most misreadable thing in the resilience surface, so the ruling, in one line: **key fallback owns `401` and `403`; the provider failover and `cooldown_policy` own everything else.**
+
+A `429`, a `5xx`, or a timeout says the provider cannot serve you right now, and a different key against a rate-limited provider is still rate limited, so those advance to the next provider. A `401` is not retryable by default and opens no failover, so with nothing else configured it reaches the caller verbatim. An entry can instead name an operator-held credential to retry the *same* provider on, once:
+
+```yaml
+providers:
+  - name: openai
+    api_key: vault://primary/secret/data/acme/openai?key=api_key
+    fallback_credential_id: house-openai   # a key_management.seed.credentials[] id
+    on_key_failure: fallback               # the default; `fail_closed` opts out
+```
+
+The retry keeps the provider, the model, the base URL, and the price the request was quoted at. It does not spend the availability budget, and it happens at most once per request. When the operator's credential is also refused, or does not resolve, the untried tail of the failover chain is still there behind it, so an availability failover runs exactly as it would have.
+
+A request that arrived carrying a caller-owned native provider key never falls back, whatever the entry says: the caller presented their own credential and the provider refused it, so spending yours would bill you for their authorization failure.
+
+`credential_source` on the admin request row (`provider_entry`, `native_caller`, `fallback`) says which secret paid, one `credential_fallback` event lands on the typed feed per swap, and `sbproxy_ai_key_fallbacks_total{provider,outcome}` counts the same decision for anyone alerting off the scrape rather than off the feed. Full decision path, the `fail_closed` argument, and a runnable walkthrough are in [multi-tenant.md](multi-tenant.md#when-a-tenants-provider-key-is-refused) and [examples/tenant-key-fallback](../examples/tenant-key-fallback/).
+
 ## Shadow eval
 
 Mirror a sampled set of non-streaming chat evaluation requests to a second provider. V1 includes Chat Completions plus Messages and Responses requests after those native formats are normalized to the chat hub. Mutating and non-chat surfaces, including Assistants, Threads, Batches, Fine Tuning, Files, images, audio, embeddings, moderation, and reranking, are never copied. The copy is taken after request policy, guardrails, model rewrites, and context compression. Shadow admission is bounded by both 16 in-flight tasks and a 64 MiB reservation budget per live AI client, and the upstream call is fire-and-forget: a slow, failed, timed-out, policy-disallowed, or saturated shadow never delays or rejects the primary. Streaming requests are intentionally skipped.

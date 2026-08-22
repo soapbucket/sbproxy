@@ -121,6 +121,35 @@ pub struct ProviderConfig {
     /// entry that can never serve the tier you asked for never boots.
     #[serde(default)]
     pub service_tier: Option<crate::service_tier::ServiceTier>,
+    /// What happens when this provider rejects the request's own
+    /// credential with a `401` or `403`.
+    ///
+    /// `fallback` (the default) retries this same provider once with
+    /// `fallback_credential_id`, if one is configured. `fail_closed`
+    /// returns the provider's rejection to the caller untouched, which
+    /// is what you want when the tenant's own key is the authorization
+    /// boundary and serving them on a house credential would let a
+    /// revoked tenant keep working.
+    ///
+    /// This only ever applies to this entry's own `api_key`. A request
+    /// carrying a caller-owned native credential never falls back to an
+    /// operator credential: the caller presented their own key and the
+    /// provider refused it, so spending yours would bill you for their
+    /// authorization failure.
+    #[serde(default)]
+    pub on_key_failure: KeyFailurePosture,
+    /// Id of the operator-held credential to retry with when this
+    /// entry's own `api_key` is rejected. Names a record under
+    /// `key_management.seed.credentials[]` (or one minted through the
+    /// admin key plane), never a secret written here.
+    ///
+    /// The record is resolved per request through the key plane, so it
+    /// picks up a rotation without a config reload, and it is refused
+    /// if it belongs to a different tenant than the request. Unset
+    /// means there is nothing to fall back to, and `on_key_failure:
+    /// fallback` then behaves exactly like `fail_closed`.
+    #[serde(default)]
+    pub fallback_credential_id: Option<String>,
     /// WOR-1652: optional local model-serving block. When set, the
     /// gateway itself hosts the models (pull weights, fit an engine to
     /// the GPU, supervise it) and registers them as local providers
@@ -203,6 +232,25 @@ pub struct BedrockGuardrailPassthrough {
     pub trace: bool,
 }
 
+/// What the gateway does when one provider entry's credential is
+/// rejected upstream.
+///
+/// The rejection this decides is a `401` or `403` from the provider,
+/// which is a statement about the credential rather than about the
+/// provider's health. A `429`, a `5xx`, or a timeout stays with the
+/// provider failover and `cooldown_policy`, because a different key
+/// against a rate-limited provider is still rate limited.
+#[derive(Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyFailurePosture {
+    /// Retry this provider once with `fallback_credential_id`. The
+    /// default, and inert on an entry that names no fallback credential.
+    #[default]
+    Fallback,
+    /// Return the provider's rejection to the caller unchanged.
+    FailClosed,
+}
+
 fn default_weight() -> u32 {
     1
 }
@@ -261,6 +309,47 @@ impl ProviderConfig {
                 "accept_native_credentials_for {bound:?} must match provider_type {:?}",
                 self.effective_provider_type()
             ));
+        }
+        Ok(())
+    }
+
+    /// Validate the credential-failure posture and its fallback credential.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a `fallback_credential_id` that can never be presented:
+    /// paired with `on_key_failure: fail_closed`, or set on an entry
+    /// that has no static upstream credential to replace (a `serve:`
+    /// entry, a `managed_model` entry, or one that signs with AWS
+    /// SigV4). Each of those is a config that reads as configured and
+    /// does nothing at request time.
+    pub fn validate_key_failure_posture(&self) -> Result<(), String> {
+        let Some(id) = self.fallback_credential_id.as_deref() else {
+            return Ok(());
+        };
+        if id.trim().is_empty() {
+            return Err("fallback_credential_id must not be empty".to_string());
+        }
+        if self.on_key_failure == KeyFailurePosture::FailClosed {
+            return Err(
+                "fallback_credential_id is set but on_key_failure is fail_closed, so the \
+                 credential can never be presented; drop one of the two"
+                    .to_string(),
+            );
+        }
+        if self.is_managed_model() || self.serve.is_some() {
+            return Err(
+                "managed or locally served providers present no upstream credential, so \
+                 fallback_credential_id has nothing to replace"
+                    .to_string(),
+            );
+        }
+        if self.aws_sigv4.is_some() {
+            return Err(
+                "an aws_sigv4 provider signs each request instead of presenting a static \
+                 key, so fallback_credential_id has nothing to replace"
+                    .to_string(),
+            );
         }
         Ok(())
     }
@@ -525,6 +614,8 @@ mod tests {
             no_prompt_training: false,
             data_posture: None,
             service_tier: None,
+            on_key_failure: KeyFailurePosture::Fallback,
+            fallback_credential_id: None,
             serve: None,
             aws_sigv4: None,
             bedrock_guardrail: None,
@@ -1017,6 +1108,104 @@ mod tests {
             "AwsCredentialSource",
             "\"secret_access_key\"",
             "\"assume_role\"",
+        ] {
+            assert!(json.contains(needle), "schema is missing {needle}");
+        }
+    }
+
+    /// WOR-2655: the posture defaults to `fallback` and is inert
+    /// without a credential to fall back to, so an existing config
+    /// deserializes with no behavior change at all. This is the claim
+    /// the rustdoc, and therefore the operator-facing schema, makes.
+    #[test]
+    fn key_failure_posture_defaults_to_an_inert_fallback() {
+        let provider: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "openai-acme",
+            "api_key": "sk-tenant"
+        }))
+        .expect("an entry that names neither key still parses");
+        assert_eq!(provider.on_key_failure, KeyFailurePosture::Fallback);
+        assert_eq!(provider.fallback_credential_id, None);
+        provider
+            .validate_key_failure_posture()
+            .expect("the default pair is valid");
+    }
+
+    #[test]
+    fn fail_closed_parses_from_snake_case() {
+        let provider: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "openai-acme",
+            "api_key": "sk-tenant",
+            "on_key_failure": "fail_closed"
+        }))
+        .expect("the opt-out spelling parses");
+        assert_eq!(provider.on_key_failure, KeyFailurePosture::FailClosed);
+        provider
+            .validate_key_failure_posture()
+            .expect("an opt-out with no fallback credential is coherent");
+    }
+
+    /// A `fallback_credential_id` that can never be presented is a
+    /// config that reads as configured and does nothing, which is the
+    /// failure mode this validation exists to make loud.
+    #[test]
+    fn a_fallback_credential_that_can_never_be_presented_is_refused() {
+        let opted_out: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "openai-acme",
+            "api_key": "sk-tenant",
+            "on_key_failure": "fail_closed",
+            "fallback_credential_id": "house-openai"
+        }))
+        .expect("parses; the refusal is a validation, not a parse error");
+        let error = opted_out
+            .validate_key_failure_posture()
+            .expect_err("fail_closed plus a fallback credential is refused");
+        assert!(error.contains("fail_closed"), "{error}");
+
+        let managed: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "house-llama",
+            "provider_type": "managed_model",
+            "deployment": "llama-3-8b",
+            "fallback_credential_id": "house-openai"
+        }))
+        .expect("parses");
+        assert!(
+            managed.validate_key_failure_posture().is_err(),
+            "a managed deployment presents no upstream credential"
+        );
+
+        let signed: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "bedrock",
+            "provider_type": "bedrock",
+            "aws_sigv4": {"region": "us-east-1"},
+            "fallback_credential_id": "house-openai"
+        }))
+        .expect("parses");
+        assert!(
+            signed.validate_key_failure_posture().is_err(),
+            "a SigV4 entry signs each request and has no static key to replace"
+        );
+
+        let empty: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "openai-acme",
+            "api_key": "sk-tenant",
+            "fallback_credential_id": "   "
+        }))
+        .expect("parses");
+        assert!(empty.validate_key_failure_posture().is_err());
+    }
+
+    /// The two keys ship as the operator-facing JSON schema, so an
+    /// entry missing from it is one an operator mistypes in silence.
+    #[test]
+    fn json_schema_carries_the_key_failure_surface() {
+        let schema = schemars::schema_for!(ProviderConfig);
+        let json = serde_json::to_string(&schema).expect("schema serializes");
+        for needle in [
+            "\"on_key_failure\"",
+            "\"fallback_credential_id\"",
+            "fail_closed",
+            "KeyFailurePosture",
         ] {
             assert!(json.contains(needle), "schema is missing {needle}");
         }

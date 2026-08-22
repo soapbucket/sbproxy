@@ -234,6 +234,17 @@ pub struct LlmUsageEvent {
     /// replay of the verifiable ledger.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shadow_of: Option<String>,
+    /// Which secret the accepted upstream attempt presented
+    /// (WOR-2655): `provider_entry`, `native_caller`, or `fallback`.
+    ///
+    /// The outbound counterpart to the request row's inbound
+    /// `key_mode`, and it is on the spend record rather than only on
+    /// the log because it answers a billing question: an entry whose
+    /// `fallback` share climbs is one whose tenant key is dying and
+    /// whose spend is quietly moving onto the operator's account.
+    /// `None` on records the AI dispatch path did not produce.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_source: Option<String>,
 }
 
 /// A destination for completed-call usage events.
@@ -1448,6 +1459,7 @@ mod tests {
             served_model: None,
             finish_reason: None,
             shadow_of: None,
+            credential_source: None,
         }
     }
 

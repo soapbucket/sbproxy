@@ -86,7 +86,7 @@ pub use key_scoping::KeyPermissions;
 pub use model_alias::{ModelAlias, ModelAliasRegistry};
 pub use model_group::{GroupMember, ModelGroup, ModelGroupRegistry};
 pub use prompt_fingerprint::prompt_fingerprint;
-pub use provider::ProviderConfig;
+pub use provider::{KeyFailurePosture, ProviderConfig};
 pub use provider_ratelimit::{
     ProviderQuotaSnapshot, ProviderRateLimitTracker, ProviderRateState, QuotaSignalQuality,
     QuotaSignalSource,

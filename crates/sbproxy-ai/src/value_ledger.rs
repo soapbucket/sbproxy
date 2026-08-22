@@ -1002,6 +1002,7 @@ mod tests {
             served_model: Some(model.into()),
             finish_reason: None,
             shadow_of: None,
+            credential_source: None,
         }
     }
 
@@ -1022,6 +1023,7 @@ mod tests {
             served_model: None,
             finish_reason: None,
             shadow_of: None,
+            credential_source: None,
             ..event(model, prompt_tokens, completion_tokens)
         }
     }

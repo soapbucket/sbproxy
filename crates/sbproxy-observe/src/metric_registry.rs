@@ -962,6 +962,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_ai_key_fallbacks_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_key_fallback"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["provider", "outcome"],
+        description: "AI provider-key fallback decisions, by the provider entry whose own key was refused and the outcome (`engaged` when the operator's `fallback_credential_id` resolved and the retry was queued, `unavailable` when it did not and the provider's rejection stands). `unavailable` is the alertable one: it means the house credential is broken and the only other evidence is a `401` that reads like the tenant's fault.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_ai_lb_decisions_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_lb_decision"),

@@ -1690,6 +1690,8 @@ Peak EWMA accepts the object form:
 | `no_prompt_training` | bool | `false` | Marks the provider safe for training-sensitive prompts. Requests carrying the `x-sbproxy-disallow-prompt-training: true` header only route to providers with this flag; a request with the header and no marked provider in the chain gets a 400 `no_compliant_provider`. |
 | `service_tier` | string | unset | Upstream service tier this destination requests: `flex`, `standard`, or `priority`. Unset sends no tier field and the vendor serves on its own default. The operator's decision, not the caller's: a caller's `service_tier` is removed from every request and replaced by this value where it is set. To run two tiers of one vendor, declare two entries with the same `provider_type` and different tiers. A tier the provider catalog does not record for this vendor is refused at config load. See [ai-gateway.md](ai-gateway.md#service-tier). |
 | `data_posture` | object | unset | Operator override of this entry's declared data-handling posture, consulted by the action-level `data_posture:` filter: `zdr: true` declares this deployment holds a zero-data-retention arrangement (the only thing that makes a vendor which retains by default eligible for `require_zdr`), and `retains_data` overrides the catalog's retention declaration in either direction. Unset keeps the provider catalog's declaration. See [ai-gateway.md](ai-gateway.md#provider-data-posture). |
+| `on_key_failure` | enum | `fallback` | What happens when this provider rejects the request's own credential with a `401`/`403`. `fallback` retries the same provider once with `fallback_credential_id`; `fail_closed` returns the rejection to the caller untouched. Only ever applies to this entry's own `api_key`: a request carrying a caller-owned native credential never falls back. |
+| `fallback_credential_id` | string | unset | Id of the operator-held credential to retry with when this entry's `api_key` is rejected. Names a record under `key_management.seed.credentials[]` (or one minted through the admin key plane), never a secret written here, and it is resolved per request through the key plane so a rotation lands without a config reload and a cross-tenant record is refused. Unset means `on_key_failure: fallback` behaves as `fail_closed`. See [multi-tenant.md](multi-tenant.md#when-a-tenants-provider-key-is-refused). |
 | `aws_sigv4` | object | unset | Sign this provider's requests with AWS Signature Version 4, which is what Bedrock and SageMaker require in place of a bearer token. Presence of the block selects the signer. See [AWS SigV4 fields](#aws-sigv4-fields-providersaws_sigv4). |
 | `bedrock_guardrail` | object | unset | Run one of your Bedrock guardrails inside the `Converse` generation instead of as a separate `ApplyGuardrail` call. Keys: `identifier` and `version` (both required, sent as `guardrailIdentifier` / `guardrailVersion`), and `trace` (bool, default `false`, asks AWS which policies fired so the block reason can name them). Refused on any provider entry that is not Bedrock-format. See [guardrails.md](guardrails.md#bedrock-guardrails-inline-on-the-converse-call). |
 
@@ -1704,6 +1706,11 @@ discarded. `accept_native_credentials_for` is refused with `aws_sigv4` for the
 same reason, since it substitutes a caller-owned key for an `api_key` a signed
 provider does not use, and `aws_sigv4` is refused on a `serve:` or
 `managed_model` entry because neither dials AWS.
+
+`fallback_credential_id` is refused alongside `on_key_failure: fail_closed`,
+and on a `serve:`, `managed_model`, or `aws_sigv4` entry: in each of those a
+credential is named that can never be presented, which is a config that reads
+as configured and does nothing.
 
 #### AWS SigV4 fields (`providers[].aws_sigv4`)
 

@@ -172,6 +172,8 @@ mod tests {
             no_prompt_training: false,
             data_posture: None,
             service_tier: None,
+            on_key_failure: crate::provider::KeyFailurePosture::Fallback,
+            fallback_credential_id: None,
             serve: None,
             aws_sigv4: None,
             bedrock_guardrail: None,

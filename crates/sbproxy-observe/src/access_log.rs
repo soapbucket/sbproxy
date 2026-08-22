@@ -320,6 +320,14 @@ pub struct AccessLogEntry {
     /// Inbound credential mode (`none`, `minted`, or `native`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_mode: Option<String>,
+    /// Which secret the AI attempt presented upstream: `provider_entry`,
+    /// `native_caller`, or `fallback`. The outbound counterpart to
+    /// [`Self::key_mode`], and the field a log-based ledger reconciles
+    /// spend against when a tenant's own provider key stops working and
+    /// the operator's credential starts paying. Absent on requests the
+    /// AI gateway did not dispatch. Never credential material.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_source: Option<String>,
     /// True when this request was served from cache (hot or reserve)
     /// without contacting the upstream. Mirrors `cache_result == "hit"`
     /// but distinguishes hit-then-revalidated paths.
@@ -701,6 +709,7 @@ impl Default for AccessLogEntry {
             api_key_id: None,
             key_provider: None,
             key_mode: None,
+            credential_source: None,
             served_from_cache: None,
             fallback_triggered: None,
             retry_count: None,
@@ -1023,6 +1032,7 @@ mod tests {
             api_key_id: None,
             key_provider: None,
             key_mode: None,
+            credential_source: None,
             served_from_cache: None,
             fallback_triggered: None,
             retry_count: None,

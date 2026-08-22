@@ -178,6 +178,22 @@
         }
       ]
     },
+    "on_key_failure": {
+      "description": "What happens when this provider rejects the request's own credential with a `401` or `403`.\n\n`fallback` (the default) retries this same provider once with `fallback_credential_id`, if one is configured. `fail_closed` returns the provider's rejection to the caller untouched, which is what you want when the tenant's own key is the authorization boundary and serving them on a house credential would let a revoked tenant keep working.\n\nThis only ever applies to this entry's own `api_key`. A request carrying a caller-owned native credential never falls back to an operator credential: the caller presented their own key and the provider refused it, so spending yours would bill you for their authorization failure.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/KeyFailurePosture"
+        }
+      ]
+    },
+    "fallback_credential_id": {
+      "description": "Id of the operator-held credential to retry with when this entry's own `api_key` is rejected. Names a record under `key_management.seed.credentials[]` (or one minted through the admin key plane), never a secret written here.\n\nThe record is resolved per request through the key plane, so it picks up a rotation without a config reload, and it is refused if it belongs to a different tenant than the request. Unset means there is nothing to fall back to, and `on_key_failure: fallback` then behaves exactly like `fail_closed`.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "serve": {
       "description": "WOR-1652: optional local model-serving block. When set, the gateway itself hosts the models (pull weights, fit an engine to the GPU, supervise it) and registers them as local providers ahead of any cloud fallback, instead of proxying `base_url` to an already-running server. `None` keeps the proxy-only behavior. The lifecycle half (spawn/evict) ships in phases of the model-host epic; this field is the config surface it reads.",
       "anyOf": [
@@ -242,6 +258,25 @@
         "flex",
         "standard",
         "priority"
+      ]
+    },
+    "KeyFailurePosture": {
+      "description": "What the gateway does when one provider entry's credential is rejected upstream.\n\nThe rejection this decides is a `401` or `403` from the provider, which is a statement about the credential rather than about the provider's health. A `429`, a `5xx`, or a timeout stays with the provider failover and `cooldown_policy`, because a different key against a rate-limited provider is still rate limited.",
+      "oneOf": [
+        {
+          "description": "Retry this provider once with `fallback_credential_id`. The default, and inert on an entry that names no fallback credential.",
+          "type": "string",
+          "enum": [
+            "fallback"
+          ]
+        },
+        {
+          "description": "Return the provider's rejection to the caller unchanged.",
+          "type": "string",
+          "enum": [
+            "fail_closed"
+          ]
+        }
       ]
     },
     "ModelHostConfig": {

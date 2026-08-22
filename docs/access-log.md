@@ -290,6 +290,7 @@ restricts the rule set; accepted names are `email`, `us_ssn`,
 | `api_key_id` | string? | Stable identifier of the credential (virtual key) that authenticated the request, mirroring the `api_key_id` metric label. Never the raw secret. Absent for un-credentialed requests. |
 | `key_provider` | string? | Recognized native provider label when the request was governed by [native-key policy](key-management.md#attributing-native-provider-keys). Never contains credential material. |
 | `key_mode` | string? | Inbound credential mode: `none`, `minted`, or `native`. |
+| `credential_source` | string? | Which secret the AI attempt presented upstream, the outbound counterpart to `key_mode`: `provider_entry` (the provider entry's own `api_key`), `native_caller` (a caller-owned native provider key), or `fallback` (the operator's `fallback_credential_id`, presented after the entry's own key was refused). Absent on requests the AI gateway did not dispatch. Never credential material. See [multi-tenant.md](multi-tenant.md#when-a-tenants-provider-key-is-refused). |
 | `served_from_cache` | bool? | `true` when the response came from cache (hot or reserve) without contacting the upstream. |
 | `fallback_triggered` | bool? | `true` when the primary upstream failed and a `fallback_origin` served the response. |
 | `retry_count` | int? | Number of upstream retries attempted before the terminal outcome. `0` means the first attempt succeeded. |

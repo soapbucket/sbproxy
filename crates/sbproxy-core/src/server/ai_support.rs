@@ -2339,6 +2339,7 @@ fn usage_event_from_context(
         // response body on the billing path.
         finish_reason: None,
         shadow_of: None,
+        credential_source: ctx.ai_credential_source.map(str::to_string),
     }
 }
 

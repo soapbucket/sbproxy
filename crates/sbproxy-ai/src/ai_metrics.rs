@@ -198,6 +198,29 @@ static AI_FAILOVERS: LazyLock<CounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Provider-key fallback decisions, by the provider entry whose own key
+/// was refused and what happened next.
+///
+/// `outcome` is the closed pair `engaged` (the operator's credential
+/// resolved and the retry was queued) and `unavailable` (it did not
+/// resolve, so the provider's rejection stands). The second is the one
+/// worth an alert: it means the house credential is broken and the only
+/// other evidence is a `401` that reads like the tenant's fault.
+///
+/// `provider` is a configured provider entry name, bounded by the
+/// config the same way [`AI_FAILOVERS`] above is, so it is passed
+/// through unsanitized for the same reason.
+static AI_KEY_FALLBACKS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_key_fallbacks_total",
+            "AI provider-key fallback decisions by provider and outcome"
+        ),
+        &["provider", "outcome"]
+    )
+    .unwrap()
+});
+
 /// Route reasoning-policy outcomes for each provider attempt.
 ///
 /// `provider` is bounded by configured provider names and `outcome` comes
@@ -1379,6 +1402,18 @@ fn provider_selected_event(
             "reason": reason,
         }),
     )
+}
+
+/// Record one provider-key fallback decision.
+///
+/// Deliberately not folded into [`record_failover`]: `from == to` on a
+/// same-provider retry, and that recorder also publishes
+/// `EventType::ProviderSelected`, which would be false here. The typed
+/// `credential_fallback` event is published at the call site instead.
+pub fn record_key_fallback(provider: &str, outcome: &'static str) {
+    AI_KEY_FALLBACKS
+        .with_label_values(&[provider, outcome])
+        .inc();
 }
 
 /// Record one closed reasoning-policy outcome for a provider attempt.

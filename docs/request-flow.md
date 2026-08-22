@@ -1,6 +1,6 @@
 # Request flow
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 Every request SBproxy accepts runs through one pipeline, implemented as a
 sequence of Pingora `ProxyHttp` callbacks: `request_filter`,
@@ -213,7 +213,7 @@ see [cache-reserve.md](cache-reserve.md) and [degradation.md](degradation.md).
 ## 9. Logging and the typed event bus
 
 Metrics emission, the structured access log, and event publication close
-out the pipeline. `ProxyEvent` has eighteen variants; sixteen of them
+out the pipeline. `ProxyEvent` has nineteen variants; seventeen of them
 ship a production emitter in the OSS binary today: `request_started`,
 `request_completed`, `request_error` (the `request_events:` lane),
 `auth_denied`, `policy_denied`, `config_reloaded`, `egress_refused`
@@ -222,7 +222,9 @@ audit records), `mcp_governance_decision` (every MCP `tools/call`
 decision, allowed or refused), `key_minted`, `key_revoked`,
 `key_rotated`, `key_blocked` (the admin key plane, bridged from the
 `key_audit` channel), `credential_resolved` (once per actual upstream
-credential resolution, never per request), and `provider_selected`,
+credential resolution, never per request),
+`credential_fallback` (once per AI provider-key fallback decision),
+and `provider_selected`,
 `budget_exceeded`, `guardrail_triggered` (verdict-level: a provider
 fallback, a budget cap denial, or a guardrail block, never a
 per-request or per-chunk line). `cache_hit` and `cache_miss` are the

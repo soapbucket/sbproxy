@@ -4161,6 +4161,7 @@ mod tests {
             served_model: None,
             finish_reason: None,
             shadow_of: None,
+            credential_source: None,
         }
     }
 

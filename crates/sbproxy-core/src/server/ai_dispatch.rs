@@ -20,13 +20,149 @@ fn provider_matches_native_key(
     provider.accepts_native_credential_for(native_provider)
 }
 
+/// Which secret an AI attempt presents upstream (WOR-2655).
+///
+/// The outbound counterpart to the inbound `key_mode`, and a closed set
+/// for the same reason: it labels a request row, a usage-ledger record,
+/// and a typed event, so a new spelling has to be added here rather
+/// than invented at a call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CredentialSource {
+    /// The provider entry's own `api_key`, exactly as configured.
+    ProviderEntry,
+    /// A caller-owned native provider key, forwarded verbatim.
+    NativeCaller,
+    /// The operator's `fallback_credential_id`, presented after the
+    /// entry's own key was refused with a `401` / `403`.
+    Fallback,
+}
+
+impl CredentialSource {
+    /// Stable label for the request row, the ledger, and the event.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderEntry => "provider_entry",
+            Self::NativeCaller => "native_caller",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
+/// Write the credential this attempt will present into `provider`, and
+/// name which one it was.
+///
+/// Only `provider.api_key` is written, never a header: the vendor's
+/// wire shape stays with `ProviderConfig::auth_header`, so an Anthropic
+/// entry still sends a bare `x-api-key` and an OpenAI entry still sends
+/// `Bearer `.
+///
+/// A caller-owned native key wins over an operator fallback whenever
+/// both are somehow present. That ordering is the money-safe one and it
+/// is deliberate rather than incidental: the caller presented their own
+/// credential, so a rejection is theirs to fix, and spending the house
+/// credential on it would bill the operator for someone else's
+/// authorization failure. The retry-loop arm that supplies
+/// `fallback_material` already refuses to run when a native key is in
+/// flight; this is the second lock on the same door, because the two
+/// conditions live several thousand lines apart.
+fn select_upstream_credential(
+    provider: &mut sbproxy_ai::ProviderConfig,
+    native_api_key: Option<&str>,
+    fallback_material: Option<&str>,
+) -> CredentialSource {
+    if let Some(api_key) = native_api_key {
+        provider.api_key = Some(api_key.to_string());
+        return CredentialSource::NativeCaller;
+    }
+    if let Some(material) = fallback_material {
+        provider.api_key = Some(material.to_string());
+        return CredentialSource::Fallback;
+    }
+    CredentialSource::ProviderEntry
+}
+
+/// Whether this attempt's rejection should be retried against the same
+/// provider on the operator's fallback credential (WOR-2655).
+///
+/// Extracted from the retry loop rather than written inline, because
+/// the loop sits six thousand lines inside `handle_ai_proxy` and only
+/// the e2e harness reaches it. The rule this gate carries is a money
+/// rule, so it is testable by name.
+///
+/// `native_key_in_flight` is the important one. A request whose
+/// credential came from the caller (`inbound_key_mode: native`) never
+/// falls back: the caller presented their own key, the provider refused
+/// it, and spending the operator's credential there would bill the
+/// operator for someone else's authorization failure and let a caller
+/// whose upstream key was revoked keep working on the house account.
+///
+/// What this gate cannot see: whether the named credential actually
+/// resolves, whether it belongs to this tenant, and whether the retry
+/// succeeds. Those are the key plane's decisions and are made at the
+/// call site, after this returns `true`.
+fn wants_provider_key_fallback(
+    provider: &sbproxy_ai::ProviderConfig,
+    status: u16,
+    native_key_in_flight: bool,
+    already_used: bool,
+) -> bool {
+    !already_used
+        && !native_key_in_flight
+        && provider.on_key_failure == sbproxy_ai::KeyFailurePosture::Fallback
+        && provider.fallback_credential_id.is_some()
+        && sbproxy_ai::failure_cause::FailureCause::classify(status, "").triggers_key_fallback()
+}
+
+/// Build the `credential_fallback` typed event for one AI provider-key
+/// fallback decision (WOR-2655).
+///
+/// A free function so the field set is testable without a running event
+/// egress, the same shape as `credential_resolved_event` in
+/// `crate::key_plane`. The payload mirrors that family's
+/// `op`/`resource`/`id`/`outcome` vocabulary so one SIEM rule covers
+/// both, and adds the provider entry and the upstream status that
+/// triggered the swap. It never carries the entry's own key, the
+/// fallback credential's material, or a vault reference: only which
+/// credential record was named.
+///
+/// `outcome` is `engaged` when the operator's credential resolved and
+/// the retry was queued, and `unavailable` when it did not resolve and
+/// the provider's rejection stands. The second one is the alertable
+/// event: it means the house credential is broken, and the only other
+/// evidence is a `401` that looks like the tenant's fault.
+fn credential_fallback_event(
+    hostname: &str,
+    tenant_id: &str,
+    provider: &str,
+    credential_id: &str,
+    status: u16,
+    outcome: &'static str,
+) -> sbproxy_observe::ProxyEvent {
+    sbproxy_observe::ProxyEvent::new(
+        sbproxy_observe::EventType::CredentialFallback,
+        hostname.to_string(),
+        tenant_id.to_string(),
+        serde_json::json!({
+            "op": "credential_fallback",
+            "resource": "credential",
+            "id": credential_id,
+            "provider": provider,
+            "status": status,
+            "outcome": outcome,
+        }),
+    )
+}
+
+/// [`select_upstream_credential`] with no fallback credential in play.
+///
+/// The four dispatch paths that never run the provider-key fallback
+/// retry loop (the pre-flight resolution sites and the raced dispatch)
+/// keep the same one-line shape they had.
 fn apply_native_provider_credential(
     provider: &mut sbproxy_ai::ProviderConfig,
     native_api_key: Option<&str>,
-) {
-    if let Some(api_key) = native_api_key {
-        provider.api_key = Some(api_key.to_string());
-    }
+) -> CredentialSource {
+    select_upstream_credential(provider, native_api_key, None)
 }
 
 #[cfg(test)]
@@ -6179,7 +6315,10 @@ pub(super) async fn handle_ai_proxy(
             }
         };
         let mut resolved_provider = config.providers[provider_idx].clone();
-        apply_native_provider_credential(&mut resolved_provider, native_api_key.as_deref());
+        ctx.ai_credential_source = Some(
+            apply_native_provider_credential(&mut resolved_provider, native_api_key.as_deref())
+                .as_str(),
+        );
         let provider = &resolved_provider;
         ctx.admin_load_balancer_strategy = Some(router.strategy_name().to_string());
         ctx.admin_load_balancer_target = Some(provider.name.to_string());
@@ -6590,7 +6729,10 @@ pub(super) async fn handle_ai_proxy(
                 }
             };
         let mut resolved_provider = config.providers[provider_idx].clone();
-        apply_native_provider_credential(&mut resolved_provider, native_api_key.as_deref());
+        ctx.ai_credential_source = Some(
+            apply_native_provider_credential(&mut resolved_provider, native_api_key.as_deref())
+                .as_str(),
+        );
         let provider = &resolved_provider;
         ctx.admin_load_balancer_strategy = Some(router.strategy_name().to_string());
         ctx.admin_load_balancer_target = Some(provider.name.to_string());
@@ -7420,7 +7562,10 @@ pub(super) async fn handle_ai_proxy(
                 break;
             }
             let mut resolved_provider = config.providers[provider_idx].clone();
-            apply_native_provider_credential(&mut resolved_provider, native_api_key.as_deref());
+            ctx.ai_credential_source = Some(
+                apply_native_provider_credential(&mut resolved_provider, native_api_key.as_deref())
+                    .as_str(),
+            );
             let provider = &resolved_provider;
             let reservation_id = format!("{}:quota-pool:multipart:{attempt}", ctx.request_id);
             let Some(quota_attempt) = reserve_quota_pool_attempt_or_respond(
@@ -11302,6 +11447,17 @@ pub(super) async fn handle_ai_proxy(
 
         let client = std::sync::Arc::clone(&dispatch_client);
         let race_start = std::time::Instant::now();
+        // WOR-2655: every racer presents the same class of credential,
+        // so the request row is stamped once here rather than from
+        // inside the racing loop, which cannot borrow `ctx`. A raced
+        // dispatch never runs the provider-key fallback: the sequential
+        // loop below is skipped entirely, and there is no attempt left
+        // to retry on another key.
+        ctx.ai_credential_source = Some(if native_api_key.is_some() {
+            CredentialSource::NativeCaller.as_str()
+        } else {
+            CredentialSource::ProviderEntry.as_str()
+        });
         let mut futs = FuturesUnordered::new();
         for (race_attempt, &idx) in provider_order.iter().enumerate() {
             let mut provider = config.providers[idx].clone();
@@ -11476,7 +11632,26 @@ pub(super) async fn handle_ai_proxy(
     // is the provider count: entries are unique by construction and a
     // splice only appends indices not already present, so the order can
     // never grow past it.
-    let max_provider_visits = config.providers.len().max(provider_order.len());
+    //
+    // WOR-2655: `+ 1` reserves the one visit the provider-key fallback
+    // can add, and it is the only duplicate index the order ever holds.
+    // The typed splice above only appends indices not already present,
+    // so it stays inside the provider count; the key fallback
+    // deliberately re-visits the provider it just tried, on a different
+    // credential, and its budget is one per request
+    // (`key_fallback_used`). Without the reservation a single-provider
+    // origin would run out of visits before the retry it just queued.
+    let max_provider_visits = config.providers.len().max(provider_order.len()) + 1;
+    // WOR-2655: the provider-key fallback's whole state. `Some((idx,
+    // secret))` means the next visit to `idx` presents the operator's
+    // credential instead of the entry's own; `key_fallback_used` is the
+    // budget, so two refused credentials terminate rather than loop.
+    let mut key_fallback_used = false;
+    let mut key_fallback_material: Option<(usize, String)> = None;
+    // An auth retry is not an availability attempt, so it does not
+    // spend the operator's `max_retries` budget. One, at most, per
+    // request.
+    let mut key_fallback_extra_attempts = 0usize;
     for attempt in 0..max_provider_visits {
         let Some(&provider_idx) = provider_order.get(attempt) else {
             break;
@@ -11489,7 +11664,7 @@ pub(super) async fn handle_ai_proxy(
         let effective_max_attempts = if ctx.managed_fallback_reason.is_some() {
             provider_order.len()
         } else {
-            max_attempts
+            max_attempts + key_fallback_extra_attempts
         };
         if attempt >= effective_max_attempts {
             break;
@@ -11504,7 +11679,22 @@ pub(super) async fn handle_ai_proxy(
         ctx.managed_route_trace = None;
         ctx.managed_route_class = None;
         let mut resolved_provider = config.providers[provider_idx].clone();
-        apply_native_provider_credential(&mut resolved_provider, native_api_key.as_deref());
+        // WOR-2655: the fallback credential is keyed by provider index,
+        // so only the queued re-visit picks it up and a later
+        // availability failover to a different provider goes back to
+        // that entry's own key.
+        let queued_fallback = key_fallback_material
+            .as_ref()
+            .filter(|(idx, _)| *idx == provider_idx)
+            .map(|(_, material)| material.as_str());
+        ctx.ai_credential_source = Some(
+            select_upstream_credential(
+                &mut resolved_provider,
+                native_api_key.as_deref(),
+                queued_fallback,
+            )
+            .as_str(),
+        );
         let mut local_public_model = None;
         let mut local_engine_model = None;
         let distributed_managed =
@@ -11966,6 +12156,145 @@ pub(super) async fn handle_ai_proxy(
                     && !takes_managed_break
                     && (content_policy_fallback || typed_fallbacks_active)
                     && body_refinable_client_status(status);
+                // WOR-2655: provider-key fallback. A `401`/`403` is a
+                // statement about the credential rather than about the
+                // provider, and it is precisely the class
+                // `is_retryable_default` excludes, so today it reaches
+                // the caller verbatim. When this entry names an
+                // operator-held `fallback_credential_id`, retry the same
+                // provider once on that credential instead.
+                //
+                // Placed ahead of `takes_availability_failover`, and the
+                // ordering is load-bearing on exactly one config: a
+                // `retry_policy` that retries `auth` makes a 401 open
+                // the availability failover too. Trying a fresh
+                // credential against the provider the caller asked for
+                // is the narrower repair, and it does not cost the
+                // wider one: the splice leaves the untried tail of
+                // `provider_order` intact behind the re-visit, so an
+                // availability failover still runs when the operator's
+                // credential is refused as well.
+                //
+                // Also placed ahead of `note_classified_failure`, so a
+                // rejection the house credential recovers from does not
+                // feed `cooldown_policy.auth` and park a provider that
+                // is serving fine. The retry it queues is itself
+                // classified when it lands, and a second refusal
+                // records there.
+                //
+                // `native_api_key` is `Some` exactly when
+                // `ctx.inbound_key_mode` is `Native`, which is the
+                // "caller presented their own key" case the gate
+                // refuses.
+                let key_fallback_wanted = wants_provider_key_fallback(
+                    provider,
+                    status,
+                    native_api_key.is_some(),
+                    key_fallback_used,
+                );
+                if let Some(credential_id) = provider
+                    .fallback_credential_id
+                    .as_deref()
+                    .filter(|_| key_fallback_wanted)
+                {
+                    // A credential the *inbound key* is bound to is a
+                    // different thing and never falls back; see
+                    // `CredentialResolveError`'s rustdoc. This resolves
+                    // the provider entry's own operator-owned
+                    // alternative, under the request's tenant scope, so
+                    // the key plane refuses a cross-tenant record here
+                    // exactly as it does at the admin boundary.
+                    let tenant_scope = Some(ctx.tenant_id.as_str())
+                        .filter(|tenant| *tenant != sbproxy_observe::decision::DEFAULT_TENANT);
+                    // Boxed: `handle_ai_proxy` already runs close to the
+                    // 2MB Pingora worker stack limit, and an inline
+                    // await here would grow the frame for every request
+                    // on the AI path, not only the ones that fall back.
+                    let resolved = match key_plane.as_deref() {
+                        Some(plane) => {
+                            Box::pin(plane.resolve_credential_material(credential_id, tenant_scope))
+                                .await
+                                .map_err(|error| error.to_string())
+                        }
+                        None => Err("no key plane is installed".to_string()),
+                    };
+                    match resolved {
+                        Ok(material) => {
+                            key_fallback_used = true;
+                            key_fallback_extra_attempts = 1;
+                            key_fallback_material = Some((provider_idx, material));
+                            provider_order.insert(attempt + 1, provider_idx);
+                            sbproxy_observe::metrics::record_provider_attempt(
+                                &provider.name,
+                                "error",
+                            );
+                            // Scrapeable from day one, because the typed
+                            // event only reaches a deployment that
+                            // configured an `events:` sink for it, and
+                            // "the house credential is now paying" is a
+                            // thing to alert on rather than to discover.
+                            sbproxy_ai::ai_metrics::record_key_fallback(&provider.name, "engaged");
+                            warn!(
+                                provider = %provider.name,
+                                status = %status,
+                                credential_id = %credential_id,
+                                "AI proxy: provider refused this entry's key, retrying on the \
+                                 operator's fallback credential"
+                            );
+                            sbproxy_observe::publish_proxy_event(
+                                sbproxy_observe::EventType::CredentialFallback,
+                                || {
+                                    credential_fallback_event(
+                                        ctx.hostname.as_str(),
+                                        ctx.tenant_id.as_str(),
+                                        provider.name.as_str(),
+                                        credential_id,
+                                        status,
+                                        "engaged",
+                                    )
+                                },
+                            );
+                            // Consume the body to avoid a connection leak,
+                            // exactly as the availability arm below does.
+                            let _ = resp.bytes().await;
+                            continue;
+                        }
+                        Err(error) => {
+                            // Fail to the provider's own rejection, not
+                            // to a 503: the caller's request already has
+                            // a truthful upstream answer, and inventing
+                            // a different status would hide it. The
+                            // credential is named, never its material,
+                            // and `error` is `CredentialResolveError`'s
+                            // Display, which carries no secret either.
+                            sbproxy_ai::ai_metrics::record_key_fallback(
+                                &provider.name,
+                                "unavailable",
+                            );
+                            warn!(
+                                provider = %provider.name,
+                                status = %status,
+                                credential_id = %credential_id,
+                                error = %error,
+                                "AI proxy: provider refused this entry's key and the fallback \
+                                 credential did not resolve; returning the provider's rejection"
+                            );
+                            sbproxy_observe::publish_proxy_event(
+                                sbproxy_observe::EventType::CredentialFallback,
+                                || {
+                                    credential_fallback_event(
+                                        ctx.hostname.as_str(),
+                                        ctx.tenant_id.as_str(),
+                                        provider.name.as_str(),
+                                        credential_id,
+                                        status,
+                                        "unavailable",
+                                    )
+                                },
+                            );
+                        }
+                    }
+                }
                 if (400..600).contains(&status) && !body_refines_cause {
                     router.note_classified_failure(
                         provider_idx,
@@ -29939,5 +30268,214 @@ mod routing_batch_seam_tests {
                  the client its relay headers"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod provider_key_fallback_tests {
+    //! WOR-2655: the provider-key fallback's gate and its labels.
+    //!
+    //! The arm itself lives six thousand lines inside `handle_ai_proxy`
+    //! and only the e2e harness reaches it, so the two decisions that
+    //! carry money are extracted and tested here by name:
+    //! [`super::wants_provider_key_fallback`], which decides whether the
+    //! operator's credential is spent at all, and
+    //! [`super::select_upstream_credential`], which decides which secret
+    //! actually reaches the wire.
+    //!
+    //! What these cannot see: the splice into `provider_order`, the
+    //! visit budget, and whether the retried attempt succeeds. Those are
+    //! the loop's, and only the e2e test reaches them.
+
+    use super::{select_upstream_credential, wants_provider_key_fallback, CredentialSource};
+
+    fn provider(extra: serde_json::Value) -> sbproxy_ai::ProviderConfig {
+        let mut json = serde_json::json!({
+            "name": "openai-acme",
+            "provider_type": "openai",
+            "api_key": "sk-tenant-key"
+        });
+        let object = json.as_object_mut().expect("fixture is an object");
+        for (key, value) in extra.as_object().expect("extra is an object") {
+            object.insert(key.clone(), value.clone());
+        }
+        serde_json::from_value(json).expect("ProviderConfig fixture")
+    }
+
+    /// The money-leak test. A caller who presented their own native
+    /// provider key and had it refused must never be served on the
+    /// operator's credential: it bills the operator for someone else's
+    /// authorization failure, and it lets a caller whose upstream key
+    /// was revoked keep working on the house account.
+    #[test]
+    fn a_native_caller_credential_never_falls_back() {
+        let entry = provider(serde_json::json!({"fallback_credential_id": "house-openai"}));
+        assert!(
+            wants_provider_key_fallback(&entry, 401, false, false),
+            "the operator's own key being refused is what the fallback is for"
+        );
+        assert!(
+            !wants_provider_key_fallback(&entry, 401, true, false),
+            "a caller-owned native key in flight must never spend the house credential"
+        );
+        assert!(
+            !wants_provider_key_fallback(&entry, 403, true, false),
+            "and the same holds for a 403"
+        );
+    }
+
+    /// Even with a native key somehow in flight alongside a resolved
+    /// fallback, the caller's key is the one presented. The gate above
+    /// already refuses to produce that pair; this is the second lock,
+    /// because the two conditions live thousands of lines apart.
+    #[test]
+    fn the_caller_key_wins_over_an_operator_fallback_on_the_wire() {
+        let mut entry = provider(serde_json::json!({}));
+        assert_eq!(
+            select_upstream_credential(&mut entry, Some("caller-native"), Some("house-material")),
+            CredentialSource::NativeCaller
+        );
+        assert_eq!(entry.api_key.as_deref(), Some("caller-native"));
+    }
+
+    #[test]
+    fn the_selected_source_matches_the_key_written() {
+        let mut entry = provider(serde_json::json!({}));
+        assert_eq!(
+            select_upstream_credential(&mut entry, None, None),
+            CredentialSource::ProviderEntry
+        );
+        assert_eq!(entry.api_key.as_deref(), Some("sk-tenant-key"));
+
+        assert_eq!(
+            select_upstream_credential(&mut entry, None, Some("house-material")),
+            CredentialSource::Fallback
+        );
+        assert_eq!(
+            entry.api_key.as_deref(),
+            Some("house-material"),
+            "only api_key is written; the vendor's header stays with auth_header()"
+        );
+
+        assert_eq!(CredentialSource::ProviderEntry.as_str(), "provider_entry");
+        assert_eq!(CredentialSource::NativeCaller.as_str(), "native_caller");
+        assert_eq!(CredentialSource::Fallback.as_str(), "fallback");
+    }
+
+    /// The explicit opt-out, and the inert default. An entry that names
+    /// no fallback credential behaves exactly as `fail_closed` does,
+    /// which is what makes `fallback` a safe default on an existing
+    /// config.
+    ///
+    /// The `fail_closed` fixture carries a `fallback_credential_id` on
+    /// purpose, even though `ProviderConfig::validate_key_failure_posture`
+    /// refuses that pair at config load. Without it the assertion would
+    /// pass on the missing credential and prove nothing about the
+    /// posture, and the posture check would be the one term of this gate
+    /// no test holds. It is also what a reader needs to see if the
+    /// validation is ever relaxed to let the two coexist.
+    #[test]
+    fn fail_closed_and_a_missing_credential_both_refuse_the_fallback() {
+        let opted_out = provider(serde_json::json!({
+            "on_key_failure": "fail_closed",
+            "fallback_credential_id": "house-openai"
+        }));
+        assert!(
+            !wants_provider_key_fallback(&opted_out, 401, false, false),
+            "the posture alone must refuse, with a credential named and \
+             everything else identical to the engaging case"
+        );
+        let opted_in = provider(serde_json::json!({
+            "on_key_failure": "fallback",
+            "fallback_credential_id": "house-openai"
+        }));
+        assert!(
+            wants_provider_key_fallback(&opted_in, 401, false, false),
+            "the differential: only on_key_failure differs from the fixture above"
+        );
+
+        let nothing_to_fall_back_to = provider(serde_json::json!({}));
+        assert!(!wants_provider_key_fallback(
+            &nothing_to_fall_back_to,
+            401,
+            false,
+            false
+        ));
+    }
+
+    /// One retry per request. Both credentials failing must terminate
+    /// rather than queue a third visit to the same provider.
+    #[test]
+    fn the_fallback_budget_is_one_per_request() {
+        let entry = provider(serde_json::json!({"fallback_credential_id": "house-openai"}));
+        assert!(wants_provider_key_fallback(&entry, 401, false, false));
+        assert!(
+            !wants_provider_key_fallback(&entry, 401, false, true),
+            "the retried attempt's own 401 must not queue another"
+        );
+    }
+
+    /// The precedence ruling, at the gate rather than only on the enum:
+    /// a rate limit or a server error is a statement about the
+    /// provider, and stays with the availability failover.
+    #[test]
+    fn only_an_auth_rejection_reaches_the_gate() {
+        let entry = provider(serde_json::json!({"fallback_credential_id": "house-openai"}));
+        for status in [401, 403] {
+            assert!(wants_provider_key_fallback(&entry, status, false, false));
+        }
+        for status in [200, 400, 404, 408, 429, 500, 502, 503] {
+            assert!(
+                !wants_provider_key_fallback(&entry, status, false, false),
+                "{status} belongs to the availability failover"
+            );
+        }
+    }
+
+    /// The typed event names the credential and never its material,
+    /// the same rule the bound-credential resolver in `proxy_http`
+    /// follows. Asserted by searching the serialized payload for the
+    /// fixture secret rather than by reading the field list, so a
+    /// future field that happens to carry the secret also fails.
+    #[test]
+    fn the_fallback_event_names_the_credential_and_carries_no_secret() {
+        let event = super::credential_fallback_event(
+            "acme.example.com",
+            "acme",
+            "openai-acme",
+            "house-openai",
+            401,
+            "engaged",
+        );
+        assert_eq!(
+            event.event_type,
+            sbproxy_observe::EventType::CredentialFallback
+        );
+        assert_eq!(event.hostname, "acme.example.com");
+        assert_eq!(event.tenant_id, "acme");
+        assert_eq!(event.data["op"], "credential_fallback");
+        assert_eq!(event.data["resource"], "credential");
+        assert_eq!(event.data["id"], "house-openai");
+        assert_eq!(event.data["provider"], "openai-acme");
+        assert_eq!(event.data["status"], 401);
+        assert_eq!(event.data["outcome"], "engaged");
+
+        let serialized = serde_json::to_string(&event).expect("event serializes");
+        for secret in ["sk-tenant-key", "sk-house-openai", "vault://"] {
+            assert!(
+                !serialized.contains(secret),
+                "the event must not carry credential material: {serialized}"
+            );
+        }
+
+        let unavailable = super::credential_fallback_event(
+            "acme.example.com",
+            "acme",
+            "openai-acme",
+            "house-openai",
+            403,
+            "unavailable",
+        );
+        assert_eq!(unavailable.data["outcome"], "unavailable");
     }
 }

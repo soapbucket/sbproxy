@@ -614,6 +614,7 @@ pub(super) fn emit_access_log(
         api_key_id,
         key_provider: ctx.native_key_provider.clone(),
         key_mode: Some(ctx.inbound_key_mode.as_str().to_string()),
+        credential_source: ctx.ai_credential_source.map(str::to_string),
         served_from_cache: Some(ctx.served_from_cache),
         fallback_triggered: Some(ctx.fallback_triggered),
         retry_count: Some(ctx.retry_count),
@@ -842,6 +843,9 @@ pub(super) struct AccessLogContext {
     pub(super) key_provider: Option<String>,
     /// Inbound credential mode (`none`, `minted`, or `native`).
     pub(super) key_mode: Option<String>,
+    /// Which secret the AI attempt presented upstream (WOR-2655):
+    /// `provider_entry`, `native_caller`, or `fallback`.
+    pub(super) credential_source: Option<String>,
     pub(super) served_from_cache: Option<bool>,
     pub(super) fallback_triggered: Option<bool>,
     pub(super) retry_count: Option<u32>,
@@ -976,6 +980,7 @@ impl AccessLogContext {
             api_key_id: None,
             key_provider: None,
             key_mode: None,
+            credential_source: None,
             served_from_cache: None,
             fallback_triggered: None,
             retry_count: None,
@@ -1216,6 +1221,7 @@ pub(super) fn emit_access_log_entry(
         api_key_id: context.api_key_id,
         key_provider: context.key_provider,
         key_mode: context.key_mode,
+        credential_source: context.credential_source,
         served_from_cache: context.served_from_cache,
         fallback_triggered: context.fallback_triggered,
         retry_count: context.retry_count,

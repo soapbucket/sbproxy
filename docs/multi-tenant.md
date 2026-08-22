@@ -1,6 +1,6 @@
 # Multi-tenant deployment
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 SBproxy serves multiple tenants from a single binary. Each tenant gets its own configuration scope under `proxy.tenants[]`; origins bind to a tenant via `origin.tenant_id`; request-time resolution walks origin → tenant → proxy with most-specific-wins by name.
 
@@ -80,6 +80,97 @@ origins:
 In this config, a request to `api.acme.example.com` resolves `openai-shared` to acme-corp's copy; the same name on the proxy default is shadowed, so the proxy default's key does not authenticate there at all. A request to `api.beta.example.com` sees `openai-shared` from the proxy default plus `openai-experimental` from the tenant. The `__default__` tenant (any origin without `tenant_id`) sees only `openai-shared` from the proxy default.
 
 `require_governed_key: true` is what makes any of that observable. Without it, a key that resolved at no scope still reaches the provider, with no policy, no budget, and no attribution, and nothing says so.
+
+## When a tenant's provider key is refused
+
+A `401` or `403` from the provider is a statement about the credential, not about the provider. The gateway treats it that way: it is not retryable, it opens no availability failover, and by default it reaches the caller verbatim. One tenant's expired key is then one tenant's outage.
+
+Two keys on the provider entry decide what happens instead. They are on `providers[]`, not on the tenant: a tenant entry still carries exactly the three fields named above, and the key that gets refused is `origins.<host>.action.providers[].api_key`, bound to a tenant through `origin.tenant_id`.
+
+```yaml
+origins:
+  api.acme.example.com:
+    tenant_id: acme-corp
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: vault://primary/secret/data/acme/openai?key=api_key
+          # Retry this same provider once on the operator's credential.
+          fallback_credential_id: house-openai
+          # `fallback` is the default. `fail_closed` returns the
+          # provider's rejection to the caller untouched.
+          on_key_failure: fallback
+```
+
+`fallback_credential_id` names a record under `key_management.seed.credentials[]` (or one minted through the admin key plane), never a second secret written into the origin. Two consequences worth having: the credential is resolved per request through the key plane, so it picks up a rotation with no config reload, and a record that belongs to a different tenant than the request is refused at resolution.
+
+```yaml
+proxy:
+  key_management:
+    enabled: true
+    crypto:
+      master_key: env:SBPROXY_KEY_MASTER
+    seed:
+      credentials:
+        - id: house-openai
+          provider: openai
+          vault_ref: vault://primary/secret/data/house/openai?key=api_key
+```
+
+### The call and the outcome
+
+```bash
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Host: api.acme.example.com' -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}'
+```
+
+Acme's key is expired, so the provider refuses the first attempt. The gateway retries the same provider on `house-openai` and the caller sees the answer, not the `401`:
+
+```text
+WARN sbproxy_core::server::ai_dispatch: AI proxy: provider refused this entry's key, retrying on the operator's fallback credential provider=openai status=401 credential_id=house-openai
+```
+
+The request row on `GET /api/requests` carries `credential_source: "fallback"`, and one `credential_fallback` event lands on the typed feed:
+
+```json
+{"event_type":"credential_fallback","tenant_id":"acme-corp","data":{"op":"credential_fallback","resource":"credential","id":"house-openai","provider":"openai","status":401,"outcome":"engaged"}}
+```
+
+That is the row to bill from and the event to alert on. A tenant whose `fallback` share is climbing is a tenant whose key is dying and whose spend has quietly moved onto your account.
+
+The same decision is on the scrape as `sbproxy_ai_key_fallbacks_total{provider,outcome}`, so the alert does not need an `events:` sink configured. Alert on `outcome="unavailable"` first: it means the operator's credential is the broken one, and the only other evidence is a `401` that reads like the tenant's fault.
+
+### Choosing the posture
+
+```mermaid
+flowchart TD
+    A["Provider returns 401 / 403"] --> B{"Caller presented their own\nnative provider key?"}
+    B -->|yes| R["Relay the rejection.\ncredential_source: native_caller"]
+    B -->|no| C{"on_key_failure"}
+    C -->|fail_closed| R2["Relay the rejection.\ncredential_source: provider_entry"]
+    C -->|fallback| D{"fallback_credential_id set?"}
+    D -->|no| R2
+    D -->|yes| E{"Credential resolves\nfor this tenant?"}
+    E -->|no| F["Relay the rejection, warn with\nthe credential id.\nEvent outcome: unavailable"]
+    E -->|yes| G["Retry the SAME provider once.\ncredential_source: fallback"]
+    G --> H{"Second attempt also 401?"}
+    H -->|yes| I["Relay it. One fallback per request."]
+    H -->|no| J["Serve the answer"]
+```
+
+Three rulings the diagram encodes, each of which costs money if you get it backwards.
+
+**A caller-owned native credential never falls back.** When a request arrives with `inbound_key_mode: native`, the key on the wire is the caller's, the provider refused *their* credential, and spending yours would bill you for their authorization failure. It would also let a caller whose upstream key was revoked keep working on your account. This is not configurable.
+
+**Key fallback owns `401` and `403`, and nothing else.** A `429`, a `5xx`, or a timeout stays with the provider failover and `resilience.cooldown_policy`, because a different key against a rate-limited provider is still rate limited. If both are configured and the provider returns a `401` that a `retry_policy` would also retry, the key fallback goes first: trying a fresh credential against the provider the caller asked for is the narrower repair, and the untried tail of the failover chain is left intact behind it, so an availability failover still runs when the operator's credential is refused as well.
+
+One consequence of that ordering is worth stating, because it is the thing an operator running both would otherwise have to discover: on an entry that names a `fallback_credential_id`, a `401` the operator's credential recovers from no longer feeds `resilience.cooldown_policy`'s `auth` axis. Parking a provider that is serving every request fine on the house key would be the wrong repair. A second refusal, on the retry itself, does record and does park. Entries with no `fallback_credential_id` are unaffected and record exactly as before.
+
+**`fail_closed` is a real choice, not a paranoia setting.** Use it wherever the tenant's own key *is* the authorization boundary: a tenant billed on their own account has to find out their key stopped working, and a tenant you revoked upstream must not keep serving traffic on your credential. Setting `on_key_failure: fail_closed` together with a `fallback_credential_id` is refused at config load, because a credential that can never be presented is a config that reads as configured and does nothing.
+
+An entry that names no `fallback_credential_id` behaves exactly as `fail_closed` does, which is what makes `fallback` a safe default on a config written before this feature existed.
 
 ## The `__default__` tenant
 
