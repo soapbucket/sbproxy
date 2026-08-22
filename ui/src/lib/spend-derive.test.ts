@@ -193,14 +193,54 @@ describe("rowsByGroup and compareRows", () => {
     const byGroup = Object.fromEntries(compared.map((r) => [r.group, r]));
     expect(byGroup.kept.vsPrior).toBeCloseTo(1, 6);
     expect(byGroup.kept.presence).toBe("both");
-    // A brand new group has no prior value to subtract, so the delta is
-    // absent rather than "+$1.00 from nothing".
-    expect(byGroup.new.vsPrior).toBeUndefined();
+    // A brand new group carries its whole value as the delta, so the
+    // column reconstructs the change; the badge is what says it is new
+    // rather than up from something.
+    expect(byGroup.new.vsPrior).toBeCloseTo(1, 6);
     expect(byGroup.new.presence).toBe("new");
     // A group that stopped keeps its old dollars as a negative delta.
     expect(byGroup.gone.vsPrior).toBeCloseTo(-2, 6);
     expect(byGroup.gone.costUsd).toBe(0);
     expect(byGroup.gone.presence).toBe("gone");
+  });
+
+  it("claims nothing about the prior window until the prior window lands", () => {
+    // The second request can be in flight or can fail on its own, and an
+    // empty prior list then looks exactly like a window in which nothing
+    // ran. Folding those together labels every row on the page `new`.
+    const now = rowsByGroup([
+      bucket({ group: "kept", cost_usd_micros: 4_000_000 }),
+    ]);
+    const compared = compareRows(now, [], 4, false);
+    expect(compared).toHaveLength(1);
+    expect(compared[0].presence).toBe("unknown");
+    expect(compared[0].vsPrior).toBeUndefined();
+    // The share is this window's own arithmetic and survives.
+    expect(compared[0].share).toBeCloseTo(1, 6);
+  });
+});
+
+describe("rebucket shared fold", () => {
+  it("honors a floor wider than the response's own bucket", () => {
+    // The prior window can come back in daily buckets while the current
+    // one is hourly. Each folded to its own width and drawn on one
+    // y-axis, the previous period's points are four times too tall.
+    const hourly: SpendWindowBucket[] = Array.from({ length: 24 }, (_, i) =>
+      bucket({ ts_secs: i * 3600, cost_usd_micros: 1_000_000 }),
+    );
+    const own = rebucket(hourly, 3600);
+    expect(own.foldedSecs).toBe(3600);
+    const floored = rebucket(hourly, 3600, 40, 86_400);
+    expect(floored.foldedSecs).toBe(86_400);
+    expect(floored.points).toHaveLength(1);
+    expect(floored.points[0].usd).toBeCloseTo(24, 6);
+  });
+
+  it("ignores a floor narrower than the response's own bucket", () => {
+    const daily: SpendWindowBucket[] = Array.from({ length: 3 }, (_, i) =>
+      bucket({ ts_secs: i * 86_400, cost_usd_micros: 1_000_000 }),
+    );
+    expect(rebucket(daily, 86_400, 40, 3600).foldedSecs).toBe(86_400);
   });
 });
 
@@ -214,8 +254,18 @@ describe("topNWithOther", () => {
       { group: "e", costUsd: 1 },
     ];
     const items = topNWithOther(rows, 3);
-    expect(items.map((i) => i.key)).toEqual(["a", "b", "c", "Other (2 more)"]);
-    expect(items[3].value).toBe(3);
+    // The unattributed segment never folds into Other: a tile above
+    // these bars names it in dollars, so hiding it here would send the
+    // reader hunting for a headline figure that is not on the chart.
+    expect(items.map((i) => i.key)).toEqual([
+      "a",
+      "b",
+      "c",
+      "(unattributed)",
+      "Other (1 more)",
+    ]);
+    expect(items[3].value).toBe(2);
+    expect(items[4].value).toBe(1);
     expect(items.reduce((s, i) => s + i.value, 0)).toBe(24);
   });
 

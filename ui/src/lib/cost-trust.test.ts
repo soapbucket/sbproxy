@@ -234,6 +234,16 @@ describe("selectCappedKeys", () => {
     expect(selection.rows[0].windowSpendUsd).toBe(184);
   });
 
+  it("does not claim a spend order when the spend map joined nothing", () => {
+    // The rollup groups by the id the request path stamped and the key
+    // list comes from the admin store, so the join can miss entirely.
+    // Printing "highest spend in this window first" over a list ordered
+    // by cap describes an order the list is not in.
+    const selection = selectCappedKeys(keys, { unrelated: 500 });
+    expect(selection.orderedBy).toBe("cap");
+    expect(selection.rows.map((r) => r.id)).toEqual(["k2", "k1"]);
+  });
+
   it("reports the keys it left out rather than stopping quietly", () => {
     const many: AdminKey[] = Array.from({ length: 34 }, (_, i) => ({
       id: `k${i}`,

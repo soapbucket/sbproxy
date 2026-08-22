@@ -97,6 +97,29 @@ describe("SpendView breakdown", () => {
     expect(spendView).toContain("<th>Blocked</th>");
   });
 
+  it("says so when the comparison call fails, instead of calling every row new", () => {
+    // An empty prior list is what a failed second request and a quiet
+    // previous period both look like. Folding them together badges every
+    // model `new` and draws the previous period as a line at nothing.
+    expect(spendView).toContain(
+      "compareRows(rows.value, priorRows.value, totalUsd.value, priorLoaded.value)",
+    );
+    expect(spendView).toContain("const priorFailed = computed(");
+    expect(spendView).toContain("The previous {{ activeWindow }} could not be read");
+    expect(spendView).toContain("could not be read`");
+    expect(spendView).toContain("if (priorLoaded.value) {");
+  });
+
+  it("folds both chart series to one bucket width", () => {
+    // The store answers hourly inside its hourly retention and daily
+    // outside it, so the prior window can come back coarser. Two folds
+    // on one y-axis draw the previous period four times too high.
+    expect(spendView).toContain("const commonFoldSecs = computed(");
+    expect(
+      spendView.match(/rebucket\([^)]*40, commonFoldSecs\.value\)/g),
+    ).toHaveLength(2);
+  });
+
   it("marks a group only one window saw rather than printing a zero delta", () => {
     expect(spendView).toContain("row.presence === 'new'");
     expect(spendView).toContain("row.presence === 'gone'");
@@ -222,9 +245,32 @@ describe("CostTrustPanel", () => {
   });
 
   it("distinguishes an absent price-source family from zero lookups", () => {
-    expect(costTrustPanel).toContain('v-if="priceSources === undefined"');
+    expect(costTrustPanel).toContain('v-else-if="priceSources === undefined"');
     expect(costTrustPanel).toContain("is not reported by this build");
     expect(costTrustPanel).toContain('v-else-if="priceSources.total === 0"');
+  });
+
+  it("waits for the scrape before calling anything unconfigured", () => {
+    // Every readout here reports "not reported" on a missing family, and
+    // an unfetched scrape has no families, so the panel would otherwise
+    // open by asserting four things about a deployment it has not read.
+    // `loading` does not cover it: the first paint happens before
+    // onMounted fires, so it is false with no data in hand.
+    expect(costTrustPanel).toContain("scrapeLoaded: boolean");
+    expect(
+      costTrustPanel.match(/v-if="!scrapeLoaded" class="hint sb-faint">Reading \/metrics\./g),
+    ).toHaveLength(3);
+    expect(spendView).toContain(
+      "const scrapeLoaded = computed(() => metricsReq.data.value !== null)",
+    );
+    expect(spendView).toContain(':scrape-loaded="scrapeLoaded"');
+  });
+
+  it("never rounds a real share away to zero or up to the whole", () => {
+    // A 0.4% fallback share printed as "0%" says no price was invented,
+    // on the panel whose entire job is to say some were.
+    expect(costTrustPanel).toContain("formatShare");
+    expect(costTrustPanel).not.toMatch(/\* 100\)\.toFixed\(0\)/);
   });
 
   it("says the estimator runs unmeasured rather than drawing an empty chart", () => {
@@ -284,9 +330,16 @@ describe("BudgetHeadroom", () => {
   });
 
   it("distinguishes an unconfigured gauge from every budget reading zero", () => {
-    expect(budgetHeadroom).toContain('v-if="scopes === undefined"');
+    expect(budgetHeadroom).toContain('v-else-if="scopes === undefined"');
     expect(budgetHeadroom).toContain("Budget utilization is not reported.");
     expect(budgetHeadroom).toContain('v-else-if="!scopes.length"');
+  });
+
+  it("waits for the scrape before claiming no budget is configured", () => {
+    expect(budgetHeadroom).toContain("scrapeLoaded: boolean");
+    expect(budgetHeadroom).toContain(
+      '<p v-if="!scrapeLoaded" class="hint sb-faint">Reading /metrics.</p>',
+    );
   });
 
   it("reuses the component that owns the workspace resume control", () => {

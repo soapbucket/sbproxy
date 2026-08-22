@@ -546,7 +546,11 @@ page open does not inflate the values it displays.
 
 ## Spend (`/spend`)
 
-![Spend: the window control and coverage line above four tiles, a two-series spend chart, and the ranked breakdown below](assets/admin-spend.png)
+![Spend, showing the window control, the group-by selector, and the ranked breakdown](assets/admin-spend.png)
+
+This shot predates the tiles, the two-series chart, and the trust panel.
+Every screenshot in this doc carries the sidebar, so they are recaptured
+together at release prep rather than one at a time.
 
 What the gateway estimates you spent, what it saved you, and how much of
 the number is measured rather than guessed. Every figure above the fold
@@ -618,7 +622,11 @@ flowchart TD
   an error panel. A one hour window renders no chart and says why:
   hourly is the finest bucket the store keeps, so the window is a single
   point. A property that disappears from one window stays selected with
-  an unavailable hint rather than silently changing the query.
+  an unavailable hint rather than silently changing the query. The
+  prior-window request can fail on its own, most often as a `400` when
+  the selected promoted property carries no row in the earlier range;
+  the page then drops the comparison and says so instead of drawing the
+  previous period at zero.
 
 ### Absent is not zero
 
@@ -629,7 +637,10 @@ unconfigured semantic cache reads "not reported" and a configured one
 that has saved nothing reads `$0.00`. The same rule covers derived
 figures: a unit cost over zero tokens, a percentage change against a
 prior window of zero, and a run rate with fewer than three complete
-buckets all render `n/a` with the reason underneath.
+buckets all render `n/a` with the reason underneath. Percentages are
+guarded the same way: a real share that would round to `0%` reads `<1%`
+and one below the whole that would round to `100%` reads `>99%`, so a
+small fallback price share cannot render as no fallbacks at all.
 
 Two figures the page deliberately does not show. There is no dollar
 figure for what the refused requests avoided, because nothing
@@ -651,9 +662,13 @@ Someone in finance asks why last week cost more than the week before.
    models. That is a price-volume variance computed from the rollup's
    own cost and token counts, so the two parts always reconstruct the
    whole change.
-3. The table's `vs prev` column names which model moved. A row marked
-   `new` appeared this week and has no prior figure to subtract; a row
-   marked `gone` kept its old dollars as a negative delta.
+3. The table's `vs prev` column names which model moved, and the column
+   reconstructs the whole change. A row marked `new` was not there last
+   week, so its delta is its whole spend; a row marked `gone` kept its
+   old dollars as a negative delta. If the previous window could not be
+   read at all, no row carries a delta and a line above the table says
+   so, because an unanswered comparison is not a comparison against
+   zero.
 4. Follow the model label into Reports, filtered to that model, to see
    the requests behind it. Both pages read the same 1000-entry ring,
    which clears on restart, so treat it as a recent sample rather than

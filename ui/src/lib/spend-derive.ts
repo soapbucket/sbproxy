@@ -239,8 +239,16 @@ export function rowsByGroup(buckets: SpendWindowBucket[]): SpendRow[] {
   return [...byGroup.values()].sort((a, b) => b.costUsd - a.costUsd);
 }
 
-/** Whether a row appeared in only one of the two windows. */
-export type RowPresence = "both" | "new" | "gone";
+/**
+ * Whether a row appeared in only one of the two windows.
+ *
+ * `unknown` is the case that matters most and is the easiest to get
+ * wrong: the prior-window request has not landed, or failed. An empty
+ * prior list is then indistinguishable from a window in which nothing
+ * ran, and folding the two together labels every row on the page `new`,
+ * which is a claim about the money the page has no evidence for.
+ */
+export type RowPresence = "both" | "new" | "gone" | "unknown";
 
 export interface ComparedSpendRow extends SpendRow {
   /** Row cost over the window total, or `undefined` on an empty window. */
@@ -258,14 +266,35 @@ export interface ComparedSpendRow extends SpendRow {
  * A group present in one window and absent in the other is the
  * interesting case, not the edge case: it is a model that was switched
  * on, or a key that went quiet. Rendering the delta as a silent zero
- * hides exactly that, so presence is carried out to the view and a
- * `gone` row keeps its old dollars.
+ * hides exactly that, so presence is carried out to the view, a `gone`
+ * row keeps its old dollars as a negative delta, and a `new` row carries
+ * its full value so the column reconstructs the whole change.
+ *
+ * `priorKnown` is false while the second request is in flight and after
+ * it fails. Every delta is then `undefined` and every row reads
+ * `unknown`, because an absent answer is not an answer of zero.
  */
 export function compareRows(
   rows: SpendRow[],
   priorRows: SpendRow[],
   totalUsd: number,
+  priorKnown = true,
 ): ComparedSpendRow[] {
+  if (!priorKnown) {
+    return rows
+      .map((row) => ({
+        ...row,
+        share: totalUsd > 0 ? row.costUsd / totalUsd : undefined,
+        vsPrior: undefined,
+        presence: "unknown" as const,
+        perMillionTokens: costPerMillionTokens(
+          row.costUsd,
+          row.tokensIn,
+          row.tokensOut,
+        ),
+      }))
+      .sort((a, b) => b.costUsd - a.costUsd);
+  }
   const prior = new Map(priorRows.map((row) => [row.group, row]));
   const seen = new Set<string>();
   const out: ComparedSpendRow[] = [];
@@ -275,7 +304,7 @@ export function compareRows(
     out.push({
       ...row,
       share: totalUsd > 0 ? row.costUsd / totalUsd : undefined,
-      vsPrior: before ? row.costUsd - before.costUsd : undefined,
+      vsPrior: row.costUsd - (before?.costUsd ?? 0),
       presence: before ? "both" : "new",
       perMillionTokens: costPerMillionTokens(
         row.costUsd,
@@ -316,6 +345,10 @@ export interface TopNItem {
  * cohort truncates without saying so. The Other row is what keeps the
  * bars summing to the headline, and a breakdown whose parts do not add
  * up to the total is the fastest way to lose a finance reader.
+ *
+ * The unattributed segment never folds into Other. A tile above these
+ * bars names it in dollars, so hiding it here would leave the reader
+ * hunting for a headline figure that is not on the chart.
  */
 export function topNWithOther(
   rows: { group: string; costUsd: number }[],
@@ -323,14 +356,17 @@ export function topNWithOther(
   unattributedLabel = "(unattributed)",
 ): TopNItem[] {
   const ranked = [...rows].sort((a, b) => b.costUsd - a.costUsd);
-  const head = ranked.slice(0, n).map((row) => ({
+  const head = ranked.slice(0, n);
+  let tail = ranked.slice(n);
+  const pinned = tail.filter((row) => row.group === "");
+  tail = tail.filter((row) => row.group !== "");
+  const items: TopNItem[] = [...head, ...pinned].map((row) => ({
     key: row.group === "" ? unattributedLabel : row.group,
     value: row.costUsd,
   }));
-  const tail = ranked.slice(n);
-  if (tail.length === 0) return head;
+  if (tail.length === 0) return items;
   return [
-    ...head,
+    ...items,
     {
       key: `Other (${tail.length} more)`,
       value: tail.reduce((sum, row) => sum + row.costUsd, 0),
@@ -367,6 +403,14 @@ export interface RebucketResult {
  *
  * Factors are whole numbers of hours that divide a day, so a folded
  * bucket always starts on a clock boundary an operator recognizes.
+ *
+ * `minFoldSecs` exists for the two-series chart. The store answers in
+ * hourly buckets inside its hourly retention and daily ones outside it,
+ * so the prior window can come back at a coarser width than the current
+ * one. Folding each series to its own width and drawing them on one
+ * y-axis would put daily sums against six-hourly sums and show the
+ * previous period four times higher than it was. The view folds both to
+ * the wider of the two.
  */
 const FOLD_FACTORS_HOURS = [1, 2, 3, 4, 6, 8, 12, 24] as const;
 
@@ -374,6 +418,7 @@ export function rebucket(
   buckets: SpendWindowBucket[],
   bucketSecs: number,
   maxPoints = 40,
+  minFoldSecs = 0,
 ): RebucketResult {
   const byTs = new Map<number, number>();
   for (const bucket of buckets) {
@@ -382,14 +427,15 @@ export function rebucket(
       (byTs.get(bucket.ts_secs) ?? 0) + bucket.cost_usd_micros,
     );
   }
+  const floorSecs = Math.max(bucketSecs, minFoldSecs);
   const raw = [...byTs.entries()].sort((a, b) => a[0] - b[0]);
-  if (raw.length === 0) return { points: [], foldedSecs: bucketSecs };
+  if (raw.length === 0) return { points: [], foldedSecs: floorSecs };
 
   const span = raw[raw.length - 1][0] - raw[0][0] + bucketSecs;
-  let foldedSecs = bucketSecs;
+  let foldedSecs = floorSecs;
   for (const hours of FOLD_FACTORS_HOURS) {
     const candidate = hours * HOUR_SECS;
-    if (candidate < bucketSecs) continue;
+    if (candidate < floorSecs) continue;
     foldedSecs = candidate;
     if (Math.ceil(span / candidate) <= maxPoints) break;
   }

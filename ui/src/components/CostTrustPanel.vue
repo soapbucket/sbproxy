@@ -14,7 +14,7 @@
  * "Not reported" and "reported zero" are different sentences.
  */
 import { computed } from "vue";
-import { formatNumber, formatUsd } from "../lib/format";
+import { formatNumber, formatShare, formatUsd } from "../lib/format";
 import {
   estimateErrorByModel,
   priceCeilingOutcomes,
@@ -36,6 +36,16 @@ const props = defineProps<{
   /** False for `group_by=total`, where every row is unattributed by
    *  construction and the coverage question does not apply. */
   attributionApplies: boolean;
+  /**
+   * Whether the first `/metrics` scrape has landed.
+   *
+   * Every readout here says "not reported" when its family is missing,
+   * and an unfetched scrape has no families at all. Without this the
+   * panel opens by asserting that price provenance, the ceiling counter
+   * and the estimator are all unconfigured, which is four wrong claims
+   * about the deployment before a single byte has been read.
+   */
+  scrapeLoaded: boolean;
 }>();
 
 /* --- Price provenance --- */
@@ -95,7 +105,8 @@ const gatewayOwnSpend = computed(() => {
     <h2>How much to trust this</h2>
 
     <h3>Price provenance</h3>
-    <p v-if="priceSources === undefined" class="hint sb-faint">
+    <p v-if="!scrapeLoaded" class="hint sb-faint">Reading /metrics.</p>
+    <p v-else-if="priceSources === undefined" class="hint sb-faint">
       Price provenance is not reported by this build.
     </p>
     <p v-else-if="priceSources.total === 0" class="hint sb-faint">
@@ -119,7 +130,7 @@ const gatewayOwnSpend = computed(() => {
           <span class="legend__swatch" :style="{ background: sourceColor(share.source) }" />
           <span class="legend__name">{{ share.label }}</span>
           <span class="legend__val sb-mono">
-            {{ share.share === undefined ? "n/a" : `${(share.share * 100).toFixed(1)}%` }}
+            {{ formatShare(share.share, 1) }}
           </span>
         </li>
       </ul>
@@ -143,17 +154,18 @@ const gatewayOwnSpend = computed(() => {
       No spend in this window, so there is no coverage to report.
     </p>
     <p v-else class="hint">
-      {{ (attributedShare * 100).toFixed(0) }}% of spend in this window
-      carries a {{ dimensionLabel.toLowerCase() }}. This is computed from
+      {{ formatShare(attributedShare) }} of spend in this window carries a
+      {{ dimensionLabel.toLowerCase() }}. This is computed from
       the durable rollup and changes with the dimension you group by.
     </p>
 
     <h3>Price ceiling activity</h3>
-    <p v-if="ceilingOutcomes === undefined" class="hint sb-faint">
+    <p v-if="!scrapeLoaded" class="hint sb-faint">Reading /metrics.</p>
+    <p v-else-if="ceilingOutcomes === undefined" class="hint sb-faint">
       The price ceiling is not reported. The counter appears once a request
       carries an x-sbproxy-max-price header or an origin sets a ceiling.
     </p>
-    <ul v-else class="outcomes">
+    <ul v-else-if="ceilingOutcomes" class="outcomes">
       <li v-for="row in ceilingOutcomes" :key="row.outcome">
         <div class="outcomes__head">
           <span class="outcomes__label">{{ row.label }}</span>
@@ -165,17 +177,21 @@ const gatewayOwnSpend = computed(() => {
         <p class="hint">{{ row.note }}</p>
       </li>
     </ul>
-    <p v-if="ceilingOutcomes" class="hint">
+    <p v-if="scrapeLoaded && ceilingOutcomes" class="hint">
       Steady exclusions with no refusals is the healthy shape.
     </p>
 
     <h3>Estimator accuracy</h3>
-    <p v-if="estimateRows === undefined || !estimateRows.length" class="hint sb-faint">
+    <p v-if="!scrapeLoaded" class="hint sb-faint">Reading /metrics.</p>
+    <p
+      v-else-if="estimateRows === undefined || !estimateRows.length"
+      class="hint sb-faint"
+    >
       Estimator accuracy is only measured for models that have a per-model
       rate limit configured. None are configured here, so the estimator that
       drives budget debits and the price ceiling is running unmeasured.
     </p>
-    <table v-else class="detail">
+    <table v-else-if="estimateRows && estimateRows.length" class="detail">
       <thead>
         <tr>
           <th>Model</th>
@@ -195,7 +211,7 @@ const gatewayOwnSpend = computed(() => {
         </tr>
       </tbody>
     </table>
-    <p v-if="estimateRows && estimateRows.length" class="hint">
+    <p v-if="scrapeLoaded && estimateRows && estimateRows.length" class="hint">
       Measured against the upstream prompt token count on a reconciled
       admission, as (actual - estimated) / actual. Positive means the
       estimator reserved too little and a budget can overshoot; negative

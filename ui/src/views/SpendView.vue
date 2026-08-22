@@ -29,7 +29,7 @@ import {
   sumSamples,
   type MetricFamily,
 } from "../lib/metrics";
-import { formatNumber, formatUsd } from "../lib/format";
+import { formatNumber, formatShare, formatUsd } from "../lib/format";
 import { spendGroupOptions } from "../lib/spend-grouping";
 import { priceSourceShares } from "../lib/cost-trust";
 import {
@@ -150,7 +150,15 @@ const priorTotalUsd = computed(() =>
 );
 // The prior window is a second request. Until it lands, the page shows
 // the total without a comparison rather than a comparison against zero.
+// It can also fail on its own: `group_by=property:<key>` is a 400 when
+// the earlier range holds no row carrying that key. Every comparison on
+// the page is gated on this, because an absent prior window and a prior
+// window in which nothing ran produce the same empty list, and treating
+// them alike labels every row `new`.
 const priorLoaded = computed(() => priorData.value !== null);
+const priorFailed = computed(
+  () => priorData.value === null && prior.error.value !== null,
+);
 const delta = computed(() => spendDelta(totalUsd.value, priorTotalUsd.value));
 
 const rate = computed(() =>
@@ -178,22 +186,27 @@ const unitCost = computed(() => {
 const priceSources = computed(() =>
   priceSourceShares(findFamily(families.value, "sbproxy_ai_price_source_total")),
 );
+// A scrape that has not landed yet is not the same claim as a build
+// that does not report provenance. `loading` only covers a first load
+// already in flight, and the first paint happens before `onMounted`
+// fires, so the presence of data is what separates the two.
+const scrapeLoaded = computed(() => metricsReq.data.value !== null);
 const priceSourceSentence = computed(() => {
-  // A scrape that failed is not the same claim as a build that does not
-  // report provenance, and saying the second when the first happened
-  // would blame the binary for a network error.
   if (metricsReq.error.value) {
     return "Price provenance is unavailable while /metrics cannot be read.";
   }
-  if (metricsReq.loading.value) return "Reading price provenance.";
+  if (!scrapeLoaded.value) return "Reading price provenance.";
   const reading = priceSources.value;
   if (!reading) return "Price provenance is not reported by this build.";
   if (reading.total === 0) return "No price has been looked up yet.";
   const share = (source: string) =>
     reading.shares.find((s) => s.source === source)?.share ?? 0;
+  // Rounded to a whole percent, a real fallback share of 0.4% would
+  // print "0%" on the one line whose job is to say some of these
+  // dollars were invented. `formatShare` prints "<1%" instead.
   return (
-    `${(share("catalog") * 100).toFixed(0)}% of price lookups used the shipped ` +
-    `catalog. ${(share("fallback") * 100).toFixed(0)}% fell back to the flat rate.`
+    `${formatShare(share("catalog"))} of price lookups used the shipped ` +
+    `catalog. ${formatShare(share("fallback"))} fell back to the flat rate.`
   );
 });
 const coverageSentence = computed(() => {
@@ -202,7 +215,7 @@ const coverageSentence = computed(() => {
   }
   const share = attributedShare.value;
   if (share === undefined) return "No spend in this window to attribute.";
-  return `${(share * 100).toFixed(0)}% of spend in this window carries a ${dimensionLabel.value.toLowerCase()}.`;
+  return `${formatShare(share)} of spend in this window carries a ${dimensionLabel.value.toLowerCase()}.`;
 });
 
 /* ---- the chart ---- */
@@ -215,9 +228,30 @@ const noChartReason = computed(() => {
     : undefined;
 });
 
+/**
+ * The width both series are folded to.
+ *
+ * The store answers in hourly buckets inside its hourly retention and
+ * daily ones outside it, so a 7d window can come back hourly while the
+ * 7d before it comes back daily. Folding each series to the width its
+ * own response suggests puts daily sums against six-hourly sums on one
+ * y-axis, and the previous period draws four times higher than it was.
+ * Both series fold to the wider of the two.
+ */
+const commonFoldSecs = computed(() => {
+  const current = windowData.value;
+  if (!current) return 0;
+  const mine = rebucket(current.buckets, current.bucket_secs).foldedSecs;
+  const res = priorData.value;
+  if (!res) return mine;
+  return Math.max(mine, rebucket(res.buckets, res.bucket_secs).foldedSecs);
+});
+
 const folded = computed(() => {
   const res = windowData.value;
-  return res ? rebucket(res.buckets, res.bucket_secs) : undefined;
+  return res
+    ? rebucket(res.buckets, res.bucket_secs, 40, commonFoldSecs.value)
+    : undefined;
 });
 const currentPoints = computed(() => folded.value?.points ?? []);
 
@@ -241,7 +275,7 @@ const priorPoints = computed(() => {
   if (!res) return [];
   // Shifted forward one window length so both series share an x-axis.
   return shiftForward(
-    rebucket(res.buckets, res.bucket_secs).points,
+    rebucket(res.buckets, res.bucket_secs, 40, commonFoldSecs.value).points,
     activeWindow.value,
   );
 });
@@ -249,24 +283,30 @@ const priorPoints = computed(() => {
 const series = computed(() => {
   const shape = (points: TimePoint[]) =>
     toSeriesPoints(chartMode.value === "cumulative" ? cumulative(points) : points);
-  return [
+  const out = [
     {
       name: `this ${activeWindow.value}`,
       points: shape(currentPoints.value),
       color: "var(--sb-chart-1)",
     },
-    {
+  ];
+  // No second series until the second call answers. An empty series
+  // still draws its legend entry, and a named line with nothing under it
+  // reads as a period that cost nothing.
+  if (priorLoaded.value) {
+    out.push({
       name: `previous ${activeWindow.value}`,
       points: shape(priorPoints.value),
       color: "var(--sb-chart-2)",
-    },
-  ];
+    });
+  }
+  return out;
 });
 
 /* ---- where it went ---- */
 
 const comparedRows = computed(() =>
-  compareRows(rows.value, priorRows.value, totalUsd.value),
+  compareRows(rows.value, priorRows.value, totalUsd.value, priorLoaded.value),
 );
 const barItems = computed(() => topNWithOther(rows.value, 8));
 
@@ -472,11 +512,13 @@ const spendByKey = computed(() => {
         :value="formatUsd(totalUsd)"
         tone="accent"
         :sub="
-          !priorLoaded
-            ? 'comparing with the previous period'
-            : delta.ratio === undefined
-              ? `nothing recorded in the previous ${activeWindow}`
-              : `${formatUsd(priorTotalUsd)} in the previous ${activeWindow}, ${delta.absolute >= 0 ? '+' : ''}${(delta.ratio * 100).toFixed(0)}%`
+          priorFailed
+            ? `the previous ${activeWindow} could not be read`
+            : !priorLoaded
+              ? 'comparing with the previous period'
+              : delta.ratio === undefined
+                ? `nothing recorded in the previous ${activeWindow}`
+                : `${formatUsd(priorTotalUsd)} in the previous ${activeWindow}, ${delta.absolute >= 0 ? '+' : ''}${formatShare(delta.ratio)}`
         "
       />
       <StatCard
@@ -485,7 +527,7 @@ const spendByKey = computed(() => {
         :sub="
           rate
             ? `from the last ${Math.round(rate.basisSecs / 3600)}h; ${formatUsd(rate.overWindow)} over ${activeWindow} if it holds`
-            : 'needs six hours of complete buckets, so a one hour window is too short'
+            : 'needs at least three complete buckets covering six hours'
         "
       />
       <StatCard
@@ -498,7 +540,7 @@ const spendByKey = computed(() => {
             ? 'group by a dimension to see what it cannot name'
             : unattributed?.share === undefined
               ? 'no spend in this window'
-              : `${(unattributed.share * 100).toFixed(0)}% of window spend has no ${dimensionLabel.toLowerCase()}`
+              : `${formatShare(unattributed.share)} of window spend has no ${dimensionLabel.toLowerCase()}`
         "
       />
       <StatCard
@@ -548,12 +590,17 @@ const spendByKey = computed(() => {
       </div>
 
       <p v-if="varianceSentence" class="hint">{{ varianceSentence }}</p>
+      <p v-if="priorFailed" class="hint">
+        The previous {{ activeWindow }} could not be read, so no row carries a
+        delta and none is marked new or gone. Everything else on this page is
+        the selected window and is unaffected.
+      </p>
       <p
         v-if="attributionApplies && unattributed && unattributed.usd > 0"
         class="hint"
       >
         {{ formatUsd(unattributed.usd) }} of {{ formatUsd(unattributed.totalUsd) }}
-        ({{ ((unattributed.share ?? 0) * 100).toFixed(0) }}%) carries no
+        ({{ formatShare(unattributed.share) }}) carries no
         {{ dimensionLabel.toLowerCase() }}.
       </p>
 
@@ -588,15 +635,22 @@ const spendByKey = computed(() => {
                 <span v-else class="sb-mono">{{ groupLabel(row.group) }}</span>
                 <span v-if="row.presence === 'new'" class="tag sb-faint">new</span>
                 <span v-if="row.presence === 'gone'" class="tag sb-faint">gone</span>
+                <!-- Only once the comparison is known to have failed. In
+                     flight is the ordinary state on every load and does
+                     not deserve a tag on every row. -->
+                <span
+                  v-if="row.presence === 'unknown' && priorFailed"
+                  class="tag sb-faint"
+                >
+                  no comparison
+                </span>
               </td>
               <td>{{ formatUsd(row.costUsd) }}</td>
-              <td>
-                {{ row.share === undefined ? "n/a" : `${(row.share * 100).toFixed(1)}%` }}
-              </td>
+              <td>{{ formatShare(row.share, 1) }}</td>
               <td>
                 {{
                   row.vsPrior === undefined
-                    ? "-"
+                    ? "n/a"
                     : `${row.vsPrior >= 0 ? "+" : "-"}${formatUsd(Math.abs(row.vsPrior))}`
                 }}
               </td>
@@ -645,7 +699,7 @@ const spendByKey = computed(() => {
         {{
           cacheHitRate === undefined
             ? "Hit rate is not reported."
-            : `${(cacheHitRate * 100).toFixed(0)}% of cache lookups hit.`
+            : `${formatShare(cacheHitRate)} of cache lookups hit.`
         }}
       </p>
       <p class="hint">
@@ -708,12 +762,14 @@ const spendByKey = computed(() => {
       ref="budgets"
       :families="families"
       :spend-by-key="spendByKey"
+      :scrape-loaded="scrapeLoaded"
     />
     <CostTrustPanel
       :families="families"
       :attributed-share="attributedShare"
       :dimension-label="dimensionLabel"
       :attribution-applies="attributionApplies"
+      :scrape-loaded="scrapeLoaded"
     />
   </template>
 </template>

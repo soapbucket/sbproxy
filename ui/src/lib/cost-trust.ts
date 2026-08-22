@@ -367,6 +367,12 @@ export interface CappedKeySelection {
  * Either way the view says which order it used and how many keys it left
  * out, because a list that silently stops at twenty reads as the whole
  * fleet.
+ *
+ * A spend map that names none of the capped keys is treated as absent.
+ * The rollup groups by the id the request path stamped and the key list
+ * comes from the admin store, so the two can fail to join; claiming
+ * "highest spend first" over a join that matched nothing would describe
+ * an order the list is not in.
  */
 export function selectCappedKeys(
   keys: AdminKey[],
@@ -386,7 +392,8 @@ export function selectCappedKeys(
       windowSpendUsd: spendByKey?.[id],
     });
   }
-  const orderedBy = spendByKey ? "spend" : "cap";
+  const spendJoins = capped.some((row) => row.windowSpendUsd !== undefined);
+  const orderedBy = spendByKey && spendJoins ? "spend" : "cap";
   capped.sort((a, b) => {
     if (orderedBy === "spend") {
       const delta = (b.windowSpendUsd ?? 0) - (a.windowSpendUsd ?? 0);

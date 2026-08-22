@@ -28,7 +28,7 @@ import {
   type GovernanceSnapshot,
 } from "../api";
 import { useAsync } from "../composables/useAsync";
-import { formatTime, formatUsd } from "../lib/format";
+import { formatShare, formatTime, formatUsd } from "../lib/format";
 import { budgetBar, selectCappedKeys, utilizationByScope } from "../lib/cost-trust";
 import { findFamily, type MetricFamily } from "../lib/metrics";
 import ErrorState from "./ErrorState.vue";
@@ -45,6 +45,15 @@ const props = defineProps<{
    * means fall back to ordering by the size of the cap.
    */
   spendByKey?: Record<string, number>;
+  /**
+   * Whether the first `/metrics` scrape has landed.
+   *
+   * The scope gauge reads "not reported" on a missing family, and an
+   * unfetched scrape has no families at all, so without this the panel
+   * opens by claiming no AI budget is configured on a deployment that
+   * has several.
+   */
+  scrapeLoaded: boolean;
 }>();
 
 /** One usage request per key is the cost, so the list stops here. */
@@ -198,8 +207,11 @@ const scopes = computed(() => utilizationByScope(utilizationFamily.value));
               {{ formatUsd(row.bar.usedUsd) }} used,
               {{ formatUsd(row.bar.reservedUsd) }} held, of
               {{ formatUsd(row.bar.limitUsd) }}
+              <!-- A cap at 99.6% rounded to "100%" reads as already
+                   exhausted, and one at 0.4% rounded to "0%" reads as
+                   untouched. `formatShare` prints ">99%" and "<1%". -->
               <StatusBadge
-                :label="`${(row.bar.ratio * 100).toFixed(0)}%`"
+                :label="formatShare(row.bar.ratio)"
                 :tone="row.bar.tone"
               />
             </span>
@@ -248,19 +260,20 @@ const scopes = computed(() => utilizationByScope(utilizationFamily.value));
       Highest single budget in each scope. This gauge carries no identity,
       so it cannot say which workspace or which key.
     </p>
-    <p v-if="scopes === undefined" class="hint sb-faint">
+    <p v-if="!scrapeLoaded" class="hint sb-faint">Reading /metrics.</p>
+    <p v-else-if="scopes === undefined" class="hint sb-faint">
       Budget utilization is not reported. The gauge appears once an AI
       budget is configured.
     </p>
     <p v-else-if="!scopes.length" class="hint sb-faint">
       No scope has reported a utilization sample yet.
     </p>
-    <div v-else class="scopes">
+    <div v-else-if="scopes" class="scopes">
       <div class="scope" v-for="scope in scopes" :key="scope.scope">
         <div class="scope__head">
           <span class="sb-mono">{{ scope.scope }}</span>
           <StatusBadge
-            :label="`${(scope.ratio * 100).toFixed(0)}%`"
+            :label="formatShare(scope.ratio)"
             :tone="scope.tone"
           />
         </div>
