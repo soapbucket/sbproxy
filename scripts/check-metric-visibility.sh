@@ -21,7 +21,7 @@
 #
 # # Shrink-only, not a wall
 #
-# 260 stable families are uncovered as this lands. Failing the world on
+# 251 stable families are uncovered as this lands. Failing the world on
 # day one would mean turning the check off, so the committed baseline is
 # today's real number and it may only fall. Adding a family without a
 # panel pushes the count up and this goes red; adding the panel later

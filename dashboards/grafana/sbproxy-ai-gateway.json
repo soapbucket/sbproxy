@@ -1099,7 +1099,8 @@
             "drawStyle": "line",
             "pointSize": 5,
             "showPoints": "auto"
-          }
+          },
+          "noValue": "No AI requests in this window"
         },
         "overrides": [
           {

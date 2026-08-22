@@ -1,6 +1,6 @@
 # Operator runbook
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 This runbook is the dashboard/action companion to
 [`quickstart-operator.md`](quickstart-operator.md). Use the quickstart for first
