@@ -101,13 +101,29 @@ const ANONYMOUS_AGENT_ID: &str = "anonymous";
 /// goes on to reject never installs a hook that outlives it.
 pub struct CedarMcpHook {
     evaluator: Arc<CedarEvaluator>,
+    /// Server names (the `McpAction::prefixes` key space, i.e. the
+    /// resolved names a `tools/call`'s `mcp_server` is drawn from)
+    /// this hook's owning `mcp` action actually federates.
+    ///
+    /// A call for a server outside this set is not this hook's to
+    /// judge: [`Self::evaluate_ctx`] answers `Allow` (a pass, not an
+    /// opinion) rather than evaluating against a `PolicySet` that has
+    /// never heard of the resource, which -- absent this check --
+    /// Cedar's own default-deny turns into a wrong refusal (WOR-2587
+    /// review). `sbproxy_plugin::mcp::set_pipeline_mcp_policy_hooks`
+    /// collects every action's hook into one process-wide list and
+    /// dispatch takes the first non-Allow verdict, so an unscoped hook
+    /// would refuse every other action's tool calls the moment its own
+    /// `PolicySet` did not happen to permit them.
+    servers: std::collections::HashSet<String>,
 }
 
 impl CedarMcpHook {
     /// Wrap an already-compiled [`CedarEvaluator`] as an
-    /// [`McpPolicyHook`].
-    pub fn new(evaluator: Arc<CedarEvaluator>) -> Self {
-        Self { evaluator }
+    /// [`McpPolicyHook`], scoped to `servers` (the owning
+    /// `McpAction`'s resolved server names).
+    pub fn new(evaluator: Arc<CedarEvaluator>, servers: std::collections::HashSet<String>) -> Self {
+        Self { evaluator, servers }
     }
 
     /// Build the Cedar principal / action / resource triple for a
@@ -117,6 +133,11 @@ impl CedarMcpHook {
     /// returns a boxed future) so unit tests, and any future caller
     /// that wants a synchronous check, can call it directly.
     fn evaluate_ctx(&self, ctx: &McpToolCallCtx<'_>) -> PolicyDecision {
+        if !self.servers.contains(ctx.mcp_server) {
+            // Out of scope for this hook's action; defer to whichever
+            // hook (or RBAC-only default) actually owns `mcp_server`.
+            return PolicyDecision::Allow;
+        }
         let principal = agent_uid(ctx.agent_id);
         // Fixed literal, not user input: safe to parse from Cedar
         // source-text syntax. The default MCP schema declares no
@@ -172,7 +193,7 @@ mod tests {
     fn hook_from_source(src: &str) -> CedarMcpHook {
         let compiled = compile_all(&[("t", src)], None).expect("compile");
         let evaluator = CedarEvaluator::new(compiled.policy_set, None).expect("new evaluator");
-        CedarMcpHook::new(Arc::new(evaluator))
+        CedarMcpHook::new(Arc::new(evaluator), ["srv".to_string()].into_iter().collect())
     }
 
     fn ctx<'a>(agent_id: Option<&'a str>, server: &'a str, tool: &'a str) -> McpToolCallCtx<'a> {
@@ -316,5 +337,28 @@ mod tests {
             .evaluate(ctx(Some("someone-else"), "srv", "tool_a"))
             .await;
         assert!(matches!(verdict, PolicyDecision::Deny { .. }));
+    }
+
+    /// WOR-2587 review: a hook scoped to one action's servers must not
+    /// opine on a `tools/call` for a server outside that scope, even
+    /// when its own policy set would otherwise default-deny an
+    /// unmatched resource. Two pipeline actions can each declare
+    /// `cedar_policies:` for their own, disjoint `federated_servers`;
+    /// `sbproxy_plugin::mcp::set_pipeline_mcp_policy_hooks` flattens
+    /// both hooks into one list and dispatch stops at the first
+    /// non-Allow verdict, so an unscoped hook answering Deny for a
+    /// server it has never heard of would silently shadow the other
+    /// action's own (correct) verdict for that call.
+    #[tokio::test]
+    async fn out_of_scope_server_defers_with_allow_regardless_of_policy() {
+        let hook = hook_from_source(r#"forbid(principal, action, resource);"#);
+        let verdict = hook
+            .evaluate(ctx(Some("agent-1"), "other-srv", "tool_a"))
+            .await;
+        assert_eq!(
+            verdict,
+            PolicyDecision::Allow,
+            "a server this hook was not scoped to must be a pass, not a verdict"
+        );
     }
 }
