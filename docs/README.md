@@ -124,6 +124,7 @@ Route AI, govern the AI that calls you, and run AI models yourself.
 - [402-challenge.md](402-challenge.md) - the exact bytes of every payment challenge, credential, problem document, and receipt.
 - [l402.md](l402.md) - L402 (Lightning HTTP 402) design notes: the protocol shape SBproxy would implement. None of it ships in the current binary.
 - [ai-crawl-control.md](ai-crawl-control.md) - the `ai_crawl_control` policy: Pay Per Crawl token challenge and ledger trait.
+- [comp-marketplace.md](comp-marketplace.md) - the `sbproxy-licensing` crate: IAB CoMP marketplace bridge (manifest, signed quote, redeem), bridging into the OSS OLP license-token wire format on redeem.
 - [ai-usage-ledger.md](ai-usage-ledger.md) - the verifiable usage ledger: hash-chained, Ed25519-signed spend receipts you can re-derive and verify.
 - [metering.md](metering.md) - attested metering: signed, hash-chained consumption receipts, the operator surface that reads and verifies the chain, and buyer-side verification against the published key set.
 - [value-ledger-economics.md](value-ledger-economics.md) - the Value Ledger: local-vs-cloud lane split, reference prices, and the savings report at `/admin/model-host/value`.

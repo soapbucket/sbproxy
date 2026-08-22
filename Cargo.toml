@@ -36,6 +36,7 @@ members = [
     "crates/sbproxy-capability",
     "crates/sbproxy-mcp-gateway",
     "crates/sbproxy-federation",
+    "crates/sbproxy-licensing",
     "e2e",
 ]
 # The k8s operator and the Gateway API controller both pull kube +
@@ -75,6 +76,7 @@ default-members = [
     "crates/sbproxy-agent-detect",
     "crates/sbproxy-mcp-gateway",
     "crates/sbproxy-federation",
+    "crates/sbproxy-licensing",
     "e2e",
 ]
 

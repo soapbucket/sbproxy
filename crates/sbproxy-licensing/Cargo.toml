@@ -1,0 +1,64 @@
+[package]
+name = "sbproxy-licensing"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "IAB Content Authorization Marketplace Protocol (CoMP) bridge: signed manifest, quote, and redeem-to-OLP-token endpoints, plus the shared Ed25519 key manager and per-jti revocation store behind them."
+
+[lib]
+name = "sbproxy_licensing"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
+prometheus = { workspace = true }
+ulid = { workspace = true }
+
+# Ed25519 sign/verify for quote signatures and the redeem-time OLP
+# token bridge. Per-crate pin (not promoted to workspace.dependencies)
+# mirrors the convention `sbproxy-config`, `sbproxy-modules`, and
+# several other crates already use for the same primitive.
+ed25519-dalek = "2"
+# HKDF-SHA256 key derivation for KeyManager: one operator-supplied
+# master key expands into a rotation-addressable signing key per
+# `rotation_id`, so an operator rotates by bumping a label instead of
+# minting and distributing a raw Ed25519 seed by hand.
+hkdf = "0.13"
+
+# Workspace storage abstraction. `RedisRevocation` composes with any
+# `EphemeralKv` backend (Redis, mesh, in-memory) instead of opening its
+# own `redis::Client`. `redis` is on by default so the URL-based
+# constructor works out of the box; a deployment that already owns an
+# `Arc<dyn EphemeralKv>` from its own bootstrap reaches for
+# `RedisRevocation::with_storage` instead and can turn the feature off.
+sbproxy-storage = { workspace = true }
+
+# Per-crate axum pin for the CoMP router. Not promoted to
+# workspace.dependencies: `sbproxy-mcp-gateway` and `sbproxy-federation`
+# already each carry their own independent pin with the same note, so a
+# third independent pin keeps this crate's version bump free of
+# coordinating with either of them until a shared need appears.
+axum = { version = "0.7", default-features = false, features = ["http1", "tokio", "matched-path", "json"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tower = { version = "0.4", features = ["util"] }
+http = { workspace = true }
+http-body-util = { workspace = true }
+# Pulls in `MockEphemeralKv` so the `RedisRevocation` test proves the
+# trait-driven path without standing up a real Redis.
+sbproxy-storage = { workspace = true, features = ["mock"] }
+tracing-subscriber = { workspace = true }
