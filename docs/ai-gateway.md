@@ -959,7 +959,7 @@ The retry keeps the provider, the model, the base URL, and the price the request
 
 A request that arrived carrying a caller-owned native provider key never falls back, whatever the entry says: the caller presented their own credential and the provider refused it, so spending yours would bill you for their authorization failure.
 
-`credential_source` on the admin request row (`provider_entry`, `native_caller`, `fallback`) says which secret paid, and one `credential_fallback` event lands on the typed feed per swap. Full decision path, the `fail_closed` argument, and a runnable walkthrough are in [multi-tenant.md](multi-tenant.md#when-a-tenants-provider-key-is-refused) and [examples/tenant-key-fallback](../examples/tenant-key-fallback/).
+`credential_source` on the admin request row (`provider_entry`, `native_caller`, `fallback`) says which secret paid, one `credential_fallback` event lands on the typed feed per swap, and `sbproxy_ai_key_fallbacks_total{provider,outcome}` counts the same decision for anyone alerting off the scrape rather than off the feed. Full decision path, the `fail_closed` argument, and a runnable walkthrough are in [multi-tenant.md](multi-tenant.md#when-a-tenants-provider-key-is-refused) and [examples/tenant-key-fallback](../examples/tenant-key-fallback/).
 
 ## Shadow eval
 

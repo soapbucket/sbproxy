@@ -1,6 +1,6 @@
 # Multi-tenant deployment
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 SBproxy serves multiple tenants from a single binary. Each tenant gets its own configuration scope under `proxy.tenants[]`; origins bind to a tenant via `origin.tenant_id`; request-time resolution walks origin → tenant → proxy with most-specific-wins by name.
 
@@ -140,6 +140,8 @@ The request row on `GET /api/requests` carries `credential_source: "fallback"`, 
 
 That is the row to bill from and the event to alert on. A tenant whose `fallback` share is climbing is a tenant whose key is dying and whose spend has quietly moved onto your account.
 
+The same decision is on the scrape as `sbproxy_ai_key_fallbacks_total{provider,outcome}`, so the alert does not need an `events:` sink configured. Alert on `outcome="unavailable"` first: it means the operator's credential is the broken one, and the only other evidence is a `401` that reads like the tenant's fault.
+
 ### Choosing the posture
 
 ```mermaid
@@ -163,6 +165,8 @@ Three rulings the diagram encodes, each of which costs money if you get it backw
 **A caller-owned native credential never falls back.** When a request arrives with `inbound_key_mode: native`, the key on the wire is the caller's, the provider refused *their* credential, and spending yours would bill you for their authorization failure. It would also let a caller whose upstream key was revoked keep working on your account. This is not configurable.
 
 **Key fallback owns `401` and `403`, and nothing else.** A `429`, a `5xx`, or a timeout stays with the provider failover and `resilience.cooldown_policy`, because a different key against a rate-limited provider is still rate limited. If both are configured and the provider returns a `401` that a `retry_policy` would also retry, the key fallback goes first: trying a fresh credential against the provider the caller asked for is the narrower repair, and the untried tail of the failover chain is left intact behind it, so an availability failover still runs when the operator's credential is refused as well.
+
+One consequence of that ordering is worth stating, because it is the thing an operator running both would otherwise have to discover: on an entry that names a `fallback_credential_id`, a `401` the operator's credential recovers from no longer feeds `resilience.cooldown_policy`'s `auth` axis. Parking a provider that is serving every request fine on the house key would be the wrong repair. A second refusal, on the retry itself, does record and does park. Entries with no `fallback_credential_id` are unaffected and record exactly as before.
 
 **`fail_closed` is a real choice, not a paranoia setting.** Use it wherever the tenant's own key *is* the authorization boundary: a tenant billed on their own account has to find out their key stopped working, and a tenant you revoked upstream must not keep serving traffic on your credential. Setting `on_key_failure: fail_closed` together with a `fallback_credential_id` is refused at config load, because a credential that can never be presented is a config that reads as configured and does nothing.
 

@@ -11458,6 +11458,12 @@ pub(super) async fn handle_ai_proxy(
                                 &provider.name,
                                 "error",
                             );
+                            // Scrapeable from day one, because the typed
+                            // event only reaches a deployment that
+                            // configured an `events:` sink for it, and
+                            // "the house credential is now paying" is a
+                            // thing to alert on rather than to discover.
+                            sbproxy_ai::ai_metrics::record_key_fallback(&provider.name, "engaged");
                             warn!(
                                 provider = %provider.name,
                                 status = %status,
@@ -11491,6 +11497,10 @@ pub(super) async fn handle_ai_proxy(
                             // credential is named, never its material,
                             // and `error` is `CredentialResolveError`'s
                             // Display, which carries no secret either.
+                            sbproxy_ai::ai_metrics::record_key_fallback(
+                                &provider.name,
+                                "unavailable",
+                            );
                             warn!(
                                 provider = %provider.name,
                                 status = %status,
@@ -27587,12 +27597,33 @@ mod provider_key_fallback_tests {
     /// no fallback credential behaves exactly as `fail_closed` does,
     /// which is what makes `fallback` a safe default on an existing
     /// config.
+    ///
+    /// The `fail_closed` fixture carries a `fallback_credential_id` on
+    /// purpose, even though `ProviderConfig::validate_key_failure_posture`
+    /// refuses that pair at config load. Without it the assertion would
+    /// pass on the missing credential and prove nothing about the
+    /// posture, and the posture check would be the one term of this gate
+    /// no test holds. It is also what a reader needs to see if the
+    /// validation is ever relaxed to let the two coexist.
     #[test]
     fn fail_closed_and_a_missing_credential_both_refuse_the_fallback() {
         let opted_out = provider(serde_json::json!({
-            "on_key_failure": "fail_closed"
+            "on_key_failure": "fail_closed",
+            "fallback_credential_id": "house-openai"
         }));
-        assert!(!wants_provider_key_fallback(&opted_out, 401, false, false));
+        assert!(
+            !wants_provider_key_fallback(&opted_out, 401, false, false),
+            "the posture alone must refuse, with a credential named and \
+             everything else identical to the engaging case"
+        );
+        let opted_in = provider(serde_json::json!({
+            "on_key_failure": "fallback",
+            "fallback_credential_id": "house-openai"
+        }));
+        assert!(
+            wants_provider_key_fallback(&opted_in, 401, false, false),
+            "the differential: only on_key_failure differs from the fixture above"
+        );
 
         let nothing_to_fall_back_to = provider(serde_json::json!({}));
         assert!(!wants_provider_key_fallback(

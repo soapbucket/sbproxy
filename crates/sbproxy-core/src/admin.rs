@@ -7907,6 +7907,21 @@ mod tests {
         // Structured columns carry JSON so nothing is lossy.
         let properties: serde_json::Value = serde_json::from_str(&row[col("properties")]).unwrap();
         assert_eq!(properties["tier"], "gold");
+        // Appended last, so the row has to be as wide as the header or
+        // an importer reading by position silently shifts. `col()`
+        // panics if the name is missing, and indexing panics if the row
+        // is short, which is the pair this asserts.
+        assert_eq!(header.len(), row.len(), "{header:?} vs {row:?}");
+        assert_eq!(
+            col("credential_source"),
+            header.len() - 1,
+            "credential_source is the appended column"
+        );
+        assert_eq!(
+            row[col("credential_source")],
+            "",
+            "a non-AI row leaves it empty rather than dropping the field"
+        );
     }
 
     #[test]

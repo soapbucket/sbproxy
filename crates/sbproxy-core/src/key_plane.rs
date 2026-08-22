@@ -352,10 +352,38 @@ struct ResolvedCredentialEntry {
     at: std::time::Instant,
     value: ResolvedCredential,
     stale_announced: bool,
+    /// The tenant the underlying record was bound to when it resolved,
+    /// `None` for a shared credential.
+    ///
+    /// Carried here because the cache is keyed by credential id alone
+    /// and the tenant refusal lives past the two paths that serve from
+    /// it. Without it the first tenant to warm an entry hands every
+    /// later tenant the same upstream identity, which is the exact
+    /// refusal `resolve_credential_secret` advertises.
+    tenant_id: Option<String>,
 }
 
 type ResolvedCredentialCache =
     parking_lot::Mutex<std::collections::HashMap<String, ResolvedCredentialEntry>>;
+
+/// Whether a credential bound to `record_tenant` may be presented for a
+/// request scoped to `request_tenant`.
+///
+/// A credential with no tenant is shared and any request may present it.
+/// One with a tenant may only be presented by a request of that same
+/// tenant, and an unscoped request is not a wildcard.
+///
+/// A free function rather than an inline comparison because the same
+/// rule has to hold on three return paths: the record read, the fresh
+/// resolved-secret cache hit, and the grace-window stale serve. The
+/// first of those is where it was originally written, and the other two
+/// return before it.
+fn tenant_binding_permits(record_tenant: Option<&str>, request_tenant: Option<&str>) -> bool {
+    match record_tenant {
+        None => true,
+        Some(bound) => request_tenant == Some(bound),
+    }
+}
 
 /// Drop any cached resolved secret for `id`. Called from the admin mutation
 /// path alongside the record-cache invalidation.
@@ -542,6 +570,15 @@ impl KeyPlane {
         // served immediately, and a stale one is held so the grace window
         // below has something to fall back to when the backend is down.
         let cached = self.resolved_credentials.lock().get(id).cloned();
+        // The tenant refusal is re-applied here, not only after the
+        // record is read below: this cache is keyed by credential id
+        // alone, and both paths that serve from it (fresh hit and the
+        // grace-window stale serve) return before the record's own
+        // `tenant_id` is consulted. A caller resolving one credential id
+        // under whichever tenant's request arrived would otherwise be
+        // served the first tenant's material for the life of the entry.
+        let cached =
+            cached.filter(|entry| tenant_binding_permits(entry.tenant_id.as_deref(), tenant_id));
         if let Some(entry) = &cached {
             if entry.at.elapsed() < policy.re_resolve_interval() {
                 *cache_layer = "hit";
@@ -625,7 +662,7 @@ impl KeyPlane {
         }
         // A credential with no tenant is shared; one with a tenant may only be
         // bound by a key of that same tenant.
-        if record.tenant_id.is_some() && record.tenant_id.as_deref() != tenant_id {
+        if !tenant_binding_permits(record.tenant_id.as_deref(), tenant_id) {
             return Err(CredentialResolveError::TenantMismatch);
         }
 
@@ -691,6 +728,7 @@ impl KeyPlane {
                 // A fresh resolution ends whatever stale-serving episode
                 // was running, so the next outage announces again.
                 stale_announced: false,
+                tenant_id: record.tenant_id.clone(),
             },
         );
         // WOR-2571: one typed event per actual resolution. The cached
@@ -2572,6 +2610,49 @@ mod resolve_credential_secret_tests {
                 .await
                 .expect("the owning tenant resolves it"),
             "sk-acme-only"
+        );
+    }
+
+    /// The resolved-secret cache is keyed by credential id alone, so the
+    /// tenant binding has to be re-checked on the cache-hit path as well
+    /// as on the resolution path. The AI provider-key fallback resolves
+    /// one `fallback_credential_id` under whichever tenant's request
+    /// arrives, so without this the first tenant to warm the cache hands
+    /// every other tenant the same upstream identity and the same bill.
+    #[tokio::test]
+    async fn a_warm_cache_entry_is_still_refused_across_tenants() {
+        invalidate_all_resolved_credentials();
+        let p = plane();
+        let mut rec = credential(
+            "c-warm-tenant-bound",
+            CredentialMaterial::Plaintext {
+                value: "sk-acme-only-warm".into(),
+            },
+        );
+        rec.tenant_id = Some("acme".to_string());
+        put(&p, rec).await;
+
+        assert_eq!(
+            p.resolve_credential_material("c-warm-tenant-bound", Some("acme"))
+                .await
+                .expect("the owning tenant resolves it and warms the cache"),
+            "sk-acme-only-warm"
+        );
+        assert!(
+            matches!(
+                p.resolve_credential_material("c-warm-tenant-bound", Some("globex"))
+                    .await,
+                Err(CredentialResolveError::TenantMismatch)
+            ),
+            "a warm cache entry must not serve another tenant's credential"
+        );
+        assert!(
+            matches!(
+                p.resolve_credential_material("c-warm-tenant-bound", None)
+                    .await,
+                Err(CredentialResolveError::TenantMismatch)
+            ),
+            "and an unscoped request is not a wildcard on the cache path either"
         );
     }
 

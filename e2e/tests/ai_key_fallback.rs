@@ -13,6 +13,7 @@
 
 use sbproxy_e2e::{MockUpstream, ProxyHarness};
 use serde_json::json;
+use std::net::TcpListener;
 
 const TENANT_KEY: &str = "sk-tenant-key-acme";
 const HOUSE_KEY: &str = "sk-house-key-operator";
@@ -305,8 +306,13 @@ fn both_credentials_401_terminates() {
 fn a_credential_that_cannot_resolve_returns_the_original_401() {
     let upstream = MockUpstream::start_sequence(vec![(401, rejected()), (200, chat_reply())])
         .expect("upstream");
-    let proxy = ProxyHarness::start_with_yaml(&config_without_a_key_plane(&upstream.base_url()))
-        .expect("proxy");
+    // `start_with_workspace`, not `start_with_yaml`: sbproxy's tracing
+    // output goes to stdout, and only the workspace harness captures it.
+    // `start_with_yaml` sends stdout to /dev/null, so the log assertions
+    // below would read an empty string and pass on nothing.
+    let proxy =
+        ProxyHarness::start_with_workspace(&config_without_a_key_plane(&upstream.base_url()), &[])
+            .expect("proxy");
 
     assert_eq!(
         send(&proxy),
@@ -318,13 +324,147 @@ fn a_credential_that_cannot_resolve_returns_the_original_401() {
         vec![format!("Bearer {TENANT_KEY}")]
     );
 
-    let logs = proxy.stderr_contents();
+    let logs = format!("{}\n{}", proxy.stdout_contents(), proxy.stderr_contents());
     assert!(
         logs.contains("house-openai"),
         "the operator has to be able to tell which credential failed: {logs}"
     );
     assert!(
+        logs.contains("fallback credential did not resolve"),
+        "and why, not only that something failed: {logs}"
+    );
+    assert!(
         !logs.contains(HOUSE_KEY) && !logs.contains(TENANT_KEY),
         "no credential material may reach the log"
+    );
+}
+
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("ephemeral listener")
+        .local_addr()
+        .expect("listener address")
+        .port()
+}
+
+/// The fallback origin again, with the two surfaces the docs promise an
+/// operator will read it on: the admin request row and the typed event
+/// feed. `events_path` is absolute because the proxy's working directory
+/// is not this test's.
+fn config_with_observability(upstream_url: &str, admin_port: u16, events_path: &str) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+  admin:
+    enabled: true
+    port: {admin_port}
+    username: admin
+    password: secret
+  key_management:
+    enabled: true
+    store:
+      backend: embedded
+      path: /tmp/sbproxy-e2e-key-fallback-observed.redb
+    crypto:
+      pepper: e2e-pepper-value-not-a-real-secret
+      master_key: e2e-master-value-not-a-real-secret
+    seed:
+      credentials:
+        - id: house-openai
+          name: house openai account
+          provider: openai
+          secret: {HOUSE_KEY}
+events:
+  sink: file
+  path: {events_path}
+  types:
+    - credential_fallback
+origins:
+  "ai.localhost":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai-acme
+          provider_type: openai
+          api_key: {TENANT_KEY}
+          base_url: "{upstream_url}"
+          allow_private_base_url: true
+          models: [gpt-4o]
+          fallback_credential_id: house-openai
+"#
+    )
+}
+
+/// The two surfaces `docs/multi-tenant.md` and the example README tell an
+/// operator to read, proven against a live swap rather than against the
+/// builders in isolation. A doc that names a field is trusted, so the
+/// field has to be on the wire.
+///
+/// Red before the change on both halves: `credential_source` is not a
+/// column and `credential_fallback` is not an event name, so the
+/// `events.types:` entry alone refuses the config at load.
+#[test]
+fn the_swap_is_visible_on_the_request_row_and_the_typed_feed() {
+    let upstream = MockUpstream::start_sequence(vec![(401, rejected()), (200, chat_reply())])
+        .expect("upstream");
+    let admin_port = free_port();
+    let events_dir = tempfile::tempdir().expect("events dir");
+    let events_path = events_dir.path().join("credential-fallback.ndjson");
+    let proxy = ProxyHarness::start_with_yaml(&config_with_observability(
+        &upstream.base_url(),
+        admin_port,
+        &events_path.display().to_string(),
+    ))
+    .expect("proxy");
+
+    assert_eq!(send(&proxy), 200);
+
+    let client = reqwest::blocking::Client::new();
+    // Both writes race the response: the ring is written after the relay
+    // and the event egress is a separate task.
+    let mut row = serde_json::Value::Null;
+    let mut events = String::new();
+    for _ in 0..80 {
+        let rows: Vec<serde_json::Value> = client
+            .get(format!(
+                "http://127.0.0.1:{admin_port}/api/requests?limit=5"
+            ))
+            .basic_auth("admin", Some("secret"))
+            .send()
+            .expect("admin query")
+            .json()
+            .expect("admin rows json");
+        events = std::fs::read_to_string(&events_path).unwrap_or_default();
+        if let Some(first) = rows.into_iter().next() {
+            row = first;
+            if !events.is_empty() {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    assert_eq!(
+        row["credential_source"], "fallback",
+        "the request row has to say which credential paid: {row}"
+    );
+    assert_eq!(row["status"], 200, "{row}");
+
+    let event: serde_json::Value = serde_json::from_str(
+        events
+            .lines()
+            .find(|line| line.contains("credential_fallback"))
+            .unwrap_or_else(|| panic!("no credential_fallback line in: {events}")),
+    )
+    .expect("the event line is JSON");
+    assert_eq!(event["event_type"], "credential_fallback");
+    assert_eq!(event["data"]["id"], "house-openai");
+    assert_eq!(event["data"]["provider"], "openai-acme");
+    assert_eq!(event["data"]["status"], 401);
+    assert_eq!(event["data"]["outcome"], "engaged");
+    assert!(
+        !events.contains(HOUSE_KEY) && !events.contains(TENANT_KEY),
+        "no credential material may reach a feed that leaves the network: {events}"
     );
 }
