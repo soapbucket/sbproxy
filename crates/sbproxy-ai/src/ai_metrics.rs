@@ -684,6 +684,49 @@ pub fn record_price_ceiling(outcome: &str) {
     counter.with_label_values(&[outcome]).inc();
 }
 
+// --- Per-request timeout override ---
+
+/// Registered without `.unwrap()` for the same reason as
+/// `AI_PRICE_CEILING` above.
+static AI_REQUEST_TIMEOUT_OVERRIDE: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_request_timeout_override_total",
+            "Per-request transport timeout override outcomes"
+        ),
+        &["outcome"]
+    )
+    .ok()
+});
+
+/// Record one `x-sbproxy-timeout-ms` outcome. `outcome` is a closed set
+/// of four:
+///
+/// - `applied`: the header was honored and replaced the selected
+///   provider's `timeout_ms` for this request.
+/// - `ignored_override_disabled`: a caller sent the header on an origin
+///   whose `allow_request_timeout_override` is off, so it was dropped and
+///   the request dispatched on the configured budget.
+/// - `over_ceiling`: the header exceeded `max_request_timeout_ms`, and
+///   the request was refused with 400 rather than clamped.
+/// - `invalid_header`: the header was not a positive integer, answered
+///   400.
+///
+/// A rising `ignored_override_disabled` rate is the one to read first:
+/// it means callers believe they can set a budget the operator has not
+/// granted, and the answer is either to turn the flag on with a ceiling
+/// or to tell them to stop. `applied` rising toward the request rate
+/// means the ceiling is now the effective per-attempt timeout for this
+/// origin, which is worth knowing before sizing capacity. The two 400s
+/// are caller mistakes rather than gateway decisions, so alert on them
+/// separately or not at all.
+pub fn record_request_timeout_override(outcome: &str) {
+    let Some(counter) = &*AI_REQUEST_TIMEOUT_OVERRIDE else {
+        return;
+    };
+    counter.with_label_values(&[outcome]).inc();
+}
+
 // --- Per-error-class provider cooldowns (WOR-2556) ---
 
 /// Registered without `.unwrap()` for the same reason as
@@ -728,6 +771,68 @@ pub fn record_provider_cooldown(provider: &str, cause: &str) {
         return;
     };
     let metric = "sbproxy_ai_provider_cooldowns_total";
+    let provider = sbproxy_observe::metrics::sanitize_label_budget(metric, "provider", provider);
+    let cause = sbproxy_observe::metrics::sanitize_label_budget(metric, "cause", cause);
+    counter.with_label_values(&[&provider, &cause]).inc();
+}
+
+// --- Post-commit streaming failures ---
+
+/// Registered without `.unwrap()` for the same reason as
+/// `AI_PROVIDER_COOLDOWNS` above: the production unwrap/expect ratchet
+/// is at its baseline and one metric family is not worth a panic path.
+static AI_STREAM_POST_COMMIT_FAILURES: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_stream_post_commit_failures_total",
+            "Streaming responses that failed after the gateway committed to a provider"
+        ),
+        &["provider", "cause"]
+    )
+    .ok()
+});
+
+/// Record one streaming response that failed after the request was
+/// committed to a provider.
+///
+/// A streaming request is committed the moment the provider answers with
+/// a streaming content type: from there the relay is writing bytes the
+/// caller is already consuming, and a later candidate cannot replace
+/// them. Everything that goes wrong after that point is therefore a
+/// stream failure rather than a failover, and this counter is the only
+/// place it is visible as one. `sbproxy_ai_failovers_total` counts the
+/// other side of the same line, so the two never double count a request.
+///
+/// `cause` is a closed set of three:
+///
+/// - `upstream_timeout`: reading the next chunk from the provider hit a
+///   transport timeout, so `providers[].timeout_ms` or the gateway's
+///   30-second client default cut a generation that was still running. A
+///   rising rate here means a budget is sized below the completions the
+///   origin actually serves.
+/// - `upstream_error`: the provider's stream ended in a transport error
+///   that was not a timeout, most often a reset or a truncated body.
+/// - `guardrail`: the gateway itself ended the stream, on an output
+///   guardrail block or a stream-safety verdict. Operator policy working
+///   as configured, not a provider fault; it is carried here so the
+///   provider-fault rate can be read without it.
+///
+/// What this counter cannot see. A caller that disconnects mid-stream:
+/// the failed downstream write aborts the relay before this point, so a
+/// client cancel is counted nowhere in this family rather than being
+/// guessed at as one of the three values above. And an extension `close`
+/// hook that blocks after the upstream stream already reached its end:
+/// the counter keys on the upstream stream not finishing, so a block
+/// that lands past that point is outside it.
+///
+/// This is not a rename of [`WasteKind::AbandonedStream`]. That marker
+/// is only emitted when a budget recorder is wired to the origin, and
+/// this counter has to fire whether or not anyone configured budgets.
+pub fn record_stream_post_commit_failure(provider: &str, cause: &str) {
+    let Some(counter) = &*AI_STREAM_POST_COMMIT_FAILURES else {
+        return;
+    };
+    let metric = "sbproxy_ai_stream_post_commit_failures_total";
     let provider = sbproxy_observe::metrics::sanitize_label_budget(metric, "provider", provider);
     let cause = sbproxy_observe::metrics::sanitize_label_budget(metric, "cause", cause);
     counter.with_label_values(&[&provider, &cause]).inc();

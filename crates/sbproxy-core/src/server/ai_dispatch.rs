@@ -2051,6 +2051,10 @@ fn try_spawn_governed_shadow_after_primary(
     }
     let usage = super::ai_support::shadow_usage_record_from_context(ctx);
     let reservation_prefix = format!("{}:quota-pool", ctx.request_id);
+    // Shared client on purpose. A shadow copy outlives the caller's
+    // request and is the operator's evaluation traffic, so a caller's
+    // honored `x-sbproxy-timeout-ms` has no business setting its budget;
+    // the shadow supervisor's own `timeout_ms` does.
     let _ = AI_CLIENT
         .load()
         .try_spawn_shadow_with_quota_detached_with_reasoning_eligibility(
@@ -4292,6 +4296,135 @@ fn effective_price_ceiling(
     })
 }
 
+/// What a caller's `x-sbproxy-timeout-ms` came to on this request.
+///
+/// `IgnoredDisabled` is a variant rather than something the call site
+/// infers from the flag, because that is what makes the "operator left
+/// the flag off and a caller sent the header anyway" branch testable
+/// without a live session, and it is the branch an operator most needs
+/// counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeoutOverrideOutcome {
+    /// No header on the request.
+    Absent,
+    /// A header arrived on an origin that has not opted in. Dropped.
+    IgnoredDisabled,
+    /// A header the origin allows and the ceiling admits.
+    Applied(std::time::Duration),
+}
+
+impl TimeoutOverrideOutcome {
+    /// The closed metric label for this outcome, or `None` for the
+    /// common case where the caller sent no header and there is nothing
+    /// to count.
+    fn metric_label(self) -> Option<&'static str> {
+        match self {
+            Self::Absent => None,
+            Self::IgnoredDisabled => Some("ignored_override_disabled"),
+            Self::Applied(_) => Some("applied"),
+        }
+    }
+}
+
+/// A refused `x-sbproxy-timeout-ms`: the closed metric label this
+/// refusal belongs on, and the message the caller gets back.
+///
+/// Both travel together because the alternative was reading the label
+/// back out of the message at the call site, which quietly reclassifies
+/// a series the next time anyone rewords a sentence.
+#[derive(Debug, PartialEq, Eq)]
+struct TimeoutOverrideRefusal {
+    /// `over_ceiling` or `invalid_header`; the two 400 members of the
+    /// `sbproxy_ai_request_timeout_override_total` outcome set.
+    outcome: &'static str,
+    /// Caller-facing text. Safe to return in the response body; it never
+    /// carries anything but the caller's own parsed number.
+    message: String,
+}
+
+impl TimeoutOverrideRefusal {
+    fn invalid(message: String) -> Self {
+        Self {
+            outcome: "invalid_header",
+            message,
+        }
+    }
+
+    fn over_ceiling(message: String) -> Self {
+        Self {
+            outcome: "over_ceiling",
+            message,
+        }
+    }
+}
+
+/// Resolve a caller's `x-sbproxy-timeout-ms` against the origin's opt-in
+/// and ceiling.
+///
+/// A malformed or out-of-range header is an error rather than an ignore,
+/// for the same reason `effective_price_ceiling` refuses a mistyped
+/// `x-sbproxy-max-price`: a caller who asked for 60 seconds and silently
+/// got 5 builds a retry schedule on a budget it never had. The whole
+/// `x-sbproxy-*` family refuses rather than adjusting, and an
+/// inconsistent family is worse than either rule.
+///
+/// With the flag off the header is dropped instead, because there is
+/// nothing to correct: the caller asked for something this origin does
+/// not offer at any value, and refusing would break callers that send the
+/// header to a fleet where only some origins have opted in. Ignoring it
+/// is still visible, on
+/// `sbproxy_ai_request_timeout_override_total{outcome="ignored_override_disabled"}`.
+///
+/// Err carries the closed metric label alongside the operator-safe
+/// message, so the call site never has to read the message back to
+/// decide which series the refusal belongs on. The message never
+/// interpolates anything but the caller's own number, which is already
+/// bounded by the parse.
+fn effective_request_timeout(
+    allow_override: bool,
+    ceiling_ms: Option<u64>,
+    header_value: Option<&str>,
+) -> Result<TimeoutOverrideOutcome, TimeoutOverrideRefusal> {
+    let Some(raw) = header_value else {
+        return Ok(TimeoutOverrideOutcome::Absent);
+    };
+    if !allow_override {
+        return Ok(TimeoutOverrideOutcome::IgnoredDisabled);
+    }
+    let Ok(requested) = raw.trim().parse::<u64>() else {
+        return Err(TimeoutOverrideRefusal::invalid(format!(
+            "x-sbproxy-timeout-ms is not a whole number of milliseconds: {raw:?}"
+        )));
+    };
+    if requested == 0 {
+        return Err(TimeoutOverrideRefusal::invalid(
+            "x-sbproxy-timeout-ms must be above zero milliseconds".to_string(),
+        ));
+    }
+    // The ceiling is required whenever the flag is on, refused at config
+    // load otherwise, so this `None` is unreachable through a loaded
+    // config. Treating it as a refusal rather than as "no ceiling" keeps
+    // the fail-closed direction if that validation is ever loosened, and
+    // it counts as `over_ceiling` because that is what it is: no value a
+    // caller can send clears an absent ceiling.
+    let Some(ceiling) = ceiling_ms else {
+        return Err(TimeoutOverrideRefusal::over_ceiling(
+            "x-sbproxy-timeout-ms cannot be honored: this origin has no \
+             max_request_timeout_ms ceiling configured"
+                .to_string(),
+        ));
+    };
+    if requested > ceiling {
+        return Err(TimeoutOverrideRefusal::over_ceiling(format!(
+            "x-sbproxy-timeout-ms of {requested} exceeds this origin's \
+             max_request_timeout_ms of {ceiling}; ask for between 1 and {ceiling}"
+        )));
+    }
+    Ok(TimeoutOverrideOutcome::Applied(
+        std::time::Duration::from_millis(requested),
+    ))
+}
+
 /// Build the WOR-2559 fail-closed refusal body for a candidate set the
 /// price ceiling fully excluded. Names the ceiling and carries each
 /// excluded candidate's resolved price, so a caller sees what the
@@ -4912,6 +5045,44 @@ fn record_price_ceiling_request_refusal(
     ctx.deny_reason = Some(reason);
 }
 
+/// The bounded admin reason for a refused `x-sbproxy-timeout-ms`.
+///
+/// The caller's header value never appears, for the same reason it never
+/// appears in [`price_ceiling_request_refusal_reason`]: it is untrusted
+/// request text and this string is retained on the admin ring row. The
+/// caller still gets the number back, in the response body, which is not
+/// retained.
+fn request_timeout_refusal_reason(outcome: &str) -> String {
+    match outcome {
+        "over_ceiling" => {
+            "request_timeout: x-sbproxy-timeout-ms above max_request_timeout_ms".to_string()
+        }
+        _ => "request_timeout: malformed x-sbproxy-timeout-ms header".to_string(),
+    }
+}
+
+/// Record a refused `x-sbproxy-timeout-ms` on the same four surfaces
+/// [`record_price_ceiling_request_refusal`] uses: the metric, the admin
+/// decision verdict, a bounded deny reason, and an error on the request
+/// span. A bare 400 would leave the refusal invisible to all four.
+fn record_request_timeout_refusal(
+    ctx: &mut RequestContext,
+    span: &tracing::Span,
+    outcome: &'static str,
+    reason: String,
+) {
+    sbproxy_ai::ai_metrics::record_request_timeout_override(outcome);
+    ctx.record_policy_decision("request_timeout", "deny");
+    // `invalid_request`: the caller's own input was unusable. This is not
+    // a capacity decision and must not alert alongside one.
+    sbproxy_ai::tracing_spans::record_error(
+        span,
+        sbproxy_ai::tracing_spans::error_type::INVALID_REQUEST,
+        &reason,
+    );
+    ctx.deny_reason = Some(reason);
+}
+
 /// Fail closed on a candidate set the price ceiling fully excluded
 /// (WOR-2559): record the refusal on the metric, the admin decision
 /// row, the attributed-outcome label, and the typed audit funnel, then
@@ -5427,6 +5598,63 @@ pub(super) async fn handle_ai_proxy(
         return Ok(());
     }
 
+    // Resolved here, immediately after the price ceiling and for the
+    // same reasons: below the per-surface counter, the latency guard and
+    // identity resolution so a refusal is counted, timed, traced and
+    // authenticated, but above the multipart, audio and cached-replay
+    // branches, which answer and return before any provider is picked.
+    // A per-provider placement could not fire on those at all, which is
+    // also why the two keys are origin-level rather than on
+    // `providers[]`.
+    let timeout_override_header = req_header_value(session, "x-sbproxy-timeout-ms");
+    let timeout_override = match effective_request_timeout(
+        config.allow_request_timeout_override,
+        config.max_request_timeout_ms,
+        timeout_override_header.as_deref(),
+    ) {
+        Ok(outcome) => outcome,
+        Err(refusal) => {
+            // Over the ceiling and malformed are both 400 and both the
+            // caller's mistake, but they are separate series: one says
+            // the client library is broken, the other says the ceiling
+            // is smaller than callers expect. The refusal carries which
+            // one it is, so the split cannot drift with the wording.
+            record_request_timeout_refusal(
+                ctx,
+                &ai_span,
+                refusal.outcome,
+                request_timeout_refusal_reason(refusal.outcome),
+            );
+            let bytes = ErrorEnvelope::new("invalid_request_timeout", &refusal.message)
+                .request_id(ctx.request_id.as_str())
+                .to_bytes();
+            send_response(session, 400, "application/json", &bytes).await?;
+            return Ok(());
+        }
+    };
+    if let Some(label) = timeout_override.metric_label() {
+        sbproxy_ai::ai_metrics::record_request_timeout_override(label);
+    }
+    // One clone per request that carries an honored header, and an
+    // `Arc` bump per field at that. Every dispatch site below reads
+    // this instead of `AI_CLIENT` so the race legs, the cascade tiers
+    // and each retry attempt inherit the budget without a parameter on
+    // twenty `forward_*` signatures. The three auxiliary call sites (the
+    // semantic-cache embedding, the semantic-route embedding, and the
+    // shadow spawn) deliberately stay on `AI_CLIENT`: a caller's
+    // completion budget is not a budget for the gateway's own routing
+    // work.
+    let dispatch_client: std::sync::Arc<sbproxy_ai::AiClient> = match timeout_override {
+        TimeoutOverrideOutcome::Applied(timeout) => std::sync::Arc::new(
+            AI_CLIENT
+                .load_full()
+                .as_ref()
+                .clone()
+                .with_request_timeout_override(timeout),
+        ),
+        _ => AI_CLIENT.load_full(),
+    };
+
     let router = config.router();
     if ctx.inbound_key_mode == crate::context::InboundKeyMode::Native
         && router.cascade_config().is_some()
@@ -5906,8 +6134,7 @@ pub(super) async fn handle_ai_proxy(
         };
         ctx.record_admin_ai_attempt(&provider.name);
         let resp = match run_routed_provider_attempt(&router, provider_idx, async {
-            AI_CLIENT
-                .load()
+            dispatch_client
                 .forward_get_request_with_quota(provider, &path, quota_attempt)
                 .await
         })
@@ -6294,8 +6521,7 @@ pub(super) async fn handle_ai_proxy(
         };
         ctx.record_admin_ai_attempt(&provider.name);
         let resp = match run_routed_provider_attempt(&router, provider_idx, async {
-            AI_CLIENT
-                .load()
+            dispatch_client
                 .forward_with_method_and_quota(
                     provider,
                     &method_str,
@@ -7187,8 +7413,7 @@ pub(super) async fn handle_ai_proxy(
                             }
                         }
                     } else {
-                        AI_CLIENT
-                            .load()
+                        dispatch_client
                             .forward_bytes_with_quota(
                                 provider,
                                 &method_str,
@@ -9390,6 +9615,14 @@ pub(super) async fn handle_ai_proxy(
                                 else {
                                     return Ok(());
                                 };
+                                // Deliberately the shared client, not
+                                // `dispatch_client`: a caller's
+                                // `x-sbproxy-timeout-ms` is a budget for
+                                // its own completion, not for the
+                                // gateway's cache lookup, and letting a
+                                // caller stretch this one would let it
+                                // hold an embedding call open with no
+                                // completion to show for it.
                                 let ai_client = AI_CLIENT.load_full();
                                 sbproxy_ai::semantic_cache::compute_embedding_with_quota(
                                     &ai_client,
@@ -9848,6 +10081,16 @@ pub(super) async fn handle_ai_proxy(
         .map(|r| r.content_policy_fallback)
         .unwrap_or(false);
 
+    // The pre-header streaming budget. Resolved once here, beside the
+    // other `resilience` reads, because the attempt loop below is inside
+    // a `for` and re-reading per attempt would say the same thing three
+    // times. `None` leaves the loop byte-for-byte as it was.
+    let pre_header_timeout = config
+        .resilience
+        .as_ref()
+        .and_then(|r| r.pre_header_timeout_ms)
+        .map(std::time::Duration::from_millis);
+
     // WOR-2556: a configured typed fallback list opens the sequential
     // loop the same way `content_policy_fallback` does, or the reroute
     // it aims could never take a second attempt. Configuration, not the
@@ -10222,6 +10465,9 @@ pub(super) async fn handle_ai_proxy(
         // digest on every request of a `semantic_route` origin would be
         // a hot-path cost with no reader.
         let prompt = semantic_query_text(&body);
+        // Shared client on purpose, the same reason as the semantic-cache
+        // embedding above: routing work is the gateway's, not the
+        // caller's, so it is not covered by a caller's honored timeout.
         let ai_client = AI_CLIENT.load_full();
         // WOR-2564: a routing embedding through `source: provider` or
         // `source: openai` is an upstream call, so it meters against the
@@ -10645,8 +10891,7 @@ pub(super) async fn handle_ai_proxy(
                 return Ok(());
             }
             let cascade_quota_reservation = format!("{}:quota-pool:cascade", ctx.request_id);
-            let outcome = AI_CLIENT
-                .load()
+            let outcome = dispatch_client
                 .forward_cascade_with_policy_and_quota_with_reasoning_eligibility(
                     config,
                     cascade_cfg,
@@ -10891,7 +11136,7 @@ pub(super) async fn handle_ai_proxy(
             Quota(QuotaPoolErrorDisposition),
         }
 
-        let client = AI_CLIENT.load();
+        let client = std::sync::Arc::clone(&dispatch_client);
         let race_start = std::time::Instant::now();
         let mut futs = FuturesUnordered::new();
         for (race_attempt, &idx) in provider_order.iter().enumerate() {
@@ -11356,58 +11601,79 @@ pub(super) async fn handle_ai_proxy(
             provider = %provider.name,
             attempt = attempt,
         );
+        // The pre-header budget bounds exactly this binding, and only
+        // for a streaming request. The inner future resolves at the
+        // provider's response headers (`forward_request_impl` hands back
+        // a `reqwest::Response` before any body byte is read), so
+        // `tokio::time::timeout` around it is a headers-only deadline
+        // with nothing to reconcile against `providers[].timeout_ms`,
+        // which reqwest measures through end-of-body. An elapse is
+        // turned into an ordinary `Err` so the arm below fails over
+        // through its existing `continue` rather than growing a second
+        // control path.
+        //
+        // The attempt is boxed because the AI request path runs on a
+        // Pingora worker with the std 2MB stack and was already close to
+        // it: `Timeout<F>` would otherwise add `F` plus a timer to the
+        // frame. Boxed, the frame carries a pointer, which is smaller
+        // than what was there before.
+        let pre_header_budget = pre_header_timeout.filter(|_| is_stream);
         let result: anyhow::Result<reqwest::Response> =
-            run_routed_provider_attempt(&router, provider_idx, async {
-                if distributed_managed {
-                    let managed_body = serde_json::to_vec(&attempt_body)
-                        .map(bytes::Bytes::from)
-                        .map_err(anyhow::Error::from);
-                    match managed_body {
-                        Ok(managed_body) => {
-                            let origin = ctx
-                                .origin_idx
-                                .and_then(|index| ctx.pipeline.config.origins.get(index))
-                                .map(|origin| origin.origin_id.to_string())
-                                .unwrap_or_else(|| ctx.hostname.to_string());
-                            let prefix_key = extract_prefix_key(&attempt_body, 1024);
-                            let requested_adapter = attempt_body
-                                .get("adapter")
-                                .or_else(|| attempt_body.get("lora_adapter"))
-                                .and_then(serde_json::Value::as_str)
-                                .map(str::to_string);
-                            let preferred_region = ctx
-                                .principal
-                                .attrs
-                                .metadata
-                                .get("region")
-                                .cloned()
-                                .or_else(|| ctx.request_geo.clone());
-                            let maximum = buffered_body_limit(config.max_body_size);
-                            let managed = crate::server::model_host::distributed_managed_upstream(
-                                crate::server::model_host::ManagedDistributedRequest {
-                                    origin: &origin,
-                                    provider,
-                                    requested_model: (!model.is_empty()).then_some(model.as_str()),
-                                    request_id: ctx.request_id.as_str(),
-                                    tenant_id: ctx.tenant_id.as_str(),
-                                    governed_key_id: ctx.principal.api_key_id(),
-                                    policy_revision: &peer_policy_revision,
-                                    path: &path,
-                                    body: managed_body,
-                                    content_type: Some("application/json"),
-                                    priority: crate::server::model_host::lane_class_for(
-                                        ctx.ai_lane_priority,
-                                    ),
-                                    prefix_key: &prefix_key,
-                                    preferred_region: preferred_region.as_deref(),
-                                    requested_adapter: requested_adapter.as_deref(),
-                                    max_body_bytes: maximum,
-                                    quota_attempt,
-                                },
-                            )
-                            .instrument(attempt_span)
-                            .await;
-                            match managed {
+            {
+                let attempt_future =
+                    Box::pin(run_routed_provider_attempt(&router, provider_idx, async {
+                        if distributed_managed {
+                            let managed_body = serde_json::to_vec(&attempt_body)
+                                .map(bytes::Bytes::from)
+                                .map_err(anyhow::Error::from);
+                            match managed_body {
+                                Ok(managed_body) => {
+                                    let origin = ctx
+                                        .origin_idx
+                                        .and_then(|index| ctx.pipeline.config.origins.get(index))
+                                        .map(|origin| origin.origin_id.to_string())
+                                        .unwrap_or_else(|| ctx.hostname.to_string());
+                                    let prefix_key = extract_prefix_key(&attempt_body, 1024);
+                                    let requested_adapter = attempt_body
+                                        .get("adapter")
+                                        .or_else(|| attempt_body.get("lora_adapter"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::to_string);
+                                    let preferred_region = ctx
+                                        .principal
+                                        .attrs
+                                        .metadata
+                                        .get("region")
+                                        .cloned()
+                                        .or_else(|| ctx.request_geo.clone());
+                                    let maximum = buffered_body_limit(config.max_body_size);
+                                    let managed =
+                                        crate::server::model_host::distributed_managed_upstream(
+                                            crate::server::model_host::ManagedDistributedRequest {
+                                                origin: &origin,
+                                                provider,
+                                                requested_model: (!model.is_empty())
+                                                    .then_some(model.as_str()),
+                                                request_id: ctx.request_id.as_str(),
+                                                tenant_id: ctx.tenant_id.as_str(),
+                                                governed_key_id: ctx.principal.api_key_id(),
+                                                policy_revision: &peer_policy_revision,
+                                                path: &path,
+                                                body: managed_body,
+                                                content_type: Some("application/json"),
+                                                priority: crate::server::model_host::lane_class_for(
+                                                    ctx.ai_lane_priority,
+                                                ),
+                                                prefix_key: &prefix_key,
+                                                preferred_region: preferred_region.as_deref(),
+                                                requested_adapter: requested_adapter.as_deref(),
+                                                max_body_bytes: maximum,
+                                                quota_attempt,
+                                            },
+                                        )
+                                        .instrument(attempt_span)
+                                        .await;
+                                    match managed {
                                 Ok(Some(upstream)) => {
                                     local_public_model = Some(upstream.public_model);
                                     ctx.managed_model_permit = upstream.local_permit;
@@ -11431,39 +11697,46 @@ pub(super) async fn handle_ai_proxy(
                                     Err(anyhow::Error::new(error))
                                 }
                             }
-                        }
-                        Err(error) => Err(error),
-                    }
-                } else {
-                    async {
-                        if let Some((bypass_body, native_path)) = upstream_call {
-                            AI_CLIENT
-                                .load()
-                                .forward_native_bypass_with_quota(
-                                    provider,
-                                    &method_str,
-                                    native_path,
-                                    bypass_body,
-                                    quota_attempt,
-                                )
-                                .await
+                                }
+                                Err(error) => Err(error),
+                            }
                         } else {
-                            AI_CLIENT
-                                .load()
-                                .forward_request_with_quota(
-                                    provider,
-                                    &path,
-                                    &attempt_body,
-                                    quota_attempt,
-                                )
-                                .await
+                            async {
+                                if let Some((bypass_body, native_path)) = upstream_call {
+                                    dispatch_client
+                                        .forward_native_bypass_with_quota(
+                                            provider,
+                                            &method_str,
+                                            native_path,
+                                            bypass_body,
+                                            quota_attempt,
+                                        )
+                                        .await
+                                } else {
+                                    dispatch_client
+                                        .forward_request_with_quota(
+                                            provider,
+                                            &path,
+                                            &attempt_body,
+                                            quota_attempt,
+                                        )
+                                        .await
+                                }
+                            }
+                            .instrument(attempt_span)
+                            .await
                         }
-                    }
-                    .instrument(attempt_span)
-                    .await
+                    }));
+                match pre_header_budget {
+                    Some(budget) => match tokio::time::timeout(budget, attempt_future).await {
+                        Ok(inner) => inner,
+                        Err(_elapsed) => Err(anyhow::Error::new(PreHeaderTimeoutElapsed {
+                            budget_ms: u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
+                        })),
+                    },
+                    None => attempt_future.await,
                 }
-            })
-            .await;
+            };
         ctx.ai_serve_model = local_public_model.clone();
 
         match result {
@@ -11856,6 +12129,11 @@ pub(super) async fn handle_ai_proxy(
                     &provider.name,
                     ai_metric_error_kind_for_span_error_type(last_error_type),
                 );
+                // Read before the error is moved into `last_error`. A
+                // wedged provider and a refused connection both arrive
+                // here, and an operator sizing `pre_header_timeout_ms`
+                // needs to tell which of the two the budget is producing.
+                let pre_header_elapsed = e.downcast_ref::<PreHeaderTimeoutElapsed>().is_some();
                 last_error = Some(e);
                 if ctx.managed_fallback_reason.is_some() && attempt + 1 < provider_order.len() {
                     let to_provider = provider_order
@@ -11881,10 +12159,18 @@ pub(super) async fn handle_ai_proxy(
                 sbproxy_ai::ai_metrics::record_failover(
                     &provider.name,
                     &to_provider,
-                    "transport",
+                    if pre_header_elapsed {
+                        "pre_header_timeout"
+                    } else {
+                        "transport"
+                    },
                     ctx.tenant_id.as_str(),
                 );
                 // WOR-2556: a transport failover is the generic trigger.
+                // A pre-header elapse is one too: the admin
+                // `failover_trigger` set stays closed, because the
+                // distinction an operator needs is already on the
+                // metric's `reason` label.
                 record_generic_failover_trigger(ctx);
                 continue;
             }
@@ -12234,7 +12520,41 @@ fn record_ai_transport_failure(
     }
 }
 
+/// A streaming attempt that ran out its `resilience.pre_header_timeout_ms`
+/// budget before the provider sent response headers.
+///
+/// Carried as an `anyhow` cause rather than as a separate control-flow
+/// arm so the elapse lands in the dispatch loop's existing `Err` arm and
+/// inherits its failover, its per-provider error accounting, and its
+/// `continue`. The `Err` arm downcasts to this type for one decision
+/// only: whether the handover it is about to count is labeled
+/// `pre_header_timeout` or `transport`.
+#[derive(Debug)]
+struct PreHeaderTimeoutElapsed {
+    budget_ms: u64,
+}
+
+impl std::fmt::Display for PreHeaderTimeoutElapsed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "provider did not send response headers within the {}ms \
+             resilience.pre_header_timeout_ms budget",
+            self.budget_ms
+        )
+    }
+}
+
+impl std::error::Error for PreHeaderTimeoutElapsed {}
+
 fn ai_transport_error_type(error: &anyhow::Error) -> &'static str {
+    // A pre-header budget elapse is a timeout the same way reqwest's own
+    // is; classifying it as a generic provider error would send it to
+    // `record_provider_error`'s wrong bucket and put the wrong error type
+    // on the span.
+    if error.downcast_ref::<PreHeaderTimeoutElapsed>().is_some() {
+        return sbproxy_ai::tracing_spans::error_type::TIMEOUT;
+    }
     if error
         .downcast_ref::<reqwest::Error>()
         .is_some_and(reqwest::Error::is_timeout)
@@ -15368,6 +15688,12 @@ pub(super) async fn relay_ai_stream(
     // SSE body never lands in memory.
     let mut stream = resp.bytes_stream();
     let mut upstream_complete = false;
+    // Which upstream read failure ended the stream, when one did. Read
+    // once after the loop to label
+    // `sbproxy_ai_stream_post_commit_failures_total`; a timeout there
+    // means a whole-call budget cut a generation that was still running,
+    // which is a different operator action from a reset.
+    let mut upstream_stream_error: Option<&'static str> = None;
     // WOR-895: track TTFT + output throughput. `stream_started` anchors
     // the generation window; `first_token_at` is set on the first chunk
     // that carries any payload. Both feed `sbproxy_ai_ttft_seconds` +
@@ -15879,6 +16205,11 @@ pub(super) async fn relay_ai_stream(
                     ai_metric_error_kind_for_span_error_type(kind),
                 );
                 warn!(error = %e, "AI proxy: error reading SSE chunk from upstream");
+                upstream_stream_error = Some(if e.is_timeout() {
+                    "upstream_timeout"
+                } else {
+                    "upstream_error"
+                });
                 break;
             }
             None => {
@@ -16142,6 +16473,26 @@ pub(super) async fn relay_ai_stream(
                 break;
             }
         }
+    }
+
+    // Everything reaching this relay has already been committed to a
+    // provider: the dispatcher only calls it once
+    // `upstream_response_is_successful_stream` accepted the response, and
+    // the attempt loop has closed by then. So a stream that did not run
+    // to its natural end here can never be failed over, and this counter
+    // is where that failure is visible. Counted before the close-out
+    // writes below, because a failed downstream write leaves this
+    // function on `?` and would otherwise swallow an upstream cause the
+    // operator needs.
+    if !upstream_complete {
+        let cause = upstream_stream_error.unwrap_or(if safety_blocked || output_guard_blocked {
+            "guardrail"
+        } else {
+            // Every other way out of the chunk loop leaves through `?`,
+            // so this is a floor rather than a live branch.
+            "upstream_error"
+        });
+        sbproxy_ai::ai_metrics::record_stream_post_commit_failure(router_sink.provider_name, cause);
     }
 
     if let Some(block) = pending_builtin_block.take() {
@@ -22939,6 +23290,650 @@ origins:
             Some("model_group_no_member")
         );
     }
+
+    // --- Pre-header streaming budget ---
+
+    /// An upstream that accepts a connection, reads the whole request,
+    /// and then never answers. The socket stays open, so nothing on the
+    /// upstream side can end the attempt: only a gateway-side budget can.
+    async fn wedged_upstream_fixture() -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind wedged upstream");
+        let address = listener.local_addr().expect("wedged upstream address");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&hits);
+        tokio::spawn(async move {
+            // Held rather than dropped. A dropped `TcpStream` sends FIN,
+            // which reqwest reports as a connection error, and the test
+            // would then pass on the wrong mechanism.
+            let mut held = Vec::new();
+            loop {
+                match listener.accept().await {
+                    Ok((mut stream, _)) => {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        drain_upstream_request(&mut stream).await;
+                        held.push(stream);
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        (format!("http://{address}/v1"), hits)
+    }
+
+    /// An upstream that commits to a stream (`200 text/event-stream`),
+    /// writes one chunked SSE frame, and then drops the connection
+    /// without the terminating zero-length chunk. The client-side body
+    /// therefore ends in a transport error rather than at its natural
+    /// end, which is the post-commit failure this counter exists for.
+    async fn truncated_stream_upstream_fixture() -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind truncated stream upstream");
+        let address = listener
+            .local_addr()
+            .expect("truncated stream upstream address");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&hits);
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept upstream request");
+            observed.fetch_add(1, Ordering::SeqCst);
+            drain_upstream_request(&mut stream).await;
+            let frame = concat!(
+                "data: {\"id\":\"chatcmpl-truncated\",\"object\":\"chat.completion.chunk\",",
+                "\"created\":1,\"model\":\"requested-model\",\"choices\":[{\"index\":0,",
+                "\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                 transfer-encoding: chunked\r\n\r\n{:x}\r\n{}\r\n",
+                frame.len(),
+                frame
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write committed stream prefix");
+            stream.flush().await.expect("flush committed stream prefix");
+            // No `0\r\n\r\n`: the body is cut mid-stream.
+            drop(stream);
+        });
+        (format!("http://{address}/v1"), hits)
+    }
+
+    /// A wedged primary and a working SSE secondary, with the
+    /// primary's whole-call `timeout_ms` deliberately far above the
+    /// pre-header budget so the two budgets are distinguishable by the
+    /// clock alone.
+    fn pre_header_timeout_config(
+        wedged_url: &str,
+        stream_url: &str,
+        pre_header_timeout_ms: Option<u64>,
+        wedged_timeout_ms: u64,
+    ) -> sbproxy_ai::AiHandlerConfig {
+        let mut action = serde_json::json!({
+            "providers": [
+                {
+                    "name": "primary",
+                    "provider_type": "openai",
+                    "base_url": wedged_url,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key",
+                    "priority": 1,
+                    "timeout_ms": wedged_timeout_ms
+                },
+                {
+                    "name": "secondary",
+                    "provider_type": "openai",
+                    "base_url": stream_url,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key",
+                    "priority": 2
+                }
+            ],
+            "routing": {"strategy": "fallback_chain"}
+        });
+        if let Some(budget) = pre_header_timeout_ms {
+            action["resilience"] = serde_json::json!({"pre_header_timeout_ms": budget});
+        }
+        sbproxy_ai::AiHandlerConfig::from_config(action).expect("pre-header timeout config")
+    }
+
+    /// Serializes the two tests that read
+    /// `sbproxy_ai_failovers_total{reason="transport"}`.
+    ///
+    /// `prometheus::gather()` reads a process-global registry.
+    /// `a_pre_header_timeout_is_labeled_as_such` asserts that the
+    /// `transport` series did *not* move, and
+    /// `a_non_streaming_request_is_not_bounded_by_the_pre_header_budget`
+    /// moves it. nextest gives each test its own process and would hide
+    /// that, but `cargo test` runs both on threads in one process, where
+    /// the pair interleaves and the equality assertion fails for a
+    /// reason that has nothing to do with the code under test.
+    static FAILOVER_REASON_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// One `sbproxy_ai_failovers_total` series, or 0 when nothing has
+    /// created it yet.
+    ///
+    /// Callers assert a strict increase rather than an exact value
+    /// wherever a sibling could also move the series; the one place that
+    /// needs an exact value takes [`FAILOVER_REASON_LOCK`] instead.
+    fn failovers_count(reason: &str) -> f64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "sbproxy_ai_failovers_total")
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        metric
+                            .get_label()
+                            .iter()
+                            .any(|label| label.name() == "reason" && label.value() == reason)
+                    })
+                    .map(|metric| metric.get_counter().value())
+                    .sum()
+            })
+            .unwrap_or_default()
+    }
+
+    /// One `sbproxy_ai_stream_post_commit_failures_total` series, or 0
+    /// when nothing has created it yet. Same process-global caveat as
+    /// [`failovers_count`].
+    fn stream_post_commit_failures_count(provider: &str, cause: &str) -> f64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "sbproxy_ai_stream_post_commit_failures_total")
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        let labelled = |name: &str, want: &str| {
+                            metric
+                                .get_label()
+                                .iter()
+                                .any(|label| label.name() == name && label.value() == want)
+                        };
+                        labelled("provider", provider) && labelled("cause", cause)
+                    })
+                    .map(|metric| metric.get_counter().value())
+                    .sum()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The seam: the `tokio::time::timeout` wrapped around the dispatch
+    /// loop's attempt binding.
+    ///
+    /// The wedged provider's own `timeout_ms` is 5000, so without the
+    /// pre-header budget the failover cannot happen for five seconds
+    /// (and without any `timeout_ms` at all it would be the client
+    /// default's thirty). With a 200ms budget the handover is inside the
+    /// bound asserted here.
+    #[tokio::test]
+    async fn a_wedged_provider_fails_over_before_the_client_timeout() {
+        let (wedged_url, wedged_hits) = wedged_upstream_fixture().await;
+        let (stream_url, stream_hits) =
+            upstream_bytes_fixture(openai_tool_call_stream(), "text/event-stream").await;
+        let config = pre_header_timeout_config(&wedged_url, &stream_url, Some(200), 5_000);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let started = std::time::Instant::now();
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the wedged candidate is abandoned and the next one serves");
+        let elapsed = started.elapsed();
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(wedged_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            stream_hits.load(Ordering::SeqCst),
+            1,
+            "the second candidate serves the stream"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the pre-header budget, not the provider's whole-call timeout_ms, \
+             has to end the wedged attempt; took {elapsed:?}"
+        );
+    }
+
+    /// The seam: the failover reason at the dispatch loop's `Err` arm.
+    /// Every timeout was labeled `transport` before, which put a wedged
+    /// provider on the same series as a refused connection.
+    #[tokio::test]
+    async fn a_pre_header_timeout_is_labeled_as_such() {
+        // Held for the whole test: the `transport` assertion below is an
+        // equality on a process-global counter a sibling also writes.
+        let _serialized = FAILOVER_REASON_LOCK.lock().await;
+        let (wedged_url, _wedged_hits) = wedged_upstream_fixture().await;
+        let (stream_url, _stream_hits) =
+            upstream_bytes_fixture(openai_tool_call_stream(), "text/event-stream").await;
+        let config = pre_header_timeout_config(&wedged_url, &stream_url, Some(200), 5_000);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let labeled_before = failovers_count("pre_header_timeout");
+        let transport_before = failovers_count("transport");
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the wedged candidate is abandoned and the next one serves");
+        drop(session);
+        let _ = live_downstream_body(client).await;
+
+        assert!(
+            failovers_count("pre_header_timeout") > labeled_before,
+            "a handover taken on the pre-header budget carries its own reason"
+        );
+        assert_eq!(
+            failovers_count("transport"),
+            transport_before,
+            "and it is not also counted as a generic transport failure"
+        );
+    }
+
+    /// The seam: the `is_stream` gate on the budget.
+    ///
+    /// A buffered request has no commit point to protect and no partial
+    /// output to lose, so the pre-header budget must not touch it. The
+    /// assertion is a floor rather than a ceiling on purpose: the
+    /// wedged provider's own 800ms `timeout_ms` is what ends this
+    /// attempt, and a budget applied to a non-streaming request would
+    /// end it four times sooner.
+    #[tokio::test]
+    async fn a_non_streaming_request_is_not_bounded_by_the_pre_header_budget() {
+        // This failover writes `reason="transport"`, which the sibling
+        // above asserts did not move. Same lock, opposite side.
+        let _serialized = FAILOVER_REASON_LOCK.lock().await;
+        let (wedged_url, wedged_hits) = wedged_upstream_fixture().await;
+        let (json_url, json_hits) =
+            upstream_bytes_fixture(canonical_chat_response("buffered"), "application/json").await;
+        let config = pre_header_timeout_config(&wedged_url, &json_url, Some(200), 800);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let started = std::time::Instant::now();
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the buffered request still fails over on the provider timeout");
+        let elapsed = started.elapsed();
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(wedged_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(json_hits.load(Ordering::SeqCst), 1);
+        assert!(
+            elapsed >= Duration::from_millis(500),
+            "a non-streaming request keeps waiting out providers[].timeout_ms; \
+             a 200ms pre-header budget must not reach it, but this took {elapsed:?}"
+        );
+    }
+
+    /// The seam: `upstream_response_is_successful_stream` as the commit
+    /// point, and the post-commit counter that reports what happens
+    /// past it.
+    ///
+    /// The no-failover half of this passes on main with no change: the
+    /// dispatch loop has already closed by the time the relay is called,
+    /// so a candidate switch is structurally impossible and this is a
+    /// regression lock rather than evidence of new behavior. The counter
+    /// half is what is new.
+    ///
+    /// The budget is deliberately generous. This test needs it set (so a
+    /// budget that leaked past the commit point would show up) but never
+    /// needs it to fire, and a 200ms budget would turn a loaded build
+    /// machine into a failover to the second provider and a red test
+    /// about nothing.
+    #[tokio::test]
+    async fn a_stall_after_upstream_headers_does_not_fail_over() {
+        let (truncated_url, truncated_hits) = truncated_stream_upstream_fixture().await;
+        let (stream_url, stream_hits) =
+            upstream_bytes_fixture(openai_tool_call_stream(), "text/event-stream").await;
+        let config = pre_header_timeout_config(&truncated_url, &stream_url, Some(5_000), 30_000);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let failures_before = stream_post_commit_failures_count("primary", "upstream_error");
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("a committed stream that dies is relayed as far as it got");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "the commit already put stream headers on the wire: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(truncated_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            stream_hits.load(Ordering::SeqCst),
+            0,
+            "no candidate switch is possible once the response was accepted as a stream"
+        );
+        assert!(
+            stream_post_commit_failures_count("primary", "upstream_error") > failures_before,
+            "the failure past the commit point is counted where an operator can see it"
+        );
+    }
+
+    // --- Per-request timeout override ---
+
+    /// An upstream that accepts, reads the whole request, waits
+    /// `delay_ms`, and only then answers 200. The one way this request
+    /// completes is if something raised the transport budget above
+    /// `delay_ms`.
+    async fn upstream_slow_fixture(delay_ms: u64, body: Vec<u8>) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind slow upstream");
+        let address = listener.local_addr().expect("slow upstream address");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&hits);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                observed.fetch_add(1, Ordering::SeqCst);
+                let body = body.clone();
+                tokio::spawn(async move {
+                    drain_upstream_request(&mut stream).await;
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                });
+            }
+        });
+        (format!("http://{address}/v1"), hits)
+    }
+
+    /// One provider on a 100ms whole-call budget, with the origin's
+    /// caller-override flag and ceiling under test.
+    fn request_timeout_override_config(
+        upstream_url: &str,
+        allow_override: bool,
+        ceiling_ms: Option<u64>,
+    ) -> sbproxy_ai::AiHandlerConfig {
+        let mut action = serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "timeout_ms": 100
+            }],
+            "allow_request_timeout_override": allow_override
+        });
+        if let Some(ceiling) = ceiling_ms {
+            action["max_request_timeout_ms"] = serde_json::json!(ceiling);
+        }
+        sbproxy_ai::AiHandlerConfig::from_config(action).expect("timeout override config")
+    }
+
+    /// One `sbproxy_ai_request_timeout_override_total` series, or 0 when
+    /// nothing has created it yet. Same process-global caveat as
+    /// [`failovers_count`].
+    fn request_timeout_override_count(outcome: &str) -> f64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "sbproxy_ai_request_timeout_override_total")
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        metric
+                            .get_label()
+                            .iter()
+                            .any(|label| label.name() == "outcome" && label.value() == outcome)
+                    })
+                    .map(|metric| metric.get_counter().value())
+                    .sum()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The seam: `apply_provider_timeout` reading the client's honored
+    /// override instead of the provider's `timeout_ms`.
+    ///
+    /// This is the test that proves the override reaches
+    /// `reqwest::Request::timeout_mut`, not just the config struct. The
+    /// upstream sleeps four times the provider budget, so a 200 is only
+    /// possible if the header replaced it.
+    #[tokio::test]
+    async fn an_honored_timeout_header_outlives_the_provider_timeout() {
+        let (upstream_url, upstream_hits) =
+            upstream_slow_fixture(400, canonical_chat_response("slow but fine")).await;
+        let config = request_timeout_override_config(&upstream_url, true, Some(5_000));
+        let (mut session, client) = downstream_method_bytes_session_with_headers(
+            "POST",
+            "/v1/chat/completions",
+            "application/json",
+            serde_json::to_vec(&serde_json::json!({
+                "model": "requested-model",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }))
+            .expect("request JSON"),
+            &[("x-sbproxy-timeout-ms", "3000")],
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let applied_before = request_timeout_override_count("applied");
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the honored budget carries the request");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert!(
+            request_timeout_override_count("applied") > applied_before,
+            "an honored override is counted"
+        );
+    }
+
+    /// The seam: the `allow_override` gate inside
+    /// `effective_request_timeout`, end to end.
+    ///
+    /// Identical request and identical upstream, minus the operator
+    /// opt-in. The header is dropped rather than refused, the provider's
+    /// own 100ms budget kills the attempt, and the drop is visible on the
+    /// metric, which is the whole point of counting an ignore.
+    #[tokio::test]
+    async fn the_same_request_fails_with_the_flag_off() {
+        let (upstream_url, upstream_hits) =
+            upstream_slow_fixture(400, canonical_chat_response("never reaches the caller")).await;
+        let config = request_timeout_override_config(&upstream_url, false, None);
+        let (mut session, client) = downstream_method_bytes_session_with_headers(
+            "POST",
+            "/v1/chat/completions",
+            "application/json",
+            serde_json::to_vec(&serde_json::json!({
+                "model": "requested-model",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }))
+            .expect("request JSON"),
+            &[("x-sbproxy-timeout-ms", "3000")],
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let ignored_before = request_timeout_override_count("ignored_override_disabled");
+        let result = super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await;
+        drop(session);
+        let mut client = client;
+        client.abort_and_wait().await;
+
+        // Every candidate having failed at the transport level is the one
+        // outcome the dispatcher hands back to pingora rather than
+        // answering itself, so there is no downstream body to read here.
+        assert!(
+            result.is_err(),
+            "the provider's own 100ms timeout_ms still ends the attempt"
+        );
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            1,
+            "the header is ignored, not refused, so the request still dispatches"
+        );
+        assert_eq!(
+            request_timeout_override_count("ignored_override_disabled"),
+            ignored_before + 1.0,
+            "ignoring a caller's header has to be visible somewhere an operator can find"
+        );
+    }
+
+    /// The seam: the over-ceiling branch, refusing rather than clamping.
+    /// A caller who asked for 60s and silently got 5s builds a retry
+    /// schedule on a budget it never had.
+    #[tokio::test]
+    async fn a_timeout_header_over_the_ceiling_refuses_with_400() {
+        let (upstream_url, upstream_hits) =
+            upstream_slow_fixture(0, canonical_chat_response("never dispatched")).await;
+        let config = request_timeout_override_config(&upstream_url, true, Some(5_000));
+        let (mut session, client) = downstream_method_bytes_session_with_headers(
+            "POST",
+            "/v1/chat/completions",
+            "application/json",
+            serde_json::to_vec(&serde_json::json!({
+                "model": "requested-model",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }))
+            .expect("request JSON"),
+            &[("x-sbproxy-timeout-ms", "60000")],
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let refused_before = request_timeout_override_count("over_ceiling");
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the refusal is answered");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        let text = String::from_utf8_lossy(&response).to_string();
+        assert!(text.starts_with("HTTP/1.1 400"), "{text}");
+        assert!(text.contains("invalid_request_timeout"), "{text}");
+        assert!(
+            text.contains("5000"),
+            "the refusal names the accepted range so the caller can correct in one trip: {text}"
+        );
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            0,
+            "the refusal precedes any upstream call"
+        );
+        assert_eq!(
+            request_timeout_override_count("over_ceiling"),
+            refused_before + 1.0
+        );
+        assert!(
+            context
+                .policy_decisions
+                .iter()
+                .any(|decision| decision == "request_timeout:deny"),
+            "the refusal reaches the admin decision row: {:?}",
+            context.policy_decisions
+        );
+    }
 }
 
 #[cfg(test)]
@@ -27130,6 +28125,90 @@ mod price_ceiling_tests {
         // A config ceiling does not rescue a malformed header: the caller
         // asked for a bound the gateway cannot honor.
         assert!(effective_price_ceiling(Some(0.05), Some("cheap")).is_err());
+    }
+
+    #[test]
+    fn timeout_override_header_that_is_not_a_number_is_an_error() {
+        for bad in ["soon", "", "3.5", "-100", "3000ms"] {
+            let refusal = super::effective_request_timeout(true, Some(5_000), Some(bad))
+                .expect_err("not a whole number of milliseconds");
+            assert_eq!(
+                refusal.outcome, "invalid_header",
+                "{bad:?} is a malformed header, not a ceiling breach"
+            );
+        }
+    }
+
+    #[test]
+    fn timeout_override_header_of_zero_is_an_error() {
+        // A zero budget refuses the request it was asked to bound, the
+        // same reading as a zero price ceiling.
+        let refusal = super::effective_request_timeout(true, Some(5_000), Some("0"))
+            .expect_err("a zero budget is refused");
+        assert_eq!(refusal.outcome, "invalid_header");
+    }
+
+    /// The label rides on the refusal rather than being recovered from
+    /// its wording. Reading it back out of the message put the
+    /// "origin has no ceiling" refusal, which names the same key, on the
+    /// caller-mistake series, and would have moved any of these the next
+    /// time a sentence was reworded.
+    #[test]
+    fn a_refused_timeout_override_carries_its_own_metric_label() {
+        let over = super::effective_request_timeout(true, Some(5_000), Some("60000"))
+            .expect_err("above the ceiling");
+        assert_eq!(over.outcome, "over_ceiling");
+        let no_ceiling = super::effective_request_timeout(true, None, Some("3000"))
+            .expect_err("the flag on with no ceiling refuses, fail-closed");
+        assert_eq!(no_ceiling.outcome, "over_ceiling");
+    }
+
+    #[test]
+    fn timeout_override_above_the_ceiling_names_the_accepted_range() {
+        let refusal = super::effective_request_timeout(true, Some(5_000), Some("60000"))
+            .expect_err("a header above the ceiling is refused, not clamped");
+        let message = refusal.message;
+        assert!(message.contains("60000"), "{message}");
+        assert!(message.contains("5000"), "{message}");
+        // The message reaches the caller verbatim in the 400 body, and
+        // docs/ai-gateway.md quotes it, so a stray run of whitespace
+        // from a wrapped literal is a shipped defect.
+        assert!(
+            !message.contains("  "),
+            "the refusal is one clean sentence: {message:?}"
+        );
+    }
+
+    /// The seam that decides whether an operator who left the flag off
+    /// can be surprised by a caller. Off must ignore, never apply, and
+    /// never refuse: a caller sending the header to a fleet where only
+    /// some origins opted in must not get a 400 from the rest.
+    #[test]
+    fn timeout_override_with_the_flag_off_reports_ignored_not_applied() {
+        assert_eq!(
+            super::effective_request_timeout(false, Some(5_000), Some("3000")),
+            Ok(super::TimeoutOverrideOutcome::IgnoredDisabled)
+        );
+        assert_eq!(
+            super::effective_request_timeout(false, None, Some("60000")),
+            Ok(super::TimeoutOverrideOutcome::IgnoredDisabled),
+            "with the flag off nothing about the value matters, including \
+             whether it would have been over a ceiling"
+        );
+    }
+
+    #[test]
+    fn a_header_within_the_ceiling_is_applied_and_no_header_is_absent() {
+        assert_eq!(
+            super::effective_request_timeout(true, Some(5_000), Some("3000")),
+            Ok(super::TimeoutOverrideOutcome::Applied(
+                std::time::Duration::from_millis(3_000)
+            ))
+        );
+        assert_eq!(
+            super::effective_request_timeout(true, Some(5_000), None),
+            Ok(super::TimeoutOverrideOutcome::Absent)
+        );
     }
 
     #[test]

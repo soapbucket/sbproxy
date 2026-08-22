@@ -453,6 +453,13 @@ struct PreparedShadowRequest {
 }
 
 /// HTTP client that forwards AI requests to upstream providers.
+///
+/// `Clone` is cheap and deliberate: every field is an `Arc` bump or a
+/// `reqwest::Client` handle, which is itself an `Arc`. That is what lets
+/// the dispatcher build a per-request copy carrying one caller's honored
+/// timeout instead of threading an options struct through twenty
+/// `forward_*` signatures.
+#[derive(Clone)]
 pub struct AiClient {
     http: reqwest::Client,
     shadow_supervisor: Arc<ShadowSupervisor>,
@@ -461,6 +468,11 @@ pub struct AiClient {
     egress: Option<EgressAuthorizer>,
     /// Per-provider outbound request signers, built on first use.
     signers: Arc<SignerCache>,
+    /// A caller's honored `x-sbproxy-timeout-ms`, replacing
+    /// `ProviderConfig::timeout_ms` for the life of this client. `None`
+    /// on the shared process client, which is the only one that outlives
+    /// a request.
+    request_timeout_override: Option<Duration>,
 }
 
 impl AiClient {
@@ -481,6 +493,7 @@ impl AiClient {
             shadow_supervisor: Arc::new(ShadowSupervisor::default()),
             egress: None,
             signers: Arc::new(SignerCache::default()),
+            request_timeout_override: None,
         }
     }
 
@@ -489,6 +502,20 @@ impl AiClient {
     /// before any I/O (fail closed).
     pub fn with_egress(mut self, authorizer: EgressAuthorizer) -> Self {
         self.egress = Some(authorizer);
+        self
+    }
+
+    /// A per-request copy of this client that stamps `timeout` on every
+    /// provider request in place of the provider's own `timeout_ms`.
+    ///
+    /// Cloning is an `Arc` bump per field, so this is cheap enough to do
+    /// once per request that carries an honored `x-sbproxy-timeout-ms`.
+    /// Carrying the budget on the client rather than as a parameter is
+    /// what makes the race path, the cascade fan-out, and every retry
+    /// attempt inherit it without twenty signature changes.
+    #[must_use]
+    pub fn with_request_timeout_override(mut self, timeout: Duration) -> Self {
+        self.request_timeout_override = Some(timeout);
         self
     }
 
@@ -509,6 +536,7 @@ impl AiClient {
             shadow_supervisor: supervisor,
             egress: None,
             signers: Arc::new(SignerCache::default()),
+            request_timeout_override: None,
         }
     }
 
@@ -597,7 +625,7 @@ impl AiClient {
         provider: &ProviderConfig,
     ) -> Result<reqwest::Response> {
         Box::pin(async move {
-            apply_provider_timeout(&mut request, provider);
+            apply_provider_timeout(&mut request, provider, self.request_timeout_override);
             let signer = self.signers.signer_for(provider).await?;
             send_governed(
                 &self.http,
@@ -1688,9 +1716,23 @@ pub(crate) fn strip_sensitive_headers(headers: &mut reqwest::header::HeaderMap) 
     headers.remove(reqwest::header::COOKIE);
 }
 
-fn apply_provider_timeout(request: &mut reqwest::Request, provider: &ProviderConfig) {
-    if let Some(timeout_ms) = provider.timeout_ms {
-        *request.timeout_mut() = Some(Duration::from_millis(timeout_ms));
+/// Stamp the effective per-attempt transport budget onto `request`.
+///
+/// `override_timeout` is a caller's honored `x-sbproxy-timeout-ms`, which
+/// replaces the provider's own `timeout_ms` rather than being clamped
+/// against it: the operator ceiling that bounds the caller's value was
+/// already applied at the request path, and applying a second one here
+/// would silently give the caller less than the gateway told them they
+/// could have.
+fn apply_provider_timeout(
+    request: &mut reqwest::Request,
+    provider: &ProviderConfig,
+    override_timeout: Option<Duration>,
+) {
+    if let Some(timeout) =
+        override_timeout.or_else(|| provider.timeout_ms.map(Duration::from_millis))
+    {
+        *request.timeout_mut() = Some(timeout);
     }
 }
 
@@ -1904,6 +1946,7 @@ impl AiClient {
                 prepare_provider_attempt_body(config, &provider, body);
             let http = self.http.clone();
             let egress = self.egress.clone();
+            let timeout_override = self.request_timeout_override;
             // Resolved before the spawn so a provider whose credentials
             // cannot be built refuses the whole race rather than losing
             // one leg silently mid-flight.
@@ -1946,7 +1989,7 @@ impl AiClient {
                 ai_metrics::record_reasoning_policy_attempt(&provider.name, reasoning_outcome);
                 let resp = match req.json(send_body).build() {
                     Ok(mut request) => {
-                        apply_provider_timeout(&mut request, &provider);
+                        apply_provider_timeout(&mut request, &provider, timeout_override);
                         send_governed(
                             &http,
                             egress.as_ref(),

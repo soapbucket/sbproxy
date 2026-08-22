@@ -1645,7 +1645,9 @@ origins:
 | `model_rate_limits` | map | | Per-model rate limit overrides keyed by model name. |
 | `per_surface_rate_limits` | map | | Per-surface rate limit overrides keyed by AI surface label (`chat_completions`, `assistants`, `image_generation`, ...). |
 | `max_concurrent` | map | | Maximum concurrent in-flight requests per provider. |
-| `resilience` | object | | Per-provider circuit breaker, outlier detection, and active health probes. Also hosts the LLM-aware knobs (`retry_policy`, `cooldown_policy`, `llm_aware`, `content_policy_fallback`); see [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md). |
+| `resilience` | object | | Per-provider circuit breaker, outlier detection, and active health probes. Also hosts the LLM-aware knobs (`retry_policy`, `cooldown_policy`, `llm_aware`, `content_policy_fallback`) and the streaming `pre_header_timeout_ms` budget; see [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md). |
+| `allow_request_timeout_override` | bool | `false` | Honor a caller's `x-sbproxy-timeout-ms` in place of the selected provider's `timeout_ms`. Off means the header is ignored rather than refused. Requires `max_request_timeout_ms`; the flag alone is refused at config load. Scope is the origin, so it applies to every caller and tenant routed here. |
+| `max_request_timeout_ms` | int | unset | Ceiling in milliseconds on a caller's `x-sbproxy-timeout-ms`. A header above it is refused with 400 naming the accepted range, not clamped. Must be above zero. Bounds one attempt, so `max_retries` multiplies it. An honored header replaces the gateway's 30-second HTTP client default too, so a ceiling above 30000 does lengthen an attempt. |
 | `compression` | object | unset | Ordered AI context-compression policy. See [AI context compression](#ai-context-compression) and [ai-context-compression.md](ai-context-compression.md). |
 | `reasoning` | string or object | `off` | Route policy for concise reasoning. Use `concise`, `off`, or `{budget: N}` with `N` greater than zero. |
 | `shadow` | object | | Side-by-side eval: mirror each request to a second provider and log metrics. |
@@ -1681,7 +1683,7 @@ Peak EWMA accepts the object form:
 | `priority` | int | unset | Priority used by priority routing (lower runs first). |
 | `enabled` | bool | true | When false, this provider is skipped during routing. |
 | `max_retries` | int | unset | Maximum retries on transient upstream failures. |
-| `timeout_ms` | int | unset | Request timeout in milliseconds. |
+| `timeout_ms` | int | unset | Request timeout in milliseconds, measured from connect through the end of the response body, so it cuts a streaming completion mid-stream if the stream outlives it. To bound only how long a streaming request waits for the provider's response headers, and fail over when it elapses, set the action-level `resilience.pre_header_timeout_ms` instead. |
 | `organization` | string | | Organization identifier for providers that scope keys per org. |
 | `api_version` | string | | API version header value (e.g. for Anthropic and Azure OpenAI). |
 | `no_prompt_training` | bool | `false` | Marks the provider safe for training-sensitive prompts. Requests carrying the `x-sbproxy-disallow-prompt-training: true` header only route to providers with this flag; a request with the header and no marked provider in the chain gets a 400 `no_compliant_provider`. |
@@ -2184,9 +2186,12 @@ resilience:
     timeout_ms: 5000
     unhealthy_threshold: 3
     healthy_threshold: 2
+  pre_header_timeout_ms: 2000 # streaming: give up on a silent provider here
 ```
 
 `resilience` on its own does not add an attempt. A second attempt needs a routing plan that has somewhere to go: `routing.strategy: fallback_chain`, `resilience.content_policy_fallback: true`, or a typed fallback list. With one of those, the dispatch loop visits each configured provider at most once, so the attempt ceiling is the provider count and no separate key raises it. Circuit-broken, ejected, and cooling-down providers are skipped on the second and later attempts.
+
+Because each candidate is visited at most once, the worst case a caller waits is the per-attempt budget times the candidate count: `(timeout_ms + backoff) x (max_retries + 1) x providers`. `resilience.pre_header_timeout_ms` is what keeps that product small without shortening `timeout_ms` for the provider that does answer. It bounds connect through the upstream response headers on streaming requests only, fails over on elapse under `sbproxy_ai_failovers_total{reason="pre_header_timeout"}`, must be above zero, and only ever shortens an attempt, so a value above the attempt's own `timeout_ms` (or above the gateway's 30-second HTTP client default when `timeout_ms` is unset) never fires. Past the response headers the request is committed to that provider, so a later stall ends the stream and is counted on `sbproxy_ai_stream_post_commit_failures_total` instead. See [Pre-header streaming budget](ai-llm-aware-resilience.md#pre-header-streaming-budget).
 
 The block also accepts the LLM-aware keys: `retry_policy` (per-failure-class retry counts, e.g. `rate_limit: 3`), `cooldown_policy` (per-failure-class provider cooldown seconds), `llm_aware.context_compress` plus `llm_aware.completion_reserve_tokens` (fit an over-long prompt to the model's window before dispatch), and `content_policy_fallback` (route a content-policy refusal to the next provider in priority order). The typed reroute lists, `context_window_fallbacks` and `content_policy_fallbacks`, are siblings of `routing:` on the action rather than resilience keys. Semantics and the failure-cause table are in [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md).
 

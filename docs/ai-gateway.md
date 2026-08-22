@@ -74,6 +74,111 @@ The second is multipart: an audio transcription, image edit, or image variation 
 
 Two more per-provider fields bound dispatch. `timeout_ms` caps one attempt's wall clock, measured from connect through the end of the response body, so it cuts a streaming completion off mid-stream if the stream outlives it; pick it with your slowest legitimate stream in mind, not your median. `max_retries` re-dispatches on retryable failures, each attempt with a fresh timeout window, so the worst case a client waits on one provider is `(timeout_ms + backoff) x (max_retries + 1)` before routing moves on.
 
+That is one provider. A fallback chain multiplies it again, because the dispatch loop visits each configured candidate at most once: worst case across the whole request is `(timeout_ms + backoff) x (max_retries + 1) x candidate count`. Four providers at `timeout_ms: 30000` is a two-minute wait before the caller sees an error. Nobody sizes for that on purpose, which is what the next section is about.
+
+#### Bounding a wedged provider on a streaming request
+
+`timeout_ms` is the wrong instrument for a provider that accepts the connection and then goes quiet. It cannot be short, because it also has to cover a legitimate three-minute completion, and while it runs no failover happens. Set `resilience.pre_header_timeout_ms` instead. It bounds connect through the provider's response headers on streaming requests only, and an elapse fails over to the next candidate:
+
+```yaml
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      routing: fallback_chain
+      resilience:
+        pre_header_timeout_ms: 2000
+      providers:
+        - name: primary
+          api_key: ${OPENAI_API_KEY}
+          priority: 1
+          timeout_ms: 180000
+        - name: secondary
+          api_key: ${BACKUP_API_KEY}
+          priority: 2
+          timeout_ms: 180000
+```
+
+The two budgets measure different spans of the same request:
+
+```mermaid
+gantt
+    title One streaming attempt, and which key bounds what
+    dateFormat X
+    axisFormat %s
+    section Request
+    connect and TLS         :a1, 0, 1
+    provider thinking       :a2, 1, 2
+    response headers        :milestone, m1, 3, 0
+    SSE events to client    :a3, 3, 9
+    section Budgets
+    pre_header_timeout_ms   :crit, b1, 0, 3
+    timeout_ms              :b2, 0, 9
+```
+
+`pre_header_timeout_ms` is the red span and it stops at the milestone. `timeout_ms` runs past it to the last byte, and a failover is possible only inside the red span.
+
+The milestone is the commit point: once the provider answers `200 text/event-stream` the gateway is relaying bytes the caller is already reading, and no later candidate can take them back. A stall after that ends the stream, and it is counted on `sbproxy_ai_stream_post_commit_failures_total` rather than on the failover counter.
+
+Send a streaming request at a primary that never answers:
+
+```bash
+curl -N -sS http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Host: ai.example.com' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+The caller gets `secondary`'s stream about two seconds in. Without the key it waits out `timeout_ms`, three minutes here, and then gets the same stream. The failover is on the metric either way, but only the bounded one carries the reason:
+
+```
+sbproxy_ai_failovers_total{from_provider="primary",to_provider="secondary",reason="pre_header_timeout"} 1
+```
+
+Two things to know about its edges. It never applies to a non-streaming request: a buffered call has no partial output to protect, so it keeps waiting out `timeout_ms`. And it only ever shortens an attempt, so a value above the attempt's own transport budget never fires: keep it under `timeout_ms`, or under 30000 on a provider that sets no `timeout_ms` and so runs on the gateway's HTTP client default.
+
+One more, on a cluster: a `managed_model` served by another node is dispatched over the model plane from inside the same bounded attempt, so this budget bounds that dispatch too, cold start included. A cold start is legitimately slower than any hosted provider's headers. On an origin that can route to a managed model, size the budget above your cold-start allowance or leave it unset there.
+
+With it set, the worst case above becomes `(pre_header_timeout_ms + backoff) x candidate count` for a provider that never answers, while a provider that does answer still gets its full `timeout_ms` to finish generating.
+
+#### Letting a caller set its own budget
+
+An agent that will abandon a call after four seconds should not be held on a provider budget sized for a two-minute batch job, and a caller doing deep research needs the opposite. `x-sbproxy-timeout-ms` lets the caller say which, replacing the selected provider's `timeout_ms` for that one request. It is off by default and the flag alone is refused at config load, because a caller who can raise a timeout holds a downstream connection, a `quota_pool` slot, and an upstream generation open for as long as you let it:
+
+```yaml
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      allow_request_timeout_override: true
+      max_request_timeout_ms: 20000
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          timeout_ms: 60000
+```
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Host: ai.example.com' \
+  -H 'Content-Type: application/json' \
+  -H 'x-sbproxy-timeout-ms: 4000' \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+```
+
+That attempt now runs on 4 seconds instead of 60. Ask for more than the ceiling and the request is refused rather than quietly clamped, so the caller can correct it in one round trip:
+
+```bash
+$ curl -sS -H 'x-sbproxy-timeout-ms: 60000' ...
+{"error":{"type":"invalid_request_timeout","message":"x-sbproxy-timeout-ms of 60000 exceeds this origin's max_request_timeout_ms of 20000; ask for between 1 and 20000"}}
+```
+
+With `allow_request_timeout_override` off, the same header is dropped and the request dispatches on the configured budget. That is deliberate: callers hitting a fleet where only some origins have opted in should not collect 400s from the rest. The drop is still counted, on `sbproxy_ai_request_timeout_override_total{outcome="ignored_override_disabled"}`, along with `applied`, `over_ceiling`, and `invalid_header`.
+
+The ceiling bounds one attempt, not the request. With `max_retries: 3` a caller asking for 20 seconds can hold four attempts of it, so the worst case is `max_request_timeout_ms x (max_retries + 1) x candidate count`. Size the ceiling against a single attempt and then do that multiplication before you pick it. Note that an honored header replaces the gateway's 30-second HTTP client default along with the provider's `timeout_ms`, so a ceiling above 30000 does buy a caller a longer attempt. Nothing else bounds it, which is why the ceiling is mandatory.
+
+The override does not reach the gateway's own routing work. Semantic-cache embeddings, semantic-route embeddings, and shadow copies keep the shared client and its configured budgets, because a caller's completion budget is not a budget for work the caller did not ask for. It does reach a `managed_model` this process serves locally, which is dialed over the same provider HTTP client once the engine is up. It does not reach a `managed_model` served by another node in a cluster: that dispatch goes over the model plane on its own deadlines.
+
 ### Native providers
 70 native providers ship in-tree. The split: 63 entries are OpenAI-format passthrough, 3 (Anthropic, Gemini, Bedrock) carry in-tree translators, and 4 custom-format entries (SageMaker, Oracle OCI, Watsonx, Writer) pass through untranslated, so clients must send those four their native body shape. You bring your own key per provider and the `model` field passes straight through, so the gateway reaches 200+ models (and any model a provider ships next) without enumerating them. Direct adapters include `openai`, `anthropic`, `gemini`, `azure`, `bedrock`, `cohere`, `mistral`, `groq`, `deepseek`, `together`, `fireworks`, `cerebras`, `sambanova`, `nvidia`, `vertex`, `databricks`, `huggingface`, `vllm`, and `openrouter`. For the AWS entries, SBproxy signs the request itself: add `aws_sigv4:` to a `bedrock` or `sagemaker` provider and the gateway computes the SigV4 `Authorization` header per request, with credentials from the standard AWS provider chain, a static key pair, or a renewed STS role session.
 
