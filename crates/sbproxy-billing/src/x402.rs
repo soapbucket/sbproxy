@@ -486,22 +486,6 @@ impl FacilitatorBreaker {
         }
     }
 
-    /// Reports whether the breaker is currently refusing calls.
-    ///
-    /// Unlike [`Self::admit`] this claims nothing, so it is safe to ask
-    /// from a selection path that may not go on to make a call.
-    #[must_use]
-    pub fn is_open(&self, now_ms: i64) -> bool {
-        let state = self.lock();
-        match state.opened_at_ms {
-            None => false,
-            Some(opened_at) => {
-                now_ms.saturating_sub(opened_at) < self.open_ms
-                    || state.probes_in_flight >= self.half_open_max
-            }
-        }
-    }
-
     /// Records a transport-level failure.
     pub fn record_transport_failure(&self, now_ms: i64) {
         let mut state = self.lock();
