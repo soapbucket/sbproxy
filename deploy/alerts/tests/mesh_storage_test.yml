@@ -1,0 +1,136 @@
+# promtool unit tests for the mesh-admission and storage-backend rules.
+#
+# Every case here has a firing half and a control, because the bug this shape
+# exists to catch passes the firing half on its own. The mesh control is the
+# important one: `idle_timeout` is a reason on the same counter that a quiet
+# cluster moves by itself, so a rule that forgot to exclude it would fire on
+# housekeeping and still look correct against a connection_limit burn.
+#
+# The storage control is the other half of the same problem. Both storage
+# families are absent, not zero, on a deployment that never calls the storage
+# layer, so the ratio has to return nothing rather than 0 when the numerator
+# has no series. A rule that manufactured a zero there would read as a healthy
+# backend on a deployment that has none.
+
+rule_files:
+  - ../recording-rules.yml
+  - ../alerting-rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # Mesh: a node at its inbound connection cap turns peers away.
+  - interval: 1m
+    input_series:
+      - series: 'mesh_transport_inbound_rejected_total{reason="connection_limit"}'
+        values: '0+6x180'
+
+    promql_expr_test:
+      - expr: round(sbproxy:mesh:inbound_rejected:5m, 0.001)
+        eval_time: 30m
+        exp_samples:
+          - labels: '{reason="connection_limit"}'
+            value: 0.1
+
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: SBPROXY-MESH-INBOUND-REJECTED
+        exp_alerts:
+          - exp_labels:
+              reason: connection_limit
+              severity: ticket
+              slo_id: SLO-MESH-ADMISSION
+              runbook_id: RB-MESH-ADMISSION
+              window: 5m
+            exp_annotations:
+              summary: "Mesh is refusing inbound peer connections (connection_limit)"
+              description: |
+                This node has been rejecting inbound cache RPC connections for 10
+                minutes under a reason that is not the routine idle reclaim.
+                connection_limit means the inbound connection cap is reached and
+                peers are being turned away. handshake_timeout and
+                handshake_failed are mesh mTLS. frame_timeout and write_timeout
+                are a peer that opened a request and then stopped talking. The
+                peer address is in the transport log line, not in a label.
+              runbook_url: "https://docs.sbproxy.dev/runbook#rb-mesh-admission"
+
+  # Mesh control: a quiet cluster reclaiming idle peer connections, five times
+  # faster than the burn above, records nothing and fires nothing.
+  - interval: 1m
+    input_series:
+      - series: 'mesh_transport_inbound_rejected_total{reason="idle_timeout"}'
+        values: '0+30x180'
+
+    promql_expr_test:
+      - expr: sbproxy:mesh:inbound_rejected:5m
+        eval_time: 30m
+        exp_samples: []
+
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: SBPROXY-MESH-INBOUND-REJECTED
+        exp_alerts: []
+
+  # Storage: 5% of Redis operations come back disconnected.
+  - interval: 1m
+    input_series:
+      - series: 'sbproxy_storage_op_errors_total{op="get", backend="redis", kind="ephemeral", error_kind="disconnected"}'
+        values: '0+3x180'
+      - series: 'sbproxy_storage_op_duration_seconds_count{op="get", backend="redis", kind="ephemeral"}'
+        values: '0+60x180'
+
+    promql_expr_test:
+      - expr: round(sbproxy:storage:op_errors:5m, 0.001)
+        eval_time: 30m
+        exp_samples:
+          - labels: '{backend="redis", error_kind="disconnected"}'
+            value: 0.05
+      - expr: round(sbproxy:storage:op_error_ratio:5m, 0.001)
+        eval_time: 30m
+        exp_samples:
+          - labels: '{backend="redis"}'
+            value: 0.05
+
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: SBPROXY-STORAGE-BACKEND-ERRORS
+        exp_alerts:
+          - exp_labels:
+              backend: redis
+              error_kind: disconnected
+              severity: ticket
+              slo_id: SLO-STORAGE-OPS
+              runbook_id: RB-STORAGE-BACKEND
+              window: 5m
+            exp_annotations:
+              summary: "Storage backend redis returning disconnected errors"
+              description: |
+                sbproxy_storage_op_errors_total has been moving for 10 minutes.
+                disconnected and timeout are the backend or the network between
+                here and it, and the mesh is running without its shared store
+                until they clear. key_too_large and value_too_large are a caller
+                writing past the storage layer's caps and will repeat until that
+                call site is fixed. Read the error ratio on the Mesh Admission and
+                Storage dashboard to size the damage before deciding which.
+              runbook_url: "https://docs.sbproxy.dev/runbook#rb-storage-backend"
+
+  # Storage control: a backend doing the same work with no errors at all. The
+  # error ratio has to be empty here, not 0, because the numerator has no
+  # series to divide.
+  - interval: 1m
+    input_series:
+      - series: 'sbproxy_storage_op_duration_seconds_count{op="get", backend="redis", kind="ephemeral"}'
+        values: '0+60x180'
+
+    promql_expr_test:
+      - expr: sbproxy:storage:op_errors:5m
+        eval_time: 30m
+        exp_samples: []
+      - expr: sbproxy:storage:op_error_ratio:5m
+        eval_time: 30m
+        exp_samples: []
+
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: SBPROXY-STORAGE-BACKEND-ERRORS
+        exp_alerts: []

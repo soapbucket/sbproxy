@@ -32,6 +32,17 @@ scrape_configs:
 | Model Host | `grafana/sbproxy-model-host.json` | `sbproxy-model-host` | Local inference-engine lifecycle: resident models, cold-start (time-to-ready) latency, launch/eviction rates, load-queue depth, and per-device VRAM used/free and GPU utilization |
 | Mesh Admission & Storage | `grafana/sbproxy-mesh-storage.json` | `sbproxy-mesh-storage` | Mesh inbound connection admission by refusal reason and regrouped by operator fix, plus storage backend latency percentiles, error rate by error kind, operation throughput, and error ratio. Both halves report only where the mesh runs with its Redis backend, and the header tiles say so rather than leaving an empty chart to read as health. |
 
+One family cannot be charted at all and it is the obvious one to reach for on
+the mesh board: `mesh_peer_count`. The coverage scanner in
+`crates/sbproxy-capability/src/scan.rs` canonicalizes a `_count` suffix back to
+the family it belongs to, because that is how a histogram's derived series are
+folded into their parent. Applied to a gauge whose real name ends in `_count`,
+it resolves `mesh_peer_count` to `mesh_peer`, which no crate declares, and the
+build refuses the panel. It is the only one of the 331 declared families with
+that name shape. `sbproxy-mesh-storage.json` uses `mesh_node_isolated` as its
+mesh-is-running tile instead; mesh bootstrap publishes that gauge at 0 when it
+builds the isolation observer, so its presence carries the same signal.
+
 ### Importing via Grafana UI
 
 1. Open Grafana and navigate to **Dashboards > Import**

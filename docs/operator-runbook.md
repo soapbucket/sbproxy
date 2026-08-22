@@ -524,8 +524,8 @@ The `error_kind` label is the triage:
 dashboard. It divides the error counter by the latency histogram's `_count`
 series, which is observed on success and failure alike, so the ratio is really
 bounded to 0 and 1 and sizes the damage honestly. A ratio near 1 means the store
-is effectively down; a ratio of a few percent alongside a healthy peer count is
-a slow or lossy path, not an outage.
+is effectively down; a ratio of a few percent while the mesh is otherwise
+reporting is a slow or lossy path, not an outage.
 
 **Second check.** The per-operation error panel. All of the rate on one
 operation points at a single call site or a single Redis data structure. Rate
