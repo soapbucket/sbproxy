@@ -558,3 +558,13 @@ where the count first became visible to a gate.
 # same class as the `MeshFederationConfig` / `RequirementExtensionInfo`
 # / `JsonRpcError` entries already sitting in this bucket. Raising
 # rather than narrowing.
+
+# 2026-08-22 (WOR-2585/2586/2587, unreferenced bucket, follow-up): 1426
+# -> 1425. Fixing the adversarial-review findings on the Cedar MCP hook
+# (server-scoping the hook, threading the merged schema through
+# compile_all, moving the hook's construction after `prefixes` is
+# built) touched enough surrounding doc comments and call sites that
+# the grep-based scanner's textual count shifted by one net item below
+# the just-raised baseline, the same "mention moves the bucket" effect
+# already logged above for `fallback_trigger` and `sweep_expired`.
+# Lowering to hold the ground rather than leaving it unclaimed.

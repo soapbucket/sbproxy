@@ -109,20 +109,35 @@ pub fn merged_schema(
         return Ok(Some(default_schema()?));
     };
 
-    // Parse the override on its own first so a malformed override
-    // surfaces as `OverrideParse` rather than `MergedParse`. This
-    // matters for the admin-view error message: the operator wants to
-    // know whether their override is wrong, or whether it collided
-    // with the default.
-    let _ = Schema::from_cedarschema_str(override_src)
-        .map_err(|e| SchemaError::OverrideParse(e.to_string()))?;
-
     detect_conflicts(DEFAULT_MCP_SCHEMA_SRC, override_src)?;
 
+    // WOR-2587 review: this used to parse `override_src` on its own
+    // *before* merging, so a malformed override surfaced as
+    // `OverrideParse` rather than the less specific `MergedParse`.
+    // That pre-check ran unconditionally, though, and the module's own
+    // stated purpose for overrides -- extending a default entity type
+    // (e.g. `entity CustomBinding = { binding: ArgumentBinding, ... };`)
+    // -- can never parse standalone: `ArgumentBinding` is declared only
+    // in the default schema, so every override that used the extension
+    // mechanism for its intended purpose was rejected before the merge
+    // that would have made it valid ever ran. The merged parse is
+    // therefore attempted first; the standalone parse only runs to
+    // pick an error message once the merge has already failed, never
+    // as a gate on the happy path.
     let merged_src = format!("{DEFAULT_MCP_SCHEMA_SRC}\n{override_src}");
-    let (schema, warnings) = Schema::from_cedarschema_str(&merged_src)
-        .map_err(|e| SchemaError::MergedParse(e.to_string()))?;
-    Ok(Some((schema, warnings.collect())))
+    match Schema::from_cedarschema_str(&merged_src) {
+        Ok((schema, warnings)) => Ok(Some((schema, warnings.collect()))),
+        Err(merged_err) => {
+            if let Err(override_err) = Schema::from_cedarschema_str(override_src) {
+                // The override is broken independent of the default
+                // schema (a genuine syntax error the operator wrote),
+                // so report against their own source rather than the
+                // harder-to-read concatenated document.
+                return Err(SchemaError::OverrideParse(override_err.to_string()));
+            }
+            Err(SchemaError::MergedParse(merged_err.to_string()))
+        }
+    }
 }
 
 /// Lightweight conflict check that scans Cedar source text for
@@ -252,6 +267,32 @@ mod tests {
             ),
         };
         let result = merged_schema(&cfg).expect("merge ok");
+        assert!(result.is_some(), "expected Some(schema)");
+    }
+
+    /// WOR-2587 review: the default schema's own docs invite a
+    /// workspace to extend it by referencing a default entity type
+    /// from an override (`ArgumentBinding` here, matching the doc
+    /// example this module's header comments point to). The override
+    /// used to be parsed on its own, before merging, so this exact,
+    /// intended use of the extension mechanism failed with
+    /// `OverrideParse("...ArgumentBinding...undeclared...")` even
+    /// though the merged document is perfectly valid Cedar.
+    #[test]
+    fn merged_schema_accepts_an_override_that_extends_a_default_entity_type() {
+        let cfg = McpSchemaConfig {
+            mcp_primitives_enabled: true,
+            workspace_override: Some(
+                r#"
+                entity CustomBinding = {
+                    binding: ArgumentBinding,
+                    note: String,
+                };
+            "#
+                .into(),
+            ),
+        };
+        let result = merged_schema(&cfg).expect("an override extending a default type must merge");
         assert!(result.is_some(), "expected Some(schema)");
     }
 

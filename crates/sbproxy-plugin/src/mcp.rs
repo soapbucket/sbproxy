@@ -244,10 +244,15 @@ pub fn register_mcp_policy_hook(hook: Arc<dyn McpPolicyHook>) {
 ///
 /// ## Panics
 ///
-/// Panics if either internal registry mutex is poisoned (a prior
-/// holder panicked while holding the lock). The link-time inventory
-/// feed is read without locking and does not contribute to this
-/// condition.
+/// Panics only if the runtime-installed registry's mutex is
+/// poisoned (a prior holder panicked while holding it); see
+/// [`register_mcp_policy_hook`]. The pipeline-scoped slot recovers
+/// from a poisoned lock instead of panicking -- see
+/// [`pipeline_mcp_policy_hooks`]'s doc comment for why that is safe --
+/// so a poisoned `PIPELINE_HOOKS` lock does not surface here at all;
+/// this function silently proceeds with whatever that recovery
+/// returns. The link-time inventory feed is read without locking and
+/// does not contribute to either condition.
 pub fn mcp_policy_hooks() -> Vec<Arc<dyn McpPolicyHook>> {
     let mut hooks: Vec<Arc<dyn McpPolicyHook>> = inventory::iter::<McpPolicyHookEntry>()
         .map(|entry| (entry.factory)())

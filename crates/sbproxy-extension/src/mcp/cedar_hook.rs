@@ -139,13 +139,9 @@ impl CedarMcpHook {
             return PolicyDecision::Allow;
         }
         let principal = agent_uid(ctx.agent_id);
-        // Fixed literal, not user input: safe to parse from Cedar
-        // source-text syntax. The default MCP schema declares no
-        // other action this hook has any reason to dispatch.
-        let action = EntityUid::from_str(r#"Action::"MCP::CallTool""#)
-            .unwrap_or_else(|e| unreachable!("MCP::CallTool action uid is a fixed literal: {e}"));
         let resource = tool_invocation_uid(ctx.mcp_server, ctx.tool_name);
-        self.evaluator.evaluate_uids(principal, action, resource)
+        self.evaluator
+            .evaluate_uids(principal, call_tool_action_uid().clone(), resource)
     }
 }
 
@@ -171,6 +167,21 @@ fn agent_uid(agent_id: Option<&str>) -> EntityUid {
     EntityUid::from_type_name_and_id(ty, id)
 }
 
+/// The fixed `Action::"MCP::CallTool"` uid every `tools/call` this
+/// hook evaluates dispatches through. A `LazyLock` rather than a
+/// per-call `EntityUid::from_str`: the source is a fixed literal, not
+/// user input, so parsing it more than once buys nothing, and this
+/// runs on every `tools/call` (WOR-2587 review) -- the module's own
+/// docs already call the evaluation itself out as synchronous CPU
+/// work on the hot path.
+fn call_tool_action_uid() -> &'static EntityUid {
+    static ACTION: std::sync::LazyLock<EntityUid> = std::sync::LazyLock::new(|| {
+        EntityUid::from_str(r#"Action::"MCP::CallTool""#)
+            .unwrap_or_else(|e| unreachable!("MCP::CallTool action uid is a fixed literal: {e}"))
+    });
+    &ACTION
+}
+
 /// Build the `ToolInvocation::"<server>/<tool>"` resource uid.
 fn tool_invocation_uid(mcp_server: &str, tool_name: &str) -> EntityUid {
     let ty = EntityTypeName::from_str("ToolInvocation")
@@ -193,7 +204,10 @@ mod tests {
     fn hook_from_source(src: &str) -> CedarMcpHook {
         let compiled = compile_all(&[("t", src)], None).expect("compile");
         let evaluator = CedarEvaluator::new(compiled.policy_set, None).expect("new evaluator");
-        CedarMcpHook::new(Arc::new(evaluator), ["srv".to_string()].into_iter().collect())
+        CedarMcpHook::new(
+            Arc::new(evaluator),
+            ["srv".to_string()].into_iter().collect(),
+        )
     }
 
     fn ctx<'a>(agent_id: Option<&'a str>, server: &'a str, tool: &'a str) -> McpToolCallCtx<'a> {
