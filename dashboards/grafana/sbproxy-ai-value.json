@@ -651,6 +651,328 @@
           }
         }
       ]
+    },
+    {
+      "id": 18,
+      "title": "Price source share (which table produced the price)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 36
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Share of AI price lookups by the table that produced the price: catalog is the shipped model catalog, rate_card and config are operator-supplied, and fallback is a flat blended rate applied when nothing else priced the model. Counted per price lookup and not per request, so one request can contribute several samples. A rising fallback share means the spend figure, the budget debits, and the price ceiling are all comparing against a guess, so add the missing model to the catalog or to a rate card. The family carries only the source label, so this panel is fleet-wide, the Tenant and Credential dropdowns do not apply to it, and it cannot say which model fell back. The red not reported series sits at 1 when no AI request has ever been priced on this instance, which is not the same as a zero fallback share. Runbook: docs/operator-runbook.md.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "not reported"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              },
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (source) (rate(sbproxy_ai_price_source_total[5m])) / ignoring(source) group_left sum(rate(sbproxy_ai_price_source_total[5m]))",
+          "legendFormat": "{{source}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "absent(sbproxy_ai_price_source_total)",
+          "legendFormat": "not reported",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "title": "Price ceiling outcomes",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 36
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Rate of price-ceiling guard outcomes. candidate_excluded is a routing candidate dropped for being priced over the ceiling, counted per candidate, so one request can contribute several. refused is a request where every candidate was over the ceiling and the caller was answered 402. invalid_header is an unparseable x-sbproxy-max-price and is a client integration bug, not a pricing problem. unsupported_surface is a header ceiling set on a surface with no pre-dispatch cost estimate; only chat completions, messages, and responses can enforce one. Steady exclusions with no refusals is the healthy shape. Refusals climbing means the ceiling now sits below the cheapest available candidate, so raise the ceiling or add a cheaper model to the route. The family carries only the outcome label, so this panel is fleet-wide and the Tenant and Credential dropdowns do not apply. The red not reported series sits at 1 when no price ceiling has ever been evaluated on this instance. Runbook: docs/operator-runbook.md.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "not reported"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              },
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(sbproxy_ai_price_ceiling_total[5m]))",
+          "legendFormat": "{{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "absent(sbproxy_ai_price_ceiling_total)",
+          "legendFormat": "not reported",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "title": "Token estimate error p95 by model",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 44
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "p95 relative error of the pre-request token estimate against the upstream usage.prompt_tokens, per model, sign preserved. Positive means the estimator under-reserved and the request cost more than it debited from the budget. This is recorded only on a reconciled rate-limit admission, which requires the model to hold an entry in config.model_rate_limits. On a deployment with no per-model rate limits the family never appears while the same estimator keeps driving budget debits and the price ceiling, so the red not reported series at 1 means unmeasured rather than accurate. Sustained error above roughly 0.2 means headroom and ceiling decisions are being made on a bad number; refresh the tokenizer for that model. The family carries only the model label, so the Tenant and Credential dropdowns do not apply. Runbook: docs/operator-runbook.md.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "not reported"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              },
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, model) (rate(sbproxy_ai_token_estimate_error_ratio_bucket[5m])))",
+          "legendFormat": "{{model}} p95",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "absent(sbproxy_ai_token_estimate_error_ratio_bucket)",
+          "legendFormat": "not reported",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "title": "Semantic cache cost saved ($/hr)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 44
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Dollars per hour avoided by semantic-cache hits, by model. Priced from the cached response's own usage block using the same cost table as spent cost, so saved and spent reconcile. A hit whose stored response carries no usage block still counts as a hit and contributes zero dollars, so this reads lower than the hit rate implies and is a floor on the saving, not the saving. The family names its tenant label tenant rather than tenant_id, so this panel joins the Tenant dropdown through that label; it carries no api_key_id at all, so a saving cannot be credited to a credential and the Credential dropdown does not apply. If this drops to zero while the cache hit rate holds, the cached entries stopped carrying usage blocks. The red not reported series sits at 1 when no priced cache hit has been recorded for the selected tenants. Runbook: docs/operator-runbook.md.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "not reported"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              },
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (model) (rate(sbproxy_ai_cost_saved_micros_total{tenant=~\"$tenant\"}[5m]))*3600/1000000",
+          "legendFormat": "{{model}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "absent(sbproxy_ai_cost_saved_micros_total{tenant=~\"$tenant\"})",
+          "legendFormat": "not reported",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ]
     }
   ],
   "templating": {
