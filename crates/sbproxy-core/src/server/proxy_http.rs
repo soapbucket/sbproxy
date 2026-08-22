@@ -9568,7 +9568,10 @@ origins:
             "no header describes nothing, so nothing is lost by dropping it"
         );
 
-        headers.insert("grpc-encoding", http::HeaderValue::from_static(" IDENTITY "));
+        headers.insert(
+            "grpc-encoding",
+            http::HeaderValue::from_static(" IDENTITY "),
+        );
         assert!(
             grpc_web_may_drop_grpc_encoding(&headers),
             "identity is case-insensitive and may be padded"

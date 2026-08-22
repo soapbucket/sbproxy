@@ -11,10 +11,10 @@
 pub const FRAME_HEADER_LEN: usize = 5;
 
 /// Compression flag for an uncompressed gRPC frame.
-pub const FLAG_UNCOMPRESSED: u8 = 0x00;
+pub(crate) const FLAG_UNCOMPRESSED: u8 = 0x00;
 
 /// Compression flag for a compressed gRPC frame.
-pub const FLAG_COMPRESSED: u8 = 0x01;
+pub(crate) const FLAG_COMPRESSED: u8 = 0x01;
 
 /// Wrap a serialized protobuf payload in a single uncompressed gRPC
 /// length-prefixed frame.
