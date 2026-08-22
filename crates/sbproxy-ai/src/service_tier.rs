@@ -103,7 +103,7 @@ pub struct CatalogServiceTiers {
 impl CatalogServiceTiers {
     /// The vendor's wire value for one canonical tier, if it sells it.
     #[must_use]
-    pub fn wire_value(&self, tier: ServiceTier) -> Option<&str> {
+    pub(crate) fn wire_value(&self, tier: ServiceTier) -> Option<&str> {
         match tier {
             ServiceTier::Flex => self.flex.as_deref(),
             ServiceTier::Standard => self.standard.as_deref(),
@@ -131,7 +131,7 @@ impl CatalogServiceTiers {
 /// gateway sends no tier field for it and refuses any entry that asks for
 /// one.
 #[must_use]
-pub fn provider_tier_vocabulary(provider: &ProviderConfig) -> Option<CatalogServiceTiers> {
+pub(crate) fn provider_tier_vocabulary(provider: &ProviderConfig) -> Option<CatalogServiceTiers> {
     get_provider_info(provider.effective_provider_type())
         .and_then(|info| info.service_tiers.clone())
 }
@@ -191,34 +191,6 @@ pub fn validate_provider_tier(provider: &ProviderConfig) -> Result<(), String> {
     ))
 }
 
-/// Names of the enabled providers that cannot serve `tier`, in config
-/// declaration order.
-#[must_use]
-pub fn tier_excluded_provider_names(
-    tier: ServiceTier,
-    providers: &[ProviderConfig],
-) -> Vec<String> {
-    providers
-        .iter()
-        .filter(|provider| provider.enabled)
-        .filter(|provider| {
-            provider_tier_vocabulary(provider)
-                .is_none_or(|vocabulary| vocabulary.wire_value(tier).is_none())
-        })
-        .map(|provider| provider.name.to_string())
-        .collect()
-}
-
-/// The fail-closed refusal body: names the tier and the providers it
-/// excluded, bounded the same way the posture refusal is.
-#[must_use]
-pub fn service_tier_refusal_message(tier: ServiceTier, excluded: &[String]) -> String {
-    format!(
-        "no eligible provider for service tier {tier}; excluded by tier: {}",
-        crate::data_posture::bounded_exclusion_list(excluded)
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,18 +239,5 @@ mod tests {
         let entry = provider("oai", "openai", None);
         validate_provider_tier(&entry).expect("no tier is always valid");
         assert_eq!(resolved_wire_tier(&entry), None);
-    }
-
-    #[test]
-    fn the_refusal_names_the_tier_and_the_excluded_providers() {
-        let providers = vec![
-            provider("claude", "anthropic", None),
-            provider("oai", "openai", None),
-        ];
-        let excluded = tier_excluded_provider_names(ServiceTier::Priority, &providers);
-        assert_eq!(excluded, vec!["claude".to_string()]);
-        let message = service_tier_refusal_message(ServiceTier::Priority, &excluded);
-        assert!(message.contains("priority"), "{message}");
-        assert!(message.contains("claude"), "{message}");
     }
 }

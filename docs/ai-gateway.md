@@ -737,6 +737,16 @@ are declared in the shipped catalog. To add one, override the catalog with
 `proxy.ai_providers_file` and give the vendor a `service_tiers` block naming
 the request field and its wire value for each tier you use.
 
+`sbproxy_ai_service_tier_decisions_total{disposition}` counts every attempt
+whose tier the gateway decided, so a caller quietly losing the tier they asked
+for is visible rather than silent. `caller_tier_replaced` overwrote a
+caller-supplied tier, `caller_tier_stripped` removed one from an entry that
+declares no tier, and `operator_tier_applied` wrote the entry's tier onto a
+request that asked for none. Nothing is counted when the caller sent no tier
+and the entry declares none, so an untiered deployment reads flat zero here
+instead of tracking its whole request rate. It counts attempts rather than
+requests, because two entries in one failover chain can carry two tiers.
+
 ## Routing policy
 
 The strategies above are a fixed menu. `ai_routing_policy` lets you write

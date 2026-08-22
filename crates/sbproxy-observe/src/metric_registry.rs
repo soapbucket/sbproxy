@@ -1017,6 +1017,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_ai_service_tier_decisions_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_service_tier_decision"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["disposition"],
+        description: "Upstream attempts whose service tier the operator's provider entry decided.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_ai_quota_pool_fail_open_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_quota_pool_fail_open"),

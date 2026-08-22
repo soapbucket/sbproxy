@@ -1530,8 +1530,10 @@ impl Router {
     /// pick, never a pin. `None` leaves the strategy's ordering untouched.
     ///
     /// Every call records exactly one
-    /// `sbproxy_ai_cache_affinity_decisions_total` outcome, so the counter
-    /// totals the requests that carried a cache key.
+    /// `sbproxy_ai_cache_affinity_decisions_total` outcome. The dispatcher
+    /// records `missing_signal` on the requests that never reach here for
+    /// want of a cache key, so the five outcomes together total the requests
+    /// an affinity-enabled origin evaluated.
     pub fn select_cache_affinity(
         &self,
         providers: &[ProviderConfig],

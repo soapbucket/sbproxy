@@ -126,10 +126,10 @@ pub enum PrefixAffinityConfigError {
 }
 
 /// Default cache-affinity lease lifetime of five minutes.
-pub const DEFAULT_CACHE_AFFINITY_TTL_SECS: u64 = 300;
+pub(crate) const DEFAULT_CACHE_AFFINITY_TTL_SECS: u64 = 300;
 
 /// Default maximum number of remembered leases for each provider.
-pub const DEFAULT_MAX_CACHE_KEYS_PER_PROVIDER: usize = 1_024;
+pub(crate) const DEFAULT_MAX_CACHE_KEYS_PER_PROVIDER: usize = 1_024;
 
 /// Domain separator for the caller-scoped prompt-cache lease identity.
 const CACHE_AFFINITY_KEY_DOMAIN: &[u8] = b"sbproxy.cache-affinity.v1";

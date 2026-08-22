@@ -311,6 +311,18 @@ static AI_CACHE_AFFINITY_EVICTIONS: LazyLock<CounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Requests whose upstream service tier the operator's entry decided.
+static AI_SERVICE_TIER_DECISIONS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_service_tier_decisions_total",
+            "Upstream attempts whose service tier the operator's provider entry decided"
+        ),
+        &["disposition"]
+    )
+    .unwrap()
+});
+
 /// Semantic-route selections by closed decision outcome (WOR-2564).
 /// `matched` pinned a deployment; every other outcome is a fallback
 /// disposition, mirrored on `sbproxy_ai_routing_fallbacks_total`.
@@ -1204,6 +1216,32 @@ pub fn record_cache_affinity_eviction(reason: &str) {
     };
     AI_CACHE_AFFINITY_EVICTIONS
         .with_label_values(&[reason])
+        .inc();
+}
+
+/// Record that the operator's provider entry decided one attempt's upstream
+/// service tier.
+///
+/// Counted once per upstream attempt, not once per request, because the
+/// decision is per destination: two entries in a failover chain can carry
+/// two different tiers.
+///
+/// Nothing is recorded for the ordinary case where the caller sent no tier
+/// and the entry declares none, so an untiered deployment keeps a flat zero
+/// here rather than a counter that tracks its whole request rate.
+///
+/// `caller_tier_replaced` overwrote a caller-supplied tier with the entry's.
+/// `caller_tier_stripped` removed a caller-supplied tier from an entry that
+/// declares none, so the vendor serves on its own default.
+/// `operator_tier_applied` wrote the entry's tier onto a request that asked
+/// for none.
+pub fn record_service_tier_decision(disposition: &str) {
+    let disposition = match disposition {
+        "caller_tier_replaced" | "caller_tier_stripped" | "operator_tier_applied" => disposition,
+        _ => "unknown",
+    };
+    AI_SERVICE_TIER_DECISIONS
+        .with_label_values(&[disposition])
         .inc();
 }
 

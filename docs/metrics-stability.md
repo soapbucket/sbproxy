@@ -128,6 +128,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_ai_prefix_affinity_evictions_total` | Counter | `stable` | `beta` | `reason` | Entries evicted from the bounded prefix-affinity table. |
 | `sbproxy_ai_cache_affinity_decisions_total` | Counter | `stable` | `beta` | `outcome` | Caller-keyed prompt-cache affinity selections by lease outcome. |
 | `sbproxy_ai_cache_affinity_evictions_total` | Counter | `stable` | `beta` | `reason` | Leases removed from the bounded prompt-cache affinity table. |
+| `sbproxy_ai_service_tier_decisions_total` | Counter | `stable` | `beta` | `disposition` | Upstream attempts whose service tier the operator's provider entry decided. |
 | `sbproxy_ai_quota_pool_fail_open_total` | Counter | `stable` | `beta` | `pool` | Quota-pool admissions allowed while the shared backend was unavailable. |
 | `sbproxy_ai_quota_pool_overshare_total` | Counter | `stable` | `beta` | `pool` | Soft quota-pool admissions beyond a member entitlement. |
 | `sbproxy_ai_routing_fallbacks_total` | Counter | `stable` | `beta` | `strategy`, `reason` | AI routing selections that used an explicit fallback path. |
