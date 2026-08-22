@@ -4361,8 +4361,12 @@ fn legacy_serialized_tools_for_catalog(catalog: &ToolCatalogState) -> Arc<Serial
 }
 
 /// Build the frozen legacy catalogue before its enclosing state is
-/// published. Its field order and per-entry projection intentionally
-/// stay identical to the pre-lossless serializer.
+/// published. Its per-entry projection (which fields appear at all)
+/// intentionally stays identical to the pre-lossless serializer. Key
+/// order within each entry follows `serde_json::Map`'s representation
+/// (insertion order under the workspace-wide `preserve_order`
+/// feature), which is not this function's own contract to keep
+/// stable; see [`legacy_serialized_tool_entry`].
 fn build_legacy_serialized_tools(
     registry: &HashMap<String, FederatedTool>,
     generation: u64,
@@ -4414,10 +4418,15 @@ fn serialized_tool_array(entries: &[SerializedToolEntry]) -> String {
 
 /// Frozen legacy `tools/list` projection for one federated tool.
 ///
-/// Keep this byte-for-byte equivalent to the pre-lossless serializer:
+/// Keep the field set equivalent to the pre-lossless serializer:
 /// clients on the 2025-06-18 wire see only name, description,
 /// inputSchema, and optional `_meta`, even when the internal modern
-/// contract carries additional fields.
+/// contract carries additional fields. Key order comes from
+/// `serde_json::Map`'s representation for the whole workspace
+/// (`preserve_order` is on because `cedar-policy-core` requires it
+/// for its own deterministic entity serialization); it is insertion
+/// order here, not alphabetical, and is not independently
+/// configurable per call site.
 fn legacy_serialized_tool_entry(tool: &FederatedTool) -> SerializedToolEntry {
     let mut obj = serde_json::json!({
         "name": tool.name,
@@ -5140,12 +5149,12 @@ mod tests {
         let legacy = federation.serialized_tools();
         assert_eq!(
             legacy.full_array,
-            "[{\"description\":\"Legacy missing schema\",\"inputSchema\":{\"properties\":{},\"type\":\"object\"},\"name\":\"missing_input\"}]"
+            "[{\"name\":\"missing_input\",\"description\":\"Legacy missing schema\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]"
         );
         assert_eq!(
             serde_json::to_string(&crate::mcp::compat::contract_of(&tool))
                 .expect("legacy compatibility JSON"),
-            "{\"description\":\"Legacy missing schema\",\"inputSchema\":{\"properties\":{},\"type\":\"object\"},\"name\":\"missing_input\"}"
+            "{\"name\":\"missing_input\",\"description\":\"Legacy missing schema\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}"
         );
         let codemode = federation.codemode_ts("https://gateway.example");
         assert!(codemode.contains("export interface MissingInputInput"));
@@ -5176,12 +5185,12 @@ mod tests {
         let legacy = federation.serialized_tools();
         assert_eq!(
             legacy.full_array,
-            "[{\"description\":\"Legacy scalar schema\",\"inputSchema\":\"opaque-schema\",\"name\":\"scalar_input\"}]"
+            "[{\"name\":\"scalar_input\",\"description\":\"Legacy scalar schema\",\"inputSchema\":\"opaque-schema\"}]"
         );
         assert_eq!(
             serde_json::to_string(&crate::mcp::compat::contract_of(&tool))
                 .expect("legacy compatibility JSON"),
-            "{\"description\":\"Legacy scalar schema\",\"inputSchema\":\"opaque-schema\",\"name\":\"scalar_input\"}"
+            "{\"name\":\"scalar_input\",\"description\":\"Legacy scalar schema\",\"inputSchema\":\"opaque-schema\"}"
         );
         let codemode = federation.codemode_ts("https://gateway.example");
         assert!(codemode.contains("export interface ScalarInputInput"));
@@ -5250,7 +5259,7 @@ mod tests {
         let legacy = federation.serialized_tools();
         assert_eq!(
             legacy.full_array,
-            "[{\"description\":\"OpenAPI search\",\"inputSchema\":{\"properties\":{},\"type\":\"object\"},\"name\":\"search\"}]"
+            "[{\"name\":\"search\",\"description\":\"OpenAPI search\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]"
         );
         let modern: serde_json::Value =
             serde_json::from_str(&federation.serialized_modern_tools().full_array)
@@ -5494,7 +5503,7 @@ mod tests {
         assert!(tool.modern_contract.is_some());
         assert!(tool.modern_incompatibility.is_none());
 
-        const LEGACY_GOLDEN: &str = "[{\"_meta\":{\"openai/widget\":{\"templateId\":\"search-card\"}},\"description\":\"Search the indexed documents\",\"inputSchema\":{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"properties\":{\"query\":{\"type\":\"string\"}},\"required\":[\"query\"],\"type\":\"object\"},\"name\":\"alpha.search\"}]";
+        const LEGACY_GOLDEN: &str = "[{\"name\":\"alpha.search\",\"description\":\"Search the indexed documents\",\"inputSchema\":{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}},\"required\":[\"query\"]},\"_meta\":{\"openai/widget\":{\"templateId\":\"search-card\"}}}]";
         let legacy_entry = legacy_serialized_tool_entry(&tool);
         assert_eq!(format!("[{}]", legacy_entry.json), LEGACY_GOLDEN);
         assert!(!legacy_entry.json.contains("outputSchema"));

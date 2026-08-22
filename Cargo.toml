@@ -272,6 +272,11 @@ cel = { version = "0.13", features = ["regex", "chrono", "json"] }
 # `net` builtin assumes `arc`.
 regorus = "0.11"
 
+# Cedar policy engine: typed entity/schema/evaluator used for MCP
+# tool-call semantic governance. Apache-2.0 only; NOTICE carries the
+# attribution stanza.
+cedar-policy = "4"
+
 # Lua scripting
 mlua = { version = "0.11", features = ["luau", "serialize", "vendored", "error-send"] }
 

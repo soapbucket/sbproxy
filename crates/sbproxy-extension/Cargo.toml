@@ -24,6 +24,10 @@ sbproxy-observe.workspace = true
 cel.workspace = true
 regorus.workspace = true
 
+# Cedar policy engine (typed authorization policy language, used for
+# MCP tool-call semantic governance)
+cedar-policy.workspace = true
+
 # Lua scripting engine
 mlua.workspace = true
 
@@ -44,7 +48,14 @@ wasmtime-wasi.workspace = true
 
 # Serialization
 serde = { workspace = true }
-serde_json.workspace = true
+# `preserve_order` keeps `mcp::federation`'s `serde_json::json!(...)`
+# key order stable (insertion order, not alphabetical). Declared
+# explicitly here rather than relying on it arriving transitively
+# through another crate's `schemars` dependency: adding cedar-policy
+# pulls in its own `serde_json` feature edge, and depending on an
+# unrelated crate to keep this feature unified for a narrow `-p
+# sbproxy-extension` build is fragile.
+serde_json = { workspace = true, features = ["preserve_order"] }
 serde_yaml.workspace = true
 
 # Error handling
@@ -92,8 +103,9 @@ semver.workspace = true
 serde_json_canonicalizer.workspace = true
 async-trait.workspace = true
 
-# UUID
-uuid.workspace = true
+# UUID. The `serde` feature is needed by `cedar::schema::SchemaRefusalReport`,
+# which derives `Serialize` over a `Vec<(uuid::Uuid, Vec<String>)>`.
+uuid = { workspace = true, features = ["serde"] }
 
 # Time
 chrono.workspace = true
