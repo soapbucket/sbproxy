@@ -30,7 +30,35 @@ function refresh() {
   modelHost.run();
   clusterVram.run();
 }
-onMounted(refresh);
+
+const liveRps = ref(0);
+let rpsInterval: ReturnType<typeof setInterval> | null = null;
+let eventCount = 0;
+let source: EventSource | null = null;
+
+onMounted(() => {
+  refresh();
+  
+  // Real-time RPS counter using the existing SSE stream
+  source = new EventSource(api.requestsStreamUrl());
+  source.onmessage = () => {
+    eventCount++;
+  };
+  rpsInterval = setInterval(() => {
+    liveRps.value = eventCount;
+    eventCount = 0;
+  }, 1000);
+});
+
+import { onUnmounted } from "vue";
+onUnmounted(() => {
+  if (source) {
+    source.close();
+  }
+  if (rpsInterval) {
+    clearInterval(rpsInterval);
+  }
+});
 
 // Health components can arrive as an array or a map of name -> value.
 const healthComponents = computed<HealthComponent[]>(() => {
@@ -138,6 +166,7 @@ function optionalNumber(v: unknown): number | undefined {
     <ErrorState v-if="stats.error.value" :error="stats.error.value" @retry="stats.run" />
     <EmptyState v-else-if="!statTiles.length" message="No stats reported by /api/stats." />
     <div v-else class="grid">
+      <StatCard label="Live RPS" :value="liveRps" />
       <StatCard v-for="t in statTiles" :key="t.label" :label="t.label" :value="t.value" />
     </div>
   </section>

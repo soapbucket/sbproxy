@@ -4,7 +4,10 @@ import AppSidebar from "./components/AppSidebar.vue";
 import BrandMark from "./components/BrandMark.vue";
 import ToastHost from "./components/ToastHost.vue";
 import { useAuth } from "./composables/useAuth";
-import { api } from "./api";
+import { toast } from "./composables/useToasts";
+import { api, setWarningHandler } from "./api";
+
+setWarningHandler((msg) => toast.warn(msg));
 
 // WOR-1758: check the session on load, then gate the app on auth.
 const { authenticated, ready, refresh } = useAuth();

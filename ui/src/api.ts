@@ -26,6 +26,11 @@ export function setUnauthorizedHandler(handler: (() => void) | null): void {
   onUnauthorized = handler;
 }
 
+let onWarning: ((msg: string) => void) | null = null;
+export function setWarningHandler(handler: ((msg: string) => void) | null): void {
+  onWarning = handler;
+}
+
 /**
  * Paths that legitimately answer 401 without meaning "your session died":
  * the login attempt itself, and the session probe used to discover that
@@ -211,6 +216,10 @@ async function request(
     res = await fetch(path, init);
   } catch (e) {
     throw new ApiError(0, `Network error contacting ${path}`, String(e));
+  }
+  const warning = res.headers.get("Warning") || res.headers.get("X-Warning") || res.headers.get("X-SB-Warning");
+  if (warning) {
+    onWarning?.(warning);
   }
   if (!res.ok) {
     let text = "";
