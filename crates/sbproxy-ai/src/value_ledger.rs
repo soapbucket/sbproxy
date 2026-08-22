@@ -528,6 +528,12 @@ impl ValueLedger {
 }
 
 fn open_redb_backend(path: &Path) -> anyhow::Result<(Database, PathBuf, BTreeSet<String>)> {
+    // redb calls `File::create` itself, so the ledger of what every tenant
+    // spent landed at whatever the umask allowed, normally `0o644`. Creating
+    // it owner-only first is enough: redb opens an existing file rather than
+    // replacing it.
+    sbproxy_util::secure_fs::ensure_file_owner_only(path)
+        .with_context(|| format!("create value ledger at {}", path.display()))?;
     let database = Database::create(path)
         .with_context(|| format!("open value ledger at {}", path.display()))?;
     // Ensure the table exists so a fresh open can be read immediately.

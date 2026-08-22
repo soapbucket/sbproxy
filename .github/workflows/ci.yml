@@ -442,6 +442,17 @@ jobs:
       - name: no process-global env mutation outside test helpers
         run: bash scripts/check-env-mutation.sh
 
+      # Durable sinks create their files owner-only, through
+      # sbproxy-util's secure_fs rather than std directly (WOR-2626).
+      # Pure grep plus its own fixtures. The structural half is the
+      # only thing that can prove the mode goes into the open(2) call
+      # rather than a chmod after it: a runtime test stats the file
+      # afterwards and sees 0o600 either way, so it cannot see the
+      # window a create-then-chmod leaves open. Shares one script with
+      # scripts/check.sh.
+      - name: durable sinks create files owner-only (WOR-2626)
+        run: bash scripts/check-durable-file-modes.sh
+
       # Apache 2.0 section 4(d): every Apache-2.0-only crate must be
       # named in NOTICE. Shares one script with scripts/check.sh.
       # cargo metadata does not compile and does not change this job's

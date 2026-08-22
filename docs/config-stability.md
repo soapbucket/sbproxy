@@ -254,6 +254,7 @@ see that case, because the key is read.
 |---|---|---|
 | `audit.sink: tracing` | It never selected anything. Emission to the `config_audit`, `security_audit`, and `key_audit` targets has always been unconditional, so `tracing` and `memory` described the same proxy. | `memory` for the same behavior under an honest name, or `chain` with a `path` and a `sign_with` for a hash-chained, signed trail that survives a restart. |
 | `audit.path`, `audit.sign_with` under any sink but `chain` | Nothing would write to the file or sign anything. A path nothing writes to is the more dangerous of the two shapes, because it looks configured. | Set `sink: chain`, or remove the key. |
+| `attestation.role: claim` and `attestation.role: both`, proxy-wide or on an origin | Both promise the claim half of attestation and this build does not implement it. No claim is written before a call is served, nothing ever reads `proxy.attestation.queue`, and no ceiling is computed for `proxy.attestation.enforcement_mode` to act on, so a config declaring either role compiled clean and served traffic producing neither a claim nor a receipt. That is worse than not offering the role: the operator believes their spend is bounded. Both spellings stay in the vocabulary so the refusal can name the missing half instead of reporting an unknown value. | `receipt`, which is the half that works: a receipt is written after the call is served and carries the settled cost. Leave `off` if you want neither. |
 
 #### Rego base data that collides with a rule (upgrade-affecting)
 
@@ -385,6 +386,86 @@ OpenAPI tool calls, never its token endpoint.
 
 **What to do before upgrading.** Add every MCP token endpoint host to
 `egress.token_exchange.hosts` alongside the non-MCP ones already there.
+
+### Durable sink files are created `0o600` and existing ones are tightened
+
+**Who this reaches.** Any config that names a path for a durable sink, and any
+process outside the proxy that reads one of those files. The paths are
+`meter.ledger.path` (and the audit chains built on it), `payments.state_path`,
+`session_ledger.path`, `request_events.path`, and the AI gateway's
+`usage.sink: jsonl_file` path. A deployment where only the proxy user ever
+opens these files is unaffected in practice, though the mode on disk still
+changes.
+
+**What changes.** Every one of those files used to be opened with a plain
+create-and-append, which asks the kernel for `0o666` and lets the process umask
+subtract from it. On a host with the near-universal `0o022` they were all
+`0o644`. They now carry `0o600`, requested in the open itself so the file never
+exists at a wider mode, and reasserted afterwards so a file left behind by an
+older build at `0o644` is tightened on the first open rather than inherited.
+Directories the proxy creates for its own state, today only the parent of
+`payments.state_path`, are created `0o700`.
+
+Two things are deliberately left alone. A directory that already exists keeps
+the mode it has, because a sink path may sit under a `/var/log` the operator
+shares on purpose, and narrowing that would be a much larger change than
+hardening one file. A path that resolves to something other than a regular file
+(`/dev/stdout`, a fifo drained by a shipper, a device) is written to exactly as
+before with no mode applied, since its permissions are the operator's and not
+the proxy's.
+
+**What an operator sees when it bites.** Nothing inside the proxy: it reads and
+writes its own files as before. What breaks is outside it. A log shipper, a
+backup job, or a metrics scraper running as a different user starts getting
+`EACCES` on the first open after the upgrade, and keeps getting it, because the
+tightening is applied every time the sink opens the file. If the proxy itself
+cannot tighten a file, because another account owns it, the sink refuses to
+start rather than appending to a file other accounts can read: the session
+ledger and request event sinks warn and fall back to the logging sink, and the
+usage ledger and settlement store fail startup with the path in the message.
+
+**What to do before upgrading.** List every process that reads a sink file and
+decide, per reader, which of these applies: run it as the proxy's user; give it
+access explicitly at deployment time rather than through world-readable modes;
+or point the sink at a fifo or `/dev/stdout` it already drains, which this
+change does not touch. On Windows there are no POSIX permission bits, so files
+and directories keep inheriting the containing directory's ACL and nothing
+about this changes.
+
+### Bedrock's catalog data posture is now `retains_data: true`
+
+**Who this reaches.** Any action carrying
+`data_posture: {allow_data_collection: false}` that can route to a
+`bedrock`-typed provider entry with no operator posture override on it. A
+config that leaves `allow_data_collection` at its default `true`, or that
+sets `data_posture.retains_data: false` on the provider entry, is unaffected.
+`require_zdr: true` is also unaffected: Bedrock still declares
+`zdr_available: true`, because eligible customers can arrange full zero data
+retention through their AWS account team.
+
+**What changes.** Nothing in the request path changed. The catalog's claim
+about the vendor did. AWS's platform default is still zero retention, but its
+abuse-detection page carves out named models: classifier-flagged traffic to
+the OpenAI GPT-5.x family on Bedrock is retained up to thirty days with no
+opt-in. The model name passes straight through from the caller, so a stock
+account reaches a retention window without ever asking for one. A catalog
+entry that says `retains_data: false` promises the whole surface is
+non-retaining, and for that account it is not, so the entry now says `true`
+and the control closes rather than reading as a guarantee it cannot make.
+
+**What an operator sees when it bites.** Bedrock drops out of the eligible
+set for that action. If it was the only eligible provider, the call is
+refused rather than routed to a retaining endpoint, which is the direction
+this control is supposed to fail in.
+
+**What to do before upgrading.** Check
+[`GET /admin/ai-data-posture`](admin-api-reference.md#get-adminai-data-posture)
+for your Bedrock entry's `effective.retains_data`, and its `excluded_providers`
+for whether the entry has already dropped out. If your account has a ZDR
+arrangement with AWS, or you route Bedrock only to models outside the
+carve-out, declare it on the entry with `data_posture: {retains_data: false}`
+and the previous behavior returns. That declaration is the operator saying
+something about their own account that the catalog cannot know.
 
 ---
 
@@ -594,6 +675,30 @@ codings the caller accepts. Two consequences for an existing config:
 | `set` | - | object | `{}` | **stable** |
 | `add` | - | object | `{}` | **stable** |
 | `remove` | `delete` | array | `[]` | **stable** |
+
+### `providers[].aws_sigv4` - AWS SigV4 request signing
+
+| Field | Type | Default | Stability | Notes |
+|---|---|---|---|---|
+| `region` | string | required | **beta** | Credential scope. Independent of `base_url`; never inferred from the endpoint host. |
+| `service` | string | from `provider_type` | **beta** | Signing service name. Defaults to `bedrock` / `sagemaker`. |
+| `refresh_margin_secs` | integer | 900 | **beta** | Refresh window before a short-lived credential expires. Minimum 600. |
+| `credentials.source` | string | `default_chain` | **beta** | `default_chain`, `static`, or `assume_role`. |
+| `credentials.access_key_id` | string | - | **beta** | Read by `static` only. |
+| `credentials.secret_access_key` | string | - | **beta** | Read by `static` only. Secret-resolving. |
+| `credentials.session_token` | string | - | **beta** | Read by `static` only. Secret-resolving. Not renewable by SBproxy. |
+| `credentials.role_arn` | string | - | **beta** | Read by `assume_role` only. |
+| `credentials.external_id` | string | - | **beta** | Read by `assume_role` only. Secret-resolving. |
+| `credentials.session_name` | string | `sbproxy` | **beta** | Read by `assume_role` only. |
+| `credentials.session_duration_secs` | integer | role default | **beta** | Read by `assume_role` only. |
+| `credentials.profile` | string | - | **beta** | Read by `default_chain` and by the `assume_role` base identity. |
+
+The whole block is **beta** for its first release. The shape that is least
+likely to move is `region` plus a credential source, and the part most likely
+to gain fields is `credentials`, where AWS keeps adding provider kinds. Every
+field a source does not read is refused rather than ignored, so a rename would
+surface as a config error rather than as a silently unsigned request.
+`api_key` and `aws_sigv4` on one provider entry are refused together.
 
 ### Body Modifier (request)
 

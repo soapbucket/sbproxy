@@ -1,6 +1,6 @@
 # 402 challenge contract
 
-*Last modified: 2026-08-09*
+*Last modified: 2026-08-21*
 
 The exact bytes SBproxy puts on the wire when a request has to be paid
 for, and the exact bytes it accepts back. This page is the wire reference.
@@ -329,13 +329,36 @@ The verify response is read for `isValid`, and optionally
 absent is a refusal, and settle is never prepared or sent.
 
 The settle response is read for `success`, and optionally `errorReason`,
-`payer`, `transaction`, `network`, `amount`, and `extensions`. Settlement
-counts only when `success` is `true`, `transaction` is non-empty,
-`network` equals the accepted requirement's network exactly, `amount`
-equals the accepted amount exactly whenever the response includes it, and
-the two responses' `payer` values agree whenever both are present.
-Anything else is ambiguous and goes to reconciliation rather than to the
-origin.
+`payer`, `transaction`, `network`, `amount`, and `extensions`, but only
+when the facilitator answered with a 2xx status. Settlement counts only
+when `success` is `true`, `transaction` is non-empty, `network` equals
+the accepted requirement's network exactly, `amount` equals the accepted
+amount exactly whenever the response includes it, and the two responses'
+`payer` values agree whenever both are present. Anything else is
+ambiguous and goes to reconciliation rather than to the origin.
+
+A settle has three outcomes, not two, and the status is what separates
+them:
+
+| What came back | How it is read |
+|---|---|
+| 2xx, `success: true`, terms agree | Settled. The origin is called |
+| 2xx, `success: false` | Refused. The facilitator said no funds moved, the intent goes `Terminal`, and the payer gets a 402 |
+| Anything outside 2xx, whatever the body says | Unknown. The intent goes `NeedsReconciliation` and the payer gets a 503 with `Retry-After` |
+| 2xx whose body does not parse, omits `success`, or fails a terms check | Unknown, the same way |
+
+The status is read before the body because the two mistakes are not
+equally expensive. x402 v2 at the pinned revision publishes no error
+response shape, and the facilitator root is a URL you configure that may
+sit behind a gateway, so a 500 or a 502 page can carry a `success` field
+of its own. Reading one as the facilitator's refusal would close the
+payment as definitively failed while the settlement may already have
+been broadcast: the money moves, the request is refused, and no sweep is
+left holding anything to ask about. A genuine refusal misread as unknown
+costs one row on the reconciliation queue instead.
+
+On the settle leg a 5xx is also counted against the facilitator's
+breaker, the same way a 5xx on verify is.
 
 On success the origin is called and the exact settle response is echoed
 back as `PAYMENT-RESPONSE`.

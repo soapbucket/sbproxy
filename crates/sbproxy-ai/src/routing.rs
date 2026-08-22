@@ -1718,6 +1718,7 @@ mod tests {
             no_prompt_training: false,
             data_posture: None,
             serve: None,
+            aws_sigv4: None,
         }
     }
 

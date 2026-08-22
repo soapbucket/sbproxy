@@ -19,19 +19,23 @@
 #     `tool_calls`, `stopReason` mapped to `finish_reason`, usage
 #     tokens renamed from inputTokens/outputTokens.
 #
-# Auth: Bedrock requires SigV4 request signing. The example below
-# uses a static `Authorization` header (typically a short-lived
-# session token from `aws sts get-session-token` or `aws-vault exec`);
-# wiring full SigV4 signing into the request path is tracked
-# separately. Operators with a sidecar that handles SigV4 can point
-# `default_base_url` at it instead.
+# Auth: Bedrock requires SigV4 request signing, and the `aws_sigv4:`
+# block below is what does it. `region` is the credential scope; it is
+# required, and it is independent of the endpoint, so pointing
+# `base_url` at a VPC endpoint would not change it. With `base_url`
+# unset, `region` fills the `{region}` placeholder in the provider
+# catalog's default URL. Credentials come from the standard AWS chain
+# here (environment, shared config files, EKS web identity, ECS task
+# role, EC2 instance profile); set `credentials.source: static` for an
+# access key pair or `assume_role` for an STS session sbproxy renews
+# before it expires. See docs/providers.md for both.
 #
 # Known limitation: streaming responses (`stream: true`) pass through
 # in Bedrock's native EventStream shape today. Use the non-streaming
 # form below to exercise the translator end to end.
 #
-# Setup:
-#   export BEDROCK_AUTH="Bearer ${AWS_SESSION_TOKEN}"
+# Setup (any credential the AWS SDKs would find works here):
+#   export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
 #   make run CONFIG=examples/ai-bedrock-direct/sb.yml
 #
 # Test (OpenAI-style request, Bedrock on the upstream):
@@ -58,14 +62,14 @@ origins:
       type: ai_proxy
       providers:
         - name: bedrock
-          api_key: ${BEDROCK_AUTH}
-          # The registry's default_base_url is the literal, unsubstituted
-          # `https://bedrock-runtime.{region}.amazonaws.com` (there is no
-          # `region:` field that fills it in), so every Bedrock provider
-          # must override `base_url` with a real region or every request
-          # fails at URL-parse time. Override AWS_REGION for a region
-          # other than us-east-1.
-          base_url: https://bedrock-runtime.${AWS_REGION:-us-east-1}.amazonaws.com
+          # No api_key: a signed provider computes its own Authorization
+          # header, and setting both is refused at config load. The
+          # region below fills the {region} placeholder in the catalog's
+          # default URL, so the dial goes to
+          # https://bedrock-runtime.us-east-1.amazonaws.com without a
+          # base_url override.
+          aws_sigv4:
+            region: ${AWS_REGION:-us-east-1}
           default_model: anthropic.claude-sonnet-4-5-20250929-v1:0
           models:
             - anthropic.claude-sonnet-4-5-20250929-v1:0

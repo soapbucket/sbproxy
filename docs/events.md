@@ -400,7 +400,16 @@ bus.subscribe(EventType::BudgetExceeded, Box::new(|event: &ProxyEvent| {
 }));
 ```
 
-Handlers run on the publisher's thread, so a slow or panicking handler stalls whatever emitted the event. Keep the body short. The `events:` sinks do not go through this bus and are not affected by a handler registered on it.
+Handlers run on the publisher's thread, in registration order, so a slow handler stalls whatever emitted the event. Keep the body short. The `events:` sinks do not go through this bus and are not affected by a handler registered on it.
+
+The set a `publish` fans out to is the subscribers registered when that `publish` started, and the handler map is unlocked before the first handler runs. Four consequences are worth knowing before you write a handler:
+
+- **A slow handler delays its own publisher and nobody else.** Other threads keep publishing, subscribing, and counting subscribers while it runs.
+- **A handler may call back into the bus.** `publish`, `subscribe`, and `subscriber_count` all return when called from inside a handler instead of waiting on a lock the handler's own caller is holding.
+- **A handler that subscribes is delivered to from the next publish**, never the one in flight, because that fan-out already took its snapshot.
+- **Nested publishes on one thread stop at eight.** Past the cap the event is dropped and a `warn` names its type, so two handlers that publish each other's event type end in a dropped event rather than a stack overflow.
+
+A panicking handler unwinds through `publish` and the handlers registered after it do not run for that event. The bus stays usable: the next publish reads the same subscriber list and runs it from the start.
 
 ## See also
 

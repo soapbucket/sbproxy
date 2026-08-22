@@ -56,7 +56,9 @@ proxy:
 
   attestation:
     # This proxy records what calls actually consumed, after serving
-    # them. `claim` asserts cost before the call; `both` does both.
+    # them. `receipt` is the only role this build implements: `claim`
+    # and `both` are refused at config load, because nothing here
+    # writes a pre-call claim.
     role: receipt
 
     # What happens when metering itself breaks (full ledger disk,
@@ -65,14 +67,19 @@ proxy:
     failure_mode: degraded
 
     # What happens when attestation reaches a "refuse" verdict.
-    # `observe` records the verdict without acting on it.
+    # `observe` records the verdict without acting on it. Nothing
+    # reaches a verdict yet: the ceiling that produces one belongs to
+    # the claim half, so this key records a posture and no more.
     enforcement_mode: block
 
     # Receipts sign with the identity above; the ledger chain signs
     # with the same key, so a buyer fetches one key set for both.
     sign_with: proxy.web_bot_auth
 
-    # Claims wait here between "call started" and "call settled".
+    # Where claims would wait between "call started" and "call
+    # settled". Required whenever a role is declared, and written by
+    # nothing in this build; the path is validated and no directory is
+    # created for it.
     queue:
       path: '/tmp/sbproxy-metering/claims'
 
