@@ -557,3 +557,34 @@ them). None of this is scaffolding nothing calls: it is the exact shape
 `sbproxy-storage::RedisStore` and `sbproxy-plugin`'s traits already take
 elsewhere in this workspace, a wider surface than any single in-tree caller
 exercises because the caller is meant to live outside the tree.
+
+2026-08-22 (WOR-2663): unreferenced bucket 1452 -> 1458, tests-only bucket
+unchanged at 295. `sbproxy-federation` is a whole-crate port of a
+previously-shipped, already-proven OpenID Federation 1.0 implementation (11
+files, ~4.3k lines). The scanner first flagged a seventh item,
+`EntityStatementClaims::is_self_signed`, whose only cross-file consumer was a
+test; that one was wired to a real production call site in this same PR
+(`TrustChainResolver::resolve` and `compose_trust_chain` now call it instead
+of duplicating its `iss == sub` check inline) rather than justified here,
+which is why the tests-only bucket does not move. The six behind this bump:
+`jwk::FederationKeySet::find_by_kid` is the public lookup-by-kid step
+`decoding_key_for` composes above, kept public because a consumer resolving
+its own key material without a full JWS decode is a real use OIDF's
+`kid`-first key model expects. `TrustChainResolver::metadata_policies`
+returns the anchor-to-leaf iterator this crate's own
+`apply_block_policy`/`compose_policies` operators are shaped to consume once
+a caller drives the composition across a resolved chain; that driver is not
+built in this PR, matching how the metadata-policy stage of the original
+enterprise crate shipped one PR ahead of its first caller. Similarly,
+`EntityConfigurationDocument::remaining_lifetime` is the raw-`Duration`
+sibling of `cache_max_age_secs` (which the well-known route does call
+cross-file); a consumer that wants the `Duration` instead of the wire-form
+seconds integer reaches for this one directly. The four `metrics.rs` statics
+(`ENTITY_STATEMENT_VERIFICATIONS_TOTAL`, `TRUST_MARK_VERIFICATIONS_TOTAL`,
+`TRUST_CHAIN_RESOLUTIONS_TOTAL`, `WELL_KNOWN_SERVES_TOTAL`) are the same
+shape WOR-2662 already justified above for `DPOP_PROOFS_TOTAL` and
+`SESSIONS_ACTIVE`: consumed by name only from this same file's `record_*`
+helpers and its own test, live counters `docs/federation.md` and the shipped
+Grafana dashboard both name. The fifth static,
+`WELL_KNOWN_CACHE_REMAINING_SECONDS`, is set directly from `http_route.rs`
+and so is already outside either bucket.

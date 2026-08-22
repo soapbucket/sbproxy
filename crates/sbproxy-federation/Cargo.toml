@@ -1,0 +1,63 @@
+[package]
+name = "sbproxy-federation"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "OpenID Federation 1.0: entity statements, JWS sign/verify, RFC 7638 key thumbprints, a well-known issuer, and a trust-chain resolver."
+
+[lib]
+name = "sbproxy_federation"
+path = "src/lib.rs"
+
+[dependencies]
+# JWS sign + verify for entity statements and trust marks. The OIDF
+# spec mandates JWS Compact Serialization with a mandatory `typ`
+# header per document kind; `jsonwebtoken` is the workspace standard.
+jsonwebtoken = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+base64 = { workspace = true }
+# SHA-256 for the RFC 7638 JWK thumbprint helper, used to derive
+# `kid` values when an operator does not pre-assign one.
+sha2 = { workspace = true }
+tracing = { workspace = true }
+prometheus = { workspace = true }
+# Async trait for the federation fetcher (so a consumer can swap
+# reqwest for a different transport in tests) plus its default
+# hardened reqwest impl for the trust-chain composer's HTTP walk.
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+http = { workspace = true }
+url = { workspace = true }
+# Hardened outbound client (WOR-170 timeout / redirect-cap /
+# connection-pool defaults) for the trust-chain composer's HTTP
+# fetches; federation endpoints are public per §9, so the looser
+# `default_outbound` policy applies rather than the token-bearing one.
+sbproxy-httpkit = { workspace = true }
+
+# Per-crate axum pin for the well-known + admin-status routes. Not
+# promoted to workspace.dependencies because sbproxy-mcp-gateway
+# already carries its own independent per-crate pin with its own
+# promotion note; duplicating the pin here keeps this crate's version
+# bump independent of that one until a shared need appears.
+axum = { version = "0.7", default-features = false, features = ["http1", "tokio", "matched-path", "json"] }
+
+[dev-dependencies]
+# Round-trip tests mint an ES256 keypair to exercise sign+verify
+# without a vendored PEM. `p256` is the workspace key-generation
+# primitive used elsewhere for the same purpose.
+p256 = { version = "0.13", features = ["pem", "pkcs8"] }
+rand = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
+tower = { version = "0.4", features = ["util"] }
+http-body-util = { workspace = true }
+# The runnable example installs a real subscriber (rather than the
+# print-a-note stub some other crates' examples use) so its decision
+# events are visible on stderr when you run it.
+tracing-subscriber = { workspace = true }
