@@ -32,6 +32,15 @@ promtool check rules \
   dashboards/prometheus/recording-rules.yml \
   dashboards/prometheus/alerts.yml
 
-promtool test rules deploy/alerts/tests/availability_slo_test.yml
+# Every test file, not a hardcoded list. This line named exactly one file
+# for as long as exactly one existed, which is the shape that quietly stops
+# covering the second one somebody adds.
+shopt -s nullglob
+tests=(deploy/alerts/tests/*_test.yml)
+if [ ${#tests[@]} -eq 0 ]; then
+  echo "no promtool unit tests found under deploy/alerts/tests/" >&2
+  exit 1
+fi
+promtool test rules "${tests[@]}"
 
-echo "prometheus rules validate and the availability SLO burns under a 5xx load"
+echo "prometheus rules validate and ${#tests[@]} rule unit test file(s) pass"

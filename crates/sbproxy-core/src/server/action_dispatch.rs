@@ -6472,10 +6472,38 @@ pub(super) async fn handle_mcp_action(
                                     // client must not follow redirects
                                     // on its own; `mint_token_exchange`
                                     // re-authorizes each hop instead.
-                                    let http = reqwest::Client::builder()
+                                    //
+                                    // Fail closed when that client will not
+                                    // build. This used to fall back to
+                                    // `reqwest::Client::new()`, which carries
+                                    // the default policy of following up to
+                                    // ten hops, so the fallback reinstated
+                                    // exactly the hole the line above closes
+                                    // and did it on the runs where something
+                                    // was already wrong. `GovernedEgress`
+                                    // refuses a dial it cannot pin for the
+                                    // same reason; an unmintable token is a
+                                    // failed tool call, not a reason to post
+                                    // the subject token somewhere unchecked.
+                                    let Ok(http) = reqwest::Client::builder()
                                         .redirect(reqwest::redirect::Policy::none())
                                         .build()
-                                        .unwrap_or_else(|_| reqwest::Client::new());
+                                    else {
+                                        let response = JsonRpcResponse::error(
+                                            request.id.clone(),
+                                            INTERNAL_ERROR,
+                                            "token exchange client unavailable",
+                                        );
+                                        return write_mcp_application_response(
+                                            session,
+                                            &response,
+                                            &request_id,
+                                            &rpc_method,
+                                            modern_server.as_ref(),
+                                            None,
+                                        )
+                                        .await;
+                                    };
                                     let token_exchange_egress = mcp_token_exchange_gate();
                                     let subject_token = session
                                         .req_header()

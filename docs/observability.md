@@ -301,7 +301,11 @@ The Wave 1 substrate adds five labels: `agent_id`, `agent_class`, `agent_vendor`
 | SLO-DR-RESTORE | DR | restore drill | succeed monthly | calendar | Page on missed |
 | SLO-CONFIG-RELOAD | Config | hot-reload success | 100% | 24h | Page |
 | SLO-BOT-AUTH-DIR | Bot Auth | directory freshness (TTL not exceeded) | 99.9% | 7d | Ticket |
+| SLO-CERT-STORE | Certs | configured certificate-store backend open (not degraded to in-memory) | 100% | continuous | Ticket |
 | SLO-CARD-BUDGET | Substrate | per-metric series count under cap | 100% | continuous | Log-only (CI gate) |
+| SLO-AI-ADMISSION | AI Gateway | requests admitted past the inbound shim (1 - pre-provider refusal share, per surface) | 95% | 15 min sustained | Ticket |
+| SLO-MESH-ADMISSION | Mesh | inbound peer connections admitted (the idle reclaim is not a refusal and is excluded) | 100% | 10 min sustained | Ticket |
+| SLO-STORAGE-OPS | Storage | storage backend operations returning no error | 99.9% | 10 min sustained | Ticket |
 
 PromQL recording rules pre-compute each SLI at 1m, 5m, 1h, 6h, and 24h windows. Burn-rate alerts use the multi-window pattern from the SRE workbook (5m AND 1h at 14.4x for page tier, 30m AND 6h at 6x, 1h AND 24h at 3x for ticket). The full rule set lives in `deploy/alerts/`. These are the rules to page on. The proxy also evaluates one availability burn rate in process, covered under [Alerts](#alerts), and it is a fallback for deployments with no scrape target rather than a second copy of the set above.
 
@@ -1396,6 +1400,16 @@ dashboards:
 ```
 
 Set `dashboards.enabled: false` to skip the ConfigMap when dashboards are managed out of band. Operators who run Grafana outside Helm can `kubectl create configmap` the JSON files from `deploy/dashboards/` directly with the `grafana_dashboard=1` label.
+
+The `dashboards/grafana/` tree ships the import-ready boards instead, listed
+with their uids in [`dashboards/README.md`](../dashboards/README.md). One of
+them covers a subsystem nothing in this directory reaches:
+`sbproxy-mesh-storage.json` charts mesh inbound connection admission and the
+storage backend the mesh persists into. Read its two header tiles before
+reading anything else on it. Both metric families are absent rather than zero
+on a deployment that does not run the mesh with its Redis backend, so an empty
+chart there is not the same claim as a flat zero, and the tiles are what tell
+the two apart.
 
 ## Alerts
 

@@ -3270,6 +3270,15 @@ impl ProxyHttp for SbProxy {
             let _ = upstream_request.insert_header("content-type".to_string(), "application/grpc");
             let _ = upstream_request.insert_header("te".to_string(), "trailers");
             upstream_request.remove_header("content-length");
+            // The proxy is the gRPC client on this hop and it decodes the
+            // response frame itself to produce JSON, so it has to say
+            // which message encodings it can read. It can read exactly
+            // one. Sending nothing leaves the upstream to guess, and a
+            // guess of `gzip` yields a frame the transcoder cannot decode
+            // at all; the inbound REST request's own `accept-encoding` is
+            // about the HTTP body downstream, not about gRPC message
+            // framing, so it must not leak into this decision either.
+            let _ = upstream_request.insert_header("grpc-accept-encoding".to_string(), "identity");
         }
 
         // WOR-819: gRPC-Web request -> native gRPC. The path and method
@@ -3285,6 +3294,14 @@ impl ProxyHttp for SbProxy {
             // X-Grpc-Web is a CORS preflight marker the upstream gRPC
             // server does not expect.
             upstream_request.remove_header("x-grpc-web");
+            // The bridge forwards response message frames byte for byte
+            // to a browser, and no gRPC-Web client implementation reads
+            // message-level compression, so a compressed frame is
+            // undeliverable however the proxy handles it. Overriding
+            // whatever the browser sent is the point: the negotiation
+            // that matters is between this proxy and the upstream, and
+            // this proxy will not re-frame a payload it cannot read.
+            let _ = upstream_request.insert_header("grpc-accept-encoding".to_string(), "identity");
         }
 
         // Prepend the proxy action's URL path to the upstream request path.
@@ -4240,6 +4257,13 @@ impl ProxyHttp for SbProxy {
         if ctx.transcode_active {
             let _ = upstream_response.insert_header("content-type".to_string(), "application/json");
             upstream_response.remove_header("content-length");
+            // Unconditional here, unlike the gRPC-Web block below: no
+            // gRPC frame reaches the client on this path at all, only the
+            // JSON the transcoder builds from it, so a header describing
+            // gRPC message framing would describe nothing the client
+            // holds. Whether the frame was actually compressed is decided
+            // per message by its flag byte, which `transcode_response`
+            // reads and refuses.
             upstream_response.remove_header("grpc-encoding");
             if let Some(status) = upstream_response
                 .headers
@@ -4259,6 +4283,34 @@ impl ProxyHttp for SbProxy {
                 sbproxy_observe::metrics::record_grpc_status(
                     sbproxy_observe::metrics::grpc_status_label(code_u32),
                 );
+                // A gRPC upstream answers a failed call with HTTP 200 and
+                // puts the real outcome in `grpc-status`; the status line
+                // carries the transport's health, not the call's. The
+                // body this filter is about to replace is the JSON error
+                // envelope, so forwarding the 200 tells a REST client its
+                // call succeeded and leaves the failure discoverable only
+                // by parsing the document. `transcode_response` already
+                // decides the HTTP status for that envelope; use the same
+                // mapping here so the status line and the body agree.
+                //
+                // This is the trailers-only shape (tonic and grpc-go emit
+                // it for a unary `Err`), which is the only shape fixable
+                // from a header filter. When the upstream sends response
+                // headers first and `grpc-status` in real trailers,
+                // pingora has already written the downstream header by
+                // the time `response_trailer_filter` runs, so that
+                // response keeps the upstream's 200 and only the body
+                // reports the error. docs/routing.md states the limit.
+                //
+                // An operator `status` response modifier still wins: it
+                // is applied further down this same filter.
+                //
+                // `grpc-status: 0` is left alone rather than forced to
+                // 200; `transcoded_http_status_override` owns that rule
+                // and is unit-tested for it.
+                if let Some(mapped) = transcoded_http_status_override(status) {
+                    apply_response_status_override(upstream_response, mapped, None);
+                }
             }
         }
 
@@ -4279,7 +4331,23 @@ impl ProxyHttp for SbProxy {
             let resp_ct = sbproxy_transport::grpc::GrpcWebBridge::response_content_type(&req_ct);
             let _ = upstream_response.insert_header("content-type".to_string(), resp_ct);
             upstream_response.remove_header("content-length");
-            upstream_response.remove_header("grpc-encoding");
+            // `grpc-encoding` describes the framing of message bytes this
+            // bridge forwards byte for byte, so it may only be dropped
+            // when it describes nothing. The request advertised
+            // `grpc-accept-encoding: identity`, so a compliant upstream
+            // sends no header or `identity` and this strips it exactly as
+            // before. An upstream that ignored the negotiation keeps its
+            // header, and the browser client rejects a body it cannot
+            // read instead of parsing compressed bytes as protobuf. A
+            // header claiming compression over frames whose flag byte is
+            // clear is the harmless direction of the same mismatch: the
+            // client reads the flag per message, as the spec requires.
+            // A header present but unreadable as text keeps the same
+            // treatment as one naming an algorithm: it is not proof of
+            // identity, so it is not dropped.
+            if grpc_web_may_drop_grpc_encoding(&upstream_response.headers) {
+                upstream_response.remove_header("grpc-encoding");
+            }
             if let Some(status) = upstream_response
                 .headers
                 .get("grpc-status")
@@ -4519,7 +4587,28 @@ impl ProxyHttp for SbProxy {
         }
 
         // --- On-status fallback: rewrite response if upstream status matches ---
-        {
+        //
+        // Skipped on the two translated gRPC paths, which own the
+        // response body outright. `response_body_filter` returns from its
+        // `transcode_active` / `grpc_web_active` branch before it reaches
+        // the `ctx.fallback_body` swap below, so a fallback that fired
+        // here would send the fallback's status and its `content-length`
+        // over a body that is still the translated one (or, on a
+        // trailers-only response, no body at all). A body that does not
+        // match its declared length desynchronizes a keep-alive
+        // connection, which is worse than not applying the fallback.
+        //
+        // The mismatch is not new, but its reach is. Until the
+        // gRPC-status-to-HTTP-status mapping above, only a genuine
+        // non-gRPC HTTP status from the upstream could land here on a
+        // translated origin, since a transcoded RPC carried the
+        // upstream's own 200 whatever its outcome. Mapping the status
+        // makes 503 and 429 ordinary values at this point, so the
+        // exclusion has to be explicit. `on_error` is untouched: it fires
+        // in `fail_to_proxy`, before any upstream response exists, so
+        // there is no translated body to conflict with.
+        // docs/routing.md states the limit.
+        if !ctx.transcode_active && !ctx.grpc_web_active {
             let upstream_status = upstream_response.status.as_u16();
             if let Some(origin_idx) = ctx.origin_idx {
                 let pipeline = ctx.pipeline.clone();
@@ -8727,6 +8816,51 @@ fn build_transcoded_json(ctx: &RequestContext, frame: &[u8]) -> Vec<u8> {
     }
 }
 
+/// The HTTP status a transcoded REST response should carry for a
+/// header-borne `grpc-status`, or `None` to leave the upstream's status
+/// line alone.
+///
+/// `Some` for every non-OK code, using the same `google.rpc.Code` table
+/// the JSON error envelope in the body already uses, so the status line
+/// and the body agree. `None` for OK: on a successful call the
+/// upstream's own status line already says 200 and the override would be
+/// a no-op, and where it would not be a no-op the response is malformed
+/// (a non-2xx status line carrying an OK gRPC status). Overwriting a
+/// real HTTP failure with a 200 is the one direction this must never
+/// move in, so OK never produces an override at all.
+fn transcoded_http_status_override(grpc_status: i32) -> Option<u16> {
+    let grpc = sbproxy_transport::grpc::GrpcStatus::from_code(grpc_status);
+    if grpc == sbproxy_transport::grpc::GrpcStatus::Ok {
+        return None;
+    }
+    Some(grpc.to_http_status())
+}
+
+/// Whether the gRPC-Web bridge may strip the upstream's `grpc-encoding`
+/// response header.
+///
+/// The bridge forwards message frames byte for byte, so the header
+/// describes bytes the browser still holds and may only be dropped when
+/// it describes nothing: absent, or naming `identity`. A value that
+/// names an algorithm, or one that is not readable as text and so proves
+/// nothing, is kept. A free function rather than an inline `match`
+/// because the inline form sat inside `ProxyHttp::response_filter`,
+/// where a unit test cannot reach it.
+///
+/// Every value is checked, not just the first. `grpc-encoding` is
+/// single-valued per the gRPC spec, but an upstream that sent it twice
+/// would otherwise have its second value decide nothing while the first
+/// one licensed the drop. An empty iterator is the absent case and
+/// returns true, which is the behavior wanted there anyway.
+fn grpc_web_may_drop_grpc_encoding(headers: &http::HeaderMap) -> bool {
+    headers.get_all("grpc-encoding").iter().all(|value| {
+        value
+            .to_str()
+            .map(|v| v.trim().eq_ignore_ascii_case("identity"))
+            .unwrap_or(false)
+    })
+}
+
 /// Apply a response modifier's `status` override to the outgoing header.
 ///
 /// The optional `reason` is the modifier's `status.text`. Pingora carries
@@ -9377,6 +9511,99 @@ origins:
 
         assert_eq!(response.status.as_u16(), 200);
         assert_eq!(response.get_reason_phrase(), Some("OK"));
+    }
+
+    #[test]
+    fn a_non_ok_grpc_status_maps_onto_the_http_status_line() {
+        // The four an operator is most likely to alert on, plus the
+        // out-of-range code a client is allowed to send: gRPC treats an
+        // unrecognized code as UNKNOWN, which is a 500 and not a 200.
+        assert_eq!(transcoded_http_status_override(5), Some(404), "NOT_FOUND");
+        assert_eq!(
+            transcoded_http_status_override(7),
+            Some(403),
+            "PERMISSION_DENIED"
+        );
+        assert_eq!(
+            transcoded_http_status_override(9),
+            Some(400),
+            "FAILED_PRECONDITION"
+        );
+        assert_eq!(
+            transcoded_http_status_override(14),
+            Some(503),
+            "UNAVAILABLE"
+        );
+        assert_eq!(
+            transcoded_http_status_override(99),
+            Some(500),
+            "an unrecognized code is UNKNOWN, not a success"
+        );
+    }
+
+    /// The safety half of the mapping, and the reason it returns an
+    /// `Option` rather than a `u16`. A response whose `grpc-status` is
+    /// OK must keep whatever status line the upstream sent: forcing 200
+    /// would turn a genuine HTTP failure carrying `grpc-status: 0` into
+    /// a success, which is the one direction this must never move in.
+    #[test]
+    fn an_ok_grpc_status_never_rewrites_the_http_status_line() {
+        assert_eq!(transcoded_http_status_override(0), None);
+
+        let mut response = pingora_http::ResponseHeader::build(502, None).expect("build header");
+        if let Some(mapped) = transcoded_http_status_override(0) {
+            apply_response_status_override(&mut response, mapped, None);
+        }
+        assert_eq!(
+            response.status.as_u16(),
+            502,
+            "an OK gRPC status must not overwrite an upstream HTTP failure"
+        );
+    }
+
+    #[test]
+    fn grpc_web_drops_grpc_encoding_only_when_it_proves_identity() {
+        let mut headers = http::HeaderMap::new();
+        assert!(
+            grpc_web_may_drop_grpc_encoding(&headers),
+            "no header describes nothing, so nothing is lost by dropping it"
+        );
+
+        headers.insert(
+            "grpc-encoding",
+            http::HeaderValue::from_static(" IDENTITY "),
+        );
+        assert!(
+            grpc_web_may_drop_grpc_encoding(&headers),
+            "identity is case-insensitive and may be padded"
+        );
+
+        let mut gzip = http::HeaderMap::new();
+        gzip.insert("grpc-encoding", http::HeaderValue::from_static("gzip"));
+        assert!(
+            !grpc_web_may_drop_grpc_encoding(&gzip),
+            "the bridge forwards the frames byte for byte, so the browser \
+             must keep the header that describes them"
+        );
+
+        // A value that is not readable as text proves nothing about the
+        // framing, so it gets the same treatment as one naming an
+        // algorithm. Dropping it would be the bridge asserting identity
+        // on the strength of bytes it could not read.
+        let mut opaque = http::HeaderMap::new();
+        opaque.insert(
+            "grpc-encoding",
+            http::HeaderValue::from_bytes(&[0xff, 0xfe]).expect("opaque header value"),
+        );
+        assert!(!grpc_web_may_drop_grpc_encoding(&opaque));
+
+        // Two values, the first of which reads as identity. Checking
+        // only `get("grpc-encoding")` would drop the header on the
+        // strength of the first and lose the second.
+        let mut two = http::HeaderMap::new();
+        two.append("grpc-encoding", http::HeaderValue::from_static("identity"));
+        two.append("grpc-encoding", http::HeaderValue::from_static("gzip"));
+        assert!(!grpc_web_may_drop_grpc_encoding(&two));
     }
 
     /// 299 has no canonical reason in the `http` crate, proving the

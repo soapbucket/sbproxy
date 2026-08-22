@@ -329,6 +329,12 @@ impl Transcoder {
     /// frame (may be empty on an error-only response), `grpc_status` is
     /// the integer from the `grpc-status` trailer, and `grpc_message` is
     /// the human-readable `grpc-message` trailer (if any).
+    ///
+    /// Message-level compression is not supported and is refused rather
+    /// than ignored: a frame whose compression flag is set returns an
+    /// error instead of being decoded as if it were plain protobuf. The
+    /// request side advertises `grpc-accept-encoding: identity`, so a
+    /// compliant upstream never produces one.
     pub fn transcode_response(
         &self,
         grpc_method: &str,
@@ -356,6 +362,28 @@ impl Transcoder {
         }
 
         let (parsed, _) = frame::decode_one(frame_bytes)?;
+        // The frame header's first byte is per-message and authoritative:
+        // a `grpc-encoding` response header only names the algorithm the
+        // upstream *may* use, and a compliant server can still send an
+        // individual frame uncompressed. So the flag, not the header, is
+        // what decides whether these bytes are protobuf.
+        //
+        // The proxy advertises `grpc-accept-encoding: identity` on every
+        // request it synthesizes for this path, so a compliant upstream
+        // never sets the flag and this arm never fires. It exists because
+        // the alternative is worse than a failed request: handing
+        // compressed bytes to `DynamicMessage::decode` usually produces a
+        // parse error attributed to the message schema, and for a payload
+        // whose compressed form happens to parse as valid protobuf it
+        // produces JSON with the wrong field values and no error at all.
+        // Refusing here keeps the failure at the layer that caused it.
+        if parsed.compressed {
+            anyhow::bail!(
+                "gRPC response frame is compressed, which this transcoder cannot decode; \
+                 the upstream compressed a response after the proxy advertised \
+                 `grpc-accept-encoding: identity`"
+            );
+        }
         let message = DynamicMessage::decode(output.clone(), parsed.payload.as_slice())
             .map_err(|e| anyhow::anyhow!("failed to decode gRPC response message: {e}"))?;
 
@@ -1516,6 +1544,36 @@ mod tests {
         assert_eq!(json["code"], 5);
         assert_eq!(json["status"], "NOT_FOUND");
         assert_eq!(json["message"], "missing");
+    }
+
+    #[test]
+    fn transcode_response_refuses_a_frame_marked_compressed() {
+        let set = echo_descriptor_set();
+        let t = Transcoder::from_descriptor_set(&set, &[echo_route()]).unwrap();
+        // The payload is deliberately still valid, uncompressed protobuf
+        // for `EchoResponse`. Only the frame's compression flag is
+        // flipped, which is the exact discrepancy the transcoder used to
+        // ignore: it read the payload straight through and answered 200
+        // with JSON the caller had no way to know was decoded under the
+        // wrong assumption. A test whose payload were real gzip would
+        // pass without the fix too, because gzip's magic bytes happen to
+        // fail the protobuf parse; this one only passes when the flag
+        // itself is read.
+        let mut frame_bytes = echo_response_frame(&set, "pong", 3);
+        assert_eq!(
+            frame_bytes[0],
+            frame::FLAG_UNCOMPRESSED,
+            "fixture must start uncompressed for the flip below to mean anything"
+        );
+        frame_bytes[0] = frame::FLAG_COMPRESSED;
+
+        let err = t
+            .transcode_response("sbproxy_test.Echo.Hello", &frame_bytes, 0, None)
+            .expect_err("a compressed frame must not decode as plain protobuf");
+        assert!(
+            err.to_string().contains("compressed"),
+            "the error must name compression as the cause, not the message schema: {err}"
+        );
     }
 
     #[test]

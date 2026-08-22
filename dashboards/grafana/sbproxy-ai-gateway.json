@@ -933,6 +933,233 @@
         }
       ],
       "description": "Fraction of each budget scope's tightest cap consumed; 1.0 is the hard cap, and the same fraction warn_at/downgrade_at compare against. Headroom is 1 - this value. The pre-exhaustion alert in dashboards/prometheus/alerts.yml fires at 0.9. Runbook: docs/operator-runbook.md#ai-gateway. When a scope crosses the orange line, its next stop is soft-landing downgrade and then a 402."
+    },
+    {
+      "id": 17,
+      "title": "Pre-provider Refusals by Reason",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 72
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "noValue": "No pre-provider refusal recorded since start",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "bars",
+            "pointSize": 5,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (rate(sbproxy_ai_admission_decisions_total{outcome=\"deny\"}[5m]))",
+          "legendFormat": "{{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Requests the AI gateway refused before it called any provider, split by the bounded reason code. Nothing above this row can show them: no provider was dialed, so there is no upstream latency, no token count, and no cost. The reason names the fix. tools_mcp_unsupported, store_unsupported, previous_response_id_unsupported and conversation_unsupported mean a client is asking for a provider feature this gateway governs, so change the client or route it elsewhere. prompt_reference_not_found, prompt_object_unresolved, prompt_object_unrenderable and prompt_render_failed mean a stored prompt is missing or will not render, so check the prompt layer. malformed_json, body_not_object, role_missing and role_unsupported mean a client is sending bodies the shim cannot read. This family is registered on first use, so an empty panel means no request has been refused since the process started, not a broken scrape. Runbook: docs/operator-runbook.md#rb-ai-admission."
+    },
+    {
+      "id": 18,
+      "title": "Pre-provider Refusal Share by Surface",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 72
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "noValue": "No pre-provider refusal recorded since start",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto",
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.01
+              },
+              {
+                "color": "red",
+                "value": 0.05
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (surface) (rate(sbproxy_ai_admission_decisions_total{outcome=\"deny\"}[5m])) / clamp_min(sum by (surface) (rate(sbproxy_ai_surface_requests_total[5m])), 0.000001)",
+          "legendFormat": "{{surface}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Fraction of the requests arriving on each AI surface that the gateway refused before dispatch. The two families share the surface label, so this is a join and not an estimate. A surface with no refusal produces no line at all rather than a zero, which is why an empty panel here is good news. Red is 5 percent, the point where SBPROXY-AI-ADMISSION-REFUSAL-SHARE files a ticket. These refusals answer 4xx, so the inbound availability SLO reads 1.0 the whole time they run and no error-rate panel moves. This is the panel that shows a client integration breaking against the gateway. When a surface climbs, read the reason breakdown to the left, then either fix the caller or enable the feature it is asking for. Runbook: docs/operator-runbook.md#rb-ai-admission."
+    },
+    {
+      "id": 19,
+      "title": "AI Requests Arrived, Dispatched, and Refused",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 80
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "noValue": "No AI requests in this window"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Refused before dispatch"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(sbproxy_ai_surface_requests_total[5m]))",
+          "legendFormat": "Arrived on an AI surface",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(sbproxy_ai_requests_attributed_total[5m]))",
+          "legendFormat": "Dispatched to a provider",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(sbproxy_ai_admission_decisions_total{outcome=\"deny\"}[5m]))",
+          "legendFormat": "Refused before dispatch",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Reconciles inbound AI traffic against provider traffic on one axis. Arrived counts every request classified onto an AI surface. Dispatched counts requests attributed to a provider. Refused counts requests denied before any provider was dialed. When Arrived holds steady and Dispatched drops, the missing requests should appear on Refused. If they do not, the loss is somewhere this funnel cannot see: the model allow and block gate, a virtual-key policy, a guardrail, a budget, a rate limiter, or a CEL or Rego policy each record on their own plane, and only five inbound refusal arms report here. Refused draws no line until the first refusal, because the family is registered on first use. Runbook: docs/operator-runbook.md#rb-ai-admission."
     }
   ],
   "templating": {

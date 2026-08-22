@@ -268,7 +268,7 @@ fn registry_slot() -> &'static ArcSwap<Registry> {
 /// the file cannot be read, the embedded gzipped catalog is used
 /// instead.
 ///
-/// Behaviour on a second call: the new registry replaces the live
+/// Behavior on a second call: the new registry replaces the live
 /// one atomically (so this entrypoint can also drive an explicit
 /// reload). For SIGHUP / file-watcher / admin reload paths, prefer
 /// [`reload_provider_registry`] for clarity.

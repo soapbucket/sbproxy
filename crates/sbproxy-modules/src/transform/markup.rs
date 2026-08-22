@@ -234,44 +234,161 @@ impl HtmlTransform {
     /// `[^>]*` still bounds an opening tag, so a `>` inside an attribute
     /// value cuts the match short. That limitation predates this pass and
     /// is the price of not carrying an HTML parser.
+    ///
+    /// Which attribute of the matched tag gets rewritten is decided by
+    /// [`stamp_attribute`], walking the tag's attribute list, rather than
+    /// by a second regex over the tag text. A regex cannot tell an
+    /// attribute from the same characters inside another attribute's
+    /// value, and the two ways it gets that wrong are both defects a page
+    /// can reach: see that function's own note.
     fn rewrite_attr(&self, html: &str, rewrite: &AttributeRewrite) -> String {
         let tag = regex::escape(&rewrite.selector);
-        let attr = regex::escape(&rewrite.attribute);
         let Ok(tag_re) = Regex::new(&format!(r"(?is)<{tag}\b[^>]*>", tag = tag)) else {
             return html.to_string();
         };
-        // The leading `\s` keeps `target` from matching inside
-        // `data-target`; every attribute in a well-formed opening tag is
-        // preceded by whitespace, because the tag name comes first.
-        let Ok(attr_re) = Regex::new(&format!(
-            r#"(?i)\s{attr}\s*=\s*["'][^"']*["']"#,
-            attr = attr
-        )) else {
-            return html.to_string();
-        };
-        let assignment = format!(r#" {}="{}""#, rewrite.attribute, rewrite.value);
 
         tag_re
             .replace_all(html, |caps: &regex::Captures| {
-                let open = &caps[0];
-                if attr_re.is_match(open) {
-                    // `NoExpand`: an operator's value is literal text, not a
-                    // capture-group reference, so a `$1` in it stays a `$1`.
-                    return attr_re
-                        .replace_all(open, regex::NoExpand(assignment.as_str()))
-                        .into_owned();
-                }
-                let Some(body) = open.strip_suffix('>') else {
-                    return open.to_string();
-                };
-                let (body, close) = match body.strip_suffix('/') {
-                    Some(rest) => (rest, "/>"),
-                    None => (body, ">"),
-                };
-                format!("{}{}{}", body.trim_end(), assignment, close)
+                stamp_attribute(&caps[0], &rewrite.attribute, &rewrite.value)
             })
             .into_owned()
     }
+}
+
+/// Set `attribute` to `value` on one opening tag, replacing the value it
+/// already carries or appending the attribute when it carries none.
+///
+/// `open` is one whole opening tag as `HtmlTransform::rewrite_attr` matched
+/// it, `<name ...>` or `<name ... />`. This walks the tag's attribute list
+/// and only ever rewrites something it parsed as an attribute value. The
+/// regex this replaced, `\s{attr}\s*=\s*["'][^"']*["']` over the tag text,
+/// got two cases wrong that a real page reaches:
+///
+/// * A tag carrying the attribute *unquoted*, which minifiers emit
+///   routinely (`<a target=_self>`), did not match, so the code took the
+///   append path and produced `target=_self target="_blank"`. An HTML
+///   parser keeps the first of a duplicated attribute and drops the rest,
+///   so the rewrite silently did nothing to exactly the tags it reported
+///   stamping.
+/// * The same characters inside *another* attribute's value did match.
+///   Upstream content of the shape `<a title="a target='b' onclick=x">`
+///   came out as `<a title="a target="_blank" onclick=x">`, which closes
+///   the title early and promotes the rest of an upstream-controlled
+///   string to real attributes, event handlers included. Substituting
+///   inside a quoted value is an injection primitive, not a cosmetic bug.
+///
+/// Unparseable noise between attributes is copied through rather than
+/// dropped: this is a rewriter, and a tag it cannot fully read should come
+/// out as it went in apart from the one attribute it was asked to set.
+fn stamp_attribute(open: &str, attribute: &str, value: &str) -> String {
+    let Some(inner) = open.strip_prefix('<').and_then(|s| s.strip_suffix('>')) else {
+        return open.to_string();
+    };
+    // A self-closing `/` belongs after the last attribute, so hold it back
+    // and re-emit it with the closing `>`.
+    let (inner, close) = match inner.strip_suffix('/') {
+        Some(rest) => (rest, "/>"),
+        None => (inner, ">"),
+    };
+
+    // Every byte this scan compares or stops on is ASCII, and every byte of
+    // a multi-byte UTF-8 sequence is >= 0x80, so an index the scan produces
+    // is always a char boundary.
+    let bytes = inner.as_bytes();
+    let mut out = String::with_capacity(open.len() + attribute.len() + value.len() + 4);
+    out.push('<');
+
+    // The tag name runs to the first whitespace.
+    let mut i = 0;
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    out.push_str(&inner[..i]);
+
+    let mut replaced = false;
+    while i < bytes.len() {
+        let space_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        out.push_str(&inner[space_start..i]);
+        if i >= bytes.len() {
+            break;
+        }
+
+        let name_start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'=' {
+            i += 1;
+        }
+        if i == name_start {
+            // A `=` where a name should be. Copy it and carry on, so a
+            // malformed tag cannot spin this loop.
+            out.push('=');
+            i += 1;
+            continue;
+        }
+        let name = &inner[name_start..i];
+
+        // Advance `i` past an optional `= value`, so `inner[name_start..i]`
+        // is the whole attribute and an untouched one can be copied out
+        // verbatim, spacing included.
+        let mut j = i;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j < bytes.len() && bytes[j] == b'=' {
+            j += 1;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'\'') {
+                let quote = bytes[j];
+                let mut k = j + 1;
+                while k < bytes.len() && bytes[k] != quote {
+                    k += 1;
+                }
+                // Past the closing quote when there is one. An unterminated
+                // quote runs to the end of the tag, which is where the
+                // `[^>]*` match already cut it off.
+                i = if k < bytes.len() { k + 1 } else { k };
+            } else {
+                let mut k = j;
+                while k < bytes.len() && !bytes[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                i = k;
+            }
+        }
+
+        if name.eq_ignore_ascii_case(attribute) {
+            // The source's spelling of the name is kept: matching is
+            // case-insensitive, and rewriting `TARGET` to `target` would be
+            // a change nobody asked for.
+            out.push_str(name);
+            out.push_str("=\"");
+            out.push_str(value);
+            out.push('"');
+            replaced = true;
+        } else {
+            out.push_str(&inner[name_start..i]);
+        }
+    }
+
+    if !replaced {
+        // Trailing space before the `>` was already copied through; drop it
+        // so `<a href="x" >` does not gain a second one.
+        let trimmed = out
+            .trim_end_matches(|c: char| c.is_ascii_whitespace())
+            .len();
+        out.truncate(trimmed);
+        out.push(' ');
+        out.push_str(attribute);
+        out.push_str("=\"");
+        out.push_str(value);
+        out.push('"');
+    }
+    out.push_str(close);
+    out
 }
 
 // --- OptimizeHtmlTransform ---
@@ -387,7 +504,7 @@ pub struct MarkdownProjection {
     pub body: String,
     /// Page title. `Some` when an H1 was found in the body or a `<title>`
     /// element was found in the source HTML. `None` is preserved for the
-    /// JSON envelope to serialise as an empty string.
+    /// JSON envelope to serialize as an empty string.
     pub title: Option<String>,
     /// Approximate token count of `body`, using
     /// `(body.len() as f32 * token_bytes_ratio) as u32`. Capped by `u32::MAX`
@@ -1017,6 +1134,37 @@ mod tests {
         assert!(
             result.contains(r#" target="_blank""#),
             "the requested attribute is added: {result}"
+        );
+    }
+
+    #[test]
+    fn html_rewrite_attribute_replaces_an_unquoted_value() {
+        let t = rewrite_attributes_transform("a", "target", "_blank");
+        let result = rewritten(&t, "<a href=/page target=_self>x</a>");
+        assert_eq!(
+            result, r#"<a href=/page target="_blank">x</a>"#,
+            "an unquoted value is a value: appending a second `target` here \
+             would leave the browser reading the first one and the rewrite \
+             doing nothing: {result}"
+        );
+    }
+
+    #[test]
+    fn html_rewrite_attribute_never_substitutes_inside_another_value() {
+        let t = rewrite_attributes_transform("a", "target", "_blank");
+        // Upstream text inside `title`, quoted the other way. Substituting
+        // there would close the title early and promote `onmouseover` to a
+        // real attribute, which is an injection primitive rather than a
+        // formatting wart.
+        let result = rewritten(&t, r#"<a title="pick target='b' onmouseover=x">y</a>"#);
+        assert!(
+            result.contains(r#"title="pick target='b' onmouseover=x""#),
+            "the title must survive whole: {result}"
+        );
+        assert_eq!(
+            result.matches(r#"target="_blank""#).count(),
+            1,
+            "the tag is stamped exactly once, on its own attribute list: {result}"
         );
     }
 
