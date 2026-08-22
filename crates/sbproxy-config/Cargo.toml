@@ -17,7 +17,19 @@ sbproxy-observe.workspace = true
 sbproxy-security.workspace = true
 
 serde = { workspace = true }
-serde_json = { workspace = true }
+# `preserve_order` explicit here (WOR-2585 fix), not left to arrive
+# incidentally: `config_json_schema()` embeds a `serde_json::to_value`
+# of each config type's default instance, and cedar-policy-core (a
+# sbproxy-extension dependency, not this crate's) forces the same
+# feature on for any build that also compiles sbproxy-extension. A
+# `cargo build --workspace` and a scoped `cargo run -p sbproxy-config
+# --bin generate-schema` therefore disagreed on default-value key
+# order (declaration order vs `BTreeMap`-sorted) depending on which
+# packages happened to share the build, and `schema_is_committed_
+# verbatim` caught the mismatch. Declaring it here keeps both
+# invocations, and the schema this crate serves over the admin API,
+# identical regardless of what else the graph happens to pull in.
+serde_json = { workspace = true, features = ["preserve_order"] }
 serde_yaml = { workspace = true }
 # WOR-1140: collect unknown/misspelled config keys at parse time so a
 # typo in a (often protection-disabling) key fails boot instead of being

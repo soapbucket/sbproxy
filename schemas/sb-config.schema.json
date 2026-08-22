@@ -20,8 +20,8 @@
       "description": "Extension bundle discovery sources. Paths stay unresolved in this parsed representation and are interpreted only by the runtime loader.",
       "default": {
         "bundles_dir": null,
-        "grants": {},
-        "sources": []
+        "sources": [],
+        "grants": {}
       },
       "allOf": [
         {
@@ -32,69 +32,69 @@
     "proxy": {
       "description": "Server-wide settings parsed from the top-level `proxy:` block.",
       "default": {
-        "acme": null,
-        "admin": null,
-        "ai_providers_file": null,
-        "alerting": null,
-        "attestation": null,
-        "bind_address": null,
-        "cache_reserve": null,
-        "cluster": null,
-        "compression_state": null,
-        "config_authority": null,
-        "config_history": null,
-        "correlation_id": {
-          "echo_response": true,
-          "enabled": true,
-          "header": "X-Request-Id"
-        },
-        "credentials": [],
-        "device_parser_file": null,
-        "extensions": {},
-        "http2_cleartext": false,
-        "http3": null,
         "http_bind_port": 8080,
-        "http_client_timeouts": {
-          "bot_auth_directory_client_secs": 5,
-          "callback_client_secs": 10,
-          "forward_auth_client_secs": 30,
-          "forward_auth_request_secs": 5,
-          "swr_client_secs": 30
-        },
+        "bind_address": null,
+        "zone": null,
+        "http2_cleartext": false,
         "https_bind_port": null,
+        "tls_cert_file": null,
+        "tls_key_file": null,
+        "acme": null,
+        "http3": null,
+        "metrics": null,
+        "observability": null,
+        "alerting": null,
+        "admin": null,
+        "model_host": null,
+        "cluster": null,
+        "config_authority": null,
+        "secrets": null,
         "key_management": null,
         "l2_cache_settings": null,
-        "messenger_settings": null,
-        "metrics": null,
-        "model_host": null,
-        "mtls": null,
-        "observability": null,
-        "payments": null,
+        "cache_reserve": null,
         "response_cache_store": null,
+        "compression_state": null,
+        "config_history": null,
+        "messenger_settings": null,
+        "trusted_proxies": [],
+        "correlation_id": {
+          "enabled": true,
+          "header": "X-Request-Id",
+          "echo_response": true
+        },
+        "mtls": null,
+        "ai_providers_file": null,
+        "device_parser_file": null,
+        "synthetic_probe": null,
         "scripting": {
+          "lua": {
+            "sandbox": {
+              "max_execution_ms": 100,
+              "max_memory_mb": 8,
+              "allow_patterns": true
+            }
+          },
           "javascript": {
             "sandbox": {
               "budget_ms": 100,
               "memory_mb": 16,
               "stack_kb": 1024
             }
-          },
-          "lua": {
-            "sandbox": {
-              "allow_patterns": true,
-              "max_execution_ms": 100,
-              "max_memory_mb": 8
-            }
           }
         },
-        "secrets": null,
-        "synthetic_probe": null,
-        "tenants": [],
-        "tls_cert_file": null,
-        "tls_key_file": null,
-        "trusted_proxies": [],
+        "extensions": {},
+        "http_client_timeouts": {
+          "forward_auth_client_secs": 30,
+          "forward_auth_request_secs": 5,
+          "bot_auth_directory_client_secs": 5,
+          "swr_client_secs": 30,
+          "callback_client_secs": 10
+        },
         "web_bot_auth": null,
-        "zone": null
+        "attestation": null,
+        "tenants": [],
+        "credentials": [],
+        "payments": null
       },
       "allOf": [
         {
@@ -217,8 +217,8 @@
     "update": {
       "description": "WOR-1804: how `sbproxy update` behaves for the binary and the managed inference engines. Optional; an absent block is the same as the defaults (stable channel, no background check).",
       "default": {
-        "auto": false,
         "channel": "stable",
+        "auto": false,
         "check_interval_secs": 86400
       },
       "allOf": [
@@ -732,9 +732,9 @@
         "correlation_id": {
           "description": "Correlation-ID propagation policy. By default, the proxy honors any inbound `X-Request-Id` header, generates one if absent, forwards the value to the upstream, and echoes it in the downstream response. Set fields here to change the header name or disable.",
           "default": {
-            "echo_response": true,
             "enabled": true,
-            "header": "X-Request-Id"
+            "header": "X-Request-Id",
+            "echo_response": true
           },
           "allOf": [
             {
@@ -785,18 +785,18 @@
         "scripting": {
           "description": "Scripting runtime limits. Today this block carries the Lua sandbox knobs (execution-time budget, memory budget, pattern API gating); other languages (CEL, JavaScript, WebAssembly) keep their own knobs elsewhere until they have similar enforcement surfaces. When omitted, the documented defaults are applied (see [`LuaSandboxConfig::default`]).",
           "default": {
+            "lua": {
+              "sandbox": {
+                "max_execution_ms": 100,
+                "max_memory_mb": 8,
+                "allow_patterns": true
+              }
+            },
             "javascript": {
               "sandbox": {
                 "budget_ms": 100,
                 "memory_mb": 16,
                 "stack_kb": 1024
-              }
-            },
-            "lua": {
-              "sandbox": {
-                "allow_patterns": true,
-                "max_execution_ms": 100,
-                "max_memory_mb": 8
               }
             }
           },
@@ -815,11 +815,11 @@
         "http_client_timeouts": {
           "description": "Tunable client-side timeouts for the proxy's outbound HTTP helpers (forward-auth, callbacks, mirrors, SWR refreshes, bot- auth directory). Defaults match the prior hardcoded literals so existing configs see no behavior change. See [`HttpClientTimeoutsConfig`] for the field list.",
           "default": {
-            "bot_auth_directory_client_secs": 5,
-            "callback_client_secs": 10,
             "forward_auth_client_secs": 30,
             "forward_auth_request_secs": 5,
-            "swr_client_secs": 30
+            "bot_auth_directory_client_secs": 5,
+            "swr_client_secs": 30,
+            "callback_client_secs": 10
           },
           "allOf": [
             {
@@ -1978,8 +1978,8 @@
         "cache": {
           "description": "Artifact cache and residency policy.",
           "default": {
-            "budget_gib": null,
             "directory": null,
+            "budget_gib": null,
             "max_resident_models": null
           },
           "allOf": [
@@ -4071,18 +4071,18 @@
           "default": {
             "backend": "embedded",
             "path": "/var/lib/sbproxy/keystore.redb",
-            "prefix": "sbproxy/keystore",
+            "url": null,
             "redis_source_of_truth": false,
+            "prefix": "sbproxy/keystore",
             "secrets_manager": {
-              "address": null,
-              "kv_v2": true,
-              "mount": null,
-              "namespace": null,
               "provider": "local",
-              "region": null,
-              "token_env": "VAULT_TOKEN"
-            },
-            "url": null
+              "address": null,
+              "mount": null,
+              "kv_v2": true,
+              "token_env": "VAULT_TOKEN",
+              "namespace": null,
+              "region": null
+            }
           },
           "allOf": [
             {
@@ -4093,13 +4093,13 @@
         "cache": {
           "description": "In-memory policy cache in front of the store.",
           "default": {
-            "max_entries": 10000,
-            "mesh": null,
-            "mesh_node_id": null,
+            "ttl_secs": 60,
             "negative_ttl_secs": 5,
-            "redis_url": null,
+            "max_entries": 10000,
             "tier": "none",
-            "ttl_secs": 60
+            "redis_url": null,
+            "mesh_node_id": null,
+            "mesh": null
           },
           "allOf": [
             {
@@ -4110,14 +4110,14 @@
         "governance": {
           "description": "Governed key admission, accounting, and authenticated introspection.",
           "default": {
-            "backend": null,
             "consistency": "approximate",
-            "failure_mode": "closed",
-            "key_introspection": false,
+            "backend": null,
             "lease_ttl_secs": 120,
+            "terminal_retention_secs": 300,
+            "failure_mode": "closed",
             "missing_rate": "zero_cost",
-            "require_governed_key": false,
-            "terminal_retention_secs": 300
+            "key_introspection": false,
+            "require_governed_key": false
           },
           "allOf": [
             {
@@ -4128,8 +4128,8 @@
         "crypto": {
           "description": "At-rest crypto material.",
           "default": {
-            "master_key": null,
-            "pepper": null
+            "pepper": null,
+            "master_key": null
           },
           "allOf": [
             {
@@ -4154,59 +4154,59 @@
                 "scheme": ""
               }
             ],
-            "native_key_policy": null,
+            "require": false,
             "provider_hints": [
               {
-                "also_header": null,
-                "header": "x-api-key",
                 "provider": "anthropic",
+                "header": "x-api-key",
                 "scheme": "",
-                "value_prefix": "sk-ant-"
+                "value_prefix": "sk-ant-",
+                "also_header": null
               },
               {
-                "also_header": null,
-                "header": "authorization",
                 "provider": "anthropic",
+                "header": "authorization",
                 "scheme": "Bearer ",
-                "value_prefix": "sk-ant-"
+                "value_prefix": "sk-ant-",
+                "also_header": null
               },
               {
-                "also_header": "anthropic-version",
-                "header": "x-api-key",
                 "provider": "anthropic",
+                "header": "x-api-key",
                 "scheme": "",
-                "value_prefix": ""
+                "value_prefix": "",
+                "also_header": "anthropic-version"
               },
               {
-                "also_header": null,
-                "header": "authorization",
                 "provider": "openrouter",
-                "scheme": "Bearer ",
-                "value_prefix": "sk-or-"
-              },
-              {
-                "also_header": null,
-                "header": "x-goog-api-key",
-                "provider": "gemini",
-                "scheme": "",
-                "value_prefix": ""
-              },
-              {
-                "also_header": null,
-                "header": "api-key",
-                "provider": "azure",
-                "scheme": "",
-                "value_prefix": ""
-              },
-              {
-                "also_header": null,
                 "header": "authorization",
-                "provider": "openai",
                 "scheme": "Bearer ",
-                "value_prefix": "sk-"
+                "value_prefix": "sk-or-",
+                "also_header": null
+              },
+              {
+                "provider": "gemini",
+                "header": "x-goog-api-key",
+                "scheme": "",
+                "value_prefix": "",
+                "also_header": null
+              },
+              {
+                "provider": "azure",
+                "header": "api-key",
+                "scheme": "",
+                "value_prefix": "",
+                "also_header": null
+              },
+              {
+                "provider": "openai",
+                "header": "authorization",
+                "scheme": "Bearer ",
+                "value_prefix": "sk-",
+                "also_header": null
               }
             ],
-            "require": false
+            "native_key_policy": null
           },
           "allOf": [
             {
@@ -4250,8 +4250,8 @@
         "seed": {
           "description": "Optional declarative seed of keys and credentials.",
           "default": {
-            "credentials": [],
-            "keys": []
+            "keys": [],
+            "credentials": []
           },
           "allOf": [
             {
@@ -4301,13 +4301,13 @@
         "secrets_manager": {
           "description": "External secrets-manager connection (backend `secrets_manager`).",
           "default": {
-            "address": null,
-            "kv_v2": true,
-            "mount": null,
-            "namespace": null,
             "provider": "local",
-            "region": null,
-            "token_env": "VAULT_TOKEN"
+            "address": null,
+            "mount": null,
+            "kv_v2": true,
+            "token_env": "VAULT_TOKEN",
+            "namespace": null,
+            "region": null
           },
           "allOf": [
             {
@@ -4883,53 +4883,53 @@
           "description": "Ordered rules attributing a native (non-minted) inbound credential to a provider. First matching hint wins, so more specific value prefixes belong before general ones. A matching hint then enters native-key policy admission; a credential matching no hint remains unattributed.",
           "default": [
             {
-              "also_header": null,
-              "header": "x-api-key",
               "provider": "anthropic",
+              "header": "x-api-key",
               "scheme": "",
-              "value_prefix": "sk-ant-"
+              "value_prefix": "sk-ant-",
+              "also_header": null
             },
             {
-              "also_header": null,
-              "header": "authorization",
               "provider": "anthropic",
+              "header": "authorization",
               "scheme": "Bearer ",
-              "value_prefix": "sk-ant-"
+              "value_prefix": "sk-ant-",
+              "also_header": null
             },
             {
-              "also_header": "anthropic-version",
-              "header": "x-api-key",
               "provider": "anthropic",
+              "header": "x-api-key",
               "scheme": "",
-              "value_prefix": ""
+              "value_prefix": "",
+              "also_header": "anthropic-version"
             },
             {
-              "also_header": null,
-              "header": "authorization",
               "provider": "openrouter",
-              "scheme": "Bearer ",
-              "value_prefix": "sk-or-"
-            },
-            {
-              "also_header": null,
-              "header": "x-goog-api-key",
-              "provider": "gemini",
-              "scheme": "",
-              "value_prefix": ""
-            },
-            {
-              "also_header": null,
-              "header": "api-key",
-              "provider": "azure",
-              "scheme": "",
-              "value_prefix": ""
-            },
-            {
-              "also_header": null,
               "header": "authorization",
-              "provider": "openai",
               "scheme": "Bearer ",
-              "value_prefix": "sk-"
+              "value_prefix": "sk-or-",
+              "also_header": null
+            },
+            {
+              "provider": "gemini",
+              "header": "x-goog-api-key",
+              "scheme": "",
+              "value_prefix": "",
+              "also_header": null
+            },
+            {
+              "provider": "azure",
+              "header": "api-key",
+              "scheme": "",
+              "value_prefix": "",
+              "also_header": null
+            },
+            {
+              "provider": "openai",
+              "header": "authorization",
+              "scheme": "Bearer ",
+              "value_prefix": "sk-",
+              "also_header": null
             }
           ],
           "type": "array",
@@ -5427,9 +5427,9 @@
         "params": {
           "description": "Driver-specific parameters.",
           "default": {
+            "dsn": "",
             "ca_file": null,
             "cert_file": null,
-            "dsn": "",
             "key_file": null
           },
           "allOf": [
@@ -5955,9 +5955,9 @@
           "description": "Lua sandbox limits. Always populated, even when the operator omitted the block, so callers never have to special-case `None`.",
           "default": {
             "sandbox": {
-              "allow_patterns": true,
               "max_execution_ms": 100,
-              "max_memory_mb": 8
+              "max_memory_mb": 8,
+              "allow_patterns": true
             }
           },
           "allOf": [
@@ -5991,9 +5991,9 @@
         "sandbox": {
           "description": "Per-script execution limits.",
           "default": {
-            "allow_patterns": true,
             "max_execution_ms": 100,
-            "max_memory_mb": 8
+            "max_memory_mb": 8,
+            "allow_patterns": true
           },
           "allOf": [
             {
@@ -6664,13 +6664,13 @@
         "attrs": {
           "description": "Attribution attributes lowered onto matched principals. Individual compatibility-only fields are documented on their definitions.",
           "default": {
-            "budget": null,
-            "cost_center": null,
-            "metadata": {},
             "project": null,
-            "tags": [],
+            "user": null,
             "team": null,
-            "user": null
+            "cost_center": null,
+            "tags": [],
+            "metadata": {},
+            "budget": null
           },
           "allOf": [
             {
@@ -6978,9 +6978,9 @@
         "log": {
           "description": "Tenant-scoped log block. See [`TenantObservabilityLogConfig`].",
           "default": {
-            "custom_fields": [],
             "redact": {},
-            "sinks": []
+            "sinks": [],
+            "custom_fields": []
           },
           "allOf": [
             {
@@ -7154,8 +7154,8 @@
         "worker": {
           "description": "Recovery-only background worker. It never performs the settlement that authorizes a request.",
           "default": {
-            "max_reconcile_batch": 32,
             "reconcile_interval_ms": 1000,
+            "max_reconcile_batch": 32,
             "shutdown_timeout_ms": 5000
           },
           "allOf": [
@@ -7178,11 +7178,11 @@
         "rails": {
           "description": "Settlement rails and their provider credentials.",
           "default": {
-            "lightning_backend": null,
+            "x402": null,
+            "stripe": null,
             "lightning_cln": null,
             "lightning_lnd": null,
-            "stripe": null,
-            "x402": null
+            "lightning_backend": null
           },
           "allOf": [
             {
@@ -7450,8 +7450,8 @@
           "description": "Breaker around the facilitator.",
           "default": {
             "failure_threshold": 3,
-            "half_open_max": 1,
-            "open_ms": 5000
+            "open_ms": 5000,
+            "half_open_max": 1
           },
           "allOf": [
             {
@@ -10560,9 +10560,9 @@
         "log": {
           "description": "Origin-scope log block. See [`OriginObservabilityLogConfig`].",
           "default": {
-            "custom_fields": [],
             "redact": {},
-            "sinks": []
+            "sinks": [],
+            "custom_fields": []
           },
           "allOf": [
             {
@@ -10691,12 +10691,12 @@
         "capture_headers": {
           "description": "Header capture configuration. Off by default; opt in by listing header names (or `*`) in `request` / `response`. Captured values land in the `request_headers` / `response_headers` fields of the emitted entry.",
           "default": {
+            "request": [],
+            "response": [],
             "max_value_bytes": 1024,
             "redact_pii": false,
-            "redact_pii_other_fields": false,
             "redact_pii_rules": [],
-            "request": [],
-            "response": []
+            "redact_pii_other_fields": false
           },
           "allOf": [
             {
@@ -10721,11 +10721,11 @@
         "output": {
           "description": "Output sink. Defaults to stderr/tracing target.",
           "default": {
-            "compress": false,
-            "max_backups": 7,
-            "max_size_mb": 100,
+            "type": "stderr",
             "path": null,
-            "type": "stderr"
+            "max_size_mb": 100,
+            "max_backups": 7,
+            "compress": false
           },
           "allOf": [
             {
@@ -10852,9 +10852,9 @@
         "resolver": {
           "description": "Resolver tuning (rDNS toggle, bot-auth toggle, cache size). Each field has a sensible default; this block is rarely needed.",
           "default": {
+            "rdns_enabled": true,
             "bot_auth_keyid_enabled": true,
-            "cache_size": 10000,
-            "rdns_enabled": true
+            "cache_size": 10000
           },
           "allOf": [
             {
@@ -10918,8 +10918,8 @@
         "workspace_default": {
           "description": "Budget applied to the default workspace (the only workspace in the OSS single-tenant build; enterprise multi-tenant resolves a per-tenant budget).",
           "default": {
-            "http_rps_burst": 2000,
             "http_rps_sustained": 1000,
+            "http_rps_burst": 2000,
             "soft_threshold_rps": null
           },
           "allOf": [

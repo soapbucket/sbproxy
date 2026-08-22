@@ -1349,8 +1349,12 @@ fn cel_to_json(value: &CelValue) -> serde_json::Value {
 }
 
 /// Convert a CEL map. The source is a `HashMap` with no order of its
-/// own; `serde_json::Map` (without `preserve_order`) is a BTreeMap, so
-/// keys come out sorted and the document is deterministic.
+/// own; the resulting object's key order is therefore unspecified
+/// (`serde_json::Map`'s own order depends on whether the workspace has
+/// serde_json's `preserve_order` feature on, which cedar-policy-core
+/// forces regardless of this crate's own manifest). That is fine here:
+/// [`context_to_input`]'s only consumer is `regorus`, which reads a
+/// Rego input document by field name, never by iteration order.
 fn convert_map(entries: &HashMap<String, CelValue>) -> serde_json::Value {
     let mut object = serde_json::Map::with_capacity(entries.len());
     for (key, value) in entries {
