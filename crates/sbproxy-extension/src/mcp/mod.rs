@@ -17,6 +17,9 @@
 //! - [`openapi_convert`] - Convert OpenAPI 3.x specs to MCP tools and routes.
 //! - [`compat`] - Tool-versioning compatibility oracle.
 //! - [`access_control`] - Principal-aware tool ACLs and per-tool quotas.
+//! - [`cedar_hook`] - `CedarMcpHook`, the built-in Cedar-backed
+//!   `McpPolicyHook` (WOR-2587). Runs alongside `access_control`'s
+//!   RBAC gate, not instead of it.
 //! - [`schema_drift`] / [`cassette_drift`] - CI drift detection (drift CLI).
 //! - [`egress`] - Deterministic allowlist for gateway-originated traffic.
 //! - [`auth`] - Run-as-user upstream credential minting (WOR-1792).
@@ -28,6 +31,7 @@
 pub mod access_control;
 pub mod auth;
 pub mod cassette_drift;
+pub mod cedar_hook;
 pub mod codemode_ts;
 pub mod compat;
 pub mod concealed_text;
@@ -66,6 +70,7 @@ pub use cassette_drift::{
     tools_from_value, CassetteContract, CassetteDriftChange, CassetteDriftEvent, CassetteDriftKind,
     CassetteDriftReport, CassetteFieldContract, CassetteToolContract, CASSETTE_DRIFT_EVENT_TYPE,
 };
+pub use cedar_hook::CedarMcpHook;
 pub use egress::{EgressDenied, EgressMode, EgressPolicy, SystemHostResolver};
 pub use federation::{
     FederatedPrompt, FederatedTool, FederationIoSettings, LocalBacking, McpCallOutcome,

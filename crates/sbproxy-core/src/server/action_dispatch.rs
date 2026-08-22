@@ -17774,4 +17774,188 @@ allow := false if {
             "capture_arguments must carry the local denial's verbatim arguments, got: {event:?}"
         );
     }
+
+    /// WOR-2587: `CedarMcpHook` is registered as a built-in
+    /// `McpPolicyHook` and dispatched from the exact seam
+    /// `McpFederation::call_tool_with_upstream_headers_from_snapshot`
+    /// runs its registered hooks through -- the only path
+    /// `handle_mcp_action` takes to a non-`local` upstream. This test
+    /// drives real `tools/call` requests through `handle_mcp_action`
+    /// (not a hand-built `McpToolCallCtx` fed to the hook directly)
+    /// against ONE compiled action carrying both `rbac_policies` and
+    /// `cedar_policies`, and four tool names prove:
+    ///
+    /// 1. `wor2587-allow-tool`: RBAC allows; Cedar's blanket `permit`
+    ///    applies (no `forbid` matches) -> the call actually reaches
+    ///    the stub upstream and returns its scripted result.
+    /// 2. `wor2587-deny-tool`: RBAC allows this tool too (same
+    ///    allowlist entry as #1), so a refusal here can only come from
+    ///    Cedar's own `forbid` actually firing -- proving Cedar is
+    ///    consulted and not silently shadowed by RBAC's allow.
+    /// 3. `wor2587-confirm-tool`: same RBAC allowlist entry, but the
+    ///    matched `forbid` carries `@confirm(...)`, so `CedarEvaluator`
+    ///    maps it onto `PolicyDecision::Confirm` rather than a plain
+    ///    deny; the confirmation reason text making it all the way to
+    ///    the JSON-RPC error is the load-bearing assertion (PR beta of
+    ///    the OSS `McpPolicyHook` contract still surfaces `Confirm` as
+    ///    a refusal; there is no `PendingConfirmStore` in OSS).
+    /// 4. `wor2587-rbac-denied-tool`: absent from the RBAC allowlist ->
+    ///    RBAC denies before Cedar (or the stub upstream) is ever
+    ///    reached, proving the reverse direction: registering a Cedar
+    ///    hook does not disable or bypass RBAC's own gate.
+    #[tokio::test]
+    async fn wor_2587_cedar_hook_runs_alongside_rbac_without_shadowing() {
+        const SERVER: &str = "wor2587-cedar-server";
+        const ALLOW_TOOL: &str = "wor2587-allow-tool";
+        const DENY_TOOL: &str = "wor2587-deny-tool";
+        const CONFIRM_TOOL: &str = "wor2587-confirm-tool";
+        const RBAC_DENIED_TOOL: &str = "wor2587-rbac-denied-tool";
+
+        let origin = scripted_responses_server(vec![scripted_tool_call_response()]);
+
+        let cedar_policies = format!(
+            r#"
+            permit(principal, action, resource);
+
+            forbid(
+                principal,
+                action,
+                resource == ToolInvocation::"{SERVER}/{DENY_TOOL}"
+            );
+
+            @confirm("high-risk tool requires human approval")
+            forbid(
+                principal,
+                action,
+                resource == ToolInvocation::"{SERVER}/{CONFIRM_TOOL}"
+            );
+            "#
+        );
+
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2587-cedar-hook-fixture", "version": "1.0.0"},
+            "rbac_policies": {
+                "gate": {
+                    "default_allow": false,
+                    "tool_access": [{
+                        "principals": [],
+                        "allowed": [ALLOW_TOOL, DENY_TOOL, CONFIRM_TOOL]
+                    }]
+                }
+            },
+            "cedar_policies": {
+                "policies": cedar_policies
+            },
+            "federated_servers": [{
+                "origin": origin,
+                "prefix": SERVER,
+                "rbac": "gate"
+            }]
+        }))
+        .expect("wor-2587 cedar hook fixture compiles");
+
+        // `seed_tools_for_test` marks the federation primed so
+        // `ensure_ready` never dials the stub for a cold-prime probe;
+        // the one dial this test makes is the allow-tool's real
+        // dispatch below.
+        action.federation.seed_tools_for_test(
+            HashMap::from([
+                (ALLOW_TOOL.to_string(), tool(ALLOW_TOOL, SERVER)),
+                (DENY_TOOL.to_string(), tool(DENY_TOOL, SERVER)),
+                (CONFIRM_TOOL.to_string(), tool(CONFIRM_TOOL, SERVER)),
+                (RBAC_DENIED_TOOL.to_string(), tool(RBAC_DENIED_TOOL, SERVER)),
+            ]),
+            None,
+        );
+
+        // 1. Allow: RBAC allows, Cedar's blanket permit applies -> the
+        // call actually dispatches to the stub upstream.
+        let allow = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": ALLOW_TOOL, "arguments": {}}
+            }),
+        )
+        .await;
+        assert!(
+            allow.get("error").is_none(),
+            "RBAC-allowed, Cedar-unmatched call must dispatch: {allow:?}"
+        );
+        assert_eq!(
+            allow["result"]["content"][0]["text"], "fixture",
+            "must carry the stub upstream's scripted result: {allow:?}"
+        );
+
+        // 2. Deny: RBAC allows this tool too, so a refusal can only
+        // come from Cedar's own `forbid` actually firing.
+        let deny = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": DENY_TOOL, "arguments": {}}
+            }),
+        )
+        .await;
+        let deny_message = deny["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            !deny_message.contains("RBAC policy"),
+            "the deny-tool is RBAC-allowed; a refusal naming the RBAC policy would mean \
+             Cedar never ran: {deny:?}"
+        );
+        assert!(
+            deny_message.contains("denied by cedar policy"),
+            "expected a Cedar denial, got: {deny:?}"
+        );
+
+        // 3. Confirm: same RBAC allowlist entry, but the matched
+        // `forbid` carries `@confirm(...)`.
+        let confirm = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": CONFIRM_TOOL, "arguments": {}}
+            }),
+        )
+        .await;
+        let confirm_message = confirm["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            confirm_message.contains("confirmation required"),
+            "expected a Confirm verdict to surface, got: {confirm:?}"
+        );
+        assert!(
+            confirm_message.contains("high-risk tool requires human approval"),
+            "the Cedar @confirm annotation's reason text must reach the caller, got: {confirm:?}"
+        );
+
+        // 4. RBAC still gates independently: a tool absent from the
+        // allowlist is denied by RBAC before Cedar (or the stub
+        // upstream, which never answers a fourth request) is ever
+        // reached -- registering a Cedar hook does not disable RBAC.
+        let rbac_denied = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {"name": RBAC_DENIED_TOOL, "arguments": {}}
+            }),
+        )
+        .await;
+        assert!(
+            rbac_denied["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("denied by RBAC policy"),
+            "got: {rbac_denied:?}"
+        );
+    }
 }

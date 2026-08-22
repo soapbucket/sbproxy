@@ -43,6 +43,13 @@
 //!       guardrails:
 //!         - type: tool_allowlist
 //!           allow: [gh.search_repos, db.query]
+//!       cedar_policies:
+//!         policies: |
+//!           permit(
+//!               principal in AgentClass::"trusted",
+//!               action == Action::"MCP::CallTool",
+//!               resource == ToolInvocation::"gh/search_repos"
+//!           );
 //! ```
 //!
 //! The `rbac:` field on each `federated_servers[]` references a key
@@ -61,6 +68,26 @@
 //! request layer (not just the connection layer) via
 //! `tokio::time::timeout`.
 //!
+//! `cedar_policies:` (WOR-2587) is optional and independent of
+//! `rbac_policies:`: when present, its `policies` source compiles
+//! once at config-load time (`sbproxy_extension::cedar::compile_all`)
+//! against the default MCP entity/action schema
+//! (`Agent`/`AgentClass`/`User`/`Group`/`Server`/`Tool`/
+//! `ToolInvocation`/`ArgumentBinding`, `MCP::CallTool` etc.; see
+//! `sbproxy_extension::cedar::schema::mcp`), and registers a
+//! `CedarMcpHook` as a built-in `McpPolicyHook`
+//! (`sbproxy_plugin::mcp::register_mcp_policy_hook`). This runs
+//! ALONGSIDE `rbac_policies`, not instead of it: RBAC stays the
+//! coarse, per-server, default-deny gate consulted directly below by
+//! `sbproxy-core`'s dispatcher; Cedar is the finer-grained ABAC layer
+//! evaluated afterward, on every federated `tools/call` in the
+//! process, regardless of which `mcp` action or origin declared it
+//! (the underlying `McpPolicyHook` registry is process-global, not
+//! scoped per action). `schema_override` appends workspace-authored
+//! Cedar source to the default schema; see
+//! `sbproxy_extension::cedar::schema::mcp::merged_schema` for the
+//! conflict-detection rules an override must satisfy.
+//!
 //! The action is a thin adapter on top of
 //! [`sbproxy_extension::mcp::McpFederation`]. Tool aggregation, name
 //! collision handling, and the underlying transports all live in the
@@ -71,8 +98,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use sbproxy_extension::cedar::schema::{merged_schema, McpSchemaConfig};
+use sbproxy_extension::cedar::{compile_all as compile_cedar_policies, CedarEvaluator};
 use sbproxy_extension::cel::{CelSurface, CompiledCel};
 use sbproxy_extension::mcp::access_control::McpPrincipalSelector;
+use sbproxy_extension::mcp::cedar_hook::CedarMcpHook;
 use sbproxy_extension::mcp::rollout::{
     AdapterPair, PinSpec, RolloutPlan, RolloutSpec, SunsetBehavior, ToolRolloutSpec, VersionSpec,
 };
@@ -105,6 +135,12 @@ pub struct McpActionConfig {
     /// reference a label in this table. WOR-186.
     #[serde(default)]
     pub rbac_policies: HashMap<String, ToolAccessPolicy>,
+    /// Optional Cedar ABAC policy for MCP tool calls (WOR-2587). Runs
+    /// ALONGSIDE `rbac_policies` above, not instead of it. See the
+    /// module docs' `cedar_policies:` section and
+    /// [`McpCedarPolicyConfig`].
+    #[serde(default)]
+    pub cedar_policies: Option<McpCedarPolicyConfig>,
     /// List of upstream MCP servers to federate.
     #[serde(default)]
     pub federated_servers: Vec<McpFederatedServerConfig>,
@@ -239,6 +275,40 @@ pub struct McpActionConfig {
     /// default (`capture_arguments: false`). See [`McpAuditConfig`].
     #[serde(default)]
     pub mcp_audit: McpAuditConfig,
+}
+
+/// `cedar_policies:` block (WOR-2587): a Cedar ABAC policy for MCP
+/// tool calls, compiled once at config-load time and registered as a
+/// built-in `McpPolicyHook` alongside `rbac_policies`.
+///
+/// ```yaml
+/// origins:
+///   "mcp.example.com":
+///     action:
+///       type: mcp
+///       cedar_policies:
+///         policies: |
+///           permit(
+///               principal in AgentClass::"trusted",
+///               action == Action::"MCP::CallTool",
+///               resource == ToolInvocation::"gh/search_repos"
+///           );
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpCedarPolicyConfig {
+    /// Cedar policy source text: one or more `permit` / `forbid`
+    /// statements, in the format
+    /// `sbproxy_extension::cedar::compile_all` accepts. A `forbid`
+    /// annotated `@confirm("reason")` maps to a held-for-confirmation
+    /// verdict instead of an outright deny; see
+    /// `sbproxy_extension::cedar::evaluator`.
+    pub policies: String,
+    /// Optional workspace Cedar source appended to the default MCP
+    /// entity/action schema before `policies` is compiled. Names
+    /// declared here must not collide with the default schema; see
+    /// `sbproxy_extension::cedar::schema::mcp::merged_schema`.
+    #[serde(default)]
+    pub schema_override: Option<String>,
 }
 
 /// `mcp_audit:` block (WOR-2392): governs whether the
@@ -4415,6 +4485,39 @@ impl McpAction {
             policy.validate_quota_windows().map_err(|error| {
                 anyhow::anyhow!("mcp action: rbac_policies['{label}']: {error}")
             })?;
+        }
+
+        // WOR-2587: compile the optional Cedar ABAC policy and
+        // register it as a built-in `McpPolicyHook`, ALONGSIDE the
+        // `rbac_policies` gate above rather than instead of it -- RBAC
+        // is still consulted directly by `action_dispatch.rs` before
+        // any registered `McpPolicyHook` ever runs (see
+        // `sbproxy_extension::mcp::cedar_hook`'s module docs for the
+        // exact seam). A malformed policy or schema override is a
+        // config-load error, exactly like every other Cedar / CEL /
+        // Rego surface in this codebase: a caller that wants
+        // deliberate allow-all writes a single `permit(principal,
+        // action, resource);` policy rather than omitting the block.
+        if let Some(cedar_cfg) = &cfg.cedar_policies {
+            let schema_config = McpSchemaConfig {
+                mcp_primitives_enabled: true,
+                workspace_override: cedar_cfg.schema_override.clone(),
+            };
+            let (schema, _warnings) = merged_schema(&schema_config)
+                .map_err(|error| anyhow::anyhow!("mcp action: cedar_policies: {error}"))?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "mcp action: cedar_policies: default MCP schema unexpectedly disabled"
+                    )
+                })?;
+            let compiled =
+                compile_cedar_policies(&[("cedar_policies", cedar_cfg.policies.as_str())], None)
+                    .map_err(|error| anyhow::anyhow!("mcp action: cedar_policies: {error}"))?;
+            let evaluator = CedarEvaluator::new(compiled.policy_set, Some(schema))
+                .map_err(|error| anyhow::anyhow!("mcp action: cedar_policies: {error}"))?;
+            sbproxy_plugin::mcp::register_mcp_policy_hook(Arc::new(CedarMcpHook::new(Arc::new(
+                evaluator,
+            ))));
         }
 
         // WOR-2384 fix round 1, item 1 (critical): federation's

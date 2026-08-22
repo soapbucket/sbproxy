@@ -16,28 +16,32 @@
 //! sharing one instance across all dispatches is the documented
 //! pattern.
 //!
-//! The verdict mapping is intentionally narrow today. Cedar returns
-//! `Decision::{Allow, Deny}` with a `Diagnostics` blob that carries
-//! the matched policy ids and any evaluation errors. This maps that
-//! to:
+//! Cedar returns `Decision::{Allow, Deny}` with a `Diagnostics` blob
+//! that carries the matched policy ids and any evaluation errors.
+//! This maps that to:
 //!
 //! - `Decision::Allow` -> [`PolicyDecision::Allow`].
-//! - `Decision::Deny`  -> [`PolicyDecision::Deny`] with status 403 and
-//!   a message that includes the matched policy ids (Cedar's
-//!   `Diagnostics::reason()` exposes them).
+//! - `Decision::Deny`, no matched policy annotated `@confirm(...)` ->
+//!   [`PolicyDecision::Deny`] with status 403 and a message that
+//!   includes the matched policy ids (Cedar's `Diagnostics::reason()`
+//!   exposes them).
+//! - `Decision::Deny`, a matched `forbid` annotated
+//!   `@confirm("reason")` -> [`PolicyDecision::Confirm`] with that
+//!   reason text (WOR-2587). This is how a Cedar-authored policy asks
+//!   for human-in-the-loop approval rather than an outright refusal:
+//!   the annotation is inert to Cedar's own evaluator (annotations
+//!   never affect which policy fires), so the same source stays a
+//!   plain `forbid` from Cedar's point of view and only sbproxy's
+//!   verdict mapping treats it specially.
 //! - Bridge or request-construction errors short-circuit to
 //!   [`PolicyDecision::Deny`] with status 500 and a structured
 //!   reason. This is a deliberate fail-closed posture: a malformed
 //!   request should never be silently allowed because the bridge
 //!   could not translate it.
-//!
-//! A `forbid` annotation channel that maps onto
-//! [`PolicyDecision::Confirm`] is a natural extension once a
-//! rationale-rendering caller exists to consume it; today the
-//! Allow / Deny pair is sufficient to exercise the full
-//! compile-evaluate loop end to end.
 
-use cedar_policy::{Authorizer, Decision, Entities, PolicySet, Request, Schema};
+use cedar_policy::{
+    Authorizer, Context, Decision, Entities, EntityUid, PolicySet, Request, Schema,
+};
 use sbproxy_plugin::PolicyDecision;
 use thiserror::Error;
 
@@ -165,9 +169,30 @@ impl CedarEvaluator {
         match response.decision() {
             Decision::Allow => PolicyDecision::Allow,
             Decision::Deny => {
-                let matched = response
-                    .diagnostics()
-                    .reason()
+                let matched_ids: Vec<_> = response.diagnostics().reason().collect();
+
+                // WOR-2587: a `forbid` annotated `@confirm("reason")`
+                // asks for human-in-the-loop approval rather than an
+                // outright refusal. The first matched id carrying the
+                // annotation wins; Cedar itself already resolved
+                // "which forbid(s) fired" via `Diagnostics::reason()`,
+                // so this only decides how sbproxy reports that
+                // outcome upstream, not whether the request was
+                // denied.
+                if let Some(reason) = matched_ids
+                    .iter()
+                    .find_map(|id| self.policy_set.annotation(id, "confirm"))
+                {
+                    let reason = if reason.is_empty() {
+                        "cedar policy requires confirmation".to_string()
+                    } else {
+                        reason.to_string()
+                    };
+                    return PolicyDecision::confirm(reason, None, None);
+                }
+
+                let matched = matched_ids
+                    .iter()
                     .map(|id| id.to_string())
                     .collect::<Vec<_>>()
                     .join(", ");
@@ -180,6 +205,53 @@ impl CedarEvaluator {
                     status: 403,
                     message,
                 }
+            }
+        }
+    }
+
+    /// Evaluate a request built directly from an `EntityUid` triple,
+    /// with an empty Cedar context, against this evaluator's own
+    /// schema (when one is configured).
+    ///
+    /// Callers whose principal / resource ids come from untrusted
+    /// request data (an MCP `agent_id`, a `tool_name`) build their
+    /// [`EntityUid`]s via [`EntityUid::from_type_name_and_id`] rather
+    /// than interpolating the raw string into Cedar source-text syntax
+    /// and parsing it through [`CedarRequest`] / [`Self::evaluate`]: a
+    /// value containing `"` or other Cedar syntax characters would
+    /// otherwise either fail to parse or be interpreted as additional
+    /// Cedar syntax. `EntityId::new` (used to build the ids that go
+    /// into those `EntityUid`s) is infallible and escapes arbitrary
+    /// input safely, which `EntityUid::from_str` on a hand-assembled
+    /// string does not guarantee. See
+    /// `crate::mcp::cedar_hook::CedarMcpHook` for the production
+    /// caller.
+    ///
+    /// # Errors surfaced as Deny
+    ///
+    /// A schema-validation failure at request-construction time (the
+    /// action does not apply to the given principal / resource types,
+    /// for example) fails closed through the same
+    /// [`RequestBridgeError::InvalidRequest`] path
+    /// [`super::request_bridge::build_request`] uses, so callers see
+    /// one consistent Deny message shape regardless of which bridge
+    /// failed.
+    pub fn evaluate_uids(
+        &self,
+        principal: EntityUid,
+        action: EntityUid,
+        resource: EntityUid,
+    ) -> PolicyDecision {
+        match Request::new(
+            principal,
+            action,
+            resource,
+            Context::empty(),
+            self.schema.as_ref(),
+        ) {
+            Ok(request) => self.evaluate_cedar_request(&request),
+            Err(err) => {
+                deny_from_bridge_error(RequestBridgeError::InvalidRequest(format!("{err}")))
             }
         }
     }
@@ -292,5 +364,80 @@ mod tests {
             }
             other => panic!("expected Deny, got {other:?}"),
         }
+    }
+
+    /// WOR-2587: a `forbid` annotated `@confirm("reason")` maps to
+    /// [`PolicyDecision::Confirm`] carrying that reason text, instead
+    /// of the plain `Deny` an unannotated `forbid` produces.
+    #[test]
+    fn confirm_annotated_forbid_maps_to_confirm_verdict() {
+        let src = r#"
+            permit(principal, action, resource);
+
+            @confirm("high-risk tool requires human approval")
+            forbid(principal == User::"risky", action, resource);
+        "#;
+        let compiled = compile_all(&[("t", src)], None).expect("compile");
+        let evaluator = CedarEvaluator::new(compiled.policy_set, None).expect("new evaluator");
+
+        let req = CedarRequest::new(r#"User::"risky""#, r#"Action::"view""#, r#"Doc::"d""#);
+        match evaluator.evaluate(&req) {
+            PolicyDecision::Confirm { reason, .. } => {
+                assert_eq!(reason, "high-risk tool requires human approval");
+            }
+            other => panic!("expected Confirm, got {other:?}"),
+        }
+    }
+
+    /// An unannotated `forbid` still produces a plain `Deny`: the
+    /// `@confirm` mapping only fires for policies that actually carry
+    /// the annotation, so existing forbid-only policy sets keep their
+    /// current behaviour unchanged.
+    #[test]
+    fn unannotated_forbid_still_denies() {
+        let src = r#"
+            permit(principal, action, resource);
+            forbid(principal == User::"banned", action, resource);
+        "#;
+        let compiled = compile_all(&[("t", src)], None).expect("compile");
+        let evaluator = CedarEvaluator::new(compiled.policy_set, None).expect("new evaluator");
+
+        let req = CedarRequest::new(r#"User::"banned""#, r#"Action::"view""#, r#"Doc::"d""#);
+        assert!(matches!(
+            evaluator.evaluate(&req),
+            PolicyDecision::Deny { status: 403, .. }
+        ));
+    }
+
+    /// [`CedarEvaluator::evaluate_uids`] round-trips a request built
+    /// from `EntityUid`s directly (the shape `CedarMcpHook` uses),
+    /// rather than through the text-based [`CedarRequest`] bridge.
+    #[test]
+    fn evaluate_uids_round_trips_permit_and_forbid() {
+        use cedar_policy::{EntityId, EntityTypeName};
+        use std::str::FromStr;
+
+        let src = r#"
+            permit(principal == User::"alice", action, resource);
+            forbid(principal == User::"mallory", action, resource);
+        "#;
+        let compiled = compile_all(&[("t", src)], None).expect("compile");
+        let evaluator = CedarEvaluator::new(compiled.policy_set, None).expect("new evaluator");
+
+        let user_ty = EntityTypeName::from_str("User").expect("User type");
+        let action = EntityUid::from_str(r#"Action::"view""#).expect("action uid");
+        let resource = EntityUid::from_str(r#"Doc::"d""#).expect("resource uid");
+
+        let alice = EntityUid::from_type_name_and_id(user_ty.clone(), EntityId::new("alice"));
+        assert_eq!(
+            evaluator.evaluate_uids(alice, action.clone(), resource.clone()),
+            PolicyDecision::Allow
+        );
+
+        let mallory = EntityUid::from_type_name_and_id(user_ty, EntityId::new("mallory"));
+        assert!(matches!(
+            evaluator.evaluate_uids(mallory, action, resource),
+            PolicyDecision::Deny { status: 403, .. }
+        ));
     }
 }
