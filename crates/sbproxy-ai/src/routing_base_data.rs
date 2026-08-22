@@ -10,8 +10,15 @@
 //! ```text
 //! ai.catalog["gpt-4o-mini"].input_per_million   // USD per million prompt tokens
 //! ai.catalog["gpt-4o-mini"].output_per_million  // USD per million completion tokens
-//! ai.catalog["gpt-4o-mini"].context_window      // tokens
+//! ai.catalog["gpt-4o-mini"].context_window      // prompt tokens
+//! ai.catalog["gpt-4o-mini"].max_output_tokens   // completion tokens
 //! ```
+//!
+//! `max_output_tokens` appears only for models an operator's
+//! `rate_card:` declares one for; nothing built in carries a completion
+//! cap. Both token fields come from the same resolution the
+//! `/v1/models` listing publishes, so a policy and a client are never
+//! told different numbers for one model.
 //!
 //! Prices are USD per million tokens, the same unit the operator already
 //! writes in `model_prices` (`input_per_million: 3.0`), so a policy compares
@@ -88,15 +95,20 @@ fn catalog_entries(providers: &[ProviderConfig]) -> HashMap<String, CelValue> {
                 CelValue::Float(price.output_per_million),
             );
         }
-        // The price layers match case-insensitively but the window table is
-        // exact; fall back to the lowercase form so a mixed-case declared
-        // model does not end up priced-but-windowless.
-        let window = crate::context_window::model_context_window(model)
-            .or_else(|| crate::context_window::model_context_window(&model.to_lowercase()));
-        if let Some(window) = window {
+        // WOR-2647: one resolution, shared with the `/v1/models`
+        // listing. Two derivations of the same fact is how a policy and
+        // a client end up reading different windows for one model.
+        let facts = crate::context_window::model_facts(model);
+        if let Some(window) = facts.context_window {
             entry.insert(
                 "context_window".to_string(),
                 CelValue::Int(i64::try_from(window).unwrap_or(i64::MAX)),
+            );
+        }
+        if let Some(max_output) = facts.max_output_tokens {
+            entry.insert(
+                "max_output_tokens".to_string(),
+                CelValue::Int(i64::try_from(max_output).unwrap_or(i64::MAX)),
             );
         }
         // A model this process knows nothing about would be an entry of

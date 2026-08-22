@@ -58,6 +58,66 @@ struct LogicalModelAggregate {
     /// model publishes. `BTreeSet` so the wire order is stable and a
     /// name a second provider repeats appears once.
     capabilities: BTreeSet<&'static str>,
+    /// Tightest known token limits across everything serving this name
+    /// (WOR-2647). For a plain model id every contributor resolves the
+    /// same numbers, so the narrowing is a no-op; it earns its keep on a
+    /// `model_groups:` entry, whose members may serve different upstream
+    /// model ids with different windows.
+    facts: sbproxy_ai::context_window::ModelFacts,
+}
+
+impl LogicalModelAggregate {
+    /// Count one provider entry's replicas toward this logical model.
+    fn absorb_availability(
+        &mut self,
+        provider: &sbproxy_ai::ProviderConfig,
+        managed: &BTreeMap<String, ManagedDeploymentAvailability>,
+    ) {
+        if provider.is_managed_model() {
+            let availability = provider
+                .deployment
+                .as_deref()
+                .and_then(|deployment| managed.get(deployment))
+                .copied()
+                .unwrap_or_default();
+            self.ready_replicas = self
+                .ready_replicas
+                .saturating_add(availability.ready_replicas);
+            self.cold_replicas = self
+                .cold_replicas
+                .saturating_add(availability.cold_replicas);
+            self.desired_replicas = self
+                .desired_replicas
+                .saturating_add(availability.desired_replicas);
+        } else {
+            self.ready_replicas = self.ready_replicas.saturating_add(1);
+            self.desired_replicas = self.desired_replicas.saturating_add(1);
+        }
+    }
+
+    /// Narrow the published limits to the tightest a contributor
+    /// declares.
+    ///
+    /// A caller sizing a prompt to a name that fronts several
+    /// deployments has to fit whichever one serves the request, so the
+    /// floor is the only number that is true for every outcome.
+    /// Publishing the maximum would let a caller build a prompt the
+    /// smaller member rejects.
+    ///
+    /// A contributor whose limit is unknown does not lower the floor:
+    /// unknown is not zero, and treating it as one would erase a limit
+    /// the other members do declare.
+    fn absorb_facts(&mut self, facts: sbproxy_ai::context_window::ModelFacts) {
+        fn floor(current: Option<u64>, candidate: Option<u64>) -> Option<u64> {
+            match (current, candidate) {
+                (Some(current), Some(candidate)) => Some(current.min(candidate)),
+                (Some(current), None) => Some(current),
+                (None, candidate) => candidate,
+            }
+        }
+        self.facts.context_window = floor(self.facts.context_window, facts.context_window);
+        self.facts.max_output_tokens = floor(self.facts.max_output_tokens, facts.max_output_tokens);
+    }
 }
 
 /// Build an OpenAI-compatible logical model list without node or endpoint data.
@@ -107,13 +167,22 @@ pub fn logical_model_listing(
 ) -> serde_json::Value {
     let mut models = BTreeMap::<String, LogicalModelAggregate>::new();
 
-    for provider in config.providers.iter().filter(|provider| {
+    // Hoisted so the alias and group passes below narrow by the same
+    // rule as the provider scan. Two copies of a visibility predicate is
+    // how one of them ends up wider than the other.
+    let provider_filter = |provider: &sbproxy_ai::ProviderConfig| {
         provider.enabled
             && (allowed_providers.is_empty()
                 || allowed_providers
                     .iter()
                     .any(|allowed| allowed == provider.name.as_str()))
-    }) {
+    };
+
+    for provider in config
+        .providers
+        .iter()
+        .filter(|provider| provider_filter(provider))
+    {
         // WOR-2647: the capability names this entry may advertise are
         // the surface matrix the dispatch path enforces, intersected
         // with the provider catalog's per-vendor claims. Resolved once
@@ -132,34 +201,12 @@ pub fn logical_model_listing(
         }
 
         for public_model in public_models {
-            if !config.is_model_allowed(public_model)
-                || blocked_models.iter().any(|blocked| blocked == public_model)
-                || (!allowed_models.is_empty()
-                    && !allowed_models.iter().any(|allowed| allowed == public_model))
-            {
+            if !model_visible(config, public_model, allowed_models, blocked_models) {
                 continue;
             }
             let aggregate = models.entry(public_model.to_string()).or_default();
-            if provider.is_managed_model() {
-                let availability = provider
-                    .deployment
-                    .as_deref()
-                    .and_then(|deployment| managed.get(deployment))
-                    .copied()
-                    .unwrap_or_default();
-                aggregate.ready_replicas = aggregate
-                    .ready_replicas
-                    .saturating_add(availability.ready_replicas);
-                aggregate.cold_replicas = aggregate
-                    .cold_replicas
-                    .saturating_add(availability.cold_replicas);
-                aggregate.desired_replicas = aggregate
-                    .desired_replicas
-                    .saturating_add(availability.desired_replicas);
-            } else {
-                aggregate.ready_replicas = aggregate.ready_replicas.saturating_add(1);
-                aggregate.desired_replicas = aggregate.desired_replicas.saturating_add(1);
-            }
+            aggregate.absorb_availability(provider, managed);
+            aggregate.absorb_facts(sbproxy_ai::context_window::model_facts(public_model));
             // A logical model can be served by several entries, and a
             // request naming it can land on any of them. Union rather
             // than intersect, matching the 501 gate, which admits a
@@ -172,6 +219,23 @@ pub fn logical_model_listing(
         }
     }
 
+    // WOR-2647: a `model_aliases:` entry and a `model_groups:` entry are
+    // both names a caller may send as `model`, and neither appears in
+    // any provider's `models:` list, so the scan above cannot see
+    // either. A client that reads this listing to learn what it may
+    // address would otherwise be told about every name except the ones
+    // the operator published for it.
+    //
+    // Both passes gate on the model id the name **resolves to**, never on
+    // the name itself, because that is what the dispatch path gates. An
+    // alias resolves before every model gate, so a credential whose
+    // `allowed_models` names the upstream id admits a request that asked
+    // for the alias; filtering the listing on the alias name instead
+    // would hide a name that works.
+    let visible = |model: &str| model_visible(config, model, allowed_models, blocked_models);
+    absorb_alias_entries(config, &mut models, &provider_filter, &visible, managed);
+    absorb_group_entries(config, &mut models, &provider_filter, &visible, managed);
+
     let data = models
         .into_iter()
         .map(|(id, aggregate)| {
@@ -182,9 +246,16 @@ pub fn logical_model_listing(
             } else {
                 "unavailable"
             };
-            serde_json::json!({
+            let mut entry = serde_json::json!({
                 "id": id,
                 "object": "model",
+                // The OpenAI `Model` object declares `created` required,
+                // and an SDK-shaped client refuses to deserialize a list
+                // without it. This gateway does not know when a model was
+                // published and will not invent a date, so the field is
+                // the epoch constant: present for the schema, and not a
+                // claim about anything.
+                "created": 0,
                 "owned_by": "sbproxy",
                 "availability": {
                     "state": state,
@@ -192,11 +263,144 @@ pub fn logical_model_listing(
                     "desired_replicas": aggregate.desired_replicas,
                 },
                 "capabilities": aggregate.capabilities,
-            })
+            });
+            // Omitted rather than null when unknown, the same rule the
+            // routing base data applies: a client can tell "the gateway
+            // was not told" from "the limit is zero".
+            if let Some(object) = entry.as_object_mut() {
+                if let Some(window) = aggregate.facts.context_window {
+                    object.insert("context_window".to_string(), window.into());
+                }
+                if let Some(max_output) = aggregate.facts.max_output_tokens {
+                    object.insert("max_output_tokens".to_string(), max_output.into());
+                }
+            }
+            entry
         })
         .collect::<Vec<_>>();
 
     serde_json::json!({ "object": "list", "data": data })
+}
+
+/// Whether a model id survives the origin's allow/block lists and the
+/// calling credential's own two lists.
+fn model_visible(
+    config: &sbproxy_ai::handler::AiHandlerConfig,
+    model: &str,
+    allowed_models: &[String],
+    blocked_models: &[String],
+) -> bool {
+    config.is_model_allowed(model)
+        && !blocked_models.iter().any(|blocked| blocked == model)
+        && (allowed_models.is_empty() || allowed_models.iter().any(|allowed| allowed == model))
+}
+
+/// Add one entry per `model_aliases:` name (WOR-2647).
+///
+/// The alias is gated on the model id it **resolves to**, not on its own
+/// name, which is exactly what the dispatch path gates: the alias
+/// resolves before every model gate, so a `blocked_models` entry
+/// naming the upstream id blocks the alias too, and one naming the alias
+/// is never consulted. Listing the alias when its target is blocked
+/// would advertise a name that answers 403.
+///
+/// Facts and capabilities come from the resolved id and from the
+/// providers that can actually serve it: the pinned provider when the
+/// alias names one, every provider declaring the id when it does not.
+fn absorb_alias_entries(
+    config: &sbproxy_ai::handler::AiHandlerConfig,
+    models: &mut BTreeMap<String, LogicalModelAggregate>,
+    provider_filter: &dyn Fn(&sbproxy_ai::ProviderConfig) -> bool,
+    visible: &dyn Fn(&str) -> bool,
+    managed: &BTreeMap<String, ManagedDeploymentAvailability>,
+) {
+    for alias in &config.model_aliases {
+        let name = alias.alias.as_str();
+        let target = alias.model_id.as_str();
+        if !visible(target) {
+            continue;
+        }
+        let mut aggregate = LogicalModelAggregate::default();
+        let mut served = false;
+        for provider in config.providers.iter().filter(|p| provider_filter(p)) {
+            let pinned_elsewhere = alias
+                .provider
+                .as_ref()
+                .is_some_and(|pin| pin.as_str() != provider.name.as_str());
+            if pinned_elsewhere {
+                continue;
+            }
+            // An unpinned alias spreads over every provider declaring
+            // the target. A provider that enumerates no models defers to
+            // its upstream catalog and is a wildcard on the dispatch
+            // path, so it counts here too.
+            let serves = provider.models.is_empty()
+                || provider.models.iter().any(|model| model.as_str() == target);
+            if !serves {
+                continue;
+            }
+            served = true;
+            aggregate.absorb_availability(provider, managed);
+            aggregate
+                .capabilities
+                .extend(sbproxy_ai::api_routes::surface_capability_names(provider));
+        }
+        if !served {
+            continue;
+        }
+        aggregate.absorb_facts(sbproxy_ai::context_window::model_facts(target));
+        models.insert(name.to_string(), aggregate);
+    }
+}
+
+/// Add one entry per `model_groups:` name (WOR-2657, WOR-2647).
+///
+/// A group's members may serve different upstream model ids, so the
+/// entry answers the three questions a client asks in the three ways
+/// that are true for every member it could land on: capabilities are the
+/// **union**, matching the 501 gate, which admits a surface when any
+/// eligible provider handles it; the token limits are the **floor**,
+/// because a prompt has to fit whichever member serves it; and
+/// availability is the sum, as it is for a model several providers
+/// declare.
+///
+/// A member whose model the gates refuse contributes nothing, and a
+/// group with no surviving member is left off entirely.
+fn absorb_group_entries(
+    config: &sbproxy_ai::handler::AiHandlerConfig,
+    models: &mut BTreeMap<String, LogicalModelAggregate>,
+    provider_filter: &dyn Fn(&sbproxy_ai::ProviderConfig) -> bool,
+    visible: &dyn Fn(&str) -> bool,
+    managed: &BTreeMap<String, ManagedDeploymentAvailability>,
+) {
+    for group in config.model_group_registry().groups() {
+        let mut aggregate = LogicalModelAggregate::default();
+        let mut served = false;
+        for member in &group.members {
+            let Some(provider) = config
+                .providers
+                .iter()
+                .find(|provider| provider.name.as_str() == member.provider.as_str())
+            else {
+                continue;
+            };
+            if !provider_filter(provider) || !visible(member.model.as_str()) {
+                continue;
+            }
+            served = true;
+            aggregate.absorb_availability(provider, managed);
+            aggregate
+                .capabilities
+                .extend(sbproxy_ai::api_routes::surface_capability_names(provider));
+            aggregate.absorb_facts(sbproxy_ai::context_window::model_facts(
+                member.model.as_str(),
+            ));
+        }
+        if !served {
+            continue;
+        }
+        models.insert(group.name.as_str().to_string(), aggregate);
+    }
 }
 
 /// Response headers that expose only logical model and bounded route class.

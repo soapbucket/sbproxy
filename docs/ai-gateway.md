@@ -114,8 +114,32 @@ OpenAI-compatible logical list built from its configured eligible providers and
 models. Managed entries report aggregate `ready`, `cold`, or `unavailable`
 state, ready and desired replica counts, and bounded capability names. The list
 omits worker identity, engine ports, and private endpoints. It does not call an
-ordinary provider's native model-list endpoint or reproduce provider-specific
-model metadata.
+ordinary provider's native model-list endpoint.
+
+The list carries every name a caller may send as `model`, not only the ids in
+the providers' `models:` lists: a [`model_aliases`](#model-aliases) entry
+appears under its own name, and a [`model_groups`](#model-groups) entry appears
+under the group name. An alias is listed under the gates that apply to the id it
+resolves to, so an alias whose target `blocked_models` refuses is left off
+rather than advertised as a name that answers 403.
+
+Each entry also carries `created`, which the OpenAI `Model` object declares
+required and without which an SDK-shaped client refuses to deserialize the
+response. This gateway does not know when a model was published and will not
+invent a date, so the value is the epoch constant: present for the schema, and
+not a claim about anything.
+
+Two token limits appear where this process knows them: `context_window` and
+`max_output_tokens`. Both are **omitted rather than nulled** when it does not,
+so a client can tell "the gateway was not told" from "the limit is zero". The
+window comes from the built-in table the compression pipeline already sizes
+prompts against, falling back to the `max_input_tokens` an operator's
+[`rate_card:`](#model-prices) declares. `max_output_tokens` has only the rate
+card as a source: nothing built in carries a completion cap, so an origin with
+no rate card publishes no completion limits. Both are the same resolution the
+`ai.catalog` routing base data reads, so a routing policy and a client are never
+told different numbers for one model. No provider-specific model metadata beyond
+these is reproduced.
 
 Each entry's `capabilities` array names the surfaces this gateway will forward
 for that model and that the provider catalog records the vendor as exposing.

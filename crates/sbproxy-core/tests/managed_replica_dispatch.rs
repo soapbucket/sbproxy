@@ -648,3 +648,293 @@ fn vertex_listing_advertises_the_embeddings_it_serves() {
     );
     assert!(listed_capabilities(&listing).contains("embeddings"));
 }
+
+// --- Model capability metadata on the listing (WOR-2647) ---
+
+/// Read one listed entry by id.
+fn listed_entry<'a>(response: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
+    response["data"]
+        .as_array()
+        .expect("data array")
+        .iter()
+        .find(|entry| entry["id"] == id)
+        .unwrap_or_else(|| panic!("{id} is listed: {response}"))
+}
+
+/// The OpenAI `Model` object declares `created` required, so an
+/// SDK-shaped client refuses a list without it. Red on main, where
+/// nothing emits the field.
+#[test]
+fn every_listed_model_carries_the_fields_an_openai_sdk_requires() {
+    let config = single_provider_config("openai");
+    let listing = logical_model_listing(&config, &[], &[], &[], &BTreeMap::new());
+    let entry = listed_entry(&listing, "m");
+    for field in ["id", "object", "created", "owned_by"] {
+        assert!(
+            entry.get(field).is_some(),
+            "the OpenAI Model object requires {field}: {entry}"
+        );
+    }
+    assert!(entry["created"].is_u64(), "created must be an integer");
+    assert_eq!(entry["object"], "model");
+}
+
+/// A model the process knows a window for publishes it; one it knows
+/// nothing about omits the field rather than guessing a default, which
+/// is the same rule the routing base data applies. Red on main: the
+/// listing carried no token limits at all.
+#[test]
+fn the_listing_publishes_a_known_context_window_and_omits_an_unknown_one() {
+    let config: sbproxy_ai::handler::AiHandlerConfig = serde_json::from_value(serde_json::json!({
+        "providers": [{
+            "name": "entry",
+            "provider_type": "openai",
+            "api_key": "test",
+            "models": ["gpt-4o-mini", "listing-unknown-model"]
+        }]
+    }))
+    .expect("provider fixture");
+    let listing = logical_model_listing(&config, &[], &[], &[], &BTreeMap::new());
+
+    assert_eq!(
+        listed_entry(&listing, "gpt-4o-mini")["context_window"],
+        serde_json::json!(128_000),
+        "the static window table is the source, and it knows this model"
+    );
+    let unknown = listed_entry(&listing, "listing-unknown-model");
+    assert!(
+        unknown.get("context_window").is_none(),
+        "an unknown window is absent, not null and not a guessed default: {unknown}"
+    );
+    assert!(
+        unknown.get("max_output_tokens").is_none(),
+        "nothing in this process holds a completion cap without a rate card: {unknown}"
+    );
+}
+
+/// A `model_aliases:` entry is a name a caller may send as `model`, so a
+/// client reading the listing has to see it. Red on main: aliases were
+/// invisible, and only the upstream ids appeared.
+#[test]
+fn an_alias_is_listed_under_its_own_name_with_its_targets_facts() {
+    let config: sbproxy_ai::handler::AiHandlerConfig = serde_json::from_value(serde_json::json!({
+        "providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "test",
+            "models": ["gpt-4o-mini"]
+        }],
+        "model_aliases": [{"alias": "fast", "provider": "openai", "model_id": "gpt-4o-mini"}]
+    }))
+    .expect("alias fixture");
+    let listing = logical_model_listing(&config, &[], &[], &[], &BTreeMap::new());
+
+    let fast = listed_entry(&listing, "fast");
+    assert_eq!(fast["context_window"], serde_json::json!(128_000));
+    assert_eq!(fast["availability"]["state"], "ready");
+    assert!(fast["capabilities"]
+        .as_array()
+        .expect("capabilities")
+        .contains(&serde_json::json!("chat_completions")));
+    // The upstream id is still listed on its own.
+    assert_eq!(listed_entry(&listing, "gpt-4o-mini")["id"], "gpt-4o-mini");
+}
+
+/// An alias is gated on the id it resolves to, which is exactly what the
+/// dispatch path gates: the alias resolves before every model gate, so a
+/// `blocked_models` entry naming the upstream id blocks the alias too.
+/// Listing it would advertise a name that answers 403.
+#[test]
+fn an_alias_whose_target_is_blocked_is_not_listed() {
+    let config: sbproxy_ai::handler::AiHandlerConfig = serde_json::from_value(serde_json::json!({
+        "providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "test",
+            "models": ["gpt-4o-mini", "gpt-4o"]
+        }],
+        "blocked_models": ["gpt-4o-mini"],
+        "model_aliases": [
+            {"alias": "fast", "provider": "openai", "model_id": "gpt-4o-mini"},
+            {"alias": "smart", "provider": "openai", "model_id": "gpt-4o"}
+        ]
+    }))
+    .expect("alias fixture");
+    let listing = logical_model_listing(&config, &[], &[], &[], &BTreeMap::new());
+    let ids: Vec<&str> = listing["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .map(|entry| entry["id"].as_str().expect("id"))
+        .collect();
+
+    assert!(
+        !ids.contains(&"fast"),
+        "an alias must not be a way around blocked_models: {ids:?}"
+    );
+    assert!(ids.contains(&"smart"));
+    assert!(!ids.contains(&"gpt-4o-mini"));
+}
+
+/// A named model group is a third kind of callable `model` name. Its
+/// entry reports the union of its members' capabilities and the floor of
+/// their windows, because a caller's prompt has to fit whichever member
+/// serves it. Red on main: groups do not exist in the listing.
+#[test]
+fn a_model_group_is_listed_with_the_union_of_capabilities_and_the_floor_window() {
+    let config: sbproxy_ai::handler::AiHandlerConfig = serde_json::from_value(serde_json::json!({
+        "providers": [
+            {"name": "big", "provider_type": "openai", "api_key": "t", "models": ["gpt-4o-mini"]},
+            {"name": "small", "provider_type": "openai", "api_key": "t", "models": ["gpt-4"]}
+        ],
+        "model_groups": [{
+            "name": "pool",
+            "members": [
+                {"provider": "big", "model": "gpt-4o-mini"},
+                {"provider": "small", "model": "gpt-4"}
+            ]
+        }]
+    }))
+    .expect("group fixture");
+    let listing = logical_model_listing(&config, &[], &[], &[], &BTreeMap::new());
+
+    let pool = listed_entry(&listing, "pool");
+    // gpt-4o-mini is 128k and gpt-4 is 8_192. Publishing the larger
+    // would let a caller build a prompt the smaller member rejects.
+    assert_eq!(
+        pool["context_window"],
+        serde_json::json!(8_192),
+        "a group reports the floor across its members, not the maximum"
+    );
+    assert_eq!(pool["availability"]["ready_replicas"], 2);
+    assert!(pool["capabilities"]
+        .as_array()
+        .expect("capabilities")
+        .contains(&serde_json::json!("chat_completions")));
+}
+
+/// A group member whose model the block list refuses contributes
+/// nothing, and a group with no surviving member is left off entirely.
+#[test]
+fn a_group_with_every_member_blocked_is_not_listed() {
+    let config: sbproxy_ai::handler::AiHandlerConfig = serde_json::from_value(serde_json::json!({
+        "providers": [
+            {"name": "big", "provider_type": "openai", "api_key": "t", "models": ["gpt-4o-mini"]}
+        ],
+        "blocked_models": ["gpt-4o-mini"],
+        "model_groups": [{
+            "name": "pool",
+            "members": [{"provider": "big", "model": "gpt-4o-mini"}]
+        }]
+    }))
+    .expect("group fixture");
+    let listing = logical_model_listing(&config, &[], &[], &[], &BTreeMap::new());
+    assert!(
+        listing["data"]
+            .as_array()
+            .expect("data")
+            .iter()
+            .all(|entry| entry["id"] != "pool"),
+        "a group whose every member is refused must not be advertised: {listing}"
+    );
+}
+
+/// `max_output_tokens` has exactly one source in this process: the
+/// operator's LiteLLM rate card. The parser used to read the two cost
+/// keys and discard the two limit keys, so the field could never be
+/// emitted no matter what the listing asked for. This drives the whole
+/// operator path, `rate_card:` file -> price table -> `model_facts` ->
+/// the wire.
+///
+/// The card names one model nothing else in this binary looks up, so
+/// installing the process-global price table here cannot change another
+/// test's answer: every other model still resolves its window from the
+/// static table exactly as before.
+#[test]
+fn a_rate_card_puts_max_output_tokens_on_the_wire() {
+    let card = std::env::temp_dir().join("sbproxy-listing-rate-card.json");
+    std::fs::write(
+        &card,
+        r#"{
+            "ratecard-only-model": {
+                "input_cost_per_token": 0.000001,
+                "output_cost_per_token": 0.000002,
+                "max_input_tokens": 64000,
+                "max_output_tokens": 4096
+            }
+        }"#,
+    )
+    .expect("the rate card fixture is written");
+
+    // `from_config` installs the process-global price table, which is
+    // the seam an operator reaches through `rate_card:`.
+    let config = sbproxy_ai::handler::AiHandlerConfig::from_config(serde_json::json!({
+        "providers": [{
+            "name": "entry",
+            "provider_type": "openai",
+            "api_key": "test",
+            "models": ["ratecard-only-model"]
+        }],
+        "rate_card": card.to_string_lossy(),
+    }))
+    .expect("provider fixture");
+    let listing = logical_model_listing(&config, &[], &[], &[], &BTreeMap::new());
+
+    let entry = listed_entry(&listing, "ratecard-only-model");
+    assert_eq!(entry["max_output_tokens"], serde_json::json!(4_096));
+    assert_eq!(
+        entry["context_window"],
+        serde_json::json!(64_000),
+        "the static table does not know this model, so the card's max_input_tokens answers"
+    );
+    let _ = std::fs::remove_file(&card);
+}
+
+/// A credential's `allowed_models` names upstream ids, and the dispatch
+/// path judges it on the id an alias or group resolves to. The listing
+/// has to gate the same way. Filtering on the alias or group name
+/// instead would hide names the caller can in fact use, which is a
+/// listing narrower than the gate rather than wider.
+#[test]
+fn a_credential_allowlist_of_upstream_ids_still_lists_the_alias_and_the_group() {
+    let config: sbproxy_ai::handler::AiHandlerConfig = serde_json::from_value(serde_json::json!({
+        "providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "test",
+            "models": ["gpt-4o-mini"]
+        }],
+        "model_aliases": [{"alias": "fast", "provider": "openai", "model_id": "gpt-4o-mini"}],
+        "model_groups": [{
+            "name": "pool",
+            "members": [{"provider": "openai", "model": "gpt-4o-mini"}]
+        }]
+    }))
+    .expect("alias + group fixture");
+
+    // The credential may use `gpt-4o-mini` and nothing else. It has never
+    // heard of `fast` or `pool`, and does not need to: both resolve to
+    // the id it allows before any credential gate runs.
+    let allowed = vec!["gpt-4o-mini".to_string()];
+    let listing = logical_model_listing(&config, &[], &allowed, &[], &BTreeMap::new());
+    let ids: Vec<&str> = listing["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .map(|entry| entry["id"].as_str().expect("id"))
+        .collect();
+
+    assert!(ids.contains(&"fast"), "{ids:?}");
+    assert!(ids.contains(&"pool"), "{ids:?}");
+    assert!(ids.contains(&"gpt-4o-mini"), "{ids:?}");
+
+    // The other direction still holds: blocking the resolved id removes
+    // every name that fronts it.
+    let blocked = vec!["gpt-4o-mini".to_string()];
+    let blocked_listing = logical_model_listing(&config, &[], &[], &blocked, &BTreeMap::new());
+    assert_eq!(
+        blocked_listing["data"].as_array().expect("data").len(),
+        0,
+        "blocking the upstream id must remove the alias and the group with it: {blocked_listing}"
+    );
+}
