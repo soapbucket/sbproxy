@@ -973,6 +973,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_ai_model_group_selections_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_model_group_selection"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        registry: Registry::Default,
+        labels: &["group", "provider"],
+        description: "Named model group member selections: which group a request addressed and which provider's deployment served it. Both labels are operator-declared config names.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_ai_prefix_affinity_decisions_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_prefix_affinity_decision"),

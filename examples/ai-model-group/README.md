@@ -4,9 +4,11 @@
 
 ![AI gateway: model group (one public name, several deployments)](../../docs/assets/ai-model-group.gif)
 
-A model group is LiteLLM's core load-balancing abstraction: several deployments share one public model name, and requests to that name are spread across them. SBproxy expresses it directly. List each deployment as a provider whose `models` list declares the same model. The requested model selects the group (model-based provider routing), and the `routing` strategy load-balances across the matching deployments. Outlier detection ejects a failing deployment without taking the group offline.
+A model group is one public name your callers send as `model`, served by several deployments. A `model_groups:` entry names the members: each one is a provider on this action, the upstream model id that provider serves, and its share of traffic. Members may serve **different** model ids, which is what a same-model-name pool cannot express.
 
-This is also the shape the LiteLLM importer emits: two `model_list` entries that share a `model_name` become two providers declaring that model. See [docs/migration-litellm.md](../../docs/migration-litellm.md).
+This example splits the public name `chat` 9:1 across two deployments that serve two different model ids: `gpt-4o-mini` on one and `gpt-4o-mini-preview` on the other. The group carries its own `routing: weighted`, independent of the action's `routing: round_robin`.
+
+The simpler shape still works and is still right when every deployment serves the same model id: list each one as a provider whose `models:` declares that model, and the action's `routing` load-balances across them. The LiteLLM importer emits that shape from a `model_list` whose entries share a `model_name`. See [docs/migration-litellm.md](../../docs/migration-litellm.md).
 
 ## Run
 
@@ -17,13 +19,25 @@ make run CONFIG=examples/ai-model-group/sb.yml
 
 ## Try it
 
-Every request addresses the single public name; the group load-balances across the deployments:
+Every request addresses the single public name; the group picks a member and rewrites the model on the way out:
 
 ```bash
 $ curl -s http://127.0.0.1:8080/v1/chat/completions \
     -H 'Host: ai.local' -H 'Content-Type: application/json' \
-    -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"In one sentence, what is load balancing?"}]}' \
+    -d '{"model":"chat","messages":[{"role":"user","content":"In one sentence, what is load balancing?"}]}' \
     | jq -r '.model, .choices[0].message.content'
+```
+
+The `model` in the response is the member's id, `gpt-4o-mini` or `gpt-4o-mini-preview`, never `chat`. Nine of every ten requests take the first.
+
+Every gate below the pick sees the member's real id, so a group is never a way around one. Block the member and the request is refused, even though the group name itself is not blocked:
+
+```bash
+# with `blocked_models: [gpt-4o-mini]` on the action
+$ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/v1/chat/completions \
+    -H 'Host: ai.local' -H 'Content-Type: application/json' \
+    -d '{"model":"chat","messages":[{"role":"user","content":"hi"}]}'
+403
 ```
 
 ## Group info and health (LiteLLM-parity endpoints)
@@ -31,19 +45,26 @@ $ curl -s http://127.0.0.1:8080/v1/chat/completions \
 The gateway serves read-only metadata endpoints from this config, no upstream call:
 
 ```bash
-# Deployments grouped by public model name.
-curl -s -H 'Host: ai.local' http://127.0.0.1:8080/model_group/info | jq
-# => {"data":[{"model_group":"gpt-4o-mini","num_deployments":2,
-#              "providers":["openai-deployment-a","openai-deployment-b"],
-#              "capabilities":["audio_speech","audio_transcription","chat_completions",
-#                              "embeddings","image_edits","image_generation",
-#                              "image_variations","messages","moderations","realtime",
-#                              "responses","streaming"]}]}
+# The configured group, with its members.
+curl -s -H 'Host: ai.local' http://127.0.0.1:8080/model_group/info | jq '.data[] | select(.model_group=="chat")'
+# => {"model_group":"chat","num_deployments":2,
+#     "providers":["openai-deployment-a","openai-deployment-b"],
+#     "capabilities":["audio_speech","audio_transcription","chat_completions",
+#                     "embeddings","image_edits","image_generation",
+#                     "image_variations","messages","moderations","realtime",
+#                     "responses","streaming"],
+#     "members":[{"provider":"openai-deployment-a","model":"gpt-4o-mini","weight":9},
+#                {"provider":"openai-deployment-b","model":"gpt-4o-mini-preview","weight":1}],
+#     "routing":"weighted"}
 #
-# `capabilities` is the union across the group's deployments. Both are
-# `provider_type: openai` here, so the union is one deployment's array;
-# a group mixing an OpenAI deployment with an embeddings-only provider
-# would list the surfaces of both.
+# `capabilities` is the union across the group's members. Both are
+# `provider_type: openai` here, so the union is one member's array; a group
+# mixing an OpenAI deployment with an embeddings-only provider would list the
+# surfaces of both.
+
+# The OpenAI-shaped listing carries the group beside the model ids.
+curl -s -H 'Host: ai.local' http://127.0.0.1:8080/v1/models | jq '.data[].id'
+# => "chat", "gpt-4o-mini", "gpt-4o-mini-preview"
 
 # Flat list of every deployment, each with the same capabilities array.
 curl -s -H 'Host: ai.local' http://127.0.0.1:8080/model/info | jq
@@ -55,11 +76,12 @@ curl -s -H 'Host: ai.local' http://127.0.0.1:8080/health
 
 ## What this exercises
 
-- Model-based provider routing: the `model` field selects the group of providers that declare it.
-- `routing: round_robin` (swap for `weighted`, `least_connections`, `lowest_latency`, etc.) to distribute across deployments.
-- Per-deployment ejection via outlier detection keeps the group available when one deployment fails.
+- A `model_groups:` entry whose members serve different upstream model ids behind one public name.
+- A per-group `routing: weighted` with per-member weights, independent of the action's own strategy.
+- Resolution before every model gate, so `blocked_models`, per-key allowlists, per-model rate limits, and the budget scope all judge the member's id.
+- Per-deployment ejection via outlier detection or a circuit breaker moves the group's traffic to a sibling member rather than taking the group offline.
 
 ## See also
 
-- [docs/ai-gateway.md](../../docs/ai-gateway.md) - routing strategies and model-based selection.
+- [docs/ai-gateway.md](../../docs/ai-gateway.md) - the model groups section, and routing strategies.
 - [examples/ai-routing-fallback](../ai-routing-fallback) - priority failover instead of load balancing.

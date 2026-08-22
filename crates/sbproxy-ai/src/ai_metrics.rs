@@ -1097,6 +1097,45 @@ pub fn record_lb_decision(strategy: &str, provider: &str) {
         .inc();
 }
 
+// --- Named model groups (WOR-2657) ---
+
+/// Registered without `.unwrap()` for the same reason as
+/// `AI_PRICE_CEILING`: the production unwrap/expect ratchet is at its
+/// baseline and one metric family is not worth a panic path.
+static AI_MODEL_GROUP_SELECTIONS: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_model_group_selections_total",
+            "Named model group member selections by group and picked provider (WOR-2657)"
+        ),
+        &["group", "provider"]
+    )
+    .ok()
+});
+
+/// Record one member pick inside a named model group (WOR-2657).
+///
+/// This is a second family rather than a `group` label on
+/// `sbproxy_ai_lb_decisions_total`, which is a stable metric: adding a
+/// label there would change a stable label set and make every origin
+/// carry a dimension that is empty on the ones configuring no groups.
+///
+/// Both labels are operator-declared config values, a `model_groups[].name`
+/// and a `providers[].name`, so they are bounded by the config rather
+/// than by traffic. They still pass the workspace cardinality limiter as
+/// a backstop, the same contract [`record_provider_cooldown`] holds.
+pub fn record_model_group_selection(group: &str, provider: &str) {
+    let Some(counter) = &*AI_MODEL_GROUP_SELECTIONS else {
+        return;
+    };
+    let metric = "sbproxy_ai_model_group_selections_total";
+    let group = sbproxy_observe::metrics::sanitize_label_budget(metric, "group", group);
+    let provider = sbproxy_observe::metrics::sanitize_label_budget(metric, "provider", provider);
+    counter
+        .with_label_values(&[group.as_str(), provider.as_str()])
+        .inc();
+}
+
 /// Record an intentional routing fallback.
 ///
 /// Reasons are a closed vocabulary shared by the outcome-aware,
