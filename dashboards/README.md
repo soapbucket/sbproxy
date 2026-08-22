@@ -23,7 +23,7 @@ scrape_configs:
 |-----------|------|-----|-------------|
 | SBProxy Overview | `grafana/sbproxy-overview.json` | `sbproxy-overview` | Request rate, latency percentiles, error rate, active connections, cache hit ratio, bandwidth |
 | AI Gateway | `grafana/sbproxy-ai-gateway.json` | `sbproxy-ai-gateway` | AI provider request rates, token usage, TTFT, guardrail triggers, fallbacks, and context-compression savings, latency, failures, and state coordination |
-| AI Value | `grafana/sbproxy-ai-value.json` | `sbproxy-ai-value` | Per-credential, multi-tenant, multi-model value tracking: spend, token volume, p95 model latency, value-vs-waste by outcome, and success-only compression tokens and cost saved. Tokenizer precision stays visible. Ends with a trust row that says how much of the spend figure is measured: which price table produced each price, price-ceiling outcomes, token-estimate error p95 by model, and semantic-cache dollars saved. |
+| AI Value | `grafana/sbproxy-ai-value.json` | `sbproxy-ai-value` | Per-credential, multi-tenant, multi-model value tracking: spend, token volume, p95 model latency, value-vs-waste by outcome, and success-only compression tokens and cost saved. Tokenizer precision stays visible. Ends with a trust row that says how much of the spend figure is measured: which price table produced each price, price-ceiling outcomes, token-estimate error p05 and p95 by model, and semantic-cache dollars saved. |
 | Judge Backend | `grafana/sbproxy-judge-backend.json` | `sbproxy-judge-backend` | LLM-as-judge call rate by verdict, cache hit ratio, latency, cost per decision, budget exhaustion |
 | Policy Verdicts | `grafana/sbproxy-policy-verdicts.json` | `sbproxy-policy-verdicts` | Verdict rate by tag, audit bus drops per tenant, plugin vs built-in surface ratio, decision latency percentiles, top policies |
 | Security | `grafana/sbproxy-security.json` | `sbproxy-security` | WAF blocks, rate limiting, auth failures, IP filter blocks, bot detections |
@@ -44,6 +44,11 @@ Panels over an optional family therefore carry a second target,
 written and the panel below it is not a measurement of anything. When the red
 line is missing and the other series read zero, that is a real zero. Each such
 panel's description says which of the two its absence means.
+
+The `absent()` target must carry the same label selector as the target it
+guards. A panel filtered to `{tenant=~"$tenant"}` whose guard reads the bare
+family goes quiet the moment any other tenant writes the family, which is the
+false healthy zero the convention exists to prevent.
 
 The trust row on `sbproxy-ai-value` is the current example, on all four of its
 panels.

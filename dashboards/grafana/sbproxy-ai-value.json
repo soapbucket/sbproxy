@@ -38,7 +38,7 @@
   "id": null,
   "uid": "sbproxy-ai-value",
   "title": "AI Value (per-tenant, per-credential, per-model)",
-  "description": "Per-credential, multi-tenant, multi-model AI value tracking: spend, tokens, model latency, value-vs-waste by outcome, and success-only context-compression value.",
+  "description": "Per-credential, multi-tenant, multi-model AI value tracking: spend, tokens, model latency, value-vs-waste by outcome, and success-only context-compression value. Ends with a trust row that says how much of the spend figure is measured: which price table produced each price, price-ceiling outcomes, token-estimate error by model, and semantic-cache dollars saved.",
   "tags": [
     "sbproxy",
     "ai",
@@ -666,7 +666,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "Share of AI price lookups by the table that produced the price: catalog is the shipped model catalog, rate_card and config are operator-supplied, and fallback is a flat blended rate applied when nothing else priced the model. Counted per price lookup and not per request, so one request can contribute several samples. A rising fallback share means the spend figure, the budget debits, and the price ceiling are all comparing against a guess, so add the missing model to the catalog or to a rate card. The family carries only the source label, so this panel is fleet-wide, the Tenant and Credential dropdowns do not apply to it, and it cannot say which model fell back. The red not reported series sits at 1 when no AI request has ever been priced on this instance, which is not the same as a zero fallback share. Runbook: docs/operator-runbook.md.",
+      "description": "Share of AI price lookups by the table that produced the price: catalog is the shipped model catalog, rate_card and config are operator-supplied, and fallback is the pessimistic default of $5 per million tokens in and $5 per million out, applied when nothing else priced the model. That default is usually well above a real price, so a rising fallback share normally overstates spend and trips budget caps and the price ceiling early; on a genuinely expensive model it understates. Counted per price lookup and not per request, so one request can contribute several samples. When fallback climbs, add the missing model to the catalog or to a rate card. The family carries only the source label, so this panel is fleet-wide, the Tenant and Credential dropdowns do not apply to it, and it cannot say which model fell back. The red not reported series sits at 1 when no AI request has ever been priced on this instance, which is not the same as a zero fallback share. Runbook: docs/operator-runbook.md.",
       "fieldConfig": {
         "defaults": {
           "unit": "percentunit",
@@ -816,7 +816,7 @@
     },
     {
       "id": 20,
-      "title": "Token estimate error p95 by model",
+      "title": "Token estimate error by model (p05 and p95)",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
@@ -828,7 +828,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "p95 relative error of the pre-request token estimate against the upstream usage.prompt_tokens, per model, sign preserved. Positive means the estimator under-reserved and the request cost more than it debited from the budget. This is recorded only on a reconciled rate-limit admission, which requires the model to hold an entry in config.model_rate_limits. On a deployment with no per-model rate limits the family never appears while the same estimator keeps driving budget debits and the price ceiling, so the red not reported series at 1 means unmeasured rather than accurate. Sustained error above roughly 0.2 means headroom and ceiling decisions are being made on a bad number; refresh the tokenizer for that model. The family carries only the model label, so the Tenant and Credential dropdowns do not apply. Runbook: docs/operator-runbook.md.",
+      "description": "Relative error of the pre-request token estimate against the upstream usage.prompt_tokens, per model, sign preserved as (actual - estimated) / actual. Positive means the estimator under-reserved and the request cost more than it debited from the budget. Negative means it over-reserved, which over-debits the budget and holds rate-limit headroom the request never used. p95 tracks the under-reserving tail and p05 the over-reserving one, because a p95 near zero says nothing about an estimator that is systematically too high. The buckets cut at +/- 0.10, so either line sitting outside that band means headroom and ceiling decisions are being made on a bad number; refresh the tokenizer for that model. This is recorded only on a reconciled rate-limit admission, which requires the model to hold an entry in config.model_rate_limits. On a deployment with no per-model rate limits the family never appears while the same estimator keeps driving budget debits and the price ceiling, so the red not reported series at 1 means unmeasured rather than accurate. The family carries only the model label, so the Tenant and Credential dropdowns do not apply. Runbook: docs/operator-runbook.md.",
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -885,6 +885,15 @@
         },
         {
           "refId": "B",
+          "expr": "histogram_quantile(0.05, sum by (le, model) (rate(sbproxy_ai_token_estimate_error_ratio_bucket[5m])))",
+          "legendFormat": "{{model}} p05",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "C",
           "expr": "absent(sbproxy_ai_token_estimate_error_ratio_bucket)",
           "legendFormat": "not reported",
           "datasource": {
