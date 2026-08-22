@@ -134,15 +134,16 @@ impl CedarEvaluator {
         self.evaluate_with_entities(&cedar_req, &entities)
     }
 
-    /// Evaluate an already-translated `cedar_policy::Request`.
+    /// Evaluate an already-translated `cedar_policy::Request` with an
+    /// empty [`Entities`] store.
     ///
-    /// A caller that builds its own `cedar_policy::Request` directly
-    /// (rather than going through [`CedarRequest`] /
-    /// [`Self::evaluate`]) calls this method. An empty [`Entities`]
-    /// store is used; materialising per-agent / per-tool entities
-    /// through [`Self::evaluate_with_entities`] is follow-up work once
-    /// a workspace state projection exists to source them from.
-    pub fn evaluate_cedar_request(&self, request: &Request) -> PolicyDecision {
+    /// Internal step shared by [`Self::evaluate_uids`] (the production
+    /// caller: see its docs) and, indirectly, [`Self::evaluate`].
+    /// Materialising per-agent / per-tool entities through
+    /// [`Self::evaluate_with_entities`] instead of an empty store is
+    /// follow-up work once a workspace state projection exists to
+    /// source them from.
+    fn evaluate_cedar_request(&self, request: &Request) -> PolicyDecision {
         let entities = Entities::empty();
         self.evaluate_with_entities(request, &entities)
     }
@@ -152,7 +153,7 @@ impl CedarEvaluator {
     /// Shared entry point for [`Self::evaluate`] and
     /// [`Self::evaluate_cedar_request`]. Keeps the verdict mapping in
     /// one place so the two callers never drift.
-    pub fn evaluate_with_entities(&self, request: &Request, entities: &Entities) -> PolicyDecision {
+    fn evaluate_with_entities(&self, request: &Request, entities: &Entities) -> PolicyDecision {
         let response = self
             .authorizer
             .is_authorized(request, &self.policy_set, entities);
