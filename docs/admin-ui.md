@@ -659,20 +659,63 @@ per-user cut.
 Serving latency (time-to-first-token, inter-token latency, throughput)
 and provider health from the live counters.
 
-- **Shows:** `GET /metrics`, specifically the TTFT/TPOT/throughput
-  histograms, per-provider request/error counts and error rate,
-  gateway admission/rejection rate with rejection reasons, failover
-  reasons, cascade-tier outcomes, and router-strategy decisions. When
+- **Shows:** `GET /metrics`, specifically the pre-provider refusal
+  panel described below, the TTFT/TPOT/throughput histograms,
+  per-provider request/error counts and error rate, gateway
+  admission/rejection rate with rejection reasons, failover reasons,
+  cascade-tier outcomes, and router-strategy decisions. When
   context-compression policies are active, a
   compression section reports compressed requests, tokens and cost
   saved, per-lever savings, request outcomes, and the average
   compression ratio per lever.
 - **Mutations:** none.
-- **Empty/error notes:** no AI traffic renders an empty state
-  explaining that panels light up after the first request through an
-  `ai_proxy` origin; streaming-latency panels specifically need at
-  least one streamed completion (TPOT needs at least two tokens in
-  that stream) and say so rather than showing a misleading zero.
+- **Empty/error notes:** no AI traffic and no pre-provider refusal
+  renders an empty state explaining that panels light up after the
+  first request through an `ai_proxy` origin; streaming-latency panels
+  specifically need at least one streamed completion (TPOT needs at
+  least two tokens in that stream) and say so rather than showing a
+  misleading zero.
+
+### Refused before dispatch
+
+The refusals nothing else can show you. A request the AI gateway turns
+away at the inbound native-format shim, or at the shared stored-prompt
+resolver, never reaches a provider, so it leaves no trace in provider
+health here, in your provider's own console, or in any provider-side
+bill. The `Refused before dispatch` tile and the panel under it read
+`sbproxy_ai_admission_decisions_total{surface,reason,outcome}`, the
+counter the [`ai.admission` decision record](decision-records.md#aiadmission)
+increments in the same breath.
+
+The panel lists one row per `surface / reason` pair, with the bounded
+label values rendered as the phrase they mean and the raw code printed
+underneath so the row still joins the metric and the decision record.
+A refusal that arrived on more than one inbound surface also gets a
+per-surface breakdown.
+
+- **Coverage:** the three refusal arms of the inbound native-format
+  shim (the Anthropic Messages translate, the Responses stored-prompt
+  bridge, and the Responses translate) and the two of the shared
+  stored-prompt resolver. A request refused later by the model
+  allow/block gate, a virtual-key policy, a guardrail, a budget, a rate
+  limiter, or a CEL or Rego policy is that plane's decision and is not
+  counted here.
+- **Absent is not zero.** The counter is published on its first
+  increment, so a proxy that has never refused a request before
+  dispatch exports no family at all. The tile reads `not reported` for
+  that case rather than `0`, because a flat zero over a measurement
+  nobody has ever taken reads as a healthy signal.
+
+Triage: a caller reports a 400 that their provider dashboard has no
+record of. Open AI performance. A `Refused before dispatch` count above
+zero with a row reading `OpenAI Responses / MCP tool block, which would
+reach an MCP server past this gateway` says the caller sent
+`tools: [{"type": "mcp", ...}]` on `/v1/responses`, asking the provider
+to reach an MCP server behind this gateway's MCP governance, and the
+gateway refused it before dispatch. Turn on
+`observability.log.decision_audit.events.ai.admission` to get the
+per-request `ai.admission` record with the request id, then find the
+caller in [Logs](#logs-logs).
 
 ## Guardrails (`/guardrails`)
 
