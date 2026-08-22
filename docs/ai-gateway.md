@@ -114,8 +114,32 @@ OpenAI-compatible logical list built from its configured eligible providers and
 models. Managed entries report aggregate `ready`, `cold`, or `unavailable`
 state, ready and desired replica counts, and bounded capability names. The list
 omits worker identity, engine ports, and private endpoints. It does not call an
-ordinary provider's native model-list endpoint or reproduce provider-specific
-model metadata.
+ordinary provider's native model-list endpoint.
+
+The list carries every name a caller may send as `model`, not only the ids in
+the providers' `models:` lists: a [`model_aliases`](#model-aliases) entry
+appears under its own name, and a [`model_groups`](#model-groups) entry appears
+under the group name. An alias is listed under the gates that apply to the id it
+resolves to, so an alias whose target `blocked_models` refuses is left off
+rather than advertised as a name that answers 403.
+
+Each entry also carries `created`, which the OpenAI `Model` object declares
+required and without which an SDK-shaped client refuses to deserialize the
+response. This gateway does not know when a model was published and will not
+invent a date, so the value is the epoch constant: present for the schema, and
+not a claim about anything.
+
+Two token limits appear where this process knows them: `context_window` and
+`max_output_tokens`. Both are **omitted rather than nulled** when it does not,
+so a client can tell "the gateway was not told" from "the limit is zero". The
+window comes from the built-in table the compression pipeline already sizes
+prompts against, falling back to the `max_input_tokens` an operator's
+[`rate_card:`](#model-prices) declares. `max_output_tokens` has only the rate
+card as a source: nothing built in carries a completion cap, so an origin with
+no rate card publishes no completion limits. Both are the same resolution the
+`ai.catalog` routing base data reads, so a routing policy and a client are never
+told different numbers for one model. No provider-specific model metadata beyond
+these is reproduced.
 
 Each entry's `capabilities` array names the surfaces this gateway will forward
 for that model and that the provider catalog records the vendor as exposing.
@@ -138,7 +162,9 @@ The names are the surface labels from
 reaches by naming a model, plus `streaming`. Account-scoped surfaces (`models`,
 `files`, `batches`, `assistants`, `threads`, `fine_tuning`) belong to the
 provider rather than to any one model, so they are left out. `GET /model/info`
-and `GET /model_group/info` carry the same array.
+and `GET /model_group/info` carry the same array. A group's array is the union
+across its members and its token limits are the floor across them, for the
+reasons in [Model groups](#model-groups).
 
 Successful completions add `x-sbproxy-logical-model` and an allowlisted
 `x-sbproxy-route-class` of `local`, `peer`, or `external`. Managed availability
@@ -2263,6 +2289,169 @@ Aliases are validated when the config compiles, because every one of these is a 
 
 Marking an alias `deprecated` keeps it serving while making its use visible. Every resolution logs a warning that names the alias, the model it resolved to, and the `replacement` to move to, so you can watch the log go quiet before you delete the entry.
 
+## Model groups
+
+A model group is one public name your callers send as `model`, served by several deployments. Each member names a provider on the same action, the upstream model id that provider serves, and its share of traffic. Members may serve **different** model ids, which is the point: one name can front an OpenAI model and an Azure deployment at once.
+
+Groups live on the `ai_proxy` action, beside the providers their members name:
+
+```yaml
+action:
+  type: ai_proxy
+  routing: round_robin          # the action's own strategy, unchanged
+  providers:
+    - name: openai-primary
+      api_key: ${OPENAI_API_KEY}
+      models: [gpt-4o-mini]
+    - name: azure-secondary
+      api_key: ${AZURE_API_KEY}
+      base_url: https://contoso.openai.azure.com/openai/deployments/mini
+      models: [mini-prod-2]
+    - name: openai-overflow
+      api_key: ${OPENAI_OVERFLOW_KEY}
+      models: [gpt-4o-mini]
+  model_groups:
+    # A 90/10 split across two vendors serving different model ids.
+    - name: chat
+      routing: weighted
+      members:
+        - provider: openai-primary
+          model: gpt-4o-mini
+          weight: 9
+        - provider: azure-secondary
+          model: mini-prod-2
+          weight: 1
+    # A second group over overlapping providers, with its own strategy
+    # and its own rotation cursor. The two never interleave.
+    - name: chat-spillover
+      routing: least_connections
+      members:
+        - provider: openai-primary
+          model: gpt-4o-mini
+        - provider: openai-overflow
+          model: gpt-4o-mini
+```
+
+Callers address the group and never learn which member answered:
+
+```bash
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Host: ai.example.com' \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "chat", "messages": [{"role": "user", "content": "hello"}]}' \
+  | jq -r .model
+```
+
+Nine of every ten of those requests reach OpenAI carrying `"model": "gpt-4o-mini"`; the tenth reaches Azure carrying `"model": "mini-prod-2"`. The name `chat` never reaches a provider. The tenth request's admin row reads `model_group: chat -> azure-secondary/mini-prod-2`, and `sbproxy_ai_model_group_selections_total{group="chat", provider="azure-secondary"}` counts it.
+
+### Where a group resolves
+
+A group resolves at the same point in the request as a [model alias](#model-aliases): before every model gate and before provider selection. That is what makes members with different model ids safe. Each gate below the pick judges the member's real model id, so a group can never be a way around a block list, a per-key allowlist, a per-model rate limit, or a budget scope.
+
+```mermaid
+flowchart TD
+    A["request model: chat"] --> B{"a model_groups: name?"}
+    B -- no --> C{"a model_aliases: name?"}
+    C -- no --> D["literal model id"]
+    C -- yes --> E["alias target + optional provider pin"]
+    B -- yes --> F["member set: this group's members"]
+    F --> G["drop disabled providers<br/>and any the credential forbids"]
+    G -- credential forbids all --> H1["403: no permitted member"]
+    G -- all providers disabled --> H2["503: no eligible member"]
+    G --> I["narrow by breaker, outlier, health"]
+    I --> J["pick with the group's strategy<br/>and the member's weight"]
+    J --> K["rewrite model to the member's id<br/>pin the member's provider"]
+    K --> L
+    E --> L
+    D --> L["blocked_models, credential allowlist,<br/>per-model rate limit, budget scope,<br/>price ceiling, guardrails"]
+    L --> M["provider order, narrowed to the pin"]
+    M --> N["dispatch"]
+```
+
+Three consequences worth stating outright.
+
+A pick is **resilience-aware but not fail-closed**. An open circuit breaker, an outlier ejection, or a failed health probe moves the group's traffic to a sibling member rather than refusing, which is what those three axes promise everywhere else in this gateway. A group whose members are *all* ejected still routes, because three advisory signals must not combine into an outage none of them can cause alone.
+
+A pick **does** fail closed on policy, rather than falling through to some other provider: falling through would dispatch a model id nobody declared for that vendor. The two ways that happens answer differently, because one is retryable and the other is not. When the calling credential's provider policy forbids every member, the request answers `403`, the same status every other credential refusal on this path uses. When every member's provider is switched off, it answers `503`. Either way the refusal is logged with the group name and published as an `ai.admission` decision record carrying `model_group_forbidden` or `model_group_no_member`, so a group that has quietly stopped serving is visible in the SIEM feed and not only in a client's error rate. See [events.md](events.md#decision-audit-the-other-nineteen).
+
+A pick is made **once per request**. The chosen member's provider becomes the request's routing pin, the same pin a `model_aliases` entry sets, so a transport failure or a retryable 5xx from that member does not move the request to a sibling member; whatever retry policy the action configures applies to that one member. Handing the request to a sibling would dispatch the first member's model id to a vendor that does not serve it. Health signals move the *next* request instead: the failure trips the breaker or the outlier ejector, and the pick that follows skips that member. Configure `resilience:` on the action if you want that to happen quickly.
+
+### Groups, aliases, and same-name pools
+
+Three mechanisms front one name over several upstreams. They are not interchangeable.
+
+| | What it fronts | Strategy | Weights |
+|---|---|---|---|
+| Same-name pool (several providers declaring one model in `models:`) | one model id | the action's `routing:` | the providers' `weight:` |
+| `model_aliases` entry | one model id, optionally pinned to one provider | the action's `routing:` | the providers' `weight:` |
+| `model_groups` entry | a mix of model ids | the group's own `routing:` | the members' `weight:` |
+
+The same-name pool still works and is still the right answer when every deployment serves the same model id and the action's strategy is the one you want. Reach for a group when the deployments' model ids differ, or when one public name needs a balancing policy of its own.
+
+One name cannot be two of these at once. A group that shadows a served model, a `model_map` key, a `default_model`, or an alias is refused at config load, and so is an alias whose `model_id` names a group: aliases resolve in one pass, so the group would never be looked up.
+
+### Which strategies a group may name
+
+A group accepts the thirteen selection strategies: `round_robin`, `weighted`, `fallback_chain`, `random`, `lowest_latency`, `peak_ewma`, `least_connections`, `cost_optimized`, `least_token_usage`, `sticky`, `outcome_aware`, `headroom`, and `reset_aware`. Omitting `routing:` gives `round_robin`.
+
+Six are refused at config load: `cascade`, `cost_quality`, `race`, `semantic_route`, `prefix_affinity`, and `token_rate`. Each of the first five runs a second dispatch pass at the action level (a tier walk, a prompt score, a fan-out, an embedding match, a prefix digest) that a per-group pick never reaches, so a group naming one would quietly get a plain rotation instead of the strategy you wrote. `token_rate` is refused origin-wide already. Set any of them on the action.
+
+Each group gets its own rotation cursor, so two `round_robin` groups over the same providers rotate independently, and neither is advanced by the action's own selections.
+
+### `model_groups` fields
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `name` | string | required | The public name callers send as `model`. |
+| `routing` | string | `round_robin` | This group's selection strategy, independent of the action's. |
+| `members` | list | required | At least one. No two may name the same provider. |
+
+### `model_groups[].members` fields
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `provider` | string | required | A provider configured on this action. |
+| `model` | string | required | The upstream model id this member serves, sent verbatim in place of the group name. |
+| `weight` | integer | `1` | Share of traffic under `routing: weighted`, relative to the other members. Ignored by every other strategy. |
+
+### What is refused at config load
+
+Every one of these is a misrouting that goes invisible once traffic is flowing:
+
+- A group whose **name shadows a real name**: a model a provider declares in `models:`, a `model_map` key, a `default_model`, or a `model_aliases` entry.
+- An **alias that resolves to a group name**. Aliases resolve in one pass, so the group would never be looked up and the group name would go upstream as a literal model id.
+- A **duplicate group name**, a name with leading or trailing whitespace, or an empty `members` list.
+- A member naming a **provider that is not configured** on the origin, or one whose declared `models:` list does not include the member's model.
+- **Two members on one provider.** A member is addressed by the provider that serves it, so a second member on the same provider could never be selected. Declare a second provider entry for the second deployment.
+- An **all-zero weighted split**. A zero total sends everything to the first member without saying so.
+- One of the **six refused strategies** above.
+
+`model_groups:` is an AI-gateway key and belongs to the action. Setting it at the top level of the config is refused with a pointer at the action path, rather than parsed and ignored.
+
+### Reading a group back
+
+A group is a name callers may send, so it appears in both model listings.
+
+```bash
+# The OpenAI-shaped listing carries the group alongside the model ids.
+curl -s -H 'Host: ai.example.com' http://127.0.0.1:8080/v1/models | jq '.data[] | select(.id == "chat")'
+# => {"id":"chat","object":"model","created":0,"owned_by":"sbproxy",
+#     "availability":{"state":"ready","ready_replicas":2,"desired_replicas":2},
+#     "capabilities":["chat_completions","messages","responses","streaming", ...],
+#     "context_window":128000}
+
+# The LiteLLM-parity endpoint carries the members.
+curl -s -H 'Host: ai.example.com' http://127.0.0.1:8080/model_group/info | jq '.data[] | select(.model_group == "chat")'
+# => {"model_group":"chat","num_deployments":2,
+#     "providers":["openai-primary","azure-secondary"],
+#     "capabilities":[...],
+#     "members":[{"provider":"openai-primary","model":"gpt-4o-mini","weight":9},
+#                {"provider":"azure-secondary","model":"mini-prod-2","weight":1}],
+#     "routing":"weighted"}
+```
+
+A group's `capabilities` array is the union across its members, matching the surface gate, which admits a request when any eligible provider handles it. Its `context_window` is the **floor** across the members whose window is known, because a prompt has to fit whichever member serves the request; publishing the largest would let a caller build a prompt the smaller member rejects. A group whose every member the calling credential's model or provider policy refuses is left off both listings, rather than advertised as a name that answers 503.
+
 ## Supported endpoints
 
 Every inbound request to an `action: ai_proxy` origin is classified into an `AiSurface` by `classify_surface(method, path)` in `crates/sbproxy-ai/src/handler.rs`. The classifier accepts canonical OpenAI paths with optional `/v1` or `/api/v1` prefix and any trailing slash. The surface label appears on the per-surface metrics, on the request tracing span, and on every per-surface decision (rate limit, guardrail extractor, 501 gate).
@@ -3420,7 +3609,7 @@ To help you get started with the AI gateway, we provide several runnable example
 |---------|------------|---------------|---------|
 | [`ai-bedrock-direct`](../examples/ai-bedrock-direct/) | Direct integration with AWS Bedrock. | Add a provider named `bedrock` (or set `provider_type: bedrock` on any name) with an `aws_sigv4:` block naming the region; the gateway signs each request itself and needs no `api_key`. | Exposes Bedrock via the standard OpenAI-compatible API. |
 | [`ai-gemini-direct`](../examples/ai-gemini-direct/) | Direct integration with Google Gemini. | Add a provider named `gemini` (or set `provider_type: gemini`) with a Gemini API key. | Seamless integration with Gemini models without client SDK changes. |
-| [`ai-model-group`](../examples/ai-model-group/) | Model pooling. | List multiple providers that declare the same model name in `models`; there is no separate `model_group` key. | The routing strategy load-balances requests for that model name across every declaring provider. |
+| [`ai-model-group`](../examples/ai-model-group/) | Model pooling. | A `model_groups:` entry binds one public name to several members, each with its own provider, upstream model id, and weight; a same-model-name pool across providers' `models:` lists still works for the simpler case. | The group's own strategy load-balances across its members, and the member's model id is what reaches the wire. |
 | [`ai-streaming`](../examples/ai-streaming/) | Streaming LLM completions. | Send requests with `stream: true`. | SBproxy streams Server-Sent Events (SSE) securely back to the client. |
 | [`ai-routing-fallback`](../examples/ai-routing-fallback/) | High-availability failover. | Set `routing.strategy: fallback_chain` and give each provider a `priority`; there is no separate generic `fallbacks:` key. | Transport failures and retryable 5xx responses from the primary provider fail over to the next provider in priority order. |
 | [`typed-fallbacks`](../examples/typed-fallbacks/) | Typed fallback triggers. | Set `context_window_fallbacks:` and/or `content_policy_fallbacks:` as siblings of `routing:`, each naming providers. | An oversized prompt reroutes to a larger-window model before dispatch; a content-policy refusal reroutes to a more permissive provider; the admin request log names the trigger that fired. |

@@ -706,6 +706,26 @@ impl PriceSource {
 #[derive(Debug, Clone, Default)]
 pub struct PriceTable {
     exact: HashMap<String, (ModelPrice, PriceSource)>,
+    /// Per-model token limits read off the same rate card (WOR-2647).
+    /// Kept beside the prices rather than on [`ModelPrice`] because a
+    /// window is not a cost: `ModelPrice` is `Copy` and is summed,
+    /// scaled, and compared against budgets all over the cost path,
+    /// and a token limit has no meaning in any of that arithmetic.
+    limits: HashMap<String, ModelTokenLimits>,
+}
+
+/// A model's declared token limits, as carried by the LiteLLM rate
+/// card (WOR-2647).
+///
+/// Both fields are optional because the card itself omits them for many
+/// entries. Absence means this process was not told the limit, never
+/// that the limit is zero or unlimited.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModelTokenLimits {
+    /// Maximum prompt tokens the model accepts.
+    pub max_input_tokens: Option<u64>,
+    /// Maximum completion tokens the model will generate.
+    pub max_output_tokens: Option<u64>,
 }
 
 impl PriceTable {
@@ -737,6 +757,12 @@ impl PriceTable {
         self.exact.get(&model.to_ascii_lowercase()).copied()
     }
 
+    /// The token limits for `model`, if the rate card carried any
+    /// (exact, case-insensitive).
+    pub fn token_limits(&self, model: &str) -> Option<ModelTokenLimits> {
+        self.limits.get(&model.to_ascii_lowercase()).copied()
+    }
+
     /// Merge a LiteLLM `model_prices_and_context_window.json` document
     /// into the table (WOR-1707), the ecosystem's canonical rate card.
     /// Its costs are per-token, so they are scaled to per-million here;
@@ -759,6 +785,21 @@ impl PriceTable {
                 continue;
             };
             let per_token = |k: &str| entry.get(k).and_then(serde_json::Value::as_f64);
+            // WOR-2647: token limits are recorded before the price
+            // check below, not after. That check skips embeddings,
+            // image, and audio models, which have no completion cost
+            // and every one of which still has a real input window an
+            // operator wants published. A limits map narrower than the
+            // card would be a listing that reports a window for chat
+            // models only, for no reason a reader could infer.
+            let token_count = |k: &str| entry.get(k).and_then(serde_json::Value::as_u64);
+            let limits = ModelTokenLimits {
+                max_input_tokens: token_count("max_input_tokens"),
+                max_output_tokens: token_count("max_output_tokens"),
+            };
+            if limits != ModelTokenLimits::default() {
+                self.limits.insert(name.to_ascii_lowercase(), limits);
+            }
             let (Some(inp), Some(out)) = (
                 per_token("input_cost_per_token"),
                 per_token("output_cost_per_token"),
@@ -827,6 +868,19 @@ fn resolve_price(model: &str) -> Option<(ModelPrice, PriceSource)> {
 /// does not apply the pessimistic accounting fallback).
 pub(crate) fn catalog_price(model: &str) -> Option<ModelPrice> {
     resolve_price(model).map(|(price, _)| price)
+}
+
+/// The operator rate card's token limits for `model`, or `None` when no
+/// rate card is installed or it carried none for this model (WOR-2647).
+///
+/// Only the operator table answers here. The built-in `lookup_price`
+/// catalog is a price catalog and holds no window, and the static
+/// [`crate::context_window`] table is the other half of
+/// [`crate::context_window::model_facts`], which is the seam callers
+/// should use rather than this one.
+pub(crate) fn catalog_token_limits(model: &str) -> Option<ModelTokenLimits> {
+    let guard = PRICE_TABLE.read().ok()?;
+    guard.as_ref()?.token_limits(model)
 }
 
 /// A config-supplied model price (WOR-1707). Rates are per-million USD

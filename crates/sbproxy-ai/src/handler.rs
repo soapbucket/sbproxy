@@ -105,6 +105,19 @@ pub struct AiHandlerConfig {
     /// already chosen that provider. See [`crate::model_alias`].
     #[serde(default)]
     pub model_aliases: Vec<crate::model_alias::ModelAlias>,
+    /// Named model groups for this origin.
+    ///
+    /// Each entry binds one public name callers send as `model` to a
+    /// list of members, each naming a provider on this action and the
+    /// upstream model id it serves. A group carries its own routing
+    /// strategy and per-member weights, so it load-balances
+    /// independently of this action's `routing:`, and its members may
+    /// serve different model ids. Groups resolve on the dispatch path
+    /// before every model gate and before provider selection, the same
+    /// point a `model_aliases` entry resolves, so every gate below
+    /// judges the member's real model id. See [`crate::model_group`].
+    #[serde(default)]
+    pub model_groups: Vec<crate::model_group::ModelGroup>,
     /// Maximum request body size in bytes accepted by the gateway.
     ///
     /// Checked while the body arrives rather than once it is all in
@@ -353,6 +366,10 @@ pub struct AiHandlerConfig {
     /// that carries aliases is fully resolved before it is published.
     #[serde(skip)]
     model_alias_index: OnceLock<crate::model_alias::ModelAliasRegistry>,
+    /// Group index built from `model_groups`. `from_config` warms it at
+    /// config load, for the same reason the alias index is warmed there.
+    #[serde(skip)]
+    model_group_index: OnceLock<crate::model_group::ModelGroupRegistry>,
 }
 
 fn default_usage_parser() -> String {
@@ -558,7 +575,13 @@ impl AiHandlerConfig {
         self.router
             .get_or_init(|| {
                 let mut router =
-                    crate::routing::Router::new(self.routing.clone(), self.providers.len());
+                    crate::routing::Router::new(self.routing.clone(), self.providers.len())
+                        // WOR-2657: one rotation cursor per named group,
+                        // sized here for the same reason the
+                        // per-provider vectors are sized in `new`.
+                        .with_model_groups(
+                            self.model_groups.iter().map(|group| group.name.as_str()),
+                        );
                 if let Some(resilience) = self.resilience.as_ref() {
                     if let Some(breaker) = resilience.circuit_breaker.as_ref() {
                         let failure_threshold = breaker.failure_threshold.max(1);
@@ -992,7 +1015,7 @@ fn default_strategy() -> RoutingStrategy {
 /// - A flat string: `"round_robin"` (Rust format)
 /// - A nested object: `{strategy: "round_robin", ...}` (Go format)
 /// - A cascade object: `{strategy: "cascade", tiers: [...], max_total_cost: ...}`
-fn deserialize_routing<'de, D>(deserializer: D) -> Result<RoutingStrategy, D::Error>
+pub(crate) fn deserialize_routing<'de, D>(deserializer: D) -> Result<RoutingStrategy, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -1570,6 +1593,16 @@ impl AiHandlerConfig {
         // Warm the index here rather than on the first request, so the
         // whole alias plane is resolved at config load.
         let _ = config.model_alias_registry();
+        // WOR-2657: a group resolves at the same seam an alias does, so
+        // it is validated against the same filled-in `models:` lists and
+        // against the alias list itself: one name cannot be both.
+        crate::model_group::validate_model_groups(
+            &config.model_groups,
+            &config.providers,
+            &config.model_aliases,
+        )
+        .map_err(|error| anyhow::anyhow!("ai model_groups: {error}"))?;
+        let _ = config.model_group_registry();
         // WOR-2557: a `data_posture:` block whose own requirement
         // excludes every provider the origin configures is a blackholed
         // origin, not a strict one: it boots green and then refuses
@@ -1662,6 +1695,18 @@ impl AiHandlerConfig {
     pub fn model_alias_registry(&self) -> &crate::model_alias::ModelAliasRegistry {
         self.model_alias_index.get_or_init(|| {
             crate::model_alias::ModelAliasRegistry::from_config(self.model_aliases.clone())
+        })
+    }
+
+    /// This origin's model-group registry, built on first call.
+    ///
+    /// [`Self::from_config`] warms it, so the request path only ever
+    /// hits the cached instance. The fallback build keeps a handler
+    /// assembled some other way (a struct literal in a test) resolving
+    /// the same groups as one that came through config load.
+    pub fn model_group_registry(&self) -> &crate::model_group::ModelGroupRegistry {
+        self.model_group_index.get_or_init(|| {
+            crate::model_group::ModelGroupRegistry::from_config(self.model_groups.clone())
         })
     }
 
@@ -2725,6 +2770,8 @@ mod tests {
             quota_pool_store: OnceLock::new(),
             model_aliases: Vec::new(),
             model_alias_index: OnceLock::new(),
+            model_groups: Vec::new(),
+            model_group_index: OnceLock::new(),
         };
         assert!(config.is_model_allowed("gpt-4"));
         assert!(config.is_model_allowed("anything"));
@@ -2776,6 +2823,8 @@ mod tests {
             quota_pool_store: OnceLock::new(),
             model_aliases: Vec::new(),
             model_alias_index: OnceLock::new(),
+            model_groups: Vec::new(),
+            model_group_index: OnceLock::new(),
         };
         assert!(!config.is_model_allowed("gpt-4"));
         assert!(config.is_model_allowed("gpt-3.5-turbo"));
@@ -2827,6 +2876,8 @@ mod tests {
             quota_pool_store: OnceLock::new(),
             model_aliases: Vec::new(),
             model_alias_index: OnceLock::new(),
+            model_groups: Vec::new(),
+            model_group_index: OnceLock::new(),
         };
         assert!(config.is_model_allowed("gpt-4"));
         assert!(config.is_model_allowed("gpt-3.5-turbo"));
@@ -2879,6 +2930,8 @@ mod tests {
             quota_pool_store: OnceLock::new(),
             model_aliases: Vec::new(),
             model_alias_index: OnceLock::new(),
+            model_groups: Vec::new(),
+            model_group_index: OnceLock::new(),
         };
         // Block list wins
         assert!(!config.is_model_allowed("gpt-4"));

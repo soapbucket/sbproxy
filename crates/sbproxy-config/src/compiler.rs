@@ -899,6 +899,19 @@ fn yaml_uses_top_level_model_aliases(yaml: &str) -> bool {
         .is_some_and(|root| root.get("model_aliases").is_some())
 }
 
+/// Whether the document sets `model_groups:` at the top level.
+///
+/// Same shape and same reason as
+/// [`yaml_uses_top_level_model_aliases`]: named model groups are read
+/// from the `ai_proxy` action, next to the providers their members
+/// name, and the root of the file ignores unknown keys, so a root-level
+/// block would parse and silently do nothing.
+fn yaml_uses_top_level_model_groups(yaml: &str) -> bool {
+    serde_yaml::from_str::<serde_yaml::Value>(yaml)
+        .ok()
+        .is_some_and(|root| root.get("model_groups").is_some())
+}
+
 /// The legacy `proxy.secrets` keys this document authors, in schema order.
 ///
 /// Read off the raw YAML rather than off the typed block because presence
@@ -1551,6 +1564,19 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
              Model aliases belong to the AI gateway action that serves them: move the block to \
              `origins.<hostname>.action.model_aliases` alongside that action's `providers:`. \
              See the `Model aliases` section of `docs/ai-gateway.md`."
+        );
+    }
+
+    // WOR-2657: the same refusal for a top-level `model_groups:` block.
+    // A group's members name providers on one action, so the block is
+    // meaningless anywhere else, and at the root it would parse and be
+    // dropped.
+    if yaml_uses_top_level_model_groups(&yaml) {
+        anyhow::bail!(
+            "config compile: `model_groups:` is set at the top level, where nothing reads it. \
+             Model groups belong to the AI gateway action whose providers serve their members: \
+             move the block to `origins.<hostname>.action.model_groups` alongside that action's \
+             `providers:`. See the `Model groups` section of `docs/ai-gateway.md`."
         );
     }
 
@@ -7084,6 +7110,70 @@ origins:
           model_id: gpt-4o-mini
 "#;
         compile_config(yaml).expect("aliases on the AI action compile");
+    }
+
+    /// A top-level `model_groups:` block is refused with the live path,
+    /// for the same reason the alias block above is: the root ignores
+    /// unknown keys, so it would parse and load-balance nothing.
+    #[test]
+    fn compile_rejects_top_level_model_groups() {
+        let yaml = r#"
+model_groups:
+  - name: pool
+    members:
+      - provider: openai
+        model: gpt-4o-mini
+origins:
+  ai.local:
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: dummy
+          models: [gpt-4o-mini]
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("a top-level model_groups: block should be rejected at compile");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("model_groups") && msg.contains("action.model_groups"),
+            "unhelpful error: {msg}"
+        );
+    }
+
+    /// The same group on the AI action compiles. `compile_config` parses
+    /// the action body without building its handler, so this pins the key
+    /// as accepted here and nothing more; the group validator itself runs
+    /// where the action is compiled, which
+    /// `a_group_two_members_on_one_provider_is_refused_at_pipeline_build`
+    /// in `sbproxy-core` covers.
+    #[test]
+    fn compile_accepts_model_groups_on_the_ai_action() {
+        let yaml = r#"
+origins:
+  ai.local:
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: dummy
+          models: [gpt-4o-mini]
+        - name: azure
+          api_key: dummy
+          models: [gpt-4o-mini-deployment]
+      model_groups:
+        - name: pool
+          routing: weighted
+          members:
+            - provider: openai
+              model: gpt-4o-mini
+              weight: 9
+            - provider: azure
+              model: gpt-4o-mini-deployment
+              weight: 1
+"#;
+        compile_config(yaml).expect("groups on the AI action compile");
     }
 
     /// An `ai_provider` credential at proxy scope lowers onto every

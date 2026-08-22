@@ -16,6 +16,51 @@
 //! reads this table through
 //! `crate::typed_fallbacks::preflight_context_window_reroute`.
 
+/// Everything this process knows about one model's token limits
+/// (WOR-2647).
+///
+/// Both fields are `None` for a model nothing knows. Absence means "not
+/// known here", never "unlimited": a caller that substituted a default
+/// would silently truncate a prompt that would have fit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModelFacts {
+    /// Maximum prompt tokens the model accepts.
+    pub context_window: Option<u64>,
+    /// Maximum completion tokens the model will generate.
+    pub max_output_tokens: Option<u64>,
+}
+
+/// Resolve one model's token limits across both layers that hold them.
+///
+/// This is the single resolution the `ai.catalog` routing base data and
+/// the `/v1/models` listing both call, so a policy and a client cannot
+/// be told two different windows for one model.
+///
+/// The static table below is the first layer. The operator's rate card
+/// (`rate_card:`, the LiteLLM
+/// `model_prices_and_context_window.json`) is the second, and it is the
+/// only source of `max_output_tokens` in this process: nothing built in
+/// carries a completion cap. The static table wins on the context
+/// window where both know a model, because it is the value the
+/// compression pipeline already sizes prompts against and two answers
+/// for one model is the divergence this function exists to prevent.
+///
+/// A model neither layer knows resolves to two `None`s, and every
+/// caller omits the fields rather than guessing.
+#[must_use]
+pub fn model_facts(model: &str) -> ModelFacts {
+    // The price layers match case-insensitively but the static table is
+    // exact; fall back to the lowercase form so a mixed-case declared
+    // model does not end up priced-but-windowless.
+    let window =
+        model_context_window(model).or_else(|| model_context_window(&model.to_ascii_lowercase()));
+    let limits = crate::budget::catalog_token_limits(model);
+    ModelFacts {
+        context_window: window.or_else(|| limits.and_then(|limits| limits.max_input_tokens)),
+        max_output_tokens: limits.and_then(|limits| limits.max_output_tokens),
+    }
+}
+
 /// Return the known maximum context window (in tokens) for a model.
 ///
 /// Returns `None` for an unlisted model. Callers treat that as "no budget

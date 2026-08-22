@@ -814,6 +814,232 @@ fn resolve_model_alias(
     ))
 }
 
+/// One member picked out of a named model group (WOR-2657).
+#[derive(Debug, PartialEq, Eq)]
+struct ModelGroupPick {
+    /// The group name the caller sent as `model`.
+    group: String,
+    /// The member's upstream model id, which replaces the group name
+    /// everywhere below: on the wire, in the gates, and in the budget.
+    model: String,
+    /// The member's provider, applied as the same routing pin a model
+    /// alias uses.
+    provider: String,
+}
+
+/// Why a named model group could not serve a request (WOR-2657).
+///
+/// The two causes answer with different statuses on purpose. A
+/// credential whose provider policy excludes every member is a
+/// permanent decision about this caller, and every other credential
+/// refusal on this path answers `403`; returning `503` there would tell
+/// a client with retry logic to come back and be refused again. A group
+/// whose members are all switched off is an operator-side condition the
+/// same client should retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelGroupRefusal {
+    /// The calling credential's provider policy forbids every member.
+    CredentialForbidsEveryMember,
+    /// Every member's provider is disabled, or the candidate narrowing
+    /// left nothing to pick from.
+    NoMemberAvailable,
+}
+
+impl ModelGroupRefusal {
+    /// The status this refusal answers with.
+    fn status(self) -> u16 {
+        match self {
+            Self::CredentialForbidsEveryMember => 403,
+            Self::NoMemberAvailable => 503,
+        }
+    }
+
+    /// The message sent to the caller. Neither names a provider: which
+    /// vendors an origin configures is not the caller's to learn from a
+    /// refusal.
+    fn message(self) -> &'static str {
+        match self {
+            Self::CredentialForbidsEveryMember => {
+                "no member of this model group is permitted for this credential"
+            }
+            Self::NoMemberAvailable => {
+                "the model group for this request has no eligible member provider"
+            }
+        }
+    }
+
+    /// The bounded reason code carried on the admission decision family
+    /// and its audit record.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::CredentialForbidsEveryMember => "model_group_forbidden",
+            Self::NoMemberAvailable => "model_group_no_member",
+        }
+    }
+}
+
+/// Resolve a requested model name against the origin's group registry
+/// and pick one member.
+///
+/// Returns `None` when the name is not a group, which the caller then
+/// tries as an alias and finally as a literal model id. `Some(Err(..))`
+/// means the name *is* a group and every member is out of the request's
+/// candidate set, which is a refusal rather than a fallthrough: routing
+/// a group name to some other provider would dispatch a model id nobody
+/// declared.
+///
+/// Callers must apply this before the model gates and before building
+/// the provider candidate set, for the reason the alias resolver states
+/// and one more of its own. A group's members may serve *different*
+/// upstream model ids, so a late pick would leave `blocked_models`, the
+/// credential allowlist, the per-model rate limiter, and the budget
+/// scope all judging the group name instead of the model that is about
+/// to be dispatched. The routing-policy path documents exactly that
+/// failure where it changes the model late and has to re-gate.
+///
+/// The pick is resilience-aware: breaker, outlier, and health narrow the
+/// member set through `Router::routable_candidate_indices` before the
+/// group's strategy runs, so an open breaker moves traffic to a sibling
+/// member instead of turning the group into a refusal. Those three axes
+/// stay advisory, so an all-ejected group gives its members back rather
+/// than refusing.
+fn resolve_model_group(
+    config: &AiHandlerConfig,
+    router: &sbproxy_ai::routing::Router,
+    allowed_providers: &[String],
+    blocked_providers: &[String],
+    requested: &str,
+) -> Option<Result<ModelGroupPick, ModelGroupRefusal>> {
+    let registry = config.model_group_registry();
+    if registry.is_empty() || requested.is_empty() {
+        return None;
+    }
+    let group = registry.resolve(requested)?;
+
+    // Two hard filters, kept apart so the refusal can say which one
+    // emptied the set: the enabled switch is the operator's and answers
+    // 503, the credential's provider policy is the caller's and answers
+    // 403. Neither is a health signal; those are advisory and run below.
+    let enabled = group
+        .members
+        .iter()
+        .filter_map(|member| {
+            let index = config
+                .providers
+                .iter()
+                .position(|provider| provider.name.as_str() == member.provider.as_str())?;
+            config.providers[index].enabled.then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if enabled.is_empty() {
+        return Some(Err(ModelGroupRefusal::NoMemberAvailable));
+    }
+    let members = enabled
+        .into_iter()
+        .filter(|&index| {
+            provider_allowed_for_request(
+                &config.providers[index],
+                allowed_providers,
+                blocked_providers,
+            )
+        })
+        .collect::<Vec<_>>();
+    if members.is_empty() {
+        return Some(Err(ModelGroupRefusal::CredentialForbidsEveryMember));
+    }
+
+    let routable = router.routable_candidate_indices(&config.providers, &members);
+    let Some(picked) = router.select_group(&config.providers, &routable, group) else {
+        return Some(Err(ModelGroupRefusal::NoMemberAvailable));
+    };
+    // A pick outside the member set cannot happen: the candidates are
+    // member indices and the narrowing only ever removes from that set.
+    // Refuse rather than fall through if it ever does, because falling
+    // through would send the group name upstream as a literal model id.
+    let Some(provider) = config.providers.get(picked) else {
+        return Some(Err(ModelGroupRefusal::NoMemberAvailable));
+    };
+    let Some(member) = group
+        .members
+        .iter()
+        .find(|member| member.provider.as_str() == provider.name.as_str())
+    else {
+        return Some(Err(ModelGroupRefusal::NoMemberAvailable));
+    };
+    Some(Ok(ModelGroupPick {
+        group: group.name.as_str().to_string(),
+        model: member.model.as_str().to_string(),
+        provider: provider.name.as_str().to_string(),
+    }))
+}
+
+/// Resolve a JSON request body's `model` field against the group
+/// registry, rewriting both representations to the picked member's
+/// upstream model id.
+///
+/// Same contract as [`resolve_body_model_alias`]: the request that
+/// reaches the upstream, the one the budget prices, and the one the
+/// cache keys are all the same model.
+fn resolve_body_model_group(
+    config: &AiHandlerConfig,
+    router: &sbproxy_ai::routing::Router,
+    allowed_providers: &[String],
+    blocked_providers: &[String],
+    model: &mut String,
+    body: &mut serde_json::Value,
+) -> Option<Result<ModelGroupPick, ModelGroupRefusal>> {
+    let pick =
+        match resolve_model_group(config, router, allowed_providers, blocked_providers, model) {
+            Some(Ok(pick)) => pick,
+            other => return other,
+        };
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "model".to_string(),
+            serde_json::Value::String(pick.model.clone()),
+        );
+    }
+    model.clone_from(&pick.model);
+    Some(Ok(pick))
+}
+
+/// Log and publish a refused model group before the caller answers.
+///
+/// Without this a group that refuses every request is invisible: the
+/// selection counter only counts picks that happened, and the 503 or
+/// 403 reaches the client with nothing naming the group behind it. The
+/// refusal is decided before any provider is chosen, so it publishes on
+/// the same pre-provider admission funnel the inbound shim's refusals
+/// use, which puts it on the decision metric, the `ai.admission`
+/// decision family, and the audit feed at once.
+///
+/// `group` is safe to log: the name matched a `model_groups[].name` the
+/// operator declared, so it is bounded by the config rather than by the
+/// request.
+fn record_model_group_refusal(
+    ctx: &RequestContext,
+    surface_label: &str,
+    group: &str,
+    refusal: ModelGroupRefusal,
+) {
+    warn!(
+        ai.surface = surface_label,
+        model_group = %group,
+        reason = refusal.reason(),
+        status = refusal.status(),
+        "AI proxy: named model group has no eligible member; refusing"
+    );
+    record_ai_admission_refusal(ctx, surface_label, refusal.reason());
+}
+
+/// The admin routing-decisions reason a group pick writes.
+fn model_group_route_reason(pick: &ModelGroupPick) -> String {
+    format!(
+        "model_group: {} -> {}/{}",
+        pick.group, pick.provider, pick.model
+    )
+}
+
 /// The origin's default model, when every enabled provider that names
 /// one names the same one.
 ///
@@ -5830,7 +6056,31 @@ pub(super) async fn handle_ai_proxy(
             // sent; re-judge it on what that name resolved to, or an alias
             // would be a way around the credential's block-list.
             if let Some(model) = effective_model.as_mut() {
-                alias_provider = resolve_body_model_alias(config, model, body);
+                // WOR-2657: a named model group is the outer name, so it
+                // resolves ahead of the alias registry. The pick sets the
+                // same provider pin an alias pin sets, and the member's
+                // upstream model id is what every gate below judges.
+                match resolve_body_model_group(
+                    config,
+                    &router,
+                    allowed_providers,
+                    blocked_providers,
+                    model,
+                    body,
+                ) {
+                    Some(Ok(pick)) => {
+                        append_ai_route_reason(ctx, model_group_route_reason(&pick));
+                        alias_provider = Some(pick.provider);
+                    }
+                    Some(Err(refusal)) => {
+                        record_model_group_refusal(ctx, surface_label, model, refusal);
+                        send_error(session, refusal.status(), refusal.message()).await?;
+                        return Ok(());
+                    }
+                    None => {
+                        alias_provider = resolve_body_model_alias(config, model, body);
+                    }
+                }
             }
             if let Some(model) = effective_model.as_deref() {
                 let credential_allows = resolved_request_vk
@@ -5944,7 +6194,11 @@ pub(super) async fn handle_ai_proxy(
             })
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
-        // WOR-2312: an alias that named a provider narrows the set to it.
+        // WOR-2312: an alias that named a provider narrows the set to
+        // it, and WOR-2657: so does the member a model group picked.
+        // The refusal below names neither, because from here the two
+        // are one pin and an operator with only groups configured
+        // should not be told about aliases.
         if !retain_alias_pinned_providers(
             &mut provider_candidates,
             &config.providers,
@@ -5953,7 +6207,7 @@ pub(super) async fn handle_ai_proxy(
             send_error(
                 session,
                 503,
-                "the model alias for this request targets a provider that is not eligible",
+                "the model routing pin for this request targets a provider that is not eligible",
             )
             .await?;
             return Ok(());
@@ -6518,9 +6772,40 @@ pub(super) async fn handle_ai_proxy(
         // rewrite runs against the body as it stands, so a governed route
         // override composes with it, and it lands before the budget gate
         // and both model gates below.
-        let alias_resolution = requested_model
-            .as_deref()
-            .and_then(|requested| resolve_model_alias(config, requested));
+        //
+        // WOR-2657: a named model group resolves first, ahead of the
+        // alias registry, and rewrites the same `model` part. This seam
+        // has no JSON body to rewrite alongside it, so it calls the
+        // non-body resolver and hands the picked member's model id to
+        // `rewrite_engine_model` exactly as an alias target is handed.
+        let group_resolution = requested_model.as_deref().and_then(|requested| {
+            resolve_model_group(
+                config,
+                &router,
+                allowed_providers,
+                blocked_providers,
+                requested,
+            )
+        });
+        let alias_resolution = match group_resolution {
+            Some(Ok(pick)) => {
+                append_ai_route_reason(ctx, model_group_route_reason(&pick));
+                Some((pick.model, Some(pick.provider)))
+            }
+            Some(Err(refusal)) => {
+                record_model_group_refusal(
+                    ctx,
+                    surface_label,
+                    requested_model.as_deref().unwrap_or_default(),
+                    refusal,
+                );
+                send_error(session, refusal.status(), refusal.message()).await?;
+                return Ok(());
+            }
+            None => requested_model
+                .as_deref()
+                .and_then(|requested| resolve_model_alias(config, requested)),
+        };
         let mut alias_provider = None;
         if let Some((resolved, pinned)) = alias_resolution {
             forwarded_body = crate::model_plane::rewrite_engine_model(
@@ -6722,7 +7007,11 @@ pub(super) async fn handle_ai_proxy(
             })
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
-        // WOR-2312: an alias that named a provider narrows the set to it.
+        // WOR-2312: an alias that named a provider narrows the set to
+        // it, and WOR-2657: so does the member a model group picked.
+        // The refusal below names neither, because from here the two
+        // are one pin and an operator with only groups configured
+        // should not be told about aliases.
         if !retain_alias_pinned_providers(
             &mut provider_order,
             &config.providers,
@@ -6731,7 +7020,7 @@ pub(super) async fn handle_ai_proxy(
             send_error(
                 session,
                 503,
-                "the model alias for this request targets a provider that is not eligible",
+                "the model routing pin for this request targets a provider that is not eligible",
             )
             .await?;
             return Ok(());
@@ -7371,7 +7660,31 @@ pub(super) async fn handle_ai_proxy(
     // dispatched, so an alias can never route around a `blocked_models`
     // entry. The alias's optional provider pin is applied to the routing
     // set further down.
-    let alias_provider = resolve_body_model_alias(config, &mut model, &mut body);
+    // WOR-2657: the group registry is consulted first, for the same
+    // reason and at the same point. A group name is the outer name a
+    // caller sends, and the member it resolves to carries its own
+    // upstream model id, so resolving here is what keeps `blocked_models`,
+    // the credential allowlist, the per-model rate limiter, and the
+    // budget scope judging the model that will actually be dispatched.
+    let alias_provider = match resolve_body_model_group(
+        config,
+        &router,
+        allowed_providers,
+        blocked_providers,
+        &mut model,
+        &mut body,
+    ) {
+        Some(Ok(pick)) => {
+            append_ai_route_reason(ctx, model_group_route_reason(&pick));
+            Some(pick.provider)
+        }
+        Some(Err(refusal)) => {
+            record_model_group_refusal(ctx, surface_label, &model, refusal);
+            send_error(session, refusal.status(), refusal.message()).await?;
+            return Ok(());
+        }
+        None => resolve_body_model_alias(config, &mut model, &mut body),
+    };
 
     // Check model allow/block lists.
     if !model.is_empty() && !config.is_model_allowed(&model) {
@@ -9640,11 +9953,12 @@ pub(super) async fn handle_ai_proxy(
     let shadow_allowed_providers = allowed_providers.to_vec();
     let shadow_blocked_providers = blocked_providers.to_vec();
 
-    // WOR-2312: an alias that named a provider pins the routing set to it.
-    // This is stricter than the `models:` filter below on purpose: the
-    // alias already resolved the caller's name to that vendor's model id,
-    // so handing the request to another vendor would dispatch an id it
-    // does not serve. Failing here is the honest answer.
+    // WOR-2312: an alias that named a provider pins the routing set to
+    // it, and WOR-2657: so does the member a model group picked. This is
+    // stricter than the `models:` filter below on purpose: both already
+    // resolved the caller's name to that vendor's model id, so handing
+    // the request to another vendor would dispatch an id it does not
+    // serve. Failing here is the honest answer.
     if !retain_alias_pinned_providers(
         &mut provider_order,
         &config.providers,
@@ -9653,7 +9967,7 @@ pub(super) async fn handle_ai_proxy(
         send_error(
             session,
             503,
-            "the model alias for this request targets a provider that is not eligible",
+            "the model routing pin for this request targets a provider that is not eligible",
         )
         .await?;
         return Ok(());
@@ -12037,28 +12351,34 @@ fn record_ai_failure_decision(
 /// Record `ai.admission` on the decision family, the AI admission
 /// counter, and, when enabled, the audit feed (WOR-2595).
 ///
-/// The funnel behind the five refusals the AI dispatch path can take
+/// The funnel behind the six refusals the AI dispatch path can take
 /// before any provider is chosen: the three arms of the inbound
 /// native-format shim (the Anthropic Messages translate, the Responses
-/// stored-prompt bridge, and the Responses translate) and the two
+/// stored-prompt bridge, and the Responses translate), the two
 /// refusal arms of the shared stored-prompt resolver (a render failure,
-/// and a reference lifted off a native body that no prompt layer holds).
+/// and a reference lifted off a native body that no prompt layer holds),
+/// and a named model group with no eligible member
+/// (`model_group_no_member`, `model_group_forbidden`), which is decided
+/// at the same point for the same reason: the request names something
+/// this origin cannot dispatch, and no provider has been chosen yet.
 /// Before it, an MCP-governance-bypass attempt (`tools: [{"type":
 /// "mcp", ...}]` on `/v1/responses`) produced one free-text warn and a
 /// bare 400, which is metrically and forensically indistinguishable
 /// from a typo'd JSON body.
 ///
-/// **What this cannot see.** Only those five. A request refused later
+/// **What this cannot see.** Only those six. A request refused later
 /// by the model allow/block gate, a virtual-key policy, a guardrail, a
 /// budget, a rate limiter, or a CEL/Rego policy is that plane's
 /// decision and publishes under that plane's own event; none of them
 /// route through here. On the canonical `/v1/chat/completions` path
-/// there is no inbound shim, so the only refusal that reaches this
-/// funnel from there is a stored-prompt render failure.
-/// `docs/events.md` states the same boundary for operators.
+/// there is no inbound shim, so the refusals that reach this funnel
+/// from there are a stored-prompt render failure and an unservable
+/// model group. `docs/events.md` states the same boundary for
+/// operators.
 ///
-/// `reason` is a `&'static str` from [`sbproxy_ai::format::ChatError::reason`]
-/// and never the error's message: several of the coded refusals
+/// `reason` is a `&'static str` from [`sbproxy_ai::format::ChatError::reason`],
+/// or one of the two model-group codes, and never the error's message:
+/// several of the coded refusals
 /// interpolate caller bytes into the message (a serde parse error, an
 /// unrecognized role name), and both the metric label and
 /// `DecisionDetails` ship unscrubbed. The message reaches the client and
@@ -22418,6 +22738,207 @@ origins:
             }
         }
     }
+
+    // --- Named model groups through the live dispatch path (WOR-2657) ---
+
+    /// The wiring test the resolver's own unit tests cannot be: a real
+    /// request through `handle_ai_proxy`, asserting on the bytes the
+    /// provider received. Coverage of `resolve_model_group` proves the
+    /// pick; only this proves the pick is applied to the request that
+    /// leaves the gateway.
+    #[tokio::test]
+    async fn a_group_name_is_rewritten_before_the_request_leaves_the_gateway() {
+        let (upstream_url, hits, captured) = capturing_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        )
+        .await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "deployment-a",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "models": ["deployment-model-id"]
+            }],
+            "model_groups": [{
+                "name": "chat-pool",
+                "members": [{"provider": "deployment-a", "model": "deployment-model-id"}]
+            }]
+        }))
+        .expect("model group dispatch config");
+        let request = serde_json::json!({
+            "model": "chat-pool",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        });
+        let (mut session, client) = downstream_session(request).await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("a group request dispatches");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let upstream_request = captured.await.expect("capturing upstream task");
+        let request_text = String::from_utf8(upstream_request).expect("upstream request UTF-8");
+        let body = request_text
+            .split_once("\r\n\r\n")
+            .expect("upstream request body")
+            .1;
+        let body: serde_json::Value = serde_json::from_str(body).expect("upstream JSON body");
+        assert_eq!(
+            body["model"], "deployment-model-id",
+            "the group name must never reach a provider: {body}"
+        );
+        assert_eq!(
+            context.ai_route_reason.as_deref(),
+            Some("model_group: chat-pool -> deployment-a/deployment-model-id"),
+            "the admin row has to name the member that served the request"
+        );
+    }
+
+    /// The group validator has to run where an operator can see it.
+    /// `compile_config` parses the action body without building its
+    /// handler, so a config test there proves only that the key is
+    /// accepted; the refusal lands when the action compiles, which is
+    /// what `sbproxy validate` and boot both do.
+    #[test]
+    fn a_group_two_members_on_one_provider_is_refused_at_pipeline_build() {
+        let compiled = sbproxy_config::compile_config(
+            r#"
+origins:
+  "ai.test":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: dummy
+          models: [gpt-4o-mini, gpt-4o]
+      model_groups:
+        - name: pool
+          members:
+            - provider: openai
+              model: gpt-4o-mini
+            - provider: openai
+              model: gpt-4o
+"#,
+        )
+        .expect("the key parses; the validator runs a layer up");
+        let error = crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+            .err()
+            .expect("two members on one provider is refused when the action compiles");
+        let message = error.to_string();
+        assert!(
+            message.contains("already a member of this group"),
+            "the refusal must name the validator's reason: {message}"
+        );
+    }
+
+    /// A group with no eligible member refuses, and the refusal is
+    /// visible to the pipeline operators actually watch: an
+    /// `ai.admission` decision record carrying the bounded code, not
+    /// only a status line on the wire.
+    #[tokio::test]
+    async fn an_unservable_group_refuses_and_publishes_an_admission_record() {
+        let compiled = sbproxy_config::compile_config(
+            r#"
+proxy:
+  observability:
+    log:
+      decision_audit:
+        enabled: true
+origins:
+  "ai.test":
+    action:
+      type: static
+      body: ok
+"#,
+        )
+        .expect("model group refusal fixture config");
+        let pipeline = std::sync::Arc::new(
+            crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+                .expect("model group refusal fixture pipeline"),
+        );
+        // The group's only member is switched off while a second,
+        // non-member provider stays up, so a fallthrough would have had
+        // somewhere to go and the refusal is the group's own decision
+        // rather than an empty origin.
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "parked", "provider_type": "openai", "api_key": "k",
+                 "enabled": false, "base_url": "http://127.0.0.1:9",
+                 "allow_private_base_url": true, "models": ["parked-model"]},
+                {"name": "live", "provider_type": "openai", "api_key": "k",
+                 "base_url": "http://127.0.0.1:9", "allow_private_base_url": true,
+                 "models": ["live-model"]}
+            ],
+            "model_groups": [{
+                "name": "chat-pool",
+                "members": [{"provider": "parked", "model": "parked-model"}]
+            }]
+        }))
+        .expect("model group refusal config");
+        let request = serde_json::json!({
+            "model": "chat-pool",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        });
+        let (mut session, client) = downstream_session(request).await;
+        let mut context = crate::context::RequestContext::new();
+        context.pipeline = std::sync::Arc::clone(&pipeline);
+        context.origin_idx = Some(0);
+        context.tenant_id = "acme".into();
+        context.request_id = "req-model-group-refusal".into();
+
+        let (bus, mut rx) = crate::policy_bus::channel(16);
+        crate::policy_bus::init_global_bus(bus);
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            pipeline.as_ref(),
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("the group refusal is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 503"), "{response:?}");
+
+        let mut ours = Vec::new();
+        while let Ok(record) = rx.try_recv() {
+            if let crate::policy_bus::AuditRecord::Decision(audit) = record {
+                if audit.request_id == "req-model-group-refusal" {
+                    ours.push(audit);
+                }
+            }
+        }
+        assert_eq!(ours.len(), 1, "the refusal publishes exactly one record");
+        assert_eq!(
+            ours[0].event,
+            sbproxy_observe::decision::DecisionEvent::AiAdmission
+        );
+        assert_eq!(
+            ours[0].outcome,
+            sbproxy_observe::decision::DecisionOutcome::Deny
+        );
+        assert_eq!(
+            ours[0].details.verdict.as_deref(),
+            Some("model_group_no_member")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -22544,7 +23065,7 @@ fn ai_management_response_with_policy(
                     group.1.extend(capabilities.iter().copied());
                 }
             }
-            let data: Vec<_> = groups
+            let mut data: Vec<_> = groups
                 .into_iter()
                 .map(|(model_group, (providers, capabilities))| {
                     serde_json::json!({
@@ -22555,6 +23076,60 @@ fn ai_management_response_with_policy(
                     })
                 })
                 .collect();
+            // WOR-2657: a configured `model_groups:` entry is a real
+            // group and the derived scan above cannot see it, because a
+            // group name is deliberately absent from every provider's
+            // `models:` list. A LiteLLM client that reads this endpoint
+            // to discover what it may address would otherwise never
+            // learn the one name the operator actually published.
+            //
+            // These entries carry `members`, which the derived ones
+            // cannot: a derived group is several providers behind one
+            // model id, so there is nothing per-deployment to say. A
+            // named group's members each carry their own upstream model
+            // id and weight.
+            for group in config.model_group_registry().groups() {
+                let mut providers = Vec::new();
+                let mut members = Vec::new();
+                let mut capabilities = BTreeSet::new();
+                for member in &group.members {
+                    let Some(entry) = config
+                        .providers
+                        .iter()
+                        .find(|provider| provider.name.as_str() == member.provider.as_str())
+                    else {
+                        continue;
+                    };
+                    if !provider_allowed(entry) || !model_allowed(member.model.as_str()) {
+                        continue;
+                    }
+                    providers.push(entry.name.to_string());
+                    members.push(serde_json::json!({
+                        "provider": entry.name.as_str(),
+                        "model": member.model.as_str(),
+                        "weight": member.weight,
+                    }));
+                    capabilities.extend(
+                        sbproxy_ai::api_routes::surface_capability_names(entry)
+                            .iter()
+                            .copied(),
+                    );
+                }
+                // Every member filtered out by this credential's policy
+                // means the group is unusable for this caller, so listing
+                // it would advertise a name that answers 503.
+                if members.is_empty() {
+                    continue;
+                }
+                data.push(serde_json::json!({
+                    "model_group": group.name.as_str(),
+                    "num_deployments": members.len(),
+                    "providers": providers,
+                    "capabilities": capabilities,
+                    "members": members,
+                    "routing": group.routing_name(),
+                }));
+            }
             Some(serde_json::json!({ "data": data }))
         }
         // LiteLLM spells one of these "liveliness"; accept both spellings.
@@ -22987,6 +23562,245 @@ mod model_routing_tests {
             ]
         }))
         .expect("AiHandlerConfig fixture")
+    }
+
+    // --- Named model groups (WOR-2657) ---
+
+    /// An origin with two providers serving *different* upstream model
+    /// ids behind one group name. The mixed ids are the point: it is
+    /// what a same-model-name pool cannot express.
+    fn group_config(routing: &str, blocked: &[&str]) -> sbproxy_ai::handler::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "openai-a", "api_key": "k", "provider_type": "openai",
+                 "models": ["gpt-4o-mini"]},
+                {"name": "azure-b", "api_key": "k", "provider_type": "openai",
+                 "models": ["gpt-4o-mini-deployment"]}
+            ],
+            "blocked_models": blocked,
+            "model_groups": [{
+                "name": "pool",
+                "routing": routing,
+                "members": [
+                    {"provider": "openai-a", "model": "gpt-4o-mini", "weight": 9},
+                    {"provider": "azure-b", "model": "gpt-4o-mini-deployment", "weight": 1}
+                ]
+            }]
+        }))
+        .expect("group fixture")
+    }
+
+    #[test]
+    fn a_group_member_serves_its_own_model_id_and_pins_its_provider() {
+        // The seam: the group name never reaches the wire. What replaces
+        // it is the picked member's upstream id, and the pin is the same
+        // one an alias sets, so `retain_alias_pinned_providers` narrows
+        // the order to that member downstream.
+        let config = group_config("round_robin", &[]);
+        let router = config.router();
+        let pick = super::resolve_model_group(&config, &router, &[], &[], "pool")
+            .expect("pool is a group")
+            .expect("a member is eligible");
+        assert_eq!(pick.group, "pool");
+        assert_eq!(pick.provider, "openai-a");
+        assert_eq!(pick.model, "gpt-4o-mini");
+
+        let next = super::resolve_model_group(&config, &router, &[], &[], "pool")
+            .expect("pool is a group")
+            .expect("a member is eligible");
+        assert_eq!(next.provider, "azure-b");
+        assert_eq!(
+            next.model, "gpt-4o-mini-deployment",
+            "the second member serves a different upstream id, which is what a group is for"
+        );
+    }
+
+    #[test]
+    fn a_literal_model_name_is_not_a_group() {
+        let config = group_config("round_robin", &[]);
+        let router = config.router();
+        assert!(super::resolve_model_group(&config, &router, &[], &[], "gpt-4o-mini").is_none());
+        assert!(super::resolve_model_group(&config, &router, &[], &[], "").is_none());
+    }
+
+    #[test]
+    fn resolving_a_group_rewrites_both_the_model_and_the_body() {
+        // Both representations move together, so the id the upstream
+        // sees, the one the budget prices, and the one the cache keys are
+        // the same. A rewrite of only `model` would leave the body's
+        // `"model": "pool"` on the wire.
+        let config = group_config("round_robin", &[]);
+        let router = config.router();
+        let mut model = "pool".to_string();
+        let mut body = serde_json::json!({"model": "pool", "messages": []});
+        let pick =
+            super::resolve_body_model_group(&config, &router, &[], &[], &mut model, &mut body)
+                .expect("pool is a group")
+                .expect("a member is eligible");
+        assert_eq!(model, pick.model);
+        assert_eq!(body["model"], serde_json::Value::String(pick.model.clone()));
+        assert_ne!(model, "pool");
+    }
+
+    #[test]
+    fn a_group_resolves_before_the_model_allowlist_sees_the_name() {
+        // The security seam. `blocked_models: [gpt-4o-mini]` names a
+        // member's upstream id, not the group name, and the group name
+        // is not blocked. Because the group resolves first, the gate
+        // below it judges `gpt-4o-mini` and refuses. Resolving late
+        // would have handed the gate the string `pool`, which passes.
+        let config = group_config("round_robin", &["gpt-4o-mini"]);
+        assert!(
+            config.is_model_allowed("pool"),
+            "the group name itself is not blocked, so the gate can only bite on the member"
+        );
+        let router = config.router();
+        let pick = super::resolve_model_group(&config, &router, &[], &[], "pool")
+            .expect("pool is a group")
+            .expect("a member is eligible");
+        assert_eq!(pick.model, "gpt-4o-mini");
+        assert!(
+            !config.is_model_allowed(&pick.model),
+            "the gate that runs after resolution sees the member's real id and refuses it"
+        );
+    }
+
+    #[test]
+    fn a_group_pick_skips_a_member_whose_breaker_is_open() {
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "openai-a", "api_key": "k", "provider_type": "openai",
+                 "models": ["gpt-4o-mini"]},
+                {"name": "azure-b", "api_key": "k", "provider_type": "openai",
+                 "models": ["gpt-4o-mini-deployment"]}
+            ],
+            "resilience": {"circuit_breaker": {"failure_threshold": 1, "open_duration_secs": 60}},
+            "model_groups": [{
+                "name": "pool",
+                "routing": "round_robin",
+                "members": [
+                    {"provider": "openai-a", "model": "gpt-4o-mini"},
+                    {"provider": "azure-b", "model": "gpt-4o-mini-deployment"}
+                ]
+            }]
+        }))
+        .expect("group fixture with a breaker");
+        let router = config.router();
+        // Trip openai-a's breaker.
+        router.record_provider_failure(0, "openai-a");
+        assert!(
+            router.provider_runtime_states()[0].circuit_open,
+            "the fixture must actually open the breaker, or this test proves nothing"
+        );
+
+        for _ in 0..4 {
+            let pick = super::resolve_model_group(&config, &router, &[], &[], "pool")
+                .expect("pool is a group")
+                .expect("the healthy member is eligible");
+            assert_eq!(
+                pick.provider, "azure-b",
+                "an open breaker must move group traffic to the sibling member"
+            );
+        }
+    }
+
+    #[test]
+    fn a_group_whose_members_the_credential_forbids_refuses_rather_than_routes() {
+        // Falling through to some other provider would dispatch a model
+        // id nobody declared, so the honest answer is a refusal. It is
+        // a permanent decision about this caller, so it answers 403 like
+        // every other credential refusal on this path; 503 would tell a
+        // client with retry logic to come back and be refused again.
+        let config = group_config("round_robin", &[]);
+        let router = config.router();
+        let blocked = vec!["openai-a".to_string(), "azure-b".to_string()];
+        let outcome = super::resolve_model_group(&config, &router, &[], &blocked, "pool")
+            .expect("pool is still a group");
+        assert_eq!(
+            outcome,
+            Err(super::ModelGroupRefusal::CredentialForbidsEveryMember)
+        );
+        assert_eq!(
+            super::ModelGroupRefusal::CredentialForbidsEveryMember.status(),
+            403
+        );
+    }
+
+    #[test]
+    fn a_group_whose_members_are_all_disabled_is_unavailable_not_forbidden() {
+        // The operator switched the deployments off, which is a
+        // retryable condition and not a statement about this caller, so
+        // the two refusals must not collapse into one status.
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "openai-a", "api_key": "k", "provider_type": "openai",
+                 "enabled": false, "models": ["gpt-4o-mini"]},
+                {"name": "azure-b", "api_key": "k", "provider_type": "openai",
+                 "enabled": false, "models": ["gpt-4o-mini-deployment"]}
+            ],
+            "model_groups": [{
+                "name": "pool",
+                "members": [
+                    {"provider": "openai-a", "model": "gpt-4o-mini"},
+                    {"provider": "azure-b", "model": "gpt-4o-mini-deployment"}
+                ]
+            }]
+        }))
+        .expect("group fixture with disabled providers");
+        let router = config.router();
+        let outcome = super::resolve_model_group(&config, &router, &[], &[], "pool")
+            .expect("pool is still a group");
+        assert_eq!(outcome, Err(super::ModelGroupRefusal::NoMemberAvailable));
+        assert_eq!(super::ModelGroupRefusal::NoMemberAvailable.status(), 503);
+    }
+
+    #[test]
+    fn model_group_info_reports_a_configured_group_with_its_members() {
+        // Red on main: the endpoint derives groups by scanning
+        // `providers[].models`, and a group name appears in no such
+        // list, so the one name the operator published was invisible to
+        // every LiteLLM client.
+        let config = group_config("weighted", &[]);
+        let resp = super::ai_management_response("/model_group/info", &config).unwrap();
+        let groups = resp["data"].as_array().unwrap();
+        let pool = groups
+            .iter()
+            .find(|group| group["model_group"] == "pool")
+            .expect("the configured group is listed");
+        assert_eq!(pool["num_deployments"], 2);
+        assert_eq!(pool["routing"], "weighted");
+        assert_eq!(
+            pool["members"],
+            serde_json::json!([
+                {"provider": "openai-a", "model": "gpt-4o-mini", "weight": 9},
+                {"provider": "azure-b", "model": "gpt-4o-mini-deployment", "weight": 1}
+            ])
+        );
+        // The derived per-model groups are still there beside it.
+        assert!(groups
+            .iter()
+            .any(|group| group["model_group"] == "gpt-4o-mini"));
+    }
+
+    #[test]
+    fn model_group_info_drops_a_group_whose_every_member_the_policy_refuses() {
+        // Listing it would advertise a name that answers 503.
+        let config = group_config("round_robin", &[]);
+        let blocked_providers = vec!["openai-a".to_string(), "azure-b".to_string()];
+        let resp = super::ai_management_response_with_policy(
+            "/model_group/info",
+            &config,
+            &[],
+            &blocked_providers,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(!resp["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|group| group["model_group"] == "pool"));
     }
 
     #[test]

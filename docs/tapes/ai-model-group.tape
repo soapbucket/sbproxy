@@ -20,7 +20,7 @@ Type `export PS1='$ '; clear`
 Enter
 Show
 
-Type `curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Host: ai.local' -H 'Content-Type: application/json' -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"In one sentence, what is load balancing?"}]}' | jq -r '.model, .choices[0].message.content'`
+Type `curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Host: ai.local' -H 'Content-Type: application/json' -d '{"model":"chat","messages":[{"role":"user","content":"In one sentence, what is load balancing?"}]}' | jq -r '.model, .choices[0].message.content'`
 Enter
 Sleep 3.5s
 
