@@ -21,14 +21,20 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use sbproxy_classifier_proto::{
-    compress_request, ClassifyRequest, CompressRequest, CompressResponse, EmbedRequest,
-    InferenceServiceClient, VersionRequest, VersionResponse,
+    compress_request, ClassifierServiceClient, ClassifyRequest, CompressRequest, CompressResponse,
+    EmbedRequest, InferenceServiceClient, QualityRequest, SafetyToken, VersionRequest,
+    VersionResponse,
 };
 
 /// Classification response types, re-exported so callers of
 /// [`ClassifierClient::classify`] can name them without depending on the
 /// proto crate directly.
 pub use sbproxy_classifier_proto::{ClassifyResponse, Label};
+/// `ClassifierService` response types (WOR-2665), re-exported for the same
+/// reason: [`ClassifierClient::quality`] and
+/// [`ClassifierClient::open_stream_safety`] callers should not need to add
+/// a direct `sbproxy-classifier-proto` dependency just to name these.
+pub use sbproxy_classifier_proto::{QualityResponse, SafetyVerdict};
 use tokio::net::UnixStream;
 use tonic::transport::{Channel, Endpoint};
 use tower::service_fn;
@@ -41,6 +47,16 @@ use tower::service_fn;
 /// and supports a SIGTERM-then-SIGKILL graceful shutdown.
 pub mod supervisor;
 pub use supervisor::{Supervisor, SupervisorConfig, SupervisorError, SupervisorState};
+
+/// WOR-2665: the optional-degrade architecture. `FallbackClassifier` wraps
+/// an *optional* [`ClassifierClient`] and a caller-supplied in-process
+/// classifier, so an operator who never deploys the rich or minimal sidecar
+/// still gets full classification via the existing in-process path. See the
+/// module doc there and `crates/sbproxy-classifier-client/examples/fallback.rs`
+/// for a runnable demonstration of all three cases (no sidecar configured,
+/// sidecar configured but unreachable, sidecar healthy).
+pub mod fallback;
+pub use fallback::{FallbackClassifier, InProcessClassifier, Verdict};
 
 /// Error talking to the classifier sidecar.
 ///
@@ -96,6 +112,13 @@ pub enum CompressionTarget {
 #[derive(Clone, Debug)]
 pub struct ClassifierClient {
     inner: InferenceServiceClient<Channel>,
+    /// `ClassifierService` stub (WOR-2665), sharing the same channel as
+    /// `inner`. Only the rich sidecar (`sbproxy-classifier`) implements
+    /// this service; calling [`Self::quality`] or
+    /// [`Self::open_stream_safety`] against the minimal sidecar surfaces as
+    /// an RPC error (`UNIMPLEMENTED`/`NOT_FOUND` depending on the peer),
+    /// which the caller's fail policy handles like any other RPC error.
+    classifier: ClassifierServiceClient<Channel>,
     timeout: Duration,
 }
 
@@ -114,7 +137,8 @@ impl ClassifierClient {
             .await
             .map_err(|e| ClassifierClientError::Connect(e.to_string()))?;
         Ok(Self {
-            inner: InferenceServiceClient::new(channel),
+            inner: InferenceServiceClient::new(channel.clone()),
+            classifier: ClassifierServiceClient::new(channel),
             timeout: call_timeout,
         })
     }
@@ -150,7 +174,8 @@ impl ClassifierClient {
             .connect_timeout(call_timeout)
             .connect_lazy();
         Ok(Self {
-            inner: InferenceServiceClient::new(channel),
+            inner: InferenceServiceClient::new(channel.clone()),
+            classifier: ClassifierServiceClient::new(channel),
             timeout: call_timeout,
         })
     }
@@ -186,7 +211,8 @@ impl ClassifierClient {
             .await
             .map_err(|e| ClassifierClientError::Connect(format!("uds {path:?}: {e}")))?;
         Ok(Self {
-            inner: InferenceServiceClient::new(channel),
+            inner: InferenceServiceClient::new(channel.clone()),
+            classifier: ClassifierServiceClient::new(channel),
             timeout: call_timeout,
         })
     }
@@ -217,7 +243,8 @@ impl ClassifierClient {
             }
         }));
         Ok(Self {
-            inner: InferenceServiceClient::new(channel),
+            inner: InferenceServiceClient::new(channel.clone()),
+            classifier: ClassifierServiceClient::new(channel),
             timeout: call_timeout,
         })
     }
@@ -338,6 +365,103 @@ impl ClassifierClient {
             Err(_) => Err(ClassifierClientError::Timeout(self.timeout)),
         }
     }
+
+    /// Heuristic quality score for `text` (WOR-2665). Only the rich sidecar
+    /// (`sbproxy-classifier`) implements `ClassifierService`; against the
+    /// minimal sidecar this surfaces as an RPC error, handled by the
+    /// caller's fail policy like any other RPC error.
+    pub async fn quality(
+        &self,
+        tenant: &str,
+        text: &str,
+    ) -> Result<QualityResponse, ClassifierClientError> {
+        let request = QualityRequest {
+            tenant: tenant.to_string(),
+            text: text.to_string(),
+        };
+        let mut client = self.classifier.clone();
+        match tokio::time::timeout(self.timeout, client.quality(request)).await {
+            Ok(Ok(resp)) => Ok(resp.into_inner()),
+            Ok(Err(status)) => Err(rpc_error(status)),
+            Err(_) => Err(ClassifierClientError::Timeout(self.timeout)),
+        }
+    }
+
+    /// Open a per-token streaming safety check against the rich sidecar
+    /// (WOR-2665). `rules` is sent once, on the first outbound message; see
+    /// [`SafetyStream`] for the send/receive halves. The connect-timeout
+    /// half of `self.timeout` bounds opening the stream; there is no
+    /// per-message timeout on [`SafetyStream::send`] /
+    /// [`SafetyStream::next_verdict`], since the caller controls the pace
+    /// tokens arrive at (a fixed per-token timeout would either be too
+    /// tight for a slow upstream or too loose to matter).
+    pub async fn open_stream_safety(
+        &self,
+        tenant: &str,
+        rules: Vec<String>,
+    ) -> Result<SafetyStream, ClassifierClientError> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<SafetyToken>(16);
+        let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let mut client = self.classifier.clone();
+        let response = tokio::time::timeout(self.timeout, client.stream_safety(outbound))
+            .await
+            .map_err(|_| ClassifierClientError::Timeout(self.timeout))?
+            .map_err(rpc_error)?;
+        Ok(SafetyStream {
+            tx,
+            tenant: tenant.to_string(),
+            rules,
+            first_sent: false,
+            inbound: response.into_inner(),
+        })
+    }
+}
+
+/// Send/receive handle for one `ClassifierService::StreamSafety` call,
+/// opened via [`ClassifierClient::open_stream_safety`].
+///
+/// Drop this to close the outbound half of the stream; the sidecar then
+/// ends the inbound half once it has drained any verdicts still in flight.
+pub struct SafetyStream {
+    tx: tokio::sync::mpsc::Sender<SafetyToken>,
+    tenant: String,
+    rules: Vec<String>,
+    first_sent: bool,
+    inbound: tonic::Streaming<SafetyVerdict>,
+}
+
+impl SafetyStream {
+    /// Send the next token (or chunk) of streaming output to check.
+    /// `rules` (and `tenant`) are attached to the first call only, per the
+    /// proto contract; later calls carry the token alone.
+    pub async fn send(&mut self, token: impl Into<String>) -> Result<(), ClassifierClientError> {
+        let msg = SafetyToken {
+            tenant: if self.first_sent {
+                String::new()
+            } else {
+                self.tenant.clone()
+            },
+            rules: if self.first_sent {
+                Vec::new()
+            } else {
+                std::mem::take(&mut self.rules)
+            },
+            token: token.into(),
+        };
+        self.first_sent = true;
+        self.tx
+            .send(msg)
+            .await
+            .map_err(|_| ClassifierClientError::Connect("stream_safety sender closed".into()))
+    }
+
+    /// Receive the verdict for the next sent token, in order. Returns
+    /// `None` once the sidecar has closed the inbound half (normally right
+    /// after this handle is dropped, ending the outbound half).
+    pub async fn next_verdict(&mut self) -> Option<Result<SafetyVerdict, ClassifierClientError>> {
+        use tokio_stream::StreamExt as _;
+        self.inbound.next().await.map(|r| r.map_err(rpc_error))
+    }
 }
 
 /// Validate (and normalize) a classification response before it reaches an
@@ -436,11 +560,12 @@ fn is_char_subsequence(candidate: &str, source: &str) -> bool {
 mod tests {
     use super::*;
     use sbproxy_classifier_proto::{
-        compress_request, ClassifyRequest, CompressRequest, CompressResponse, EmbedRequest,
-        EmbedResponse, Embedding, InferenceService, InferenceServiceServer, Label,
-        ModelInfoRequest, ModelInfoResponse,
+        compress_request, ClassifierService, ClassifierServiceServer, ClassifyRequest,
+        CompressRequest, CompressResponse, EmbedRequest, EmbedResponse, Embedding,
+        InferenceService, InferenceServiceServer, Label, ModelInfoRequest, ModelInfoResponse,
     };
-    use tonic::{Request, Response, Status};
+    use tokio_stream::StreamExt as _;
+    use tonic::{Request, Response, Status, Streaming};
 
     // Minimal stub sidecar: Classify echoes a fixed label, Version reports one
     // model. Lets us exercise the client end to end without a real ONNX model.
@@ -604,7 +729,81 @@ mod tests {
         }
     }
 
-    // Bind port 0, spawn the stub server, return its `http://` endpoint.
+    /// Stub `ClassifierService`: `Quality` echoes a fixed score, and
+    /// `StreamSafety` mirrors the real sidecar's contract (rules read from
+    /// the first message, blocked verdicts stick) closely enough to
+    /// exercise the client's [`SafetyStream`] end to end.
+    #[tonic::async_trait]
+    impl ClassifierService for StubService {
+        async fn quality(
+            &self,
+            req: Request<QualityRequest>,
+        ) -> Result<Response<QualityResponse>, Status> {
+            let req = req.into_inner();
+            let mut signals = std::collections::HashMap::new();
+            signals.insert("length".to_string(), req.text.len() as f64);
+            Ok(Response::new(QualityResponse {
+                score: 0.75,
+                signals,
+            }))
+        }
+
+        type StreamSafetyStream = std::pin::Pin<
+            Box<dyn tokio_stream::Stream<Item = Result<SafetyVerdict, Status>> + Send>,
+        >;
+
+        async fn stream_safety(
+            &self,
+            req: Request<Streaming<SafetyToken>>,
+        ) -> Result<Response<Self::StreamSafetyStream>, Status> {
+            let mut inbound = req.into_inner();
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            tokio::spawn(async move {
+                let mut rules: Vec<String> = Vec::new();
+                let mut seen_first = false;
+                let mut blocked_reason: Option<String> = None;
+                while let Some(Ok(token)) = inbound.next().await {
+                    if !seen_first {
+                        rules = token.rules;
+                        seen_first = true;
+                    }
+                    let verdict = if let Some(reason) = &blocked_reason {
+                        SafetyVerdict {
+                            safe: false,
+                            blocked: false,
+                            reason: reason.clone(),
+                        }
+                    } else if rules
+                        .iter()
+                        .any(|r| token.token.to_lowercase().contains(&r.to_lowercase()))
+                    {
+                        let reason = format!("matched rule in {:?}", token.token);
+                        blocked_reason = Some(reason.clone());
+                        SafetyVerdict {
+                            safe: false,
+                            blocked: true,
+                            reason,
+                        }
+                    } else {
+                        SafetyVerdict {
+                            safe: true,
+                            blocked: false,
+                            reason: String::new(),
+                        }
+                    };
+                    if tx.send(Ok(verdict)).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            let stream: Self::StreamSafetyStream =
+                Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
+            Ok(Response::new(stream))
+        }
+    }
+
+    // Bind port 0, spawn the stub server (both services), return its
+    // `http://` endpoint.
     async fn spawn_stub() -> Option<String> {
         let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
             Ok(listener) => listener,
@@ -619,6 +818,7 @@ mod tests {
         tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(InferenceServiceServer::new(StubService))
+                .add_service(ClassifierServiceServer::new(StubService))
                 .serve_with_incoming(stream)
                 .await
                 .unwrap();
@@ -973,5 +1173,57 @@ mod tests {
             ),
             "expected Timeout or Rpc, got {err:?}"
         );
+    }
+
+    // --- ClassifierService: quality + stream_safety (WOR-2665) ---
+
+    #[tokio::test]
+    async fn quality_round_trips_against_a_stub() {
+        let Some(endpoint) = spawn_stub().await else {
+            return;
+        };
+        let client =
+            ClassifierClient::connect(&endpoint, Duration::from_secs(2), Duration::from_secs(2))
+                .await
+                .expect("connect");
+
+        let resp = client
+            .quality("tenant.example", "hello world")
+            .await
+            .unwrap();
+        assert_eq!(resp.score, 0.75);
+        assert_eq!(resp.signals["length"], "hello world".len() as f64);
+    }
+
+    #[tokio::test]
+    async fn open_stream_safety_round_trips_and_blocks_once_a_rule_matches() {
+        let Some(endpoint) = spawn_stub().await else {
+            return;
+        };
+        let client =
+            ClassifierClient::connect(&endpoint, Duration::from_secs(2), Duration::from_secs(2))
+                .await
+                .expect("connect");
+
+        let mut stream = client
+            .open_stream_safety("tenant.example", vec!["forbidden".to_string()])
+            .await
+            .expect("open stream_safety");
+
+        stream.send("this is ").await.unwrap();
+        let first = stream.next_verdict().await.unwrap().unwrap();
+        assert!(first.safe && !first.blocked);
+
+        stream.send("forbidden content").await.unwrap();
+        let second = stream.next_verdict().await.unwrap().unwrap();
+        assert!(!second.safe && second.blocked);
+        assert!(second.reason.contains("forbidden"));
+
+        // Stays blocked on the next message even though it alone contains
+        // none of the rule text.
+        stream.send("more text").await.unwrap();
+        let third = stream.next_verdict().await.unwrap().unwrap();
+        assert!(!third.safe);
+        assert_eq!(third.reason, second.reason);
     }
 }

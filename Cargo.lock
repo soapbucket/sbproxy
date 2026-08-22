@@ -7859,6 +7859,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "sbproxy-classifier"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "prometheus",
+ "prost 0.13.5",
+ "regex",
+ "rmp-serde",
+ "sbproxy-classifier-proto",
+ "sbproxy-classifiers",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic 0.12.3",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "sbproxy-classifier-client"
 version = "0.1.0"
 dependencies = [
@@ -10085,6 +10108,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

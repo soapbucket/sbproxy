@@ -1,0 +1,48 @@
+[package]
+name = "sbproxy-classifier"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+description = "Rich multi-tenant prompt-classification sidecar: gRPC + TCP/MessagePack, heuristic and ONNX classification, quality scoring, and streaming safety checks (WOR-2665)."
+
+[[bin]]
+name = "sbproxy-classifier"
+path = "src/main.rs"
+
+[dependencies]
+# Shared InferenceService + ClassifierService gRPC contract, and the
+# tract-onnx classification/embedding engine already used by the OSS
+# in-process detectors and the minimal sidecar. Reusing it here (rather
+# than adding a second ONNX runtime such as `ort`) keeps one ONNX engine
+# in the workspace.
+sbproxy-classifier-proto = { path = "../sbproxy-classifier-proto" }
+sbproxy-classifiers = { workspace = true }
+
+tokio = { workspace = true, features = ["net"] }
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
+tonic = { workspace = true }
+prost = { workspace = true }
+
+# MessagePack, for the legacy TCP protocol on port 9400.
+rmp-serde = "1"
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+regex = { workspace = true }
+unicode-normalization = "0.1"
+
+clap = { version = "4", features = ["derive"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+# Sidecar-local Prometheus exposition. Matches the `prometheus` crate the
+# rest of the workspace (`sbproxy-observe`) standardizes on, rather than
+# introducing a second metrics stack for one binary.
+prometheus = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

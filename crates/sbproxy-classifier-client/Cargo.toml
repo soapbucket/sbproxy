@@ -10,6 +10,9 @@ description = "Resilient gRPC client for the classifier sidecar InferenceService
 sbproxy-classifier-proto = { path = "../sbproxy-classifier-proto" }
 tonic = { workspace = true }
 tokio = { workspace = true, features = ["net", "process", "sync", "time", "macros", "rt"] }
+# WOR-2665: `open_stream_safety`'s outbound half is a `ReceiverStream`
+# wrapping a `Streaming` request body for `ClassifierService::StreamSafety`.
+tokio-stream = { version = "0.1", features = ["sync"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 # WOR-705 UDS transport: `tower::service_fn` is the tonic-recommended
@@ -26,3 +29,7 @@ tokio = { workspace = true, features = ["full", "macros"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 # UDS test: bind in a tempdir so parallel test runs do not collide.
 tempfile = "3"
+
+[[example]]
+name = "fallback"
+path = "examples/fallback.rs"

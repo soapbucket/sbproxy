@@ -112,3 +112,70 @@ message VersionResponse {
   // Logical model ids this sidecar can serve.
   repeated string models = 2;
 }
+
+// The enterprise-superset RPCs (WOR-2665). `InferenceService` above is the
+// contract both the minimal OSS sidecar and the rich sidecar implement;
+// `ClassifierService` is additional surface only the rich sidecar
+// (`sbproxy-classifier`) serves. Kept in the same proto file (rather than a
+// second crate) so one generated client crate can carry both stubs, per the
+// comment on `InferenceService`: one client reaches whichever sidecar is
+// deployed. A caller talking only to the minimal sidecar never constructs a
+// `ClassifierServiceClient`, so this costs nothing when unused.
+//
+// `Classify`-shaped multi-tenant work (heuristic pattern classification,
+// intent detection, content-type detection) and tenant administration
+// (register/delete/list) are server today over the TCP + MessagePack
+// transport on port 9400 only; see `docs/classifier-sidecar.md` for why
+// that surface, rather than this one, carries them for the initial port.
+service ClassifierService {
+  // Heuristic quality score for an AI-generated response: refusal-phrase
+  // detection, length, repetition, formatting, and casing signals combined
+  // into one score plus the per-signal breakdown.
+  rpc Quality (QualityRequest) returns (QualityResponse);
+  // Per-token streaming safety check. The caller streams one message per
+  // token (or per small chunk) as it arrives from the upstream provider;
+  // the server streams back one verdict per input message, so a caller can
+  // cut a response short the moment a rule matches instead of waiting for
+  // the full body. `rules` is read from the first message in the stream and
+  // ignored on subsequent ones, so a caller sets it once per stream.
+  rpc StreamSafety (stream SafetyToken) returns (stream SafetyVerdict);
+}
+
+message QualityRequest {
+  // Tenant id, for future per-tenant weighting. Unused by the heuristic
+  // scorer today; carried so a client does not need a breaking change when
+  // per-tenant weights ship.
+  string tenant = 1;
+  // AI-generated text to score.
+  string text = 2;
+}
+
+message QualityResponse {
+  // Overall score, 0.0 (poor) to 1.0 (excellent).
+  double score = 1;
+  // Per-signal scores: "length", "coherence", "repetition", "formatting",
+  // "error_patterns", "casing".
+  map<string, double> signals = 2;
+}
+
+message SafetyToken {
+  // Tenant id. Read from the first message; ignored afterward.
+  string tenant = 1;
+  // Case-insensitive substrings that block the stream when matched against
+  // the tokens accumulated so far. Read from the first message; ignored
+  // afterward, so a caller sends the rule set once per stream.
+  repeated string rules = 2;
+  // The next token (or chunk) of the streaming response.
+  string token = 3;
+}
+
+message SafetyVerdict {
+  // False once any rule has matched; stays false for the rest of the
+  // stream, since the caller is expected to stop forwarding output at that
+  // point.
+  bool safe = 1;
+  // True on the message where a rule first matched.
+  bool blocked = 2;
+  // Which rule matched, empty when `blocked` is false.
+  string reason = 3;
+}

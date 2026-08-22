@@ -568,3 +568,13 @@ where the count first became visible to a gate.
 # the just-raised baseline, the same "mention moves the bucket" effect
 # already logged above for `fallback_trigger` and `sweep_expired`.
 # Lowering to hold the ground rather than leaving it unclaimed.
+
+2026-08-22 (WOR-2665): stayed at 295, and worth a note because it
+briefly looked like it had to move. `sbproxy-classifier` is a new
+binary crate with zero external consumers, so its wire-format structs
+(`protocol::TenantLabel`, `TenantClassification`, `TenantNormalization`,
+`TenantNormRule`) only need to be visible to the rest of the crate, not
+truly `pub`: `rmp_serde` derives against `pub(crate)` fields exactly as
+well as `pub` ones, since deserialization happens inside the same
+crate. Narrowing all four (plus `quality::QualityResult`, same
+reasoning) held the count at 295 instead of raising it to 297.

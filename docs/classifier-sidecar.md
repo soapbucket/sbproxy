@@ -1,8 +1,13 @@
 # Classifier Sidecar
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-22*
 
-SBproxy heavily invests in out-of-process AI safety via the `sbproxy-classifier-sidecar` and `sbproxy-classifier-client` crates. These components allow you to run remote or local Machine Learning safety classifiers (e.g., prompt injection detection, PII detection, toxicity) outside of the main proxy process using gRPC.
+SBproxy heavily invests in out-of-process AI safety via the `sbproxy-classifier-sidecar`, `sbproxy-classifier`, and `sbproxy-classifier-client` crates. These components allow you to run remote or local Machine Learning safety classifiers (e.g., prompt injection detection, PII detection, toxicity) outside of the main proxy process using gRPC, plus (for `sbproxy-classifier`) TCP + MessagePack.
+
+Two sidecar binaries exist, both built from this OSS tree, and a caller reaches either through the same `sbproxy-classifier-client`:
+
+- **`sbproxy-classifier-sidecar`** - minimal: `InferenceService` only (`Classify`, `Embed`, `Compress`, backed by ONNX), with hardened per-RPC admission control (request-byte budgets, running/queued semaphores, a bounded deadline). Sections 1-5 below cover it.
+- **`sbproxy-classifier`** - rich: the same `InferenceService` contract (ONNX-backed, without the admission-control hardening) plus multi-tenant heuristic classification, quality scoring, intent/content-type detection, and per-token streaming safety checks. Section 6 covers it, including the optional-degrade architecture every caller of either sidecar should use.
 
 By running classifiers in a sidecar, you achieve strict process isolation: if a learned classifier or its ONNX engine crashes, it does not take down the main proxy serving traffic.
 
@@ -222,7 +227,73 @@ When SBproxy encounters an AI request with a sidecar-backed guardrail, it automa
 
 See [guardrails.md](guardrails.md) and [prompt-injection-v2.md](prompt-injection-v2.md) for more details on wiring guardrails into your AI pipelines.
 
+## 6. The Rich Sidecar (`sbproxy-classifier`) and the Optional-Degrade Architecture
+
+`sbproxy-classifier` (port to OSS, WOR-2665) is the superset sidecar the `InferenceService` proto comment refers to: same `Classify` / `Embed` / `ModelInfo` / `Version` contract as the minimal sidecar (so `prompt_injection_v2`'s `detector: sidecar` config, unchanged, works against either binary), plus additional capability the minimal sidecar does not carry.
+
+### What it adds
+
+| Capability | Transport | Notes |
+|---|---|---|
+| Multi-tenant heuristic classification | TCP + MessagePack, port 9400 | Per-tenant regex-pattern label sets, registered at runtime via the `register` command (no config file, no hostname pattern matching); `delete` and `list` manage the registry. |
+| Quality scoring | gRPC `ClassifierService.Quality`, and TCP `quality_score` | Heuristic AI-response quality score: refusal-phrase detection, length, repetition, formatting, casing. Sub-100us, no model. |
+| Text normalization / PII redaction | TCP, applied to `classify` text before scoring | Unicode NFKC plus a regex substitution pipeline per tenant; an operator registers `email` / `phone` / `credit_card` rules (or its own) with a `<REDACTED>`-style replacement in `normalization.rules`. |
+| Intent / content-type detection | TCP `intent_detect` / `content_type_detect` | Coarse heuristic categories (coding / vision / analysis / summarization / general; image / audio / video / text). |
+| Per-token streaming safety | gRPC `ClassifierService.StreamSafety` (bidi), and TCP `streaming_safety` | Checks accumulated streamed tokens against a rule set as they arrive, so a caller can cut a response short instead of waiting for the full body. Once a rule matches, every later verdict on the stream reports blocked again. |
+
+`Compress` (token-classification pruning) is not ported and returns `UNIMPLEMENTED` on this binary; run the minimal sidecar for that RPC. See the crate's module docs (`crates/sbproxy-classifier/src/*.rs`) for the full scope note, including what was deliberately not ported from the enterprise source (LLM-judge backends, license-leak detection, the Wave 5 agent-classifier ML path, Ed25519 model-signing, OpenTelemetry).
+
+### Running it
+
+```bash
+cargo run -p sbproxy-classifier -- \
+  --listen 127.0.0.1:9500 \
+  --listen-tcp 127.0.0.1:9400 \
+  --metrics-addr 127.0.0.1:9402 \
+  --model prompt-injection=/models/model.onnx:/models/tokenizer.json
+```
+
+`--model` / `--embed-model` / `--default-model` / `--default-embed-model` mirror the minimal sidecar's flags of the same name. `/healthz`, `/readyz`, `/metrics` (Prometheus text), and `/tenants` are served on `--metrics-addr`.
+
+### The optional-degrade architecture
+
+Per the epic's rule that a sidecar a deployment must run and keep running is the same category of hard dependency as an external database: **nothing in this OSS workspace may require either classifier sidecar to be up.** `sbproxy-classifier-client`'s `FallbackClassifier` is the reusable piece that guarantees this for any caller, not just `prompt_injection_v2`'s own hand-written fail-open/fail-closed logic:
+
+- No sidecar configured (the common OSS case: an operator who never deploys one) - every call goes straight to a caller-supplied in-process classifier. No connection is ever attempted.
+- A sidecar is configured but unreachable, times out, or returns a malformed response - the call degrades to the in-process classifier for that request, logging a warning.
+- A sidecar is configured and healthy - its verdict is used, and the in-process classifier is not invoked at all.
+
+```rust,ignore
+use sbproxy_classifier_client::{ClassifierClient, FallbackClassifier, InProcessClassifier, Verdict};
+
+struct MyOnnxWrapper(sbproxy_classifiers::OnnxClassifier);
+
+impl InProcessClassifier for MyOnnxWrapper {
+    fn classify(&self, text: &str) -> Verdict {
+        let out = self.0.classify(text).unwrap_or_default();
+        Verdict { label: out.label, score: out.score as f64 }
+    }
+}
+
+// `sidecar` is `None` when the operator never configured one; `Some(..)`
+// when they did, whether or not it turns out to be reachable.
+let classifier = FallbackClassifier::new(sidecar, "prompt-injection", MyOnnxWrapper(onnx));
+let verdict = classifier.classify(&prompt).await;
+```
+
+Run `cargo run -p sbproxy-classifier-client --example fallback` for a live demonstration of all three cases.
+
+### Open product question (not resolved here)
+
+Should `sbproxy-classifier` eventually replace OSS's in-process ONNX classifier (`crates/sbproxy-classifiers`), or do the two coexist as a light tier (in-process, zero extra deployment) and a heavy tier (this sidecar, richer capability, its own process to run)? This is a product decision the WOR-2665 disposition explicitly carries unresolved; nothing in this port assumes either answer, and `FallbackClassifier` works identically either way.
+
+### Metrics
+
+`sbproxy-classifier` exposes its own Prometheus families on `--metrics-addr`'s `/metrics` (see `crates/sbproxy-classifier/src/metrics.rs`): `sbproxy_classifier_requests_total{transport,cmd}`, `sbproxy_classifier_errors_total{transport,cmd,reason}`, `sbproxy_classifier_tenants`, `sbproxy_classifier_quality_score{transport}`, and `sbproxy_classifier_safety_verdicts_total{verdict}`. `dashboards/grafana/sbproxy-classifier.json` graphs all five; import it alongside the existing `sbproxy-model-host.json` and `sbproxy-mesh-storage.json` dashboards, which chart their own similarly out-of-process binaries the same way.
+
 ## See also
 
 - [`examples/prompt-injection-sidecar/`](../examples/prompt-injection-sidecar/) - the `prompt_injection_v2` policy against an out-of-process classifier sidecar, `tag` and `block` variants.
+- [`examples/classifier-rich-sidecar/`](../examples/classifier-rich-sidecar/) - the same policy pointed at the rich sidecar's gRPC port, plus a note on its additional TCP capabilities.
+- [`crates/sbproxy-classifier-client/examples/fallback.rs`](../crates/sbproxy-classifier-client/examples/fallback.rs) - runnable demonstration of the optional-degrade architecture (`cargo run -p sbproxy-classifier-client --example fallback`).
 - [`examples/sidecar/`](../examples/sidecar/) - a different sense of "sidecar": sbproxy itself deployed per-pod as a workload sidecar rather than a classifier process. Relevant if the classifier sidecar above is going to run alongside a proxy deployed this way.
