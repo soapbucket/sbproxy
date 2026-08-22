@@ -1222,7 +1222,8 @@ impl AiClient {
         quota_attempt: Option<crate::quota_pool::QuotaPoolAttemptGuard>,
     ) -> Result<reqwest::Response> {
         let format = provider_format(provider);
-        let (translated_body, translated_path) = translators::translate_request(format, path, body);
+        let (translated_body, translated_path) =
+            translators::translate_request(format, path, body, translate_options(provider));
         // Passthrough formats return `None`; send the original borrowed
         // body without a clone (WOR-1701).
         let send_body = translated_body.as_ref().unwrap_or(body);
@@ -1368,7 +1369,7 @@ impl AiClient {
         // return `None`, so `send_body` falls back to the original
         // borrowed body with no clone (WOR-1701).
         let (translated_body, translated_path) = match body {
-            Some(b) => translators::translate_request(format, path, b),
+            Some(b) => translators::translate_request(format, path, b, translate_options(provider)),
             None => (None, path.to_string()),
         };
         let send_body: Option<&serde_json::Value> = translated_body.as_ref().or(body);
@@ -1913,8 +1914,12 @@ impl AiClient {
             // denied without opening a connection.
             {
                 let format = provider_format(&provider);
-                let (_translated_body, translated_path) =
-                    translators::translate_request(format, &path_owned, &body_owned);
+                let (_translated_body, translated_path) = translators::translate_request(
+                    format,
+                    &path_owned,
+                    &body_owned,
+                    translate_options(&provider),
+                );
                 let base_url_owned = provider.effective_base_url();
                 let base_url = base_url_owned.trim_end_matches('/');
                 let url = build_url(base_url, &translated_path);
@@ -1922,8 +1927,12 @@ impl AiClient {
             }
             tasks.push(async move {
                 let format = provider_format(&provider);
-                let (translated_body, translated_path) =
-                    translators::translate_request(format, &path_owned, &body_owned);
+                let (translated_body, translated_path) = translators::translate_request(
+                    format,
+                    &path_owned,
+                    &body_owned,
+                    translate_options(&provider),
+                );
                 let send_body = translated_body.as_ref().unwrap_or(&body_owned);
                 let base_url_owned = provider.effective_base_url();
                 let base_url = base_url_owned.trim_end_matches('/');
@@ -2666,7 +2675,8 @@ async fn run_shadow_request(
     quota_attempt: Option<crate::quota_pool::QuotaPoolAttemptGuard>,
 ) -> ShadowCallResult {
     let format = provider_format(&provider);
-    let (translated_body, translated_path) = translators::translate_request(format, &path, &body);
+    let (translated_body, translated_path) =
+        translators::translate_request(format, &path, &body, translate_options(&provider));
     let send_body = translated_body.as_ref().unwrap_or(&body);
     let base_url_owned = provider.effective_base_url();
     let base_url = base_url_owned.trim_end_matches('/');
@@ -2890,6 +2900,18 @@ impl Default for AiClient {
     }
 }
 
+/// Collect the per-provider settings the canonical OpenAI body cannot
+/// carry into the translator's options struct.
+///
+/// One place, so a new option reaches every dial (single forward,
+/// method forward, the race's pre-authorize and send legs, and the
+/// shadow leg) instead of the subset a caller sweep remembered.
+pub(crate) fn translate_options(provider: &ProviderConfig) -> translators::TranslateOptions<'_> {
+    translators::TranslateOptions {
+        bedrock_guardrail: provider.bedrock_guardrail.as_deref(),
+    }
+}
+
 /// Look up a provider's wire format. Falls back to `OpenAi` (the
 /// pass-through path) for unknown / custom provider names so existing
 /// configurations keep working unchanged.
@@ -2945,6 +2967,56 @@ pub(crate) fn build_url(base_url: &str, path: &str) -> String {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+
+    /// The composition every dial performs: read the provider entry,
+    /// pick its wire format, and translate. Written against the pair
+    /// rather than against `request_to_native` because the failure
+    /// mode is a provider setting that parses, validates, and then
+    /// never reaches the body.
+    #[test]
+    fn a_bedrock_entrys_guardrail_reaches_the_converse_body() {
+        let provider: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "bedrock",
+            "aws_sigv4": {"region": "us-east-1"},
+            "bedrock_guardrail": {"identifier": "gr-abc123", "version": "2", "trace": true},
+        }))
+        .expect("fixture provider parses");
+        let body = serde_json::json!({
+            "model": "anthropic.claude-3-5-sonnet-20240620-v1:0",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let (translated, _path) = translators::translate_request(
+            provider_format(&provider),
+            "/v1/chat/completions",
+            &body,
+            translate_options(&provider),
+        );
+        let translated = translated.expect("Bedrock always translates");
+        assert_eq!(
+            translated["guardrailConfig"]["guardrailIdentifier"],
+            "gr-abc123"
+        );
+        assert_eq!(translated["guardrailConfig"]["guardrailVersion"], "2");
+
+        let unguarded: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "bedrock",
+            "aws_sigv4": {"region": "us-east-1"},
+        }))
+        .expect("fixture provider parses");
+        let (translated, _path) = translators::translate_request(
+            provider_format(&unguarded),
+            "/v1/chat/completions",
+            &body,
+            translate_options(&unguarded),
+        );
+        assert!(
+            translated
+                .expect("Bedrock always translates")
+                .get("guardrailConfig")
+                .is_none(),
+            "an entry with no guardrail must send no guardrailConfig"
+        );
+    }
 
     static SHADOW_METRIC_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));

@@ -1719,6 +1719,7 @@ mod tests {
             data_posture: None,
             serve: None,
             aws_sigv4: None,
+            bedrock_guardrail: None,
         }
     }
 

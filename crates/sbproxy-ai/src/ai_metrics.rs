@@ -1285,6 +1285,14 @@ fn normalize_external_guardrail_labels<'a>(
         | "aporia"
         | "azure_content_safety"
         | "bedrock"
+        // Not a `GuardrailProvider` variant. `bedrock` is an
+        // out-of-band `ApplyGuardrail` side call; `bedrock_inline` is
+        // the same AWS guardrail evaluated inside the Converse
+        // generation via a provider entry's `bedrock_guardrail`.
+        // Sharing one label would make the two layers
+        // indistinguishable on the dashboard that exists to say which
+        // one stopped a request.
+        | "bedrock_inline"
         | "crowdstrike"
         | "mistral"
         | "pangea"
@@ -2287,6 +2295,27 @@ pub(crate) fn replica_selection_excluded_value(stage: &str) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bedrock_inline_verdict_is_labeled_separately_from_apply_guardrail() {
+        // An operator's whole reason for reading this metric is to see
+        // which layer stopped a request. Folding the inline Converse
+        // guardrail into the `bedrock` label (or into `unknown`) makes
+        // that unanswerable.
+        assert_eq!(
+            normalize_external_guardrail_labels("bedrock_inline", "output", "block"),
+            ("bedrock_inline", "output", "block")
+        );
+        assert_eq!(
+            normalize_external_guardrail_labels("bedrock", "input", "block"),
+            ("bedrock", "input", "block")
+        );
+        assert_eq!(
+            normalize_external_guardrail_labels("bedrock-inline", "output", "block").0,
+            "unknown",
+            "the set stays closed; only the exact spelling is admitted"
+        );
+    }
 
     #[test]
     fn stream_guardrail_counters_register_and_increment() {

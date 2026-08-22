@@ -334,6 +334,15 @@ impl DecisionEvent {
             // "every streamed AI response" and is a real, documented
             // gap (see `docs/events.md`), not the funnel-per-event
             // shape the other `Emitted` arms guarantee.
+            // ai.guardrail.output: `ai_output_guardrail_block` in
+            // ai_dispatch.rs, on the live provider response, the
+            // idempotency replay, and the semantic-cache hit, for the
+            // allow as well as the block. Until WOR-2649 the live
+            // response did not route through it and published nothing,
+            // so the feed carried replays only. Still narrower than
+            // "every AI response": a streamed response is never
+            // materialized, and a live multipart response runs its own
+            // external-adapter path. See `docs/events.md`.
             // Each of the others is a funnel rather than a scattering of
             // call sites, which is what makes those arms honest: wiring
             // some sites and not others would silence the startup

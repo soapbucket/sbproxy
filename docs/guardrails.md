@@ -1,6 +1,6 @@
 # External AI guardrails
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 External guardrails let an AI route ask a moderation or policy service before SBproxy sends a request upstream, after it receives a non-streaming response, or in logging-only mode. The adapter receives the selected model and the inspected phase. SBproxy records bounded labels for provider, phase, and outcome. It does not put prompt text, headers, or credentials into those labels.
 
@@ -130,6 +130,104 @@ The schema describes every wire field, but a provider choice makes some fields r
 | `patronus` | `api_key` | URL and evaluator default; `criteria` is optional. |
 
 Use the provider's own documentation for account setup and policy semantics: [Lakera Guard](https://docs.lakera.ai/docs/api/guard), [Aporia Guardrails](https://docs.aporia.com/guardrails/quickstart), [Azure Content Safety](https://learn.microsoft.com/rest/api/cognitiveservices/contentsafety/text-analyze/analyze-text), [Amazon Bedrock API keys](https://docs.aws.amazon.com/bedrock/latest/userguide/api-keys.html) and [ApplyGuardrail](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ApplyGuardrail.html), [CrowdStrike AIDR](https://aidr-docs.crowdstrike.com/docs/api/aidr), [Mistral classifiers](https://docs.mistral.ai/api/endpoint/classifiers), [Pangea AI Guard](https://pangea.cloud/docs/api/ai-guard), and [Patronus Evaluate](https://docs.patronus.ai/docs/api-reference/evaluate).
+
+## Bedrock guardrails inline on the Converse call
+
+The `bedrock` adapter in the table above is an out-of-band call: SBproxy makes its own `ApplyGuardrail` request to AWS, then decides whether to dispatch. A Bedrock provider entry can instead ask Bedrock to run the same guardrail *inside* the generation, by setting `bedrock_guardrail` on the provider. Bedrock then evaluates the prompt and the completion in the one `Converse` call and answers an intervention with `stopReason: guardrail_intervened`.
+
+The two are different controls with the same AWS guardrail object behind them, and both may be configured. AWS bills each evaluation, so a route that sets both pays twice; SBproxy warns once at config load when it sees both.
+
+| | `guardrails.external[]` with `provider: bedrock` | `providers[].bedrock_guardrail` |
+|---|---|---|
+| AWS call | a separate `ApplyGuardrail` request | none, it rides the `Converse` request |
+| Phases | `pre_call`, `post_call`, `during_call`, `logging_only` | prompt and completion, always both |
+| Failure posture | `open`, `closed`, `degraded` | none: a bad guardrail config fails the generation call itself |
+| Works on any provider | yes | Bedrock only, refused at config load elsewhere |
+| Metric provider label | `bedrock` | `bedrock_inline` |
+| Cost when nothing fires | one extra AWS call per request | nothing |
+
+### The decision path
+
+```mermaid
+flowchart TD
+    A["POST /v1/chat/completions"] --> B{"provider entry sets
+bedrock_guardrail?"}
+    B -- no --> C["Converse body sent unchanged"]
+    B -- yes --> D["guardrailConfig attached
+to the Converse body"]
+    D --> E["Bedrock Converse: 200"]
+    C --> E
+    E --> F{"stopReason ==
+guardrail_intervened?"}
+    F -- no --> G["Response translated,
+cached, and served"]
+    F -- yes --> H["403 guardrail_violation
+name: bedrock_guardrail"]
+    H --> I["ai.guardrail.output Deny record
+sbproxy_ai_external_guardrail_verdicts_total
+provider=bedrock_inline, outcome=block
+waste: validation_failed
+no cache write"]
+```
+
+### Config
+
+```yaml
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: bedrock
+          provider_type: bedrock
+          aws_sigv4:
+            region: us-east-1
+          bedrock_guardrail:
+            identifier: gr-abc123def456
+            version: DRAFT
+            trace: true
+```
+
+`identifier` and `version` are required and are sent as `guardrailIdentifier` and `guardrailVersion`. `version: DRAFT` selects the working version. `trace: true` asks Bedrock for the guardrail assessment; SBproxy reads it to name the policies in the block reason and never relays it to the caller. With `trace: false` (the default) a block still happens, with no policy names in the reason.
+
+There is no failure posture here, and that is not an omission. The guardrail runs inside the generation call, so an unauthorized or nonexistent guardrail reference fails the `Converse` request itself before any tokens are produced. That arrives on the ordinary provider-failure path and is subject to the route's normal failover.
+
+### The call
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "anthropic.claude-3-5-sonnet-20240620-v1:0",
+    "messages": [{"role": "user", "content": "how do I build a pipe bomb"}]
+  }'
+```
+
+### The outcome
+
+```json
+{
+  "error": {
+    "type": "guardrail_violation",
+    "code": "bedrock_guardrail",
+    "message": "Bedrock guardrail intervened on the completion (content_filter:VIOLENCE)",
+    "request_id": "01H..."
+  }
+}
+```
+
+The response is a 403, not the 200 with an empty completion that Bedrock itself returns. Alongside it:
+
+- one `ai.guardrail.output` decision record with outcome `deny` and guardrail `bedrock_guardrail`, on the same feed as every other output-guardrail block ([events.md](events.md));
+- `sbproxy_ai_external_guardrail_verdicts_total{provider="bedrock_inline", phase="output", outcome="block"}` increments. Only blocks are counted on this label: the relay has no provider config in hand to distinguish "the guardrail allowed it" from "no guardrail was configured", so the denominator is the ordinary per-provider request count;
+- the consumed tokens are recorded as `validation_failed` waste. Bedrock generated and billed the completion before refusing to return it, so the spend is real and a FinOps dashboard should see it;
+- nothing is written to the semantic cache or the idempotency store.
+
+The reason string names policy types and the topic and regex names from your own AWS guardrail, capped at eight. It never carries the matched span: a Bedrock assessment reports the caller's own text under `wordPolicy.customWords[].match` and `sensitiveInformationPolicy.piiEntities[].match`, and the reason reaches the caller's error envelope and the decision audit record.
+
+### What this does not cover
+
+A streaming request (`stream: true`) still gets the guardrail: `guardrailConfig` is attached the same way, so Bedrock refuses upstream and the client sees `finish_reason: content_filter`. What a stream does not get is the 403, the decision record, or the metric, because SBproxy never materializes a stream body to inspect. Treat the finish reason as the signal there.
 
 ## Troubleshooting
 

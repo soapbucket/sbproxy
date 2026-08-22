@@ -70,6 +70,18 @@ origins:
           # base_url override.
           aws_sigv4:
             region: ${AWS_REGION:-us-east-1}
+          # Optional: have Bedrock run one of your guardrails inside
+          # this same Converse call, instead of paying for a separate
+          # ApplyGuardrail request. An intervention comes back as a 200
+          # with stopReason: guardrail_intervened, and sbproxy turns
+          # that into a 403 guardrail_violation rather than relaying an
+          # empty completion. trace: true asks AWS which policies fired
+          # so the block reason can name them. See docs/guardrails.md.
+          #
+          # bedrock_guardrail:
+          #   identifier: ${BEDROCK_GUARDRAIL_ID}
+          #   version: DRAFT
+          #   trace: true
           default_model: anthropic.claude-sonnet-4-5-20250929-v1:0
           models:
             - anthropic.claude-sonnet-4-5-20250929-v1:0

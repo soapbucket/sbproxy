@@ -1428,6 +1428,9 @@ impl AiHandlerConfig {
             provider
                 .validate_base_url()
                 .map_err(|e| anyhow::anyhow!("ai provider {:?} base_url: {e}", provider.name))?;
+            provider.validate_bedrock_guardrail().map_err(|error| {
+                anyhow::anyhow!("ai provider {:?} bedrock guardrail: {error}", provider.name)
+            })?;
             // WOR-1818: an unresolved `${VAR}` left by env interpolation
             // would reach the wire verbatim as a bearer token and read as
             // a provider auth outage at request time. Fail at config load
@@ -1465,6 +1468,35 @@ impl AiHandlerConfig {
                 }
             }
         }
+        // Both Bedrock guardrail controls on one origin is a legal and
+        // sometimes deliberate deployment (ApplyGuardrail screens the
+        // prompt out of band, the inline block screens the completion),
+        // so this warns rather than refuses. It is still worth saying
+        // once at load: AWS bills each evaluation, and an operator who
+        // meant to migrate from one to the other has just doubled the
+        // guardrail spend without changing any behavior they can see.
+        let inline_guardrail_providers: Vec<&str> = config
+            .providers
+            .iter()
+            .filter(|provider| provider.bedrock_guardrail.is_some())
+            .map(|provider| provider.name.as_str())
+            .collect();
+        if !inline_guardrail_providers.is_empty() {
+            let apply_guardrail = config.guardrails.as_ref().is_some_and(|guardrails| {
+                guardrails.external.iter().any(|external| {
+                    external.provider == crate::external_guardrail::GuardrailProvider::Bedrock
+                })
+            });
+            if apply_guardrail {
+                tracing::warn!(
+                    providers = %inline_guardrail_providers.join(","),
+                    "ai: providers[].bedrock_guardrail and guardrails.external[] with \
+                     provider: bedrock are both configured; AWS evaluates and bills the \
+                     guardrail twice per request"
+                );
+            }
+        }
+
         // WOR-1880: reject strong consistency / invalid pool shapes at load.
         if let Some(pool) = &config.quota_pool {
             crate::quota_pool::validate_quota_pool_config(pool)
@@ -3032,6 +3064,70 @@ mod tests {
             error.contains("reasoning budget must be greater than zero"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn from_config_refuses_bedrock_guardrail_on_a_non_bedrock_provider() {
+        // Drives the whole action body through `from_config_inner`
+        // rather than calling `validate_bedrock_guardrail` directly. A
+        // validator with no caller is a guard that reports green while
+        // enforcing nothing, and that is the failure this asserts
+        // against, not the validator's own logic (which
+        // `provider::tests` covers).
+        let error = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "api_key": "sk-test",
+                "bedrock_guardrail": {"identifier": "gr-1", "version": "DRAFT"},
+            }],
+        }))
+        .expect_err("an inline Bedrock guardrail on an OpenAI provider must refuse the config")
+        .to_string();
+        assert!(error.contains("bedrock guardrail"), "{error}");
+        assert!(error.contains("openai"), "{error}");
+    }
+
+    #[test]
+    fn from_config_accepts_bedrock_guardrail_on_a_bedrock_provider() {
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "bedrock",
+                "aws_sigv4": {"region": "us-east-1"},
+                "bedrock_guardrail": {
+                    "identifier": "gr-abc123",
+                    "version": "DRAFT",
+                    "trace": true,
+                },
+            }],
+        }))
+        .expect("a Bedrock provider accepts the inline guardrail");
+        let guardrail = config.providers[0]
+            .bedrock_guardrail
+            .as_deref()
+            .expect("the block survives deserialization");
+        assert_eq!(guardrail.identifier, "gr-abc123");
+        assert!(guardrail.trace);
+    }
+
+    #[test]
+    fn an_unknown_bedrock_guardrail_key_is_refused() {
+        // `deny_unknown_fields`: the block is new and small, so a
+        // typo'd key must not be silently dropped into a guardrail the
+        // operator believes is configured.
+        let error = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "bedrock",
+                "aws_sigv4": {"region": "us-east-1"},
+                "bedrock_guardrail": {
+                    "identifier": "gr-abc123",
+                    "version": "DRAFT",
+                    "guardrail_version": "1",
+                },
+            }],
+        }))
+        .expect_err("an unknown key inside the guardrail block must refuse the config")
+        .to_string();
+        assert!(error.contains("guardrail_version"), "{error}");
     }
 
     #[test]
