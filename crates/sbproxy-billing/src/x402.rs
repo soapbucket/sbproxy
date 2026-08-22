@@ -467,6 +467,26 @@ impl FacilitatorBreaker {
 
     /// Asks whether a call may be made, and claims the half-open probe
     /// when one is available.
+    /// Reports whether the breaker is currently refusing calls.
+    ///
+    /// Unlike [`Self::admit`] this claims nothing, so it is safe to ask
+    /// from a selection path that may not go on to make a call.
+    ///
+    /// Private on purpose: the only caller is the candidate filter in
+    /// this file, and a `pub` predicate nothing outside names is what
+    /// the pub-item ratchet exists to catch.
+    #[must_use]
+    fn is_open(&self, now_ms: i64) -> bool {
+        let state = self.lock();
+        match state.opened_at_ms {
+            None => false,
+            Some(opened_at) => {
+                now_ms.saturating_sub(opened_at) < self.open_ms
+                    || state.probes_in_flight >= self.half_open_max
+            }
+        }
+    }
+
     #[must_use]
     pub fn admit(&self, now_ms: i64) -> BreakerVerdict {
         let mut state = self.lock();
