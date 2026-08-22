@@ -81,7 +81,7 @@ use sbproxy_billing::sqlite::{SqliteSettlementStore, SCHEMA_VERSION};
 use sbproxy_billing::store::{BillingClock, ReconciliationOutcome, SharedSettlementStore};
 use sbproxy_billing::types::{AttemptOperation, SettlementRail};
 use sbproxy_billing::worker::{
-    SettlementWorker, SettlementWorkerHandle, WorkerConfig, WorkerStageFailures, WorkerStatus,
+    SettlementWorker, SettlementWorkerHandle, WorkerConfig, WorkerStatus,
 };
 use sbproxy_config::payments::{PaymentsConfig, PaymentsConfigError};
 use sbproxy_observe::metrics::{
@@ -1726,6 +1726,9 @@ fn record_worker_delta(observed: &ObservedStatus, current: WorkerStatus) {
 
 #[cfg(test)]
 mod tests {
+    // Only the tests construct a stage-failure snapshot directly.
+    use sbproxy_billing::worker::WorkerStageFailures;
+
     use super::*;
 
     /// Fails a test without requiring `Debug` on the success type. The
