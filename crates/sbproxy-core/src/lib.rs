@@ -138,6 +138,12 @@ pub mod hooks;
 pub mod identity;
 /// Extraction of a minted virtual key from configured inbound headers.
 pub mod inbound_key;
+/// WOR-2672: port of `sbproxy-enterprise-ai::intent_detection`. Coarse
+/// keyword-heuristic prompt classification, dispatched from
+/// [`server::ai_dispatch`] as the fallback when no
+/// [`hooks::IntentDetectionHook`] is registered or the registered one
+/// declines to decide.
+pub mod intent_detection;
 /// WOR-2306: resolve one RFC 6901 JSON Pointer against a request body
 /// without materializing the document, for body-field route matching.
 pub mod json_pointer;
@@ -207,6 +213,13 @@ pub mod policy_bus;
 /// integration tests in `crates/sbproxy-core/tests/`.
 pub mod policy_dispatch;
 mod proxy_wasm_http;
+/// WOR-2672: port of `sbproxy-enterprise-ai::quality_routing`. Provider
+/// selection by quality score via an optional
+/// [`hooks::QualityScoringHook`], falling back to the first candidate on
+/// any failure. No call site in [`server::ai_dispatch`] invokes this yet
+/// (see the module docs); it is shipped as the reusable routing-decision
+/// library the port asks for.
+pub mod quality_routing;
 pub(crate) mod request_body_plan;
 /// WOR-1130: module-owned workspace rate-limit budget state machine.
 ///

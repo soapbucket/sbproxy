@@ -8771,25 +8771,37 @@ pub(super) async fn handle_ai_proxy(
         }
     }
 
-    // --- Intent detection hook (F5, fail-open) ---
+    // --- Intent detection hook (F5, fail-open to a keyword heuristic) ---
     //
     // Separate hook from prompt classification: `IntentDetectionHook` maps
     // the raw prompt to a coarse task category (coding, vision, analysis,
-    // summarization, general) that is useful for provider routing. A
-    // missing result is silently ignored so the AI request still flows.
-    if let Some(hook) = pipeline.hooks.intent_detection.as_ref().cloned() {
-        if !extracted_prompt.is_empty() {
-            if let Some(cat) = hook.detect(&extracted_prompt).await {
-                debug!(
-                    origin = %hostname,
-                    intent = ?cat,
-                    "AI proxy: intent detected"
-                );
-                let span = tracing::Span::current();
-                span.record("classifier.intent", tracing::field::debug(&cat));
-                ctx.classifier_intent = Some(cat);
-            }
-        }
+    // summarization, general) that is useful for provider routing.
+    //
+    // WOR-2672: previously a missing hook, or a hook that declined to
+    // decide, left `ctx.classifier_intent` unset. `detect_intent_async`
+    // (ported from `sbproxy-enterprise-ai::intent_detection`) now covers
+    // both cases with the local keyword heuristic, so this field is
+    // populated on every request that carries a prompt, and
+    // `record_intent_detection_source` below makes the hook-vs-heuristic
+    // split visible on the AI gateway dashboard.
+    if !extracted_prompt.is_empty() {
+        let hook_ref = pipeline.hooks.intent_detection.as_ref();
+        let (cat, source) =
+            crate::intent_detection::detect_intent_with_source(hook_ref, &extracted_prompt).await;
+        // `source` reflects which path actually answered, not just
+        // whether a hook was registered: a registered hook that fails
+        // open (returns `None`) reports `Heuristic` here, matching the
+        // category `detect_intent_with_source` actually returned.
+        sbproxy_ai::ai_metrics::record_intent_detection_source(&source.to_string());
+        debug!(
+            origin = %hostname,
+            intent = ?cat,
+            source = %source,
+            "AI proxy: intent detected"
+        );
+        let span = tracing::Span::current();
+        span.record("classifier.intent", tracing::field::debug(&cat));
+        ctx.classifier_intent = Some(cat);
     }
 
     // WOR-1154: input guardrails run BEFORE the semantic-cache

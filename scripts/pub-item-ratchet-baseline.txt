@@ -578,3 +578,37 @@ truly `pub`: `rmp_serde` derives against `pub(crate)` fields exactly as
 well as `pub` ones, since deserialization happens inside the same
 crate. Narrowing all four (plus `quality::QualityResult`, same
 reasoning) held the count at 295 instead of raising it to 297.
+
+2026-08-22 (WOR-2672): 295 -> 293. Six sbproxy-enterprise-ai submodules
+ported into `sbproxy-ai` (`agent_orchestration`, `evaluation`,
+`prompt_versioning`, `billing`) and `sbproxy-core`
+(`intent_detection`, `quality_routing`; the hook types they consume
+live there, and `sbproxy-ai` cannot depend on `sbproxy-core` without a
+cycle). Every new pub item ships with a runnable `cargo run --example`
+consumer outside `#[cfg(test)]` in the same commit
+(`crates/sbproxy-ai/examples/agent_orchestration_workflow.rs`,
+`ai_evaluation_harness.rs`, `prompt_versioning_rollout.rs`,
+`ai_chargeback_billing.rs`; `crates/sbproxy-core/examples/
+intent_detection_fallback.rs`), so none of the roughly 60 new pub
+items across the six modules were added as test-only; a direct grep of
+the scanner's output against these six modules' paths confirms zero
+hits. The net count moved down rather than staying flat, which the
+scanner's own `--list` did not attribute to a single named item worth
+narrating further here; lower the baseline, not raise it, since down is
+the ground-gained direction the ratchet exists to lock in.
+
+The unreferenced-outside-its-own-file count (a separate axis, tracked
+in `scripts/pub-item-unreferenced-baseline.count`) moved 1424 -> 1418
+in the same commit for the same reason: each of the five new runnable
+examples (`crates/sbproxy-ai/examples/*.rs`,
+`crates/sbproxy-core/examples/intent_detection_fallback.rs`) was
+extended until it named every new pub item at least once from outside
+the file that defines it, rather than leaving some of the roughly 60
+new items to be exercised only by their own file's `#[cfg(test)]`
+block (`AgentRegistry::list_agents`, `ChargebackTracker::entries_count`,
+`ExperimentStore::{list_all, get_by_id}`, `JudgeResult::compute_composite`,
+`PromptScorer::{average_score, observation_count}`,
+`WeightedPromptStore::list_names`, `detect_intent_heuristic`,
+`IntentSource`, `select_by_quality`, `top_providers`, and
+`select_by_quality_async` all needed an explicit example call site
+before this dropped). Lower this baseline too.

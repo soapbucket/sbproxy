@@ -962,6 +962,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_ai_intent_detection_source_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_intent_detection_source"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["source"],
+        description: "Intent-detection dispatches by which path answered: a registered sidecar hook or the local keyword-heuristic fallback.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_ai_key_fallbacks_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_key_fallback"),
@@ -4603,7 +4614,7 @@ pub fn run_scoped_label_gaps(
 pub fn render_markdown() -> String {
     let mut out = String::from(
         "# Metrics stability\n\
-         *Last modified: 2026-08-21*\n\n\
+         *Last modified: 2026-08-22*\n\n\
          *Generated from the executable metric registry. Do not hand-edit; run \
          `cargo run -q -p sbproxy-observe --bin generate-metrics-stability > \
          docs/metrics-stability.md`.*\n\n\

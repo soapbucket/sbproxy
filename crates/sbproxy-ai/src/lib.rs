@@ -3,6 +3,10 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+/// WOR-2672: port of `sbproxy-enterprise-ai::a2a`, renamed to avoid
+/// colliding with the proxy's own, unrelated `a2a` action/policy feature
+/// (`docs/a2a-gateway.md`). See the module docs for the distinction.
+pub mod agent_orchestration;
 pub mod ai_metrics;
 pub mod ai_policy;
 pub mod ai_routing_policy;
@@ -10,6 +14,9 @@ pub mod alerting;
 pub mod api_routes;
 pub mod attribution;
 pub mod aws_sigv4;
+/// WOR-2672: port of `sbproxy-enterprise-ai::billing`. Layers onto
+/// [`usage_sink`] rather than duplicating it; storage-free.
+pub mod billing;
 pub mod budget;
 pub mod client;
 pub mod compression;
@@ -19,6 +26,9 @@ pub mod cost_quality;
 pub mod data_posture;
 pub mod degradation;
 pub mod effective_key_policy;
+/// WOR-2672: port of `sbproxy-enterprise-ai::evaluation`. Offline
+/// evaluation harness; does not touch live traffic.
+pub mod evaluation;
 pub mod external_guardrail;
 pub mod failure_cause;
 pub mod fill_first;
@@ -40,6 +50,10 @@ pub mod model_directory;
 pub mod model_group;
 pub mod prompt_fingerprint;
 pub mod prompt_optimizer;
+/// WOR-2672: port of `sbproxy-enterprise-ai::prompt_versioning`, with
+/// its types renamed `Weighted*` to avoid colliding with [`prompts`]'s
+/// existing `PromptVersion` / `PromptStore`. See the module docs.
+pub mod prompt_versioning;
 pub mod prompts;
 pub mod provider;
 pub mod provider_ratelimit;

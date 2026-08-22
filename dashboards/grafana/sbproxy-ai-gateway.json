@@ -1955,6 +1955,62 @@
         }
       ],
       "description": "How long each shadow target takes to answer. This is the cost side of running an evaluation in production. Shadow calls are dispatched off the request path under a bounded in-flight budget, so a slow target does not slow callers down; it occupies that budget and starves the evaluation instead, and the calls that no longer fit are dropped before dispatch and never appear on the panel to the left. A P95 that climbs while the completed-call rate falls is that starvation happening. Compare these lines with AI Latency P95 by Provider higher up the board to tell a target that is genuinely slower from a provider set that is slow for everyone. Absent until the first shadow call completes."
+    },
+    {
+      "id": 33,
+      "title": "Intent Detection Source (Hook vs Heuristic)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 133
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "noValue": "No AI request with a prompt has run since start"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (source) (rate(sbproxy_ai_intent_detection_source_total[5m]))",
+          "legendFormat": "{{source}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Which path answered intent detection: a registered classifier-sidecar IntentDetectionHook (`hook`), or the local keyword heuristic (`heuristic`, WOR-2672) used when no hook is registered or the registered one fails open. A deployment with no sidecar hook configured is 100% `heuristic` by design, which is not a problem; a deployment that configured a hook and shows a rising `heuristic` share is one whose sidecar has stopped answering, which is."
     }
   ],
   "templating": {

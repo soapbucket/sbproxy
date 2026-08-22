@@ -253,6 +253,45 @@ static AI_LB_DECISIONS: LazyLock<CounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// WOR-2672: intent-detection dispatch outcomes by which path answered.
+///
+/// `source` is `"hook"` when a registered classifier-sidecar hook
+/// (`IntentDetectionHook`) returned a category, or `"heuristic"` when no
+/// hook was registered or the registered one failed open; see
+/// `sbproxy_core::intent_detection::detect_intent_with_source`. A rising
+/// `heuristic` share on a deployment that configured a sidecar hook is a
+/// degradation signal: the sidecar is not answering and every request is
+/// paying for keyword matching instead of real classification.
+static AI_INTENT_DETECTION_SOURCE: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_intent_detection_source_total",
+            "Intent-detection dispatches by which path answered: a registered sidecar hook or the local keyword-heuristic fallback"
+        ),
+        &["source"]
+    )
+    // The name, help text, and label set are fixed string literals above,
+    // so the only way this ever fails is registering the same family name
+    // twice under a different type, which is a programming error to catch
+    // at startup, not a runtime condition to recover from.
+    .expect("sbproxy_ai_intent_detection_source_total is a fixed, unique metric family")
+});
+
+/// Record one intent-detection dispatch outcome (WOR-2672).
+///
+/// `source` is normalized to a closed vocabulary: callers pass `"hook"` or
+/// `"heuristic"`; anything else folds into `"unknown"` so a caller cannot
+/// mint new label values.
+pub fn record_intent_detection_source(source: &str) {
+    let source = match source {
+        "hook" | "heuristic" => source,
+        _ => "unknown",
+    };
+    AI_INTENT_DETECTION_SOURCE
+        .with_label_values(&[source])
+        .inc();
+}
+
 /// AI routing decisions that intentionally use a fallback path.
 ///
 /// `strategy` comes from the closed routing enum. `reason` is normalized by
