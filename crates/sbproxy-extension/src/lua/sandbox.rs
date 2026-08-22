@@ -22,8 +22,10 @@ pub struct SandboxConfig {
     /// Maximum allocator footprint of the Lua VM, in bytes.
     pub max_memory: usize,
     /// Whether to expose the Lua pattern API (`string.find` /
-    /// `string.match` / `string.gmatch`). When `false`, calling any
-    /// of these from a script raises a Lua error.
+    /// `string.match` / `string.gmatch` / `string.gsub`, which is
+    /// every function in the `string` table that takes a pattern).
+    /// When `false`, calling any of these from a script raises a Lua
+    /// error.
     pub allow_patterns: bool,
 }
 

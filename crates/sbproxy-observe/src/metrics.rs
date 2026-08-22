@@ -2221,6 +2221,38 @@ pub fn record_key_operation(operation: &'static str, outcome: &'static str) {
     }
 }
 
+/// Count one shared-cache-tier invalidation that did not propagate, on
+/// `sbproxy_key_cache_invalidation_failures_total{scope}`.
+///
+/// `scope` is `key` (one id) or `all` (the whole tier). Both mean the
+/// same thing to an operator: the store write landed and the shared L2
+/// did not hear about it, so every other replica keeps answering with the
+/// record that was just changed until its TTL lapses. On a revoke that is
+/// a credential that stays accepted fleet-wide, which is why this is a
+/// counter of its own rather than a label on the lookup family: a
+/// failed lookup is a cache miss the store covers for, and this is not.
+///
+/// There is deliberately no `ok` counterpart. The question an alert asks
+/// here is "did any invalidation fail", not "what fraction", and a
+/// success series on a path that runs once per admin mutation buys
+/// nothing a `sbproxy_key_operations_total` rate does not already give.
+pub fn record_key_cache_invalidation_failure(scope: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_key_cache_invalidation_failures_total",
+            "Keystore cache-tier invalidations that did not reach the shared tier or its peers, by scope (key or all)",
+            &["scope"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        counter.with_label_values(&[scope]).inc();
+    }
+}
+
 /// Observe one bound-credential resolution on
 /// `sbproxy_credential_resolution_duration_seconds{cache, outcome}`
 /// (WOR-2572).
@@ -4005,6 +4037,12 @@ pub fn record_payment_provider_call(rail: &str, operation: &str, provider_class:
 /// There is no `rail` label here on purpose. A sweep claims rows across
 /// every rail in one batch and reports one total, so splitting it by rail
 /// would mean inventing an attribution the worker never computed.
+///
+/// `outcome = "failed"` is the one value that is not a durable row. It
+/// counts sweeps of that operation that returned a store error and moved
+/// nothing, which is what makes a flat row series next to it readable as an
+/// outage rather than as an empty queue. The other stages of the same tick
+/// still ran.
 pub fn record_payment_recovery(operation: &str, outcome: &str, count: u64) {
     use prometheus::{register_int_counter_vec, IntCounterVec};
     use std::sync::OnceLock;
@@ -5349,6 +5387,38 @@ pub fn record_mcp_peer_registry_saturated() {
     counter.inc();
 }
 
+/// Record one MCP `tools/call` refused because the per-tool quota
+/// store could not track the caller's principal, either for the
+/// caller's tenant
+/// (`sbproxy_extension::mcp::MAX_TRACKED_QUOTA_KEYS_PER_TENANT`) or
+/// globally (`MAX_TRACKED_QUOTA_KEYS`), on
+/// `sbproxy_mcp_tool_quota_registry_saturated_total`.
+///
+/// The refusal is fail-closed, on the grounds that a limiter which
+/// cannot count is not a limiter, so without this counter it is
+/// indistinguishable on a dashboard from a caller genuinely over
+/// quota. Alert on it: a non-zero rate means some share of traffic is
+/// being refused for a capacity reason rather than a policy one.
+///
+/// No labels, the same reasoning as
+/// [`record_mcp_peer_registry_saturated`]: the tenant and principal
+/// that caused it are exactly the caller-controlled strings the caps
+/// exist to bound. Ticks on every refused call, while the
+/// `tracing::warn!` beside it fires once per scope per process.
+pub fn record_mcp_tool_quota_registry_saturated() {
+    use prometheus::{register_int_counter, IntCounter};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter!(
+            "sbproxy_mcp_tool_quota_registry_saturated_total",
+            "MCP tools/call refused because the per-tool quota store was at capacity, globally or for the caller's tenant",
+        )
+        .expect("mcp tool quota registry saturated counter registers")
+    });
+    counter.inc();
+}
+
 /// Record one `content_filters` category outcome that was not a plain
 /// miss, on `sbproxy_mcp_content_filter_total{tenant, category,
 /// verdict}` (WOR-2384, MCP01/MCP10). `category` is `"secrets"` or
@@ -5477,7 +5547,8 @@ pub fn record_mcp_poison_indicator(
 ///
 /// `field` is the advertised field (`name`, `title`, `description`), `class`
 /// the concealment class (`tag_block`, `bidi_control`, `zero_width`,
-/// `other_control`), and `kind` whether the finding appeared or cleared.
+/// `variation_selector`, `other_control`), and `kind` whether the finding
+/// appeared or cleared.
 ///
 /// Every label is a closed set chosen by this gateway. Deliberately none of
 /// them is the tool or server name: those are upstream-controlled strings and

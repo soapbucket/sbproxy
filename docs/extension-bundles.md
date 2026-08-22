@@ -349,6 +349,8 @@ An origin with filters must use a proxy action. If it has forward rules, every a
 
 The host implements a bounded HTTP subset of Proxy-Wasm. Unsupported imports fail candidate load. A callback that returns `Pause` without resolving it is treated as a filter failure, so a guest cannot leave a request stalled. The attachment or bundle failure posture decides whether traffic is admitted or refused after that failure.
 
+`proxy_log` is bounded on three axes. One message is capped at 4 KiB and one callback at 1 MiB of total guest output; past the callback budget, lines are dropped, one `warn` says so, and the guest still sees `STATUS_OK` so it has no backpressure signal to branch on. The bytes are split on newlines and emitted one record per line, with control characters escaped, so a payload cannot forge a log record the proxy did not write. The level the guest asks for is recorded as `log_level` but does not pick the channel: trace and debug emit at `debug`, info at `info`, and warn, error, and critical all emit at `warn`. A guest cannot mint an `error` line in its host's log.
+
 For `ai_stream_event`, sbproxy maps normalized AI chunks onto Proxy-Wasm request-body callbacks and keeps one filter session for the model stream. The manifest must declare `body_mode: streamed`. JavaScript and envelope WASM do not accept this hook kind.
 
 ## AI events

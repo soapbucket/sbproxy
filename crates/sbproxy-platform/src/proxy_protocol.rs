@@ -10,6 +10,18 @@
 //!
 //! Supported protocols: `TCP4` (IPv4) and `TCP6` (IPv6).
 //!
+//! # Not wired to a listener
+//!
+//! Nothing in the workspace calls this parser. No listener reads the preamble,
+//! and there is no `proxy_protocol` configuration key of any spelling, so a
+//! deployment behind an AWS NLB or HAProxy with PROXY protocol enabled will
+//! hand `PROXY TCP4 ...\r\n` to the HTTP parser as a request line and fail the
+//! connection. `docs/comparison.md` says the same thing, and
+//! `tests/proxy_protocol_wiring.rs` fails the build if these two ever
+//! disagree. Wiring it up means adding the config key, reading the preamble at
+//! accept time, and feeding the parsed address into the client-IP source that
+//! the access log, the WAF, and the IP filter already read.
+//!
 //! # Reference
 //! <https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt>
 

@@ -290,6 +290,40 @@ when the process has no dynamic key plane configured (no `keystore:`
 backend wired). List/get failures against the store are `500`; a
 missing key/credential id is `404`.
 
+### When the invalidation did not reach the shared cache
+
+Every mutation above invalidates the policy cache. With a shared L2
+tier configured (Redis, or the mesh distributed cache) that invalidation
+has to travel, and it can fail while the store write succeeds: the tier
+is unreachable, or the announcement to peer replicas did not go out.
+
+The response stays 2xx, because the record really did change in the
+keystore and re-running the mutation would not help. What it grows is a
+`cache_propagation` object saying the rest of the fleet has not heard:
+
+```json
+{
+  "key": { "key_id": "a1b2c3d4e5f60789", "status": "revoked" },
+  "cache_propagation": {
+    "status": "failed",
+    "detail": "reach the shared cache tier to invalidate an id: connection refused",
+    "effect": "other replicas may serve the previous record until their cache TTL lapses"
+  }
+}
+```
+
+The field is absent on a clean propagation, and on any deployment with
+no shared tier. The same event logs a `warn` on the replica that handled
+the request and increments
+`sbproxy_key_cache_invalidation_failures_total{scope="key"}`, which is
+the series to alert on: on a revoke it means a credential every other
+replica keeps accepting until its cache TTL expires. This replica's own
+L1 copy is always dropped, so the node that served the mutation is
+correct immediately either way.
+
+`POST /admin/cache/key-policy/evict` answers `502` in the same situation
+rather than 2xx; see that route below.
+
 ### Key record shape (`KeyView`)
 
 `GET`/`POST`/`PATCH` responses wrap a `KeyView` under `"key"`:
@@ -2886,6 +2920,16 @@ body `{}` evicts every cached policy. On the Redis key-plane tier this
 publishes the invalidation to every replica in the fleet, not just the
 node that received the request. `409 {"error":"dynamic key plane not enabled"}`
 when `key_management` has no keystore backend configured.
+
+Unlike a key mutation, propagating is the whole operation here, so a
+failure to reach the shared tier is
+`502 {"error":"eviction did not reach the shared cache tier: ...","local_cache_cleared":true}`
+rather than a 2xx with a warning attached. An operator who called this
+because a key leaked needs to know it did not happen. This node's own
+cache is cleared regardless, which is what `local_cache_cleared` reports.
+The refusal also logs a `warn` and increments
+`sbproxy_key_cache_invalidation_failures_total{scope}`, where `scope` is
+`key` for a single id and `all` for the whole-tier purge.
 
 ### `GET /admin/cache/semantic`
 

@@ -1010,9 +1010,13 @@ existing snapshot until they complete and drop their `Arc`.
 ### Circuit breaker design
 
 Each upstream has a circuit breaker backed by atomic compare-and-swap operations. The
-open / half-open / closed state transition uses a single atomic int. Only one probe request
-is allowed through per recovery cycle. All other requests during the open state fail fast
-without acquiring any lock or making any network call.
+open / half-open / closed state transition uses a single atomic int. In half-open, one
+probe request at a time is allowed through: admission takes a probe slot via a
+compare-and-swap, and the slot comes back when the probe reports success or failure, so
+concurrent traffic is rejected while a probe is outstanding rather than being dispatched
+alongside it. A probe whose caller never reports an outcome is written off after one more
+open duration, so the worst case is one probe per recovery cycle. All other requests
+during the open state fail fast without acquiring any lock or making any network call.
 
 ### Compiler optimizations
 

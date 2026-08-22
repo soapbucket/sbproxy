@@ -32,12 +32,32 @@
 //! ## Durability and exactly-once
 //!
 //! The ledger file is its own write-ahead log: [`UsageLedger::append`]
-//! serializes one entry, writes it, and flushes, all under a mutex, before
-//! returning. A local append is sub-millisecond, so it stays off the
-//! network hot path while never dropping an event under load (the lock is
-//! the backpressure). On open, the existing file is replayed to rebuild
-//! the chain head and the dedup set, so an at-least-once delivery of a
-//! payload carrying a dedup key collapses to exactly-once.
+//! serializes one entry, writes it and its newline in a single `write`,
+//! and `sync_data`s the file, all under a mutex, before
+//! returning. Both halves of that are load-bearing. One write means a
+//! process that stops mid-entry cannot leave a payload with no terminator
+//! for the next append to merge into, and the `fsync` is what makes the
+//! word "written" mean the platter rather than the page cache:
+//! `Write::flush` on a `std::fs::File` is a documented no-op, so a ledger
+//! that only flushed lost every entry the host had not written back when
+//! the power went. That matters more here than for an ordinary log,
+//! because a truncated hash chain is still a valid hash chain: the missing
+//! entries verify clean and leave no marker anywhere.
+//!
+//! The cost is one `fsync` per metered event, which is the ledger's
+//! throughput ceiling on a spinning disk or a network filesystem. It is
+//! paid under the same mutex that already serializes appends, and
+//! `sbproxy_meter_append_duration_seconds` measures the whole critical
+//! section, so the ceiling is visible rather than inferred. A deployment
+//! that cannot pay it wants an unsigned usage sink, not a chain it calls a
+//! write-ahead log.
+//!
+//! On open, the existing file is replayed to rebuild the chain head and
+//! the dedup set, so an at-least-once delivery of a payload carrying a
+//! dedup key collapses to exactly-once. The replay allocates one `String`
+//! per historical dedup key, so the resident cost of a ledger is
+//! proportional to the number of entries the file has ever carried; rotate
+//! it if that matters.
 //!
 //! ## OSS seam
 //!
@@ -251,6 +271,84 @@ pub fn verifying_key_from_seed_hex(seed_hex: &str) -> anyhow::Result<VerifyingKe
     Ok(signing_key_from_seed_hex(seed_hex)?.verifying_key())
 }
 
+/// The ledger's append target.
+///
+/// A trait rather than a bare [`std::fs::File`] because the two properties
+/// that make this file a write-ahead log rather than a cache are both
+/// invisible against a real file: that one entry costs exactly one `write`,
+/// so a process that stops mid-append cannot leave a payload without its
+/// terminator, and that the bytes are forced to stable storage before the
+/// append returns. Against a recording sink both are plain assertions, and
+/// this module's tests make them, driving the same
+/// [`UsageLedger::append_checked`] production takes.
+///
+/// Boxed rather than a type parameter on [`UsageLedger`] so no caller has to
+/// name it. One virtual call per entry is not measurable next to the `fsync`
+/// on the next line.
+trait LedgerSink: Write {
+    /// Forces the bytes already written to stable storage.
+    ///
+    /// Not named `sync_data`: that is an inherent method on `std::fs::File`
+    /// and would win method resolution, which would make a call site that
+    /// looks like the trait silently bypass it.
+    fn sync_to_disk(&mut self) -> std::io::Result<()>;
+}
+
+impl LedgerSink for std::fs::File {
+    fn sync_to_disk(&mut self) -> std::io::Result<()> {
+        // `sync_data` rather than `sync_all`: a replay reads the file's
+        // bytes and its length, and a data sync carries the length.
+        self.sync_data()
+    }
+}
+
+/// Writes one whole line, reporting whether any of it landed.
+///
+/// [`Write::write_all`] is the obvious call and the wrong one here. It
+/// collapses "the device was full and moved nothing" and "half the line is on
+/// disk" into one `io::Error`, and only the second leaves an entry the next
+/// append would merge into. Treating both as a tear would let a full disk,
+/// which is transient and clears on its own, refuse every later append for
+/// the life of the process, and the ledger would stay dead long after the
+/// space came back.
+///
+/// One `write` call in the ordinary case, which is the property the append
+/// path needs: the entry and its terminator reach the file together, so a
+/// process that stops mid-append cannot leave a payload without its newline.
+/// The loop only runs again on a short write, which is already the torn case.
+fn write_whole_line(
+    sink: &mut (dyn LedgerSink + Send),
+    mut bytes: &[u8],
+) -> std::result::Result<(), (std::io::Error, bool)> {
+    let mut landed = false;
+    while !bytes.is_empty() {
+        match sink.write(bytes) {
+            Ok(0) => {
+                return Err((
+                    std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "ledger sink accepted no bytes",
+                    ),
+                    landed,
+                ));
+            }
+            Ok(written) => {
+                landed = true;
+                // `Write::write` may not claim more than it was given, but
+                // this is a trait object: clamping rather than slicing keeps
+                // a sink that breaks that contract from panicking the
+                // metering path.
+                bytes = bytes.get(written..).unwrap_or(&[]);
+            }
+            // A signal arrived before the kernel did anything. Not a
+            // failure, and not a tear.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err((error, landed)),
+        }
+    }
+    Ok(())
+}
+
 /// Mutable, lock-guarded chain state.
 ///
 /// Deliberately not generic. Nothing here depends on the payload, and
@@ -264,7 +362,25 @@ struct LedgerState {
     /// Dedup keys already recorded, for exactly-once dedup.
     seen: HashSet<String>,
     /// Append handle to the ledger file.
-    file: std::fs::File,
+    file: Box<dyn LedgerSink + Send>,
+    /// Whether a write moved some of an entry's bytes and then failed.
+    ///
+    /// The bytes that did land have no terminating newline, so the next
+    /// append would be concatenated onto them and produce one merged line
+    /// that no reader can parse. Refusing every later append keeps the
+    /// damage to the one entry that failed.
+    ///
+    /// Set only when bytes actually landed, which is why the append path
+    /// hand-rolls its write loop instead of calling `write_all` (see
+    /// [`write_whole_line`]). A write that failed having moved nothing, the
+    /// shape a full disk takes, leaves the file intact and this flag clear,
+    /// so metering resumes when the space does.
+    ///
+    /// This only sees a tear this process caused. A tear from a hard kill
+    /// mid-write is invisible here, because there is no later append in
+    /// this process to refuse; that case is caught by the replay check in
+    /// [`UsageLedger::open`] on the next start.
+    torn: bool,
 }
 
 /// A tamper-evident append log of metered payloads.
@@ -336,7 +452,8 @@ impl<P: LedgerPayload> UsageLedger<P> {
                     seq,
                     head,
                     seen,
-                    file,
+                    file: Box::new(file),
+                    torn: false,
                 }),
                 payload: PhantomData,
             })
@@ -378,6 +495,15 @@ impl<P: LedgerPayload> UsageLedger<P> {
         let started = std::time::Instant::now();
         let mut s = self.state.lock();
 
+        if s.torn {
+            anyhow::bail!(
+                "usage ledger: {} holds a partially written entry from an earlier failed \
+                 append; appending again would merge into it. Verify the file, \
+                 truncate the trailing partial line, and restart",
+                self.path.display(),
+            );
+        }
+
         if let Some(rid) = event.dedup_key() {
             if s.seen.contains(rid) {
                 return Ok(None);
@@ -404,15 +530,59 @@ impl<P: LedgerPayload> UsageLedger<P> {
             event: event.clone(),
         };
 
-        let line = serde_json::to_string(&entry)?;
-        writeln!(s.file, "{line}")?;
-        s.file.flush()?;
+        // The entry and its terminator in one buffer, then one write.
+        // `writeln!` lowers to two writes, and a process that stops between
+        // them leaves a payload with no newline that the next append is
+        // concatenated onto; `open` then refuses that file permanently,
+        // which under `failure_mode: closed` refuses traffic until somebody
+        // edits it by hand.
+        let mut line = serde_json::to_string(&entry)?;
+        line.push('\n');
+        if let Err((error, partial)) = write_whole_line(s.file.as_mut(), line.as_bytes()) {
+            if partial {
+                // Bytes landed and then the write failed, so the file now
+                // ends mid-entry. Nothing in this process may append after
+                // that.
+                s.torn = true;
+                anyhow::bail!(
+                    "usage ledger: writing entry {seq} to {} failed partway and left a \
+                     partial line; later appends are refused until the file is \
+                     truncated and the process restarted: {error}",
+                    self.path.display(),
+                );
+            }
+            anyhow::bail!(
+                "usage ledger: writing entry {seq} to {} failed before any of it landed, \
+                 so the file is intact and a later append can still succeed: {error}",
+                self.path.display(),
+            );
+        }
 
+        // Advanced before the entry is known to be durable, and that order is
+        // deliberate. The line is in the file whatever `sync_data` says; a
+        // head that did not advance would hand the same sequence number to
+        // the next append and put two `seq` values in the chain, which is a
+        // worse failure than an entry that is written but not yet on the
+        // platter.
         s.seq += 1;
         s.head = entry_hash;
         if let Some(rid) = event.dedup_key() {
             s.seen.insert(rid.to_string());
         }
+
+        // The durability the module doc promises. What used to be here was
+        // `Write::flush`, which `std::fs::File` documents as a no-op:
+        // `File` writes are unbuffered in userspace, so it moves nothing
+        // out of the page cache and every entry a caller was told was
+        // written survived only until the host lost power.
+        if let Err(error) = s.file.sync_to_disk() {
+            anyhow::bail!(
+                "usage ledger: entry {seq} was written to {} but could not be forced to \
+                 disk: {error}",
+                self.path.display(),
+            );
+        }
+
         let head_seq = s.seq;
         // Released before observing. An observer is somebody else's code
         // running on the metering path, and holding the chain's only lock
@@ -1332,6 +1502,187 @@ mod tests {
         for path in &paths {
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    // --- The durability the module doc promises, asserted directly ---
+
+    /// What the sink does with the next `write`.
+    ///
+    /// The two failure shapes are separate on purpose: only one of them
+    /// leaves an entry the next append could merge into, and the append path
+    /// is supposed to tell them apart.
+    enum SinkStep {
+        /// Take the whole buffer.
+        Accept,
+        /// Take this many bytes and no more, the way a device that filled
+        /// up halfway through a line does.
+        Partial(usize),
+        /// Fail without moving anything, the way a device that was already
+        /// full does.
+        Fail(std::io::ErrorKind),
+    }
+
+    /// What one entry cost the sink.
+    #[derive(Default)]
+    struct SinkLog {
+        /// Every buffer the sink took, in order, holding only the bytes it
+        /// actually accepted.
+        writes: Vec<Vec<u8>>,
+        /// How many times the sink was told to force its bytes to disk.
+        syncs: usize,
+        /// What the next `write` calls do, in order. An exhausted script
+        /// accepts everything.
+        script: std::collections::VecDeque<SinkStep>,
+    }
+
+    /// An append target that records instead of writing.
+    ///
+    /// Deliberately counts `write` calls rather than bytes: `writeln!`
+    /// lowers to one `write_all` for the payload and a second for the
+    /// newline, and the bytes on disk are identical either way. The call
+    /// count is the only place the difference shows.
+    struct RecordingSink(std::sync::Arc<parking_lot::Mutex<SinkLog>>);
+
+    impl Write for RecordingSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut log = self.0.lock();
+            match log.script.pop_front().unwrap_or(SinkStep::Accept) {
+                SinkStep::Accept => {
+                    log.writes.push(buf.to_vec());
+                    Ok(buf.len())
+                }
+                SinkStep::Partial(count) => {
+                    let count = count.min(buf.len());
+                    log.writes.push(buf[..count].to_vec());
+                    Ok(count)
+                }
+                SinkStep::Fail(kind) => Err(std::io::Error::new(kind, "injected write failure")),
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl LedgerSink for RecordingSink {
+        fn sync_to_disk(&mut self) -> std::io::Result<()> {
+            self.0.lock().syncs += 1;
+            Ok(())
+        }
+    }
+
+    /// A ledger whose appends go to `sink` instead of to a file.
+    ///
+    /// Built by hand rather than through a test-only constructor so nothing
+    /// about the append path changes: `append_checked` below is the exact
+    /// code the request path runs, and only the target of its one write
+    /// differs.
+    fn recording_ledger(sink: RecordingSink) -> UsageLedger<TestPayload> {
+        UsageLedger {
+            path: PathBuf::from("recording-sink.jsonl"),
+            signing_key: None,
+            verifying_key: None,
+            state: parking_lot::Mutex::new(LedgerState {
+                seq: 0,
+                head: GENESIS_HASH.to_string(),
+                seen: HashSet::new(),
+                file: Box::new(sink),
+                torn: false,
+            }),
+            payload: PhantomData,
+        }
+    }
+
+    #[test]
+    fn an_append_is_one_write_and_one_forced_sync() {
+        let log = std::sync::Arc::new(parking_lot::Mutex::new(SinkLog::default()));
+        let ledger = recording_ledger(RecordingSink(std::sync::Arc::clone(&log)));
+
+        ledger
+            .append_checked(&event(Some("req-1"), 1.0))
+            .expect("append")
+            .expect("a fresh dedup key is recorded");
+
+        let log = log.lock();
+        assert_eq!(
+            log.writes.len(),
+            1,
+            "an entry and its newline must reach the file in one write; two writes let a \
+             stopped process leave a payload the next append merges into",
+        );
+        let written = &log.writes[0];
+        assert_eq!(
+            written.iter().filter(|byte| **byte == b'\n').count(),
+            1,
+            "exactly one terminator, at the end",
+        );
+        assert_eq!(written.last(), Some(&b'\n'));
+        assert_eq!(
+            log.syncs, 1,
+            "an entry the caller was told was written must have been forced to disk; \
+             `Write::flush` on a `File` is a no-op and loses it to a power cut",
+        );
+    }
+
+    #[test]
+    fn a_torn_write_refuses_every_later_append() {
+        let log = std::sync::Arc::new(parking_lot::Mutex::new(SinkLog::default()));
+        let ledger = recording_ledger(RecordingSink(std::sync::Arc::clone(&log)));
+
+        // Ten bytes land, then the device gives up: the file now ends in a
+        // JSON prefix with no newline.
+        log.lock().script.extend([
+            SinkStep::Partial(10),
+            SinkStep::Fail(std::io::ErrorKind::StorageFull),
+        ]);
+        let failed = ledger.append_checked(&event(Some("req-1"), 1.0));
+        assert!(failed.is_err(), "a write that failed is not an append");
+
+        // The bytes that landed have no terminator. Appending after them
+        // would produce one merged line that `open` refuses forever, so the
+        // ledger refuses now instead.
+        let refused = ledger.append_checked(&event(Some("req-2"), 2.0));
+        assert!(
+            refused.is_err(),
+            "a ledger with a partial line must not be extended",
+        );
+        assert_eq!(
+            log.lock().writes.len(),
+            1,
+            "only the ten torn bytes reached the sink; the refusal happens before \
+             anything else is written",
+        );
+        assert_eq!(log.lock().syncs, 0, "nothing was durable enough to sync");
+        assert_eq!(ledger.head().0, 0, "neither entry joined the chain");
+    }
+
+    #[test]
+    fn a_write_that_moved_nothing_leaves_the_ledger_appendable() {
+        let log = std::sync::Arc::new(parking_lot::Mutex::new(SinkLog::default()));
+        let ledger = recording_ledger(RecordingSink(std::sync::Arc::clone(&log)));
+
+        // A full disk that rejects the whole line. Nothing landed, so the
+        // file still ends on a newline and there is nothing to merge into.
+        log.lock()
+            .script
+            .push_back(SinkStep::Fail(std::io::ErrorKind::StorageFull));
+        let failed = ledger.append_checked(&event(Some("req-1"), 1.0));
+        assert!(failed.is_err(), "the caller is told the entry was lost");
+        assert_eq!(log.lock().writes.len(), 0, "the sink took no bytes");
+
+        // The assertion this test exists for. Treating every write error as
+        // a tear would leave metering dead for the life of the process over
+        // a condition that clears on its own, and the retry below is what a
+        // caller does once the space comes back.
+        let retried = ledger
+            .append_checked(&event(Some("req-1"), 1.0))
+            .expect("a ledger with an intact file still accepts appends")
+            .expect("the failed append never recorded its dedup key");
+        assert_eq!(retried.seq, 0, "the lost entry did not consume a sequence");
+        assert_eq!(ledger.head().0, 1);
+        assert_eq!(log.lock().writes.len(), 1);
+        assert_eq!(log.lock().syncs, 1);
     }
 
     /// WOR-2626: the signed ledger is a billing record, so it must not

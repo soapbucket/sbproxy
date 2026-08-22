@@ -32,11 +32,22 @@
 //!
 //! # Scheduling
 //!
-//! Each tick drains five bounded queues in a fixed order: expiry, lease
-//! recovery, the reconciliation deadline, reconciliation, then usage. Every
-//! queue has its own batch size so a backlog in one cannot starve the others,
-//! and every claim takes a lease so two workers on one database do not
-//! duplicate provider calls.
+//! Each tick drains six bounded queues in a fixed order: expiry, lease
+//! recovery, the reconciliation deadline, reconciliation, usage, then
+//! recovery-envelope purge. Every queue has its own batch size so a backlog
+//! in one cannot starve the others, and every claim takes a lease so two
+//! workers on one database do not duplicate provider calls.
+//!
+//! The stages are also independent in failure. A store error in one stage
+//! does not skip the stages below it: every stage is attempted, the stage
+//! that failed is named in its own log line and counted in
+//! [`WorkerStatus::stage_failures`], and the tick reports the first error
+//! once all six have run. That matters because the sweeps are not
+//! interchangeable. `strand_unattributable_intents` retires a payment's hold
+//! on its route and `claim_reconciliation` is the only sweep that can still
+//! resolve that payment honestly, so a tick that ran the first and skipped
+//! the second would keep retiring unresolved payments while never asking a
+//! provider what happened to them.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -134,13 +145,50 @@ impl WorkerConfig {
     }
 }
 
+/// Sweep stages that returned a store error and therefore moved nothing.
+///
+/// One counter per stage rather than one total, because the stages are not
+/// interchangeable: an operator reading "the tick failed" cannot tell
+/// whether reconciliation stopped asking providers what happened or whether
+/// expired recovery ciphertext stopped being deleted, and those are
+/// different pages.
+///
+/// A stage that fails does not stop the stages below it, so several of these
+/// can move on one tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WorkerStageFailures {
+    /// Failed challenge-expiry sweeps.
+    pub expire_challenges: u64,
+    /// Failed lease-recovery sweeps.
+    pub recover_leases: u64,
+    /// Failed unattributable-intent sweeps.
+    pub strand_intents: u64,
+    /// Failed reconciliation claims.
+    ///
+    /// A provider that cannot answer is an outcome, not a failure, so this
+    /// only moves when the claim itself could not be read from the store.
+    pub reconciliation: u64,
+    /// Failed usage-event claims.
+    ///
+    /// As with reconciliation, a reporter that rejects an event is an
+    /// outcome; this counts a claim the store could not serve.
+    pub usage: u64,
+    /// Failed recovery-envelope purges.
+    pub purge_envelopes: u64,
+}
+
 /// A snapshot of everything the worker has done.
 ///
 /// Every counter is a fact about durable rows, not about intentions. There is
 /// no settlement counter because the worker cannot settle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WorkerStatus {
-    /// Completed ticks.
+    /// Ticks on which every stage completed.
+    ///
+    /// A tick where any stage returned a store error is not counted here,
+    /// even though the other stages still ran, so this stays readable as
+    /// "the worker got all the way round" and the partial passes show up in
+    /// `stage_failures` instead.
     pub ticks: u64,
     /// Pending challenges moved to their terminal state after expiry.
     pub challenges_expired: u64,
@@ -168,6 +216,8 @@ pub struct WorkerStatus {
     pub usage_reports_failed: u64,
     /// Recovery envelopes deleted after their hard expiry.
     pub envelopes_purged: u64,
+    /// Sweep stages that returned a store error, by stage.
+    pub stage_failures: WorkerStageFailures,
     /// Whether the loop drained inside the configured shutdown deadline.
     pub clean_shutdown: bool,
 }
@@ -186,6 +236,12 @@ struct WorkerCounters {
     usage_reports_sent: AtomicU64,
     usage_reports_failed: AtomicU64,
     envelopes_purged: AtomicU64,
+    stage_expire_challenges_failed: AtomicU64,
+    stage_recover_leases_failed: AtomicU64,
+    stage_strand_intents_failed: AtomicU64,
+    stage_reconciliation_failed: AtomicU64,
+    stage_usage_failed: AtomicU64,
+    stage_purge_envelopes_failed: AtomicU64,
 }
 
 impl WorkerCounters {
@@ -212,6 +268,14 @@ impl WorkerCounters {
             usage_reports_sent: self.usage_reports_sent.load(Ordering::Relaxed),
             usage_reports_failed: self.usage_reports_failed.load(Ordering::Relaxed),
             envelopes_purged: self.envelopes_purged.load(Ordering::Relaxed),
+            stage_failures: WorkerStageFailures {
+                expire_challenges: self.stage_expire_challenges_failed.load(Ordering::Relaxed),
+                recover_leases: self.stage_recover_leases_failed.load(Ordering::Relaxed),
+                strand_intents: self.stage_strand_intents_failed.load(Ordering::Relaxed),
+                reconciliation: self.stage_reconciliation_failed.load(Ordering::Relaxed),
+                usage: self.stage_usage_failed.load(Ordering::Relaxed),
+                purge_envelopes: self.stage_purge_envelopes_failed.load(Ordering::Relaxed),
+            },
             clean_shutdown: false,
         }
     }
@@ -252,26 +316,55 @@ impl SettlementWorker {
     /// slept through. Every queue is bounded, so this returns promptly even
     /// with a large backlog.
     ///
+    /// Every stage is attempted, whatever the stages before it did. A store
+    /// error in one sweep is recorded against that sweep and the tick carries
+    /// on, because the sweeps recover different things and skipping the rest
+    /// of the tick is how a contended database turns one slow queue into a
+    /// stalled reconciliation queue and retained recovery ciphertext.
+    ///
     /// # Errors
     ///
-    /// Returns whatever the store returns. A provider that cannot answer is an
-    /// outcome rather than an error, so it does not stop the tick.
+    /// Returns the first store error any stage produced, after all six stages
+    /// have run. A provider that cannot answer is an outcome rather than an
+    /// error, so it does not fail a stage. Callers that want to know which
+    /// stage failed should read [`WorkerStatus::stage_failures`] or the
+    /// per-stage warn log, because the returned error names a category and
+    /// not a queue.
     pub async fn run_once(&self) -> Result<WorkerStatus, BillingError> {
-        let expired = self
+        let mut first_error: Option<BillingError> = None;
+
+        match self
             .service
             .expire_challenges(self.config.expiry_batch)
-            .await?;
-        WorkerCounters::add(&self.counters.challenges_expired, expired);
+            .await
+        {
+            Ok(expired) => WorkerCounters::add(&self.counters.challenges_expired, expired),
+            Err(error) => self.record_stage_failure(
+                "expire_challenge",
+                &self.counters.stage_expire_challenges_failed,
+                error,
+                &mut first_error,
+            ),
+        }
 
-        let recovered = self.service.recover_leases(self.config.lease_batch).await?;
-        WorkerCounters::add(
-            &self.counters.leases_returned_to_retry_wait,
-            recovered.returned_to_retry_wait,
-        );
-        WorkerCounters::add(
-            &self.counters.leases_moved_to_needs_reconciliation,
-            recovered.moved_to_needs_reconciliation,
-        );
+        match self.service.recover_leases(self.config.lease_batch).await {
+            Ok(recovered) => {
+                WorkerCounters::add(
+                    &self.counters.leases_returned_to_retry_wait,
+                    recovered.returned_to_retry_wait,
+                );
+                WorkerCounters::add(
+                    &self.counters.leases_moved_to_needs_reconciliation,
+                    recovered.moved_to_needs_reconciliation,
+                );
+            }
+            Err(error) => self.record_stage_failure(
+                "recover_lease",
+                &self.counters.stage_recover_leases_failed,
+                error,
+                &mut first_error,
+            ),
+        }
 
         // After lease recovery, because recovery is what puts an abandoned
         // dispatch into `NeedsReconciliation` in the first place. An intent
@@ -282,37 +375,102 @@ impl SettlementWorker {
         // Safe in the other direction too: recovery's propagation query
         // excludes `Stranded`, so an intent retired on one tick is not
         // dragged back to `NeedsReconciliation` on the next.
-        let stranded = self
+        match self
             .service
             .strand_unattributable_intents(
                 self.config.reconciliation_grace_ms,
                 self.config.strand_batch,
             )
-            .await?;
-        if stranded > 0 {
-            // Warn rather than info: every row here is money the deployment
-            // may owe and cannot account for, and the route it was holding
-            // has just started billing other callers again. No intent id, no
-            // route, and no payer: this is a count across the whole sweep,
-            // and the per-intent detail is already in the durable rows.
-            tracing::warn!(
-                stranded,
-                "unattributable payments outlived their reconciliation deadline; their routes \
-                 are challengeable again and the payments themselves are still unresolved. \
-                 Reconcile them with the provider by hand and refund or credit anything that \
-                 settled",
+            .await
+        {
+            Ok(stranded) => {
+                if stranded > 0 {
+                    // Warn rather than info: every row here is money the
+                    // deployment may owe and cannot account for, and the
+                    // route it was holding has just started billing other
+                    // callers again. No intent id, no route, and no payer:
+                    // this is a count across the whole sweep, and the
+                    // per-intent detail is already in the durable rows.
+                    tracing::warn!(
+                        stranded,
+                        "unattributable payments outlived their reconciliation deadline; their \
+                         routes are challengeable again and the payments themselves are still \
+                         unresolved. Reconcile them with the provider by hand and refund or \
+                         credit anything that settled",
+                    );
+                }
+                WorkerCounters::add(&self.counters.intents_stranded, stranded);
+            }
+            Err(error) => self.record_stage_failure(
+                "strand_intent",
+                &self.counters.stage_strand_intents_failed,
+                error,
+                &mut first_error,
+            ),
+        }
+
+        if let Err(error) = self.drain_reconciliation().await {
+            self.record_stage_failure(
+                "reconcile",
+                &self.counters.stage_reconciliation_failed,
+                error,
+                &mut first_error,
             );
         }
-        WorkerCounters::add(&self.counters.intents_stranded, stranded);
 
-        self.drain_reconciliation().await?;
-        self.drain_usage().await?;
+        if let Err(error) = self.drain_usage().await {
+            self.record_stage_failure(
+                "report_usage",
+                &self.counters.stage_usage_failed,
+                error,
+                &mut first_error,
+            );
+        }
 
-        let purged = self.service.purge_expired_envelopes().await?;
-        WorkerCounters::add(&self.counters.envelopes_purged, purged);
+        match self.service.purge_expired_envelopes().await {
+            Ok(purged) => WorkerCounters::add(&self.counters.envelopes_purged, purged),
+            Err(error) => self.record_stage_failure(
+                "purge_envelope",
+                &self.counters.stage_purge_envelopes_failed,
+                error,
+                &mut first_error,
+            ),
+        }
 
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+
+        // Only a tick that got all the way round counts. A partial pass is
+        // visible in the per-stage failure counters instead, so the tick rate
+        // keeps meaning "the worker completed a full sweep" and an operator
+        // can still tell a stalled worker from a degraded one.
         WorkerCounters::add(&self.counters.ticks, 1);
         Ok(self.counters.snapshot())
+    }
+
+    /// Records one stage that could not run, and keeps the first error.
+    ///
+    /// The stage name is the same `operation` label value
+    /// `sbproxy_payment_recovery_total` uses for the rows that stage moves,
+    /// so a failure line and the flat series it explains can be read
+    /// together.
+    fn record_stage_failure(
+        &self,
+        stage: &'static str,
+        counter: &AtomicU64,
+        error: BillingError,
+        first_error: &mut Option<BillingError>,
+    ) {
+        WorkerCounters::add(counter, 1);
+        tracing::warn!(
+            stage,
+            category = %error.failure_category(),
+            "settlement worker sweep stage failed; the remaining stages still ran",
+        );
+        if first_error.is_none() {
+            *first_error = Some(error);
+        }
     }
 
     /// Spawns the loop and returns a handle that can stop it.
@@ -335,9 +493,13 @@ impl SettlementWorker {
                     () = tokio::time::sleep(interval) => {}
                 }
                 if let Err(error) = self.run_once().await {
+                    // Every stage still ran; this is the first error of
+                    // however many there were. The stage that produced it was
+                    // already logged by name, so this line only says the tick
+                    // was not clean.
                     tracing::warn!(
                         category = %error.failure_category(),
-                        "settlement worker tick did not complete",
+                        "settlement worker tick had a stage that could not run",
                     );
                 }
             }

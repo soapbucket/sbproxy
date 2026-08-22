@@ -741,6 +741,18 @@ outstanding, drains queued usage accounting, and purges expired recovery
 envelopes. There is no code path from the worker to a settlement, and no
 counter for one, because it cannot settle.
 
+Those six sweeps are independent in failure as well as in batch size. A
+sweep that cannot reach the database is recorded against that sweep and
+the tick carries on to the next one, so a table under contention cannot
+stop reconciliation from asking providers what happened or stop expired
+recovery ciphertext from being deleted. The failing sweep logs at warn
+with its own name and increments
+`sbproxy_payment_recovery_total{operation="<sweep>", outcome="failed"}`,
+which is the one value of that counter that is not a durable row it
+moved. `sbproxy_payment_worker_ticks_total` only counts ticks where every
+sweep completed, so a flat tick rate beside a moving `failed` rate is a
+degraded worker rather than a dead one.
+
 | Field | Default | What it does |
 |---|---|---|
 | `reconcile_interval_ms` | `1000` | Delay between sweeps. Range 10 through 300000. Raising it lengthens the window in which an ambiguous write stays unresolved. |

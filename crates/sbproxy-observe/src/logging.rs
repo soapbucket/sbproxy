@@ -1010,13 +1010,19 @@ fn is_swept_header(k: &str) -> bool {
 }
 
 /// WOR-2289: field-key denylist additions declared by the currently
-/// loaded extension bundles (a hook manifest's `secret_vars` and
-/// `masked_vars`). Same shape as [`SWEPT_HEADERS`]: a bundle candidate
-/// load replaces the whole set, so a reload that drops a bundle also
-/// drops the names it declared. Additive on top of the built-in
+/// serving extension bundles (a hook manifest's `secret_vars` and
+/// `masked_vars`). Same shape as [`SWEPT_HEADERS`]: publishing a
+/// pipeline replaces the whole set, so a reload that drops a bundle
+/// also drops the names it declared. Additive on top of the built-in
 /// baseline and every operator-configured scope; there is no config
 /// key that can disable it, matching the guarantee `OpRedactState`
 /// makes for its own `fields`.
+///
+/// The set moves at pipeline publication, not at bundle candidate
+/// load. Loading is not adopting: validate-only loads (a publish dry
+/// run, doctor) build a registry that is dropped, and installing from
+/// there let a candidate carrying no bundles un-redact the secrets of
+/// the generation still serving.
 static BUNDLE_SECRET_FIELD_NAMES: OnceLock<std::sync::RwLock<std::sync::Arc<Vec<String>>>> =
     OnceLock::new();
 
@@ -1028,11 +1034,24 @@ fn bundle_secret_field_names_slot() -> &'static std::sync::RwLock<std::sync::Arc
 /// Replace the set of bundle-declared secret/masked var names treated
 /// as key-bearing for redaction.
 ///
-/// Call once per bundle candidate load with the union of every loaded
-/// hook's `secret_vars` and `masked_vars`. A name here is redacted by
-/// key in every structured sink, regardless of tenant or origin scope,
-/// the same way a `secret_vars` value is always resolved and always
-/// masked regardless of which attachment used it.
+/// Call it from pipeline publication with every `secret_vars` and
+/// `masked_vars` the adopted registry's hooks declare
+/// (`DynamicBundleRegistry::secret_field_names`). A name here is
+/// redacted by key in every structured sink, regardless of tenant or
+/// origin scope, the same way a `secret_vars` value is always resolved
+/// and always masked regardless of which attachment used it.
+///
+/// Twice per publication, in practice: the publisher installs the
+/// union of the outgoing and incoming sets before the pipeline swap
+/// and narrows to the incoming set after it, so no field is
+/// under-redacted on either side of the boundary. Going only one way
+/// leaves a window: install early and a dropped bundle's fields are in
+/// cleartext while its generation is still serving; install late and a
+/// newly added bundle's fields are in cleartext once its generation
+/// is.
+///
+/// Do not call it from a load path. A candidate that is built and
+/// dropped must leave the serving generation's denylist alone.
 pub fn set_bundle_secret_field_names(names: Vec<String>) {
     let lowered: Vec<String> = names
         .into_iter()
