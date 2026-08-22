@@ -3,6 +3,8 @@ import { computed, onMounted } from "vue";
 import { api, asList, type HealthComponent, type ResidentModel } from "../api";
 import { useAsync } from "../composables/useAsync";
 import { formatBytes, formatDuration, formatNumber } from "../lib/format";
+import { parsePrometheus } from "../lib/metrics";
+import { certStoreStatus } from "../lib/security-signals";
 import PageHeader from "../components/PageHeader.vue";
 import StatCard from "../components/StatCard.vue";
 import StatusBadge from "../components/StatusBadge.vue";
@@ -24,13 +26,33 @@ const clusterVram = useAsync(() => api.clusterVram(), {
   refreshLabel: "Cluster VRAM",
 });
 
+// The certificate store is the one startup fact with no other symptom.
+// `/health` does not carry it, so this page reads the scrape for the single
+// `sbproxy_cert_store_degraded` gauge. It is set once at startup, so 30s is
+// as often as it can usefully be read.
+const certMetrics = useAsync(() => api.metrics(), {
+  pollMs: 30_000,
+  refreshLabel: "Certificate store",
+});
+
 function refresh() {
   health.run();
   stats.run();
   modelHost.run();
   clusterVram.run();
+  certMetrics.run();
 }
 onMounted(refresh);
+
+// Three states, and the third is why this reads the family rather than
+// summing it: absent means no certificate store was opened at all, which is
+// the normal state for a node with no ACME configuration and must not be
+// drawn as the healthy zero. See lib/security-signals.ts.
+const certStore = computed(() => {
+  const text = certMetrics.data.value;
+  if (text === null || text === undefined) return null;
+  return certStoreStatus(parsePrometheus(text));
+});
 
 // Health components can arrive as an array or a map of name -> value.
 const healthComponents = computed<HealthComponent[]>(() => {
@@ -94,7 +116,7 @@ function optionalNumber(v: unknown): number | undefined {
 <template>
   <PageHeader
     title="Overview"
-    subtitle="Live health, aggregate stats, and the local model host at a glance."
+    subtitle="Live health, the certificate store this node opened, aggregate stats, and the local model host at a glance."
   >
     <template #actions>
       <button class="sb-btn" @click="refresh">Refresh</button>
@@ -121,13 +143,34 @@ function optionalNumber(v: unknown): number | undefined {
       <StatCard label="Uptime" :value="uptime ?? 'n/a'" />
       <StatCard label="Components" :value="healthComponents.length || '0'" />
     </div>
-    <div class="card-list" v-if="healthComponents.length">
+    <!--
+      The certificate store degrading has no other symptom until the CA
+      rate-limits the hostname, and it is not a health component, so it is
+      hoisted to a warning block rather than left as a row an operator has to
+      read past.
+    -->
+    <div
+      v-if="certStore?.state === 'degraded'"
+      class="cert-alert"
+      role="status"
+      aria-live="polite"
+    >
+      <strong>The certificate store fell back to memory.</strong>
+      {{ certStore.detail }}
+    </div>
+
+    <div class="card-list" v-if="healthComponents.length || certStore">
       <div class="check" v-for="(c, i) in healthComponents" :key="i">
         <span class="check__name sb-mono">{{ c.name ?? "component" }}</span>
         <span class="check__detail sb-muted" v-if="c.detail || c.message">
           {{ c.detail ?? c.message }}
         </span>
         <StatusBadge :label="String(c.status ?? 'unknown')" />
+      </div>
+      <div class="check" v-if="certStore">
+        <span class="check__name sb-mono">certificate store</span>
+        <span class="check__detail sb-muted">{{ certStore.summary }}</span>
+        <StatusBadge :label="certStore.label" :tone="certStore.tone" />
       </div>
     </div>
   </section>
@@ -247,6 +290,17 @@ function optionalNumber(v: unknown): number | undefined {
   grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
   gap: var(--sb-space-4);
   margin-bottom: var(--sb-space-4);
+}
+.cert-alert {
+  border: 1px solid var(--sb-border);
+  border-left: 3px solid var(--sb-warn);
+  background: var(--sb-warn-bg);
+  color: var(--sb-warn-fg);
+  padding: 10px 12px;
+  margin-bottom: var(--sb-space-4);
+  font-size: 13px;
+  line-height: 1.5;
+  max-width: 90ch;
 }
 .card-list {
   display: flex;

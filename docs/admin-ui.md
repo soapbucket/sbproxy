@@ -1,6 +1,6 @@
 # Admin UI
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 The built-in admin UI is a Vue 3 + Vite single-page app that drives the
 same [admin API](admin-api-reference.md) any curl script can call. It
@@ -120,16 +120,41 @@ for the full login/CSRF contract this drives.
 ![The Overview page: health ok, per-component checks, a request-log count, and the model host section](assets/admin-overview.png)
 
 Live health with per-component checks, version and uptime, a
-request-log count, and the local model host at a glance.
+request-log count, the certificate store this node opened, and the
+local model host at a glance.
 
 - **Shows:** `GET /health` (status, version, build, uptime,
   per-component checks), `GET /api/stats` (request-log entry count),
-  `GET /admin/model-host/status` (serving summary).
+  `GET /admin/model-host/status` (serving summary), and `GET /metrics`
+  for the `sbproxy_cert_store_degraded{backend}` gauge.
 - **Mutations:** none.
 - **Empty/error notes:** a component reporting `not_configured` is
   expected on a minimal config and renders as informational, not an
   error; only an `unhealthy` component or a fetch failure renders the
   error state.
+
+### The certificate store row
+
+`/health` does not carry the certificate store, so this page reads the
+scrape for one gauge. It has three states, and the third is the reason
+the page reads the family rather than summing it:
+
+| Gauge | Row reads | What it means |
+|---|---|---|
+| absent | `not reported` | No certificate store was opened. Normal for a node with no ACME configuration. |
+| `0` | `ok` | The backend named in `acme.storage_backend` opened, and certificates persist. |
+| `1` | `degraded` | The backend could not be opened and the node is serving from an in-memory store. |
+
+A `1` also raises a warning block above the component list, because the
+degradation has no other symptom until the CA rate-limits the hostname.
+Certificates do not survive a restart and are issued again on every
+boot. A `1` is always a pod-local backend (`redb`, `sqlite`, `memory`);
+a shared backend that cannot be opened refuses to start rather than
+degrade, since an in-memory fallback inherits the single-node locking
+defaults and would hand every replica its own ACME issuance lease.
+
+Summing this gauge would erase the distinction: an absent family sums
+to zero and would render as the healthy state.
 
 ## Get started (`/get-started`)
 
@@ -653,14 +678,16 @@ and provider health from the live counters.
 
 ![Guardrails: block counts by category and wasted-spend panels](assets/admin-guardrails.png)
 
-Governance outcomes: what the guardrail, WAF, and object-authz planes
-blocked, and what wasted spend the gateway flagged.
+Governance outcomes: what the guardrail, WAF, object-authz, and CORS
+planes refused, what wasted spend the gateway flagged, and whether any
+peer still signs on the deprecated RFC 9421 request-target base.
 
 - **Shows:** `GET /metrics`: guardrail blocks by category, streaming
   guardrail violations, context-poisoning findings, WAF/HTTP-framing/
-  object-authz blocks, and wasted tokens/cost by kind (duplicate
-  requests, abandoned streams, validation failures, context bloat,
-  failover losers).
+  object-authz blocks, CORS refusals by reason, RFC 9421 legacy
+  derivations by covered component, and wasted tokens/cost by kind
+  (duplicate requests, abandoned streams, validation failures, context
+  bloat, failover losers).
 - **Mutations:** none. A "Blocked requests in Logs" action link jumps
   to Logs pre-filtered by `guardrail_action=block`.
 - **Empty/error notes:** no guardrail activity since start renders an
@@ -710,6 +737,43 @@ name, and which version is pinned.
 ## Playground (`/playground`)
 
 ![The Playground page: endpoint picker, chat input, and a response panel with usage/cost/latency](assets/admin-playground.png)
+
+### CORS headers withheld
+
+`sbproxy_cors_refusals_total{reason}` sits in the protocol-plane panel
+next to the WAF, framing, and object-authz blocks, because it is the
+same kind of thing: a refusal the edge made before the origin saw the
+response.
+
+Read the label, not just the total. The counter has one reason today,
+`wildcard_with_credentials`, which is an origin configured with
+`allowed_origins: ["*"]` and `allow_credentials: true` at once.
+Browsers reject that pair, so sbproxy withholds the CORS headers rather
+than appear to authorize something the browser will strip. An origin
+that is simply not on the allowlist is denied without incrementing this
+counter, so a low number here is not a statement that every
+cross-origin request was allowed.
+
+The panel is absent, not zero, when nothing has been refused: the
+counter registers on its first use.
+
+### RFC 9421 signature deprecation
+
+`sbproxy_signature_legacy_derivation_total{component}` counts signatures
+that verified only against the derivation sbproxy used before it became
+RFC 9421 conformant, broken down by the covered component
+(`@target-uri` or `@request-target`).
+
+This is the number that closes the deprecation window. Acceptance is
+otherwise announced in a single `warn` line per process, which tells you
+a signer somewhere has not moved and nothing about whether that is still
+true this week. Watch it stop climbing, then move the signing peers to a
+conformant RFC 9421 library before the fallback is removed.
+
+The panel does not appear when the counter is absent, and it does not
+claim the fallback can go: an origin with no signature verification
+configured produces exactly the same absent family as an origin whose
+signers have all moved.
 
 Send a chat completion to any AI endpoint this server is configured
 with, and see the response, token usage, cost, and latency.
