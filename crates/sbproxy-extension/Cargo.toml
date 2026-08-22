@@ -27,6 +27,10 @@ regorus.workspace = true
 # Cedar policy engine (typed authorization policy language, used for
 # MCP tool-call semantic governance)
 cedar-policy.workspace = true
+# WOR-2586: embedded redb-backed store for dynamically-minted Cedar
+# policies (cedar::storage), the default zero-external-dependency
+# backend. Statically config-compiled Cedar policies never touch this.
+redb.workspace = true
 
 # Lua scripting engine
 mlua.workspace = true
@@ -108,7 +112,9 @@ async-trait.workspace = true
 uuid = { workspace = true, features = ["serde"] }
 
 # Time
-chrono.workspace = true
+# `serde` feature: cedar::storage::StoredPolicy derives Serialize/
+# Deserialize over a `DateTime<Utc>` field.
+chrono = { workspace = true, features = ["serde"] }
 
 # Feature-flag store: process-wide handle.
 once_cell = "1"

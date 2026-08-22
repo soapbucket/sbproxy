@@ -8119,6 +8119,7 @@ dependencies = [
  "mlua",
  "once_cell",
  "parking_lot",
+ "redb 2.6.3",
  "regex",
  "regorus",
  "reqwest 0.12.28",

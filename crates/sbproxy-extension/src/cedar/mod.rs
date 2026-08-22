@@ -33,6 +33,13 @@
 //! - [`schema`]: the default MCP entity/action schema Cedar policies
 //!   are authored against, plus workspace-override merging and the
 //!   schema-evolution validate-before-apply check.
+//! - [`storage`]: storage for Cedar policies minted or edited at
+//!   runtime, outside a config reload (WOR-2586). Statically authored
+//!   `.cedar` policies compile straight into memory via [`compiler`]
+//!   at config-load time and never touch this module; it exists only
+//!   for the dynamic case, and its default [`storage::EmbeddedPolicyStore`]
+//!   backend is redb, not Postgres, so nothing here requires an
+//!   external database to run.
 //!
 //! This module compiles and is unit-tested standalone; wiring it into
 //! the MCP tool-call hot path as a built-in policy hook is separate,
@@ -43,8 +50,10 @@ pub mod compiler;
 pub mod evaluator;
 pub mod request_bridge;
 pub mod schema;
+pub mod storage;
 
 pub use cel_bridge::{CelBridgeError, CelPredicate};
 pub use compiler::{compile_all, CompiledPolicySet, CompilerError};
 pub use evaluator::{CedarEvaluator, EvaluatorError};
 pub use request_bridge::{stub_request_for_unit_tests, CedarRequest, RequestBridgeError};
+pub use storage::{EmbeddedPolicyStore, PolicyStore, StoredPolicy};
