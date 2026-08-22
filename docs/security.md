@@ -128,16 +128,28 @@ per-instance tracking with a metric and a warning rather than silence.
 
 Every outbound destination the gateway reaches, across every wired egress
 purpose and not just AI providers, is recorded with its authorization status,
-allowed, denied, or ungated, and is readable at `GET /api/egress`. Outbound
-dials pass a default-deny, DNS-pinned egress authorizer.
+allowed, denied, or ungated, and is readable at `GET /api/egress`.
 
-Pinned means the connection goes to the addresses the authorization resolved,
-not to a second lookup the HTTP client runs on its own, so a DNS answer that
-changes between the check and the connect cannot move the dial.
+Recording is not enforcement, and that is the distinction to get right before
+relying on any of this. A purpose stays `ungated` until you arm it: its
+sub-block under the top-level `egress:` section has to say
+`mode: deny_by_default` before anything is refused. Until it does, the dial
+still happens, still reaches the host, and still lands in the inventory, with
+nothing having been checked. A purpose reading `ungated` in `GET /api/egress`
+is one nothing is enforcing.
 
-Two paths go further and do not follow redirects at all: the MCP run-as-user
-token exchange and the `events:` webhook sink, the two whose request body is
-itself the credential. On those, a `3xx` `Location` is put back through the
+An armed purpose is default-deny: only the hosts listed for it are reachable,
+and a host that resolves onto private address space is refused unless that
+sub-block allowed it. No purpose lets its HTTP client follow a `3xx` on its
+own; each `Location` is re-authorized from scratch against the same purpose,
+and a chain past ten hops is refused.
+
+Two paths go further and pin the dial: the MCP run-as-user token exchange and
+the `events:` webhook sink, the two whose request body is itself the
+credential. Pinned means the connection goes to the addresses the
+authorization resolved, not to a second lookup the HTTP client runs on its
+own, so a DNS answer that changes between the check and the connect cannot
+move the dial. On those two, a `3xx` `Location` is put back through the
 same scheme, host, port, DNS, and private-address checks the original
 destination passed, dialed on that hop's own pinned addresses, and bounded at
 ten hops inside one timeout for the whole chain rather than one per hop. A
