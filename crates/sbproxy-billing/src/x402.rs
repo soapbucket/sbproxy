@@ -465,8 +465,6 @@ impl FacilitatorBreaker {
         })
     }
 
-    /// Asks whether a call may be made, and claims the half-open probe
-    /// when one is available.
     /// Reports whether the breaker is currently refusing calls.
     ///
     /// Unlike [`Self::admit`] this claims nothing, so it is safe to ask
@@ -487,6 +485,8 @@ impl FacilitatorBreaker {
         }
     }
 
+    /// Asks whether a call may be made, and claims the half-open probe
+    /// when one is available.
     #[must_use]
     pub fn admit(&self, now_ms: i64) -> BreakerVerdict {
         let mut state = self.lock();
