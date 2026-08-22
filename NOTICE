@@ -27,6 +27,27 @@ requirement applies here even though MIT is also listed.
 
 ===========================================================================
 
+cedar-policy (cedar-policy, cedar-policy-core, cedar-policy-formatter)
+Copyright Amazon.com, Inc. or its affiliates.
+Licensed under the Apache License, Version 2.0
+https://github.com/cedar-policy/cedar
+
+===========================================================================
+
+miette (miette, miette-derive)
+Copyright Kat Marchán
+Licensed under the Apache License, Version 2.0
+https://github.com/zkat/miette
+
+===========================================================================
+
+linked_hash_set
+Copyright Alex Butler
+Licensed under the Apache License, Version 2.0
+https://github.com/alexheretic/linked-hash-set
+
+===========================================================================
+
 ring
 Copyright 2015-2026 Brian Smith
 Licensed under ISC-style license AND Apache License, Version 2.0

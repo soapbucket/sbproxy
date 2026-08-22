@@ -133,8 +133,84 @@ inventory::collect!(McpPolicyHookEntry);
 // across the process lifetime, so tests use this slot to install impls
 // without polluting the link-time feed. Iteration order is
 // registration order; the federation in PR β reads only the first
-// entry across both registries (inventory first, runtime second).
+// entry across both registries (inventory first, then the pipeline
+// slot below, then this one).
 static RUNTIME_HOOKS: Mutex<Vec<Arc<dyn McpPolicyHook>>> = Mutex::new(Vec::new());
+
+// Pipeline-scoped hook slot, separate from `RUNTIME_HOOKS` above.
+//
+// A built-in hook whose correct lifetime is tied to a compiled
+// pipeline generation -- the Cedar MCP hook (WOR-2587) is the first
+// example -- must not be installed through `register_mcp_policy_hook`:
+// that call appends forever and runs at config-compile time, which
+// fires just as readily for a validation-only compile (a
+// `/config/publish` dry run, `doctor`, a hot-reload candidate a
+// lifecycle hook goes on to reject) as for a config that actually goes
+// live, and never retires a previous generation's hook when a new one
+// replaces it. Both are real bugs: the first installs a live policy
+// hook for a config nobody is serving, and the second means a stale
+// hook from a config already rolled back keeps denying calls forever,
+// because hook dispatch takes the first non-Allow verdict and this
+// slot's previous contents would otherwise never be replaced.
+//
+// This slot exists so a compiled pipeline's own hooks can be installed
+// exactly once, at the moment that pipeline generation actually starts
+// serving, and fully replaced (not appended to) on every later
+// publication. `sbproxy_core::reload::load_pipeline` is the only
+// intended caller of the setter; anywhere else defeats the point.
+static PIPELINE_HOOKS: Mutex<Vec<Arc<dyn McpPolicyHook>>> = Mutex::new(Vec::new());
+
+/// Snapshot the hooks currently installed in the pipeline-scoped slot.
+///
+/// Exists so a publisher can union this generation's hooks with the
+/// previous one across a pipeline swap (never dropping a hook before
+/// the new generation's replacement is live) rather than opening a
+/// window where a request lands between the swap and the new
+/// generation's hooks being installed. See
+/// [`set_pipeline_mcp_policy_hooks`] for the setter half of that
+/// pattern.
+///
+/// Recovers from a poisoned lock (a prior holder panicked mid-push or
+/// mid-replace) rather than propagating the panic: this registry gates
+/// every MCP tool call in the process, so a caller reading it is on the
+/// request hot path, and a lock poisoned by an unrelated bug should not
+/// escalate into every future tool call panicking too. The vector
+/// itself carries no invariant a torn write could violate (worst case
+/// after a poisoned recovery is a snapshot missing the one hook whose
+/// installation was interrupted), so the guard's inner value is safe
+/// to read as-is.
+pub fn pipeline_mcp_policy_hooks() -> Vec<Arc<dyn McpPolicyHook>> {
+    PIPELINE_HOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Replace every pipeline-scoped hook with exactly this set.
+///
+/// Unlike [`register_mcp_policy_hook`], which only ever appends, this
+/// call fully supersedes whatever this slot held before it. A hook
+/// installed here is meant to live exactly as long as the pipeline
+/// generation that built it: the intended caller is
+/// `sbproxy_core::reload::load_pipeline`, the one place a pipeline
+/// generation is known to have actually gone live, called once with
+/// the union of the outgoing and incoming generations' hooks before
+/// the pipeline swap and again with just the incoming generation's
+/// hooks after it (mirroring the structured-log redactor's bundle
+/// field-key denylist fix for the same class of bug). A compile-time
+/// caller (anything reached from config parsing) should reach for
+/// [`register_mcp_policy_hook`] instead if append semantics are truly
+/// wanted, or better, hold the hook on the compiled value itself and
+/// let the publisher decide whether it goes live.
+///
+/// Recovers from a poisoned lock rather than panicking; see
+/// [`pipeline_mcp_policy_hooks`]'s doc comment for why that is safe
+/// for this particular registry.
+pub fn set_pipeline_mcp_policy_hooks(hooks: Vec<Arc<dyn McpPolicyHook>>) {
+    *PIPELINE_HOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = hooks;
+}
 
 /// Install an [`McpPolicyHook`] at runtime.
 ///
@@ -159,7 +235,8 @@ pub fn register_mcp_policy_hook(hook: Arc<dyn McpPolicyHook>) {
 
 /// Snapshot every registered [`McpPolicyHook`] in registration order.
 ///
-/// Inventory-feed impls come first (in link-time order) followed by
+/// Inventory-feed impls come first (in link-time order), then the
+/// pipeline-scoped slot ([`pipeline_mcp_policy_hooks`]), then
 /// runtime-installed impls (in registration order). The federation
 /// layer iterates this list and dispatches the first matching hook
 /// (PR β semantics). PR γ will replace the first-hook shortcut with a
@@ -167,14 +244,20 @@ pub fn register_mcp_policy_hook(hook: Arc<dyn McpPolicyHook>) {
 ///
 /// ## Panics
 ///
-/// Panics if the internal runtime-hook registry mutex is poisoned (a
-/// prior holder panicked while holding the lock). The link-time
-/// inventory feed is read without locking and does not contribute to
-/// this condition.
+/// Panics only if the runtime-installed registry's mutex is
+/// poisoned (a prior holder panicked while holding it); see
+/// [`register_mcp_policy_hook`]. The pipeline-scoped slot recovers
+/// from a poisoned lock instead of panicking -- see
+/// [`pipeline_mcp_policy_hooks`]'s doc comment for why that is safe --
+/// so a poisoned `PIPELINE_HOOKS` lock does not surface here at all;
+/// this function silently proceeds with whatever that recovery
+/// returns. The link-time inventory feed is read without locking and
+/// does not contribute to either condition.
 pub fn mcp_policy_hooks() -> Vec<Arc<dyn McpPolicyHook>> {
     let mut hooks: Vec<Arc<dyn McpPolicyHook>> = inventory::iter::<McpPolicyHookEntry>()
         .map(|entry| (entry.factory)())
         .collect();
+    hooks.extend(pipeline_mcp_policy_hooks());
     let runtime = RUNTIME_HOOKS
         .lock()
         .expect("mcp policy hook registry poisoned")

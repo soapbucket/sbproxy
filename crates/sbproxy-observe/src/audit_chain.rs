@@ -1324,7 +1324,16 @@ fn hmac_hex(key: &[u8; 32], data: &[u8], hex_len: usize) -> Option<String> {
 /// tag closes it: the two inputs now differ in their first six bytes no
 /// matter what `name` or `value` a caller passes.
 fn hmac_value(key: &[u8; 32], name: &str, value: &serde_json::Value) -> Option<String> {
-    let canonical = serde_json::to_vec(value).ok()?;
+    // `serde_json_canonicalizer` (RFC 8785 / JCS) rather than
+    // `serde_json::to_vec`: the latter's object-key order only happens
+    // to be insertion-order-independent while nothing in the
+    // dependency graph enables serde_json's `preserve_order` feature,
+    // and cedar-policy-core enables it workspace-wide (WOR-2585). A
+    // fingerprint that quietly started depending on insertion order
+    // would still verify against itself but would no longer match a
+    // value rebuilt with different insertion order, which is exactly
+    // the silent mismatch this function exists to prevent.
+    let canonical = serde_json_canonicalizer::to_vec(value).ok()?;
     let mut data = Vec::with_capacity(6 + name.len() + 1 + canonical.len());
     data.extend_from_slice(b"value\0");
     data.extend_from_slice(name.as_bytes());

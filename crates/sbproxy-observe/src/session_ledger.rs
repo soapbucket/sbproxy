@@ -59,7 +59,17 @@ pub enum LedgerRecord {
     /// under.
     Header(LedgerHeader),
     /// One MCP tool call as it crossed the boundary.
-    ToolCall(LedgerToolCall),
+    ///
+    /// Boxed (WOR-2585 fix): `cedar-policy-core` forces serde_json's
+    /// `preserve_order` feature on workspace-wide, which swaps
+    /// `serde_json::Map`'s backing store from a `BTreeMap` to an
+    /// `IndexMap`. [`LedgerToolCall`] carries two
+    /// `Option<serde_json::Value>` fields, so that swap grew this
+    /// variant past clippy's `large_enum_variant` threshold relative
+    /// to [`LedgerHeader`]. Boxing is the fix clippy itself suggests
+    /// and costs nothing here: every construction site already builds
+    /// a fresh `LedgerToolCall` to hand off immediately.
+    ToolCall(Box<LedgerToolCall>),
 }
 
 /// The ledger header record (schema `$defs/header`).
@@ -341,7 +351,7 @@ pub fn emit_tool_call(obs: ToolCallObservation) {
     let params = redact_json(&obs.params);
     let result = obs.result.as_ref().map(redact_json);
 
-    dispatch(LedgerRecord::ToolCall(LedgerToolCall {
+    dispatch(LedgerRecord::ToolCall(Box::new(LedgerToolCall {
         session_id: obs.session_id,
         agent_id: obs.agent_id,
         hop_index,
@@ -353,7 +363,7 @@ pub fn emit_tool_call(obs: ToolCallObservation) {
         started_at: Some(obs.started_at),
         duration_ms: Some(obs.duration_ms),
         caller: obs.caller,
-    }));
+    })));
 }
 
 #[cfg(test)]
@@ -410,7 +420,7 @@ mod tests {
 
     #[test]
     fn tool_call_serializes_with_snake_case_and_caller_enum() {
-        let rec = LedgerRecord::ToolCall(LedgerToolCall {
+        let rec = LedgerRecord::ToolCall(Box::new(LedgerToolCall {
             session_id: "s1".to_string(),
             agent_id: None,
             hop_index: 2,
@@ -422,7 +432,7 @@ mod tests {
             started_at: Some("2026-06-05T00:00:00Z".to_string()),
             duration_ms: Some(12),
             caller: Caller::Direct,
-        });
+        }));
         let json = serde_json::to_value(&rec).unwrap();
         assert_eq!(json["type"], "tool_call");
         assert_eq!(json["hop_index"], 2);

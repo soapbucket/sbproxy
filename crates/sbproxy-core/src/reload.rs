@@ -211,6 +211,43 @@ pub fn load_pipeline(new_pipeline: CompiledPipeline) {
     let mut across_the_swap = sbproxy_observe::logging::bundle_secret_field_names().to_vec();
     across_the_swap.extend_from_slice(&bundle_secret_fields);
     sbproxy_observe::logging::set_bundle_secret_field_names(across_the_swap);
+    // WOR-2587 review: the same fix, for the same reason, for the MCP
+    // Cedar policy hook. `McpAction::from_config` used to install a
+    // `CedarMcpHook` into `sbproxy_plugin::mcp`'s registry
+    // unconditionally at compile time -- the identical bug class the
+    // redactor fix above closed: a validate-only load (a
+    // `/config/publish` dry run, `doctor`) or a hot-reload candidate
+    // this function's caller goes on to reject (see
+    // `hooks::PipelineLifecycleHook::on_reload`'s doc comment)
+    // installed a live hook for a config nobody ever served, and the
+    // registry was append-only, so a successful reload piled a fresh
+    // hook on top of the previous generation's rather than replacing
+    // it -- federation dispatch takes the first non-Allow verdict, so
+    // a stale hook from a config already rolled back would keep
+    // denying calls for the rest of the process's life. The hook is
+    // compiled onto the `McpAction` instead now (see
+    // `McpAction::cedar_policy_hook`) and only reaches the registry
+    // here, at the publication boundary.
+    //
+    // Same union-before / narrow-after shape as the redactor fix, for
+    // the same reason: installing only before the swap would drop a
+    // generation's hook the moment a request lands between the swap
+    // and the narrowing below; installing only after would leave a
+    // newly added hook not yet governing calls until the swap lands.
+    // Unioning across the boundary is the direction with no window in
+    // it, and for a policy gate "briefly more restrictive" is the safe
+    // side to err on, unlike the redactor's "briefly over-redacted."
+    let cedar_hooks: Vec<Arc<dyn sbproxy_plugin::mcp::McpPolicyHook>> = new_pipeline
+        .actions
+        .iter()
+        .filter_map(|action| match action {
+            sbproxy_modules::Action::Mcp(mcp) => mcp.cedar_policy_hook(),
+            _ => None,
+        })
+        .collect();
+    let mut cedar_hooks_across_the_swap = sbproxy_plugin::mcp::pipeline_mcp_policy_hooks();
+    cedar_hooks_across_the_swap.extend(cedar_hooks.iter().cloned());
+    sbproxy_plugin::mcp::set_pipeline_mcp_policy_hooks(cedar_hooks_across_the_swap);
     // This is the only pipeline publisher. Hold the flag-store write lock
     // while the pipeline pointer is swapped, then install its matching flag
     // snapshot before CEL readers can resume. Direct/library callers therefore
@@ -227,6 +264,11 @@ pub fn load_pipeline(new_pipeline: CompiledPipeline) {
     // now serving actually declares, so a reload that drops a bundle
     // also drops its names rather than leaking them forward forever.
     sbproxy_observe::logging::set_bundle_secret_field_names(bundle_secret_fields);
+    // Narrow the Cedar hook registry the same way: from the union back
+    // to exactly what the generation now serving declares, so a reload
+    // that drops or edits a `cedar_policies:` block retires the old
+    // hook rather than leaving it denying calls forever.
+    sbproxy_plugin::mcp::set_pipeline_mcp_policy_hooks(cedar_hooks);
 }
 
 /// Monotonically increasing counter used as the projection cache's
@@ -715,6 +757,89 @@ mod tests {
             flags: Vec::new(),
             egress: Default::default(),
         }
+    }
+
+    /// [`make_config`] with the origin's action replaced by an `mcp`
+    /// gateway action, optionally carrying a `cedar_policies:` block.
+    fn make_mcp_config(hostname: &str, cedar_policies: Option<&str>) -> CompiledConfig {
+        let mut config = make_config(hostname);
+        let mut action = serde_json::json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "reload-cedar-fixture", "version": "1.0.0"},
+            "federated_servers": [{
+                "origin": "http://127.0.0.1:1/mcp",
+                "prefix": "reload-cedar-fixture-server"
+            }]
+        });
+        if let Some(policies) = cedar_policies {
+            action["cedar_policies"] = serde_json::json!({"policies": policies});
+        }
+        config.origins[0].action_config = action;
+        config
+    }
+
+    /// WOR-2587 review: `McpAction::from_config` used to install a
+    /// `CedarMcpHook` into `sbproxy_plugin::mcp`'s global registry
+    /// unconditionally at compile time, so a validation-only compile
+    /// and a runtime candidate that is never handed to
+    /// [`load_pipeline`] both installed a live hook for a config
+    /// nobody ever served, and the registry was append-only, so a
+    /// successful reload piled a fresh hook on top of the previous
+    /// generation's rather than retiring it. This pins the fix: the
+    /// hook only reaches the registry from [`load_pipeline`], for a
+    /// pipeline that actually goes live, and a later reload that drops
+    /// `cedar_policies:` retires the hook rather than leaving it
+    /// registered forever.
+    #[test]
+    fn cedar_hook_installed_only_at_publication_and_retired_on_reload() {
+        const POLICIES: &str = "permit(principal, action, resource);";
+
+        // A validation-only compile must never touch the registry.
+        let validation_cfg = make_mcp_config("cedar-reload-validate.example.com", Some(POLICIES));
+        CompiledPipeline::from_config_for_validation(validation_cfg)
+            .expect("validation-mode mcp+cedar_policies config compiles");
+        assert!(
+            sbproxy_plugin::mcp::pipeline_mcp_policy_hooks().is_empty(),
+            "a validation-only compile must never install a live Cedar hook"
+        );
+
+        // Neither must a Runtime-mode candidate that compiles cleanly
+        // but is simply never passed to `load_pipeline` -- the shape
+        // of a hot-reload candidate a lifecycle hook goes on to
+        // reject.
+        let candidate_cfg = make_mcp_config("cedar-reload-candidate.example.com", Some(POLICIES));
+        CompiledPipeline::from_config(candidate_cfg)
+            .expect("runtime-mode mcp+cedar_policies config compiles");
+        assert!(
+            sbproxy_plugin::mcp::pipeline_mcp_policy_hooks().is_empty(),
+            "compiling a runtime candidate must not install a hook until load_pipeline runs"
+        );
+
+        // Publishing DOES install it.
+        let live_cfg = make_mcp_config("cedar-reload-live.example.com", Some(POLICIES));
+        let live_pipeline = CompiledPipeline::from_config(live_cfg)
+            .expect("runtime-mode mcp+cedar_policies config compiles");
+        load_pipeline(live_pipeline);
+        assert_eq!(
+            sbproxy_plugin::mcp::pipeline_mcp_policy_hooks().len(),
+            1,
+            "load_pipeline must install exactly the live generation's Cedar hook"
+        );
+
+        // A later reload to a config with no `cedar_policies:` must
+        // retire the previous generation's hook rather than leaving it
+        // registered forever -- the monotonic-registry half of the
+        // bug this fix closes.
+        let next_cfg = make_config("cedar-reload-live.example.com");
+        let next_pipeline =
+            CompiledPipeline::from_config(next_cfg).expect("plain proxy config compiles");
+        load_pipeline(next_pipeline);
+        assert!(
+            sbproxy_plugin::mcp::pipeline_mcp_policy_hooks().is_empty(),
+            "a reload that drops cedar_policies must retire the old hook, not leave it \
+             denying calls forever"
+        );
     }
 
     #[test]

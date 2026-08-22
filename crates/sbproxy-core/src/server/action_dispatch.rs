@@ -7364,13 +7364,69 @@ pub(super) async fn handle_mcp_action(
                                                 }
                                             }
                                         }
-                                        Err(e) => mcp_upstream_failure_response(
-                                            request.id.clone(),
-                                            is_modern,
-                                            "upstream tool call failed",
-                                            "tool call failed",
-                                            &e,
-                                        ),
+                                        Err(e) => {
+                                            if let Some(denied) = e.downcast_ref::<
+                                                sbproxy_extension::mcp::McpPolicyDeniedError,
+                                            >() {
+                                                // WOR-2587 review: RBAC and
+                                                // argument-policy denials both
+                                                // reach the
+                                                // mcp_governance_decision
+                                                // evidence bus (see the
+                                                // WOR-2384 comment on the RBAC
+                                                // branch above); a generic
+                                                // McpPolicyHook denial --
+                                                // Cedar's built-in hook is
+                                                // the only in-tree producer
+                                                // today -- used to only
+                                                // record a metric and a debug
+                                                // log, leaving a security
+                                                // review of "was this call
+                                                // blocked and why" blind to
+                                                // every ABAC refusal. Same
+                                                // evidence call, same
+                                                // fail-closed contract.
+                                                let rule_id = match denied.kind {
+                                                    sbproxy_extension::mcp::McpPolicyDenialKind::Deny => {
+                                                        sbproxy_modules::action::mcp::MCP_POLICY_HOOK_DENY_RULE_ID
+                                                    }
+                                                    sbproxy_extension::mcp::McpPolicyDenialKind::Confirm => {
+                                                        sbproxy_modules::action::mcp::MCP_POLICY_HOOK_CONFIRM_RULE_ID
+                                                    }
+                                                };
+                                                if emit_mcp_governance_evidence(
+                                                    ctx,
+                                                    &name,
+                                                    governed_server,
+                                                    mcp_session_id.as_deref(),
+                                                    is_modern,
+                                                    tool_arguments_hash.as_deref(),
+                                                    McpGovernanceVerdict::Deny(
+                                                        sbproxy_modules::action::mcp::MCP_POLICY_HOOK_REASON,
+                                                    ),
+                                                    Some(rule_id),
+                                                    governance_tool_arguments.as_deref(),
+                                                ) {
+                                                    mcp_evidence_unavailable_response(request.id.clone())
+                                                } else {
+                                                    mcp_upstream_failure_response(
+                                                        request.id.clone(),
+                                                        is_modern,
+                                                        "upstream tool call failed",
+                                                        "tool call failed",
+                                                        &e,
+                                                    )
+                                                }
+                                            } else {
+                                                mcp_upstream_failure_response(
+                                                    request.id.clone(),
+                                                    is_modern,
+                                                    "upstream tool call failed",
+                                                    "tool call failed",
+                                                    &e,
+                                                )
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -9635,6 +9691,20 @@ fn mcp_oauth_resource_metadata_url(
 
 /// Map an upstream failure without reflecting untrusted detail to a modern
 /// caller. The legacy branch deliberately retains its frozen wire message.
+///
+/// WOR-2587 review: an `McpPolicyHook` deny/confirm collapses into a
+/// generic `anyhow::Error` at the `McpFederation` call-tool seam (see
+/// [`sbproxy_extension::mcp::McpPolicyDeniedError`]'s own doc
+/// comment). Recovering the structured JSON-RPC code and the
+/// operator-authored deny/confirm reason here, for both protocol eras,
+/// is what closes that gap: a policy hook refusing a call is a
+/// deterministic decision about the request, not a server fault, so it
+/// gets the same `-32602 INVALID_PARAMS` code `action_dispatch`'s own
+/// RBAC deny path uses instead of falling through to a blanket
+/// `-32603 INTERNAL_ERROR`, and a modern-protocol caller gets the same
+/// human-readable reason (including an `@confirm` annotation's text)
+/// the legacy era's frozen `{legacy_context}: {error}` formatting
+/// already happened to retain.
 fn mcp_upstream_failure_response(
     id: Option<serde_json::Value>,
     is_modern: bool,
@@ -9642,6 +9712,13 @@ fn mcp_upstream_failure_response(
     legacy_context: &'static str,
     error: &anyhow::Error,
 ) -> sbproxy_extension::mcp::types::JsonRpcResponse {
+    if let Some(denied) = error.downcast_ref::<sbproxy_extension::mcp::McpPolicyDeniedError>() {
+        return sbproxy_extension::mcp::types::JsonRpcResponse::error(
+            id,
+            denied.code,
+            &denied.message,
+        );
+    }
     let message = if is_modern {
         modern_message.to_string()
     } else {
@@ -13992,6 +14069,95 @@ mod mcp_catalog_snapshot_tests {
             );
             assert_eq!(event["data"]["sbproxy.decision.reason"], "session_flow");
         }
+
+        // --- Scenario 14 (WOR-2587 review): a generic
+        // `McpPolicyHook` denial -- Cedar's built-in hook is the only
+        // in-tree producer today -- used to only record a metric and
+        // a debug log, leaving a security review of "was this call
+        // blocked and why" blind to every ABAC refusal RBAC's own
+        // denial (scenario 1 above) already reaches evidence for. ---
+        {
+            struct ResetPipelineHooksOnDrop;
+            impl Drop for ResetPipelineHooksOnDrop {
+                fn drop(&mut self) {
+                    sbproxy_plugin::mcp::set_pipeline_mcp_policy_hooks(Vec::new());
+                }
+            }
+            let _reset_pipeline_hooks = ResetPipelineHooksOnDrop;
+
+            const TOOL_NAME: &str = "wor2587-governance-evidence-cedar-fixture";
+            const SERVER: &str = "wor2587-governance-evidence-server";
+            let action = McpAction::from_config(json!({
+                "type": "mcp",
+                "mode": "gateway",
+                "server_info": {"name": "cedar-governance-evidence-fixture", "version": "1.0.0"},
+                "cedar_policies": {
+                    "policies": format!(
+                        r#"
+                        permit(principal, action, resource);
+                        forbid(
+                            principal,
+                            action,
+                            resource == ToolInvocation::"{SERVER}/{TOOL_NAME}"
+                        );
+                        "#
+                    )
+                },
+                "federated_servers": [{
+                    "origin": "http://127.0.0.1:1/mcp",
+                    "prefix": SERVER
+                }]
+            }))
+            .expect("cedar governance-evidence fixture compiles");
+            sbproxy_plugin::mcp::set_pipeline_mcp_policy_hooks(
+                action.cedar_policy_hook().into_iter().collect(),
+            );
+            action.federation.seed_tools_for_test(
+                HashMap::from([(TOOL_NAME.to_string(), tool(TOOL_NAME, SERVER))]),
+                None,
+            );
+
+            let call = mcp_handler_exchange(
+                &action,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": TOOL_NAME, "arguments": {}}
+                }),
+            )
+            .await;
+            let message = call["error"]["message"]
+                .as_str()
+                .expect("tools/call denial message");
+            assert!(
+                message.contains("denied by cedar policy"),
+                "expected a Cedar denial, got: {message}"
+            );
+            assert_eq!(
+                call["error"]["code"],
+                sbproxy_extension::mcp::types::INVALID_PARAMS,
+                "Cedar denial must answer INVALID_PARAMS, got: {call:?}"
+            );
+
+            let event = poll_for_governance_event(&events_path, |event| {
+                event["data"]["gen_ai.tool.name"] == TOOL_NAME
+            })
+            .await
+            .expect(
+                "an mcp_governance_decision event for the Cedar-denied call \
+                 was not observed within 5s",
+            );
+            assert_eq!(event["data"]["sbproxy.decision.verdict"], "deny");
+            assert_eq!(
+                event["data"]["sbproxy.decision.rule_id"],
+                sbproxy_modules::action::mcp::MCP_POLICY_HOOK_DENY_RULE_ID
+            );
+            assert_eq!(
+                event["data"]["sbproxy.decision.reason"],
+                sbproxy_modules::action::mcp::MCP_POLICY_HOOK_REASON
+            );
+        }
     }
 
     /// Every label of a gathered family, as `name=value` pairs joined by
@@ -17772,6 +17938,232 @@ allow := false if {
         assert_eq!(
             event["data"]["gen_ai.tool.call.arguments"], r#"{"city":"sf"}"#,
             "capture_arguments must carry the local denial's verbatim arguments, got: {event:?}"
+        );
+    }
+
+    /// WOR-2587: `CedarMcpHook` is registered as a built-in
+    /// `McpPolicyHook` and dispatched from the exact seam
+    /// `McpFederation::call_tool_with_upstream_headers_from_snapshot`
+    /// runs its registered hooks through -- the only path
+    /// `handle_mcp_action` takes to a non-`local` upstream. This test
+    /// drives real `tools/call` requests through `handle_mcp_action`
+    /// (not a hand-built `McpToolCallCtx` fed to the hook directly)
+    /// against ONE compiled action carrying both `rbac_policies` and
+    /// `cedar_policies`, and four tool names prove:
+    ///
+    /// 1. `wor2587-allow-tool`: RBAC allows; Cedar's blanket `permit`
+    ///    applies (no `forbid` matches) -> the call actually reaches
+    ///    the stub upstream and returns its scripted result.
+    /// 2. `wor2587-deny-tool`: RBAC allows this tool too (same
+    ///    allowlist entry as #1), so a refusal here can only come from
+    ///    Cedar's own `forbid` actually firing -- proving Cedar is
+    ///    consulted and not silently shadowed by RBAC's allow.
+    /// 3. `wor2587-confirm-tool`: same RBAC allowlist entry, but the
+    ///    matched `forbid` carries `@confirm(...)`, so `CedarEvaluator`
+    ///    maps it onto `PolicyDecision::Confirm` rather than a plain
+    ///    deny; the confirmation reason text making it all the way to
+    ///    the JSON-RPC error is the load-bearing assertion (PR beta of
+    ///    the OSS `McpPolicyHook` contract still surfaces `Confirm` as
+    ///    a refusal; there is no `PendingConfirmStore` in OSS).
+    /// 4. `wor2587-rbac-denied-tool`: absent from the RBAC allowlist ->
+    ///    RBAC denies before Cedar (or the stub upstream) is ever
+    ///    reached, proving the reverse direction: registering a Cedar
+    ///    hook does not disable or bypass RBAC's own gate.
+    #[tokio::test]
+    async fn wor_2587_cedar_hook_runs_alongside_rbac_without_shadowing() {
+        const SERVER: &str = "wor2587-cedar-server";
+        const ALLOW_TOOL: &str = "wor2587-allow-tool";
+        const DENY_TOOL: &str = "wor2587-deny-tool";
+        const CONFIRM_TOOL: &str = "wor2587-confirm-tool";
+        const RBAC_DENIED_TOOL: &str = "wor2587-rbac-denied-tool";
+
+        let origin = scripted_responses_server(vec![scripted_tool_call_response()]);
+
+        let cedar_policies = format!(
+            r#"
+            permit(principal, action, resource);
+
+            forbid(
+                principal,
+                action,
+                resource == ToolInvocation::"{SERVER}/{DENY_TOOL}"
+            );
+
+            @confirm("high-risk tool requires human approval")
+            forbid(
+                principal,
+                action,
+                resource == ToolInvocation::"{SERVER}/{CONFIRM_TOOL}"
+            );
+            "#
+        );
+
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "server_info": {"name": "wor2587-cedar-hook-fixture", "version": "1.0.0"},
+            "rbac_policies": {
+                "gate": {
+                    "default_allow": false,
+                    "tool_access": [{
+                        "principals": [],
+                        "allowed": [ALLOW_TOOL, DENY_TOOL, CONFIRM_TOOL]
+                    }]
+                }
+            },
+            "cedar_policies": {
+                "policies": cedar_policies
+            },
+            "federated_servers": [{
+                "origin": origin,
+                "prefix": SERVER,
+                "rbac": "gate"
+            }]
+        }))
+        .expect("wor-2587 cedar hook fixture compiles");
+
+        // WOR-2587 review: `McpAction::from_config` no longer installs
+        // the compiled Cedar hook into `sbproxy_plugin::mcp`'s global
+        // registry itself (that used to happen unconditionally at
+        // compile time, which is exactly the bug this review found --
+        // see `McpAction::cedar_policy_hook`'s doc comment). Only
+        // `sbproxy_core::reload::load_pipeline` does that now, at the
+        // publication boundary; this test simulates that one step so
+        // it can keep exercising the dispatch seam directly, without
+        // standing up a full `CompiledPipeline` + `load_pipeline` round
+        // trip. `_reset_pipeline_hooks` clears the slot again when this
+        // test's scope ends (including on an assertion panic below), so
+        // this fixture's hook does not leak into a test that runs
+        // later in the same binary.
+        struct ResetPipelineHooksOnDrop;
+        impl Drop for ResetPipelineHooksOnDrop {
+            fn drop(&mut self) {
+                sbproxy_plugin::mcp::set_pipeline_mcp_policy_hooks(Vec::new());
+            }
+        }
+        let _reset_pipeline_hooks = ResetPipelineHooksOnDrop;
+        sbproxy_plugin::mcp::set_pipeline_mcp_policy_hooks(
+            action.cedar_policy_hook().into_iter().collect(),
+        );
+
+        // `seed_tools_for_test` marks the federation primed so
+        // `ensure_ready` never dials the stub for a cold-prime probe;
+        // the one dial this test makes is the allow-tool's real
+        // dispatch below.
+        action.federation.seed_tools_for_test(
+            HashMap::from([
+                (ALLOW_TOOL.to_string(), tool(ALLOW_TOOL, SERVER)),
+                (DENY_TOOL.to_string(), tool(DENY_TOOL, SERVER)),
+                (CONFIRM_TOOL.to_string(), tool(CONFIRM_TOOL, SERVER)),
+                (RBAC_DENIED_TOOL.to_string(), tool(RBAC_DENIED_TOOL, SERVER)),
+            ]),
+            None,
+        );
+
+        // 1. Allow: RBAC allows, Cedar's blanket permit applies -> the
+        // call actually dispatches to the stub upstream.
+        let allow = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": ALLOW_TOOL, "arguments": {}}
+            }),
+        )
+        .await;
+        assert!(
+            allow.get("error").is_none(),
+            "RBAC-allowed, Cedar-unmatched call must dispatch: {allow:?}"
+        );
+        assert_eq!(
+            allow["result"]["content"][0]["text"], "fixture",
+            "must carry the stub upstream's scripted result: {allow:?}"
+        );
+
+        // 2. Deny: RBAC allows this tool too, so a refusal can only
+        // come from Cedar's own `forbid` actually firing.
+        let deny = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": DENY_TOOL, "arguments": {}}
+            }),
+        )
+        .await;
+        let deny_message = deny["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            !deny_message.contains("RBAC policy"),
+            "the deny-tool is RBAC-allowed; a refusal naming the RBAC policy would mean \
+             Cedar never ran: {deny:?}"
+        );
+        assert!(
+            deny_message.contains("denied by cedar policy"),
+            "expected a Cedar denial, got: {deny:?}"
+        );
+        // WOR-2587 review: a policy-hook deny must reach the wire as
+        // INVALID_PARAMS (-32602), the same code the RBAC deny path
+        // above uses, not the generic INTERNAL_ERROR (-32603) the
+        // catch-all upstream-failure handler used to always send once
+        // `DeniedByPolicy` collapsed into a bare `anyhow::Error`.
+        assert_eq!(
+            deny["error"]["code"],
+            json!(sbproxy_extension::mcp::types::INVALID_PARAMS),
+            "Cedar denial must surface INVALID_PARAMS, not a generic INTERNAL_ERROR: {deny:?}"
+        );
+
+        // 3. Confirm: same RBAC allowlist entry, but the matched
+        // `forbid` carries `@confirm(...)`.
+        let confirm = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": CONFIRM_TOOL, "arguments": {}}
+            }),
+        )
+        .await;
+        let confirm_message = confirm["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            confirm_message.contains("confirmation required"),
+            "expected a Confirm verdict to surface, got: {confirm:?}"
+        );
+        assert!(
+            confirm_message.contains("high-risk tool requires human approval"),
+            "the Cedar @confirm annotation's reason text must reach the caller, got: {confirm:?}"
+        );
+        // WOR-2587 review: same INVALID_PARAMS reasoning as the deny
+        // case above -- a held-for-confirmation call is a deliberate
+        // decision, not a server fault.
+        assert_eq!(
+            confirm["error"]["code"],
+            json!(sbproxy_extension::mcp::types::INVALID_PARAMS),
+            "Cedar confirm-hold must surface INVALID_PARAMS, not a generic INTERNAL_ERROR: {confirm:?}"
+        );
+
+        // 4. RBAC still gates independently: a tool absent from the
+        // allowlist is denied by RBAC before Cedar (or the stub
+        // upstream, which never answers a fourth request) is ever
+        // reached -- registering a Cedar hook does not disable RBAC.
+        let rbac_denied = mcp_handler_exchange(
+            &action,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {"name": RBAC_DENIED_TOOL, "arguments": {}}
+            }),
+        )
+        .await;
+        assert!(
+            rbac_denied["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("denied by RBAC policy"),
+            "got: {rbac_denied:?}"
         );
     }
 }

@@ -43,7 +43,7 @@ fn header_record_conforms_to_canonical_schema() {
 #[test]
 fn full_tool_call_record_conforms_to_canonical_schema() {
     let schema = schema();
-    let record = LedgerRecord::ToolCall(LedgerToolCall {
+    let record = LedgerRecord::ToolCall(Box::new(LedgerToolCall {
         session_id: "01J0SESSIONID".to_string(),
         agent_id: Some("planner".to_string()),
         hop_index: 3,
@@ -55,7 +55,7 @@ fn full_tool_call_record_conforms_to_canonical_schema() {
         started_at: Some("2026-06-05T12:00:01Z".to_string()),
         duration_ms: Some(42),
         caller: Caller::Direct,
-    });
+    }));
     assert_valid(&schema, &record);
 }
 
@@ -64,7 +64,7 @@ fn minimal_tool_call_record_conforms_to_canonical_schema() {
     // Only the schema-required fields, optionals omitted. Mirrors a
     // sessionless single-agent call with empty params.
     let schema = schema();
-    let record = LedgerRecord::ToolCall(LedgerToolCall {
+    let record = LedgerRecord::ToolCall(Box::new(LedgerToolCall {
         session_id: "req-123".to_string(),
         agent_id: None,
         hop_index: 0,
@@ -76,6 +76,6 @@ fn minimal_tool_call_record_conforms_to_canonical_schema() {
         started_at: None,
         duration_ms: None,
         caller: Caller::CodeExecution,
-    });
+    }));
     assert_valid(&schema, &record);
 }

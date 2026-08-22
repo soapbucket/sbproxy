@@ -24,6 +24,14 @@ sbproxy-observe.workspace = true
 cel.workspace = true
 regorus.workspace = true
 
+# Cedar policy engine (typed authorization policy language, used for
+# MCP tool-call semantic governance)
+cedar-policy.workspace = true
+# WOR-2586: embedded redb-backed store for dynamically-minted Cedar
+# policies (cedar::storage), the default zero-external-dependency
+# backend. Statically config-compiled Cedar policies never touch this.
+redb.workspace = true
+
 # Lua scripting engine
 mlua.workspace = true
 
@@ -44,7 +52,58 @@ wasmtime-wasi.workspace = true
 
 # Serialization
 serde = { workspace = true }
-serde_json.workspace = true
+# `preserve_order` keeps `mcp::federation`'s `serde_json::json!(...)`
+# key order stable (insertion order, not alphabetical) and is required
+# for `cedar-policy-core`'s own deterministic entity/schema
+# serialization. Declared explicitly here for documentation, not
+# because omitting it would turn the feature off: `cedar-policy-core`
+# enables `serde_json/preserve_order` on its own regardless of what
+# this manifest says (confirmed by removing this line and rebuilding:
+# `serde_json`'s Cargo.lock entry still gains an `indexmap` edge either
+# way). Cargo unifies one crate's features across the whole workspace
+# build, not per-crate, so this is workspace-wide by construction the
+# moment `cedar-policy` is a dependency anywhere in the graph: every
+# crate's `serde_json::Value::Object` / `Map` iteration flips from
+# alphabetical to insertion order, not only this crate's.
+#
+# WOR-2587 review: a grep-based sweep is not evidence for a change like
+# this one -- only a full test run is, since the failure mode is a
+# byte-for-byte golden string, not a type error. Ran
+# `cargo nextest run --workspace --exclude sbproxy-e2e` (13,462 tests)
+# against this feature; it found exactly two classes of casualty, both
+# fixed in this same change:
+#
+# - `sbproxy-ai`'s external-guardrail wire-format contract tests (8
+#   cases across Aporia, Azure, Bedrock, CrowdStrike, Lakera, Pangea,
+#   Patronus): each pins an outbound HTTP body as an exact JSON string.
+#   The bodies are built with `serde_json::json!{...}` and now
+#   serialize in the macro's literal key order instead of alphabetical,
+#   which is a byte-identical-but-differently-ordered request no real
+#   JSON API cares about, so the fix is re-baselining the expected
+#   strings, not a behavior change.
+# - `sbproxy_ai::semantic_cache::SemanticCache::compute_hash`'s
+#   exact-match cache key hashed a raw `serde_json::Value` (multimodal
+#   message content) rather than a canonical form: two semantically
+#   identical messages differing only in client-supplied key order
+#   would now hash differently and silently miss the cache. Fixed by
+#   canonicalizing (`serde_json_canonicalizer`, RFC 8785) before
+#   hashing, the same pattern `sbproxy_config::cache_identity` already
+#   uses for exactly this reason.
+#
+# `mcp::federation`'s own golden-string suite (this crate) already
+# accounted for this in the diff that added `cedar-policy`. The
+# config-bundle ETag/content_digest path is unaffected: it hashes the
+# raw config YAML string, not a re-serialized JSON value
+# (`sbproxy_config::config_bundle`). The three other failures the full
+# run surfaced (`sbproxy-config::schema_is_committed_verbatim`,
+# `sbproxy-core::plugin_action_tests::linked_action_stops_reading_at_the_buffered_policys_own_cap`,
+# `sbproxy-observe::audit_chain::key_audit_value_fingerprint_is_stable_across_json_object_key_insertion_order`)
+# are unrelated to this feature: each passes cleanly both alone and as
+# part of its own crate's full suite, and none touches `serde_json`
+# object ordering; they reproduce only under this sandbox's full
+# 13k-test concurrent run, consistent with resource contention rather
+# than a code defect.
+serde_json = { workspace = true, features = ["preserve_order"] }
 serde_yaml.workspace = true
 
 # Error handling
@@ -92,11 +151,14 @@ semver.workspace = true
 serde_json_canonicalizer.workspace = true
 async-trait.workspace = true
 
-# UUID
-uuid.workspace = true
+# UUID. The `serde` feature is needed by `cedar::schema::SchemaRefusalReport`,
+# which derives `Serialize` over a `Vec<(uuid::Uuid, Vec<String>)>`.
+uuid = { workspace = true, features = ["serde"] }
 
 # Time
-chrono.workspace = true
+# `serde` feature: cedar::storage::StoredPolicy derives Serialize/
+# Deserialize over a `DateTime<Utc>` field.
+chrono = { workspace = true, features = ["serde"] }
 
 # Feature-flag store: process-wide handle.
 once_cell = "1"

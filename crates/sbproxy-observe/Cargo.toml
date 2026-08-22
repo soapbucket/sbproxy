@@ -58,6 +58,12 @@ hmac.workspace = true
 sha2.workspace = true
 hex.workspace = true
 base64.workspace = true
+# RFC 8785 (JCS) canonical form for the audit hash-chain's per-field
+# value fingerprint (WOR-2585 fix), so the HMAC is stable across
+# `serde_json::Value::Object` key insertion order rather than relying
+# on the workspace never enabling serde_json's `preserve_order`
+# feature. See `audit_chain::hmac_value`.
+serde_json_canonicalizer.workspace = true
 thiserror.workspace = true
 flate2 = "1"
 

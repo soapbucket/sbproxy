@@ -603,3 +603,47 @@ explicit goal of this change. Production construction goes through
 lazily on first use instead of taking pre-built clients; `with_clients` has
 no production caller by design, the same way the enterprise implementation
 this backend was ported from kept its equivalent constructor test-only.
+# 2026-08-22 (WOR-2585/2586/2587, unreferenced bucket): 1424 -> 1426. The
+# Cedar policy engine's port into sbproxy-extension added two pub items
+# that nothing outside their own defining file names, and neither can be
+# narrowed:
+#
+# * `cedar::compiler::ValidationFinding` is the element type of
+#   `CompilerError::Validation`'s `findings: Vec<ValidationFinding>`
+#   field. `CompilerError` is consumed by `sbproxy-modules` across a
+#   crate boundary, so its variant field is reachable at `pub`
+#   regardless of who names the element type directly; narrowing
+#   `ValidationFinding` to `pub(crate)` was tried and confirmed to
+#   trip rustc's `private_interfaces` lint under this workspace's
+#   `-D warnings` clippy gate (a public field of a less-visible type),
+#   so `pub` is the only visibility that compiles.
+# * `sbproxy_modules::action::mcp::McpCedarPolicyConfig` is the
+#   `cedar_policies:` config sub-struct on the MCP action config,
+#   deserialized straight from YAML like every other optional policy
+#   block in that file. It is reachable via serde, not a Rust call
+#   site, and a public doc comment already links to it by name
+#   (`[`McpCedarPolicyConfig`]` on the `cedar_policies` field), so
+#   narrowing would both fail the same privacy check and break a
+#   public intra-doc link.
+#
+# Neither is dead code or scaffolding ahead of a caller; both are the
+# ordinary shape of a public error payload and a public config type,
+# same class as the `MeshFederationConfig` / `RequirementExtensionInfo`
+# / `JsonRpcError` entries already sitting in this bucket. Raising
+# rather than narrowing.
+
+# 2026-08-22 (WOR-2585/2586/2587, unreferenced bucket, follow-up): 1426
+# -> 1425. Fixing the adversarial-review findings on the Cedar MCP hook
+# (server-scoping the hook, threading the merged schema through
+# compile_all, moving the hook's construction after `prefixes` is
+# built) touched enough surrounding doc comments and call sites that
+# the grep-based scanner's textual count shifted by one net item below
+# the just-raised baseline, the same "mention moves the bucket" effect
+# already logged above for `fallback_trigger` and `sweep_expired`.
+# Lowering to hold the ground rather than leaving it unclaimed.
+
+2026-08-22 (WOR-2661 merge reconciliation): the two parent branches measured
+the unreferenced bucket independently at 1458 and 1425. The merged tree is
+1459, one above the infra branch alone because Cedar's public types remain
+present. The tests-only bucket remains 296. The baselines record the merged
+tree rather than either parent so both ratchets continue to reject regressions.

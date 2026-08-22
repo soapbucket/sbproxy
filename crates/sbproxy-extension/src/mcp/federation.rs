@@ -98,8 +98,67 @@ pub enum McpCallOutcome {
         /// Human-readable deny reason returned in the JSON-RPC error
         /// message.
         message: String,
+        /// Which [`PolicyDecision`] polarity produced this outcome.
+        /// Both map to the same `code`/wire behavior today (PR β
+        /// treats `Confirm` as `Deny`), but a caller that wants to
+        /// distinguish them for evidence or metrics purposes -- rather
+        /// than re-deriving it by sniffing `message` -- reads this
+        /// field instead. See [`McpPolicyDeniedError`], which carries
+        /// this same distinction across the `anyhow::Error` collapse
+        /// at [`McpFederation::call_tool_with_upstream_headers`] /
+        /// [`McpFederation::call_tool_with_upstream_headers_from_snapshot`].
+        kind: McpPolicyDenialKind,
     },
 }
+
+/// Which [`PolicyDecision`] polarity produced an
+/// [`McpCallOutcome::DeniedByPolicy`] (WOR-2587 review).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpPolicyDenialKind {
+    /// An outright [`PolicyDecision::Deny`].
+    Deny,
+    /// A [`PolicyDecision::Confirm`] that PR β's dispatcher currently
+    /// answers with a denial rather than parking it for approval (no
+    /// `PendingConfirmStore` in OSS yet).
+    Confirm,
+}
+
+/// Error carried when [`McpFederation::call_tool_with_upstream_headers`]
+/// / [`McpFederation::call_tool_with_upstream_headers_from_snapshot`]
+/// collapse an [`McpCallOutcome::DeniedByPolicy`] into an
+/// `anyhow::Error` (WOR-2587 review).
+///
+/// Before this type existed, that collapse used `anyhow::bail!` with
+/// an interpolated string, which discarded the structured JSON-RPC
+/// code and left `action_dispatch.rs`'s catch-all `Err` arm no way to
+/// tell a policy-hook refusal apart from a genuine upstream failure --
+/// every policy deny or confirm-hold reached the wire as a generic
+/// `-32603 INTERNAL_ERROR` with, for a modern-protocol caller, no
+/// human-readable reason at all. `action_dispatch.rs` downcasts to
+/// this instead, so the caller sees the same code and message the
+/// policy hook actually produced.
+#[derive(Debug, Clone)]
+pub struct McpPolicyDeniedError {
+    /// JSON-RPC error code to surface. See
+    /// [`McpCallOutcome::DeniedByPolicy::code`].
+    pub code: i32,
+    /// Human-readable deny/confirm reason.
+    pub message: String,
+    /// Which verdict polarity produced this denial.
+    pub kind: McpPolicyDenialKind,
+}
+
+impl std::fmt::Display for McpPolicyDeniedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "denied by mcp policy hook: {} (code {})",
+            self.message, self.code
+        )
+    }
+}
+
+impl std::error::Error for McpPolicyDeniedError {}
 
 // --- Config ---
 
@@ -2565,14 +2624,22 @@ impl McpFederation {
             .await?
         {
             McpCallOutcome::Allowed(value) => Ok(value),
-            McpCallOutcome::DeniedByPolicy { code, message } => {
-                anyhow::bail!(
-                    "tool call {} denied by mcp policy hook: {} (code {})",
-                    tool_name,
-                    message,
-                    code
-                );
+            // WOR-2587 review: wrap in the typed `McpPolicyDeniedError`
+            // rather than `anyhow::bail!`ing an interpolated string, so
+            // a downstream caller (`action_dispatch.rs`) can downcast
+            // and recover the structured code/message/kind instead of
+            // falling through to a generic upstream-failure response.
+            // See that type's doc comment for the bug this fixes.
+            McpCallOutcome::DeniedByPolicy {
+                code,
+                message,
+                kind,
+            } => Err(McpPolicyDeniedError {
+                code,
+                message,
+                kind,
             }
+            .into()),
         }
     }
 
@@ -2610,14 +2677,22 @@ impl McpFederation {
             .await?
         {
             McpCallOutcome::Allowed(value) => Ok(value),
-            McpCallOutcome::DeniedByPolicy { code, message } => {
-                anyhow::bail!(
-                    "tool call {} denied by mcp policy hook: {} (code {})",
-                    tool_name,
-                    message,
-                    code
-                );
+            // WOR-2587 review: wrap in the typed `McpPolicyDeniedError`
+            // rather than `anyhow::bail!`ing an interpolated string, so
+            // a downstream caller (`action_dispatch.rs`) can downcast
+            // and recover the structured code/message/kind instead of
+            // falling through to a generic upstream-failure response.
+            // See that type's doc comment for the bug this fixes.
+            McpCallOutcome::DeniedByPolicy {
+                code,
+                message,
+                kind,
+            } => Err(McpPolicyDeniedError {
+                code,
+                message,
+                kind,
             }
+            .into()),
         }
     }
 
@@ -2855,6 +2930,7 @@ impl McpFederation {
                 return Ok(McpCallOutcome::DeniedByPolicy {
                     code: super::types::INVALID_PARAMS,
                     message,
+                    kind: McpPolicyDenialKind::Deny,
                 });
             }
             PolicyDecision::Confirm { reason, .. } => {
@@ -2879,6 +2955,7 @@ impl McpFederation {
                 return Ok(McpCallOutcome::DeniedByPolicy {
                     code: super::types::INVALID_PARAMS,
                     message: format!("confirmation required: {}", reason),
+                    kind: McpPolicyDenialKind::Confirm,
                 });
             }
         }
@@ -4361,8 +4438,12 @@ fn legacy_serialized_tools_for_catalog(catalog: &ToolCatalogState) -> Arc<Serial
 }
 
 /// Build the frozen legacy catalogue before its enclosing state is
-/// published. Its field order and per-entry projection intentionally
-/// stay identical to the pre-lossless serializer.
+/// published. Its per-entry projection (which fields appear at all)
+/// intentionally stays identical to the pre-lossless serializer. Key
+/// order within each entry follows `serde_json::Map`'s representation
+/// (insertion order under the workspace-wide `preserve_order`
+/// feature), which is not this function's own contract to keep
+/// stable; see [`legacy_serialized_tool_entry`].
 fn build_legacy_serialized_tools(
     registry: &HashMap<String, FederatedTool>,
     generation: u64,
@@ -4414,10 +4495,15 @@ fn serialized_tool_array(entries: &[SerializedToolEntry]) -> String {
 
 /// Frozen legacy `tools/list` projection for one federated tool.
 ///
-/// Keep this byte-for-byte equivalent to the pre-lossless serializer:
+/// Keep the field set equivalent to the pre-lossless serializer:
 /// clients on the 2025-06-18 wire see only name, description,
 /// inputSchema, and optional `_meta`, even when the internal modern
-/// contract carries additional fields.
+/// contract carries additional fields. Key order comes from
+/// `serde_json::Map`'s representation for the whole workspace
+/// (`preserve_order` is on because `cedar-policy-core` requires it
+/// for its own deterministic entity serialization); it is insertion
+/// order here, not alphabetical, and is not independently
+/// configurable per call site.
 fn legacy_serialized_tool_entry(tool: &FederatedTool) -> SerializedToolEntry {
     let mut obj = serde_json::json!({
         "name": tool.name,
@@ -5140,12 +5226,12 @@ mod tests {
         let legacy = federation.serialized_tools();
         assert_eq!(
             legacy.full_array,
-            "[{\"description\":\"Legacy missing schema\",\"inputSchema\":{\"properties\":{},\"type\":\"object\"},\"name\":\"missing_input\"}]"
+            "[{\"name\":\"missing_input\",\"description\":\"Legacy missing schema\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]"
         );
         assert_eq!(
             serde_json::to_string(&crate::mcp::compat::contract_of(&tool))
                 .expect("legacy compatibility JSON"),
-            "{\"description\":\"Legacy missing schema\",\"inputSchema\":{\"properties\":{},\"type\":\"object\"},\"name\":\"missing_input\"}"
+            "{\"name\":\"missing_input\",\"description\":\"Legacy missing schema\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}"
         );
         let codemode = federation.codemode_ts("https://gateway.example");
         assert!(codemode.contains("export interface MissingInputInput"));
@@ -5176,12 +5262,12 @@ mod tests {
         let legacy = federation.serialized_tools();
         assert_eq!(
             legacy.full_array,
-            "[{\"description\":\"Legacy scalar schema\",\"inputSchema\":\"opaque-schema\",\"name\":\"scalar_input\"}]"
+            "[{\"name\":\"scalar_input\",\"description\":\"Legacy scalar schema\",\"inputSchema\":\"opaque-schema\"}]"
         );
         assert_eq!(
             serde_json::to_string(&crate::mcp::compat::contract_of(&tool))
                 .expect("legacy compatibility JSON"),
-            "{\"description\":\"Legacy scalar schema\",\"inputSchema\":\"opaque-schema\",\"name\":\"scalar_input\"}"
+            "{\"name\":\"scalar_input\",\"description\":\"Legacy scalar schema\",\"inputSchema\":\"opaque-schema\"}"
         );
         let codemode = federation.codemode_ts("https://gateway.example");
         assert!(codemode.contains("export interface ScalarInputInput"));
@@ -5250,7 +5336,7 @@ mod tests {
         let legacy = federation.serialized_tools();
         assert_eq!(
             legacy.full_array,
-            "[{\"description\":\"OpenAPI search\",\"inputSchema\":{\"properties\":{},\"type\":\"object\"},\"name\":\"search\"}]"
+            "[{\"name\":\"search\",\"description\":\"OpenAPI search\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]"
         );
         let modern: serde_json::Value =
             serde_json::from_str(&federation.serialized_modern_tools().full_array)
@@ -5494,7 +5580,7 @@ mod tests {
         assert!(tool.modern_contract.is_some());
         assert!(tool.modern_incompatibility.is_none());
 
-        const LEGACY_GOLDEN: &str = "[{\"_meta\":{\"openai/widget\":{\"templateId\":\"search-card\"}},\"description\":\"Search the indexed documents\",\"inputSchema\":{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"properties\":{\"query\":{\"type\":\"string\"}},\"required\":[\"query\"],\"type\":\"object\"},\"name\":\"alpha.search\"}]";
+        const LEGACY_GOLDEN: &str = "[{\"name\":\"alpha.search\",\"description\":\"Search the indexed documents\",\"inputSchema\":{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}},\"required\":[\"query\"]},\"_meta\":{\"openai/widget\":{\"templateId\":\"search-card\"}}}]";
         let legacy_entry = legacy_serialized_tool_entry(&tool);
         assert_eq!(format!("[{}]", legacy_entry.json), LEGACY_GOLDEN);
         assert!(!legacy_entry.json.contains("outputSchema"));
@@ -9464,7 +9550,11 @@ mod tests {
             .expect("call_tool_with_policy must succeed when the hook denies");
 
         match out {
-            McpCallOutcome::DeniedByPolicy { code, message } => {
+            McpCallOutcome::DeniedByPolicy {
+                code,
+                message,
+                kind,
+            } => {
                 // WOR-2538: INVALID_PARAMS (-32602), not INTERNAL_ERROR
                 // (-32603) -- the same code
                 // `sbproxy-core::server::action_dispatch`'s config-RBAC
@@ -9476,6 +9566,7 @@ mod tests {
                     message.contains("policy hook denied"),
                     "deny reason must round-trip into the outcome, got {message}"
                 );
+                assert_eq!(kind, McpPolicyDenialKind::Deny);
             }
             McpCallOutcome::Allowed(_) => panic!("expected DeniedByPolicy, got Allowed"),
         }
@@ -9488,6 +9579,64 @@ mod tests {
         assert_eq!(tool, "deny-tool");
         assert_eq!(c_id, corr);
         assert_eq!(ws, "ws-1");
+    }
+
+    /// Hook that only acts on one specific tool name. Unlike
+    /// `ScopedHook`, this matches on `tool_name` rather than
+    /// `correlation_id`, which is what lets this test drive
+    /// `call_tool_with_upstream_headers` directly: that wrapper always
+    /// passes an empty `correlation_id` (falling back to the active
+    /// trace id, also empty in a unit test), so a `correlation_id`
+    /// scope cannot distinguish this test's hook from a concurrently
+    /// running test's. A unique tool name can.
+    struct ToolScopedHook {
+        match_tool: &'static str,
+        verdict: PolicyDecision,
+    }
+
+    impl McpPolicyHook for ToolScopedHook {
+        fn evaluate<'a>(
+            &'a self,
+            ctx: McpToolCallCtx<'a>,
+        ) -> Pin<Box<dyn Future<Output = PolicyDecision> + Send + 'a>> {
+            let verdict = if ctx.tool_name == self.match_tool {
+                self.verdict.clone()
+            } else {
+                PolicyDecision::Allow
+            };
+            Box::pin(async move { verdict })
+        }
+    }
+
+    /// WOR-2587 review: `call_tool_with_upstream_headers` collapses a
+    /// `DeniedByPolicy` outcome into an `anyhow::Error`; this pins that
+    /// the collapse is a typed [`McpPolicyDeniedError`], not a bare
+    /// string, so a caller downstream (`action_dispatch.rs`) can
+    /// downcast and recover the exact code/message/kind the policy
+    /// hook produced rather than falling through to a generic
+    /// upstream-failure response.
+    #[tokio::test]
+    async fn denied_call_collapses_to_typed_policy_error() {
+        const TOOL: &str = "wor2587-typed-error-tool";
+        register_mcp_policy_hook(Arc::new(ToolScopedHook {
+            match_tool: TOOL,
+            verdict: PolicyDecision::Deny {
+                status: 403,
+                message: "typed error fixture denial".to_string(),
+            },
+        }));
+
+        let fed = fed_with_tool("typed-error-server", TOOL);
+        let error = fed
+            .call_tool_with_upstream_headers(TOOL, json!({}), &[])
+            .await
+            .expect_err("a Deny verdict must surface as an Err");
+        let denied = error
+            .downcast_ref::<McpPolicyDeniedError>()
+            .expect("the Err must downcast to McpPolicyDeniedError, not a bare anyhow string");
+        assert_eq!(denied.code, super::super::types::INVALID_PARAMS);
+        assert_eq!(denied.message, "typed error fixture denial");
+        assert_eq!(denied.kind, McpPolicyDenialKind::Deny);
     }
 
     /// Allow lets the call continue to the upstream. The upstream URL
@@ -9562,7 +9711,11 @@ mod tests {
             .expect("Confirm must produce a clean outcome, not a network error");
 
         match out {
-            McpCallOutcome::DeniedByPolicy { code, message } => {
+            McpCallOutcome::DeniedByPolicy {
+                code,
+                message,
+                kind,
+            } => {
                 // WOR-2538: same INVALID_PARAMS reasoning as the Deny
                 // case above.
                 assert_eq!(code, super::super::types::INVALID_PARAMS);
@@ -9570,6 +9723,7 @@ mod tests {
                     message.contains("approval required for prod write"),
                     "Confirm reason must round-trip into the deny message, got {message}"
                 );
+                assert_eq!(kind, McpPolicyDenialKind::Confirm);
             }
             McpCallOutcome::Allowed(_) => {
                 panic!("Confirm must currently produce DeniedByPolicy (PR β)")

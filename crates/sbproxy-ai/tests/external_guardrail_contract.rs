@@ -289,7 +289,7 @@ async fn lakera_input_contract_allows_and_sends_exact_wire_format() {
     assert!(request.starts_with("POST /v2/guard HTTP/1.1\r\n"));
     assert!(request.contains("authorization: Bearer fixture-key\r\n"));
     assert!(request.ends_with(
-        r#"{"breakdown":true,"messages":[{"content":"fixture prompt","role":"user"}],"project_id":"fixture-project"}"#
+        r#"{"messages":[{"role":"user","content":"fixture prompt"}],"breakdown":true,"project_id":"fixture-project"}"#
     ));
 }
 
@@ -362,7 +362,7 @@ async fn aporia_input_and_output_contracts_allow_and_send_exact_wire_format() {
     assert!(wire_request.starts_with("POST /fixture-project/validate HTTP/1.1\r\n"));
     assert!(wire_request.contains("x-aporia-api-key: fixture-key\r\n"));
     assert!(wire_request.ends_with(
-        r#"{"explain":true,"messages":[{"content":"fixture prompt","role":"user"}],"validation_target":"prompt"}"#
+        r#"{"messages":[{"role":"user","content":"fixture prompt"}],"validation_target":"prompt","explain":true}"#
     ));
 
     let (base_url, received) =
@@ -380,7 +380,7 @@ async fn aporia_input_and_output_contracts_allow_and_send_exact_wire_format() {
     );
     let wire_request = finish_fixture(received).await;
     assert!(wire_request.ends_with(
-        r#"{"explain":true,"messages":[{"content":"fixture prompt","role":"user"}],"response":"fixture prompt","validation_target":"response"}"#
+        r#"{"messages":[{"role":"user","content":"fixture prompt"}],"validation_target":"response","explain":true,"response":"fixture prompt"}"#
     ));
 }
 
@@ -816,7 +816,7 @@ async fn patronus_contract_disables_capture_for_input_output_and_optional_criter
         .allowed
     );
     assert!(finish_fixture(received).await.ends_with(
-        r#"{"capture":"none","evaluators":[{"criteria":"block adversarial prompts","evaluator":"prompt-injection"}],"task_output":"fixture prompt"}"#
+        r#"{"capture":"none","evaluators":[{"evaluator":"prompt-injection","criteria":"block adversarial prompts"}],"task_output":"fixture prompt"}"#
     ));
 }
 
@@ -995,7 +995,7 @@ async fn crowdstrike_input_contract_sends_documented_shape_and_normalizes_verdic
     assert!(wire_request.starts_with("POST /aidr/aiguard/v1/guard_chat_completions HTTP/1.1\r\n"));
     assert!(wire_request.contains("authorization: Bearer fixture-key\r\n"));
     assert!(wire_request.ends_with(
-        r#"{"app_id":"fixture-app","guard_input":{"messages":[{"content":"fixture prompt","role":"user"}]}}"#
+        r#"{"guard_input":{"messages":[{"role":"user","content":"fixture prompt"}]},"app_id":"fixture-app"}"#
     ));
 }
 
@@ -1049,7 +1049,7 @@ async fn crowdstrike_block_malformed_unknown_status_timeout_and_fail_modes_are_s
     );
     let wire_request = finish_fixture(received).await;
     assert!(wire_request.ends_with(
-        r#"{"event_type":"output","guard_input":{"messages":[{"content":"fixture prompt","role":"user"}]}}"#
+        r#"{"guard_input":{"messages":[{"role":"user","content":"fixture prompt"}]},"event_type":"output"}"#
     ));
 
     for (status, body, delay, fail_open, expected_allowed) in [
@@ -1129,7 +1129,7 @@ async fn pangea_input_and_output_contracts_select_recipes_and_normalize_scores()
         assert!(wire_request.starts_with("POST /v1/text/guard HTTP/1.1\r\n"));
         assert!(wire_request.contains("authorization: Bearer fixture-key\r\n"));
         assert!(wire_request.ends_with(&format!(
-            r#"{{"debug":true,"recipe":"{recipe}","text":"fixture prompt"}}"#
+            r#"{{"text":"fixture prompt","recipe":"{recipe}","debug":true}}"#
         )));
     }
 }
@@ -1213,7 +1213,7 @@ async fn azure_content_safety_contract_uses_subscription_key_and_eight_level_out
         .starts_with("POST /contentsafety/text:analyze?api-version=2024-09-01 HTTP/1.1\r\n"));
     assert!(wire_request.contains("ocp-apim-subscription-key: fixture-key\r\n"));
     assert!(
-        wire_request.ends_with(r#"{"outputType":"EightSeverityLevels","text":"fixture prompt"}"#)
+        wire_request.ends_with(r#"{"text":"fixture prompt","outputType":"EightSeverityLevels"}"#)
     );
 }
 
@@ -1375,7 +1375,7 @@ async fn bedrock_guardrail_contract_uses_apply_guardrail_input_and_output_shapes
             .starts_with("POST /guardrail/fixture-guardrail/version/1/apply HTTP/1.1\r\n"));
         assert!(wire_request.contains("authorization: Bearer fixture-key\r\n"));
         assert!(wire_request.ends_with(&format!(
-            r#"{{"content":[{{"text":{{"text":"fixture prompt"}}}}],"source":"{source}"}}"#
+            r#"{{"source":"{source}","content":[{{"text":{{"text":"fixture prompt"}}}}]}}"#
         )));
     }
 }

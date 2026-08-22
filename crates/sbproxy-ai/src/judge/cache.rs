@@ -29,13 +29,17 @@ use sha2::{Digest, Sha256};
 /// across processes and architectures.
 pub fn cache_key(prompt: &str, payload: &serde_json::Value) -> (u128, u128) {
     let prompt_hash = truncated_sha256_u128(prompt.as_bytes());
-    // serde_json::to_string is deterministic for any serde_json::Value
-    // because Map iteration order is preserved (the BTreeMap-backed
-    // `preserve_order` feature is on by default in the workspace).
-    // For values built directly with the json! macro the field order
-    // is the source-code order, which matches the typical caller.
-    let payload_str = serde_json::to_string(payload).unwrap_or_default();
-    let payload_hash = truncated_sha256_u128(payload_str.as_bytes());
+    // RFC 8785 (JCS) canonical form (WOR-2585 fix), not
+    // `serde_json::to_string`: cedar-policy-core forces serde_json's
+    // `preserve_order` feature on workspace-wide, which flips
+    // `serde_json::Map` from a sorted `BTreeMap` to an
+    // insertion-order-preserving map. Two structurally identical
+    // payloads built in different field order (a `HashMap` iterated
+    // into a `json!` object, for instance) would then hash to
+    // different keys and silently stop sharing a cache entry, the
+    // same false-miss class `SemanticCache::compute_hash` had.
+    let payload_bytes = serde_json_canonicalizer::to_vec(payload).unwrap_or_default();
+    let payload_hash = truncated_sha256_u128(&payload_bytes);
     (prompt_hash, payload_hash)
 }
 
@@ -133,6 +137,30 @@ mod tests {
 
         let k4 = cache_key("prompt-A", &json!({"x": 2}));
         assert_ne!(k1, k4, "different payload must produce different key");
+    }
+
+    #[test]
+    fn cache_key_is_stable_across_json_object_key_insertion_order() {
+        // WOR-2585: cedar-policy-core forces serde_json's
+        // `preserve_order` feature on for the whole workspace, so a
+        // `serde_json::Map` no longer sorts its keys on its own. A
+        // structurally identical payload built with fields in a
+        // different order must still hash to the same cache key,
+        // matching `audit_chain`'s own insertion-order canary test.
+        let mut forward = serde_json::Map::new();
+        forward.insert("x".to_string(), json!(1));
+        forward.insert("y".to_string(), json!(2));
+
+        let mut reverse = serde_json::Map::new();
+        reverse.insert("y".to_string(), json!(2));
+        reverse.insert("x".to_string(), json!(1));
+
+        let k_forward = cache_key("prompt-A", &serde_json::Value::Object(forward));
+        let k_reverse = cache_key("prompt-A", &serde_json::Value::Object(reverse));
+        assert_eq!(
+            k_forward, k_reverse,
+            "cache key must not depend on object key insertion order"
+        );
     }
 
     #[test]

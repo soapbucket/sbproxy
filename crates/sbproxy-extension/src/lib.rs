@@ -1,4 +1,5 @@
-//! sbproxy-extension: Scripting runtimes (CEL, Lua, JS, WASM).
+//! sbproxy-extension: Scripting runtimes and policy engines (CEL,
+//! Cedar, Lua, JS, WASM).
 //!
 //! This crate provides expression evaluation and scripting engines used by
 //! sbproxy for conditional logic in routing, access control, and policy
@@ -8,6 +9,7 @@
 #![warn(missing_docs)]
 
 pub mod bundle;
+pub mod cedar;
 pub mod cel;
 pub mod flags;
 pub mod js;
