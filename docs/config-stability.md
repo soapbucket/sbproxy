@@ -687,6 +687,83 @@ carve-out, declare it on the entry with `data_posture: {retains_data: false}`
 and the previous behavior returns. That declaration is the operator saying
 something about their own account that the catalog cannot know.
 
+### A transcoded gRPC error now sets the HTTP status, not just the body
+
+**Who this reaches.** Any origin with `action: {type: grpc, transcode: {...}}`
+whose upstream returns a non-OK `grpc-status` in the *response headers*, which
+is what tonic and grpc-go send for a unary handler that returns an error. An
+origin with no `transcode` block is unaffected, and so is `grpc_web: true`:
+gRPC-Web requires HTTP 200 with the outcome in the trailer frame, and that
+path is untouched.
+
+**What changes.** The transcoder already mapped the gRPC code to an HTTP
+status for the JSON error envelope it puts in the body, and then threw the
+mapped value away, so the response kept the upstream's 200. It is applied to
+the status line now, using the same `google.rpc.Code` table `grpc-gateway`
+uses: `NOT_FOUND` becomes 404, `PERMISSION_DENIED` 403, `FAILED_PRECONDITION`
+and `INVALID_ARGUMENT` 400, `UNAVAILABLE` 503, `UNIMPLEMENTED` 501,
+`RESOURCE_EXHAUSTED` 429, `CANCELLED` 499. A `status` response modifier on the
+same origin still wins; it is applied later in the same filter.
+
+**What an operator sees when it bites.** Calls that used to be logged and
+metered as 2xx move into the 4xx and 5xx classes, so error-rate alerts,
+the `status` label on `sbproxy_requests_total` and
+`sbproxy_origin_requests_total`, and any downstream client that retries on 5xx
+all see the change at once. Response caching for those
+origins also changes, since a 4xx or 5xx is not stored the way a 200 was.
+Three more surfaces read the status line at the same point and therefore
+also move: the RFC 9209 `Proxy-Status` header, which is stamped on non-2xx
+responses only, so a `proxy_status.enabled` origin starts emitting it on
+failed RPCs; response `assert` policies; and `on_response` callbacks.
+Nothing about the JSON body changed.
+
+One surface deliberately does not move, and it is a change in its own
+right. `fallback_origin.on_status` is no longer consulted at all on an
+origin with `transcode` or `grpc_web: true`. Both translated modes own
+the response body outright, so a fallback that fired there could commit
+the fallback's status and `content-length` while the body downstream
+stayed the translated one, and a body that does not match its declared
+length desynchronizes a keep-alive connection. `on_error` is unaffected:
+it fires before any upstream response exists, so there is no translated
+body to conflict with. If you need a status fallback on a gRPC upstream,
+put it on a plain-passthrough origin in front of it.
+
+**What to do before upgrading.** Re-baseline error-rate alerts on the affected
+origins, and check any client that treated a transcoded call as always-2xx and
+read the outcome out of the body. The one shape that did not change is a
+failure reported in real HTTP/2 trailers after the response headers, typically
+a server-streaming method that fails partway: the status line is already
+committed downstream when the trailers arrive, so that response stays 200 with
+the error in the body.
+
+### The translated gRPC paths now ask the upstream for `identity` framing
+
+**Who this reaches.** Any origin with `action: {type: grpc}` and either
+`transcode` or `grpc_web: true`. Plain gRPC passthrough is unaffected.
+
+**What changes.** Both translated paths read the length-prefixed message
+frames, and neither can read a compressed one. They now send
+`grpc-accept-encoding: identity` on the request to the upstream, replacing
+anything the client sent, so a compliant server stops compressing. Two
+consequences follow. A compressed response frame that arrives anyway is
+refused by the transcoder with a JSON error naming compression, where before
+its bytes were handed to the protobuf decoder as if they were a message. And
+the gRPC-Web bridge no longer strips a non-`identity` `grpc-encoding` response
+header, since the frames under it are forwarded byte for byte.
+
+**What an operator sees when it bites.** An upstream configured to compress
+responses stops doing so on these origins, which shows up as larger response
+bodies between the proxy and that upstream. An upstream that compresses
+unconditionally, ignoring the negotiation, surfaces as a JSON body of
+`{"error": "gRPC response transcoding failed", "detail": "...compressed..."}`
+instead of the previous protobuf decode error. That body arrives with the
+upstream's own status, normally 200, because the frame's compression flag is
+only readable once the status line has gone downstream.
+
+**What to do before upgrading.** If you rely on gRPC message compression
+between the proxy and a gRPC upstream, keep that origin on plain passthrough
+rather than `transcode` or `grpc_web`.
+
 ---
 
 ## Selected field stability reference

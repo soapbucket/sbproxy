@@ -1604,6 +1604,8 @@ origins:
 | `grpc_web` | bool | false | Allow browser gRPC-Web clients (HTTP/1.1 with base64 or binary framing) to reach the native gRPC upstream. |
 | `transcode` | object | unset | REST-to-gRPC transcoding: `descriptor_set` (path to a compiled protobuf `FileDescriptorSet`) and `routes[]`, each a `{method, path, grpc_method, body}` binding an HTTP route to a unary gRPC call. `path` uses `google.api.http`-style templates; `body` names the field the HTTP body decodes into, or is omitted (or `"*"`) to decode the whole body as the request message. |
 
+`grpc_web` and `transcode` both read the gRPC message frames, so both send `grpc-accept-encoding: identity` upstream and neither supports gRPC message compression. There is no field to change that. Plain passthrough (neither field set) forwards frames untouched and is unaffected. See [gRPC limits](routing.md#grpc-limits).
+
 ### ai_proxy
 
 Route requests across LLM providers with automatic failover, cost tracking, and content-based routing. Supports 70 native providers behind one OpenAI-compatible API; the model name passes straight through, so any model a provider serves is reachable. For full details, see [ai-gateway.md](ai-gateway.md) and [providers.md](providers.md).
