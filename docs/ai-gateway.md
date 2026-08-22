@@ -107,16 +107,18 @@ gantt
     dateFormat X
     axisFormat %s
     section Request
-    connect + TLS            :a1, 0, 1
-    provider thinking        :a2, 1, 2
-    response headers arrive  :milestone, m1, 3, 0
-    SSE events to the client :a3, 3, 9
+    connect and TLS         :a1, 0, 1
+    provider thinking       :a2, 1, 2
+    response headers        :milestone, m1, 3, 0
+    SSE events to client    :a3, 3, 9
     section Budgets
-    pre_header_timeout_ms (failover allowed) :crit, b1, 0, 3
-    timeout_ms (no failover past the header) :b2, 0, 9
+    pre_header_timeout_ms   :crit, b1, 0, 3
+    timeout_ms              :b2, 0, 9
 ```
 
-`pre_header_timeout_ms` ends at the milestone. `timeout_ms` runs past it to the last byte. The milestone is the commit point: once the provider answers `200 text/event-stream` the gateway is relaying bytes the caller is already reading, and no later candidate can take them back. A stall after that ends the stream, and it is counted on `sbproxy_ai_stream_post_commit_failures_total` rather than on the failover counter.
+`pre_header_timeout_ms` is the red span and it stops at the milestone. `timeout_ms` runs past it to the last byte, and a failover is possible only inside the red span.
+
+The milestone is the commit point: once the provider answers `200 text/event-stream` the gateway is relaying bytes the caller is already reading, and no later candidate can take them back. A stall after that ends the stream, and it is counted on `sbproxy_ai_stream_post_commit_failures_total` rather than on the failover counter.
 
 Send a streaming request at a primary that never answers:
 
@@ -136,6 +138,44 @@ sbproxy_ai_failovers_total{from_provider="primary",to_provider="secondary",reaso
 Two things this key does not do. It never applies to a non-streaming request: a buffered call has no partial output to protect, so it keeps waiting out `timeout_ms`. And it cannot extend an attempt past the gateway's 30-second HTTP client default, so `pre_header_timeout_ms: 60000` gets you 30 seconds.
 
 With it set, the worst case above becomes `(pre_header_timeout_ms + backoff) x candidate count` for a provider that never answers, while a provider that does answer still gets its full `timeout_ms` to finish generating.
+
+#### Letting a caller set its own budget
+
+An agent that will abandon a call after four seconds should not be held on a provider budget sized for a two-minute batch job, and a caller doing deep research needs the opposite. `x-sbproxy-timeout-ms` lets the caller say which, replacing the selected provider's `timeout_ms` for that one request. It is off by default and the flag alone is refused at config load, because a caller who can raise a timeout holds a downstream connection, a `quota_pool` slot, and an upstream generation open for as long as you let it:
+
+```yaml
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      allow_request_timeout_override: true
+      max_request_timeout_ms: 20000
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          timeout_ms: 60000
+```
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Host: ai.example.com' \
+  -H 'Content-Type: application/json' \
+  -H 'x-sbproxy-timeout-ms: 4000' \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+```
+
+That attempt now runs on 4 seconds instead of 60. Ask for more than the ceiling and the request is refused rather than quietly clamped, so the caller can correct it in one round trip:
+
+```bash
+$ curl -sS -H 'x-sbproxy-timeout-ms: 60000' ...
+{"error":{"type":"invalid_request_timeout","message":"x-sbproxy-timeout-ms of 60000 exceeds this origin's max_request_timeout_ms of 20000; ask for between 1 and 20000"}}
+```
+
+With `allow_request_timeout_override` off, the same header is dropped and the request dispatches on the configured budget. That is deliberate: callers hitting a fleet where only some origins have opted in should not collect 400s from the rest. The drop is still counted, on `sbproxy_ai_request_timeout_override_total{outcome="ignored_override_disabled"}`, along with `applied`, `over_ceiling`, and `invalid_header`.
+
+The ceiling bounds one attempt, not the request. With `max_retries: 3` a caller asking for 20 seconds can hold four attempts of it, so the worst case is `max_request_timeout_ms x (max_retries + 1) x candidate count`. Size the ceiling against a single attempt and then do that multiplication before you pick it. And as everywhere else here, the gateway's 30-second HTTP client default is the hard ceiling on any single attempt: a `max_request_timeout_ms` above 30000 does not buy a caller more.
+
+The override does not reach the gateway's own routing work. Semantic-cache embeddings, semantic-route embeddings, and shadow copies keep the shared client and its configured budgets, because a caller's completion budget is not a budget for work the caller did not ask for. Nor does it reach a `managed_model` provider the gateway serves itself: that dispatch never touches the provider HTTP client and runs on the model host's own deadlines.
 
 ### Native providers
 70 native providers ship in-tree. The split: 63 entries are OpenAI-format passthrough, 3 (Anthropic, Gemini, Bedrock) carry in-tree translators, and 4 custom-format entries (SageMaker, Oracle OCI, Watsonx, Writer) pass through untranslated, so clients must send those four their native body shape. You bring your own key per provider and the `model` field passes straight through, so the gateway reaches 200+ models (and any model a provider ships next) without enumerating them. Direct adapters include `openai`, `anthropic`, `gemini`, `azure`, `bedrock`, `cohere`, `mistral`, `groq`, `deepseek`, `together`, `fireworks`, `cerebras`, `sambanova`, `nvidia`, `vertex`, `databricks`, `huggingface`, `vllm`, and `openrouter`. For the AWS entries, SBproxy signs the request itself: add `aws_sigv4:` to a `bedrock` or `sagemaker` provider and the gateway computes the SigV4 `Authorization` header per request, with credentials from the standard AWS provider chain, a static key pair, or a renewed STS role session.

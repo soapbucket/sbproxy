@@ -684,6 +684,49 @@ pub fn record_price_ceiling(outcome: &str) {
     counter.with_label_values(&[outcome]).inc();
 }
 
+// --- Per-request timeout override ---
+
+/// Registered without `.unwrap()` for the same reason as
+/// `AI_PRICE_CEILING` above.
+static AI_REQUEST_TIMEOUT_OVERRIDE: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_request_timeout_override_total",
+            "Per-request transport timeout override outcomes"
+        ),
+        &["outcome"]
+    )
+    .ok()
+});
+
+/// Record one `x-sbproxy-timeout-ms` outcome. `outcome` is a closed set
+/// of four:
+///
+/// - `applied`: the header was honored and replaced the selected
+///   provider's `timeout_ms` for this request.
+/// - `ignored_override_disabled`: a caller sent the header on an origin
+///   whose `allow_request_timeout_override` is off, so it was dropped and
+///   the request dispatched on the configured budget.
+/// - `over_ceiling`: the header exceeded `max_request_timeout_ms`, and
+///   the request was refused with 400 rather than clamped.
+/// - `invalid_header`: the header was not a positive integer, answered
+///   400.
+///
+/// A rising `ignored_override_disabled` rate is the one to read first:
+/// it means callers believe they can set a budget the operator has not
+/// granted, and the answer is either to turn the flag on with a ceiling
+/// or to tell them to stop. `applied` rising toward the request rate
+/// means the ceiling is now the effective per-attempt timeout for this
+/// origin, which is worth knowing before sizing capacity. The two 400s
+/// are caller mistakes rather than gateway decisions, so alert on them
+/// separately or not at all.
+pub fn record_request_timeout_override(outcome: &str) {
+    let Some(counter) = &*AI_REQUEST_TIMEOUT_OVERRIDE else {
+        return;
+    };
+    counter.with_label_values(&[outcome]).inc();
+}
+
 // --- Per-error-class provider cooldowns (WOR-2556) ---
 
 /// Registered without `.unwrap()` for the same reason as

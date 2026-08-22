@@ -151,6 +151,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_ai_replica_selection_excluded_total` | Counter | `stable` | `alpha` | `stage` | Managed-replica candidates excluded before rendezvous ranking, by stage. |
 | `sbproxy_ai_request_duration_attributed_seconds` | Histogram | `stable` | `beta` | `provider`, `model`, `surface`, `tenant_id`, `api_key_id` | AI upstream request latency, partitioned by surface + tenant + credential. |
 | `sbproxy_ai_request_duration_seconds` | Histogram | `stable` | `beta` | `provider`, `model` | AI request latency. |
+| `sbproxy_ai_request_timeout_override_total` | Counter | `stable` | `alpha` | `outcome` | Per-request `x-sbproxy-timeout-ms` outcomes: `applied` (honored, replacing the provider's `timeout_ms`), `ignored_override_disabled` (the origin has not opted in, so the header was dropped), `over_ceiling` (above `max_request_timeout_ms`, refused with 400 rather than clamped), `invalid_header` (not a positive integer, refused with 400). |
 | `sbproxy_ai_requests_attributed_total` | Counter | `stable` | `beta` | `origin`, `provider`, `model`, `surface`, `tenant_id`, `api_key_id`, `outcome` | AI requests partitioned by attribution + outcome. |
 | `sbproxy_ai_reversible_redaction_miss_total` | Counter | `stable` | `beta` | `rule` | Reversible PII placeholders that appeared in the upstream response but did not match a request-side capture entry. |
 | `sbproxy_ai_semantic_cache_similarity` | Histogram | `stable` | `beta` | `provider` | Cosine similarity of semantic-cache hits. |

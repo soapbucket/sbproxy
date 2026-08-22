@@ -1825,6 +1825,10 @@ fn try_spawn_governed_shadow_after_primary(
     }
     let usage = super::ai_support::shadow_usage_record_from_context(ctx);
     let reservation_prefix = format!("{}:quota-pool", ctx.request_id);
+    // Shared client on purpose. A shadow copy outlives the caller's
+    // request and is the operator's evaluation traffic, so a caller's
+    // honored `x-sbproxy-timeout-ms` has no business setting its budget;
+    // the shadow supervisor's own `timeout_ms` does.
     let _ = AI_CLIENT
         .load()
         .try_spawn_shadow_with_quota_detached_with_reasoning_eligibility(
@@ -4066,6 +4070,92 @@ fn effective_price_ceiling(
     })
 }
 
+/// What a caller's `x-sbproxy-timeout-ms` came to on this request.
+///
+/// `IgnoredDisabled` is a variant rather than something the call site
+/// infers from the flag, because that is what makes the "operator left
+/// the flag off and a caller sent the header anyway" branch testable
+/// without a live session, and it is the branch an operator most needs
+/// counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeoutOverrideOutcome {
+    /// No header on the request.
+    Absent,
+    /// A header arrived on an origin that has not opted in. Dropped.
+    IgnoredDisabled,
+    /// A header the origin allows and the ceiling admits.
+    Applied(std::time::Duration),
+}
+
+impl TimeoutOverrideOutcome {
+    /// The closed metric label for this outcome, or `None` for the
+    /// common case where the caller sent no header and there is nothing
+    /// to count.
+    fn metric_label(self) -> Option<&'static str> {
+        match self {
+            Self::Absent => None,
+            Self::IgnoredDisabled => Some("ignored_override_disabled"),
+            Self::Applied(_) => Some("applied"),
+        }
+    }
+}
+
+/// Resolve a caller's `x-sbproxy-timeout-ms` against the origin's opt-in
+/// and ceiling.
+///
+/// A malformed or out-of-range header is an error rather than an ignore,
+/// for the same reason `effective_price_ceiling` refuses a mistyped
+/// `x-sbproxy-max-price`: a caller who asked for 60 seconds and silently
+/// got 5 builds a retry schedule on a budget it never had. The whole
+/// `x-sbproxy-*` family refuses rather than adjusting, and an
+/// inconsistent family is worse than either rule.
+///
+/// With the flag off the header is dropped instead, because there is
+/// nothing to correct: the caller asked for something this origin does
+/// not offer at any value, and refusing would break callers that send the
+/// header to a fleet where only some origins have opted in. Ignoring it
+/// is still visible, on
+/// `sbproxy_ai_request_timeout_override_total{outcome="ignored_override_disabled"}`.
+///
+/// Err carries the operator-safe message; it never interpolates anything
+/// but the caller's own number, which is already bounded by the parse.
+fn effective_request_timeout(
+    allow_override: bool,
+    ceiling_ms: Option<u64>,
+    header_value: Option<&str>,
+) -> Result<TimeoutOverrideOutcome, String> {
+    let Some(raw) = header_value else {
+        return Ok(TimeoutOverrideOutcome::Absent);
+    };
+    if !allow_override {
+        return Ok(TimeoutOverrideOutcome::IgnoredDisabled);
+    }
+    let requested: u64 = raw.trim().parse().map_err(|_| {
+        format!("x-sbproxy-timeout-ms is not a whole number of milliseconds: {raw:?}")
+    })?;
+    if requested == 0 {
+        return Err("x-sbproxy-timeout-ms must be above zero milliseconds".to_string());
+    }
+    // The ceiling is required whenever the flag is on, refused at config
+    // load otherwise, so this `None` is unreachable through a loaded
+    // config. Treating it as a refusal rather than as "no ceiling" keeps
+    // the fail-closed direction if that validation is ever loosened.
+    let Some(ceiling) = ceiling_ms else {
+        return Err(
+            "x-sbproxy-timeout-ms cannot be honored: this origin has no              max_request_timeout_ms ceiling configured"
+                .to_string(),
+        );
+    };
+    if requested > ceiling {
+        return Err(format!(
+            "x-sbproxy-timeout-ms of {requested} exceeds this origin's              max_request_timeout_ms of {ceiling}; ask for between 1 and {ceiling}"
+        ));
+    }
+    Ok(TimeoutOverrideOutcome::Applied(
+        std::time::Duration::from_millis(requested),
+    ))
+}
+
 /// Build the WOR-2559 fail-closed refusal body for a candidate set the
 /// price ceiling fully excluded. Names the ceiling and carries each
 /// excluded candidate's resolved price, so a caller sees what the
@@ -4686,6 +4776,44 @@ fn record_price_ceiling_request_refusal(
     ctx.deny_reason = Some(reason);
 }
 
+/// The bounded admin reason for a refused `x-sbproxy-timeout-ms`.
+///
+/// The caller's header value never appears, for the same reason it never
+/// appears in [`price_ceiling_request_refusal_reason`]: it is untrusted
+/// request text and this string is retained on the admin ring row. The
+/// caller still gets the number back, in the response body, which is not
+/// retained.
+fn request_timeout_refusal_reason(outcome: &str) -> String {
+    match outcome {
+        "over_ceiling" => {
+            "request_timeout: x-sbproxy-timeout-ms above max_request_timeout_ms".to_string()
+        }
+        _ => "request_timeout: malformed x-sbproxy-timeout-ms header".to_string(),
+    }
+}
+
+/// Record a refused `x-sbproxy-timeout-ms` on the same four surfaces
+/// [`record_price_ceiling_request_refusal`] uses: the metric, the admin
+/// decision verdict, a bounded deny reason, and an error on the request
+/// span. A bare 400 would leave the refusal invisible to all four.
+fn record_request_timeout_refusal(
+    ctx: &mut RequestContext,
+    span: &tracing::Span,
+    outcome: &'static str,
+    reason: String,
+) {
+    sbproxy_ai::ai_metrics::record_request_timeout_override(outcome);
+    ctx.record_policy_decision("request_timeout", "deny");
+    // `invalid_request`: the caller's own input was unusable. This is not
+    // a capacity decision and must not alert alongside one.
+    sbproxy_ai::tracing_spans::record_error(
+        span,
+        sbproxy_ai::tracing_spans::error_type::INVALID_REQUEST,
+        &reason,
+    );
+    ctx.deny_reason = Some(reason);
+}
+
 /// Fail closed on a candidate set the price ceiling fully excluded
 /// (WOR-2559): record the refusal on the metric, the admin decision
 /// row, the attributed-outcome label, and the typed audit funnel, then
@@ -5201,6 +5329,67 @@ pub(super) async fn handle_ai_proxy(
         return Ok(());
     }
 
+    // Resolved here, immediately after the price ceiling and for the
+    // same reasons: below the per-surface counter, the latency guard and
+    // identity resolution so a refusal is counted, timed, traced and
+    // authenticated, but above the multipart, audio and cached-replay
+    // branches, which answer and return before any provider is picked.
+    // A per-provider placement could not fire on those at all, which is
+    // also why the two keys are origin-level rather than on
+    // `providers[]`.
+    let timeout_override_header = req_header_value(session, "x-sbproxy-timeout-ms");
+    let timeout_override = match effective_request_timeout(
+        config.allow_request_timeout_override,
+        config.max_request_timeout_ms,
+        timeout_override_header.as_deref(),
+    ) {
+        Ok(outcome) => outcome,
+        Err(reason) => {
+            // Over the ceiling and malformed are both 400 and both the
+            // caller's mistake, but they are separate series: one says
+            // the client library is broken, the other says the ceiling
+            // is smaller than callers expect.
+            let outcome = if reason.contains("max_request_timeout_ms") {
+                "over_ceiling"
+            } else {
+                "invalid_header"
+            };
+            record_request_timeout_refusal(
+                ctx,
+                &ai_span,
+                outcome,
+                request_timeout_refusal_reason(outcome),
+            );
+            let bytes = ErrorEnvelope::new("invalid_request_timeout", &reason)
+                .request_id(ctx.request_id.as_str())
+                .to_bytes();
+            send_response(session, 400, "application/json", &bytes).await?;
+            return Ok(());
+        }
+    };
+    if let Some(label) = timeout_override.metric_label() {
+        sbproxy_ai::ai_metrics::record_request_timeout_override(label);
+    }
+    // One clone per request that carries an honored header, and an
+    // `Arc` bump per field at that. Every dispatch site below reads
+    // this instead of `AI_CLIENT` so the race legs, the cascade tiers
+    // and each retry attempt inherit the budget without a parameter on
+    // twenty `forward_*` signatures. The three auxiliary call sites (the
+    // semantic-cache embedding, the semantic-route embedding, and the
+    // shadow spawn) deliberately stay on `AI_CLIENT`: a caller's
+    // completion budget is not a budget for the gateway's own routing
+    // work.
+    let dispatch_client: std::sync::Arc<sbproxy_ai::AiClient> = match timeout_override {
+        TimeoutOverrideOutcome::Applied(timeout) => std::sync::Arc::new(
+            AI_CLIENT
+                .load_full()
+                .as_ref()
+                .clone()
+                .with_request_timeout_override(timeout),
+        ),
+        _ => AI_CLIENT.load_full(),
+    };
+
     let router = config.router();
     if ctx.inbound_key_mode == crate::context::InboundKeyMode::Native
         && router.cascade_config().is_some()
@@ -5680,8 +5869,7 @@ pub(super) async fn handle_ai_proxy(
         };
         ctx.record_admin_ai_attempt(&provider.name);
         let resp = match run_routed_provider_attempt(&router, provider_idx, async {
-            AI_CLIENT
-                .load()
+            dispatch_client
                 .forward_get_request_with_quota(provider, &path, quota_attempt)
                 .await
         })
@@ -6040,8 +6228,7 @@ pub(super) async fn handle_ai_proxy(
         };
         ctx.record_admin_ai_attempt(&provider.name);
         let resp = match run_routed_provider_attempt(&router, provider_idx, async {
-            AI_CLIENT
-                .load()
+            dispatch_client
                 .forward_with_method_and_quota(
                     provider,
                     &method_str,
@@ -6898,8 +7085,7 @@ pub(super) async fn handle_ai_proxy(
                             }
                         }
                     } else {
-                        AI_CLIENT
-                            .load()
+                        dispatch_client
                             .forward_bytes_with_quota(
                                 provider,
                                 &method_str,
@@ -9077,6 +9263,14 @@ pub(super) async fn handle_ai_proxy(
                                 else {
                                     return Ok(());
                                 };
+                                // Deliberately the shared client, not
+                                // `dispatch_client`: a caller's
+                                // `x-sbproxy-timeout-ms` is a budget for
+                                // its own completion, not for the
+                                // gateway's cache lookup, and letting a
+                                // caller stretch this one would let it
+                                // hold an embedding call open with no
+                                // completion to show for it.
                                 let ai_client = AI_CLIENT.load_full();
                                 sbproxy_ai::semantic_cache::compute_embedding_with_quota(
                                     &ai_client,
@@ -9918,6 +10112,9 @@ pub(super) async fn handle_ai_proxy(
         // digest on every request of a `semantic_route` origin would be
         // a hot-path cost with no reader.
         let prompt = semantic_query_text(&body);
+        // Shared client on purpose, the same reason as the semantic-cache
+        // embedding above: routing work is the gateway's, not the
+        // caller's, so it is not covered by a caller's honored timeout.
         let ai_client = AI_CLIENT.load_full();
         // WOR-2564: a routing embedding through `source: provider` or
         // `source: openai` is an upstream call, so it meters against the
@@ -10341,8 +10538,7 @@ pub(super) async fn handle_ai_proxy(
                 return Ok(());
             }
             let cascade_quota_reservation = format!("{}:quota-pool:cascade", ctx.request_id);
-            let outcome = AI_CLIENT
-                .load()
+            let outcome = dispatch_client
                 .forward_cascade_with_policy_and_quota_with_reasoning_eligibility(
                     config,
                     cascade_cfg,
@@ -10587,7 +10783,7 @@ pub(super) async fn handle_ai_proxy(
             Quota(QuotaPoolErrorDisposition),
         }
 
-        let client = AI_CLIENT.load();
+        let client = std::sync::Arc::clone(&dispatch_client);
         let race_start = std::time::Instant::now();
         let mut futs = FuturesUnordered::new();
         for (race_attempt, &idx) in provider_order.iter().enumerate() {
@@ -11154,8 +11350,7 @@ pub(super) async fn handle_ai_proxy(
                         } else {
                             async {
                                 if let Some((bypass_body, native_path)) = upstream_call {
-                                    AI_CLIENT
-                                        .load()
+                                    dispatch_client
                                         .forward_native_bypass_with_quota(
                                             provider,
                                             &method_str,
@@ -11165,8 +11360,7 @@ pub(super) async fn handle_ai_proxy(
                                         )
                                         .await
                                 } else {
-                                    AI_CLIENT
-                                        .load()
+                                    dispatch_client
                                         .forward_request_with_quota(
                                             provider,
                                             &path,
@@ -22899,6 +23093,262 @@ origins:
             "the failure past the commit point is counted where an operator can see it"
         );
     }
+
+    // --- Per-request timeout override ---
+
+    /// An upstream that accepts, reads the whole request, waits
+    /// `delay_ms`, and only then answers 200. The one way this request
+    /// completes is if something raised the transport budget above
+    /// `delay_ms`.
+    async fn upstream_slow_fixture(delay_ms: u64, body: Vec<u8>) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind slow upstream");
+        let address = listener.local_addr().expect("slow upstream address");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&hits);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                observed.fetch_add(1, Ordering::SeqCst);
+                let body = body.clone();
+                tokio::spawn(async move {
+                    drain_upstream_request(&mut stream).await;
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                });
+            }
+        });
+        (format!("http://{address}/v1"), hits)
+    }
+
+    /// One provider on a 100ms whole-call budget, with the origin's
+    /// caller-override flag and ceiling under test.
+    fn request_timeout_override_config(
+        upstream_url: &str,
+        allow_override: bool,
+        ceiling_ms: Option<u64>,
+    ) -> sbproxy_ai::AiHandlerConfig {
+        let mut action = serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "timeout_ms": 100
+            }],
+            "allow_request_timeout_override": allow_override
+        });
+        if let Some(ceiling) = ceiling_ms {
+            action["max_request_timeout_ms"] = serde_json::json!(ceiling);
+        }
+        sbproxy_ai::AiHandlerConfig::from_config(action).expect("timeout override config")
+    }
+
+    /// One `sbproxy_ai_request_timeout_override_total` series, or 0 when
+    /// nothing has created it yet. Same process-global caveat as
+    /// [`failovers_count`].
+    fn request_timeout_override_count(outcome: &str) -> f64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "sbproxy_ai_request_timeout_override_total")
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        metric
+                            .get_label()
+                            .iter()
+                            .any(|label| label.name() == "outcome" && label.value() == outcome)
+                    })
+                    .map(|metric| metric.get_counter().value())
+                    .sum()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The seam: `apply_provider_timeout` reading the client's honored
+    /// override instead of the provider's `timeout_ms`.
+    ///
+    /// This is the test that proves the override reaches
+    /// `reqwest::Request::timeout_mut`, not just the config struct. The
+    /// upstream sleeps four times the provider budget, so a 200 is only
+    /// possible if the header replaced it.
+    #[tokio::test]
+    async fn an_honored_timeout_header_outlives_the_provider_timeout() {
+        let (upstream_url, upstream_hits) =
+            upstream_slow_fixture(400, canonical_chat_response("slow but fine")).await;
+        let config = request_timeout_override_config(&upstream_url, true, Some(5_000));
+        let (mut session, client) = downstream_method_bytes_session_with_headers(
+            "POST",
+            "/v1/chat/completions",
+            "application/json",
+            serde_json::to_vec(&serde_json::json!({
+                "model": "requested-model",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }))
+            .expect("request JSON"),
+            &[("x-sbproxy-timeout-ms", "3000")],
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let applied_before = request_timeout_override_count("applied");
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the honored budget carries the request");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert!(
+            request_timeout_override_count("applied") > applied_before,
+            "an honored override is counted"
+        );
+    }
+
+    /// The seam: the `allow_override` gate inside
+    /// `effective_request_timeout`, end to end.
+    ///
+    /// Identical request and identical upstream, minus the operator
+    /// opt-in. The header is dropped rather than refused, the provider's
+    /// own 100ms budget kills the attempt, and the drop is visible on the
+    /// metric, which is the whole point of counting an ignore.
+    #[tokio::test]
+    async fn the_same_request_fails_with_the_flag_off() {
+        let (upstream_url, upstream_hits) =
+            upstream_slow_fixture(400, canonical_chat_response("never reaches the caller")).await;
+        let config = request_timeout_override_config(&upstream_url, false, None);
+        let (mut session, client) = downstream_method_bytes_session_with_headers(
+            "POST",
+            "/v1/chat/completions",
+            "application/json",
+            serde_json::to_vec(&serde_json::json!({
+                "model": "requested-model",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }))
+            .expect("request JSON"),
+            &[("x-sbproxy-timeout-ms", "3000")],
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let ignored_before = request_timeout_override_count("ignored_override_disabled");
+        let result = super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await;
+        drop(session);
+        let mut client = client;
+        client.abort_and_wait().await;
+
+        // Every candidate having failed at the transport level is the one
+        // outcome the dispatcher hands back to pingora rather than
+        // answering itself, so there is no downstream body to read here.
+        assert!(
+            result.is_err(),
+            "the provider's own 100ms timeout_ms still ends the attempt"
+        );
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            1,
+            "the header is ignored, not refused, so the request still dispatches"
+        );
+        assert_eq!(
+            request_timeout_override_count("ignored_override_disabled"),
+            ignored_before + 1.0,
+            "ignoring a caller's header has to be visible somewhere an operator can find"
+        );
+    }
+
+    /// The seam: the over-ceiling branch, refusing rather than clamping.
+    /// A caller who asked for 60s and silently got 5s builds a retry
+    /// schedule on a budget it never had.
+    #[tokio::test]
+    async fn a_timeout_header_over_the_ceiling_refuses_with_400() {
+        let (upstream_url, upstream_hits) =
+            upstream_slow_fixture(0, canonical_chat_response("never dispatched")).await;
+        let config = request_timeout_override_config(&upstream_url, true, Some(5_000));
+        let (mut session, client) = downstream_method_bytes_session_with_headers(
+            "POST",
+            "/v1/chat/completions",
+            "application/json",
+            serde_json::to_vec(&serde_json::json!({
+                "model": "requested-model",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }))
+            .expect("request JSON"),
+            &[("x-sbproxy-timeout-ms", "60000")],
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let refused_before = request_timeout_override_count("over_ceiling");
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the refusal is answered");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        let text = String::from_utf8_lossy(&response).to_string();
+        assert!(text.starts_with("HTTP/1.1 400"), "{text}");
+        assert!(text.contains("invalid_request_timeout"), "{text}");
+        assert!(
+            text.contains("5000"),
+            "the refusal names the accepted range so the caller can correct in one trip: {text}"
+        );
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            0,
+            "the refusal precedes any upstream call"
+        );
+        assert_eq!(
+            request_timeout_override_count("over_ceiling"),
+            refused_before + 1.0
+        );
+        assert!(
+            context
+                .policy_decisions
+                .iter()
+                .any(|decision| decision == "request_timeout:deny"),
+            "the refusal reaches the admin decision row: {:?}",
+            context.policy_decisions
+        );
+    }
 }
 
 #[cfg(test)]
@@ -26797,6 +27247,63 @@ mod price_ceiling_tests {
         // A config ceiling does not rescue a malformed header: the caller
         // asked for a bound the gateway cannot honor.
         assert!(effective_price_ceiling(Some(0.05), Some("cheap")).is_err());
+    }
+
+    #[test]
+    fn timeout_override_header_that_is_not_a_number_is_an_error() {
+        for bad in ["soon", "", "3.5", "-100", "3000ms"] {
+            assert!(
+                super::effective_request_timeout(true, Some(5_000), Some(bad)).is_err(),
+                "{bad:?} is not a whole number of milliseconds"
+            );
+        }
+    }
+
+    #[test]
+    fn timeout_override_header_of_zero_is_an_error() {
+        // A zero budget refuses the request it was asked to bound, the
+        // same reading as a zero price ceiling.
+        assert!(super::effective_request_timeout(true, Some(5_000), Some("0")).is_err());
+    }
+
+    #[test]
+    fn timeout_override_above_the_ceiling_names_the_accepted_range() {
+        let error = super::effective_request_timeout(true, Some(5_000), Some("60000"))
+            .expect_err("a header above the ceiling is refused, not clamped");
+        assert!(error.contains("60000"), "{error}");
+        assert!(error.contains("5000"), "{error}");
+    }
+
+    /// The seam that decides whether an operator who left the flag off
+    /// can be surprised by a caller. Off must ignore, never apply, and
+    /// never refuse: a caller sending the header to a fleet where only
+    /// some origins opted in must not get a 400 from the rest.
+    #[test]
+    fn timeout_override_with_the_flag_off_reports_ignored_not_applied() {
+        assert_eq!(
+            super::effective_request_timeout(false, Some(5_000), Some("3000")),
+            Ok(super::TimeoutOverrideOutcome::IgnoredDisabled)
+        );
+        assert_eq!(
+            super::effective_request_timeout(false, None, Some("60000")),
+            Ok(super::TimeoutOverrideOutcome::IgnoredDisabled),
+            "with the flag off nothing about the value matters, including \
+             whether it would have been over a ceiling"
+        );
+    }
+
+    #[test]
+    fn a_header_within_the_ceiling_is_applied_and_no_header_is_absent() {
+        assert_eq!(
+            super::effective_request_timeout(true, Some(5_000), Some("3000")),
+            Ok(super::TimeoutOverrideOutcome::Applied(
+                std::time::Duration::from_millis(3_000)
+            ))
+        );
+        assert_eq!(
+            super::effective_request_timeout(true, Some(5_000), None),
+            Ok(super::TimeoutOverrideOutcome::Absent)
+        );
     }
 
     #[test]

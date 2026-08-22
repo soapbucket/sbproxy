@@ -283,6 +283,52 @@ pub struct AiHandlerConfig {
     /// positive when set; `None` (the default) disables the gate.
     #[serde(default)]
     pub max_price_per_request: Option<f64>,
+    /// Allow a caller's `x-sbproxy-timeout-ms` header to replace the
+    /// selected provider's `timeout_ms` for one request.
+    ///
+    /// Defaults to `false`, and off means the header is ignored rather
+    /// than honored or refused. A caller who can raise a timeout holds a
+    /// downstream connection, a `quota_pool` slot, and an upstream
+    /// generation open for as long as the ceiling allows, which is a
+    /// capacity decision an operator makes. A caller who can lower one is
+    /// no safer: `timeout_ms` runs from connect through the end of the
+    /// response body, so a shortened budget cuts off a streaming
+    /// completion the operator is already billed for and burns a retry
+    /// attempt doing it.
+    ///
+    /// Turning this on requires `max_request_timeout_ms`. The flag alone
+    /// is refused at config load, because an unbounded caller timeout is
+    /// the failure this gate exists to prevent.
+    ///
+    /// Scope is the origin, so this enables the override for every caller
+    /// and every tenant routed to this `ai_proxy` action.
+    ///
+    /// The override reaches hosted provider dispatch, including a
+    /// confidence cascade's tiers and every retry attempt. It does not
+    /// reach a `managed_model` provider the gateway serves itself, which
+    /// runs on the model host's own deadlines, nor the gateway's own
+    /// routing work: semantic-cache and semantic-route embeddings and
+    /// shadow copies keep their configured budgets.
+    #[serde(default)]
+    pub allow_request_timeout_override: bool,
+    /// Hard ceiling in milliseconds on a caller's `x-sbproxy-timeout-ms`.
+    ///
+    /// A header above the ceiling is refused with 400 naming the accepted
+    /// range rather than silently clamped, so a caller does not build a
+    /// retry schedule on a budget it never got. Must be above zero when
+    /// set, and required whenever `allow_request_timeout_override` is
+    /// true.
+    ///
+    /// Independent of any provider's `timeout_ms`: this bounds what a
+    /// caller may ask for, `timeout_ms` is what they get when they ask
+    /// for nothing. It bounds one attempt rather than the whole request,
+    /// so with `max_retries: 3` a caller asking for the ceiling can hold
+    /// four attempts of it. Size it against the attempt, then multiply.
+    ///
+    /// The gateway's 30-second HTTP client default still applies, so a
+    /// ceiling above 30000 does not buy a caller a longer attempt.
+    #[serde(default)]
+    pub max_request_timeout_ms: Option<u64>,
     /// WOR-1880: optional fair-share quota pool across providers.
     /// When set, each provider attempt reserves against the pool before
     /// dispatch; a deny advances to the next candidate when alternatives
@@ -1278,6 +1324,30 @@ impl AiHandlerConfig {
                      candidate estimates below it. Remove the key to disable the ceiling."
                 );
             }
+        }
+        // A zero ceiling admits no caller header at all, so the flag
+        // would be on and every request carrying the header would 400.
+        // Same reading as a zero price ceiling: a typo, not a policy.
+        if config.max_request_timeout_ms == Some(0) {
+            anyhow::bail!(
+                "ai max_request_timeout_ms must be above zero. A ceiling of zero refuses \
+                 every x-sbproxy-timeout-ms header, which is the flag being off with extra \
+                 steps. Remove the key, or set the largest per-attempt budget a caller may \
+                 ask for."
+            );
+        }
+        // The flag without a ceiling is the failure the gate exists to
+        // prevent: any caller could then hold a downstream connection, a
+        // quota_pool slot, and an upstream generation open for as long as
+        // it liked. Refusing at load is the only place an operator finds
+        // out before a caller does.
+        if config.allow_request_timeout_override && config.max_request_timeout_ms.is_none() {
+            anyhow::bail!(
+                "ai allow_request_timeout_override requires max_request_timeout_ms. Without \
+                 a ceiling the x-sbproxy-timeout-ms header is an unbounded per-attempt \
+                 budget any caller can set. Set max_request_timeout_ms to the largest \
+                 budget a caller may ask for, or remove allow_request_timeout_override."
+            );
         }
         // A zero pre-header budget elapses before any provider can
         // answer, so every streaming request would burn the whole
@@ -2776,6 +2846,8 @@ mod tests {
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
             max_price_per_request: None,
+            allow_request_timeout_override: false,
+            max_request_timeout_ms: None,
             quota_pool: None,
             rag: None,
             guardrails_pipeline: OnceLock::new(),
@@ -2827,6 +2899,8 @@ mod tests {
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
             max_price_per_request: None,
+            allow_request_timeout_override: false,
+            max_request_timeout_ms: None,
             quota_pool: None,
             rag: None,
             guardrails_pipeline: OnceLock::new(),
@@ -2878,6 +2952,8 @@ mod tests {
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
             max_price_per_request: None,
+            allow_request_timeout_override: false,
+            max_request_timeout_ms: None,
             quota_pool: None,
             rag: None,
             guardrails_pipeline: OnceLock::new(),
@@ -2930,6 +3006,8 @@ mod tests {
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
             max_price_per_request: None,
+            allow_request_timeout_override: false,
+            max_request_timeout_ms: None,
             quota_pool: None,
             rag: None,
             guardrails_pipeline: OnceLock::new(),
@@ -3168,6 +3246,45 @@ mod tests {
             error.contains("resilience.pre_header_timeout_ms"),
             "{error}"
         );
+    }
+
+    /// The flag without a ceiling hands every caller an unbounded
+    /// per-attempt budget, which is the failure the gate exists to
+    /// prevent, so it is refused at load rather than defaulted.
+    #[test]
+    fn the_override_flag_without_a_ceiling_is_refused_at_load() {
+        let error = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "allow_request_timeout_override": true,
+        }))
+        .expect_err("the flag alone must refuse the config")
+        .to_string();
+        assert!(error.contains("allow_request_timeout_override"), "{error}");
+        assert!(error.contains("max_request_timeout_ms"), "{error}");
+    }
+
+    #[test]
+    fn a_zero_request_timeout_ceiling_is_refused_at_load() {
+        let error = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "allow_request_timeout_override": true,
+            "max_request_timeout_ms": 0,
+        }))
+        .expect_err("a zero ceiling must refuse the config")
+        .to_string();
+        assert!(error.contains("max_request_timeout_ms"), "{error}");
+    }
+
+    #[test]
+    fn the_override_flag_with_a_ceiling_loads() {
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "allow_request_timeout_override": true,
+            "max_request_timeout_ms": 5000,
+        }))
+        .expect("the flag plus a ceiling is a valid config");
+        assert!(config.allow_request_timeout_override);
+        assert_eq!(config.max_request_timeout_ms, Some(5000));
     }
 
     #[test]

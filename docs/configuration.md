@@ -1643,7 +1643,9 @@ origins:
 | `model_rate_limits` | map | | Per-model rate limit overrides keyed by model name. |
 | `per_surface_rate_limits` | map | | Per-surface rate limit overrides keyed by AI surface label (`chat_completions`, `assistants`, `image_generation`, ...). |
 | `max_concurrent` | map | | Maximum concurrent in-flight requests per provider. |
-| `resilience` | object | | Per-provider circuit breaker, outlier detection, and active health probes. Also hosts the LLM-aware knobs (`retry_policy`, `cooldown_policy`, `llm_aware`, `content_policy_fallback`); see [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md). |
+| `resilience` | object | | Per-provider circuit breaker, outlier detection, and active health probes. Also hosts the LLM-aware knobs (`retry_policy`, `cooldown_policy`, `llm_aware`, `content_policy_fallback`) and the streaming `pre_header_timeout_ms` budget; see [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md). |
+| `allow_request_timeout_override` | bool | `false` | Honor a caller's `x-sbproxy-timeout-ms` in place of the selected provider's `timeout_ms`. Off means the header is ignored rather than refused. Requires `max_request_timeout_ms`; the flag alone is refused at config load. Scope is the origin, so it applies to every caller and tenant routed here. |
+| `max_request_timeout_ms` | int | unset | Ceiling in milliseconds on a caller's `x-sbproxy-timeout-ms`. A header above it is refused with 400 naming the accepted range, not clamped. Must be above zero. Bounds one attempt, so `max_retries` multiplies it. |
 | `compression` | object | unset | Ordered AI context-compression policy. See [AI context compression](#ai-context-compression) and [ai-context-compression.md](ai-context-compression.md). |
 | `reasoning` | string or object | `off` | Route policy for concise reasoning. Use `concise`, `off`, or `{budget: N}` with `N` greater than zero. |
 | `shadow` | object | | Side-by-side eval: mirror each request to a second provider and log metrics. |
