@@ -21,6 +21,7 @@ use sbproxy_licensing::comp::{
 };
 use sbproxy_licensing::keys::{KeyManager, MasterKey};
 use sbproxy_licensing::revocation::InMemoryRevocation;
+use sbproxy_modules::olp::{OlpTokenSigner, OlpTokenVerifier};
 
 fn build_manifest() -> Arc<CompManifest> {
     Arc::new(CompManifest {
@@ -160,7 +161,7 @@ async fn quote_endpoint_returns_signed_quote() {
 }
 
 #[tokio::test]
-async fn redeem_endpoint_mints_bridged_olp_token() {
+async fn comp_redeem_token_is_accepted_by_the_oss_olp_verifier() {
     let (mp, signer) = build_marketplace();
     let app = comp_router(mp.clone());
 
@@ -234,6 +235,20 @@ async fn redeem_endpoint_mints_bridged_olp_token() {
     assert_eq!(parsed.route_glob, "/api/v1/inference/**");
     assert_eq!(parsed.license_token.split('.').count(), 3);
     assert_eq!(parsed.expires_in, 3600);
+
+    // This is the CoMP-to-OLP integration seam: the token returned by the
+    // marketplace must be accepted by the OSS verifier an origin already
+    // uses for its `/.well-known/olp/introspect` endpoint.
+    let origin_signer = OlpTokenSigner::from_seed_bytes([0x88u8; 32], "olp-2026-q2-001");
+    let verifier = OlpTokenVerifier::new(origin_signer.verifying_key(), origin_signer.kid());
+    let claims = verifier
+        .verify(&parsed.license_token, 0)
+        .expect("CoMP bridge token must satisfy the OSS OLP wire contract");
+    assert_eq!(claims.iss, "https://api.example.com");
+    assert_eq!(claims.sub, parsed.agent_id);
+    assert_eq!(claims.aud, "api.example.com");
+    assert_eq!(claims.scope, "ai-input");
+    assert_eq!(claims.license_urn, "urn:rsl:pay-per-inference:default");
 }
 
 #[tokio::test]

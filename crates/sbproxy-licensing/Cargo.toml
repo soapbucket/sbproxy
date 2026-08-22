@@ -62,3 +62,7 @@ http-body-util = { workspace = true }
 # trait-driven path without standing up a real Redis.
 sbproxy-storage = { workspace = true, features = ["mock"] }
 tracing-subscriber = { workspace = true }
+# The CoMP router contract test verifies a redeemed bridge token with the
+# existing OSS OLP verifier. This is test-only so the licensing leaf crate
+# retains its production dependency boundary.
+sbproxy-modules = { path = "../sbproxy-modules" }
