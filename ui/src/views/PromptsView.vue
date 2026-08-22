@@ -27,20 +27,34 @@ function pinnedOf(p: PromptEntry): string {
 // ---- add version ----
 const showAdd = ref(false);
 const addTarget = ref<PromptEntry | null>(null);
-const addForm = reactive({ version: "", template: "" });
+const addForm = reactive({ host: "", name: "", version: "", template: "", isNew: false });
 const addBusy = ref(false);
 const addError = ref<ApiError | null>(null);
 
 function openAdd(p: PromptEntry) {
   addTarget.value = p;
+  addForm.host = String(p.host ?? "");
+  addForm.name = String(p.name ?? "");
   addForm.version = "";
   addForm.template = "";
+  addForm.isNew = false;
+  addError.value = null;
+  showAdd.value = true;
+}
+
+function openNewPrompt() {
+  addTarget.value = { host: "default", name: "my-prompt" };
+  addForm.host = "";
+  addForm.name = "";
+  addForm.version = "";
+  addForm.template = "";
+  addForm.isNew = true;
   addError.value = null;
   showAdd.value = true;
 }
 
 async function submitAdd() {
-  if (!addTarget.value) return;
+  if (!addForm.host || !addForm.name) return;
   addBusy.value = true;
   addError.value = null;
   try {
@@ -49,8 +63,8 @@ async function submitAdd() {
     // both are non-empty and the body always carries both.
     const body = { version: addForm.version, template: addForm.template };
     await api.addPromptVersion(
-      String(addTarget.value.host ?? ""),
-      String(addTarget.value.name ?? ""),
+      addForm.host,
+      addForm.name,
       body,
     );
     showAdd.value = false;
@@ -109,7 +123,11 @@ async function submitPin() {
   </PageHeader>
 
   <ErrorState v-if="req.error.value" :error="req.error.value" @retry="req.run" />
-  <EmptyState v-else-if="!prompts.length" message="No prompt overlays configured." />
+  <EmptyState v-else-if="!prompts.length" message="No prompt overlays configured.">
+    <div style="margin-top: 16px;">
+      <button class="sb-btn sb-btn--primary" @click="openNewPrompt">Create first prompt</button>
+    </div>
+  </EmptyState>
 
   <div class="cards" v-else>
     <div class="sb-card prompt" v-for="(p, i) in prompts" :key="i">
@@ -144,11 +162,21 @@ async function submitPin() {
   </div>
 
   <!-- Add version -->
-  <ModalDialog v-if="showAdd && addTarget" title="Add prompt version" wide @close="showAdd = false">
-    <p class="sb-faint" style="margin-bottom: 12px">
-      For <span class="sb-mono">{{ addTarget.host ?? "any" }} / {{ addTarget.name }}</span>.
+  <ModalDialog v-if="showAdd" :title="addForm.isNew ? 'New prompt overlay' : 'Add prompt version'" wide @close="showAdd = false">
+    <p v-if="!addForm.isNew" class="sb-faint" style="margin-bottom: 12px">
+      For <span class="sb-mono">{{ addForm.host || "any" }} / {{ addForm.name }}</span>.
     </p>
     <ErrorState v-if="addError" :error="addError" title="Add failed" @retry="submitAdd" />
+    
+    <div class="sb-field" v-if="addForm.isNew">
+      <label class="sb-label">Host</label>
+      <input class="sb-input" v-model="addForm.host" placeholder="e.g. openai" />
+    </div>
+    <div class="sb-field" v-if="addForm.isNew">
+      <label class="sb-label">Name</label>
+      <input class="sb-input" v-model="addForm.name" placeholder="e.g. default-system" />
+    </div>
+
     <div class="sb-field">
       <label class="sb-label">Version label (optional)</label>
       <input class="sb-input" v-model="addForm.version" placeholder="e.g. 2026-07-05 or v3" />
@@ -161,10 +189,10 @@ async function submitPin() {
       <button class="sb-btn" @click="showAdd = false">Cancel</button>
       <button
         class="sb-btn sb-btn--primary"
-        :disabled="addBusy || !addForm.version || !addForm.template"
+        :disabled="addBusy || !addForm.host || !addForm.name || !addForm.version || !addForm.template"
         @click="submitAdd"
       >
-        {{ addBusy ? "Adding..." : "Add version" }}
+        {{ addBusy ? "Adding..." : (addForm.isNew ? "Create prompt" : "Add version") }}
       </button>
     </template>
   </ModalDialog>

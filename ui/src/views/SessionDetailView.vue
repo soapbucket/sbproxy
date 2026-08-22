@@ -59,6 +59,7 @@ function statusTone(
     subtitle="An oldest-first call chain reconstructed from the requests still present in the in-memory ring."
   >
     <template #actions>
+      <RouterLink class="sb-btn" to="/sessions">Back to Sessions</RouterLink>
       <RouterLink
         class="sb-btn"
         :to="{ path: '/logs', query: { session_id: sessionId } }"
