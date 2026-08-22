@@ -338,7 +338,7 @@ impl QuotaClock for SystemClock {
 /// the sweep cannot help with: more distinct principals genuinely
 /// active inside their own windows than this process will track.
 ///
-/// Acts as a backstop behind [`MAX_TRACKED_QUOTA_KEYS_PER_TENANT`]: a
+/// Acts as a backstop behind `MAX_TRACKED_QUOTA_KEYS_PER_TENANT`: a
 /// single tenant cannot reach this ceiling on its own, so this bounds
 /// the number of *distinct tenants* holding live windows at once, ten
 /// at full sub-cap. That is a deployment-sizing fact, not a
@@ -395,7 +395,7 @@ struct QuotaCounter {
 /// length rather than pushing. The *number of deques* is not bounded
 /// by the policy, because the key carries a caller-presented principal
 /// id. Three mechanisms bound it instead: a sweep drops keys whose
-/// window has fully aged out, [`MAX_TRACKED_QUOTA_KEYS_PER_TENANT`]
+/// window has fully aged out, `MAX_TRACKED_QUOTA_KEYS_PER_TENANT`
 /// caps what any one tenant may hold, and `MAX_TRACKED_QUOTA_KEYS`
 /// (100_000) caps the whole map. A new key past either ceiling is
 /// refused the call rather than waved through, on the same grounds as
