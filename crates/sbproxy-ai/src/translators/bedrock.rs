@@ -435,7 +435,7 @@ const MAX_REASON_POLICIES: usize = 8;
 /// (`sensitiveInformationPolicy.piiEntities[].match`), and both of
 /// those are the caller's own prompt or the model's own completion.
 /// Only policy *types* and operator-authored *names* are summarized,
-/// and only up to [`MAX_REASON_POLICIES`] of them.
+/// and only up to `MAX_REASON_POLICIES` of them.
 ///
 /// **What this cannot see.** Streaming responses: a `ConverseStream`
 /// intervention arrives as a stream event, not as this body, and is

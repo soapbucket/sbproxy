@@ -960,7 +960,7 @@ pub enum ShadowDropReason {
 /// Every [`ShadowDropReason`], in label order.
 ///
 /// A variant added to the enum and not added here fails to compile,
-/// enforced by [`ShadowDropReason::next_in_label_order`] and the const
+/// enforced by `ShadowDropReason::next_in_label_order` and the const
 /// walk below rather than by the written-out array length, which on
 /// its own would happily stay at six. Before this, the exhaustiveness
 /// test held a hand-written copy of this list: a seventh variant would
