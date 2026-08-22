@@ -23,6 +23,7 @@ import PageHeader from "../components/PageHeader.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import ErrorState from "../components/ErrorState.vue";
 import EmptyState from "../components/EmptyState.vue";
+import ClickToCopy from "../components/ClickToCopy.vue";
 
 const route = useRoute();
 const { role } = useAuth();
@@ -673,9 +674,9 @@ function canReplay(request: RequestLog): boolean {
               </td>
               <td class="nowrap">
                 <template v-if="request.api_key_id">
-                  <span class="sb-mono" :title="request.api_key_id">{{
+                  <ClickToCopy :value="request.api_key_id" label="Key ID" class="sb-mono" :title="request.api_key_id">{{
                     shortId(request.api_key_id)
-                  }}</span>
+                  }}</ClickToCopy>
                   <StatusBadge
                     v-if="request.key_mode === 'native'"
                     :label="request.key_provider ?? 'native'"
@@ -701,9 +702,9 @@ function canReplay(request: RequestLog): boolean {
                   rel="noopener noreferrer"
                   @click.stop
                 >{{ request.trace_id!.slice(0, 8) }}…</a>
-                <span v-else-if="request.trace_id" class="sb-muted">
+                <ClickToCopy v-else-if="request.trace_id" :value="request.trace_id" label="Trace ID" class="sb-muted">
                   {{ request.trace_id.slice(0, 8) }}…
-                </span>
+                </ClickToCopy>
               </td>
               <td class="sb-mono sb-muted">{{ request.upstream ?? request.target ?? "" }}</td>
             </tr>
@@ -719,7 +720,8 @@ function canReplay(request: RequestLog): boolean {
                     class="detail-item"
                   >
                     <span class="detail-label">{{ field.label }}</span>
-                    <span class="sb-mono detail-value">{{ field.value }}</span>
+                    <ClickToCopy v-if="field.label.includes('id') || field.label.includes('Id')" :value="field.value" :label="field.label" class="sb-mono detail-value" />
+                    <span v-else class="sb-mono detail-value">{{ field.value }}</span>
                   </div>
                   <p v-if="!detailFields(request).length" class="sb-faint no-detail">
                     No additional fields on this legacy row.

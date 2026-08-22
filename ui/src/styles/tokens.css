@@ -115,3 +115,45 @@
   /* Gentle layered shadow for white panels on the white page. */
   --sb-shadow: 0 1px 2px rgba(10, 23, 51, 0.05), 0 4px 12px rgba(10, 23, 51, 0.05);
 }
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --sb-bg: #0a0a0a;
+    --sb-bg-sunken: #111111;
+    --sb-surface: #141414;
+    --sb-surface-2: #1f1f1f;
+    --sb-surface-hover: #292929;
+
+    --sb-text: #f5f8ff;
+    --sb-text-muted: #a1a1aa;
+    --sb-text-faint: #71717a;
+
+    --sb-ink: #f5f8ff;
+    --sb-ink-strong: #ffffff;
+    --sb-ink-soft: #c9d2e3;
+    --sb-on-ink: #0a1733;
+
+    --sb-accent: #3b82f6;
+    --sb-accent-strong: #60a5fa;
+    --sb-accent-tint: #1e3a8a;
+    --sb-accent-tint-strong: #1e40af;
+    --sb-accent-ring: rgba(59, 130, 246, 0.3);
+
+    --sb-border: #27272a;
+    --sb-border-strong: #3f3f46;
+    --sb-border-ink: #52525b;
+    --sb-border-accent: rgba(59, 130, 246, 0.35);
+
+    --sb-ok: #22c55e;
+    --sb-ok-bg: #14532d;
+    --sb-warn: #f97316;
+    --sb-warn-bg: #7c2d12;
+    --sb-warn-fg: #fed7aa;
+    --sb-err: #ef4444;
+    --sb-err-bg: #7f1d1d;
+    --sb-info: #60a5fa;
+    --sb-info-bg: #1e3a8a;
+
+    --sb-shadow: 0 1px 2px rgba(0, 0, 0, 0.5), 0 4px 12px rgba(0, 0, 0, 0.5);
+  }
+}

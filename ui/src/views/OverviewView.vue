@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted } from "vue";
+import { computed, onMounted, ref, onUnmounted } from "vue";
 import { api, asList, type HealthComponent, type ResidentModel } from "../api";
 import { useAsync } from "../composables/useAsync";
 import { formatBytes, formatDuration, formatNumber } from "../lib/format";
@@ -50,7 +50,6 @@ onMounted(() => {
   }, 1000);
 });
 
-import { onUnmounted } from "vue";
 onUnmounted(() => {
   if (source) {
     source.close();

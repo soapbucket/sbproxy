@@ -24,7 +24,7 @@ const keyFilter = computed(() =>
 const filters = computed<RequestFilters>(() =>
   keyFilter.value ? { apiKeyId: keyFilter.value } : {},
 );
-const req = useAsync(() => api.requests(filters.value));
+const req = useAsync(() => api.requests(filters.value), { pollMs: 10_000, refreshLabel: "Sessions" });
 onMounted(req.run);
 
 const requests = computed<RequestLog[]>(() =>

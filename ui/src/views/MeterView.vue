@@ -22,6 +22,7 @@ import {
   verifyHeadline,
   verifyTone,
 } from "../lib/meter";
+import Tooltip from "../components/Tooltip.vue";
 
 const groupBy = ref("tenant");
 const tenantFilter = ref("");
@@ -204,7 +205,11 @@ function fmt(n: number | undefined | null): string {
         :value="fmt(gapTotal)"
         :tone="gapTotal > 0 ? 'accent' : undefined"
         :sub="gapTotal > 0 ? `${fmt(degradedGaps)} degraded` : 'none owed'"
-      />
+      >
+        <template #label-append>
+          <Tooltip text="Metered consumptions (e.g., Pay Per Crawl/x402) not durably settled to the chain." />
+        </template>
+      </StatCard>
     </div>
 
     <div v-if="gapTotal > 0" class="gaps" role="alert">

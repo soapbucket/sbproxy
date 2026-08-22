@@ -41,7 +41,7 @@ function currentFilters(): RoutingDecisionFilters {
   };
 }
 
-const req = useAsync(() => api.routingDecisions(currentFilters()));
+const req = useAsync(() => api.routingDecisions(currentFilters()), { pollMs: 10_000, refreshLabel: "Routing Decisions" });
 const rows = computed<RoutingDecision[]>(() => req.data.value ?? []);
 
 const FILTER_KEYS = [

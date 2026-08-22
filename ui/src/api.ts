@@ -217,7 +217,7 @@ async function request(
   } catch (e) {
     throw new ApiError(0, `Network error contacting ${path}`, String(e));
   }
-  const warning = res.headers.get("Warning") || res.headers.get("X-Warning") || res.headers.get("X-SB-Warning");
+  const warning = res.headers?.get("Warning") || res.headers?.get("X-Warning") || res.headers?.get("X-SB-Warning");
   if (warning) {
     onWarning?.(warning);
   }
