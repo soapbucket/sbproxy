@@ -162,6 +162,8 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_ai_semantic_route_decisions_total` | Counter | `stable` | `beta` | `outcome` | Semantic-route selections by decision outcome. |
 | `sbproxy_ai_semantic_route_similarity` | Histogram | `stable` | `beta` | `provider` | Best exemplar cosine similarity of scored semantic-route requests. |
 | `sbproxy_ai_shadow_dropped_total` | Counter | `stable` | `beta` | `reason` | Configured shadow requests skipped or dropped before dispatch, by closed reason. |
+| `sbproxy_ai_shadow_calls_total` | Counter | `stable` | `beta` | `target`, `status_class`, `finish_reason` | Completed shadow evaluation calls by target, status class, and finish reason. |
+| `sbproxy_ai_shadow_latency_seconds` | Histogram | `stable` | `beta` | `target` | Shadow evaluation call latency by target, in seconds. |
 | `sbproxy_ai_shadow_inflight` | Gauge | `stable` | `beta` | none | Currently in-flight shadow request tasks supervised by the AI client. |
 | `sbproxy_ai_shadow_timeout_total` | Counter | `stable` | `beta` | none | Shadow tasks canceled after their wall-clock supervisor timeout. |
 | `sbproxy_ai_stream_guardrail_skipped_total` | Counter | `stable` | `beta` | `guardrail` | Output guardrails skipped on streaming responses via stream_policy: off. |

@@ -934,6 +934,52 @@ pub enum ShadowDropReason {
     Saturated,
 }
 
+/// Every [`ShadowDropReason`], in label order.
+///
+/// A variant added to the enum and not added here fails to compile,
+/// enforced by [`ShadowDropReason::next_in_label_order`] and the const
+/// walk below rather than by the written-out array length, which on
+/// its own would happily stay at six. Before this, the exhaustiveness
+/// test held a hand-written copy of this list: a seventh variant would
+/// have compiled, shipped, and never been asserted on, and
+/// `docs/observability.md` states this family's cardinality as a
+/// number that would then have been wrong.
+///
+/// What it still cannot see: the two prose enumerations of the same
+/// vocabulary, `docs/observability.md` and `docs/ai-gateway.md`. A new
+/// variant has to be written into both by hand.
+pub const ALL_SHADOW_DROP_REASONS: [ShadowDropReason; 6] = [
+    ShadowDropReason::Streaming,
+    ShadowDropReason::ProviderNotFound,
+    ShadowDropReason::ProviderNotAllowed,
+    ShadowDropReason::PromptTrainingDisallowed,
+    ShadowDropReason::EgressDenied,
+    ShadowDropReason::Saturated,
+];
+
+// Walks the variant chain against the array at compile time. A seventh
+// variant makes `next_in_label_order` non-exhaustive, and the arm its
+// author has to add puts a seventh link in the chain, which indexes one
+// slot past a six-element array and fails const evaluation. Written as
+// a walk rather than as a length assertion because a length written out
+// beside the array is a copy of the array, not a check on it.
+const _: () = {
+    let mut index = 0usize;
+    let mut current = Some(ShadowDropReason::Streaming);
+    while let Some(reason) = current {
+        assert!(
+            ALL_SHADOW_DROP_REASONS[index] as u8 == reason as u8,
+            "ALL_SHADOW_DROP_REASONS is out of order with the variant chain"
+        );
+        index += 1;
+        current = reason.next_in_label_order();
+    }
+    assert!(
+        index == ALL_SHADOW_DROP_REASONS.len(),
+        "ALL_SHADOW_DROP_REASONS has an entry no variant claims"
+    );
+};
+
 impl ShadowDropReason {
     /// Stable Prometheus label value.
     pub const fn as_str(self) -> &'static str {
@@ -944,6 +990,23 @@ impl ShadowDropReason {
             Self::PromptTrainingDisallowed => "prompt_training_disallowed",
             Self::EgressDenied => "egress_denied",
             Self::Saturated => "saturated",
+        }
+    }
+
+    /// The variant that follows this one in [`ALL_SHADOW_DROP_REASONS`],
+    /// or `None` for the last.
+    ///
+    /// This exists only so the array's contents are enforced rather
+    /// than asserted in prose. The match is exhaustive, so a new
+    /// variant cannot compile without joining the chain.
+    const fn next_in_label_order(self) -> Option<Self> {
+        match self {
+            Self::Streaming => Some(Self::ProviderNotFound),
+            Self::ProviderNotFound => Some(Self::ProviderNotAllowed),
+            Self::ProviderNotAllowed => Some(Self::PromptTrainingDisallowed),
+            Self::PromptTrainingDisallowed => Some(Self::EgressDenied),
+            Self::EgressDenied => Some(Self::Saturated),
+            Self::Saturated => None,
         }
     }
 }
@@ -959,6 +1022,103 @@ pub fn record_shadow_dropped(reason: ShadowDropReason) {
 /// timeout and was cancelled.
 pub fn record_shadow_timeout() {
     AI_SHADOW_TIMEOUT.inc();
+}
+
+/// Per-target outcome counter for completed shadow calls.
+///
+/// `target` is the shadow target's provider name, bounded by the
+/// route's `shadow.targets` list, which refuses a duplicate provider
+/// so the label identifies exactly one target. `status_class` and
+/// `finish_reason` are normalized to closed sets below.
+///
+/// This is the per-target comparison surface. Cost per target is
+/// answerable from the usage ledger instead (`tag == "shadow"`, grouped
+/// by `provider`, joined to the primary through `shadow_of`), which is
+/// why there is no cost metric here: the ledger is non-lossy and this
+/// counter is not.
+static AI_SHADOW_CALLS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_shadow_calls_total",
+            "Completed shadow evaluation calls by target, status class, and finish reason"
+        ),
+        &["target", "status_class", "finish_reason"]
+    )
+    .unwrap()
+});
+
+/// Per-target latency of a completed shadow call, in seconds.
+///
+/// Same bucket layout as `sbproxy_ai_request_duration_seconds`, so a
+/// target's latency distribution can be read against the primary's
+/// without rescaling.
+static AI_SHADOW_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        HistogramOpts::new(
+            "sbproxy_ai_shadow_latency_seconds",
+            "Shadow evaluation call latency by target"
+        )
+        .buckets(vec![0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]),
+        &["target"]
+    )
+    .unwrap()
+});
+
+/// Record one completed shadow call against one target.
+///
+/// `status` is the HTTP status the target answered, 504 when the
+/// wall-clock supervisor timeout fired (the same status the ledger row
+/// records for that case, so the two surfaces agree), and 0 when the
+/// transport never produced a response at all, which lands in the
+/// `error` class. `sbproxy_ai_shadow_timeout_total` is what separates
+/// a supervisor timeout from an upstream 504. `finish_reason` is
+/// whatever the target reported, normalized here.
+pub fn record_shadow_call(target: &str, status: u16, finish_reason: Option<&str>, secs: f64) {
+    let status_class = match status {
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        // 0 is what the transport paths report when no response
+        // arrived at all; anything else is not a status we produce.
+        _ => "error",
+    };
+    let finish_reason = normalize_shadow_finish_reason(finish_reason);
+    AI_SHADOW_CALLS
+        .with_label_values(&[target, status_class, finish_reason])
+        .inc();
+    if secs.is_finite() && secs >= 0.0 {
+        AI_SHADOW_LATENCY.with_label_values(&[target]).observe(secs);
+    }
+}
+
+/// Close the `finish_reason` label to the OpenAI chat vocabulary the
+/// hub normalizes every provider into, plus `none` for a call that
+/// reported none and `other` for anything else.
+///
+/// Closed because the value reaches a Prometheus label and comes off a
+/// provider response body. A provider that invents a finish reason, or
+/// a translated native shape that passes an unmapped `stopReason`
+/// through, would otherwise mint a new series per distinct string.
+fn normalize_shadow_finish_reason(finish_reason: Option<&str>) -> &'static str {
+    match finish_reason {
+        None => "none",
+        Some("stop") => "stop",
+        Some("length") => "length",
+        Some("tool_calls") => "tool_calls",
+        Some("content_filter") => "content_filter",
+        Some("function_call") => "function_call",
+        Some("") => "none",
+        Some(_) => "other",
+    }
+}
+
+/// Read one `sbproxy_ai_shadow_calls_total` sample (test accessor).
+#[cfg(test)]
+pub(crate) fn shadow_calls_value(target: &str, status_class: &str, finish_reason: &str) -> f64 {
+    AI_SHADOW_CALLS
+        .with_label_values(&[target, status_class, finish_reason])
+        .get()
 }
 
 // --- Cascade routing metrics ---
@@ -1524,6 +1684,14 @@ fn normalize_external_guardrail_labels<'a>(
         | "aporia"
         | "azure_content_safety"
         | "bedrock"
+        // Not a `GuardrailProvider` variant. `bedrock` is an
+        // out-of-band `ApplyGuardrail` side call; `bedrock_inline` is
+        // the same AWS guardrail evaluated inside the Converse
+        // generation via a provider entry's `bedrock_guardrail`.
+        // Sharing one label would make the two layers
+        // indistinguishable on the dashboard that exists to say which
+        // one stopped a request.
+        | "bedrock_inline"
         | "crowdstrike"
         | "mistral"
         | "pangea"
@@ -2526,6 +2694,27 @@ pub(crate) fn replica_selection_excluded_value(stage: &str) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bedrock_inline_verdict_is_labeled_separately_from_apply_guardrail() {
+        // An operator's whole reason for reading this metric is to see
+        // which layer stopped a request. Folding the inline Converse
+        // guardrail into the `bedrock` label (or into `unknown`) makes
+        // that unanswerable.
+        assert_eq!(
+            normalize_external_guardrail_labels("bedrock_inline", "output", "block"),
+            ("bedrock_inline", "output", "block")
+        );
+        assert_eq!(
+            normalize_external_guardrail_labels("bedrock", "input", "block"),
+            ("bedrock", "input", "block")
+        );
+        assert_eq!(
+            normalize_external_guardrail_labels("bedrock-inline", "output", "block").0,
+            "unknown",
+            "the set stays closed; only the exact spelling is admitted"
+        );
+    }
 
     #[test]
     fn stream_guardrail_counters_register_and_increment() {

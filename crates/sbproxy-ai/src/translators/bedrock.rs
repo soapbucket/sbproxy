@@ -50,7 +50,17 @@ use serde_json::{json, Map, Value};
 ///   * Unsupported OpenAI knobs (`logit_bias`, `n`,
 ///     `presence_penalty`, `frequency_penalty`, `response_format`,
 ///     `seed`, `user`, `top_k`) are dropped.
-pub fn request_to_native(body: Value, path: &str) -> (Value, String) {
+///   * `guardrail`, when set, becomes the Converse `guardrailConfig`
+///     block. It has no OpenAI counterpart: it comes from the
+///     provider entry's `bedrock_guardrail`, not from the caller's
+///     body, and a caller-supplied `guardrailConfig` is never honored
+///     because the canonical body is OpenAI-shaped and has no such
+///     field to carry one.
+pub fn request_to_native(
+    body: Value,
+    path: &str,
+    guardrail: Option<&crate::provider::BedrockGuardrailPassthrough>,
+) -> (Value, String) {
     let obj: Map<String, Value> = match body {
         Value::Object(m) => m,
         other => return (other, path.to_string()),
@@ -119,6 +129,23 @@ pub fn request_to_native(body: Value, path: &str) -> (Value, String) {
     // Preserve fields installed by per-attempt reasoning policy selection.
     if let Some(fields) = obj.get("additionalModelRequestFields") {
         out.insert("additionalModelRequestFields".to_string(), fields.clone());
+    }
+
+    // 2b. Inline guardrail. Converse evaluates the prompt and the
+    // completion inside this same call when `guardrailConfig` is
+    // present, so nothing downstream has to make a second AWS request.
+    // `trace: "enabled"` is what makes `trace.guardrail` come back on
+    // the response; without it an intervention arrives as a bare
+    // `stopReason` with no policy names to report.
+    if let Some(guardrail) = guardrail {
+        out.insert(
+            "guardrailConfig".to_string(),
+            json!({
+                "guardrailIdentifier": guardrail.identifier,
+                "guardrailVersion": guardrail.version,
+                "trace": if guardrail.trace { "enabled" } else { "disabled" },
+            }),
+        );
     }
 
     // 3. Tool config.
@@ -373,6 +400,199 @@ pub fn response_to_openai(body: Value) -> Value {
     })
 }
 
+/// Guardrail name recorded when an inline Converse guardrail
+/// intervenes. Distinct from the `bedrock` name an out-of-band
+/// `ApplyGuardrail` external guardrail records, so an operator reading
+/// a decision record can tell which layer stopped the request.
+pub const INLINE_GUARDRAIL_NAME: &str = "bedrock_guardrail";
+
+/// Most policies this module will name in a block reason. The reason
+/// reaches the caller's 403 envelope, `ctx.deny_reason`, and the
+/// decision audit record, so the count is bounded even though every
+/// component of it is already an enum value or an operator-authored
+/// name.
+///
+/// This caps the number of names, not the byte length. Each name is
+/// either a closed AWS enum value or a topic or regex name the
+/// operator wrote in their own AWS guardrail, so the length is bounded
+/// by the operator's own config rather than by anything a caller
+/// sends.
+const MAX_REASON_POLICIES: usize = 8;
+
+/// Detect an inline Converse guardrail intervention on a 2xx Bedrock
+/// response body.
+///
+/// Bedrock does not answer a guardrail block with an error status: the
+/// Converse call returns 200 with `stopReason: "guardrail_intervened"`
+/// and, when the request asked for `trace: "enabled"`, a
+/// `trace.guardrail` assessment describing which policies fired. Both
+/// halves are read here, before `response_to_openai` rebuilds the body
+/// from a fresh object and drops `trace` entirely.
+///
+/// **The returned reason never carries caller content.** A Bedrock
+/// assessment reports the matched span for a custom word
+/// (`wordPolicy.customWords[].match`) and for a PII entity
+/// (`sensitiveInformationPolicy.piiEntities[].match`), and both of
+/// those are the caller's own prompt or the model's own completion.
+/// Only policy *types* and operator-authored *names* are summarized,
+/// and only up to [`MAX_REASON_POLICIES`] of them.
+///
+/// **What this cannot see.** Streaming responses: a `ConverseStream`
+/// intervention arrives as a stream event, not as this body, and is
+/// mapped to a `content_filter` finish reason by
+/// `format::native_streams` without reaching here. A response whose
+/// request did not set `trace: enabled` yields a block with no policy
+/// names, because Bedrock sends none.
+pub fn guardrail_intervention(body: &[u8]) -> Option<crate::guardrails::GuardrailBlock> {
+    let parsed: Value = serde_json::from_slice(body).ok()?;
+    if parsed.get("stopReason").and_then(|v| v.as_str()) != Some("guardrail_intervened") {
+        return None;
+    }
+    let guardrail_trace = parsed.get("trace").and_then(|t| t.get("guardrail"));
+    let mut input_policies = Vec::new();
+    let mut output_policies = Vec::new();
+    if let Some(trace) = guardrail_trace {
+        // `inputAssessment` is a map of guardrail id to one assessment;
+        // `outputAssessments` is a map of guardrail id to a list. The
+        // side tells the operator whether the prompt or the completion
+        // tripped the policy, which is the only thing distinguishing an
+        // input intervention from an output one on the wire.
+        if let Some(map) = trace.get("inputAssessment").and_then(|v| v.as_object()) {
+            for assessment in map.values() {
+                collect_assessment_policies(assessment, &mut input_policies);
+            }
+        }
+        if let Some(map) = trace.get("outputAssessments").and_then(|v| v.as_object()) {
+            for assessments in map.values() {
+                match assessments {
+                    Value::Array(list) => {
+                        for assessment in list {
+                            collect_assessment_policies(assessment, &mut output_policies);
+                        }
+                    }
+                    other => collect_assessment_policies(other, &mut output_policies),
+                }
+            }
+        }
+    }
+
+    let side = match (input_policies.is_empty(), output_policies.is_empty()) {
+        (false, true) => "prompt",
+        (true, false) => "completion",
+        (false, false) => "prompt and completion",
+        // No trace at all, or a trace with no fired policy in it.
+        (true, true) => "generation",
+    };
+    let mut policies = input_policies;
+    policies.extend(output_policies);
+    policies.sort_unstable();
+    policies.dedup();
+    let truncated = policies.len() > MAX_REASON_POLICIES;
+    policies.truncate(MAX_REASON_POLICIES);
+
+    let reason = if policies.is_empty() {
+        format!("Bedrock guardrail intervened on the {side}")
+    } else {
+        format!(
+            "Bedrock guardrail intervened on the {side} ({}{})",
+            policies.join(", "),
+            if truncated { ", ..." } else { "" }
+        )
+    };
+    Some(crate::guardrails::GuardrailBlock {
+        name: INLINE_GUARDRAIL_NAME.to_string(),
+        reason,
+    })
+}
+
+/// Summarize one `GuardrailAssessment` into policy labels.
+///
+/// Every value read here is either a closed AWS enum (`contentPolicy`
+/// filter types, managed word list types, PII entity types,
+/// contextual-grounding filter types) or a name the operator gave the
+/// policy in their own AWS guardrail (`topicPolicy` topics, regex
+/// names). The two fields that carry caller text, `customWords[].match`
+/// and `piiEntities[].match`, are deliberately reduced to a count and a
+/// type respectively.
+fn collect_assessment_policies(assessment: &Value, out: &mut Vec<String>) {
+    let detected = |entry: &Value| {
+        // AWS reports every configured policy in the assessment and
+        // marks the ones that fired. `detected` is absent on some
+        // policy shapes, in which case an action other than `NONE` is
+        // the signal.
+        entry
+            .get("detected")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+            && entry
+                .get("action")
+                .and_then(|v| v.as_str())
+                .is_none_or(|action| !action.eq_ignore_ascii_case("NONE"))
+    };
+    let mut push_named = |prefix: &str, list: Option<&Value>, key: &str| {
+        let entries: &[Value] = list.and_then(Value::as_array).map_or(&[], Vec::as_slice);
+        for entry in entries {
+            if !detected(entry) {
+                continue;
+            }
+            if let Some(value) = entry.get(key).and_then(|v| v.as_str()) {
+                out.push(format!("{prefix}:{value}"));
+            }
+        }
+    };
+    push_named(
+        "topic",
+        assessment.get("topicPolicy").and_then(|p| p.get("topics")),
+        "name",
+    );
+    push_named(
+        "content_filter",
+        assessment
+            .get("contentPolicy")
+            .and_then(|p| p.get("filters")),
+        "type",
+    );
+    push_named(
+        "word_list",
+        assessment
+            .get("wordPolicy")
+            .and_then(|p| p.get("managedWordLists")),
+        "type",
+    );
+    push_named(
+        "pii",
+        assessment
+            .get("sensitiveInformationPolicy")
+            .and_then(|p| p.get("piiEntities")),
+        "type",
+    );
+    push_named(
+        "regex",
+        assessment
+            .get("sensitiveInformationPolicy")
+            .and_then(|p| p.get("regexes")),
+        "name",
+    );
+    push_named(
+        "grounding",
+        assessment
+            .get("contextualGroundingPolicy")
+            .and_then(|p| p.get("filters")),
+        "type",
+    );
+    // `customWords[].match` is the matched span of the caller's own
+    // text. Report only that the custom word list fired.
+    let custom_words = assessment
+        .get("wordPolicy")
+        .and_then(|p| p.get("customWords"))
+        .and_then(Value::as_array)
+        .map(|list| list.iter().filter(|entry| detected(entry)).count())
+        .unwrap_or(0);
+    if custom_words > 0 {
+        out.push(format!("custom_words:{custom_words}"));
+    }
+}
+
 fn extract_content_and_tools(message: &Value) -> (Value, Vec<Value>) {
     let blocks = message
         .get("content")
@@ -419,6 +639,166 @@ fn extract_content_and_tools(message: &Value) -> (Value, Vec<Value>) {
 mod tests {
     use super::*;
 
+    fn passthrough(trace: bool) -> crate::provider::BedrockGuardrailPassthrough {
+        crate::provider::BedrockGuardrailPassthrough {
+            identifier: "gr-abc123".to_string(),
+            version: "DRAFT".to_string(),
+            trace,
+        }
+    }
+
+    #[test]
+    fn converse_body_carries_guardrail_config() {
+        let body = json!({
+            "model": "anthropic.claude-3-5-sonnet-20240620-v1:0",
+            "messages": [{"role": "user", "content": "hello"}],
+        });
+        let guardrail = passthrough(true);
+        let (out, _) = request_to_native(body.clone(), "/v1/chat/completions", Some(&guardrail));
+        assert_eq!(out["guardrailConfig"]["guardrailIdentifier"], "gr-abc123");
+        assert_eq!(out["guardrailConfig"]["guardrailVersion"], "DRAFT");
+        assert_eq!(
+            out["guardrailConfig"]["trace"], "enabled",
+            "without trace: enabled Bedrock sends no assessment, so a \
+             block reason would have no policy names in it"
+        );
+
+        let quiet = passthrough(false);
+        let (out, _) = request_to_native(body.clone(), "/v1/chat/completions", Some(&quiet));
+        assert_eq!(out["guardrailConfig"]["trace"], "disabled");
+
+        let (out, _) = request_to_native(body, "/v1/chat/completions", None);
+        assert!(
+            out.get("guardrailConfig").is_none(),
+            "an unconfigured provider must not send an empty guardrail block: {out}"
+        );
+    }
+
+    /// A Converse intervention with the assessment shape AWS documents.
+    /// `wordPolicy.customWords[].match` and
+    /// `sensitiveInformationPolicy.piiEntities[].match` carry the
+    /// caller's own text; nothing derived from them may reach the
+    /// reason string.
+    fn intervened_body() -> Vec<u8> {
+        json!({
+            "stopReason": "guardrail_intervened",
+            "output": {"message": {"role": "assistant", "content": [{"text": ""}]}},
+            "usage": {"inputTokens": 12, "outputTokens": 0, "totalTokens": 12},
+            "trace": {
+                "guardrail": {
+                    "outputAssessments": {
+                        "gr-abc123": [{
+                            "topicPolicy": {"topics": [
+                                {"name": "legal_advice", "type": "DENY", "action": "BLOCKED", "detected": true},
+                                {"name": "medical_advice", "type": "DENY", "action": "NONE", "detected": false}
+                            ]},
+                            "contentPolicy": {"filters": [
+                                {"type": "VIOLENCE", "confidence": "HIGH", "action": "BLOCKED", "detected": true}
+                            ]},
+                            "wordPolicy": {"customWords": [
+                                {"match": "hunter2-secret-passphrase", "action": "BLOCKED", "detected": true}
+                            ]},
+                            "sensitiveInformationPolicy": {"piiEntities": [
+                                {"match": "rick@example.com", "type": "EMAIL", "action": "ANONYMIZED", "detected": true}
+                            ]}
+                        }]
+                    }
+                }
+            }
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    #[test]
+    fn guardrail_intervention_reads_stop_reason() {
+        let block = guardrail_intervention(&intervened_body())
+            .expect("stopReason guardrail_intervened is a block");
+        assert_eq!(block.name, INLINE_GUARDRAIL_NAME);
+
+        let clean = json!({
+            "stopReason": "end_turn",
+            "output": {"message": {"role": "assistant", "content": [{"text": "hi"}]}},
+        })
+        .to_string();
+        assert!(
+            guardrail_intervention(clean.as_bytes()).is_none(),
+            "a normal completion is not a guardrail block"
+        );
+        assert!(
+            guardrail_intervention(b"not json").is_none(),
+            "an unparseable body is not a guardrail block"
+        );
+    }
+
+    #[test]
+    fn the_block_reason_names_policies_and_never_caller_content() {
+        let block = guardrail_intervention(&intervened_body()).expect("block");
+        assert!(
+            block.reason.contains("topic:legal_advice"),
+            "{}",
+            block.reason
+        );
+        assert!(
+            block.reason.contains("content_filter:VIOLENCE"),
+            "{}",
+            block.reason
+        );
+        assert!(block.reason.contains("pii:EMAIL"), "{}", block.reason);
+        assert!(block.reason.contains("custom_words:1"), "{}", block.reason);
+        assert!(
+            block.reason.contains("completion"),
+            "an outputAssessments-only trace fired on the completion: {}",
+            block.reason
+        );
+        // The two assessment fields that quote the caller's own text.
+        for leaked in ["hunter2-secret-passphrase", "rick@example.com"] {
+            assert!(
+                !block.reason.contains(leaked),
+                "the reason reaches the 403 envelope, ctx.deny_reason, and the \
+                 decision audit record; it leaked {leaked}: {}",
+                block.reason
+            );
+        }
+        // A policy AWS reported but did not fire is not a reason.
+        assert!(!block.reason.contains("medical_advice"), "{}", block.reason);
+    }
+
+    #[test]
+    fn an_intervention_without_a_trace_still_blocks() {
+        // `trace: false` is the default, and Bedrock then sends no
+        // assessment at all. The block must survive with no policy
+        // names rather than being read as a normal completion.
+        let body = json!({
+            "stopReason": "guardrail_intervened",
+            "output": {"message": {"role": "assistant", "content": [{"text": ""}]}},
+        })
+        .to_string();
+        let block = guardrail_intervention(body.as_bytes()).expect("block");
+        assert_eq!(block.name, INLINE_GUARDRAIL_NAME);
+        assert!(block.reason.contains("generation"), "{}", block.reason);
+    }
+
+    #[test]
+    fn an_input_side_intervention_is_named_as_the_prompt() {
+        let body = json!({
+            "stopReason": "guardrail_intervened",
+            "trace": {"guardrail": {"inputAssessment": {"gr-abc123": {
+                "contentPolicy": {"filters": [
+                    {"type": "PROMPT_ATTACK", "action": "BLOCKED", "detected": true}
+                ]}
+            }}}}
+        })
+        .to_string();
+        let block = guardrail_intervention(body.as_bytes()).expect("block");
+        assert!(block.reason.contains("prompt"), "{}", block.reason);
+        assert!(
+            block.reason.contains("content_filter:PROMPT_ATTACK"),
+            "{}",
+            block.reason
+        );
+    }
+
     #[test]
     fn request_simple_chat_translation() {
         let body = json!({
@@ -429,7 +809,7 @@ mod tests {
             "temperature": 0.7,
             "max_tokens": 512,
         });
-        let (out, path) = request_to_native(body, "/v1/chat/completions");
+        let (out, path) = request_to_native(body, "/v1/chat/completions", None);
         assert_eq!(
             path,
             "/model/anthropic.claude-3-5-sonnet-20240620-v1:0/converse"
@@ -454,7 +834,7 @@ mod tests {
                 {"role": "user", "content": "hi"}
             ],
         });
-        let (out, _) = request_to_native(body, "/v1/chat/completions");
+        let (out, _) = request_to_native(body, "/v1/chat/completions", None);
         let system = out["system"].as_array().unwrap();
         assert_eq!(system.len(), 2);
         assert_eq!(system[0]["text"], "be terse");
@@ -481,7 +861,7 @@ mod tests {
                 }
             }],
         });
-        let (out, _) = request_to_native(body, "/v1/chat/completions");
+        let (out, _) = request_to_native(body, "/v1/chat/completions", None);
         let tools = out["toolConfig"]["tools"].as_array().unwrap();
         assert_eq!(tools[0]["toolSpec"]["name"], "get_weather");
         assert_eq!(tools[0]["toolSpec"]["description"], "look up the weather");
@@ -502,7 +882,7 @@ mod tests {
             }],
             "tool_choice": {"type": "function", "function": {"name": "f"}},
         });
-        let (out, _) = request_to_native(body, "/v1/chat/completions");
+        let (out, _) = request_to_native(body, "/v1/chat/completions", None);
         assert_eq!(out["toolConfig"]["toolChoice"]["tool"]["name"], "f");
     }
 
@@ -519,7 +899,7 @@ mod tests {
             "seed": 42,
             "user": "u-1",
         });
-        let (out, _) = request_to_native(body, "/v1/chat/completions");
+        let (out, _) = request_to_native(body, "/v1/chat/completions", None);
         let obj = out.as_object().unwrap();
         for k in [
             "logit_bias",
@@ -620,7 +1000,7 @@ mod tests {
             "model": "anthropic.claude-3-haiku-20240307-v1:0",
             "messages": [{"role": "user", "content": "hi"}],
         });
-        let (native, path) = request_to_native(req, "/v1/chat/completions");
+        let (native, path) = request_to_native(req, "/v1/chat/completions", None);
         assert!(path.ends_with("/converse"));
         assert_eq!(native["messages"][0]["content"][0]["text"], "hi");
 

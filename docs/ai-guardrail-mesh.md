@@ -1,5 +1,5 @@
 # Guardrail mesh
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 The serial guardrail chain blocks on the first security detector that flags.
 The guardrail mesh instead runs the input detectors as a cascade, collects
@@ -8,6 +8,13 @@ configurable rule.
 That unlocks three behaviors the serial chain cannot express: a quorum
 block, redact-and-continue, and a latency-budgeted cascade with a verdict
 cache.
+
+The mesh is input-side only. It has no output stage, and a verdict that
+arrives on the response, such as a provider-native one from an inline
+Bedrock `Converse` guardrail, cannot join the fusion for the request that
+produced it: input fusion has already run and dispatch has already
+happened. Those verdicts land on the output-guardrail funnel instead. See
+[guardrails.md](guardrails.md#bedrock-guardrails-inline-on-the-converse-call).
 
 Default off: with no `mesh` block under `guardrails`, the pipeline keeps
 the serial block-on-any behavior.

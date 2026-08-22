@@ -121,6 +121,61 @@ origins:
     )
 }
 
+fn two_target_shadow_config(
+    primary_url: &str,
+    first_url: &str,
+    second_url: &str,
+    usage_path: &std::path::Path,
+) -> String {
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "ai.localhost":
+    action:
+      type: ai_proxy
+      usage_sinks:
+        - type: jsonl_file
+          path: "{usage_path}"
+      providers:
+        - name: primary
+          provider_type: openai
+          api_key: "primary-key"
+          base_url: "{primary_url}"
+          allow_private_base_url: true
+          models: [gpt-4o]
+        - name: shadow-a
+          provider_type: openai
+          api_key: "a-key"
+          base_url: "{first_url}"
+          allow_private_base_url: true
+          enabled: false
+          models: [gpt-4o]
+        - name: shadow-b
+          provider_type: openai
+          api_key: "b-key"
+          base_url: "{second_url}"
+          allow_private_base_url: true
+          enabled: false
+          models: [gpt-4o]
+      routing:
+        strategy: round_robin
+      shadow:
+        targets:
+          - provider: shadow-a
+            sample_rate: 1.0
+            timeout_ms: 5000
+            task_timeout_ms: 5000
+          - provider: shadow-b
+            sample_rate: 1.0
+            timeout_ms: 5000
+            task_timeout_ms: 5000
+"#,
+        usage_path = usage_path.display(),
+    )
+}
+
 fn governed_shadow_config(
     admin_port: u16,
     store_path: &Path,
@@ -205,18 +260,24 @@ fn mint_governed_token(admin_port: u16, policy: Value) -> String {
 fn wait_for_usage_rows(path: &std::path::Path, count: usize) -> Vec<Value> {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let rows = std::fs::read_to_string(path)
-            .unwrap_or_default()
+        let raw = std::fs::read_to_string(path).unwrap_or_default();
+        let rows = raw
             .lines()
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect::<Vec<_>>();
         if rows.len() >= count {
             return rows;
         }
+        // The raw text is in the message on purpose. A JSONL sink that
+        // interleaves two concurrent rows onto one line produces a file
+        // whose line count is right and whose parseable-row count is
+        // not, and a message that reported only the row count read as
+        // "the writer never ran".
         assert!(
             std::time::Instant::now() < deadline,
-            "expected {count} usage rows, found {}: {rows:?}",
-            rows.len()
+            "expected {count} usage rows, parsed {} of {} lines. Raw file:\n{raw}",
+            rows.len(),
+            raw.lines().count()
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -500,6 +561,84 @@ fn shadow_usage_is_separate_and_never_debits_primary_budget() {
     assert_eq!(
         second.status, 200,
         "shadow spend must not consume or reject the primary budget"
+    );
+}
+
+#[test]
+fn two_targets_both_answer_and_neither_delays_the_primary() {
+    let primary = MockUpstream::start(chat_reply("primary", 1, 1)).expect("primary upstream");
+    let first = MockUpstream::start(chat_reply("shadow-a", 10, 10)).expect("first shadow upstream");
+    let second =
+        MockUpstream::start(chat_reply("shadow-b", 20, 20)).expect("second shadow upstream");
+    let temp = tempfile::tempdir().expect("usage workspace");
+    let usage_path = temp.path().join("usage.jsonl");
+    let proxy = ProxyHarness::start_with_yaml(&two_target_shadow_config(
+        &primary.base_url(),
+        &first.base_url(),
+        &second.base_url(),
+        &usage_path,
+    ))
+    .expect("proxy");
+
+    let response = proxy
+        .post_json(
+            "/v1/chat/completions",
+            "ai.localhost",
+            &json!({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "compare two targets"}]
+            }),
+            &[],
+        )
+        .expect("primary response");
+    assert_eq!(response.status, 200);
+    let body = String::from_utf8_lossy(&response.body);
+    assert!(
+        body.contains("primary"),
+        "the client always sees the primary's answer: {body}"
+    );
+
+    // One primary row plus one row per target.
+    let rows = wait_for_usage_rows(&usage_path, 3);
+    let primary_row = rows
+        .iter()
+        .find(|row| row["provider"] == "primary")
+        .expect("primary usage row");
+    let row_a = rows
+        .iter()
+        .find(|row| row["provider"] == "shadow-a")
+        .expect("first target usage row");
+    let row_b = rows
+        .iter()
+        .find(|row| row["provider"] == "shadow-b")
+        .expect("second target usage row");
+
+    assert_eq!(row_a["tag"], "shadow");
+    assert_eq!(row_b["tag"], "shadow");
+    assert_eq!(row_a["total_tokens"], 20);
+    assert_eq!(row_b["total_tokens"], 40);
+    assert_ne!(
+        row_a["request_id"], row_b["request_id"],
+        "each target needs its own ledger dedup key, or the two rows \
+         collapse to one on replay"
+    );
+    let primary_id = primary_row["request_id"]
+        .as_str()
+        .expect("primary request id");
+    for row in [row_a, row_b] {
+        assert_eq!(
+            row["shadow_of"].as_str(),
+            Some(primary_id),
+            "shadow_of is what joins a target row back to the primary"
+        );
+        assert_eq!(
+            row["finish_reason"], "stop",
+            "the target's finish reason reaches the ledger row"
+        );
+    }
+    assert!(
+        primary_row.get("shadow_of").is_none(),
+        "an ordinary completion is nobody's shadow: {primary_row}"
     );
 }
 

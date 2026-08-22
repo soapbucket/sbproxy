@@ -2331,6 +2331,14 @@ fn usage_event_from_context(
         // is present exactly when the request never left the box.
         logical_model: ctx.ai_logical_model.clone(),
         served_model: ctx.ai_serve_model.clone(),
+        // Both are shadow-row fields. `shadow_of` because an ordinary
+        // completion is nobody's shadow; `finish_reason` because the
+        // primary's reasons reach the request span as
+        // `gen_ai.response.finish_reasons` and nothing carries them
+        // this far, so putting a value here would mean re-parsing the
+        // response body on the billing path.
+        finish_reason: None,
+        shadow_of: None,
     }
 }
 

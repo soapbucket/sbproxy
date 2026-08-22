@@ -1957,6 +1957,7 @@ mod tests {
             service_tier: None,
             serve: None,
             aws_sigv4: None,
+            bedrock_guardrail: None,
         }
     }
 

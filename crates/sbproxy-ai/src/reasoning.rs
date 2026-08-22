@@ -1159,7 +1159,8 @@ mod tests {
             &mut body,
         );
 
-        let (native, _) = translators::bedrock::request_to_native(body, "/v1/chat/completions");
+        let (native, _) =
+            translators::bedrock::request_to_native(body, "/v1/chat/completions", None);
         assert_eq!(
             native["additionalModelRequestFields"]["thinking"],
             json!({"type": "enabled", "budget_tokens": 2048})

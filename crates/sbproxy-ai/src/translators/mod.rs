@@ -25,6 +25,20 @@ pub mod gemini_embeddings;
 
 use crate::providers::ProviderFormat;
 
+/// Per-provider settings the canonical OpenAI request body cannot
+/// carry, handed to [`translate_request`] alongside the format.
+///
+/// Every field is provider-specific and ignored by the formats it does
+/// not apply to, so a caller that has nothing to pass sends
+/// `TranslateOptions::default()`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TranslateOptions<'a> {
+    /// The provider entry's inline Bedrock Converse guardrail, if it
+    /// configured one. Honored only by the Bedrock arm, which writes it
+    /// out as `guardrailConfig`.
+    pub bedrock_guardrail: Option<&'a crate::provider::BedrockGuardrailPassthrough>,
+}
+
 /// Translate an OpenAI-shaped request body into the upstream's native
 /// format. Returns the body unchanged for OpenAI-compatible
 /// providers; calls the matching translator for native providers.
@@ -54,10 +68,16 @@ use crate::providers::ProviderFormat;
 /// dropping it, which is also what this path did before `top_k` was
 /// honored end to end. `Custom` keeps its lossless relay contract and
 /// forwards whatever the operator's own translator expects.
+///
+/// `opts` carries the per-provider settings a format needs but the
+/// canonical OpenAI body cannot express. It is a struct rather than a
+/// bare extra argument so a second such setting widens the options
+/// type instead of the signature and every caller again.
 pub fn translate_request(
     format: ProviderFormat,
     path: &str,
     body: &serde_json::Value,
+    opts: TranslateOptions<'_>,
 ) -> (Option<serde_json::Value>, String) {
     match format {
         ProviderFormat::OpenAi => {
@@ -79,7 +99,7 @@ pub fn translate_request(
             (Some(b), p)
         }
         ProviderFormat::Bedrock => {
-            let (b, p) = bedrock::request_to_native(body.clone(), path);
+            let (b, p) = bedrock::request_to_native(body.clone(), path, opts.bedrock_guardrail);
             (Some(b), p)
         }
         // Custom: pass through. Custom-format operators bring their
@@ -172,7 +192,12 @@ mod upstream_body_tests {
         )
         .expect("inbound Anthropic body parses");
         let canonical: Value = serde_json::from_slice(&canonical).expect("canonical body is JSON");
-        let (translated, _path) = translate_request(format, "/v1/chat/completions", &canonical);
+        let (translated, _path) = translate_request(
+            format,
+            "/v1/chat/completions",
+            &canonical,
+            TranslateOptions::default(),
+        );
         translated.unwrap_or(canonical)
     }
 
@@ -291,8 +316,12 @@ mod upstream_body_tests {
     #[test]
     fn a_body_without_top_k_is_still_forwarded_by_reference() {
         let body = json!({"model": "gpt-4o", "messages": []});
-        let (translated, path) =
-            translate_request(ProviderFormat::OpenAi, "/v1/chat/completions", &body);
+        let (translated, path) = translate_request(
+            ProviderFormat::OpenAi,
+            "/v1/chat/completions",
+            &body,
+            TranslateOptions::default(),
+        );
         assert!(
             translated.is_none(),
             "the OpenAI pass-through must stay clone-free when there is nothing to strip"

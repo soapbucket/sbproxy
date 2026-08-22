@@ -1650,7 +1650,7 @@ origins:
 | `max_request_timeout_ms` | int | unset | Ceiling in milliseconds on a caller's `x-sbproxy-timeout-ms`. A header above it is refused with 400 naming the accepted range, not clamped. Must be above zero. Bounds one attempt, so `max_retries` multiplies it. An honored header replaces the gateway's 30-second HTTP client default too, so a ceiling above 30000 does lengthen an attempt. |
 | `compression` | object | unset | Ordered AI context-compression policy. See [AI context compression](#ai-context-compression) and [ai-context-compression.md](ai-context-compression.md). |
 | `reasoning` | string or object | `off` | Route policy for concise reasoning. Use `concise`, `off`, or `{budget: N}` with `N` greater than zero. |
-| `shadow` | object | | Side-by-side eval: mirror each request to a second provider and log metrics. |
+| `shadow` | object | | Side-by-side eval: mirror each request to one or more shadow targets and log metrics. |
 | `ai_policy` | object | | One sandboxed CEL expression over the AI decision pipeline (`expression`, `on_error`). See [ai-policy-cel.md](ai-policy-cel.md). |
 | `cache_affinity` | object | unset | Prefer the provider that already holds a caller's warm prompt cache. Sits beside `routing:`, not inside it, because it layers over whatever strategy is configured rather than replacing one (except `fallback_chain`, `cascade`, `cost_quality`, and `routing_policy`, which own their ordering and are left alone). Fields: `ttl_secs` (default `300`) and `max_keys_per_provider` (default `1024`); both are refused at zero. Keys on the caller's `prompt_cache_key`, or `user` when that is absent, scoped to the tenant, credential, origin, and API surface. A preference, never a pin: an ineligible holder or a changed resolved model leaves the strategy's pick in place. Process-local and bounded. See [ai-gateway.md](ai-gateway.md#prompt-cache-affinity). |
 | `usage_sinks` | list | `[]` | Destinations for completed-call usage records. The `ledger` sink (`path`, optional `signing_seed_hex`) writes a hash-chained, signable record. See [ai-usage-ledger.md](ai-usage-ledger.md). |
@@ -1691,6 +1691,7 @@ Peak EWMA accepts the object form:
 | `service_tier` | string | unset | Upstream service tier this destination requests: `flex`, `standard`, or `priority`. Unset sends no tier field and the vendor serves on its own default. The operator's decision, not the caller's: a caller's `service_tier` is removed from every request and replaced by this value where it is set. To run two tiers of one vendor, declare two entries with the same `provider_type` and different tiers. A tier the provider catalog does not record for this vendor is refused at config load. See [ai-gateway.md](ai-gateway.md#service-tier). |
 | `data_posture` | object | unset | Operator override of this entry's declared data-handling posture, consulted by the action-level `data_posture:` filter: `zdr: true` declares this deployment holds a zero-data-retention arrangement (the only thing that makes a vendor which retains by default eligible for `require_zdr`), and `retains_data` overrides the catalog's retention declaration in either direction. Unset keeps the provider catalog's declaration. See [ai-gateway.md](ai-gateway.md#provider-data-posture). |
 | `aws_sigv4` | object | unset | Sign this provider's requests with AWS Signature Version 4, which is what Bedrock and SageMaker require in place of a bearer token. Presence of the block selects the signer. See [AWS SigV4 fields](#aws-sigv4-fields-providersaws_sigv4). |
+| `bedrock_guardrail` | object | unset | Run one of your Bedrock guardrails inside the `Converse` generation instead of as a separate `ApplyGuardrail` call. Keys: `identifier` and `version` (both required, sent as `guardrailIdentifier` / `guardrailVersion`), and `trace` (bool, default `false`, asks AWS which policies fired so the block reason can name them). Refused on any provider entry that is not Bedrock-format. See [guardrails.md](guardrails.md#bedrock-guardrails-inline-on-the-converse-call). |
 
 A `managed_model` provider must set a non-empty `deployment` and must not set
 `api_key`, `base_url`, or the legacy `serve` block. Conversely, `deployment` is
@@ -2199,18 +2200,44 @@ The block also accepts the LLM-aware keys: `retry_policy` (per-failure-class ret
 
 #### Shadow (`shadow`)
 
-Mirrors a sampled set of non-streaming chat evaluation requests to a second provider after request policy, guardrails, model rewrites, and context compression. V1 includes Chat Completions plus normalized Messages and Responses requests. Mutating and non-chat surfaces, including Assistants, Threads, Batches, Fine Tuning, Files, images, audio, embeddings, moderation, and reranking, are never copied. The primary's response is what the client sees. Shadow work uses fire-and-forget admission bounded by 16 in-flight tasks and a 64 MiB reservation budget per live AI client, so shadow failure, timeout, or saturation cannot delay or reject the primary. Streaming requests are intentionally skipped.
+Mirrors a sampled set of non-streaming chat evaluation requests to one or more shadow targets after request policy, guardrails, model rewrites, and context compression. V1 includes Chat Completions plus normalized Messages and Responses requests. Mutating and non-chat surfaces, including Assistants, Threads, Batches, Fine Tuning, Files, images, audio, embeddings, moderation, and reranking, are never copied. The primary's response is what the client sees. Shadow work uses fire-and-forget admission bounded by 16 in-flight tasks and a 64 MiB reservation budget per live AI client, so shadow failure, timeout, or saturation cannot delay or reject the primary. Streaming requests are intentionally skipped.
 
 The shadow body is drained while at most 1 MiB is retained for comparison metadata, which is logged at `target: sbproxy_ai_shadow` (status, latency, prompt/completion tokens, finish reason). Each configured usage sink receives a distinct shadow row tagged `shadow`; its request ID is freshly generated by the server and ends in `:shadow`. Shadow cost is estimated in that row but does not debit primary budgets. Set `enabled: false` on a shadow-only provider to keep it out of primary routing; the explicit shadow selection still uses it. Credential provider allow/block rules apply to the shadow target independently. A request carrying `x-sbproxy-disallow-prompt-training: true` is copied only when the shadow provider declares `no_prompt_training: true`. A hosting process that attaches a purpose-scoped egress authorizer to `AiClient` suppresses v1 shadow dispatch because the direct shadow transport cannot yet consume authorized DNS pins and redirect checks.
 
 ```yaml
 shadow:
-  provider: anthropic         # must also appear in `providers`
-  model: claude-haiku-4-5     # optional override; defaults to client's model
-  sample_rate: 0.1            # mirror 10% of traffic; 1.0 mirrors all
-  timeout_ms: 30000           # upstream HTTP timeout
-  task_timeout_ms: 30000      # hard wall-clock supervisor timeout
+  targets:
+    - provider: anthropic         # must also appear in `providers`
+      model: claude-haiku-4-5     # optional override; defaults to client's model
+      sample_rate: 0.1            # mirror 10% of traffic; 1.0 mirrors all
+      timeout_ms: 30000           # upstream HTTP timeout
+      task_timeout_ms: 30000      # hard wall-clock supervisor timeout
+    - provider: gemini
+      sample_rate: 0.5
 ```
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `targets` | list | required | One entry per provider to shadow against. An empty list is refused, and so are two entries naming the same provider: the provider name identifies the target on every metric label and every ledger row. |
+| `targets[].provider` | string | required | Must also appear in `providers`. |
+| `targets[].model` | string | client's model | Model override for this target. |
+| `targets[].sample_rate` | float | `1.0` | Fraction of requests this target sees. |
+| `targets[].timeout_ms` | int | `30000` | Upstream HTTP timeout for this target's call. |
+| `targets[].task_timeout_ms` | int | `30000` | Hard wall-clock supervisor timeout for this target's task. |
+
+The single-target form, five sibling keys directly under `shadow:` with no
+`targets:`, still parses and means a one-entry list. Writing both `targets:`
+and a sibling key is refused rather than silently resolved.
+
+Admission runs once per target, so three targets take three slots out of the
+same 16-task and 64 MiB ceiling and a target that cannot get one is dropped as
+`saturated` while the others run. Sampling draws once per request and every
+target compares against that same draw, so target populations nest rather than
+diverge: everything a `0.1` target saw, a `0.5` target on the same route also
+saw. Each target's usage row carries `shadow_of`, the primary request's id, as
+the join key, and `finish_reason`; per-target outcomes are also counted on
+`sbproxy_ai_shadow_calls_total{target, status_class, finish_reason}` and
+`sbproxy_ai_shadow_latency_seconds{target}`.
 
 `sbproxy_ai_shadow_dropped_total{reason=...}` uses the closed reasons `streaming`, `provider_not_found`, `provider_not_allowed`, `prompt_training_disallowed`, `egress_denied`, and `saturated`. Sampling out is expected behavior and does not increment the counter.
 

@@ -151,6 +151,56 @@ pub struct ProviderConfig {
     // That was enough to overflow the Pingora worker thread's stack on
     // the AI request path.
     pub aws_sigv4: Option<Box<crate::aws_sigv4::AwsSigV4Config>>,
+    /// Amazon Bedrock guardrail applied inline by the Converse call
+    /// itself.
+    ///
+    /// Set this to have Bedrock evaluate the prompt and the completion
+    /// inside the same request that generates them, rather than as a
+    /// separate `ApplyGuardrail` call. An intervention comes back on a
+    /// 200 response as `stopReason: guardrail_intervened`; SBproxy
+    /// turns that into a 403 `guardrail_violation`, records it on the
+    /// output guardrail decision feed under the name
+    /// `bedrock_guardrail`, and never admits the response to any
+    /// cache.
+    ///
+    /// Valid only when this provider entry resolves to the Bedrock
+    /// wire format. Configuring it on any other provider is refused at
+    /// config load.
+    ///
+    /// This is a different control from `guardrails.external[]` with
+    /// `provider: bedrock`, which is an out-of-band `ApplyGuardrail`
+    /// call against the same AWS guardrail object. Both may be
+    /// configured; the account is then charged for two evaluations.
+    ///
+    /// There is no failure posture for this block. The guardrail runs
+    /// inside the generation call, so a rejected or unauthorized
+    /// guardrail configuration fails the whole call before any tokens
+    /// are produced and is handled by the ordinary provider-failure
+    /// path.
+    #[serde(default)]
+    // Boxed for the same reason `aws_sigv4` is, and with the same
+    // plain-comment treatment because the rustdoc above ships as the
+    // operator-facing schema description: almost every provider entry
+    // leaves this unset, and `ProviderConfig` is held across awaits on
+    // the AI request path where the Pingora worker stack is already at
+    // its 2MB ceiling.
+    pub bedrock_guardrail: Option<Box<BedrockGuardrailPassthrough>>,
+}
+
+/// Inline Bedrock Converse guardrail settings.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BedrockGuardrailPassthrough {
+    /// Bedrock guardrail identifier, sent as `guardrailIdentifier`.
+    pub identifier: String,
+    /// Bedrock guardrail version, sent as `guardrailVersion`. Use
+    /// `DRAFT` for the working version.
+    pub version: String,
+    /// Ask Bedrock for the guardrail assessment trace. The trace is
+    /// used to name the policies that fired in the block reason and is
+    /// never relayed to the caller. Defaults to `false`.
+    #[serde(default)]
+    pub trace: bool,
 }
 
 fn default_weight() -> u32 {
@@ -246,6 +296,34 @@ impl ProviderConfig {
         }
         if self.api_key.is_some() {
             return Err("managed_model provider must not set api_key".to_string());
+        }
+        Ok(())
+    }
+
+    /// Validate the inline Bedrock Converse guardrail block.
+    ///
+    /// `bedrock_guardrail` writes `guardrailConfig` into a Converse
+    /// request body. No other wire format has that field, so an entry
+    /// that is not Bedrock would silently drop the block and claim a
+    /// guardrail it never applied.
+    pub fn validate_bedrock_guardrail(&self) -> Result<(), String> {
+        let Some(guardrail) = self.bedrock_guardrail.as_deref() else {
+            return Ok(());
+        };
+        let format = crate::client::provider_format(self);
+        if format != crate::providers::ProviderFormat::Bedrock {
+            return Err(format!(
+                "bedrock_guardrail is only valid on a Bedrock provider; \
+                 provider_type {:?} resolves to the {format:?} wire format, \
+                 which has no guardrailConfig field",
+                self.effective_provider_type()
+            ));
+        }
+        if guardrail.identifier.trim().is_empty() {
+            return Err("bedrock_guardrail.identifier must not be empty".to_string());
+        }
+        if guardrail.version.trim().is_empty() {
+            return Err("bedrock_guardrail.version must not be empty".to_string());
         }
         Ok(())
     }
@@ -449,6 +527,7 @@ mod tests {
             service_tier: None,
             serve: None,
             aws_sigv4: None,
+            bedrock_guardrail: None,
         }
     }
 
@@ -846,6 +925,82 @@ mod tests {
         make_provider("openai")
             .validate_aws_sigv4()
             .expect("no block, nothing to check");
+    }
+
+    #[test]
+    fn bedrock_guardrail_on_a_non_bedrock_provider_is_refused() {
+        // `guardrailConfig` is a Converse request field. On any other
+        // wire format the translator has nowhere to put it, so the
+        // provider entry would claim a guardrail it silently never
+        // applies.
+        let provider: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "openai",
+            "api_key": "sk-test",
+            "bedrock_guardrail": {"identifier": "gr-1", "version": "DRAFT"},
+        }))
+        .expect("fixture provider parses");
+        let error = provider
+            .validate_bedrock_guardrail()
+            .expect_err("an OpenAI-format provider cannot carry guardrailConfig");
+        assert!(error.contains("bedrock_guardrail"), "{error}");
+        assert!(error.contains("provider_type"), "{error}");
+        assert!(error.contains("openai"), "{error}");
+
+        let bedrock: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "bedrock",
+            "aws_sigv4": {"region": "us-east-1"},
+            "bedrock_guardrail": {"identifier": "gr-1", "version": "DRAFT"},
+        }))
+        .expect("fixture provider parses");
+        bedrock
+            .validate_bedrock_guardrail()
+            .expect("a Bedrock provider accepts the block");
+    }
+
+    #[test]
+    fn an_empty_bedrock_guardrail_identifier_or_version_is_refused() {
+        for (field, body) in [
+            (
+                "identifier",
+                serde_json::json!({"identifier": "  ", "version": "DRAFT"}),
+            ),
+            (
+                "version",
+                serde_json::json!({"identifier": "gr-1", "version": ""}),
+            ),
+        ] {
+            let provider: ProviderConfig = serde_json::from_value(serde_json::json!({
+                "name": "bedrock",
+                "aws_sigv4": {"region": "us-east-1"},
+                "bedrock_guardrail": body,
+            }))
+            .expect("fixture provider parses");
+            let error = provider
+                .validate_bedrock_guardrail()
+                .expect_err("a blank {field} is not a guardrail reference");
+            assert!(error.contains(field), "{error}");
+        }
+    }
+
+    #[test]
+    fn json_schema_carries_the_bedrock_guardrail_surface() {
+        // This rustdoc ships verbatim as the operator-facing schema
+        // description, so the schema is the doc.
+        let schema = schemars::schema_for!(ProviderConfig);
+        let json = serde_json::to_string(&schema).expect("schema serializes");
+        for needle in [
+            "\"bedrock_guardrail\"",
+            "BedrockGuardrailPassthrough",
+            "\"identifier\"",
+            "guardrailIdentifier",
+        ] {
+            assert!(json.contains(needle), "schema is missing {needle}");
+        }
+        assert!(
+            !json.contains("Boxed"),
+            "the boxing rationale must stay a plain comment; it ships as \
+             the operator-facing schema description otherwise"
+        );
     }
 
     #[test]

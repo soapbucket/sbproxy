@@ -7283,8 +7283,9 @@ pub(super) async fn handle_ai_proxy(
             {
                 AiIdempotencyEngagement::Replayed { response } => {
                     if let Some(block) = ai_output_guardrail_block(
-                        ctx,
+                        Some(ctx),
                         response.status,
+                        None,
                         None,
                         multipart_external,
                         &response.body,
@@ -9547,8 +9548,9 @@ pub(super) async fn handle_ai_proxy(
     {
         AiIdempotencyEngagement::Replayed { response } => {
             if let Some(block) = ai_output_guardrail_block(
-                ctx,
+                Some(ctx),
                 response.status,
+                None,
                 guardrail_pipeline.as_deref(),
                 output_external,
                 &response.body,
@@ -9904,8 +9906,9 @@ pub(super) async fn handle_ai_proxy(
                             // not a copy of the response.
                             let mut body = hit.response.body.clone();
                             if let Some(block) = ai_output_guardrail_block(
-                                ctx,
+                                Some(ctx),
                                 hit.response.status,
+                                None,
                                 guardrail_pipeline.as_deref(),
                                 output_external,
                                 body.as_ref(),
@@ -11159,10 +11162,33 @@ pub(super) async fn handle_ai_proxy(
                             .as_ref()
                             .map(|guardrails| guardrails.external.as_slice())
                             .unwrap_or_default();
-                        if let Some(block) =
-                            external_output_guardrail_block(output_external, &o.body, &o.model)
-                                .await
-                        {
+                        // Through the same funnel the relay and the two
+                        // replay paths use, so this arm publishes an
+                        // `ai.guardrail.output` record like they do.
+                        // Cascade materializes its body outside the
+                        // relay, so it used to call the external
+                        // adapter directly and recorded nothing, which
+                        // left `docs/events.md`'s claim wider than the
+                        // code for every cascade route. `builtin` is
+                        // `None` because that is exactly the set of
+                        // guardrails this arm already ran; routing it
+                        // here adds the record and changes nothing
+                        // about what is evaluated.
+                        //
+                        // Boxed for the same reason the relay's call
+                        // is: this frame is on the Pingora worker's 2MB
+                        // stack.
+                        let cascade_block = Box::pin(ai_output_guardrail_block(
+                            Some(&*ctx),
+                            o.status,
+                            None,
+                            None,
+                            output_external,
+                            &o.body,
+                            &o.model,
+                        ))
+                        .await;
+                        if let Some(block) = cascade_block {
                             warn!(
                                 guardrail = %block.name,
                                 reason = %block.reason,
@@ -13410,15 +13436,48 @@ async fn external_output_guardrail_block(
     blocked.map(|(name, reason)| sbproxy_ai::guardrails::GuardrailBlock { name, reason })
 }
 
+/// Run the output guardrails for one response and record the verdict
+/// on the `ai.guardrail.output` funnel.
+///
+/// `provider_block` is a verdict the upstream itself already returned,
+/// ahead of anything SBproxy evaluates: today the only source is an
+/// inline Bedrock Converse `guardrailConfig` intervention, detected in
+/// [`relay_ai_response_with_cache`] off the native body before
+/// translation throws the assessment trace away. It takes precedence
+/// because the provider already refused to serve the completion; there
+/// is nothing for our own guardrails to add.
+///
+/// `ctx` is `Option` because [`relay_ai_response_with_cache`] also
+/// serves callers with no request context. Without one there is no
+/// origin or tenant to attribute the decision to, so the guardrails
+/// still run and still block but nothing is recorded.
+///
+/// Callers: the live relay, the cascade arm (which materializes its
+/// body outside the relay and passes `builtin: None`, the set it has
+/// always evaluated), the JSON and multipart idempotency replays, and
+/// the semantic-cache hit.
+///
+/// **What this cannot see.** Streaming responses. An SSE relay never
+/// materializes a response body here, so neither the guardrails nor
+/// this record run for one, including for a `ConverseStream` guardrail
+/// intervention (`format::native_streams` maps that to a
+/// `content_filter` finish reason and the client sees it, but no
+/// decision record is emitted). The live multipart relay also runs its
+/// own `multipart_external_output_guardrail_block` and does not route
+/// through here; only a multipart idempotency replay does.
 async fn ai_output_guardrail_block(
-    ctx: &RequestContext,
+    ctx: Option<&RequestContext>,
     status: u16,
+    provider_block: Option<sbproxy_ai::guardrails::GuardrailBlock>,
     builtin: Option<&sbproxy_ai::guardrails::GuardrailPipeline>,
     external: &[sbproxy_ai::external_guardrail::ExternalGuardrailConfig],
     body: &[u8],
     model: &str,
 ) -> Option<sbproxy_ai::guardrails::GuardrailBlock> {
-    let block = ai_output_guardrail_block_inner(status, builtin, external, body, model).await;
+    let block = match provider_block {
+        Some(block) if (200..300).contains(&status) => Some((None, block)),
+        _ => ai_output_guardrail_block_inner(status, builtin, external, body, model).await,
+    };
     // A non-2xx response is not a guardrail decision: the inner
     // function returns before inspecting anything, so recording here
     // would manufacture an allow for a response no guardrail read.
@@ -13460,16 +13519,18 @@ async fn ai_output_guardrail_block(
         } else {
             (Vec::new(), 0)
         };
-    record_guardrail_decision(
-        ctx,
-        sbproxy_observe::decision::DecisionEvent::AiGuardrailOutput,
-        outcome,
-        name,
-        0,
-        "output",
-        &spans,
-        spans_dropped,
-    );
+    if let Some(ctx) = ctx {
+        record_guardrail_decision(
+            ctx,
+            sbproxy_observe::decision::DecisionEvent::AiGuardrailOutput,
+            outcome,
+            name,
+            0,
+            "output",
+            &spans,
+            spans_dropped,
+        );
+    }
     block.map(|(_, block)| block)
 }
 
@@ -13701,6 +13762,33 @@ pub(super) async fn relay_ai_response_with_cache(
     };
 
     let raw_body = read_capped_response_body(resp, max_body_size).await?;
+
+    // A Bedrock Converse guardrail configured through the provider
+    // entry's `bedrock_guardrail` evaluates inside the generation call
+    // and reports an intervention as a 200 with
+    // `stopReason: guardrail_intervened`. Read it here, off the native
+    // body: `translate_success_response_bytes` below rebuilds the
+    // response from a fresh object and keeps only `output.message`,
+    // `stopReason`, and `usage`, so the `trace.guardrail` assessment
+    // that names the policies is gone by the next statement.
+    let provider_guardrail_block: Option<sbproxy_ai::guardrails::GuardrailBlock> =
+        (format == sbproxy_ai::providers::ProviderFormat::Bedrock && (200..300).contains(&status))
+            .then(|| sbproxy_ai::translators::bedrock::guardrail_intervention(&raw_body))
+            .flatten();
+    if provider_guardrail_block.is_some() {
+        // Only the block arm records. There is no provider config in
+        // scope here to say whether an inline guardrail was configured
+        // at all, so an `allow` counter would be indistinguishable from
+        // "this response was never guarded"; the denominator is the
+        // ordinary per-provider request count. `docs/guardrails.md`
+        // states the same.
+        sbproxy_ai::ai_metrics::record_external_guardrail_verdict(
+            "bedrock_inline",
+            "output",
+            "block",
+        );
+    }
+
     let inbound_format: Option<String> = ctx.as_ref().and_then(|c| c.ai_inbound_format.clone());
     let native_bypass = ctx.as_ref().map(|c| c.ai_native_bypass).unwrap_or(false);
     let direct_response_body = native_bypass.then(|| raw_body.clone());
@@ -13777,27 +13865,35 @@ pub(super) async fn relay_ai_response_with_cache(
     // Only 2xx bodies are checked; external runs only when the sync pipeline
     // did not already block, and applies its configured fail mode when bytes
     // cannot be represented as text.
-    let output_block: Option<sbproxy_ai::guardrails::GuardrailBlock> =
-        if (200..300).contains(&status) {
-            let governed_client_body = direct_client_body.as_ref().unwrap_or(&resp_body);
-            let sync_block = output_guardrails
-                .as_ref()
-                .and_then(|g| g.check_output_bytes(governed_client_body));
-            if sync_block.is_some() {
-                sync_block
-            } else {
-                external_output_guardrail_block(
-                    output_external,
-                    governed_client_body,
-                    ctx.as_ref()
-                        .and_then(|context| context.ai_model.as_deref())
-                        .unwrap_or(""),
-                )
-                .await
-            }
-        } else {
-            None
-        };
+    //
+    // WOR-2649: this runs through `ai_output_guardrail_block` rather
+    // than calling the evaluators inline, so the live path emits the
+    // same `ai.guardrail.output` decision record the idempotency and
+    // semantic-cache replays already emitted. It previously emitted
+    // none: an operator with `decision_audit` on saw output-guardrail
+    // decisions for replayed responses and nothing at all for the
+    // responses the provider actually generated.
+    //
+    // Boxed: this frame is on the Pingora worker's 2MB stack and the
+    // funnel's future is materially larger than the bare
+    // `external_output_guardrail_block` future it replaces.
+    let output_block: Option<sbproxy_ai::guardrails::GuardrailBlock> = {
+        let governed_client_body = direct_client_body.as_ref().unwrap_or(&resp_body);
+        let model = ctx
+            .as_ref()
+            .and_then(|context| context.ai_model.as_deref())
+            .unwrap_or("");
+        Box::pin(ai_output_guardrail_block(
+            ctx.as_deref(),
+            status,
+            provider_guardrail_block,
+            output_guardrails.as_deref(),
+            output_external,
+            governed_client_body,
+            model,
+        ))
+        .await
+    };
     if let Some(block) = output_block {
         warn!(
             guardrail = %block.name,
@@ -21723,6 +21819,215 @@ origins:
         }
     }
 
+    /// Read one `sbproxy_decision_event_total` sample by its labels.
+    /// Sampled before and after so a concurrently running test in the
+    /// same process cannot make a delta assertion pass on someone
+    /// else's increment.
+    fn decision_event_total(labels: &[(&str, &str)]) -> f64 {
+        sbproxy_observe::metrics::metrics()
+            .render()
+            .lines()
+            .find(|line| {
+                line.starts_with("sbproxy_decision_event_total")
+                    && labels
+                        .iter()
+                        .all(|(key, value)| line.contains(&format!("{key}=\"{value}\"")))
+            })
+            .and_then(|line| line.rsplit(' ').next()?.parse().ok())
+            .unwrap_or(0.0)
+    }
+
+    /// Read one `sbproxy_ai_external_guardrail_verdicts_total` sample.
+    fn external_guardrail_verdict_total(labels: &[(&str, &str)]) -> f64 {
+        let families = prometheus::gather();
+        families
+            .iter()
+            .find(|family| family.name() == "sbproxy_ai_external_guardrail_verdicts_total")
+            .into_iter()
+            .flat_map(|family| family.get_metric())
+            .filter(|metric| {
+                labels.iter().all(|(key, value)| {
+                    metric
+                        .get_label()
+                        .iter()
+                        .any(|label| label.name() == *key && label.value() == *value)
+                })
+            })
+            .map(|metric| metric.get_counter().value())
+            .sum()
+    }
+
+    /// WOR-2649 (Seam C). The live upstream response never reached the
+    /// `ai.guardrail.output` funnel: an idempotency replay and a
+    /// semantic-cache hit each emitted a decision record, and the
+    /// response the provider actually generated emitted none. An
+    /// operator with `decision_audit` on therefore saw output-guardrail
+    /// decisions only for replays, which is the least interesting
+    /// subset.
+    ///
+    /// This has nothing to do with Bedrock, and that is the point: the
+    /// fix belongs to the funnel, not to one provider's detector.
+    #[tokio::test]
+    async fn a_live_output_guardrail_block_emits_one_output_guardrail_decision() {
+        // Scoped to a tenant label no other test uses:
+        // `sbproxy_decision_event_total` is process-global and several
+        // tests in this module publish the same event, so a bare delta
+        // would pass on a sibling's increment under `cargo test`.
+        let deny = [
+            ("event", "ai.guardrail.output"),
+            ("outcome", "deny"),
+            ("tenant", "wor2649-live-block"),
+        ];
+        let before = decision_event_total(&deny);
+
+        let (guardrail_url, _received) = blocking_guardrail().await;
+        let (upstream_url, _upstream_hits) = upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"provider-controlled text"}}]}"#,
+        )
+        .await;
+        let config = proxy_config(&upstream_url, guardrail_url, "post_call");
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        context.tenant_id = "wor2649-live-block".into();
+        let (pipeline, _semantic, _idempotency) = pipeline_with_recording_caches().await;
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("output block is a handled response");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "response was {response}"
+        );
+        assert_eq!(
+            decision_event_total(&deny) - before,
+            1.0,
+            "the live response path must publish exactly one ai.guardrail.output deny"
+        );
+    }
+
+    /// WOR-2649 (Seam A + Seam B). A Bedrock Converse guardrail
+    /// configured on the provider entry answers an intervention with a
+    /// **200** carrying `stopReason: guardrail_intervened`. Nothing in
+    /// the product read that: `body_refinable_client_status` only
+    /// classifies 400/422, so the intervention relayed to the caller as
+    /// a successful, empty completion.
+    #[tokio::test]
+    async fn a_bedrock_inline_guardrail_intervention_blocks_the_live_response() {
+        let deny = [
+            ("event", "ai.guardrail.output"),
+            ("outcome", "deny"),
+            ("tenant", "wor2649-bedrock-inline"),
+        ];
+        let before_deny = decision_event_total(&deny);
+        let inline = [("provider", "bedrock_inline"), ("outcome", "block")];
+        let before_metric = external_guardrail_verdict_total(&inline);
+
+        // A Converse intervention: 200, no content, and a trace whose
+        // `customWords[].match` is the caller's own text.
+        let (upstream_url, upstream_hits) = upstream_fixture(
+            r#"{"stopReason":"guardrail_intervened","output":{"message":{"role":"assistant","content":[{"text":""}]}},"usage":{"inputTokens":11,"outputTokens":0,"totalTokens":11},"trace":{"guardrail":{"outputAssessments":{"gr-abc123":[{"contentPolicy":{"filters":[{"type":"VIOLENCE","action":"BLOCKED","detected":true}]},"wordPolicy":{"customWords":[{"match":"hunter2-secret-passphrase","action":"BLOCKED","detected":true}]}}]}}}}"#,
+        )
+        .await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "bedrock",
+                "provider_type": "bedrock",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "bedrock_guardrail": {
+                    "identifier": "gr-abc123",
+                    "version": "DRAFT",
+                    "trace": true,
+                },
+            }],
+        }))
+        .expect("bedrock proxy config");
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "anthropic.claude-3-5-sonnet-20240620-v1:0",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        context.tenant_id = "wor2649-bedrock-inline".into();
+        let (pipeline, _semantic, recording_idempotency) = pipeline_with_recording_caches().await;
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("a provider guardrail block is a handled response");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "a Converse intervention must not relay as a 200 completion: {response}"
+        );
+        assert!(
+            response.contains("guardrail_violation"),
+            "response was {response}"
+        );
+        assert!(
+            response.contains("bedrock_guardrail"),
+            "the envelope names the layer that refused: {response}"
+        );
+        assert!(
+            response.contains("content_filter:VIOLENCE"),
+            "the reason names the policy that fired: {response}"
+        );
+        assert!(
+            !response.contains("hunter2-secret-passphrase"),
+            "the assessment's matched span is caller content and must never \
+             reach the envelope: {response}"
+        );
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            context.ai_outcome.as_deref(),
+            Some("guardrail_block"),
+            "a provider-native block reports the same outcome every other \
+             output-guardrail block reports, or two dashboards counting \
+             guardrail blocks stop agreeing"
+        );
+        assert_eq!(
+            recording_idempotency.puts.load(Ordering::SeqCst),
+            0,
+            "a blocked generation must not be admitted to any cache"
+        );
+        assert_eq!(
+            decision_event_total(&deny) - before_deny,
+            1.0,
+            "exactly one ai.guardrail.output deny"
+        );
+        assert_eq!(
+            external_guardrail_verdict_total(&inline) - before_metric,
+            1.0,
+            "the inline verdict is labeled bedrock_inline, distinct from the \
+             out-of-band ApplyGuardrail provider label"
+        );
+    }
+
     #[tokio::test]
     async fn external_output_guardrail_rejects_buffered_provider_text_before_it_can_be_served() {
         let (guardrail_url, received) = blocking_guardrail().await;
@@ -21930,6 +22235,14 @@ origins:
 
     #[tokio::test]
     async fn cascade_external_output_guardrail_blocks_the_selected_tier_model() {
+        // Scoped to a tenant label no other test uses, because
+        // `sbproxy_decision_event_total` is process-global.
+        let deny = [
+            ("event", "ai.guardrail.output"),
+            ("outcome", "deny"),
+            ("tenant", "wor2649-cascade-block"),
+        ];
+        let before_deny = decision_event_total(&deny);
         let (guardrail_url, received) = blocking_guardrail().await;
         let (upstream_url, upstream_hits) = upstream_fixture(
             r#"{"confidence_score":1.0,"choices":[{"message":{"role":"assistant","content":"cascade provider text"}}]}"#,
@@ -21942,6 +22255,7 @@ origins:
         }))
         .await;
         let mut context = crate::context::RequestContext::new();
+        context.tenant_id = "wor2649-cascade-block".into();
         let (pipeline, recording_semantic, recording_idempotency) =
             pipeline_with_recording_caches().await;
 
@@ -21996,6 +22310,17 @@ origins:
                 "model": "cascade-selected-model",
                 "phase": "output"
             })
+        );
+        // Cascade materializes its response outside the relay, so it is
+        // a third live path into the output-guardrail funnel and has to
+        // publish the record the other two publish. `docs/events.md`
+        // names the two exceptions (streamed, live multipart); a
+        // cascade route is not one of them.
+        assert_eq!(
+            decision_event_total(&deny) - before_deny,
+            1.0,
+            "a cascade output-guardrail block must publish one \
+             ai.guardrail.output deny"
         );
     }
 

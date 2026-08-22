@@ -199,6 +199,17 @@
           "type": "null"
         }
       ]
+    },
+    "bedrock_guardrail": {
+      "description": "Amazon Bedrock guardrail applied inline by the Converse call itself.\n\nSet this to have Bedrock evaluate the prompt and the completion inside the same request that generates them, rather than as a separate `ApplyGuardrail` call. An intervention comes back on a 200 response as `stopReason: guardrail_intervened`; SBproxy turns that into a 403 `guardrail_violation`, records it on the output guardrail decision feed under the name `bedrock_guardrail`, and never admits the response to any cache.\n\nValid only when this provider entry resolves to the Bedrock wire format. Configuring it on any other provider is refused at config load.\n\nThis is a different control from `guardrails.external[]` with `provider: bedrock`, which is an out-of-band `ApplyGuardrail` call against the same AWS guardrail object. Both may be configured; the account is then charged for two evaluations.\n\nThere is no failure posture for this block. The guardrail runs inside the generation call, so a rejected or unauthorized guardrail configuration fails the whole call before any tokens are produced and is handled by the ordinary provider-failure path.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/BedrockGuardrailPassthrough"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "definitions": {
@@ -1105,6 +1116,30 @@
           ]
         }
       ]
+    },
+    "BedrockGuardrailPassthrough": {
+      "description": "Inline Bedrock Converse guardrail settings.",
+      "type": "object",
+      "required": [
+        "identifier",
+        "version"
+      ],
+      "properties": {
+        "identifier": {
+          "description": "Bedrock guardrail identifier, sent as `guardrailIdentifier`.",
+          "type": "string"
+        },
+        "version": {
+          "description": "Bedrock guardrail version, sent as `guardrailVersion`. Use `DRAFT` for the working version.",
+          "type": "string"
+        },
+        "trace": {
+          "description": "Ask Bedrock for the guardrail assessment trace. The trace is used to name the policies that fired in the block reason and is never relayed to the caller. Defaults to `false`.",
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

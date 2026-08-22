@@ -478,6 +478,8 @@ mod tests {
             workflow_id: None,
             logical_model: None,
             served_model: None,
+            finish_reason: None,
+            shadow_of: None,
         }
     }
 
