@@ -567,6 +567,16 @@ mod tests {
     use crate::policy::quote_token::InMemoryNonceStore;
     use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
+    /// Wall-clock seconds. The verifier's freshness window is
+    /// symmetric, so a fixture pinned to a 2023 `created` is refused as
+    /// stale before any crypto runs.
+    fn now_epoch() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the epoch")
+            .as_secs()
+    }
+
     fn ed25519_keypair() -> (Vec<u8>, Vec<u8>) {
         let rng = ring::rand::SystemRandom::new();
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
@@ -588,7 +598,8 @@ mod tests {
         let kp = Ed25519KeyPair::from_pkcs8(pkcs8).unwrap();
         let label = "sig1";
         let sig_input_value = format!(
-            "{label}=(\"@method\" \"@target-uri\");created=1700000000;keyid=\"{key_id}\";alg=\"ed25519\";nonce=\"{nonce}\""
+            "{label}=(\"@method\" \"@target-uri\");created={};keyid=\"{key_id}\";alg=\"ed25519\";nonce=\"{nonce}\"",
+            now_epoch()
         );
         let req_base = http::Request::builder()
             .method("GET")
@@ -715,7 +726,7 @@ mod tests {
         // Build a minimal Signature-Input + Signature for a GET. The
         // signature base for ("@method";"@target-uri") + the
         // @signature-params component is what the verifier reconstructs.
-        let created = 1_700_000_000u64;
+        let created = now_epoch();
         let key_id = "gptbot-key-2026";
         let label = "sig1";
         let sig_input_value = format!(
@@ -899,7 +910,8 @@ mod tests {
         let kp = Ed25519KeyPair::from_pkcs8(&pkcs8).unwrap();
         let label = "sig1";
         let sig_input_value = format!(
-            "{label}=(\"@method\" \"@target-uri\");created=1700000000;keyid=\"{key_id}\";alg=\"ed25519\""
+            "{label}=(\"@method\" \"@target-uri\");created={};keyid=\"{key_id}\";alg=\"ed25519\"",
+            now_epoch()
         );
         let req_base = http::Request::builder()
             .method("GET")

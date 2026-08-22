@@ -305,6 +305,30 @@ agent_classes:
 | `resolver.bot_auth_keyid_enabled` | bool | `true` | Let a verified Web Bot Auth `keyid` match `expected_keyids` as resolver step 1. |
 | `resolver.cache_size` | int | `10000` | Per-process reverse-DNS verdict cache capacity. |
 
+Step 2 queries a reverse zone the client controls, so it runs under fixed
+bounds rather than operator-set ones:
+
+- At most four PTR names per address are forward-confirmed. A zone that
+  answers with more is not verified further.
+- Each DNS query is capped at two seconds. The forward-confirm loop
+  stops issuing new lookups once two seconds of it have elapsed, so a
+  whole verification, PTR query included, costs at most about six
+  seconds of wall clock.
+- At most 32 of these queries are in flight process-wide. Past that a
+  lookup is refused rather than queued, because a queued one still holds
+  the thread waiting on it.
+- Verdicts are cached per client IP, up to `cache_size` addresses: 300
+  seconds for a resolved verdict, 30 seconds for a DNS failure, so an
+  address with no PTR record costs one lookup per 30 seconds rather than
+  one per request.
+- The lookup runs on the blocking pool, never on the async worker
+  handling the request, and only on a request that actually needs it.
+
+A client that fails or exceeds any of these is not classified by rDNS;
+resolution falls through to the User-Agent pass, exactly as it does for
+an unreachable resolver. Set `resolver.rdns_enabled: false` to skip step
+2 entirely.
+
 ### Egress allowlists
 
 The optional top-level `egress` block arms per-purpose outbound
@@ -2722,7 +2746,7 @@ origins:
 | `type` | string | required | Must be `hmac_auth`. |
 | `keys` | list | required | Accepted signing keys, at least one. Each entry needs a unique `key_id` (the RFC 9421 `keyid` the signer advertises) and a `secret`. Entries also accept the per-credential metadata fields (`project`, `user`, `team`, `tags`, `metadata`). |
 | `clock_skew_seconds` | int | 300 | Freshness window for the mandatory `created` signature parameter, applied in both directions. A `created` older than the window is refused as a replay; one further in the future is refused as skewed. |
-| `required_components` | list | `["@method", "@target-uri"]` | Components every accepted signature must cover. The default binds the verb and the path-and-query, so a captured signature cannot be replayed against a different route. Add `content-digest` to bind the request body as well. |
+| `required_components` | list | `["@method", "@target-uri"]` | Components every accepted signature must cover. The default binds the verb and the full target URI, so a captured signature cannot be replayed against a different route. Add `content-digest` to bind the request body as well. |
 
 The `secret` resolves through the secret resolver like every other signing-key field: an inline literal, `${VAR}`, `env:NAME`, `file:PATH`, or a backend URI such as `vault://...`. A reference nothing can resolve refuses to boot rather than becoming the key. Verification failures answer `401` with a `WWW-Authenticate: Signature` challenge that carries no key material, and the failure reason is logged, never returned to the client.
 
@@ -2734,6 +2758,17 @@ Signature: sig1=:BASE64_HMAC_SHA256_OF_SIGNATURE_BASE:
 ```
 
 On a match the principal's `sub` is the `key_id`, `principal_kind` is `hmac_auth`, and the entry's metadata rides along for per-credential reporting.
+
+`@target-uri` is the absolute URI RFC 9421 §2.2.2 defines, scheme and
+authority included: `https://api.example.com/v1/orders?page=2`, not
+`/v1/orders?page=2`. Sign it the way any conformant RFC 9421 library
+does and the proxy reconstructs the same string. Earlier releases
+derived the path and query alone; a signature in that older shape is
+still accepted for a deprecation window, counted on
+`sbproxy_signature_legacy_derivation_total{component}` and logged once
+per process with the verifier's key id. `@request-target`, for the same reason, is
+the bare request target (`/v1/orders?page=2`) rather than
+draft-cavage's `GET /v1/orders?page=2`.
 
 The default components bind the verb and the route, not the body. A signature over `("@method" "@target-uri")` alone says nothing about the bytes that follow it, so a request captured off the wire can be replayed with a different body until its `created` timestamp falls outside `clock_skew_seconds`. Covering `content-digest` is what closes that:
 
@@ -4863,9 +4898,23 @@ origins:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | true | Master switch. Alias: `enable`. |
-| `algorithms` | list | | Allowed algorithms in priority order (e.g. `["br", "gzip"]`) |
+| `algorithms` | list | | Allowed algorithms in priority order (e.g. `["br", "gzip"]`). Valid entries are `zstd`, `br`, and `gzip`; anything else fails config load. |
 | `min_size` | int | 0 | Minimum response size in bytes before compression is applied |
 | `level` | int | | Encoder effort, clamped into the negotiated algorithm's range (gzip 0-9, brotli 0-11, zstd 1-22). Unset keeps each library's default. |
+
+`algorithms` is a priority order, not a set. The list is walked as
+authored and the first entry the client's `Accept-Encoding` accepts is
+the one served, so `algorithms: [gzip, br]` sends gzip to a browser that
+accepts both, which is what you want when something downstream caches on
+`Content-Encoding`. Leave the list empty to take the built-in order,
+best ratio first: `zstd`, then `br`, then `gzip`.
+
+Client quality values are honored as refusals per RFC 9110 §12.5.3.
+`Accept-Encoding: gzip;q=0` means gzip is not acceptable to that client
+and the proxy will not send it, and the standard opt-out
+`Accept-Encoding: identity;q=1, *;q=0` gets an uncompressed response.
+A `*` stands in only for codings the header does not name on its own, so
+`gzip, *;q=0` is a gzip-only request.
 
 ---
 
@@ -5232,7 +5281,9 @@ retries. The middleware reads the `Idempotency-Key` request header,
 hashes the request body, and:
 
 - **First call** under a given key: forwards the request upstream and
-  caches the response under `(workspace, key)` keyed by the body hash.
+  caches the response under `(tenant, origin, key)` keyed by the body
+  hash. Two origins never see each other's entries, including on the
+  `redis` backend where they share one store.
 - **Replay** with the same key + same body: returns the cached
   response with `x-sbproxy-idempotency: HIT`. The upstream is not
   contacted.
@@ -6077,6 +6128,12 @@ A single node keeps its certificates in a local `redb` file (the default), so a 
 
 Anything outside that list is rejected. `sbproxy plan` reports it as `unknown-acme-storage-backend` and the proxy refuses to start on it, rather than falling back to an in-memory store that would re-issue every certificate on every restart.
 
+**A configured backend that cannot be opened.** Naming a valid backend is not the same as being able to open it: a Redis DSN can be malformed, a bucket URL can be unparseable, a shared directory can be unmounted. What happens next depends on which half of the table you are in.
+
+A shared backend (`file`, `redis`, `s3`, `gcs`, `azure`) that cannot be opened refuses to start, and the error names the backend. This is not about persistence. The in-memory store the proxy used to fall back to has no cross-node lock at all, so every replica wins its own issuance lease: three replicas open three orders for the same hostname and publish three HTTP-01 tokens to three stores no peer can read, roughly two thirds of the CA's validation fetches land on a replica that has never seen the token, and the account burns through Let's Encrypt's limit of five duplicate certificates per hostname set per week. A pod that will not start is the cheaper failure.
+
+A pod-local backend (`redb`, `sqlite`, `memory`) still falls back to in-memory, because a single node has nothing to be mutually excluded from. It is no longer quiet about it: the log line is at `error` and names the backend, and `sbproxy_cert_store_degraded{backend="..."}` goes to `1`. Alert on that. The cost is real, which is that every certificate is re-issued on every restart. The same gauge reads `0` when the configured backend opened. It is published only by a proxy that has an `acme` block at all, so on a fleet where ACME is on everywhere an absent series is a proxy that never started rather than a healthy one, and on a mixed fleet it is that or a proxy with no ACME configured. Scope the alert to the proxies you expect to issue certificates.
+
 The shared backends hold the issuance lease as an atomic create, and the holder renews it every 20 seconds for as long as the CA takes. A node that crashes mid-issue does not wedge the others: the lease stops being renewed, expires after 120 seconds, and another node takes over with a conditional write, so two nodes racing the same expired lease see exactly one winner. Every takeover carries a fencing generation, and publication is checked against it, so a node that stalled past its lease and lost it cannot overwrite its successor's certificate however late its own order finishes.
 
 #### HTTP-01 behind a load balancer
@@ -6736,13 +6793,27 @@ A legacy `enable` flag (alias `enabled`) still parses, and the runtime has never
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `allowed_origins` | list | | Allowed origins (use `["*"]` for any). Alias: `allow_origins`. |
+| `allowed_origins` | list | | Allowed origins (use `["*"]` for any). Alias: `allow_origins`. An empty list is deny-all. |
 | `allowed_methods` | list | standard methods | Allowed HTTP methods. Alias: `allow_methods`. |
 | `allowed_headers` | list | standard headers | Allowed request headers. Alias: `allow_headers`. |
 | `expose_headers` | list | | Headers exposed to the browser |
 | `max_age` | int | | Preflight cache duration in seconds |
-| `allow_credentials` | bool | false | Allow credentials (cookies, auth headers) |
+| `allow_credentials` | bool | false | Allow credentials (cookies, auth headers). Refused at config load in combination with `allowed_origins: ["*"]`. |
 | `enable` | bool | unset | Legacy flag, alias `enabled`. Parsed but ignored at runtime. |
+
+`allowed_origins: ["*"]` together with `allow_credentials: true` fails
+config load. Browsers reject that pair per the Fetch standard, so the
+proxy has always refused to emit any CORS header for it; refusing the
+config instead means you find out at `sbproxy validate` rather than from
+a browser console. Name the origins you mean, or drop
+`allow_credentials`.
+
+A preflight is an `OPTIONS` request carrying
+`Access-Control-Request-Method`, which is what the Fetch standard
+defines it as. A plain `OPTIONS` that carries only `Origin` is a normal
+request and reaches the upstream, so an API that implements `OPTIONS`
+itself (a discovery endpoint returning `Allow:`, or WebDAV) keeps
+working when a `cors:` block is added in front of it.
 
 ---
 

@@ -45,6 +45,9 @@ pub mod fake_sinks;
 pub mod golden_signals;
 /// `/healthz` and `/readyz` registry, probes, and HTTP handlers.
 pub mod health;
+/// The identifier of this proxy process, carried by every record whose
+/// meaning depends on knowing which replica emitted it.
+pub mod instance;
 /// Global tracing subscriber configuration (log level and format).
 pub mod logging;
 /// The `sbproxy_meter_*` families: what the attested meter reports about

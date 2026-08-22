@@ -1,5 +1,5 @@
 # Web Bot Auth
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 ![an unsigned crawler request rejected with 401 and a signature-required challenge](assets/web-bot-auth.gif)
 
@@ -41,7 +41,7 @@ authentication:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `agents` | list | `[]` | Inline directory of known agents. Each `key_id` must be unique. May be empty when `directory:` is set; at least one of the two is required. |
-| `clock_skew_seconds` | int | 30 | Tolerance for the `created` / `expires` parameters. |
+| `clock_skew_seconds` | int | 30 | Freshness window for the `created` parameter, applied in both directions: a signature more than this many seconds old is refused as stale, and one that far in the future is refused as skewed. An `expires` the signer sends may shorten the window but never extend it. This window is the replay bound for a signature carrying no `nonce`. |
 | `directory` | object | unset | Dynamic hosted-directory configuration: `url` (HTTPS only), `refresh_interval_secs` (default 24h, clamped to 5m-24h), `negative_cache_ttl_secs`, `stale_grace_secs`, plus self-signature verification on by default. When set, the provider resolves `Signature-Agent` headers by fetching the JWKS-shaped hosted directory. |
 | `nonce_policy` | string | `strict` | Replay policy when the verifier observes a `nonce` parameter. `strict` fails a replayed nonce; `permissive` counts it in metrics but still verifies (shadow rollouts). Inert unless a nonce store is wired. |
 | `agents[].name` | string | required | Human-readable agent name. Surfaced in logs. |
@@ -154,10 +154,27 @@ cover the request being made, because `@target-uri` and `@method` are inside
 the signature base. Drop those from `required_components` and a captured
 signature becomes a bearer token for the whole origin.
 
-Both replays report the same generic `verification failed`. A mismatch, an
-expired `created` outside `clock_skew_seconds`, a malformed header, and a
-missing required component are indistinguishable to the caller; the specific
-reason goes to the structured log under the `sbproxy::auth` target.
+Both replays report the same generic `verification failed`. A mismatch, a
+`created` outside `clock_skew_seconds` in either direction, a malformed
+header, and a missing required component are indistinguishable to the caller;
+the specific reason goes to the structured log under the `sbproxy::auth`
+target.
+
+The `created` window is what stops a captured signature from being replayed
+forever. `nonce` is optional in the Web Bot Auth profile and
+`required_components` can require a component but never a parameter, so a
+signature with no `nonce` and no `expires` has nothing else bounding it.
+Thirty seconds is the default; raise it only as far as your signers' real
+clock drift needs.
+
+`@target-uri` is the absolute URI RFC 9421 §2.2.2 defines, scheme and
+authority included (`https://blog.example/article`). Sign it with any
+conformant RFC 9421 library and the proxy reconstructs the same string.
+Earlier releases derived the path alone, and a signature in that older shape
+is still accepted for a deprecation window. Every acceptance counts on
+`sbproxy_signature_legacy_derivation_total{component}` and the proxy logs one
+`warn` per process naming the verifier's key id, so you can tell whether any
+signer still depends on the old shape before the fallback is removed.
 
 ## Agent-class resolver relationship
 

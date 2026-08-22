@@ -43,6 +43,8 @@ WWW-Authenticate: Signature
 
 To sign, build the RFC 9421 signature base (one line per covered component, then the `@signature-params` line), HMAC it, and send the `Signature-Input` / `Signature` pair:
 
+The base below writes `"@target-uri": /`, the path alone, which is the derivation earlier releases used. RFC 9421 §2.2.2 defines the component as the absolute URI (`http://hmac.local/` here) and that is what the proxy reconstructs now; the path form is still accepted for a deprecation window, and the proxy logs once per process when one arrives. A signer built on a conformant RFC 9421 library needs no change.
+
 ```bash
 created=$(date +%s)
 base=$(printf '"@method": GET\n"@target-uri": /\n"@signature-params": ("@method" "@target-uri");created=%s;keyid="svc-billing";alg="hmac-sha256"' "$created")

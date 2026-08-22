@@ -24,7 +24,7 @@ Type `curl -v -H 'Host: api.local' http://127.0.0.1:8080/headers`
 Enter
 Sleep 1.6s
 
-Type `curl -v -H 'Host: api.local' -H 'Origin: https://example.com' -X OPTIONS http://127.0.0.1:8080/headers`
+Type `curl -v -H 'Host: api.local' -H 'Origin: https://example.com' -H 'Access-Control-Request-Method: POST' -X OPTIONS http://127.0.0.1:8080/headers`
 Enter
 Sleep 1.6s
 

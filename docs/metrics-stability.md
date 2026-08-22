@@ -189,6 +189,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_capture_budget_dropped_total` | Counter | `stable` | `beta` | `workspace`, `dimension` | Capture envelope dimensions dropped because the per-workspace budget was exhausted. |
 | `sbproxy_capture_dropped_total` | Counter | `stable` | `beta` | `workspace`, `dimension`, `reason` | Capture envelope dimensions dropped during capture, by reason. |
 | `sbproxy_cert_expiry_seconds` | Gauge | `stable` | `beta` | none | Seconds until the active certificate for the host expires; negative when expired. |
+| `sbproxy_cert_store_degraded` | Gauge | `stable` | `beta` | `backend` | 1 when the configured certificate store could not be opened and an in-memory fallback is in use, 0 when the configured backend opened. |
 | `sbproxy_circuit_breaker_transitions_total` | Counter | `stable` | `beta` | `origin`, `from_state`, `to_state` | Circuit breaker state transitions, by origin and from/to state. |
 | `sbproxy_clock_skew_seconds` | Gauge | `config_only` (nothing emits this yet) | `alpha` | none | Local clock offset from the SNTP reference, in seconds. |
 | `sbproxy_compression_decisions_total` | Counter | `stable` | `beta` | `codec`, `result` | Compression middleware decisions, by codec and outcome. |
@@ -205,6 +206,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_config_revision_info` | Gauge | `stable` | `beta` | `revision`, `digest`, `provenance` | Current entry in the config revision ring; always 1, the revision/digest/provenance are the labels. |
 | `sbproxy_config_source_fetch_total` | Counter | `stable` | `beta` | `kind`, `result` | Config source resolutions, by source kind and result. |
 | `sbproxy_config_source_revision_info` | Gauge | `stable` | `beta` | `sha` | Commit the config source resolved to; always 1, the commit is the label. |
+| `sbproxy_cors_refusals_total` | Counter | `stable` | `beta` | `reason` | Responses the CORS middleware refused to add headers to, by reason. |
 | `sbproxy_credential_resolution_duration_seconds` | Histogram | `stable` | `beta` | `cache`, `outcome` | Wall-clock latency of one bound-credential resolution, by which cache layer answered and the real outcome. |
 | `sbproxy_egress_refused_total` | Counter | `stable` | `beta` | `purpose`, `reason`, `tenant`, `origin` | Outbound dials refused by purpose-scoped egress authorization, by purpose, closed reason, tenant, and origin. |
 | `sbproxy_errors_total` | Counter | `stable` | `beta` | `hostname`, `error_type` | Total errors. |
@@ -348,6 +350,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_semantic_cache_results_total` | Counter | `stable` | `beta` | `tenant`, `origin`, `source`, `result` | Semantic-cache hit/miss/error counts. |
 | `sbproxy_serve_lane_admissions_total` | Counter | `config_only` (nothing emits this yet) | `alpha` | `priority`, `decision` | Served-lane admission gate decisions by priority lane. |
 | `sbproxy_security_headers_csp_emitted_total` | Counter | `stable` | `beta` | `mode`, `tenant` | Content-Security-Policy headers emitted by the security_headers policy, by mode (enforce, report_only). |
+| `sbproxy_signature_legacy_derivation_total` | Counter | `stable` | `beta` | `component` | RFC 9421 signatures accepted only against the pre-conformance derivation of a request-target component, by component. |
 | `sbproxy_silent_degradations_total` | Counter | `config_only` (nothing emits this yet) | `alpha` | `op` | Best-effort operations that failed and were previously dropped silently, by op. |
 | `sbproxy_sink_install_failures_total` | Counter | `stable` | `beta` | none | Failed installs of the process-wide telemetry sink dispatcher. |
 | `sbproxy_synthetic_probe_failures_total` | Counter | `stable` | `beta` | `reason` | Synthetic readiness probe failures by reason. |

@@ -85,16 +85,20 @@ pub(super) fn agent_class_label(ctx: &RequestContext) -> &'static str {
 ///   overlay path. Falls back to defaults with the same warning.
 /// - Any other catalog string: warns and falls back to defaults.
 ///
-/// DNS resolver: the OSS build does not pull `hickory-resolver`, so we
-/// install [`sbproxy_security::agent_verify::SystemResolver`]. Its
-/// `reverse()` returns an error verdict; the resolver chain treats
-/// that as a transient miss and falls through to UA matching, matching
-/// the documented "no working PTR" degradation path. Operators who
-/// want forward-confirmed rDNS in production can flip
-/// `agent_classes.resolver.rdns_enabled: false` to skip the lookup
-/// entirely (saves a syscall) until a real resolver lands.
+/// DNS resolver: [`sbproxy_security::agent_verify::SystemResolver`],
+/// which is a real resolver. `hickory-resolver` is a non-optional
+/// dependency of `sbproxy-security`, so `reverse()` issues an actual
+/// PTR query against the host DNS configuration, and this function
+/// runs unconditionally in the default build. An operator who does not
+/// want PTR lookups on the request path sets
+/// `agent_classes.resolver.rdns_enabled: false`, which skips resolver
+/// step 2 entirely; otherwise the lookup happens, bounded by the caps
+/// documented on `sbproxy_security::agent_verify` and moved off the
+/// async worker by `agent_class::stamp_request_context_offloaded`. A
+/// client IP with no PTR record yields a `DnsError` verdict, which the
+/// resolver chain treats as a miss and falls through to UA matching.
 ///
-/// Cache size honours `agent_classes.resolver.cache_size`; the default
+/// Cache size honors `agent_classes.resolver.cache_size`; the default
 /// (10 000 entries) matches the OSS recommendation in the resolver
 /// docs.
 #[cfg(feature = "agent-class")]
@@ -134,7 +138,7 @@ pub(super) fn install_agent_class_resolver(block: Option<&sbproxy_config::AgentC
                 other => {
                     tracing::warn!(
                         catalog = %other,
-                        "agent_classes.catalog '{}' is not recognised; falling back to \
+                        "agent_classes.catalog '{}' is not recognized; falling back to \
                          the built-in defaults",
                         other,
                     );
@@ -255,7 +259,7 @@ pub(super) fn redact_pii_other_fields(
             Some(r) => RedactorRef::Scoped(r),
             // No matching rule names: no-op so the caller falls back
             // to the cheap `redact_secrets` pass alone, matching the
-            // header-scope behaviour in `capture_headers_for_log`.
+            // header-scope behavior in `capture_headers_for_log`.
             None => return,
         }
     };
