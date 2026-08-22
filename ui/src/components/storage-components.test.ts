@@ -9,7 +9,12 @@ import {
   shortDigest,
   storageRows,
 } from "../lib/storage";
+import {
+  STORAGE_OP_DURATION_FAMILY,
+  STORAGE_OP_ERRORS_FAMILY,
+} from "../lib/storage-ops";
 import filesTable from "./ModelFilesTable.vue?raw";
+import backendOps from "./StorageBackendOps.vue?raw";
 import storageView from "../views/StorageView.vue?raw";
 
 const QWEN_DIGEST =
@@ -212,5 +217,51 @@ describe("cache GC", () => {
     ).toBeNull();
     expect(storageView).toContain(':title="gcDisabledReason ?? undefined"');
     expect(storageView).toContain("{{ gcDisabledReason }}");
+  });
+});
+
+describe("storage backend operations panel", () => {
+  it("loads the metrics scrape beside the artifact inventory", () => {
+    expect(storageView).toContain("api.metrics()");
+    expect(storageView).toContain("void metricsReq.run()");
+    expect(storageView).toContain("parsePrometheus(");
+  });
+
+  it("keeps the backend panel outside the files error branch", () => {
+    // A node with no model host 404s the files report. Backend health is a
+    // different question and is often the one being asked when it does.
+    const filesTemplateEnd = storageView.indexOf("</template>\n\n  <StorageBackendOps");
+    expect(filesTemplateEnd).toBeGreaterThan(-1);
+  });
+
+  it("names both storage families, which no build guard watches", () => {
+    expect(STORAGE_OP_DURATION_FAMILY).toBe("storage_op_duration_seconds");
+    expect(STORAGE_OP_ERRORS_FAMILY).toBe("storage_op_errors_total");
+    expect(backendOps).toContain("storageOps(props.families)");
+  });
+
+  it("says what would have to happen for data to appear", () => {
+    expect(backendOps).toContain('v-else-if="!report"');
+    expect(backendOps).toContain("No storage backend has run an operation");
+    expect(backendOps).toContain("serves its first read or write");
+  });
+
+  it("separates a missing latency reading from a zero one", () => {
+    expect(backendOps).toContain("not reported");
+    expect(backendOps).toContain("true\n            zero, not a missing reading");
+    // p95 is undefined when the histogram is absent; never render it as 0.
+    expect(backendOps).not.toMatch(/p95Seconds \?\? 0/);
+  });
+
+  it("labels the numbers for an operator, not for the exporter", () => {
+    expect(backendOps).toContain('label="Backend operations"');
+    expect(backendOps).toContain('label="Failed operations"');
+    expect(backendOps).toContain('label="Slowest 5% of calls"');
+    expect(backendOps).not.toContain("storage_op_duration_seconds{");
+  });
+
+  it("renders errors and the retry through the shared components", () => {
+    expect(backendOps).toMatch(/<ErrorState\s+v-if="error"/);
+    expect(storageView).toContain('@retry="metricsReq.run"');
   });
 });

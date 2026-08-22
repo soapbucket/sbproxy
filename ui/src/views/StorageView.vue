@@ -7,9 +7,11 @@ import ErrorState from "../components/ErrorState.vue";
 import ModalDialog from "../components/ModalDialog.vue";
 import ModelFilesTable from "../components/ModelFilesTable.vue";
 import PageHeader from "../components/PageHeader.vue";
+import StorageBackendOps from "../components/StorageBackendOps.vue";
 import { useAsync } from "../composables/useAsync";
 import { toast } from "../composables/useToasts";
 import { formatBytes } from "../lib/format";
+import { parsePrometheus } from "../lib/metrics";
 import {
   deleteRefusalReason,
   gcBudgetAbsentReason,
@@ -20,11 +22,26 @@ import {
 } from "../lib/storage";
 
 const filesReq = useAsync(() => api.modelHostFiles());
+
+// Backend operation health comes off the Prometheus scrape rather than a
+// second admin route. It is a separate loader from the artifact inventory
+// on purpose: a model host that is not configured 404s the files report,
+// and that must not blank the backend panel, which answers a different
+// question and is often the one being asked during an incident.
+const metricsReq = useAsync(() => api.metrics(), {
+  refreshLabel: "storage backend metrics",
+});
+
 onMounted(() => {
   void filesReq.run();
+  void metricsReq.run();
 });
 
 const files = computed(() => filesReq.data.value);
+const metricFamilies = computed(() => {
+  const text = metricsReq.data.value;
+  return text ? parsePrometheus(text) : [];
+});
 const rows = computed(() => storageRows(files.value));
 const cacheConfigured = computed(() => Boolean(files.value?.cache_root));
 
@@ -129,13 +146,14 @@ async function runGc() {
 
 function refresh() {
   void filesReq.run();
+  void metricsReq.run();
 }
 </script>
 
 <template>
   <PageHeader
     title="Storage"
-    subtitle="Verified model weights in the artifact cache: what is on disk, what is resident, and what can be reclaimed."
+    subtitle="Verified model weights in the artifact cache: what is on disk, what is resident, and what can be reclaimed. Below that, whether the storage backend the gateway reads and writes through is answering."
   >
     <template #actions>
       <button
@@ -201,6 +219,13 @@ function refresh() {
       @delete="requestDelete"
     />
   </template>
+
+  <StorageBackendOps
+    :families="metricFamilies"
+    :loading="metricsReq.loading.value"
+    :error="metricsReq.error.value"
+    @retry="metricsReq.run"
+  />
 
   <ModalDialog v-if="pendingDelete" title="Delete cached artifact" @close="closeDelete">
     <p>

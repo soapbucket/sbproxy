@@ -10,6 +10,7 @@ import {
 import ClusterControlPlane from "../components/ClusterControlPlane.vue";
 import ClusterDeploymentTable from "../components/ClusterDeploymentTable.vue";
 import ClusterHealthRail from "../components/ClusterHealthRail.vue";
+import ClusterInboundAdmission from "../components/ClusterInboundAdmission.vue";
 import ClusterMetricsPanel from "../components/ClusterMetricsPanel.vue";
 import ClusterNodeAlerts from "../components/ClusterNodeAlerts.vue";
 import ClusterNodeRoster from "../components/ClusterNodeRoster.vue";
@@ -18,6 +19,7 @@ import ErrorState from "../components/ErrorState.vue";
 import PageHeader from "../components/PageHeader.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import { formatTime } from "../lib/format";
+import { parsePrometheus, type MetricFamily } from "../lib/metrics";
 
 const status = ref<ClusterStatusResponse | null>(null);
 const statusLoading = ref(false);
@@ -27,6 +29,16 @@ const clusterMetrics = ref<ClusterMetrics | null>(null);
 const metricsLoading = ref(false);
 const metricsNotEnabled = ref(false);
 const metricsError = ref<ApiError | null>(null);
+
+// Inbound admission comes off this node's own Prometheus scrape, not the
+// fleet-metrics route: `mesh_transport_inbound_rejected_total` counts the
+// peers *this* node turned away, and aggregating that across the fleet
+// would lose the only thing an operator can act on, which is where the
+// refusals are landing. Loaded on the same 15s cadence as the roster so
+// the two never disagree about how recent they are.
+const scrape = ref<MetricFamily[]>([]);
+const scrapeLoading = ref(false);
+const scrapeError = ref<ApiError | null>(null);
 
 function asApiError(error: unknown): ApiError {
   return error instanceof ApiError
@@ -65,9 +77,22 @@ async function loadMetrics() {
   }
 }
 
+async function loadScrape() {
+  scrapeLoading.value = true;
+  scrapeError.value = null;
+  try {
+    scrape.value = parsePrometheus(await api.metrics());
+  } catch (error) {
+    scrapeError.value = asApiError(error);
+  } finally {
+    scrapeLoading.value = false;
+  }
+}
+
 function refresh() {
   void loadStatus();
   if (!metricsLoading.value) void loadMetrics();
+  if (!scrapeLoading.value) void loadScrape();
 }
 
 onMounted(refresh);
@@ -79,7 +104,7 @@ usePoll(refresh, 15_000);
 <template>
   <PageHeader
     title="Cluster"
-    subtitle="Membership, model placement, and rollout health across the fleet."
+    subtitle="Membership, model placement, and rollout health across the fleet, plus the inbound peer connections this node refused."
   >
     <template #actions>
       <button class="sb-btn sb-btn--sm" :disabled="statusLoading" @click="refresh">
@@ -139,6 +164,12 @@ usePoll(refresh, 15_000);
 
     <ClusterControlPlane :status="status" />
     <ClusterNodeRoster :nodes="status.nodes" />
+    <ClusterInboundAdmission
+      :families="scrape"
+      :loading="scrapeLoading"
+      :error="scrapeError"
+      @retry="loadScrape"
+    />
     <ClusterDeploymentTable
       :deployments="status.deployments"
       :rollouts-in-progress="status.summary.rollouts_in_progress"
