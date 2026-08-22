@@ -17,7 +17,7 @@ import ErrorState from "../components/ErrorState.vue";
 import EmptyState from "../components/EmptyState.vue";
 import WorkspaceBudgets from "../components/WorkspaceBudgets.vue";
 
-const req = useAsync(() => api.auditRecent(100));
+const req = useAsync(() => api.auditRecent(100), { pollMs: 10_000, refreshLabel: "Recent Audits" });
 
 // WOR-2094: the unified security + change audit sample.
 const channelFilter = ref<"" | "security" | "key" | "config" | "admin" | "policy">("");
@@ -28,6 +28,7 @@ const eventsReq = useAsync(() =>
     channel: channelFilter.value || undefined,
     keyId: keyFilter.value || undefined,
   }),
+  { pollMs: 10_000, refreshLabel: "Audit Events" }
 );
 const events = computed<AuditEvent[]>(() =>
   Array.isArray(eventsReq.data.value) ? eventsReq.data.value : [],
