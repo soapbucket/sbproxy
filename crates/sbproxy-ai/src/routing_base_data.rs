@@ -18,7 +18,11 @@
 //! `rate_card:` declares one for; nothing built in carries a completion
 //! cap. Both token fields come from the same resolution the
 //! `/v1/models` listing publishes, so a policy and a client are never
-//! told different numbers for one model.
+//! told different numbers for one model. That resolution also reads the
+//! card's `max_input_tokens`, so installing a rate card can add an entry
+//! for a declared model the built-in tables know nothing about: a policy
+//! guarding on `ai.model in ai.catalog` sees one more model than it did
+//! before the card.
 //!
 //! Prices are USD per million tokens, the same unit the operator already
 //! writes in `model_prices` (`input_per_million: 3.0`), so a policy compares

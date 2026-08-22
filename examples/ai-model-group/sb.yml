@@ -6,7 +6,10 @@
 # that provider serves, and its share of traffic. Members may serve DIFFERENT
 # model ids, which is what a same-model-name pool cannot express: here the
 # public name `chat` fronts `gpt-4o-mini` on one deployment and
-# `gpt-4o-mini-preview` on the other.
+# `gpt-3.5-turbo` on the other. Both are real OpenAI model ids, so the
+# walkthrough below runs as written against one OPENAI_API_KEY; in a real
+# deployment the second member would be another vendor's endpoint, an Azure
+# deployment name for example, with its own key and base_url.
 #
 # The group carries its own routing strategy, independent of the action's, and
 # resolves before every model gate, so `blocked_models`, per-key allowlists, the
@@ -51,7 +54,7 @@ origins:
           # for example an Azure OpenAI deployment with its own model id.
           api_key: ${OPENAI_API_KEY}
           models:
-            - gpt-4o-mini-preview
+            - gpt-3.5-turbo
 
       model_groups:
         - name: chat
@@ -61,5 +64,5 @@ origins:
               model: gpt-4o-mini
               weight: 9
             - provider: openai-deployment-b
-              model: gpt-4o-mini-preview
+              model: gpt-3.5-turbo
               weight: 1

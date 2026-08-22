@@ -2356,7 +2356,8 @@ flowchart TD
     C -- yes --> E["alias target + optional provider pin"]
     B -- yes --> F["member set: this group's members"]
     F --> G["drop disabled providers<br/>and any the credential forbids"]
-    G -- none left --> H["503: no eligible member"]
+    G -- credential forbids all --> H1["403: no permitted member"]
+    G -- all providers disabled --> H2["503: no eligible member"]
     G --> I["narrow by breaker, outlier, health"]
     I --> J["pick with the group's strategy<br/>and the member's weight"]
     J --> K["rewrite model to the member's id<br/>pin the member's provider"]
@@ -2367,11 +2368,13 @@ flowchart TD
     M --> N["dispatch"]
 ```
 
-Two consequences worth stating outright.
+Three consequences worth stating outright.
 
 A pick is **resilience-aware but not fail-closed**. An open circuit breaker, an outlier ejection, or a failed health probe moves the group's traffic to a sibling member rather than refusing, which is what those three axes promise everywhere else in this gateway. A group whose members are *all* ejected still routes, because three advisory signals must not combine into an outage none of them can cause alone.
 
-A pick **does** fail closed on policy. When every member's provider is disabled, or the calling credential's provider policy forbids all of them, the request answers `503` rather than falling through to some other provider. Falling through would dispatch a model id nobody declared for that vendor.
+A pick **does** fail closed on policy, rather than falling through to some other provider: falling through would dispatch a model id nobody declared for that vendor. The two ways that happens answer differently, because one is retryable and the other is not. When the calling credential's provider policy forbids every member, the request answers `403`, the same status every other credential refusal on this path uses. When every member's provider is switched off, it answers `503`. Either way the refusal is logged with the group name and published as an `ai.admission` decision record carrying `model_group_forbidden` or `model_group_no_member`, so a group that has quietly stopped serving is visible in the SIEM feed and not only in a client's error rate. See [events.md](events.md#decision-audit-the-other-nineteen).
+
+A pick is made **once per request**. The chosen member's provider becomes the request's routing pin, the same pin a `model_aliases` entry sets, so a transport failure or a retryable 5xx from that member does not move the request to a sibling member; whatever retry policy the action configures applies to that one member. Handing the request to a sibling would dispatch the first member's model id to a vendor that does not serve it. Health signals move the *next* request instead: the failure trips the breaker or the outlier ejector, and the pick that follows skips that member. Configure `resilience:` on the action if you want that to happen quickly.
 
 ### Groups, aliases, and same-name pools
 

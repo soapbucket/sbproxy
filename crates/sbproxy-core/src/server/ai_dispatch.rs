@@ -827,10 +827,56 @@ struct ModelGroupPick {
     provider: String,
 }
 
-/// Refusal message for a group whose members are all out of the
-/// request's candidate set.
-const MODEL_GROUP_NO_MEMBER: &str =
-    "the model group for this request has no eligible member provider";
+/// Why a named model group could not serve a request (WOR-2657).
+///
+/// The two causes answer with different statuses on purpose. A
+/// credential whose provider policy excludes every member is a
+/// permanent decision about this caller, and every other credential
+/// refusal on this path answers `403`; returning `503` there would tell
+/// a client with retry logic to come back and be refused again. A group
+/// whose members are all switched off is an operator-side condition the
+/// same client should retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelGroupRefusal {
+    /// The calling credential's provider policy forbids every member.
+    CredentialForbidsEveryMember,
+    /// Every member's provider is disabled, or the candidate narrowing
+    /// left nothing to pick from.
+    NoMemberAvailable,
+}
+
+impl ModelGroupRefusal {
+    /// The status this refusal answers with.
+    fn status(self) -> u16 {
+        match self {
+            Self::CredentialForbidsEveryMember => 403,
+            Self::NoMemberAvailable => 503,
+        }
+    }
+
+    /// The message sent to the caller. Neither names a provider: which
+    /// vendors an origin configures is not the caller's to learn from a
+    /// refusal.
+    fn message(self) -> &'static str {
+        match self {
+            Self::CredentialForbidsEveryMember => {
+                "no member of this model group is permitted for this credential"
+            }
+            Self::NoMemberAvailable => {
+                "the model group for this request has no eligible member provider"
+            }
+        }
+    }
+
+    /// The bounded reason code carried on the admission decision family
+    /// and its audit record.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::CredentialForbidsEveryMember => "model_group_forbidden",
+            Self::NoMemberAvailable => "model_group_no_member",
+        }
+    }
+}
 
 /// Resolve a requested model name against the origin's group registry
 /// and pick one member.
@@ -854,26 +900,27 @@ const MODEL_GROUP_NO_MEMBER: &str =
 /// The pick is resilience-aware: breaker, outlier, and health narrow the
 /// member set through `Router::routable_candidate_indices` before the
 /// group's strategy runs, so an open breaker moves traffic to a sibling
-/// member instead of turning the group into a 503. Those three axes stay
-/// advisory, so an all-ejected group gives its members back rather than
-/// refusing.
+/// member instead of turning the group into a refusal. Those three axes
+/// stay advisory, so an all-ejected group gives its members back rather
+/// than refusing.
 fn resolve_model_group(
     config: &AiHandlerConfig,
     router: &sbproxy_ai::routing::Router,
     allowed_providers: &[String],
     blocked_providers: &[String],
     requested: &str,
-) -> Option<Result<ModelGroupPick, &'static str>> {
+) -> Option<Result<ModelGroupPick, ModelGroupRefusal>> {
     let registry = config.model_group_registry();
     if registry.is_empty() || requested.is_empty() {
         return None;
     }
     let group = registry.resolve(requested)?;
 
-    // A member the credential's provider policy excludes, or one whose
-    // provider is switched off, is not a candidate. Both are hard: they
-    // are operator and credential decisions, not health signals.
-    let members = group
+    // Two hard filters, kept apart so the refusal can say which one
+    // emptied the set: the enabled switch is the operator's and answers
+    // 503, the credential's provider policy is the caller's and answers
+    // 403. Neither is a health signal; those are advisory and run below.
+    let enabled = group
         .members
         .iter()
         .filter_map(|member| {
@@ -881,27 +928,44 @@ fn resolve_model_group(
                 .providers
                 .iter()
                 .position(|provider| provider.name.as_str() == member.provider.as_str())?;
+            config.providers[index].enabled.then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if enabled.is_empty() {
+        return Some(Err(ModelGroupRefusal::NoMemberAvailable));
+    }
+    let members = enabled
+        .into_iter()
+        .filter(|&index| {
             provider_allowed_for_request(
                 &config.providers[index],
                 allowed_providers,
                 blocked_providers,
             )
-            .then_some(index)
         })
         .collect::<Vec<_>>();
     if members.is_empty() {
-        return Some(Err(MODEL_GROUP_NO_MEMBER));
+        return Some(Err(ModelGroupRefusal::CredentialForbidsEveryMember));
     }
 
     let routable = router.routable_candidate_indices(&config.providers, &members);
     let Some(picked) = router.select_group(&config.providers, &routable, group) else {
-        return Some(Err(MODEL_GROUP_NO_MEMBER));
+        return Some(Err(ModelGroupRefusal::NoMemberAvailable));
     };
-    let provider = config.providers.get(picked)?;
-    let member = group
+    // A pick outside the member set cannot happen: the candidates are
+    // member indices and the narrowing only ever removes from that set.
+    // Refuse rather than fall through if it ever does, because falling
+    // through would send the group name upstream as a literal model id.
+    let Some(provider) = config.providers.get(picked) else {
+        return Some(Err(ModelGroupRefusal::NoMemberAvailable));
+    };
+    let Some(member) = group
         .members
         .iter()
-        .find(|member| member.provider.as_str() == provider.name.as_str())?;
+        .find(|member| member.provider.as_str() == provider.name.as_str())
+    else {
+        return Some(Err(ModelGroupRefusal::NoMemberAvailable));
+    };
     Some(Ok(ModelGroupPick {
         group: group.name.as_str().to_string(),
         model: member.model.as_str().to_string(),
@@ -923,7 +987,7 @@ fn resolve_body_model_group(
     blocked_providers: &[String],
     model: &mut String,
     body: &mut serde_json::Value,
-) -> Option<Result<ModelGroupPick, &'static str>> {
+) -> Option<Result<ModelGroupPick, ModelGroupRefusal>> {
     let pick =
         match resolve_model_group(config, router, allowed_providers, blocked_providers, model) {
             Some(Ok(pick)) => pick,
@@ -937,6 +1001,35 @@ fn resolve_body_model_group(
     }
     model.clone_from(&pick.model);
     Some(Ok(pick))
+}
+
+/// Log and publish a refused model group before the caller answers.
+///
+/// Without this a group that refuses every request is invisible: the
+/// selection counter only counts picks that happened, and the 503 or
+/// 403 reaches the client with nothing naming the group behind it. The
+/// refusal is decided before any provider is chosen, so it publishes on
+/// the same pre-provider admission funnel the inbound shim's refusals
+/// use, which puts it on the decision metric, the `ai.admission`
+/// decision family, and the audit feed at once.
+///
+/// `group` is safe to log: the name matched a `model_groups[].name` the
+/// operator declared, so it is bounded by the config rather than by the
+/// request.
+fn record_model_group_refusal(
+    ctx: &RequestContext,
+    surface_label: &str,
+    group: &str,
+    refusal: ModelGroupRefusal,
+) {
+    warn!(
+        ai.surface = surface_label,
+        model_group = %group,
+        reason = refusal.reason(),
+        status = refusal.status(),
+        "AI proxy: named model group has no eligible member; refusing"
+    );
+    record_ai_admission_refusal(ctx, surface_label, refusal.reason());
 }
 
 /// The admin routing-decisions reason a group pick writes.
@@ -5979,8 +6072,9 @@ pub(super) async fn handle_ai_proxy(
                         append_ai_route_reason(ctx, model_group_route_reason(&pick));
                         alias_provider = Some(pick.provider);
                     }
-                    Some(Err(message)) => {
-                        send_error(session, 503, message).await?;
+                    Some(Err(refusal)) => {
+                        record_model_group_refusal(ctx, surface_label, model, refusal);
+                        send_error(session, refusal.status(), refusal.message()).await?;
                         return Ok(());
                     }
                     None => {
@@ -6100,7 +6194,11 @@ pub(super) async fn handle_ai_proxy(
             })
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
-        // WOR-2312: an alias that named a provider narrows the set to it.
+        // WOR-2312: an alias that named a provider narrows the set to
+        // it, and WOR-2657: so does the member a model group picked.
+        // The refusal below names neither, because from here the two
+        // are one pin and an operator with only groups configured
+        // should not be told about aliases.
         if !retain_alias_pinned_providers(
             &mut provider_candidates,
             &config.providers,
@@ -6109,7 +6207,7 @@ pub(super) async fn handle_ai_proxy(
             send_error(
                 session,
                 503,
-                "the model alias for this request targets a provider that is not eligible",
+                "the model routing pin for this request targets a provider that is not eligible",
             )
             .await?;
             return Ok(());
@@ -6694,8 +6792,14 @@ pub(super) async fn handle_ai_proxy(
                 append_ai_route_reason(ctx, model_group_route_reason(&pick));
                 Some((pick.model, Some(pick.provider)))
             }
-            Some(Err(message)) => {
-                send_error(session, 503, message).await?;
+            Some(Err(refusal)) => {
+                record_model_group_refusal(
+                    ctx,
+                    surface_label,
+                    requested_model.as_deref().unwrap_or_default(),
+                    refusal,
+                );
+                send_error(session, refusal.status(), refusal.message()).await?;
                 return Ok(());
             }
             None => requested_model
@@ -6903,7 +7007,11 @@ pub(super) async fn handle_ai_proxy(
             })
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
-        // WOR-2312: an alias that named a provider narrows the set to it.
+        // WOR-2312: an alias that named a provider narrows the set to
+        // it, and WOR-2657: so does the member a model group picked.
+        // The refusal below names neither, because from here the two
+        // are one pin and an operator with only groups configured
+        // should not be told about aliases.
         if !retain_alias_pinned_providers(
             &mut provider_order,
             &config.providers,
@@ -6912,7 +7020,7 @@ pub(super) async fn handle_ai_proxy(
             send_error(
                 session,
                 503,
-                "the model alias for this request targets a provider that is not eligible",
+                "the model routing pin for this request targets a provider that is not eligible",
             )
             .await?;
             return Ok(());
@@ -7570,8 +7678,9 @@ pub(super) async fn handle_ai_proxy(
             append_ai_route_reason(ctx, model_group_route_reason(&pick));
             Some(pick.provider)
         }
-        Some(Err(message)) => {
-            send_error(session, 503, message).await?;
+        Some(Err(refusal)) => {
+            record_model_group_refusal(ctx, surface_label, &model, refusal);
+            send_error(session, refusal.status(), refusal.message()).await?;
             return Ok(());
         }
         None => resolve_body_model_alias(config, &mut model, &mut body),
@@ -9844,11 +9953,12 @@ pub(super) async fn handle_ai_proxy(
     let shadow_allowed_providers = allowed_providers.to_vec();
     let shadow_blocked_providers = blocked_providers.to_vec();
 
-    // WOR-2312: an alias that named a provider pins the routing set to it.
-    // This is stricter than the `models:` filter below on purpose: the
-    // alias already resolved the caller's name to that vendor's model id,
-    // so handing the request to another vendor would dispatch an id it
-    // does not serve. Failing here is the honest answer.
+    // WOR-2312: an alias that named a provider pins the routing set to
+    // it, and WOR-2657: so does the member a model group picked. This is
+    // stricter than the `models:` filter below on purpose: both already
+    // resolved the caller's name to that vendor's model id, so handing
+    // the request to another vendor would dispatch an id it does not
+    // serve. Failing here is the honest answer.
     if !retain_alias_pinned_providers(
         &mut provider_order,
         &config.providers,
@@ -9857,7 +9967,7 @@ pub(super) async fn handle_ai_proxy(
         send_error(
             session,
             503,
-            "the model alias for this request targets a provider that is not eligible",
+            "the model routing pin for this request targets a provider that is not eligible",
         )
         .await?;
         return Ok(());
@@ -12241,28 +12351,34 @@ fn record_ai_failure_decision(
 /// Record `ai.admission` on the decision family, the AI admission
 /// counter, and, when enabled, the audit feed (WOR-2595).
 ///
-/// The funnel behind the five refusals the AI dispatch path can take
+/// The funnel behind the six refusals the AI dispatch path can take
 /// before any provider is chosen: the three arms of the inbound
 /// native-format shim (the Anthropic Messages translate, the Responses
-/// stored-prompt bridge, and the Responses translate) and the two
+/// stored-prompt bridge, and the Responses translate), the two
 /// refusal arms of the shared stored-prompt resolver (a render failure,
-/// and a reference lifted off a native body that no prompt layer holds).
+/// and a reference lifted off a native body that no prompt layer holds),
+/// and a named model group with no eligible member
+/// (`model_group_no_member`, `model_group_forbidden`), which is decided
+/// at the same point for the same reason: the request names something
+/// this origin cannot dispatch, and no provider has been chosen yet.
 /// Before it, an MCP-governance-bypass attempt (`tools: [{"type":
 /// "mcp", ...}]` on `/v1/responses`) produced one free-text warn and a
 /// bare 400, which is metrically and forensically indistinguishable
 /// from a typo'd JSON body.
 ///
-/// **What this cannot see.** Only those five. A request refused later
+/// **What this cannot see.** Only those six. A request refused later
 /// by the model allow/block gate, a virtual-key policy, a guardrail, a
 /// budget, a rate limiter, or a CEL/Rego policy is that plane's
 /// decision and publishes under that plane's own event; none of them
 /// route through here. On the canonical `/v1/chat/completions` path
-/// there is no inbound shim, so the only refusal that reaches this
-/// funnel from there is a stored-prompt render failure.
-/// `docs/events.md` states the same boundary for operators.
+/// there is no inbound shim, so the refusals that reach this funnel
+/// from there are a stored-prompt render failure and an unservable
+/// model group. `docs/events.md` states the same boundary for
+/// operators.
 ///
-/// `reason` is a `&'static str` from [`sbproxy_ai::format::ChatError::reason`]
-/// and never the error's message: several of the coded refusals
+/// `reason` is a `&'static str` from [`sbproxy_ai::format::ChatError::reason`],
+/// or one of the two model-group codes, and never the error's message:
+/// several of the coded refusals
 /// interpolate caller bytes into the message (a serde parse error, an
 /// unrecognized role name), and both the metric label and
 /// `DecisionDetails` ship unscrubbed. The message reaches the client and
@@ -22622,6 +22738,207 @@ origins:
             }
         }
     }
+
+    // --- Named model groups through the live dispatch path (WOR-2657) ---
+
+    /// The wiring test the resolver's own unit tests cannot be: a real
+    /// request through `handle_ai_proxy`, asserting on the bytes the
+    /// provider received. Coverage of `resolve_model_group` proves the
+    /// pick; only this proves the pick is applied to the request that
+    /// leaves the gateway.
+    #[tokio::test]
+    async fn a_group_name_is_rewritten_before_the_request_leaves_the_gateway() {
+        let (upstream_url, hits, captured) = capturing_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        )
+        .await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "deployment-a",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "models": ["deployment-model-id"]
+            }],
+            "model_groups": [{
+                "name": "chat-pool",
+                "members": [{"provider": "deployment-a", "model": "deployment-model-id"}]
+            }]
+        }))
+        .expect("model group dispatch config");
+        let request = serde_json::json!({
+            "model": "chat-pool",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        });
+        let (mut session, client) = downstream_session(request).await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("a group request dispatches");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let upstream_request = captured.await.expect("capturing upstream task");
+        let request_text = String::from_utf8(upstream_request).expect("upstream request UTF-8");
+        let body = request_text
+            .split_once("\r\n\r\n")
+            .expect("upstream request body")
+            .1;
+        let body: serde_json::Value = serde_json::from_str(body).expect("upstream JSON body");
+        assert_eq!(
+            body["model"], "deployment-model-id",
+            "the group name must never reach a provider: {body}"
+        );
+        assert_eq!(
+            context.ai_route_reason.as_deref(),
+            Some("model_group: chat-pool -> deployment-a/deployment-model-id"),
+            "the admin row has to name the member that served the request"
+        );
+    }
+
+    /// The group validator has to run where an operator can see it.
+    /// `compile_config` parses the action body without building its
+    /// handler, so a config test there proves only that the key is
+    /// accepted; the refusal lands when the action compiles, which is
+    /// what `sbproxy validate` and boot both do.
+    #[test]
+    fn a_group_two_members_on_one_provider_is_refused_at_pipeline_build() {
+        let compiled = sbproxy_config::compile_config(
+            r#"
+origins:
+  "ai.test":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: dummy
+          models: [gpt-4o-mini, gpt-4o]
+      model_groups:
+        - name: pool
+          members:
+            - provider: openai
+              model: gpt-4o-mini
+            - provider: openai
+              model: gpt-4o
+"#,
+        )
+        .expect("the key parses; the validator runs a layer up");
+        let error = crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+            .err()
+            .expect("two members on one provider is refused when the action compiles");
+        let message = error.to_string();
+        assert!(
+            message.contains("already a member of this group"),
+            "the refusal must name the validator's reason: {message}"
+        );
+    }
+
+    /// A group with no eligible member refuses, and the refusal is
+    /// visible to the pipeline operators actually watch: an
+    /// `ai.admission` decision record carrying the bounded code, not
+    /// only a status line on the wire.
+    #[tokio::test]
+    async fn an_unservable_group_refuses_and_publishes_an_admission_record() {
+        let compiled = sbproxy_config::compile_config(
+            r#"
+proxy:
+  observability:
+    log:
+      decision_audit:
+        enabled: true
+origins:
+  "ai.test":
+    action:
+      type: static
+      body: ok
+"#,
+        )
+        .expect("model group refusal fixture config");
+        let pipeline = std::sync::Arc::new(
+            crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+                .expect("model group refusal fixture pipeline"),
+        );
+        // The group's only member is switched off while a second,
+        // non-member provider stays up, so a fallthrough would have had
+        // somewhere to go and the refusal is the group's own decision
+        // rather than an empty origin.
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "parked", "provider_type": "openai", "api_key": "k",
+                 "enabled": false, "base_url": "http://127.0.0.1:9",
+                 "allow_private_base_url": true, "models": ["parked-model"]},
+                {"name": "live", "provider_type": "openai", "api_key": "k",
+                 "base_url": "http://127.0.0.1:9", "allow_private_base_url": true,
+                 "models": ["live-model"]}
+            ],
+            "model_groups": [{
+                "name": "chat-pool",
+                "members": [{"provider": "parked", "model": "parked-model"}]
+            }]
+        }))
+        .expect("model group refusal config");
+        let request = serde_json::json!({
+            "model": "chat-pool",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        });
+        let (mut session, client) = downstream_session(request).await;
+        let mut context = crate::context::RequestContext::new();
+        context.pipeline = std::sync::Arc::clone(&pipeline);
+        context.origin_idx = Some(0);
+        context.tenant_id = "acme".into();
+        context.request_id = "req-model-group-refusal".into();
+
+        let (bus, mut rx) = crate::policy_bus::channel(16);
+        crate::policy_bus::init_global_bus(bus);
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            pipeline.as_ref(),
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("the group refusal is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 503"), "{response:?}");
+
+        let mut ours = Vec::new();
+        while let Ok(record) = rx.try_recv() {
+            if let crate::policy_bus::AuditRecord::Decision(audit) = record {
+                if audit.request_id == "req-model-group-refusal" {
+                    ours.push(audit);
+                }
+            }
+        }
+        assert_eq!(ours.len(), 1, "the refusal publishes exactly one record");
+        assert_eq!(
+            ours[0].event,
+            sbproxy_observe::decision::DecisionEvent::AiAdmission
+        );
+        assert_eq!(
+            ours[0].outcome,
+            sbproxy_observe::decision::DecisionOutcome::Deny
+        );
+        assert_eq!(
+            ours[0].details.verdict.as_deref(),
+            Some("model_group_no_member")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -23390,13 +23707,51 @@ mod model_routing_tests {
     #[test]
     fn a_group_whose_members_the_credential_forbids_refuses_rather_than_routes() {
         // Falling through to some other provider would dispatch a model
-        // id nobody declared, so the honest answer is a refusal.
+        // id nobody declared, so the honest answer is a refusal. It is
+        // a permanent decision about this caller, so it answers 403 like
+        // every other credential refusal on this path; 503 would tell a
+        // client with retry logic to come back and be refused again.
         let config = group_config("round_robin", &[]);
         let router = config.router();
         let blocked = vec!["openai-a".to_string(), "azure-b".to_string()];
         let outcome = super::resolve_model_group(&config, &router, &[], &blocked, "pool")
             .expect("pool is still a group");
-        assert_eq!(outcome, Err(super::MODEL_GROUP_NO_MEMBER));
+        assert_eq!(
+            outcome,
+            Err(super::ModelGroupRefusal::CredentialForbidsEveryMember)
+        );
+        assert_eq!(
+            super::ModelGroupRefusal::CredentialForbidsEveryMember.status(),
+            403
+        );
+    }
+
+    #[test]
+    fn a_group_whose_members_are_all_disabled_is_unavailable_not_forbidden() {
+        // The operator switched the deployments off, which is a
+        // retryable condition and not a statement about this caller, so
+        // the two refusals must not collapse into one status.
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "openai-a", "api_key": "k", "provider_type": "openai",
+                 "enabled": false, "models": ["gpt-4o-mini"]},
+                {"name": "azure-b", "api_key": "k", "provider_type": "openai",
+                 "enabled": false, "models": ["gpt-4o-mini-deployment"]}
+            ],
+            "model_groups": [{
+                "name": "pool",
+                "members": [
+                    {"provider": "openai-a", "model": "gpt-4o-mini"},
+                    {"provider": "azure-b", "model": "gpt-4o-mini-deployment"}
+                ]
+            }]
+        }))
+        .expect("group fixture with disabled providers");
+        let router = config.router();
+        let outcome = super::resolve_model_group(&config, &router, &[], &[], "pool")
+            .expect("pool is still a group");
+        assert_eq!(outcome, Err(super::ModelGroupRefusal::NoMemberAvailable));
+        assert_eq!(super::ModelGroupRefusal::NoMemberAvailable.status(), 503);
     }
 
     #[test]

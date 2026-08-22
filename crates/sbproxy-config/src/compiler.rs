@@ -7142,7 +7142,12 @@ origins:
         );
     }
 
-    /// The same group on the AI action compiles and reaches the handler.
+    /// The same group on the AI action compiles. `compile_config` parses
+    /// the action body without building its handler, so this pins the key
+    /// as accepted here and nothing more; the group validator itself runs
+    /// where the action is compiled, which
+    /// `a_group_two_members_on_one_provider_is_refused_at_pipeline_build`
+    /// in `sbproxy-core` covers.
     #[test]
     fn compile_accepts_model_groups_on_the_ai_action() {
         let yaml = r#"

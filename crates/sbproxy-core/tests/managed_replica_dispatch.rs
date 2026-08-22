@@ -852,7 +852,13 @@ fn a_group_with_every_member_blocked_is_not_listed() {
 /// static table exactly as before.
 #[test]
 fn a_rate_card_puts_max_output_tokens_on_the_wire() {
-    let card = std::env::temp_dir().join("sbproxy-listing-rate-card.json");
+    // Named per process: two lanes building this workspace at once run
+    // this file concurrently, and a fixed name has one run deleting the
+    // card the other is about to read.
+    let card = std::env::temp_dir().join(format!(
+        "sbproxy-listing-rate-card-{}.json",
+        std::process::id()
+    ));
     std::fs::write(
         &card,
         r#"{

@@ -634,16 +634,22 @@ impl Router {
         candidate_indices: &[usize],
         group: &crate::model_group::ModelGroup,
     ) -> Option<usize> {
-        let member_weights: std::collections::HashMap<usize, u32> = group
-            .members
-            .iter()
-            .filter_map(|member| {
-                providers
+        // Only the `Weighted` arm reads the map, so the other twelve
+        // strategies do not pay a per-request allocation on the AI
+        // request path for a field they ignore.
+        let member_weights: Option<std::collections::HashMap<usize, u32>> =
+            matches!(group.routing, RoutingStrategy::Weighted).then(|| {
+                group
+                    .members
                     .iter()
-                    .position(|provider| provider.name.as_str() == member.provider.as_str())
-                    .map(|index| (index, member.weight))
-            })
-            .collect();
+                    .filter_map(|member| {
+                        providers
+                            .iter()
+                            .position(|provider| provider.name.as_str() == member.provider.as_str())
+                            .map(|index| (index, member.weight))
+                    })
+                    .collect()
+            });
         let enabled = candidate_indices
             .iter()
             .filter_map(|&index| providers.get(index).map(|provider| (index, provider)))
@@ -657,7 +663,7 @@ impl Router {
             false,
             &group.routing,
             counter,
-            Some(&member_weights),
+            member_weights.as_ref(),
         );
         if let Some(index) = picked {
             if let Some(provider) = providers.get(index) {
