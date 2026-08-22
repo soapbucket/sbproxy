@@ -201,6 +201,32 @@ pub struct LlmUsageEvent {
     /// resolved a local engine, and nothing else can produce it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub served_model: Option<String>,
+    /// The terminal `finish_reason` the provider reported, when the
+    /// response carried one.
+    ///
+    /// Populated on shadow rows, where it is the cheapest signal that
+    /// two targets disagreed: a target that stopped on `length` where
+    /// the primary stopped on `stop` truncated its answer, and neither
+    /// cost nor latency says so. `None` on rows whose response shape
+    /// carries no finish reason and on rows the call never completed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+    /// The primary request this row shadow-evaluated, when this row is
+    /// a shadow row.
+    ///
+    /// The join key for the shadow comparison surface: it groups the
+    /// primary's row with the one row each shadow target produced, so
+    /// cost, latency, `finish_reason`, and model can be read side by
+    /// side per request. `None` on every ordinary completion.
+    ///
+    /// Carried as data and never as the dedup key. `request_id` on a
+    /// shadow row is freshly minted per target, because the correlation
+    /// id feature lets a caller choose the primary's request id with an
+    /// `X-Request-Id` header; deriving the shadow row's key from it
+    /// would let one caller suppress another caller's shadow rows on
+    /// replay of the verifiable ledger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_of: Option<String>,
 }
 
 /// A destination for completed-call usage events.
@@ -1403,6 +1429,8 @@ mod tests {
             workflow_id: None,
             logical_model: None,
             served_model: None,
+            finish_reason: None,
+            shadow_of: None,
         }
     }
 

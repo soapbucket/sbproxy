@@ -2321,6 +2321,10 @@ fn usage_event_from_context(
         // is present exactly when the request never left the box.
         logical_model: ctx.ai_logical_model.clone(),
         served_model: ctx.ai_serve_model.clone(),
+        // Present on shadow rows only; an ordinary completion is
+        // nobody's shadow.
+        finish_reason: None,
+        shadow_of: None,
     }
 }
 

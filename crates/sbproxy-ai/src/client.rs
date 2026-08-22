@@ -386,7 +386,18 @@ impl ShadowUsageRecord {
         // Never derive the ledger dedup key from a caller-controlled
         // correlation header. A different primary request could otherwise
         // deliberately choose that derived value and suppress this event.
-        event.request_id = Some(format!("{:032x}:shadow", rand::random::<u128>()));
+        //
+        // The primary's id is still worth carrying, as data: `shadow_of`
+        // is what lets a report put the primary row and its N target
+        // rows side by side. It is not the key, and nothing derives the
+        // key from it.
+        //
+        // The key itself is minted in `record`, once per target, not
+        // here. This record is cloned per target, so minting here would
+        // give every target row the same id and collapse N rows to one
+        // on ledger replay.
+        event.shadow_of = event.request_id.take();
+        event.request_id = None;
         event.tag = Some(ShadowAttribution::Shadow.as_str().to_string());
         event.engine_version = None;
         // WOR-2223: a shadow call is an extra evaluation copy, not the
@@ -401,6 +412,9 @@ impl ShadowUsageRecord {
     }
 
     fn record(mut self, provider: String, model: String, result: ShadowCallResult) {
+        // Minted per call, so each target's row is a distinct ledger
+        // entry. See the note in `new`.
+        self.event.request_id = Some(format!("{:032x}:shadow", rand::random::<u128>()));
         let usage = crate::budget::AiUsage::Tokens {
             input: result.prompt_tokens,
             output: result.completion_tokens,
@@ -417,18 +431,25 @@ impl ShadowUsageRecord {
         self.event.cost_usd = crate::budget::estimate_cost_for_usage(&self.event.model, &usage);
         self.event.latency_ms = result.latency_ms;
         self.event.status = result.status;
+        self.event.finish_reason = result.finish_reason;
         for sink in &self.sinks {
             sink.record(&self.event);
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ShadowCallResult {
     status: u16,
     latency_ms: u64,
     prompt_tokens: u64,
     completion_tokens: u64,
+    /// The target's terminal `finish_reason`, already parsed by
+    /// [`parse_shadow_metadata`] for the log line and previously
+    /// discarded. It is the cheapest disagreement signal there is: a
+    /// target that answered `length` where the primary answered `stop`
+    /// truncated, and no amount of cost comparison says that.
+    finish_reason: Option<String>,
 }
 
 struct PreparedShadowRequest {
@@ -631,8 +652,8 @@ impl AiClient {
         blocked_providers: &[String],
         disallow_prompt_training: bool,
         usage: Option<ShadowUsageRecord>,
-    ) -> ShadowDispatchOutcome {
-        match self.prepare_shadow(
+    ) -> Vec<ShadowDispatchOutcome> {
+        match self.prepare_shadows(
             config,
             path,
             body,
@@ -643,8 +664,14 @@ impl AiClient {
             usage,
             None,
         ) {
-            Ok(prepared) => Self::spawn_prepared_shadow(prepared),
-            Err(outcome) => outcome,
+            Ok(prepared) => prepared
+                .into_iter()
+                .map(|target| match target {
+                    Ok(prepared) => Self::spawn_prepared_shadow(prepared),
+                    Err(outcome) => outcome,
+                })
+                .collect(),
+            Err(outcome) => vec![outcome],
         }
     }
 
@@ -667,8 +694,8 @@ impl AiClient {
         usage: Option<ShadowUsageRecord>,
         quota: &crate::quota_pool::QuotaPoolAdmission,
         quota_reservation_prefix: &str,
-    ) -> std::result::Result<ShadowDispatchOutcome, crate::quota_pool::PoolError> {
-        let mut prepared = match self.prepare_shadow(
+    ) -> std::result::Result<Vec<ShadowDispatchOutcome>, crate::quota_pool::PoolError> {
+        let targets = match self.prepare_shadows(
             config,
             path,
             body,
@@ -679,15 +706,30 @@ impl AiClient {
             usage,
             None,
         ) {
-            Ok(prepared) => prepared,
-            Err(outcome) => return Ok(outcome),
+            Ok(targets) => targets,
+            Err(outcome) => return Ok(vec![outcome]),
         };
-        prepared.quota_attempt = Some(
-            quota
-                .reserve_attempt(&format!("{quota_reservation_prefix}:shadow"))
-                .await?,
-        );
-        Ok(Self::spawn_prepared_shadow(prepared))
+        let mut outcomes = Vec::with_capacity(targets.len());
+        for (index, target) in targets.into_iter().enumerate() {
+            let mut prepared = match target {
+                Ok(prepared) => prepared,
+                Err(outcome) => {
+                    outcomes.push(outcome);
+                    continue;
+                }
+            };
+            // One reservation per target, distinctly named: the pool
+            // dedups by reservation id, so reusing the request's single
+            // `:shadow` id across N targets would reserve one unit for
+            // N billable calls.
+            prepared.quota_attempt = Some(
+                quota
+                    .reserve_attempt(&format!("{quota_reservation_prefix}:shadow:{index}"))
+                    .await?,
+            );
+            outcomes.push(Self::spawn_prepared_shadow(prepared));
+        }
+        Ok(outcomes)
     }
 
     /// Queue quota admission and shadow transport without delaying the caller.
@@ -709,7 +751,7 @@ impl AiClient {
         usage: Option<ShadowUsageRecord>,
         quota: crate::quota_pool::QuotaPoolAdmission,
         quota_reservation_prefix: &str,
-    ) -> ShadowDispatchOutcome {
+    ) -> Vec<ShadowDispatchOutcome> {
         self.try_spawn_shadow_with_quota_detached_impl(
             config,
             path,
@@ -741,7 +783,7 @@ impl AiClient {
         quota: crate::quota_pool::QuotaPoolAdmission,
         quota_reservation_prefix: &str,
         reasoning_eligibility: crate::reasoning::ReasoningEligibility,
-    ) -> ShadowDispatchOutcome {
+    ) -> Vec<ShadowDispatchOutcome> {
         self.try_spawn_shadow_with_quota_detached_impl(
             config,
             path,
@@ -771,8 +813,8 @@ impl AiClient {
         quota: crate::quota_pool::QuotaPoolAdmission,
         quota_reservation_prefix: &str,
         reasoning_eligibility: Option<crate::reasoning::ReasoningEligibility>,
-    ) -> ShadowDispatchOutcome {
-        let mut prepared = match self.prepare_shadow(
+    ) -> Vec<ShadowDispatchOutcome> {
+        let targets = match self.prepare_shadows(
             config,
             path,
             body,
@@ -783,29 +825,55 @@ impl AiClient {
             usage,
             reasoning_eligibility,
         ) {
-            Ok(prepared) => prepared,
-            Err(outcome) => return outcome,
+            Ok(targets) => targets,
+            Err(outcome) => return vec![outcome],
         };
-        let reservation_id = format!("{quota_reservation_prefix}:shadow");
-        tokio::spawn(async move {
-            match quota.reserve_attempt(&reservation_id).await {
-                Ok(attempt) => {
-                    prepared.quota_attempt = Some(attempt);
-                    Self::spawn_prepared_shadow(prepared);
+        let mut outcomes = Vec::with_capacity(targets.len());
+        for (index, target) in targets.into_iter().enumerate() {
+            let mut prepared = match target {
+                Ok(prepared) => prepared,
+                Err(outcome) => {
+                    outcomes.push(outcome);
+                    continue;
                 }
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        "quota admission suppressed optional shadow request"
-                    );
+            };
+            let reservation_id = format!("{quota_reservation_prefix}:shadow:{index}");
+            let quota = quota.clone();
+            tokio::spawn(async move {
+                match quota.reserve_attempt(&reservation_id).await {
+                    Ok(attempt) => {
+                        prepared.quota_attempt = Some(attempt);
+                        Self::spawn_prepared_shadow(prepared);
+                    }
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            "quota admission suppressed optional shadow request"
+                        );
+                    }
                 }
-            }
-        });
-        ShadowDispatchOutcome::Spawned
+            });
+            outcomes.push(ShadowDispatchOutcome::Spawned);
+        }
+        outcomes
     }
 
+    /// Apply the request-level shadow gates once, then prepare one
+    /// request per configured target.
+    ///
+    /// `Err` carries a refusal that is true of the whole request (no
+    /// shadow block, an ineligible surface, a stream); those never
+    /// reach a target. `Ok` carries one entry per target, in config
+    /// order, each already resolved to either a prepared request or
+    /// its own per-target refusal.
+    ///
+    /// Sampling draws **once** here and every target compares against
+    /// that draw. Independent per-target draws would give disjoint
+    /// populations, and two targets whose measured cost and latency
+    /// come from different requests are not comparable, which is the
+    /// entire point of running two.
     #[allow(clippy::too_many_arguments)]
-    fn prepare_shadow(
+    fn prepare_shadows(
         &self,
         config: &AiHandlerConfig,
         path: &str,
@@ -816,7 +884,10 @@ impl AiClient {
         disallow_prompt_training: bool,
         usage: Option<ShadowUsageRecord>,
         reasoning_eligibility: Option<crate::reasoning::ReasoningEligibility>,
-    ) -> std::result::Result<PreparedShadowRequest, ShadowDispatchOutcome> {
+    ) -> std::result::Result<
+        Vec<std::result::Result<PreparedShadowRequest, ShadowDispatchOutcome>>,
+        ShadowDispatchOutcome,
+    > {
         let Some(shadow_cfg) = config.shadow.as_ref() else {
             return Err(ShadowDispatchOutcome::NotConfigured);
         };
@@ -827,13 +898,54 @@ impl AiClient {
             ai_metrics::record_shadow_dropped(ai_metrics::ShadowDropReason::Streaming);
             return Err(ShadowDispatchOutcome::StreamingSkipped);
         }
+        let draw: f32 = rand::random();
+        Ok(shadow_cfg
+            .targets
+            .iter()
+            .map(|target| {
+                self.prepare_shadow_target(
+                    config,
+                    target,
+                    draw,
+                    path,
+                    body,
+                    allowed_providers,
+                    blocked_providers,
+                    disallow_prompt_training,
+                    usage.clone(),
+                    reasoning_eligibility,
+                )
+            })
+            .collect())
+    }
 
+    /// Everything that is decided per target: sampling against the
+    /// request's one draw, provider resolution and policy, reasoning
+    /// policy, and admission.
+    ///
+    /// Admission runs once per target, so N targets take N slots out
+    /// of the one process-wide task and memory ceiling rather than
+    /// multiplying it by the length of the config.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_shadow_target(
+        &self,
+        config: &AiHandlerConfig,
+        shadow_cfg: &crate::handler::AiShadowTarget,
+        draw: f32,
+        path: &str,
+        body: &serde_json::Value,
+        allowed_providers: &[String],
+        blocked_providers: &[String],
+        disallow_prompt_training: bool,
+        usage: Option<ShadowUsageRecord>,
+        reasoning_eligibility: Option<crate::reasoning::ReasoningEligibility>,
+    ) -> std::result::Result<PreparedShadowRequest, ShadowDispatchOutcome> {
         let sampled = if shadow_cfg.sample_rate >= 1.0 {
             true
         } else if shadow_cfg.sample_rate <= 0.0 {
             false
         } else {
-            rand::random::<f32>() < shadow_cfg.sample_rate
+            draw < shadow_cfg.sample_rate
         };
         if !sampled {
             return Err(ShadowDispatchOutcome::SampledOut);
@@ -1002,12 +1114,29 @@ impl AiClient {
             .await
             {
                 Ok(result) => {
+                    // Recorded here, beside the usage row, rather than
+                    // inside `run_shadow_request`: the timeout arm below
+                    // never reaches that function, and a target whose
+                    // calls all time out is exactly the one an operator
+                    // needs to see on this counter.
+                    ai_metrics::record_shadow_call(
+                        &usage_provider,
+                        result.status,
+                        result.finish_reason.as_deref(),
+                        result.latency_ms as f64 / 1000.0,
+                    );
                     if let Some(usage) = usage {
                         usage.record(usage_provider, usage_model, result);
                     }
                 }
                 Err(_) => {
                     ai_metrics::record_shadow_timeout();
+                    ai_metrics::record_shadow_call(
+                        &usage_provider,
+                        504,
+                        None,
+                        task_timeout_ms as f64 / 1000.0,
+                    );
                     if let Some(usage) = usage {
                         usage.record(
                             usage_provider,
@@ -1017,6 +1146,7 @@ impl AiClient {
                                 latency_ms: task_timeout_ms,
                                 prompt_tokens: 0,
                                 completion_tokens: 0,
+                                finish_reason: None,
                             },
                         );
                     }
@@ -2789,6 +2919,7 @@ async fn run_shadow_request(
                     latency_ms: started.elapsed().as_millis() as u64,
                     prompt_tokens: 0,
                     completion_tokens: 0,
+                    finish_reason: None,
                 };
             }
         }
@@ -2817,6 +2948,7 @@ async fn run_shadow_request(
         latency_ms: elapsed.as_millis() as u64,
         prompt_tokens: prompt_tokens.unwrap_or(0),
         completion_tokens: completion_tokens.unwrap_or(0),
+        finish_reason,
     }
 }
 
@@ -2826,6 +2958,10 @@ fn failed_shadow_call(started: std::time::Instant) -> ShadowCallResult {
         latency_ms: started.elapsed().as_millis() as u64,
         prompt_tokens: 0,
         completion_tokens: 0,
+        // A call that never produced a response has no finish reason.
+        // `None` rather than a synthetic value, so a report counting
+        // `length` truncations cannot pick up transport failures.
+        finish_reason: None,
     }
 }
 
@@ -3805,7 +3941,7 @@ mod tests {
             .await
             .expect("sampling out is not a quota failure");
 
-        assert_eq!(outcome, ShadowDispatchOutcome::SampledOut);
+        assert_eq!(outcome, vec![ShadowDispatchOutcome::SampledOut]);
         assert!(
             store
                 .reservation_ids
@@ -3862,15 +3998,19 @@ mod tests {
             .await
             .expect("quota admits shadow");
 
-        assert_eq!(outcome, ShadowDispatchOutcome::Spawned);
+        assert_eq!(outcome, vec![ShadowDispatchOutcome::Spawned]);
         captured.await.expect("shadow request reached provider");
+        // The trailing index is the target's position in
+        // `shadow.targets`. The pool dedups by reservation id, so one
+        // shared `:shadow` id across N targets would reserve a single
+        // unit for N billable calls.
         assert_eq!(
             *store.reservation_ids.lock().expect("recording quota lock"),
-            vec!["request-1:quota-pool:shadow".to_string()]
+            vec!["request-1:quota-pool:shadow:0".to_string()]
         );
         assert_eq!(
             *store.settled_ids.lock().expect("recording quota lock"),
-            vec!["request-1:quota-pool:shadow".to_string()]
+            vec!["request-1:quota-pool:shadow:0".to_string()]
         );
     }
 
@@ -3918,11 +4058,11 @@ mod tests {
             .await
             .expect("reservation succeeds before local shadow construction");
 
-        assert_eq!(outcome, ShadowDispatchOutcome::Spawned);
+        assert_eq!(outcome, vec![ShadowDispatchOutcome::Spawned]);
         wait_for_quota_release(&store).await;
         assert_eq!(
             *store.released_ids.lock().expect("recording quota lock"),
-            vec!["request-local-shadow:shadow".to_string()]
+            vec!["request-local-shadow:shadow:0".to_string()]
         );
         assert!(store
             .settled_ids
@@ -3959,13 +4099,44 @@ mod tests {
             workflow_id: None,
             logical_model: None,
             served_model: None,
+            finish_reason: None,
+            shadow_of: None,
         }
+    }
+
+    fn shadow_result(status: u16, finish_reason: Option<&str>) -> ShadowCallResult {
+        ShadowCallResult {
+            status,
+            latency_ms: 12,
+            prompt_tokens: 3,
+            completion_tokens: 4,
+            finish_reason: finish_reason.map(str::to_string),
+        }
+    }
+
+    /// Emit `count` rows from one `ShadowUsageRecord`, the way a
+    /// multi-target request does: build once, clone per target.
+    fn recorded_shadow_rows(count: usize) -> Vec<LlmUsageEvent> {
+        let sink = Arc::new(CapturingUsageSink::default());
+        let record = ShadowUsageRecord::new(
+            shadow_usage_event("caller-id"),
+            vec![sink.clone() as Arc<dyn UsageSink>],
+        );
+        for index in 0..count {
+            record.clone().record(
+                format!("target-{index}"),
+                "m".to_string(),
+                shadow_result(200, Some("stop")),
+            );
+        }
+        let events = sink.events.lock().expect("capturing usage sink lock");
+        events.clone()
     }
 
     #[test]
     fn shadow_usage_id_is_server_generated_and_cannot_collide_with_primary_id() {
-        let usage = ShadowUsageRecord::new(shadow_usage_event("caller-id"), Vec::new());
-        let request_id = usage.event.request_id.expect("shadow request id");
+        let rows = recorded_shadow_rows(1);
+        let request_id = rows[0].request_id.clone().expect("shadow request id");
 
         assert_ne!(request_id, "caller-id:shadow");
         assert!(request_id.ends_with(":shadow"));
@@ -3973,6 +4144,62 @@ mod tests {
         assert!(request_id[..32]
             .chars()
             .all(|character| character.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn each_shadow_target_row_gets_its_own_ledger_id() {
+        // `ShadowUsageRecord` is built once per request and cloned per
+        // target. Minting the id in `new` gave every clone the same
+        // one, and that id is the verifiable ledger's dedup key: three
+        // targets would collapse to one row on replay, silently, with
+        // no test failing.
+        let rows = recorded_shadow_rows(3);
+        assert_eq!(rows.len(), 3);
+        let ids: std::collections::BTreeSet<_> = rows
+            .iter()
+            .map(|row| row.request_id.clone().expect("shadow request id"))
+            .collect();
+        assert_eq!(ids.len(), 3, "each target row needs its own dedup key");
+    }
+
+    #[test]
+    fn shadow_row_carries_shadow_of_but_never_derives_its_id_from_it() {
+        let rows = recorded_shadow_rows(2);
+        for row in &rows {
+            assert_eq!(
+                row.shadow_of.as_deref(),
+                Some("caller-id"),
+                "shadow_of is the join key back to the primary row"
+            );
+            let request_id = row.request_id.as_deref().expect("shadow request id");
+            assert!(
+                !request_id.contains("caller-id"),
+                "the correlation-id feature lets a caller pick the primary's \
+                 request id, so a derived shadow id would let one caller \
+                 suppress another's rows on ledger replay: {request_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn shadow_finish_reason_reaches_the_usage_row() {
+        // Parsed by `parse_shadow_metadata` since the feature shipped
+        // and then dropped on the floor. A target that stopped on
+        // `length` where the primary stopped on `stop` truncated, and
+        // no cost or latency comparison says so.
+        let sink = Arc::new(CapturingUsageSink::default());
+        let record = ShadowUsageRecord::new(
+            shadow_usage_event("caller-id"),
+            vec![sink.clone() as Arc<dyn UsageSink>],
+        );
+        record.record(
+            "anthropic".to_string(),
+            "claude".to_string(),
+            shadow_result(200, Some("length")),
+        );
+        let events = sink.events.lock().expect("capturing usage sink lock");
+        assert_eq!(events[0].finish_reason.as_deref(), Some("length"));
+        assert_eq!(events[0].tag.as_deref(), Some("shadow"));
     }
 
     #[test]
@@ -4042,7 +4269,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(outcome, ShadowDispatchOutcome::Spawned);
+        assert_eq!(outcome, vec![ShadowDispatchOutcome::Spawned]);
         let request = captured.await.expect("test provider task");
         let request_text = String::from_utf8(request).expect("HTTP request is UTF-8");
         let body = request_text.split_once("\r\n\r\n").expect("HTTP body").1;
@@ -4088,7 +4315,7 @@ mod tests {
         let client = AiClient::with_shadow_supervisor(Arc::new(ShadowSupervisor::new(1)));
 
         let prepared = client
-            .prepare_shadow(
+            .prepare_shadows(
                 &config,
                 "/v1/chat/completions",
                 &compressed,
@@ -4099,11 +4326,212 @@ mod tests {
                 None,
                 Some(eligibility),
             )
+            .expect("the request-level gates admit this request")
+            .pop()
+            .expect("one configured target")
             .expect("shadow is admitted");
 
         assert_eq!(prepared.reasoning_outcome, "code_bypass");
         assert!(prepared.body.get("reasoning_effort").is_none());
         assert_eq!(prepared.body["messages"], compressed["messages"]);
+    }
+
+    fn multi_target_handler_config(targets: serde_json::Value) -> AiHandlerConfig {
+        AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {
+                    "name": "primary",
+                    "api_key": "primary-test-key",
+                    "base_url": "http://127.0.0.1:9/v1",
+                    "allow_private_base_url": true
+                },
+                {
+                    "name": "shadow-a",
+                    "api_key": "a-test-key",
+                    "base_url": "http://127.0.0.1:9/v1",
+                    "allow_private_base_url": true
+                },
+                {
+                    "name": "shadow-b",
+                    "api_key": "b-test-key",
+                    "base_url": "http://127.0.0.1:9/v1",
+                    "allow_private_base_url": true
+                },
+                {
+                    "name": "shadow-c",
+                    "api_key": "c-test-key",
+                    "base_url": "http://127.0.0.1:9/v1",
+                    "allow_private_base_url": true
+                }
+            ],
+            "shadow": {"targets": targets}
+        }))
+        .expect("valid multi-target shadow fixture")
+    }
+
+    #[tokio::test]
+    async fn two_shadow_targets_share_one_admission_ceiling() {
+        // The supervisor's task and memory ceilings are process-wide
+        // bounds on how much optional work a gateway will carry. If
+        // admission ran once per request rather than once per target,
+        // an operator could multiply that bound by editing a config
+        // list, which is exactly the thing the supervisor exists to
+        // stop. With three targets and two slots, the third is dropped
+        // as saturated.
+        let _metric_guard = SHADOW_METRIC_TEST_LOCK.lock().await;
+        let client = AiClient::with_shadow_supervisor(Arc::new(ShadowSupervisor::new(2)));
+        let config = multi_target_handler_config(serde_json::json!([
+            {"provider": "shadow-a", "timeout_ms": 50, "task_timeout_ms": 50},
+            {"provider": "shadow-b", "timeout_ms": 50, "task_timeout_ms": 50},
+            {"provider": "shadow-c", "timeout_ms": 50, "task_timeout_ms": 50},
+        ]));
+        let before = ai_metrics::shadow_dropped_value(ai_metrics::ShadowDropReason::Saturated);
+
+        let outcomes = client.try_spawn_shadow(
+            &config,
+            "/v1/chat/completions",
+            &serde_json::json!({"model": "primary-model"}),
+            false,
+            &[],
+            &[],
+            false,
+            None,
+        );
+
+        assert_eq!(
+            outcomes,
+            vec![
+                ShadowDispatchOutcome::Spawned,
+                ShadowDispatchOutcome::Spawned,
+                ShadowDispatchOutcome::Saturated,
+            ]
+        );
+        assert_eq!(
+            ai_metrics::shadow_dropped_value(ai_metrics::ShadowDropReason::Saturated) - before,
+            1.0,
+            "exactly one target is dropped, not the whole request"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_sampling_draw_nests_target_populations() {
+        // Independent per-target draws would give disjoint populations,
+        // and two targets measured on different requests are not
+        // comparable, which is the only reason to run two. One draw per
+        // request, compared against each rate, makes the 0.1 target's
+        // population a strict subset of the 0.5 target's, so the two
+        // are comparable on the smaller one's whole population.
+        // Capacity zero, so a target that clears sampling is refused at
+        // the next gate and never spawns a task. Sampling is the only
+        // thing under test here, and 500 spawned background calls would
+        // otherwise exhaust any finite supervisor partway through the
+        // loop and turn a later `Spawned` into a `Saturated` that reads
+        // exactly like "this target did not fire".
+        let client = AiClient::with_shadow_supervisor(Arc::new(ShadowSupervisor::new(0)));
+        let config = multi_target_handler_config(serde_json::json!([
+            {"provider": "shadow-a", "sample_rate": 0.1, "timeout_ms": 50, "task_timeout_ms": 50},
+            {"provider": "shadow-b", "sample_rate": 0.5, "timeout_ms": 50, "task_timeout_ms": 50},
+        ]));
+
+        let mut narrow_fired = 0_u32;
+        let mut wide_fired = 0_u32;
+        for _ in 0..500 {
+            let outcomes = client.try_spawn_shadow(
+                &config,
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "primary-model"}),
+                false,
+                &[],
+                &[],
+                false,
+                None,
+            );
+            assert_eq!(outcomes.len(), 2);
+            let narrow = outcomes[0] != ShadowDispatchOutcome::SampledOut;
+            let wide = outcomes[1] != ShadowDispatchOutcome::SampledOut;
+            assert!(
+                !narrow || wide,
+                "the 0.1 target fired on a request the 0.5 target skipped; \
+                 the populations are disjoint, not nested"
+            );
+            narrow_fired += u32::from(narrow);
+            wide_fired += u32::from(wide);
+        }
+        // Loose bounds, because this is a real RNG. The nesting
+        // assertion above is the exact one; these only catch a rate
+        // that stopped being honored at all.
+        assert!(narrow_fired > 0, "the 0.1 target never fired in 500 draws");
+        assert!(
+            wide_fired > narrow_fired,
+            "a 0.5 rate must fire more often than a 0.1 rate: \
+             {wide_fired} vs {narrow_fired}"
+        );
+        assert!(
+            wide_fired < 500,
+            "a 0.5 rate must not fire on every request: {wide_fired}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_shadow_target_records_its_own_call_metric() {
+        let _metric_guard = SHADOW_METRIC_TEST_LOCK.lock().await;
+        let (url_a, _a) = serve_one_json_response(
+            r#"{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"a"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+        )
+        .await;
+        let (url_b, _b) = serve_one_json_response(
+            r#"{"choices":[{"finish_reason":"length","message":{"role":"assistant","content":"b"}}],"usage":{"prompt_tokens":1,"completion_tokens":9,"total_tokens":10}}"#,
+        )
+        .await;
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "primary", "api_key": "k", "base_url": "http://127.0.0.1:9/v1", "allow_private_base_url": true},
+                {"name": "shadow-a", "api_key": "k", "base_url": url_a, "allow_private_base_url": true},
+                {"name": "shadow-b", "api_key": "k", "base_url": url_b, "allow_private_base_url": true},
+            ],
+            "shadow": {"targets": [
+                {"provider": "shadow-a", "timeout_ms": 2000, "task_timeout_ms": 2000},
+                {"provider": "shadow-b", "timeout_ms": 2000, "task_timeout_ms": 2000},
+            ]}
+        }))
+        .expect("valid two-target shadow fixture");
+        let before_a = ai_metrics::shadow_calls_value("shadow-a", "2xx", "stop");
+        let before_b = ai_metrics::shadow_calls_value("shadow-b", "2xx", "length");
+
+        let client = AiClient::with_shadow_supervisor(Arc::new(ShadowSupervisor::new(4)));
+        let outcomes = client.try_spawn_shadow(
+            &config,
+            "/v1/chat/completions",
+            &serde_json::json!({"model": "primary-model"}),
+            false,
+            &[],
+            &[],
+            false,
+            None,
+        );
+        assert_eq!(
+            outcomes,
+            vec![
+                ShadowDispatchOutcome::Spawned,
+                ShadowDispatchOutcome::Spawned
+            ]
+        );
+
+        // The tasks are detached; poll the counters rather than sleep a
+        // fixed amount, so a slow machine does not make this flaky.
+        for _ in 0..200 {
+            if ai_metrics::shadow_calls_value("shadow-a", "2xx", "stop") - before_a >= 1.0
+                && ai_metrics::shadow_calls_value("shadow-b", "2xx", "length") - before_b >= 1.0
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "both targets must record their own call: a={} b={}",
+            ai_metrics::shadow_calls_value("shadow-a", "2xx", "stop") - before_a,
+            ai_metrics::shadow_calls_value("shadow-b", "2xx", "length") - before_b,
+        );
     }
 
     #[tokio::test]
@@ -4121,7 +4549,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(outcome, ShadowDispatchOutcome::UnsupportedSurface);
+        assert_eq!(outcome, vec![ShadowDispatchOutcome::UnsupportedSurface]);
         assert_eq!(client.shadow_supervisor().available(), 1);
     }
 
@@ -4140,7 +4568,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(outcome, ShadowDispatchOutcome::StreamingSkipped);
+        assert_eq!(outcome, vec![ShadowDispatchOutcome::StreamingSkipped]);
         assert_eq!(client.shadow_supervisor().available(), 1);
     }
 
@@ -4159,7 +4587,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(outcome, ShadowDispatchOutcome::SampledOut);
+        assert_eq!(outcome, vec![ShadowDispatchOutcome::SampledOut]);
         assert_eq!(client.shadow_supervisor().available(), 1);
     }
 
@@ -4178,7 +4606,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(outcome, ShadowDispatchOutcome::ProviderNotAllowed);
+        assert_eq!(outcome, vec![ShadowDispatchOutcome::ProviderNotAllowed]);
         assert_eq!(client.shadow_supervisor().available(), 1);
     }
 
@@ -4200,7 +4628,10 @@ mod tests {
             None,
         );
 
-        assert_eq!(outcome, ShadowDispatchOutcome::PromptTrainingDisallowed);
+        assert_eq!(
+            outcome,
+            vec![ShadowDispatchOutcome::PromptTrainingDisallowed]
+        );
         assert!(
             ai_metrics::shadow_dropped_value(
                 ai_metrics::ShadowDropReason::PromptTrainingDisallowed
@@ -4232,20 +4663,16 @@ mod tests {
             None,
         );
 
-        assert_eq!(outcome, ShadowDispatchOutcome::Spawned);
+        assert_eq!(outcome, vec![ShadowDispatchOutcome::Spawned]);
     }
 
     #[tokio::test]
     async fn shadow_dispatch_records_each_closed_drop_reason_exactly_once() {
         let _metric_guard = SHADOW_METRIC_TEST_LOCK.lock().await;
-        let reasons = [
-            ai_metrics::ShadowDropReason::Streaming,
-            ai_metrics::ShadowDropReason::ProviderNotFound,
-            ai_metrics::ShadowDropReason::ProviderNotAllowed,
-            ai_metrics::ShadowDropReason::PromptTrainingDisallowed,
-            ai_metrics::ShadowDropReason::EgressDenied,
-            ai_metrics::ShadowDropReason::Saturated,
-        ];
+        // The canonical list, not a copy of it: a hand-written array
+        // here compiled fine when a variant was added and quietly
+        // stopped covering it.
+        let reasons = ai_metrics::ALL_SHADOW_DROP_REASONS;
         let snapshot = || reasons.map(ai_metrics::shadow_dropped_value);
 
         let before_sampling = snapshot();
@@ -4260,7 +4687,7 @@ mod tests {
                 false,
                 None,
             ),
-            ShadowDispatchOutcome::SampledOut
+            vec![ShadowDispatchOutcome::SampledOut]
         );
         assert_eq!(snapshot(), before_sampling, "sampling is not a drop");
 
@@ -4291,12 +4718,12 @@ mod tests {
                 false,
                 None,
             ),
-            ShadowDispatchOutcome::StreamingSkipped
+            vec![ShadowDispatchOutcome::StreamingSkipped]
         );
         assert_one_increment(before, ai_metrics::ShadowDropReason::Streaming);
 
         let mut missing = shadow_handler_config(1.0);
-        missing.shadow.as_mut().expect("shadow config").provider = "missing".to_string();
+        missing.shadow.as_mut().expect("shadow config").targets[0].provider = "missing".to_string();
         let before = snapshot();
         assert_eq!(
             client.try_spawn_shadow(
@@ -4309,7 +4736,7 @@ mod tests {
                 false,
                 None,
             ),
-            ShadowDispatchOutcome::ProviderNotFound
+            vec![ShadowDispatchOutcome::ProviderNotFound]
         );
         assert_one_increment(before, ai_metrics::ShadowDropReason::ProviderNotFound);
 
@@ -4325,7 +4752,7 @@ mod tests {
                 false,
                 None,
             ),
-            ShadowDispatchOutcome::ProviderNotAllowed
+            vec![ShadowDispatchOutcome::ProviderNotAllowed]
         );
         assert_one_increment(before, ai_metrics::ShadowDropReason::ProviderNotAllowed);
 
@@ -4341,7 +4768,7 @@ mod tests {
                 true,
                 None,
             ),
-            ShadowDispatchOutcome::PromptTrainingDisallowed
+            vec![ShadowDispatchOutcome::PromptTrainingDisallowed]
         );
         assert_one_increment(
             before,
@@ -4361,7 +4788,7 @@ mod tests {
                 false,
                 None,
             ),
-            ShadowDispatchOutcome::EgressDenied
+            vec![ShadowDispatchOutcome::EgressDenied]
         );
         assert_one_increment(before, ai_metrics::ShadowDropReason::EgressDenied);
 
@@ -4380,7 +4807,7 @@ mod tests {
                 false,
                 None,
             ),
-            ShadowDispatchOutcome::Saturated
+            vec![ShadowDispatchOutcome::Saturated]
         );
         assert_one_increment(before, ai_metrics::ShadowDropReason::Saturated);
         drop(held);
@@ -4406,7 +4833,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(outcome, ShadowDispatchOutcome::Saturated);
+        assert_eq!(outcome, vec![ShadowDispatchOutcome::Saturated]);
         assert!(
             ai_metrics::shadow_dropped_value(ai_metrics::ShadowDropReason::Saturated)
                 - dropped_before
@@ -4577,7 +5004,7 @@ mod tests {
                 false,
                 Some(usage),
             ),
-            ShadowDispatchOutcome::Spawned
+            vec![ShadowDispatchOutcome::Spawned]
         );
 
         let event = tokio::time::timeout(Duration::from_secs(2), async {

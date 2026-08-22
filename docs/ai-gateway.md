@@ -952,6 +952,24 @@ it never replaces or delays the primary response.
 
 The shadow body is drained while at most 1 MiB is retained for comparison metadata, which is logged at `target=sbproxy_ai_shadow` (status, latency, prompt/completion tokens, finish reason). Configured usage sinks also receive a separate row with `tag: shadow` and a fresh server-generated request ID ending in `:shadow`. That row estimates shadow cost for comparison, but it never debits the primary budget tracker.
 
+### Two or more targets
+
+```yaml
+shadow:
+  targets:
+    - provider: anthropic
+      model: claude-sonnet-4
+      sample_rate: 0.1
+      timeout_ms: 30000
+      task_timeout_ms: 30000
+    - provider: gemini
+      sample_rate: 0.1
+```
+
+Each target sees the same request and produces its own upstream call, its own usage-ledger row, and its own metric series. Two entries naming the same provider are refused at config load, and so is an empty `targets:` list: the provider name identifies the target everywhere it appears, and an empty list is a block that looks configured and evaluates nothing.
+
+The single-target form is still accepted verbatim and means a one-entry list:
+
 ```yaml
 shadow:
   provider: anthropic
@@ -960,7 +978,35 @@ shadow:
   task_timeout_ms: 30000
 ```
 
-The shadow provider must appear in `providers`. Set `enabled: false` on a shadow-only provider to exclude it from primary routing; explicit shadow selection still uses it. Credential `allowed_providers` and `blocked_providers` rules apply to it independently; a disallowed shadow is suppressed while the primary continues. The `x-sbproxy-disallow-prompt-training` opt-out also suppresses a shadow provider unless it declares `no_prompt_training: true`. If the hosting process attaches a purpose-scoped egress authorizer to `AiClient`, v1 shadow dispatch fails closed because the shadow transport cannot yet consume authorized DNS pins and redirect checks. `sbproxy_ai_shadow_dropped_total{reason=...}` reports the closed skip/drop reasons `streaming`, `provider_not_found`, `provider_not_allowed`, `prompt_training_disallowed`, `egress_denied`, and `saturated`. Deliberate sample misses are not failures and do not increment that counter.
+**One admission ceiling, shared.** The 16-task and 64 MiB bounds are process-wide limits on how much optional work the gateway carries, so admission runs once per target rather than once per request. Three targets take three slots. A target that cannot get one is dropped as `saturated` and the others still run; the primary is never affected either way.
+
+**One sampling draw, shared.** `sample_rate` still means "one request in ten", but the ten are chosen once per request and every target is compared against that same draw. Target populations therefore nest rather than diverge: everything a `0.1` target saw, a `0.5` target on the same route also saw. That is what makes two targets comparable, on the smaller one's whole population. Independent per-target draws would give disjoint populations, and cost and latency measured on different requests do not compare.
+
+### Reading the comparison
+
+Per target, from the usage ledger:
+
+| Field | Says |
+|---|---|
+| `tag` | `shadow` on every shadow row |
+| `provider` | which target produced this row |
+| `shadow_of` | the primary request this row evaluated, and the join key back to the primary's row |
+| `request_id` | this row's own id, freshly minted per target and ending in `:shadow` |
+| `finish_reason` | the target's terminal finish reason, which is the cheapest disagreement signal: `length` where the primary said `stop` means the target truncated |
+| `cost_usd`, `latency_ms`, `prompt_tokens`, `completion_tokens` | the usual per-row figures |
+
+`shadow_of` is carried as data and is never the ledger's dedup key. The correlation-id feature lets a caller choose its own request id through `X-Request-Id`, so a shadow row whose key was derived from the primary's would let one caller suppress another caller's rows on ledger replay.
+
+Per target, from Prometheus:
+
+- `sbproxy_ai_shadow_calls_total{target, status_class, finish_reason}` counts completed calls. `finish_reason` is closed to the OpenAI chat vocabulary plus `none` and `other`, because the raw value comes off a provider response body.
+- `sbproxy_ai_shadow_latency_seconds{target}` uses the same buckets as `sbproxy_ai_request_duration_seconds`, so a target's distribution reads against the primary's without rescaling.
+
+Cost per target is answerable from the ledger rather than from a metric, deliberately: the ledger is non-lossy and the metrics feed is not, and a cost figure that silently drops samples under load is worse than no cost figure.
+
+Comparing the two answers' *text* is not part of this. Shadow response bodies are drained, not retained, so what you can compare today is cost, latency, tokens, and finish reason. Retaining the text (behind the same `capture_content` plus key-policy consent gate the primary content store uses) and scoring agreement between the answers are tracked separately.
+
+Every shadow target must appear in `providers`. Set `enabled: false` on a shadow-only provider to exclude it from primary routing; explicit shadow selection still uses it. Credential `allowed_providers` and `blocked_providers` rules apply to it independently; a disallowed shadow is suppressed while the primary continues. The `x-sbproxy-disallow-prompt-training` opt-out also suppresses a shadow provider unless it declares `no_prompt_training: true`. If the hosting process attaches a purpose-scoped egress authorizer to `AiClient`, v1 shadow dispatch fails closed because the shadow transport cannot yet consume authorized DNS pins and redirect checks. `sbproxy_ai_shadow_dropped_total{reason=...}` reports the closed skip/drop reasons `streaming`, `provider_not_found`, `provider_not_allowed`, `prompt_training_disallowed`, `egress_denied`, and `saturated`. Deliberate sample misses are not failures and do not increment that counter.
 
 See [examples/ai-shadow](../examples/ai-shadow/sb.yml).
 

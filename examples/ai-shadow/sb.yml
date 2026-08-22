@@ -19,9 +19,18 @@
 # `sample_rate: 0.1` mirrors 10% of traffic. Set to 1.0 to mirror
 # every request (doubles spend on the shadow leg).
 #
+# Two targets are configured below, so each sampled request is copied
+# to both. One draw is taken per request and both rates are compared
+# against it, so the 0.1 target only ever fires on requests the 0.5
+# target also fired on: the two are comparable on the narrower one's
+# whole population. Each target produces its own usage row, tagged
+# `shadow`, joined back to the primary by `shadow_of`, and its own
+# `sbproxy_ai_shadow_calls_total{target=...}` series.
+#
 # Run:
 #   export OPENAI_API_KEY=sk-...
 #   export ANTHROPIC_API_KEY=sk-ant-...
+#   export GEMINI_API_KEY=...
 #   make run CONFIG=examples/ai-shadow/sb.yml
 #
 # Test:
@@ -30,7 +39,19 @@
 #     -H 'Content-Type: application/json' \
 #     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"What is 2+2?"}]}'
 #
-# Then watch the proxy logs for `shadow response` events.
+# Then watch the proxy logs for `shadow response` events, one per
+# target that fired, and the per-target counters:
+#
+#   curl -s http://127.0.0.1:9090/metrics | grep sbproxy_ai_shadow_calls_total
+#
+#   sbproxy_ai_shadow_calls_total{target="anthropic",status_class="2xx",finish_reason="stop"} 1
+#   sbproxy_ai_shadow_calls_total{target="gemini",status_class="2xx",finish_reason="stop"} 4
+#
+# The usage rows carry the rest of the comparison: `tag: shadow`,
+# `provider` naming the target, `shadow_of` joining back to the
+# primary, and `finish_reason`, `cost_usd`, and `latency_ms` per
+# target. Shadow response *text* is drained rather than retained, so
+# what you compare here is numbers, not answers.
 
 proxy:
   http_bind_port: 8080
@@ -51,16 +72,34 @@ origins:
           # Exclude this provider from primary routing. A disabled provider
           # may still be selected explicitly by the shadow block below.
           enabled: false
+        - name: gemini
+          api_key: ${GEMINI_API_KEY}
+          default_model: gemini-2.5-flash
+          enabled: false
       shadow:
-        provider: anthropic
         # Shadow evaluation is non-streaming only. Slow or failed shadow
-        # calls never delay or reject the primary response.
-        sample_rate: 0.1
-        timeout_ms: 30000
-        task_timeout_ms: 30000
-        # Without this override the shadow leg would forward the
-        # primary request's model name (e.g. gpt-4o-mini) to Anthropic
-        # unchanged, and Anthropic has no such model, so every shadow
-        # call would fail with 404. Set this to a model the shadow
-        # provider actually serves.
-        model: claude-haiku-4-5
+        # calls never delay or reject the primary response. Each target
+        # takes its own slot out of the shared 16-task / 64 MiB
+        # admission ceiling; a target that cannot get one is dropped as
+        # `saturated` and the others still run.
+        #
+        # No two targets may name the same provider: the provider name
+        # is what labels the metric and identifies the ledger row.
+        targets:
+          - provider: anthropic
+            sample_rate: 0.1
+            timeout_ms: 30000
+            task_timeout_ms: 30000
+            # Without this override the shadow leg would forward the
+            # primary request's model name (e.g. gpt-4o-mini) to
+            # Anthropic unchanged, and Anthropic has no such model, so
+            # every shadow call would fail with 404. Set this to a
+            # model the shadow provider actually serves.
+            model: claude-haiku-4-5
+          - provider: gemini
+            # A wider rate than the target above. The populations nest:
+            # every request the 0.1 target saw, this one saw too.
+            sample_rate: 0.5
+            timeout_ms: 30000
+            task_timeout_ms: 30000
+            model: gemini-2.5-flash

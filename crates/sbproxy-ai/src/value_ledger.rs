@@ -1000,6 +1000,8 @@ mod tests {
             workflow_id: None,
             logical_model: Some(model.into()),
             served_model: Some(model.into()),
+            finish_reason: None,
+            shadow_of: None,
         }
     }
 
@@ -1018,6 +1020,8 @@ mod tests {
             model: billed_as.into(),
             logical_model: Some(model.into()),
             served_model: None,
+            finish_reason: None,
+            shadow_of: None,
             ..event(model, prompt_tokens, completion_tokens)
         }
     }

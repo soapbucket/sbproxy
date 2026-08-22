@@ -945,12 +945,37 @@ fn default_health_healthy() -> u32 {
 /// timeout that, when exceeded, drops the future and ticks a separate timeout
 /// counter. See `sbproxy_ai::client::AiClient` for the supervisor
 /// implementation.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone)]
 pub struct AiShadowConfig {
+    /// Providers to shadow this route against.
+    ///
+    /// Every target sees the same request, independently sampled, and
+    /// each produces its own usage-ledger row tagged `shadow` and
+    /// grouped with the primary by `shadow_of`. The list is keyed by
+    /// `provider`: two entries naming the same provider are refused at
+    /// config load, because the provider name is what labels the
+    /// metric and identifies the row.
+    ///
+    /// The single-target form is still accepted and means a one-entry
+    /// list:
+    ///
+    /// ```yaml
+    /// shadow:
+    ///   provider: anthropic
+    ///   sample_rate: 0.1
+    /// ```
+    pub targets: Vec<AiShadowTarget>,
+}
+
+/// One provider this route is shadowed against.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct AiShadowTarget {
     /// Provider name to shadow against. Must also appear in the
     /// `providers` list (so its API key, base URL, and rate limits
     /// resolve normally). Use a different model than the primary if
-    /// you want to A/B different model versions.
+    /// you want to A/B different model versions. No two targets may
+    /// name the same provider.
     pub provider: String,
     /// Optional model override for the shadow request. Defaults to
     /// the same model the client sent.
@@ -958,6 +983,12 @@ pub struct AiShadowConfig {
     pub model: Option<String>,
     /// Sample rate in `[0.0, 1.0]`. Default `1.0` (mirror every
     /// request). Set lower to avoid doubling spend on every call.
+    ///
+    /// One draw is taken per request and every target is compared
+    /// against that same draw, so target populations nest rather than
+    /// diverge: everything a `0.1` target sees, a `0.5` target on the
+    /// same route also saw. That is what makes two targets comparable
+    /// on the smaller one's whole population.
     #[serde(default = "default_shadow_sample_rate")]
     pub sample_rate: f32,
     /// Per-shadow-request HTTP timeout in milliseconds. Default
@@ -972,6 +1003,61 @@ pub struct AiShadowConfig {
     /// providers that hang inside DNS, TLS, or pre-body read paths.
     #[serde(default = "default_shadow_task_timeout_ms")]
     pub task_timeout_ms: u64,
+}
+
+/// The `targets:` spelling, kept separate from the flat one so an
+/// unknown key inside it is still refused.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AiShadowTargetList {
+    targets: Vec<AiShadowTarget>,
+}
+
+impl<'de> Deserialize<'de> for AiShadowConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        // Branch on the presence of `targets` rather than with
+        // `#[serde(untagged)]`: untagged reports "data did not match any
+        // variant" for a typo anywhere in either arm, which for a block
+        // with five sibling keys is a worse error than the one
+        // `deny_unknown_fields` gives.
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let targets = if value.get("targets").is_some() {
+            serde_json::from_value::<AiShadowTargetList>(value)
+                .map_err(D::Error::custom)?
+                .targets
+        } else {
+            vec![serde_json::from_value::<AiShadowTarget>(value).map_err(D::Error::custom)?]
+        };
+
+        if targets.is_empty() {
+            return Err(D::Error::custom(
+                "ai shadow.targets must name at least one provider; remove the \
+                 shadow block to disable shadow evaluation",
+            ));
+        }
+        // The provider name labels the shadow metric families and
+        // identifies the target's ledger rows. Two entries sharing it
+        // would silently merge two evaluations into one series.
+        for (index, target) in targets.iter().enumerate() {
+            if let Some(earlier) = targets[..index]
+                .iter()
+                .position(|other| other.provider == target.provider)
+            {
+                return Err(D::Error::custom(format!(
+                    "ai shadow.targets[{index}] repeats provider {:?} from \
+                     targets[{earlier}]; each target is identified by its \
+                     provider name",
+                    target.provider
+                )));
+            }
+        }
+        Ok(Self { targets })
+    }
 }
 
 fn default_shadow_sample_rate() -> f32 {
@@ -3064,6 +3150,95 @@ mod tests {
             error.contains("reasoning budget must be greater than zero"),
             "{error}"
         );
+    }
+
+    fn shadow_config(block: serde_json::Value) -> anyhow::Result<AiHandlerConfig> {
+        AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "primary", "api_key": "k"},
+                {"name": "anthropic", "api_key": "k"},
+                {"name": "gemini", "api_key": "k"},
+            ],
+            "shadow": block,
+        }))
+    }
+
+    #[test]
+    fn flat_shadow_config_still_parses_as_one_target() {
+        // The compat promise. The flat form is five sibling keys, not a
+        // renamed field, so nothing in serde keeps it working for free.
+        let config = shadow_config(serde_json::json!({
+            "provider": "anthropic",
+            "model": "claude-sonnet-4",
+            "sample_rate": 0.25,
+            "timeout_ms": 1234,
+            "task_timeout_ms": 4321,
+        }))
+        .expect("the single-target form is still accepted");
+        let targets = &config.shadow.expect("shadow block").targets;
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].provider, "anthropic");
+        assert_eq!(targets[0].model.as_deref(), Some("claude-sonnet-4"));
+        assert!((targets[0].sample_rate - 0.25).abs() < f32::EPSILON);
+        assert_eq!(targets[0].timeout_ms, 1234);
+        assert_eq!(targets[0].task_timeout_ms, 4321);
+    }
+
+    #[test]
+    fn a_shadow_targets_list_parses_and_keeps_its_order() {
+        let config = shadow_config(serde_json::json!({
+            "targets": [
+                {"provider": "anthropic", "sample_rate": 0.1},
+                {"provider": "gemini"},
+            ],
+        }))
+        .expect("the targets form parses");
+        let targets = &config.shadow.expect("shadow block").targets;
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].provider, "anthropic");
+        assert_eq!(targets[1].provider, "gemini");
+        assert!(
+            (targets[1].sample_rate - 1.0).abs() < f32::EPSILON,
+            "an omitted rate still defaults to mirroring every request"
+        );
+    }
+
+    #[test]
+    fn empty_shadow_targets_is_refused() {
+        // An empty list is not "shadow disabled": it is a block the
+        // operator wrote expecting evaluation, that silently produces
+        // none. Removing the block is how you disable it.
+        let error = shadow_config(serde_json::json!({"targets": []}))
+            .expect_err("an empty target list must refuse the config")
+            .to_string();
+        assert!(error.contains("at least one provider"), "{error}");
+    }
+
+    #[test]
+    fn duplicate_shadow_target_provider_is_refused() {
+        // The provider name is the metric label and the ledger row's
+        // target identity. Two entries sharing it merge two evaluations
+        // into one series with no way to tell them apart.
+        let error = shadow_config(serde_json::json!({
+            "targets": [
+                {"provider": "anthropic", "sample_rate": 0.1},
+                {"provider": "anthropic", "model": "claude-opus-4"},
+            ],
+        }))
+        .expect_err("two targets on one provider must refuse the config")
+        .to_string();
+        assert!(error.contains("anthropic"), "{error}");
+        assert!(error.contains("targets[1]"), "{error}");
+    }
+
+    #[test]
+    fn an_unknown_shadow_target_key_is_refused() {
+        let error = shadow_config(serde_json::json!({
+            "targets": [{"provider": "anthropic", "sample_rare": 0.1}],
+        }))
+        .expect_err("a typo'd key must not be silently dropped")
+        .to_string();
+        assert!(error.contains("sample_rare"), "{error}");
     }
 
     #[test]

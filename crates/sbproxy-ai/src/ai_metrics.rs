@@ -793,6 +793,23 @@ pub enum ShadowDropReason {
     Saturated,
 }
 
+/// Every [`ShadowDropReason`], in label order.
+///
+/// The array length is written out, so a variant added to the enum and
+/// not added here fails to compile. Before this, the exhaustiveness
+/// test held a hand-written copy of this list: a seventh variant would
+/// have compiled, shipped, and never been asserted on, and
+/// `docs/observability.md` states this family's cardinality as a
+/// number that would then have been wrong.
+pub const ALL_SHADOW_DROP_REASONS: [ShadowDropReason; 6] = [
+    ShadowDropReason::Streaming,
+    ShadowDropReason::ProviderNotFound,
+    ShadowDropReason::ProviderNotAllowed,
+    ShadowDropReason::PromptTrainingDisallowed,
+    ShadowDropReason::EgressDenied,
+    ShadowDropReason::Saturated,
+];
+
 impl ShadowDropReason {
     /// Stable Prometheus label value.
     pub const fn as_str(self) -> &'static str {
@@ -818,6 +835,99 @@ pub fn record_shadow_dropped(reason: ShadowDropReason) {
 /// timeout and was cancelled.
 pub fn record_shadow_timeout() {
     AI_SHADOW_TIMEOUT.inc();
+}
+
+/// Per-target outcome counter for completed shadow calls.
+///
+/// `target` is the shadow target's provider name, bounded by the
+/// route's `shadow.targets` list, which refuses a duplicate provider
+/// so the label identifies exactly one target. `status_class` and
+/// `finish_reason` are normalized to closed sets below.
+///
+/// This is the per-target comparison surface. Cost per target is
+/// answerable from the usage ledger instead (`tag == "shadow"`, grouped
+/// by `provider`, joined to the primary through `shadow_of`), which is
+/// why there is no cost metric here: the ledger is non-lossy and this
+/// counter is not.
+static AI_SHADOW_CALLS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_shadow_calls_total",
+            "Completed shadow evaluation calls by target, status class, and finish reason"
+        ),
+        &["target", "status_class", "finish_reason"]
+    )
+    .unwrap()
+});
+
+/// Per-target latency of a completed shadow call, in seconds.
+///
+/// Same bucket layout as `sbproxy_ai_request_duration_seconds`, so a
+/// target's latency distribution can be read against the primary's
+/// without rescaling.
+static AI_SHADOW_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        HistogramOpts::new(
+            "sbproxy_ai_shadow_latency_seconds",
+            "Shadow evaluation call latency by target"
+        )
+        .buckets(vec![0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]),
+        &["target"]
+    )
+    .unwrap()
+});
+
+/// Record one completed shadow call against one target.
+///
+/// `status` is the HTTP status the target answered, or 0 when the call
+/// never produced a response. `finish_reason` is whatever the target
+/// reported, normalized here.
+pub fn record_shadow_call(target: &str, status: u16, finish_reason: Option<&str>, secs: f64) {
+    let status_class = match status {
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        // 0 is what the transport paths report when no response
+        // arrived at all; anything else is not a status we produce.
+        _ => "error",
+    };
+    let finish_reason = normalize_shadow_finish_reason(finish_reason);
+    AI_SHADOW_CALLS
+        .with_label_values(&[target, status_class, finish_reason])
+        .inc();
+    if secs.is_finite() && secs >= 0.0 {
+        AI_SHADOW_LATENCY.with_label_values(&[target]).observe(secs);
+    }
+}
+
+/// Close the `finish_reason` label to the OpenAI chat vocabulary the
+/// hub normalizes every provider into, plus `none` for a call that
+/// reported none and `other` for anything else.
+///
+/// Closed because the value reaches a Prometheus label and comes off a
+/// provider response body. A provider that invents a finish reason, or
+/// a translated native shape that passes an unmapped `stopReason`
+/// through, would otherwise mint a new series per distinct string.
+fn normalize_shadow_finish_reason(finish_reason: Option<&str>) -> &'static str {
+    match finish_reason {
+        None => "none",
+        Some("stop") => "stop",
+        Some("length") => "length",
+        Some("tool_calls") => "tool_calls",
+        Some("content_filter") => "content_filter",
+        Some("function_call") => "function_call",
+        Some("") => "none",
+        Some(_) => "other",
+    }
+}
+
+/// Read one `sbproxy_ai_shadow_calls_total` sample (test accessor).
+#[cfg(test)]
+pub(crate) fn shadow_calls_value(target: &str, status_class: &str, finish_reason: &str) -> f64 {
+    AI_SHADOW_CALLS
+        .with_label_values(&[target, status_class, finish_reason])
+        .get()
 }
 
 // --- Cascade routing metrics ---
