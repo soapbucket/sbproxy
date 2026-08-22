@@ -1028,11 +1028,17 @@ pulls, and verification.
 ![Storage: the verified weight cache with per-artifact size, residency, and delete controls](assets/admin-storage.png)
 
 Verified model weights in the artifact cache: what is on disk, what is
-resident, and what can be reclaimed.
+resident, and what can be reclaimed. Below the inventory, whether the
+storage backend the gateway reads and writes through is answering.
 
 - **Shows:** `GET /admin/model-host/files` (cache root, total bytes,
   per-artifact size, last-accessed time, and whether it currently
-  backs a ready replica).
+  backs a ready replica), and `GET /metrics` for the **Storage backend
+  operations** panel: operations completed, operations that returned an
+  error, the p95 across every backend and operation, the slowest
+  `backend / op` pair, and failures broken out by error kind. Those come
+  from `storage_op_duration_seconds` and `storage_op_errors_total`,
+  which every backend call is wrapped in.
 - **Mutations:** `DELETE /admin/model-host/artifacts/{digest}` (remove
   one artifact, blocked with a stated reason if it is configured,
   resident, pinned, leased, or file-locked), `POST /admin/model-host/gc`
@@ -1040,7 +1046,13 @@ resident, and what can be reclaimed.
 - **Empty/error notes:** no model host configured renders an empty
   inventory (`cache_root: null`), not an error; GC with no configured
   cache budget returns `409` and disables the control with a tooltip
-  explaining there is no target to collect toward.
+  explaining there is no target to collect toward. The backend panel
+  loads separately from the inventory, so a node with no model host
+  still shows backend health. Both storage families register on the
+  first backend operation, so a node where no backend has run publishes
+  neither and the panel says so in words rather than drawing a zero. A
+  present latency histogram with no error counter is the opposite case
+  and is a real zero: nothing has failed.
 
 ## Audit (`/audit`)
 
@@ -1117,7 +1129,8 @@ admin credential in the table.
 
 ## Cluster (`/cluster`)
 
-Membership, model placement, and rollout health across the fleet.
+Membership, model placement, and rollout health across the fleet, plus
+the inbound peer connections this node refused.
 For a runnable example that lights this page up, see
 [a three-node mesh on one machine](#example-a-three-node-mesh-on-one-machine).
 
@@ -1126,7 +1139,21 @@ For a runnable example that lights this page up, see
   look healthier, plus a health rail, prominent unhealthy-node alerts, and
   per-deployment placement/rollout detail), `GET /admin/cluster/metrics`
   (fleet-aggregated metrics, shown separately so a metrics-tier outage
-  never hides roster or rollout evidence).
+  never hides roster or rollout evidence), and `GET /metrics` for the
+  **Inbound peer admission** panel.
+
+  That panel reads `mesh_transport_inbound_rejected_total` off this
+  node's own scrape rather than the fleet aggregate, because the node a
+  refusal landed on is the actionable part of the reading. It counts
+  peers turned away, connections closed at the inbound ceiling, and
+  idle connections reclaimed, then lists every `reason` with what it
+  means. `idle_timeout` is kept out of the "turned away" total: the
+  client half re-evaluates its connection recycle lazily, so a quiet
+  cluster reclaims idle links as a matter of course and folding those
+  into the refusal count makes an idle fleet look under attack. Alert
+  on `reason!="idle_timeout"`. The peer address is deliberately not a
+  label (it is attacker-chosen and would mint one series per source);
+  it is in the node's log line instead.
 - **Mutations:** none on this page; publishing a signed deployment
   bundle happens from Model host. This page is read-only status and
   alerting.
@@ -1134,7 +1161,10 @@ For a runnable example that lights this page up, see
   single-node view rather than an error (there is a "fleet" of one).
   A metrics-endpoint `404` (mesh metrics tier not configured) renders
   "metrics not enabled" without blocking the roster/health sections,
-  which come from a separate call.
+  which come from a separate call. The admission counter registers on
+  its first increment, so a node that has refused nothing publishes no
+  family at all; the panel says the counter is not reported rather than
+  showing a zero over a signal that has never been observed.
 
 ## Example: a three-node mesh on one machine
 
