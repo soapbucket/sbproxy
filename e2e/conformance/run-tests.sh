@@ -1313,8 +1313,11 @@ run_37_ai_basic() {
     assert_body_contains "AI - models list has data" '"data"' \
         -H "Host: ai-basic.test" "$PROXY_URL/v1/models"
 
-    # Default model (no model specified)
-    assert_status "AI - default model works" 200 \
+    # Default model (no model specified). Asserting the model NAME, not
+    # just a 200: the mock answers a body with no `model` by inventing
+    # one of its own, so a status-only assertion passed whether or not
+    # the proxy injected the origin's `default_model` at all.
+    assert_body_contains "AI - default model works" '"model":"gpt-4o"' \
         -X POST -H "Host: ai-basic.test" -H "Content-Type: application/json" \
         -d '{"messages":[{"role":"user","content":"Hello"}]}' \
         "$PROXY_URL/v1/chat/completions"

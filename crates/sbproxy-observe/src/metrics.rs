@@ -2221,6 +2221,38 @@ pub fn record_key_operation(operation: &'static str, outcome: &'static str) {
     }
 }
 
+/// Count one shared-cache-tier invalidation that did not propagate, on
+/// `sbproxy_key_cache_invalidation_failures_total{scope}`.
+///
+/// `scope` is `key` (one id) or `all` (the whole tier). Both mean the
+/// same thing to an operator: the store write landed and the shared L2
+/// did not hear about it, so every other replica keeps answering with the
+/// record that was just changed until its TTL lapses. On a revoke that is
+/// a credential that stays accepted fleet-wide, which is why this is a
+/// counter of its own rather than a label on the lookup family: a
+/// failed lookup is a cache miss the store covers for, and this is not.
+///
+/// There is deliberately no `ok` counterpart. The question an alert asks
+/// here is "did any invalidation fail", not "what fraction", and a
+/// success series on a path that runs once per admin mutation buys
+/// nothing a `sbproxy_key_operations_total` rate does not already give.
+pub fn record_key_cache_invalidation_failure(scope: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_key_cache_invalidation_failures_total",
+            "Keystore cache-tier invalidations that did not reach the shared tier or its peers, by scope (key or all)",
+            &["scope"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        counter.with_label_values(&[scope]).inc();
+    }
+}
+
 /// Observe one bound-credential resolution on
 /// `sbproxy_credential_resolution_duration_seconds{cache, outcome}`
 /// (WOR-2572).
@@ -3401,6 +3433,32 @@ pub fn record_bot_auth_nonce_replay(policy: &str) {
     counter.with_label_values(&[policy]).inc();
 }
 
+/// Record an RFC 9421 signature that verified only against the
+/// pre-conformance derivation of a request-target component, on
+/// `sbproxy_signature_legacy_derivation_total{component}`.
+///
+/// `component` is `@target-uri` or `@request-target`, both compile-time
+/// constants on the call path, so the series set is closed at two.
+///
+/// This is the one number that says whether the deprecation window can
+/// close. The acceptance is otherwise a single `warn` line logged once
+/// per process, which tells an operator that some signer somewhere has
+/// not moved and nothing about whether that is still true today.
+pub fn record_signature_legacy_derivation(component: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_signature_legacy_derivation_total",
+            "RFC 9421 signatures accepted only against the pre-conformance derivation of a request-target component",
+            &["component"],
+        )
+        .expect("signature legacy derivation counter registers")
+    });
+    counter.with_label_values(&[component]).inc();
+}
+
 /// Count JWKS refreshes triggered synchronously by an unknown JWT `kid`.
 ///
 /// `result` is intentionally closed by convention: `success`, `failure`,
@@ -3979,6 +4037,12 @@ pub fn record_payment_provider_call(rail: &str, operation: &str, provider_class:
 /// There is no `rail` label here on purpose. A sweep claims rows across
 /// every rail in one batch and reports one total, so splitting it by rail
 /// would mean inventing an attribution the worker never computed.
+///
+/// `outcome = "failed"` is the one value that is not a durable row. It
+/// counts sweeps of that operation that returned a store error and moved
+/// nothing, which is what makes a flat row series next to it readable as an
+/// outage rather than as an empty queue. The other stages of the same tick
+/// still ran.
 pub fn record_payment_recovery(operation: &str, outcome: &str, count: u64) {
     use prometheus::{register_int_counter_vec, IntCounterVec};
     use std::sync::OnceLock;
@@ -4581,7 +4645,14 @@ pub fn record_rate_limit_decision(policy: &str, result: &'static str) {
 
 /// Record an idempotency-cache outcome on
 /// `sbproxy_idempotency_cache_results_total{backend, result}`. `result`
-/// is one of `hit`, `miss`, `conflict`, `not_applicable`.
+/// is one of `hit`, `miss`, `conflict`, `not_applicable`, or `error`.
+/// `backend` is the cache implementation that answered (`memory` or
+/// `kv`), so a broken shared store is visible next to a cold local one.
+///
+/// `error` is a store-side read or write failure. It is counted in
+/// addition to the `miss` the lookup degrades into, so `miss` stays the
+/// denominator for lookups and `error` is the numerator for "the cache
+/// is not working".
 pub fn record_idempotency_cache_result(backend: &'static str, result: &'static str) {
     use prometheus::{register_int_counter_vec, IntCounterVec};
     use std::sync::OnceLock;
@@ -4615,6 +4686,27 @@ pub fn record_idempotency_cache_duration(backend: &'static str, duration_secs: f
         .expect("idempotency cache duration histogram registers")
     });
     hist.with_label_values(&[backend]).observe(duration_secs);
+}
+
+/// Record a CORS response the middleware refused to decorate on
+/// `sbproxy_cors_refusals_total{reason}`.
+///
+/// The refusal used to be visible only as a `tracing::warn!` per request,
+/// which is a log flood on a busy origin and nothing at all on a
+/// dashboard. `reason` is a closed string from the middleware.
+pub fn record_cors_refusal(reason: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_cors_refusals_total",
+            "Responses the CORS middleware refused to add headers to, by reason",
+            &["reason"],
+        )
+        .expect("cors refusal counter registers")
+    });
+    counter.with_label_values(&[reason]).inc();
 }
 
 // --- body size + compression metrics --------------------------------------
@@ -4867,6 +4959,41 @@ pub fn record_cert_expiry(host: &str, seconds_until_expiry: f64) {
     gauge
         .with_label_values(&[host.as_str()])
         .set(seconds_until_expiry);
+}
+
+/// Publish whether the certificate store this process is running on is the
+/// one the config asked for, on `sbproxy_cert_store_degraded{backend}`.
+///
+/// `1` means the configured backend could not be opened and the process fell
+/// back to an in-memory store; `0` means it opened. `backend` is the
+/// configured `acme.storage_backend`, a closed set.
+///
+/// The series is published on the successful path too, deliberately. A gauge
+/// that only appears when something is wrong cannot be told apart from a
+/// scrape that never happened, and this one is the only signal for a failure
+/// mode with no other symptom until the CA rate-limits the domain: an
+/// in-memory store inherits the `KVStore` single-node lock defaults, so every
+/// replica wins its own ACME issuance lease and opens its own order.
+///
+/// Set once, at startup, from the certificate-store open path. Shared
+/// backends refuse to start rather than degrade, so a `1` here is a pod-local
+/// backend that could not open its file.
+pub fn set_cert_store_degraded(backend: &str, degraded: bool) {
+    use prometheus::{register_int_gauge_vec, IntGaugeVec};
+    use std::sync::OnceLock;
+    static G: OnceLock<IntGaugeVec> = OnceLock::new();
+    let gauge = G.get_or_init(|| {
+        register_int_gauge_vec!(
+            "sbproxy_cert_store_degraded",
+            "1 when the configured certificate store could not be opened and an in-memory fallback is in use, 0 when the configured backend opened",
+            &["backend"],
+        )
+        .expect("cert store degraded gauge registers")
+    });
+    let backend = sanitize_label("backend", backend);
+    gauge
+        .with_label_values(&[backend.as_str()])
+        .set(i64::from(degraded));
 }
 
 /// WOR-1024: record the age of the cached OCSP staple for `host` on
@@ -5260,6 +5387,38 @@ pub fn record_mcp_peer_registry_saturated() {
     counter.inc();
 }
 
+/// Record one MCP `tools/call` refused because the per-tool quota
+/// store could not track the caller's principal, either for the
+/// caller's tenant
+/// (`sbproxy_extension::mcp::MAX_TRACKED_QUOTA_KEYS_PER_TENANT`) or
+/// globally (`MAX_TRACKED_QUOTA_KEYS`), on
+/// `sbproxy_mcp_tool_quota_registry_saturated_total`.
+///
+/// The refusal is fail-closed, on the grounds that a limiter which
+/// cannot count is not a limiter, so without this counter it is
+/// indistinguishable on a dashboard from a caller genuinely over
+/// quota. Alert on it: a non-zero rate means some share of traffic is
+/// being refused for a capacity reason rather than a policy one.
+///
+/// No labels, the same reasoning as
+/// [`record_mcp_peer_registry_saturated`]: the tenant and principal
+/// that caused it are exactly the caller-controlled strings the caps
+/// exist to bound. Ticks on every refused call, while the
+/// `tracing::warn!` beside it fires once per scope per process.
+pub fn record_mcp_tool_quota_registry_saturated() {
+    use prometheus::{register_int_counter, IntCounter};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter!(
+            "sbproxy_mcp_tool_quota_registry_saturated_total",
+            "MCP tools/call refused because the per-tool quota store was at capacity, globally or for the caller's tenant",
+        )
+        .expect("mcp tool quota registry saturated counter registers")
+    });
+    counter.inc();
+}
+
 /// Record one `content_filters` category outcome that was not a plain
 /// miss, on `sbproxy_mcp_content_filter_total{tenant, category,
 /// verdict}` (WOR-2384, MCP01/MCP10). `category` is `"secrets"` or
@@ -5388,7 +5547,8 @@ pub fn record_mcp_poison_indicator(
 ///
 /// `field` is the advertised field (`name`, `title`, `description`), `class`
 /// the concealment class (`tag_block`, `bidi_control`, `zero_width`,
-/// `other_control`), and `kind` whether the finding appeared or cleared.
+/// `variation_selector`, `other_control`), and `kind` whether the finding
+/// appeared or cleared.
 ///
 /// Every label is a closed set chosen by this gateway. Deliberately none of
 /// them is the tool or server name: those are upstream-controlled strings and
@@ -6063,8 +6223,10 @@ pub fn record_key_policy_stored_rejection(reason: &str) {
 /// Record a reconcile outcome on
 /// `sbproxy_operator_reconcile_total{kind, result}` and the matching
 /// duration histogram. `result` is one of `ok`, `conflict`,
-/// `backend_error`, `crd_invalid`. Buckets cover 1ms..60s (the
-/// reconcile envelope including server-side apply round-trips).
+/// `backend_error`, `crd_invalid`, or `fenced` (the replica could no
+/// longer prove it holds the leader lease and abandoned the pass
+/// without writing). Buckets cover 1ms..60s (the reconcile envelope
+/// including server-side apply round-trips).
 pub fn record_operator_reconcile(kind: &'static str, result: &'static str, duration_secs: f64) {
     use prometheus::{
         register_histogram_vec, register_int_counter_vec, HistogramVec, IntCounterVec,
@@ -7442,32 +7604,77 @@ mod tests {
 
     #[test]
     fn record_idempotency_cache_result_emits_counter() {
-        record_idempotency_cache_result("default", "hit");
-        record_idempotency_cache_result("default", "miss");
-        record_idempotency_cache_result("default", "conflict");
-        record_idempotency_cache_result("default", "not_applicable");
+        record_idempotency_cache_result("memory", "hit");
+        record_idempotency_cache_result("memory", "miss");
+        record_idempotency_cache_result("memory", "conflict");
+        record_idempotency_cache_result("memory", "not_applicable");
+        record_idempotency_cache_result("kv", "error");
         let out = metrics().render();
         assert!(
             out.contains("sbproxy_idempotency_cache_results_total"),
             "idempotency results counter missing from render"
         );
-        for result in ["hit", "miss", "conflict", "not_applicable"] {
+        for result in ["hit", "miss", "conflict", "not_applicable", "error"] {
             assert!(
                 out.contains(&format!("result=\"{result}\"")),
                 "result={result} label missing"
+            );
+        }
+        // The backend dimension used to be the constant "default", so a
+        // dashboard could not tell a broken redis from a cold memory
+        // cache. Both real backends have to appear.
+        for backend in ["memory", "kv"] {
+            assert!(
+                out.contains(&format!("backend=\"{backend}\"")),
+                "backend={backend} label missing"
             );
         }
     }
 
     #[test]
     fn record_idempotency_cache_duration_emits_histogram() {
-        record_idempotency_cache_duration("default", 0.0005);
-        record_idempotency_cache_duration("default", 0.02);
+        record_idempotency_cache_duration("kv", 0.0005);
+        record_idempotency_cache_duration("kv", 0.02);
         let out = metrics().render();
         assert!(
             out.contains("sbproxy_idempotency_cache_duration_seconds_bucket"),
             "idempotency duration buckets missing"
         );
+        assert!(
+            out.contains("backend=\"kv\""),
+            "backend label must carry the real backend"
+        );
+    }
+
+    #[test]
+    fn record_cors_refusal_emits_counter() {
+        record_cors_refusal("wildcard_with_credentials");
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_cors_refusals_total"),
+            "cors refusal counter missing from render"
+        );
+        assert!(
+            out.contains("reason=\"wildcard_with_credentials\""),
+            "reason label missing"
+        );
+    }
+
+    #[test]
+    fn record_signature_legacy_derivation_emits_counter() {
+        record_signature_legacy_derivation("@target-uri");
+        record_signature_legacy_derivation("@request-target");
+        let out = metrics().render();
+        assert!(
+            out.contains("sbproxy_signature_legacy_derivation_total"),
+            "legacy derivation counter missing from render"
+        );
+        for component in ["@target-uri", "@request-target"] {
+            assert!(
+                out.contains(&format!("component=\"{component}\"")),
+                "component={component} label missing"
+            );
+        }
     }
 
     // --- body + compression ---
@@ -7878,6 +8085,7 @@ mod tests {
         record_operator_reconcile("sbproxy", "conflict", 0.001);
         record_operator_reconcile("sbproxyconfig", "backend_error", 2.5);
         record_operator_reconcile("sbproxy", "crd_invalid", 0.005);
+        record_operator_reconcile("sbproxy", "fenced", 0.0);
         let out = metrics().render();
         assert!(
             out.contains("sbproxy_operator_reconcile_total"),
@@ -7887,7 +8095,7 @@ mod tests {
             out.contains("sbproxy_operator_reconcile_duration_seconds_bucket"),
             "operator reconcile duration buckets missing"
         );
-        for result in ["ok", "conflict", "backend_error", "crd_invalid"] {
+        for result in ["ok", "conflict", "backend_error", "crd_invalid", "fenced"] {
             assert!(
                 out.contains(&format!("result=\"{result}\"")),
                 "result={result} label missing"

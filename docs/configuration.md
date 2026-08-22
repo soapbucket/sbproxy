@@ -151,7 +151,23 @@ an editor may flag an alias the proxy accepts. Module payloads and aliases
 are the boundaries an editor cannot check.
 
 Run `sbproxy validate <path>` for the authoritative check. It loads the same
-configuration and constructs the same runtime modules as `serve`.
+configuration and constructs the same runtime modules as `serve`, then throws
+them away.
+
+What it deliberately does not do is anything `serve` would leave behind.
+Validation opens no listener, resolves no secret reference, opens no key
+store and no receipt ledger, dials neither Redis nor the mesh for a semantic
+cache, and creates no state directory: every module that would reach the
+filesystem or the network at boot is constructed in a validation mode that
+stubs that part out. So running it against a candidate file on a host that is
+already serving traffic cannot change what that proxy is doing.
+
+What it does read is the process environment and the local files the document
+points at. A `${VAR}` is interpolated before the YAML is parsed, and material
+such as a Redis client certificate or a config-authority signing key is read
+from disk to check it is usable. Two validate runs of the same file agree
+unless one of those inputs changed between them, which is also why a run on a
+laptop and a boot on a server can legitimately disagree.
 
 Regenerate the schema locally with:
 
@@ -285,9 +301,34 @@ agent_classes:
 |-------|------|---------|-------------|
 | `catalog` | string | `builtin` | `builtin` loads the embedded catalog. `inline` loads `entries`. `hosted-feed` and `merged` are reserved for the registry fetcher and currently fall back to builtin. |
 | `entries` | list | `[]` | Complete inline catalog used when `catalog: inline`. Entries use `id`, `vendor`, `purpose`, `expected_user_agent_pattern`, optional `expected_reverse_dns_suffixes`, and optional `expected_keyids`. |
+| `entries[].expected_user_agent_pattern` | string | required | Regex compiled exactly as written and searched for anywhere in the `User-Agent` header. Write the `(?i)` yourself: without it the match is case-sensitive and the entry silently never fires, which the proxy warns about once per entry at load. Write your own boundary too, because an unanchored bare literal also matches a header that merely contains it: prefer `(?i)\\bMyBot/\\d` over `MyBot`. |
 | `resolver.rdns_enabled` | bool | `true` | Run forward-confirmed reverse DNS as resolver step 2. |
 | `resolver.bot_auth_keyid_enabled` | bool | `true` | Let a verified Web Bot Auth `keyid` match `expected_keyids` as resolver step 1. |
 | `resolver.cache_size` | int | `10000` | Per-process reverse-DNS verdict cache capacity. |
+
+Step 2 queries a reverse zone the client controls, so it runs under fixed
+bounds rather than operator-set ones:
+
+- At most four PTR names per address are forward-confirmed. A zone that
+  answers with more is not verified further.
+- Each DNS query is capped at two seconds. The forward-confirm loop
+  stops issuing new lookups once two seconds of it have elapsed, so a
+  whole verification, PTR query included, costs at most about six
+  seconds of wall clock.
+- At most 32 of these queries are in flight process-wide. Past that a
+  lookup is refused rather than queued, because a queued one still holds
+  the thread waiting on it.
+- Verdicts are cached per client IP, up to `cache_size` addresses: 300
+  seconds for a resolved verdict, 30 seconds for a DNS failure, so an
+  address with no PTR record costs one lookup per 30 seconds rather than
+  one per request.
+- The lookup runs on the blocking pool, never on the async worker
+  handling the request, and only on a request that actually needs it.
+
+A client that fails or exceeds any of these is not classified by rDNS;
+resolution falls through to the User-Agent pass, exactly as it does for
+an unreachable resolver. Set `resolver.rdns_enabled: false` to skip step
+2 entirely.
 
 ### Egress allowlists
 
@@ -408,7 +449,7 @@ proxy:
 | `credentials` | list | `[]` | Proxy-scope credentials inherited by tenant and origin scopes. |
 | `extensions` | object | | Opaque map for out-of-tree top-level config blocks. The proxy never parses them. |
 | `payments` | object | unset | Durable settlement for paid requests: SQLite intent/attempt/proof/receipt store, challenge binding key, authorization timeout, and the infra-failure posture. Absent keeps every payment provider config-only. See [payments.md](payments.md#getting-paid-proxypayments). |
-| `attestation` | object | unset | Which half (or both) of receipt attestation this node performs, and its failure/enforcement posture; origins may narrow or widen `role`. Backs the `/api/meter/*` operator surface. See [metering.md](metering.md#configuration). |
+| `attestation` | object | unset | Receipt attestation for this node: whether it writes signed, hash-chained receipts, and its failure/enforcement posture. `role: claim` and `role: both` are refused at load because the claim half is not implemented, so an origin may narrow `role` but not widen it into that half. Backs the `/api/meter/*` operator surface. See [metering.md](metering.md#configuration). |
 
 ### Choosing a bind address
 
@@ -1564,9 +1605,11 @@ origins:
 | `grpc_web` | bool | false | Allow browser gRPC-Web clients (HTTP/1.1 with base64 or binary framing) to reach the native gRPC upstream. |
 | `transcode` | object | unset | REST-to-gRPC transcoding: `descriptor_set` (path to a compiled protobuf `FileDescriptorSet`) and `routes[]`, each a `{method, path, grpc_method, body}` binding an HTTP route to a unary gRPC call. `path` uses `google.api.http`-style templates; `body` names the field the HTTP body decodes into, or is omitted (or `"*"`) to decode the whole body as the request message. |
 
+`grpc_web` and `transcode` both read the gRPC message frames, so both send `grpc-accept-encoding: identity` upstream and neither supports gRPC message compression. There is no field to change that. Plain passthrough (neither field set) forwards frames untouched and is unaffected. See [gRPC limits](routing.md#grpc-limits).
+
 ### ai_proxy
 
-Route requests across LLM providers with automatic failover, cost tracking, and content-based routing. Supports 72 native providers behind one OpenAI-compatible API; the model name passes straight through, so any model a provider serves is reachable. For full details, see [ai-gateway.md](ai-gateway.md) and [providers.md](providers.md).
+Route requests across LLM providers with automatic failover, cost tracking, and content-based routing. Supports 70 native providers behind one OpenAI-compatible API; the model name passes straight through, so any model a provider serves is reachable. For full details, see [ai-gateway.md](ai-gateway.md) and [providers.md](providers.md).
 
 ```yaml
 origins:
@@ -1594,6 +1637,7 @@ origins:
 | `context_window_fallbacks` | list | empty (trigger off) | Provider names to reroute to when a prompt overflows the model's context window. Names must match `providers[].name`. See [Typed fallback triggers](ai-llm-aware-resilience.md#typed-fallback-triggers). |
 | `content_policy_fallbacks` | list | empty (trigger off) | Provider names to reroute to when a provider refuses on content-policy grounds. Names must match `providers[].name`. See [Typed fallback triggers](ai-llm-aware-resilience.md#typed-fallback-triggers). |
 | `max_price_per_request` | number | unset (gate off) | Hard per-request price ceiling in USD. Each routing candidate on a token-priced chat surface (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`) is priced before selection; candidates over the ceiling are dropped, and a fully excluded set refuses with `402`. Must be positive when set; a value at or below zero is refused at config load. The `x-sbproxy-max-price` request header tightens the ceiling for one request but can never raise it, and sending that header to a surface the estimate does not model returns `400`. See [Per-request price ceiling](ai-gateway.md#per-request-price-ceiling). |
+| `model_groups` | list | `[]` | Named model groups. Each entry binds one public name callers send as `model` to a list of members, each naming a provider on this action, the upstream model id it serves, and its `weight` under `routing: weighted`. A group carries its own `routing:`, independent of the action's, and its members may serve different model ids. The group resolves before every model gate, so `blocked_models`, the credential's allowlist, the per-model rate limits, and the budget scope all judge the member's real model id. Six strategies are refused per group. See [Model groups](ai-gateway.md#model-groups). |
 | `allowed_models` | list | empty (allow all) | Allow-list of model names. |
 | `blocked_models` | list | | Block-list of model names. Takes precedence over allow-list. |
 | `data_posture` | object | unset | Data-handling posture requirement: `require_zdr` (default `false`) and `allow_data_collection` (default `true`). A hard provider-eligibility filter applied before any routing strategy runs, composed with the per-request `x-sbproxy-require-zdr` / `x-sbproxy-disallow-data-collection` headers (most restrictive wins). A request left with no eligible provider fails closed naming the constraint and the excluded providers; a block that excludes every configured provider is refused at config load. See [ai-gateway.md](ai-gateway.md#provider-data-posture). |
@@ -1603,14 +1647,17 @@ origins:
 | `model_rate_limits` | map | | Per-model rate limit overrides keyed by model name. |
 | `per_surface_rate_limits` | map | | Per-surface rate limit overrides keyed by AI surface label (`chat_completions`, `assistants`, `image_generation`, ...). |
 | `max_concurrent` | map | | Maximum concurrent in-flight requests per provider. |
-| `resilience` | object | | Per-provider circuit breaker, outlier detection, and active health probes. Also hosts the LLM-aware knobs (`retry_policy`, `cooldown_policy`, `llm_aware`, `content_policy_fallback`); see [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md). |
+| `resilience` | object | | Per-provider circuit breaker, outlier detection, and active health probes. Also hosts the LLM-aware knobs (`retry_policy`, `cooldown_policy`, `llm_aware`, `content_policy_fallback`) and the streaming `pre_header_timeout_ms` budget; see [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md). |
+| `allow_request_timeout_override` | bool | `false` | Honor a caller's `x-sbproxy-timeout-ms` in place of the selected provider's `timeout_ms`. Off means the header is ignored rather than refused. Requires `max_request_timeout_ms`; the flag alone is refused at config load. Scope is the origin, so it applies to every caller and tenant routed here. |
+| `max_request_timeout_ms` | int | unset | Ceiling in milliseconds on a caller's `x-sbproxy-timeout-ms`. A header above it is refused with 400 naming the accepted range, not clamped. Must be above zero. Bounds one attempt, so `max_retries` multiplies it. An honored header replaces the gateway's 30-second HTTP client default too, so a ceiling above 30000 does lengthen an attempt. |
 | `compression` | object | unset | Ordered AI context-compression policy. See [AI context compression](#ai-context-compression) and [ai-context-compression.md](ai-context-compression.md). |
 | `reasoning` | string or object | `off` | Route policy for concise reasoning. Use `concise`, `off`, or `{budget: N}` with `N` greater than zero. |
-| `shadow` | object | | Side-by-side eval: mirror each request to a second provider and log metrics. |
+| `shadow` | object | | Side-by-side eval: mirror each request to one or more shadow targets and log metrics. |
 | `ai_policy` | object | | One sandboxed CEL expression over the AI decision pipeline (`expression`, `on_error`). See [ai-policy-cel.md](ai-policy-cel.md). |
+| `cache_affinity` | object | unset | Prefer the provider that already holds a caller's warm prompt cache. Sits beside `routing:`, not inside it, because it layers over whatever strategy is configured rather than replacing one (except `fallback_chain`, `cascade`, `cost_quality`, and `routing_policy`, which own their ordering and are left alone). Fields: `ttl_secs` (default `300`) and `max_keys_per_provider` (default `1024`); both are refused at zero. Keys on the caller's `prompt_cache_key`, or `user` when that is absent, scoped to the tenant, credential, origin, and API surface. A preference, never a pin: an ineligible holder or a changed resolved model leaves the strategy's pick in place. Process-local and bounded. See [ai-gateway.md](ai-gateway.md#prompt-cache-affinity). |
 | `usage_sinks` | list | `[]` | Destinations for completed-call usage records. The `ledger` sink (`path`, optional `signing_seed_hex`) writes a hash-chained, signable record. See [ai-usage-ledger.md](ai-usage-ledger.md). |
 
-Routing strategies: `round_robin`, `weighted`, `fallback_chain`, `random`, `lowest_latency`, `least_connections`, `cost_optimized`, `least_token_usage`, `prefix_affinity`, `peak_ewma`, `sticky`, `race`, `headroom`, `reset_aware`, `cascade`, `cost_quality`, `outcome_aware`, `semantic_route`. See [ai-gateway.md](ai-gateway.md#routing-strategies) for each; `outcome_aware` has its own page in [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md). `cascade`, `cost_quality`, and `semantic_route` carry required settings, so each needs the object form; `semantic_route` written as a flat string is refused with an error naming the `routes:` and embedding-source keys it needs, and its exemplars are capped at config load: 64 routes, 64 exemplars per route, and 256 exemplar texts across every route combined, since each one is an embedding call on the request that builds the index. `token_rate` is refused at config load: it scores headroom against a per-provider token limit that no field declares, which makes it `least_token_usage` under another name. See [ai-gateway.md#token_rate-refused](ai-gateway.md#token_rate-refused).
+Routing strategies: `round_robin`, `weighted`, `fallback_chain`, `random`, `lowest_latency`, `least_connections`, `cost_optimized`, `least_token_usage`, `prefix_affinity`, `peak_ewma`, `sticky` (accepted, behaves as `round_robin`; see [ai-gateway.md](ai-gateway.md#sticky)), `race`, `headroom`, `reset_aware`, `cascade`, `cost_quality`, `outcome_aware`, `semantic_route`. See [ai-gateway.md](ai-gateway.md#routing-strategies) for each; `outcome_aware` has its own page in [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md). `cascade`, `cost_quality`, and `semantic_route` carry required settings, so each needs the object form; `semantic_route` written as a flat string is refused with an error naming the `routes:` and embedding-source keys it needs, and its exemplars are capped at config load: 64 routes, 64 exemplars per route, and 256 exemplar texts across every route combined, since each one is an embedding call on the request that builds the index. `token_rate` is refused at config load: it scores headroom against a per-provider token limit that no field declares, which makes it `least_token_usage` under another name. See [ai-gateway.md#token_rate-refused](ai-gateway.md#token_rate-refused).
 
 Peak EWMA accepts the object form:
 
@@ -1639,16 +1686,58 @@ Peak EWMA accepts the object form:
 | `priority` | int | unset | Priority used by priority routing (lower runs first). |
 | `enabled` | bool | true | When false, this provider is skipped during routing. |
 | `max_retries` | int | unset | Maximum retries on transient upstream failures. |
-| `timeout_ms` | int | unset | Request timeout in milliseconds. |
+| `timeout_ms` | int | unset | Request timeout in milliseconds, measured from connect through the end of the response body, so it cuts a streaming completion mid-stream if the stream outlives it. To bound only how long a streaming request waits for the provider's response headers, and fail over when it elapses, set the action-level `resilience.pre_header_timeout_ms` instead. |
 | `organization` | string | | Organization identifier for providers that scope keys per org. |
 | `api_version` | string | | API version header value (e.g. for Anthropic and Azure OpenAI). |
 | `no_prompt_training` | bool | `false` | Marks the provider safe for training-sensitive prompts. Requests carrying the `x-sbproxy-disallow-prompt-training: true` header only route to providers with this flag; a request with the header and no marked provider in the chain gets a 400 `no_compliant_provider`. |
+| `service_tier` | string | unset | Upstream service tier this destination requests: `flex`, `standard`, or `priority`. Unset sends no tier field and the vendor serves on its own default. The operator's decision, not the caller's: a caller's `service_tier` is removed from every request and replaced by this value where it is set. To run two tiers of one vendor, declare two entries with the same `provider_type` and different tiers. A tier the provider catalog does not record for this vendor is refused at config load. See [ai-gateway.md](ai-gateway.md#service-tier). |
 | `data_posture` | object | unset | Operator override of this entry's declared data-handling posture, consulted by the action-level `data_posture:` filter: `zdr: true` declares this deployment holds a zero-data-retention arrangement (the only thing that makes a vendor which retains by default eligible for `require_zdr`), and `retains_data` overrides the catalog's retention declaration in either direction. Unset keeps the provider catalog's declaration. See [ai-gateway.md](ai-gateway.md#provider-data-posture). |
+| `on_key_failure` | enum | `fallback` | What happens when this provider rejects the request's own credential with a `401`/`403`. `fallback` retries the same provider once with `fallback_credential_id`; `fail_closed` returns the rejection to the caller untouched. Only ever applies to this entry's own `api_key`: a request carrying a caller-owned native credential never falls back. |
+| `fallback_credential_id` | string | unset | Id of the operator-held credential to retry with when this entry's `api_key` is rejected. Names a record under `key_management.seed.credentials[]` (or one minted through the admin key plane), never a secret written here, and it is resolved per request through the key plane so a rotation lands without a config reload and a cross-tenant record is refused. Unset means `on_key_failure: fallback` behaves as `fail_closed`. See [multi-tenant.md](multi-tenant.md#when-a-tenants-provider-key-is-refused). |
+| `aws_sigv4` | object | unset | Sign this provider's requests with AWS Signature Version 4, which is what Bedrock and SageMaker require in place of a bearer token. Presence of the block selects the signer. See [AWS SigV4 fields](#aws-sigv4-fields-providersaws_sigv4). |
+| `bedrock_guardrail` | object | unset | Run one of your Bedrock guardrails inside the `Converse` generation instead of as a separate `ApplyGuardrail` call. Keys: `identifier` and `version` (both required, sent as `guardrailIdentifier` / `guardrailVersion`), and `trace` (bool, default `false`, asks AWS which policies fired so the block reason can name them). Refused on any provider entry that is not Bedrock-format. See [guardrails.md](guardrails.md#bedrock-guardrails-inline-on-the-converse-call). |
 
 A `managed_model` provider must set a non-empty `deployment` and must not set
 `api_key`, `base_url`, or the legacy `serve` block. Conversely, `deployment` is
 rejected for every other provider type. Managed traffic resolves through the
 deployment runtime rather than an operator-supplied upstream URL.
+
+A provider entry sets `api_key` or `aws_sigv4`, never both: the signature
+overwrites `Authorization`, so a static credential alongside it would be
+discarded. `accept_native_credentials_for` is refused with `aws_sigv4` for the
+same reason, since it substitutes a caller-owned key for an `api_key` a signed
+provider does not use, and `aws_sigv4` is refused on a `serve:` or
+`managed_model` entry because neither dials AWS.
+
+`fallback_credential_id` is refused alongside `on_key_failure: fail_closed`,
+and on a `serve:`, `managed_model`, or `aws_sigv4` entry: in each of those a
+credential is named that can never be presented, which is a config that reads
+as configured and does nothing.
+
+#### AWS SigV4 fields (`providers[].aws_sigv4`)
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `region` | string | required | AWS region used for the credential scope. Independent of `base_url`: pointing the endpoint at a VPC endpoint or a private host does not change the region a signature is scoped to, matching an AWS SDK's `endpoint_url` override. When `base_url` is unset, this also fills the `{region}` placeholder in the provider catalog's default endpoint. |
+| `service` | string | from `provider_type` | Signing service name in the credential scope. Defaults to `bedrock` and `sagemaker` for those provider types; required for any other. |
+| `refresh_margin_secs` | int | `900` | Seconds before expiry at which a short-lived credential is refreshed. A refresh that fails inside this window is logged and retried on the next request while the cached credential keeps serving, until 600 seconds remain. Must be at least 600. |
+| `credentials.source` | string | `default_chain` | One of `default_chain`, `static`, `assume_role`. |
+| `credentials.access_key_id` | string | unset | AWS access key ID. Required by `static`, refused by the other sources. |
+| `credentials.secret_access_key` | string | unset | AWS secret access key. Required by `static`, refused by the other sources. `${VAR}`, `vault://`, `awssm://`, `secret://`, and `file:` are dereferenced at config load; an unresolvable reference is a hard error. |
+| `credentials.session_token` | string | unset | Session token for an already-issued short-lived key pair. Read by `static` only. SBproxy cannot renew a token it was handed; use `assume_role` for credentials that expire. |
+| `credentials.role_arn` | string | unset | Role to assume. Required by `assume_role`, refused by the other sources. |
+| `credentials.external_id` | string | unset | External ID demanded by the role's trust policy. Read by `assume_role` only. Held as a credential and never formatted by SBproxy, but not covered by the admin-config redaction pass, so supply it as a reference rather than an inlined literal. |
+| `credentials.session_name` | string | `sbproxy` | Role session name recorded in CloudTrail. Read by `assume_role` only. |
+| `credentials.session_duration_secs` | int | role default | Requested role session length. Read by `assume_role` only. |
+| `credentials.profile` | string | unset | Named profile in the shared AWS config files. Read by `default_chain` and by the base identity `assume_role` starts from. |
+
+`default_chain` covers environment variables, the shared config and credentials
+files, an EKS web identity token, the ECS task role, and the EC2 instance
+profile, and it renews short-lived credentials itself. A signed provider is
+skipped by `resilience.health_check`, because there is no signable liveness
+route on `bedrock-runtime`; shadow and race legs are signed and reach AWS as
+real calls. See [providers.md](providers.md#aws-sigv4-signing-for-bedrock-and-sagemaker)
+for the expiry and clock-skew behavior.
 
 #### AI reasoning policy
 
@@ -2109,26 +2198,55 @@ resilience:
     timeout_ms: 5000
     unhealthy_threshold: 3
     healthy_threshold: 2
+  pre_header_timeout_ms: 2000 # streaming: give up on a silent provider here
 ```
 
 `resilience` on its own does not add an attempt. A second attempt needs a routing plan that has somewhere to go: `routing.strategy: fallback_chain`, `resilience.content_policy_fallback: true`, or a typed fallback list. With one of those, the dispatch loop visits each configured provider at most once, so the attempt ceiling is the provider count and no separate key raises it. Circuit-broken, ejected, and cooling-down providers are skipped on the second and later attempts.
+
+Because each candidate is visited at most once, the worst case a caller waits is the per-attempt budget times the candidate count: `(timeout_ms + backoff) x (max_retries + 1) x providers`. `resilience.pre_header_timeout_ms` is what keeps that product small without shortening `timeout_ms` for the provider that does answer. It bounds connect through the upstream response headers on streaming requests only, fails over on elapse under `sbproxy_ai_failovers_total{reason="pre_header_timeout"}`, must be above zero, and only ever shortens an attempt, so a value above the attempt's own `timeout_ms` (or above the gateway's 30-second HTTP client default when `timeout_ms` is unset) never fires. Past the response headers the request is committed to that provider, so a later stall ends the stream and is counted on `sbproxy_ai_stream_post_commit_failures_total` instead. See [Pre-header streaming budget](ai-llm-aware-resilience.md#pre-header-streaming-budget).
 
 The block also accepts the LLM-aware keys: `retry_policy` (per-failure-class retry counts, e.g. `rate_limit: 3`), `cooldown_policy` (per-failure-class provider cooldown seconds), `llm_aware.context_compress` plus `llm_aware.completion_reserve_tokens` (fit an over-long prompt to the model's window before dispatch), and `content_policy_fallback` (route a content-policy refusal to the next provider in priority order). The typed reroute lists, `context_window_fallbacks` and `content_policy_fallbacks`, are siblings of `routing:` on the action rather than resilience keys. Semantics and the failure-cause table are in [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md).
 
 #### Shadow (`shadow`)
 
-Mirrors a sampled set of non-streaming chat evaluation requests to a second provider after request policy, guardrails, model rewrites, and context compression. V1 includes Chat Completions plus normalized Messages and Responses requests. Mutating and non-chat surfaces, including Assistants, Threads, Batches, Fine Tuning, Files, images, audio, embeddings, moderation, and reranking, are never copied. The primary's response is what the client sees. Shadow work uses fire-and-forget admission bounded by 16 in-flight tasks and a 64 MiB reservation budget per live AI client, so shadow failure, timeout, or saturation cannot delay or reject the primary. Streaming requests are intentionally skipped.
+Mirrors a sampled set of non-streaming chat evaluation requests to one or more shadow targets after request policy, guardrails, model rewrites, and context compression. V1 includes Chat Completions plus normalized Messages and Responses requests. Mutating and non-chat surfaces, including Assistants, Threads, Batches, Fine Tuning, Files, images, audio, embeddings, moderation, and reranking, are never copied. The primary's response is what the client sees. Shadow work uses fire-and-forget admission bounded by 16 in-flight tasks and a 64 MiB reservation budget per live AI client, so shadow failure, timeout, or saturation cannot delay or reject the primary. Streaming requests are intentionally skipped.
 
 The shadow body is drained while at most 1 MiB is retained for comparison metadata, which is logged at `target: sbproxy_ai_shadow` (status, latency, prompt/completion tokens, finish reason). Each configured usage sink receives a distinct shadow row tagged `shadow`; its request ID is freshly generated by the server and ends in `:shadow`. Shadow cost is estimated in that row but does not debit primary budgets. Set `enabled: false` on a shadow-only provider to keep it out of primary routing; the explicit shadow selection still uses it. Credential provider allow/block rules apply to the shadow target independently. A request carrying `x-sbproxy-disallow-prompt-training: true` is copied only when the shadow provider declares `no_prompt_training: true`. A hosting process that attaches a purpose-scoped egress authorizer to `AiClient` suppresses v1 shadow dispatch because the direct shadow transport cannot yet consume authorized DNS pins and redirect checks.
 
 ```yaml
 shadow:
-  provider: anthropic         # must also appear in `providers`
-  model: claude-haiku-4-5     # optional override; defaults to client's model
-  sample_rate: 0.1            # mirror 10% of traffic; 1.0 mirrors all
-  timeout_ms: 30000           # upstream HTTP timeout
-  task_timeout_ms: 30000      # hard wall-clock supervisor timeout
+  targets:
+    - provider: anthropic         # must also appear in `providers`
+      model: claude-haiku-4-5     # optional override; defaults to client's model
+      sample_rate: 0.1            # mirror 10% of traffic; 1.0 mirrors all
+      timeout_ms: 30000           # upstream HTTP timeout
+      task_timeout_ms: 30000      # hard wall-clock supervisor timeout
+    - provider: gemini
+      sample_rate: 0.5
 ```
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `targets` | list | required | One entry per provider to shadow against. An empty list is refused, and so are two entries naming the same provider: the provider name identifies the target on every metric label and every ledger row. |
+| `targets[].provider` | string | required | Must also appear in `providers`. |
+| `targets[].model` | string | client's model | Model override for this target. |
+| `targets[].sample_rate` | float | `1.0` | Fraction of requests this target sees. |
+| `targets[].timeout_ms` | int | `30000` | Upstream HTTP timeout for this target's call. |
+| `targets[].task_timeout_ms` | int | `30000` | Hard wall-clock supervisor timeout for this target's task. |
+
+The single-target form, five sibling keys directly under `shadow:` with no
+`targets:`, still parses and means a one-entry list. Writing both `targets:`
+and a sibling key is refused rather than silently resolved.
+
+Admission runs once per target, so three targets take three slots out of the
+same 16-task and 64 MiB ceiling and a target that cannot get one is dropped as
+`saturated` while the others run. Sampling draws once per request and every
+target compares against that same draw, so target populations nest rather than
+diverge: everything a `0.1` target saw, a `0.5` target on the same route also
+saw. Each target's usage row carries `shadow_of`, the primary request's id, as
+the join key, and `finish_reason`; per-target outcomes are also counted on
+`sbproxy_ai_shadow_calls_total{target, status_class, finish_reason}` and
+`sbproxy_ai_shadow_latency_seconds{target}`.
 
 `sbproxy_ai_shadow_dropped_total{reason=...}` uses the closed reasons `streaming`, `provider_not_found`, `provider_not_allowed`, `prompt_training_disallowed`, `egress_denied`, and `saturated`. Sampling out is expected behavior and does not increment the counter.
 
@@ -2430,7 +2548,29 @@ origins:
 |-------|------|---------|-------------|
 | `type` | string | required | Must be `basic_auth` |
 | `users` | list | required | Username/password pairs |
-| `realm` | string | | Optional realm shown in the `WWW-Authenticate` challenge |
+| `realm` | string | `restricted` | Realm sent in the `WWW-Authenticate` challenge on a 401 |
+
+A denied request gets the challenge, which is what makes a browser
+prompt and tells a scripted client which scheme to retry with:
+
+```bash
+$ curl -i -H 'Host: admin.example.com' http://localhost:8080/
+HTTP/1.1 401 Unauthorized
+content-type: application/json
+content-length: 24
+www-authenticate: Basic realm="Admin Panel"
+
+{"error":"unauthorized"}
+```
+
+Both the missing-credential and the wrong-password cases challenge.
+`realm` is optional in config only; RFC 9110 section 11.6.1 requires the
+parameter on the wire, so an origin that sets none is challenged as
+`Basic realm="restricted"`. A quote or backslash in the realm is escaped
+into the quoted string rather than being allowed to end it.
+
+An `error_pages` entry or `problem_details` on the origin replaces the
+body above and leaves the challenge header in place.
 
 ### bearer
 
@@ -2673,7 +2813,7 @@ origins:
 | `type` | string | required | Must be `hmac_auth`. |
 | `keys` | list | required | Accepted signing keys, at least one. Each entry needs a unique `key_id` (the RFC 9421 `keyid` the signer advertises) and a `secret`. Entries also accept the per-credential metadata fields (`project`, `user`, `team`, `tags`, `metadata`). |
 | `clock_skew_seconds` | int | 300 | Freshness window for the mandatory `created` signature parameter, applied in both directions. A `created` older than the window is refused as a replay; one further in the future is refused as skewed. |
-| `required_components` | list | `["@method", "@target-uri"]` | Components every accepted signature must cover. The default binds the verb and the path-and-query, so a captured signature cannot be replayed against a different route. Add `content-digest` to bind the request body as well. |
+| `required_components` | list | `["@method", "@target-uri"]` | Components every accepted signature must cover. The default binds the verb and the full target URI, so a captured signature cannot be replayed against a different route. Add `content-digest` to bind the request body as well. |
 
 The `secret` resolves through the secret resolver like every other signing-key field: an inline literal, `${VAR}`, `env:NAME`, `file:PATH`, or a backend URI such as `vault://...`. A reference nothing can resolve refuses to boot rather than becoming the key. Verification failures answer `401` with a `WWW-Authenticate: Signature` challenge that carries no key material, and the failure reason is logged, never returned to the client.
 
@@ -2685,6 +2825,17 @@ Signature: sig1=:BASE64_HMAC_SHA256_OF_SIGNATURE_BASE:
 ```
 
 On a match the principal's `sub` is the `key_id`, `principal_kind` is `hmac_auth`, and the entry's metadata rides along for per-credential reporting.
+
+`@target-uri` is the absolute URI RFC 9421 §2.2.2 defines, scheme and
+authority included: `https://api.example.com/v1/orders?page=2`, not
+`/v1/orders?page=2`. Sign it the way any conformant RFC 9421 library
+does and the proxy reconstructs the same string. Earlier releases
+derived the path and query alone; a signature in that older shape is
+still accepted for a deprecation window, counted on
+`sbproxy_signature_legacy_derivation_total{component}` and logged once
+per process with the verifier's key id. `@request-target`, for the same reason, is
+the bare request target (`/v1/orders?page=2`) rather than
+draft-cavage's `GET /v1/orders?page=2`.
 
 The default components bind the verb and the route, not the body. A signature over `("@method" "@target-uri")` alone says nothing about the bytes that follow it, so a request captured off the wire can be replayed with a different body until its `created` timestamp falls outside `clock_skew_seconds`. Covering `content-digest` is what closes that:
 
@@ -4814,9 +4965,23 @@ origins:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | true | Master switch. Alias: `enable`. |
-| `algorithms` | list | | Allowed algorithms in priority order (e.g. `["br", "gzip"]`) |
+| `algorithms` | list | | Allowed algorithms in priority order (e.g. `["br", "gzip"]`). Valid entries are `zstd`, `br`, and `gzip`; anything else fails config load. |
 | `min_size` | int | 0 | Minimum response size in bytes before compression is applied |
 | `level` | int | | Encoder effort, clamped into the negotiated algorithm's range (gzip 0-9, brotli 0-11, zstd 1-22). Unset keeps each library's default. |
+
+`algorithms` is a priority order, not a set. The list is walked as
+authored and the first entry the client's `Accept-Encoding` accepts is
+the one served, so `algorithms: [gzip, br]` sends gzip to a browser that
+accepts both, which is what you want when something downstream caches on
+`Content-Encoding`. Leave the list empty to take the built-in order,
+best ratio first: `zstd`, then `br`, then `gzip`.
+
+Client quality values are honored as refusals per RFC 9110 §12.5.3.
+`Accept-Encoding: gzip;q=0` means gzip is not acceptable to that client
+and the proxy will not send it, and the standard opt-out
+`Accept-Encoding: identity;q=1, *;q=0` gets an uncompressed response.
+A `*` stands in only for codings the header does not name on its own, so
+`gzip, *;q=0` is a gzip-only request.
 
 ---
 
@@ -4981,9 +5146,11 @@ origins:
 
 ## Error pages
 
-Error pages let you replace upstream error responses with operator-defined bodies. Each entry declares the status codes it covers, the `Content-Type` it produces, and the response body. When more than one entry matches the status code, the proxy performs `Accept` header content negotiation across the candidates and picks the highest-quality match. With no concrete preference it prefers `application/json`, then `text/html`, then the first candidate.
+Error pages let you replace the error responses the proxy itself generates with operator-defined bodies. A status the upstream returned is relayed as the upstream wrote it and never runs through this table. Each entry declares the status codes it covers, the `Content-Type` it produces, and the response body. When more than one entry matches the status code, the proxy performs `Accept` header content negotiation across the candidates and picks the highest-quality match. With no concrete preference it prefers `application/json`, then `text/html`, then the first candidate.
 
 The block is a list at the origin level. Each entry's `status` field accepts a single integer or a list of integers. When `template` is true, the body is rendered with `{{ status_code }}` and `{{ request.path }}` substituted at request time.
+
+`error_pages` and `problem_details` share one emitter, so they cover the same set of errors and an authored page always wins over the renderer. [What the renderer covers](#what-the-renderer-covers) below is the list for both.
 
 ```yaml
 origins:
@@ -5016,10 +5183,10 @@ origins:
 ## Problem details (RFC 9457)
 
 The `problem_details` block opts the origin into RFC 9457
-`application/problem+json` responses for authentication-denial errors
-that are not matched by an `error_pages` entry. The two blocks compose:
-per-status custom pages still win when authored; `problem_details`
-catches every other authentication denial with a structured body.
+`application/problem+json` responses for proxy-generated errors that are
+not matched by an `error_pages` entry. The two blocks compose: per-status
+custom pages still win when authored; `problem_details` catches the rest
+with a structured body.
 
 ```yaml
 origins:
@@ -5035,8 +5202,8 @@ origins:
       include_detail: true
 ```
 
-An authentication denial on this origin with a status other than 401
-(no `error_pages` entry matches it) renders as:
+A denial on this origin with a status other than 401 (no `error_pages`
+entry matches it) renders as:
 
 ```json
 {
@@ -5050,27 +5217,27 @@ An authentication denial on this origin with a status other than 401
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | bool | false | When true, render unmatched authentication-denial errors as `application/problem+json`. |
+| `enabled` | bool | false | When true, render unmatched proxy-generated errors as `application/problem+json`. |
 | `type_base_uri` | string | | Base URI for the `type` field; the status code is appended (e.g. `https://api.example.com/errors/503`). When unset the renderer emits the RFC 9457 default `about:blank`. |
 | `include_detail` | bool | true | When false, the `detail` field is suppressed (operators can avoid leaking internal error text). |
-
-The renderer fires from the same code path that `error_pages`
-participates in for authentication denials (a bad API key, a failed
-JWT check, forward_auth rejecting a request, and so on). It does not
-currently apply to policy denials (`ip_filter`, `waf`, rate limiting,
-etc.) or to a default 404 for an unmatched route; those keep their own
-response shapes. Upstream-returned status codes are not rewritten
-either; the renderer only handles errors the proxy itself generates.
 
 See [`examples/problem-details/`](https://github.com/soapbucket/sbproxy/tree/main/examples/problem-details).
 
 Spec: <https://www.rfc-editor.org/rfc/rfc9457.html>.
 
-The renderer covers both error sources:
+### What the renderer covers
 
-- **Proxy-generated errors** (authentication denials, policy denials,
-  the default 404 for unknown origins) when no matching `error_pages`
-  entry exists.
+`problem_details` sits behind `error_pages` on the same emitter, so
+anything below that no authored page matches renders as problem+json:
+
+- **Authentication denials**: a bad API key, a failed JWT check,
+  `forward_auth` rejecting a request, a Basic or plugin denial that also
+  carries a `WWW-Authenticate` challenge. The challenge header survives
+  the rendered body.
+- **Policy denials** from the origin's `policies:` chain that do not
+  author their own response: `ip_filter`, `waf`, `dlp`, `csrf`, `rego`,
+  `expression`, `object_authz`, `request_limit`, `http_framing`,
+  `exposed_credentials`, `semantic_constraint`, and `agent_budget`.
 - **Upstream failures** (connect refused, connect timeout, TLS
   handshake errors, mid-stream connection loss) routed through
   Pingora's `fail_to_proxy` path. The `detail` field carries the
@@ -5078,6 +5245,48 @@ The renderer covers both error sources:
   `connection_timeout`, `tls_protocol_error`, `connection_terminated`,
   `http_request_error`) so downstream tooling can break down by
   failure mode without scraping the body.
+
+### What it does not cover
+
+These keep their own response shapes, and turning `problem_details` on
+does not change them:
+
+- **Denials whose body is pinned by a protocol**: rate limiting and DDoS
+  (429 with the `RateLimit-*` set), the AI-crawl family (402 payment
+  challenge, 403 content-signal refusal, 406 rail negotiation, 503
+  ledger unavailable), settlement responses, agent-to-agent chain
+  refusals, and any policy that authored its own body and media type.
+  The wire format is part of those specs, so a generic envelope would
+  break the client that reads them.
+- **Policies that write their own body on every refusal**:
+  `concurrent_limit`, `content_digest`, and `prompt_injection_v2`. Each
+  carries an operator-settable body (`error_body` /
+  `error_content_type`, `block_body` / `block_content_type`) and emits
+  it, or its own JSON default, straight to the client. The knob the
+  operator already has for those three is the body itself, so the
+  renderer stays out of the way rather than overwriting it.
+- **The default 404 for an unmatched `Host`**. No origin resolved, so
+  there is no `problem_details` block to read.
+- **Refusals that run before the policy chain**: `bot_detection`'s 403,
+  the 405 for a method the origin does not allow, and the built-in
+  well-known and callback endpoints. Those answer from their own
+  emitters, ahead of the point where the origin's error configuration is
+  consulted.
+- **The `digest` challenge 401** and the 429 a `cap` credential gets for
+  exhausting its own budget. Both write their headers and body in one
+  piece from their own emitters.
+- **AI gateway surface errors** (`/v1/chat/completions` and the rest of
+  the AI dispatch path). Those answer from their own emitters: some in
+  the provider's `{"error": {...}}` envelope so an SDK's error handling
+  still works, the rest as a flat `{"error": "..."}`. Neither reads the
+  origin's `error_pages` or `problem_details`.
+- **Upstream-returned status codes**. A 500 the backend produced is
+  relayed as the backend wrote it; the renderer only shapes errors the
+  proxy itself generates.
+
+`include_detail: false` suppresses `detail` on everything the renderer
+does cover, which includes the WAF message that names the matched rule
+id.
 
 ---
 
@@ -5183,7 +5392,9 @@ retries. The middleware reads the `Idempotency-Key` request header,
 hashes the request body, and:
 
 - **First call** under a given key: forwards the request upstream and
-  caches the response under `(workspace, key)` keyed by the body hash.
+  caches the response under `(tenant, origin, key)` keyed by the body
+  hash. Two origins never see each other's entries, including on the
+  `redis` backend where they share one store.
 - **Replay** with the same key + same body: returns the cached
   response with `x-sbproxy-idempotency: HIT`. The upstream is not
   contacted.
@@ -5564,7 +5775,7 @@ IPv6 targets are supported: the URL builder preserves bracketing. See [example 7
 
 ## Circuit breaker
 
-A formal Closed → Open → HalfOpen → Closed state machine attached to each `load_balancer` target. On `failure_threshold` consecutive failures (5xx response, connect error, timeout) the breaker trips Open; every subsequent request to that target is excluded from `select_target` and routed to a healthy peer instead. After `open_duration_secs`, the breaker enters HalfOpen and admits probe requests; on `success_threshold` consecutive successes it closes again, otherwise it re-opens.
+A formal Closed → Open → HalfOpen → Closed state machine attached to each `load_balancer` target. On `failure_threshold` consecutive failures (5xx response, connect error, timeout) the breaker trips Open; every subsequent request to that target is excluded from `select_target` and routed to a healthy peer instead. After `open_duration_secs`, the breaker enters HalfOpen and admits one probe request at a time: the request that takes the probe slot is dispatched, everything else is refused as if the breaker were still Open, and the slot comes back when that probe succeeds or fails. On `success_threshold` consecutive successes it closes again, otherwise it re-opens. Recovery therefore takes `success_threshold` sequential probes rather than one concurrent burst; raise `success_threshold` if you want a recovering upstream warmed more before it is trusted, not concurrency.
 
 ```yaml
 action:
@@ -5572,7 +5783,7 @@ action:
   circuit_breaker:
     failure_threshold: 5         # trip after 5 consecutive failures
     success_threshold: 2         # close after 2 consecutive HalfOpen successes
-    open_duration_secs: 30       # stay Open for 30s before trying probes
+    open_duration_secs: 30       # stay Open for 30s before trying a probe
   targets:
     - url: http://backend-1.internal:8080
     - url: http://backend-2.internal:8080
@@ -5582,7 +5793,7 @@ action:
 |-------|------|---------|-------------|
 | `failure_threshold` | int | `5` | Consecutive failures before tripping Open. |
 | `success_threshold` | int | `2` | Consecutive successes in HalfOpen to return to Closed. |
-| `open_duration_secs` | int | `30` | How long the breaker stays Open before admitting probes. |
+| `open_duration_secs` | int | `30` | How long the breaker stays Open before admitting a probe. Also how long an admitted probe whose caller never reported an outcome is waited out before the slot is written off and a fresh probe goes through. |
 
 The breaker is **complementary to** [outlier detection](#outlier-detection):
 
@@ -6027,6 +6238,12 @@ A single node keeps its certificates in a local `redb` file (the default), so a 
 | `memory` | ignored | tests only; nothing persists |
 
 Anything outside that list is rejected. `sbproxy plan` reports it as `unknown-acme-storage-backend` and the proxy refuses to start on it, rather than falling back to an in-memory store that would re-issue every certificate on every restart.
+
+**A configured backend that cannot be opened.** Naming a valid backend is not the same as being able to open it: a Redis DSN can be malformed, a bucket URL can be unparseable, a shared directory can be unmounted. What happens next depends on which half of the table you are in.
+
+A shared backend (`file`, `redis`, `s3`, `gcs`, `azure`) that cannot be opened refuses to start, and the error names the backend. This is not about persistence. The in-memory store the proxy used to fall back to has no cross-node lock at all, so every replica wins its own issuance lease: three replicas open three orders for the same hostname and publish three HTTP-01 tokens to three stores no peer can read, roughly two thirds of the CA's validation fetches land on a replica that has never seen the token, and the account burns through Let's Encrypt's limit of five duplicate certificates per hostname set per week. A pod that will not start is the cheaper failure.
+
+A pod-local backend (`redb`, `sqlite`, `memory`) still falls back to in-memory, because a single node has nothing to be mutually excluded from. It is no longer quiet about it: the log line is at `error` and names the backend, and `sbproxy_cert_store_degraded{backend="..."}` goes to `1`. `SBPROXY-CERT-STORE-DEGRADED` in `deploy/alerts/alerting-rules.yml` is the shipped ticket-tier alert on that condition, and the "Certificate Store Degraded" panel on the `sbproxy-security` dashboard is the read. The cost is real, which is that every certificate is re-issued on every restart. The same gauge reads `0` when the configured backend opened. It is published only by a proxy that has an `acme` block at all, so on a fleet where ACME is on everywhere an absent series is a proxy that never started rather than a healthy one, and on a mixed fleet it is that or a proxy with no ACME configured. Scope the alert to the proxies you expect to issue certificates.
 
 The shared backends hold the issuance lease as an atomic create, and the holder renews it every 20 seconds for as long as the CA takes. A node that crashes mid-issue does not wedge the others: the lease stops being renewed, expires after 120 seconds, and another node takes over with a conditional write, so two nodes racing the same expired lease see exactly one winner. Every takeover carries a fencing generation, and publication is checked against it, so a node that stalled past its lease and lost it cannot overwrite its successor's certificate however late its own order finishes.
 
@@ -6687,13 +6904,27 @@ A legacy `enable` flag (alias `enabled`) still parses, and the runtime has never
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `allowed_origins` | list | | Allowed origins (use `["*"]` for any). Alias: `allow_origins`. |
+| `allowed_origins` | list | | Allowed origins (use `["*"]` for any). Alias: `allow_origins`. An empty list is deny-all. |
 | `allowed_methods` | list | standard methods | Allowed HTTP methods. Alias: `allow_methods`. |
 | `allowed_headers` | list | standard headers | Allowed request headers. Alias: `allow_headers`. |
 | `expose_headers` | list | | Headers exposed to the browser |
 | `max_age` | int | | Preflight cache duration in seconds |
-| `allow_credentials` | bool | false | Allow credentials (cookies, auth headers) |
+| `allow_credentials` | bool | false | Allow credentials (cookies, auth headers). Refused at config load in combination with `allowed_origins: ["*"]`. |
 | `enable` | bool | unset | Legacy flag, alias `enabled`. Parsed but ignored at runtime. |
+
+`allowed_origins: ["*"]` together with `allow_credentials: true` fails
+config load. Browsers reject that pair per the Fetch standard, so the
+proxy has always refused to emit any CORS header for it; refusing the
+config instead means you find out at `sbproxy validate` rather than from
+a browser console. Name the origins you mean, or drop
+`allow_credentials`.
+
+A preflight is an `OPTIONS` request carrying
+`Access-Control-Request-Method`, which is what the Fetch standard
+defines it as. A plain `OPTIONS` that carries only `Origin` is a normal
+request and reaches the upstream, so an API that implements `OPTIONS`
+itself (a discovery endpoint returning `Allow:`, or WebDAV) keeps
+working when a `cors:` block is added in front of it.
 
 ---
 

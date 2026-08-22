@@ -314,6 +314,24 @@ batch_env_mutation() {
   bash "$ROOT/scripts/check-env-mutation.sh"
 }
 
+# CI: ci.yml lint lane, "durable sinks create files owner-only"
+# (WOR-2626). Pure grep, plus fixtures that prove the detector still
+# detects. Production code in the four sink crates must reach
+# sbproxy_util::secure_fs rather than File::create / OpenOptions /
+# create_dir_all, and the helper itself must put the mode in the open
+# rather than chmod after it.
+batch_durable_file_modes() {
+  bash "$ROOT/scripts/check-durable-file-modes.sh"
+}
+
+# CI: ci.yml guards lane, "every stable metric has somewhere to be seen".
+# A metric an operator can be alerted on but cannot look at is a gap the
+# registry cannot see: it knows the family exists, not whether any
+# dashboard draws it. Shrink-only baseline, so the number can only fall.
+batch_metric_visibility() {
+  bash "$ROOT/scripts/check-metric-visibility.sh"
+}
+
 # WOR-2449: Apache 2.0 section 4(d) attribution for Apache-2.0-only
 # crates. cargo metadata, no compile. Shares one script with the CI
 # lint lane. The CLAUDE.md / AGENTS.md snippet is no longer the check.
@@ -370,6 +388,8 @@ run_batch "read-only source and doc scans" \
   batch_log_url_ratchet "operator URLs at log lines (ratchet)" \
   batch_spec_citations "spec citation hygiene" \
   batch_env_mutation "no process-global env mutation outside test helpers" \
+  batch_durable_file_modes "durable sinks create files owner-only" \
+  batch_metric_visibility "every stable metric has a dashboard panel (ratchet)" \
   batch_notice_coverage "NOTICE covers Apache-2.0-only crates" \
   batch_secret_resolver_drift "secret-resolver drift (no new ad-hoc secret parsers)" \
   batch_doc_drift "doc drift" \

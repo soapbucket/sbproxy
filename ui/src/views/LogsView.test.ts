@@ -21,3 +21,27 @@ describe("LogsView replay affordance", () => {
     expect(logsView).toMatch(/isAdmin && (canReplay|replayQueryFor)/);
   });
 });
+
+// The Spend view links its breakdown rows and its price-ceiling refusal
+// count at this page. A link that arrives here and is dropped on the
+// floor lands the operator on an unfiltered log, which reads as "no
+// evidence" rather than "the filter was not applied".
+describe("LogsView deep-link filters", () => {
+  it("restores every filter a Spend drill-down can send", () => {
+    for (const key of [
+      "route.query.origin",
+      "route.query.api_key_id",
+      "route.query.status",
+      "route.query.property_key",
+      "route.query.property_value",
+    ]) {
+      expect(logsView).toContain(key);
+    }
+  });
+
+  it("seeds visible inputs, so the operator can see what narrowed the list", () => {
+    expect(logsView).toMatch(/v-model="fStatus"/);
+    expect(logsView).toMatch(/v-model="fPropertyKey"/);
+    expect(logsView).toMatch(/v-model="fPropertyValue"/);
+  });
+});

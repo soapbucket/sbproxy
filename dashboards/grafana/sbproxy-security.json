@@ -38,7 +38,7 @@
   "id": null,
   "uid": "sbproxy-security",
   "title": "SBProxy Security",
-  "description": "Security metrics including WAF blocks, rate limiting, authentication failures, IP filtering, and bot detection.",
+  "description": "Security metrics including WAF blocks, rate limiting, authentication failures, IP filtering, bot detection, CORS refusals, RFC 9421 legacy signature derivation, and certificate-store degradation.",
   "tags": [
     "sbproxy",
     "security"
@@ -676,6 +676,259 @@
         }
       ],
       "description": "Audit emissions that did not reach a sink they were promised, by channel: audit.key_path is the key and credential mutation trail, audit.admin_path is the admin-console action trail. Reads exactly zero in a healthy system; any nonzero value means the tamper-evident trail has a hole that cannot be backfilled, and SBPROXY-AUDIT-WRITE-FAILURE pages on the same condition across all audit channels. Runbook: docs/operator-runbook.md#rb-audit-write."
+    },
+    {
+      "id": 10,
+      "title": "Certificate Store Degraded",
+      "type": "stat",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 40
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "no cert store reporting",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "no certificate store opened in this scrape"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "blue",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (backend) (sbproxy_cert_store_degraded)",
+          "legendFormat": "{{backend}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "absent(sbproxy_cert_store_degraded)",
+          "legendFormat": "no certificate store opened in this scrape",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "1 when this process could not open the certificate-store backend named by acme.storage_backend and is running on an in-memory store, 0 when the configured backend opened. Only the pod-local backends (redb, sqlite, memory) can reach 1: a shared backend (file, redis, s3, gcs, azure) that will not open refuses to start instead, so a fleet cannot silently lose the ACME issuance lock. At 1, certificates do not survive a restart, so every restart opens a fresh ACME order and a restart loop burns the CA's duplicate-certificate limit for the hostname set. Fix acme.storage_path or the backend and restart the pod. The gauge is written once at startup, so it moves only across a restart. The second series reads 1 when nothing in the scrape has opened a certificate store at all, which is expected with no ACME configured and is not the same as a healthy 0. SBPROXY-CERT-STORE-DEGRADED alerts on the same condition. Runbook: docs/operator-runbook.md#rb-cert-store-degraded."
+    },
+    {
+      "id": 11,
+      "title": "CORS Refusals by Reason",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 40
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "noValue": "no CORS refusals recorded",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "bars",
+            "pointSize": 5,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (rate(sbproxy_cors_refusals_total[5m]))",
+          "legendFormat": "{{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Responses the CORS middleware refused to add headers to, by reason. The only reason today is wildcard_with_credentials: a live config still pairs allowed_origins: [\"*\"] with allow_credentials: true, which browsers reject, so those calls are failing in the browser rather than at the proxy. Name the origins explicitly, or drop allow_credentials, and reload. A new config fails to compile on this pairing, so a line here is a config applied before that check existed and still running. No data is the healthy state: the series only appears once a refusal has happened. Runbook: docs/operator-runbook.md#security-controls."
+    },
+    {
+      "id": 12,
+      "title": "RFC 9421 Legacy Signature Derivation",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 48
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "noValue": "no legacy derivations accepted",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "bars",
+            "pointSize": 5,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (component) (rate(sbproxy_signature_legacy_derivation_total[5m]))",
+          "legendFormat": "{{component}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "RFC 9421 signatures that verified only against the pre-conformance derivation of @target-uri or @request-target, by component. Accepting the old derivation is a deprecation window and will be removed, so every request on this line is a peer that breaks when it closes. Find the signer from the once-per-process warn line, which carries the verifier's own key id, and move it to a conformant RFC 9421 library. No data means no peer is still on the old derivation. Runbook: docs/operator-runbook.md#security-controls."
+    },
+    {
+      "id": 13,
+      "title": "Legacy Signature Derivations (24h)",
+      "type": "stat",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 48
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0 in 24h, window can close",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (component) (increase(sbproxy_signature_legacy_derivation_total[24h]))",
+          "legendFormat": "{{component}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Legacy-derivation acceptances over the last 24 hours, per component. This is the number that decides whether the compatibility fallback can be removed: close the window once both components hold at zero across a full traffic cycle, weekly and monthly batch callers included, not just across one quiet afternoon. Anything above zero means at least one signer has not moved yet. No alert fires on this: a deprecation counter is a planning input, not a page. Runbook: docs/operator-runbook.md#security-controls."
     }
   ],
   "templating": {

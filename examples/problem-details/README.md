@@ -1,21 +1,26 @@
 # Problem-Details default renderer
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-21*
 
 ![Problem-Details default renderer](../../docs/assets/problem-details.gif)
 
-The origin on `api.local` is protected by API key authentication. The
-operator authors a custom `error_pages` entry for 401 and opts in to the
-RFC 9457 `application/problem+json` default renderer for everything else
-via `problem_details:`.
+The origin on `api.local` is protected by API key authentication and an
+`ip_filter` policy. The operator authors a custom `error_pages` entry
+for 401 and opts in to the RFC 9457 `application/problem+json` default
+renderer for everything else via `problem_details:`.
 
 The two blocks compose: per-status custom pages win when matched, and
-the problem-details renderer catches every other authentication denial
-on this origin (a bad or missing API key, a failed JWT check, and so
-on) with a structured body that downstream clients can introspect
-without scraping prose. It does not currently apply to policy denials
-(`ip_filter`, `waf`, rate limiting, etc.) or to upstream-generated
-errors; those keep their own response shapes.
+the renderer catches every other error the proxy generates on this
+origin with a structured body that downstream clients can introspect
+without scraping prose. That is authentication denials (a bad or missing
+API key, a failed JWT check), policy denials from the `policies:` chain
+that do not write their own body (`ip_filter`, `waf`, `dlp`, `csrf`,
+`rego`, and the rest), and upstream connection failures.
+
+Denials whose body a protocol pins keep their own shape: the 429
+rate-limit set, the AI-crawl payment family, and agent-to-agent chain
+refusals. So does the 404 for a `Host` matching no origin, which is
+answered before any origin config is resolved.
 
 ## Run
 
@@ -35,20 +40,36 @@ curl -sv -H 'Host: api.local' -H 'X-Api-Key: secret-key' http://127.0.0.1:8080/g
 # < HTTP/1.1 200 OK
 ```
 
-When the `authentication` block on this origin denies a request with a
-status code that does *not* match the `error_pages` table (this example
-only authors a custom page for 401, so any other authentication failure
-qualifies), the response body is rendered per RFC 9457 instead:
+A policy denial has no authored page in this example, so it is the
+renderer that answers. Policies run after authentication, so the call
+below carries the API key and is refused by `ip_filter` on the
+forwarded client IP:
+
+```bash
+curl -sv -H 'Host: api.local' -H 'X-Api-Key: secret-key' \
+     -H 'X-Forwarded-For: 203.0.113.7' \
+     http://127.0.0.1:8080/get 2>&1 | grep -E '^< HTTP|^< content-type|^\{'
+# < HTTP/1.1 403 Forbidden
+# < content-type: application/problem+json
+# {"detail":"forbidden","instance":"/get","status":403,"title":"Forbidden","type":"https://api.example.com/errors/403"}
+```
+
+The keys come out sorted; formatted and reordered for reading, that body is:
 
 ```json
 {
   "type": "https://api.example.com/errors/403",
   "title": "Forbidden",
   "status": 403,
-  "detail": "authentication failed",
+  "detail": "forbidden",
   "instance": "/get"
 }
 ```
+
+Set `include_detail: false` and the `detail` field disappears. That is
+the knob to reach for when a policy's own message would say more than
+you want a client to see: the WAF, for instance, appends the id of the
+rule that matched.
 
 ## What this exercises
 
@@ -58,6 +79,8 @@ qualifies), the response body is rendered per RFC 9457 instead:
   string in the `detail` field (set to `false` to suppress it)
 - Composition with `error_pages` per-status custom bodies
 - Composition with `authentication.api_key`
+- Composition with a `policies:` chain (`ip_filter`), whose denial the
+  renderer shapes the same way it shapes an authentication denial
 
 ## See also
 

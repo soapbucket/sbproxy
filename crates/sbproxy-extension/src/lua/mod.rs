@@ -53,10 +53,13 @@ pub fn active_sandbox_config() -> Arc<SandboxConfig> {
 /// guarantee: there is no shared interpreter state across calls.
 ///
 /// The engine carries a [`SandboxConfig`] that pins the wall-clock,
-/// memory, and pattern-API limits applied to every invocation. Use
-/// [`LuaEngine::new`] for the documented defaults or
-/// [`LuaEngine::with_config`] to honor operator overrides from
-/// `proxy.scripting.lua.sandbox` in `sb.yml`.
+/// memory, and pattern-API limits applied to every invocation.
+/// [`LuaEngine::new`] snapshots whatever [`install_sandbox_config`] has
+/// installed, which is the operator's `proxy.scripting.lua.sandbox` in
+/// `sb.yml` once boot has run and the documented defaults before that.
+/// [`LuaEngine::with_config`] takes an explicit snapshot instead, for a
+/// caller that has a `SandboxConfig` in hand and must not race the
+/// process-wide one.
 pub struct LuaEngine {
     config: SandboxConfig,
 }
@@ -168,12 +171,23 @@ impl LuaEngine {
         Ok(())
     }
 
-    /// Replace `string.find` / `string.match` / `string.gmatch` with
-    /// error-raising stubs when the operator has disabled the Lua
-    /// pattern API. The pattern engine has known pathological inputs
-    /// (catastrophic backtracking on greedy alternation), and
-    /// operators who don't need patterns can disable them entirely
-    /// without losing the rest of the `string` table.
+    /// Replace every Lua-pattern function with an error-raising stub
+    /// when the operator has disabled the pattern API.
+    ///
+    /// The pattern engine has known pathological inputs (catastrophic
+    /// backtracking on greedy alternation), and operators who don't
+    /// need patterns can disable them entirely without losing the rest
+    /// of the `string` table.
+    ///
+    /// The gated set is the complete set of Luau `string` functions
+    /// that take a pattern: `find`, `match`, `gmatch`, and `gsub`.
+    /// `gsub` was missed until it was noticed that leaving it live
+    /// meant the knob closed nothing: it reaches the same C-level
+    /// matcher, and the interrupt `max_execution_ms` relies on is
+    /// never called from inside Luau's C string library, so a
+    /// backtracking `gsub` pins a worker thread with neither the flag
+    /// nor the timeout able to stop it. Anything added to Luau's
+    /// `string` table that accepts a pattern belongs on this list.
     fn install_pattern_gating(lua: &Lua, allow_patterns: bool) -> Result<()> {
         if allow_patterns {
             return Ok(());
@@ -186,7 +200,8 @@ impl LuaEngine {
         let string_tbl: mlua::Table = lua.globals().get("string")?;
         string_tbl.set("find", stub.clone())?;
         string_tbl.set("match", stub.clone())?;
-        string_tbl.set("gmatch", stub)?;
+        string_tbl.set("gmatch", stub.clone())?;
+        string_tbl.set("gsub", stub)?;
         Ok(())
     }
 
@@ -1188,6 +1203,54 @@ mod tests {
             HashMap::new(),
         );
         assert!(result.is_err());
+    }
+
+    /// `allow_patterns: false` has to close the pattern engine, and
+    /// `string.gsub` is a pattern function.
+    ///
+    /// The gate stubbed `find`, `match`, and `gmatch` and left `gsub`
+    /// live, so the knob an operator flips to contain catastrophic
+    /// backtracking left the same C matcher reachable. Nothing else
+    /// covers it either: `lua.set_interrupt` is never called from
+    /// inside Luau's C string library, so `max_execution_ms` cannot
+    /// preempt a backtracking `gsub` and one request pins a worker
+    /// thread.
+    #[test]
+    fn sandbox_allow_patterns_false_disables_string_gsub() {
+        let engine = LuaEngine::with_config(SandboxConfig {
+            max_execution_ms: 1_000,
+            max_memory: 8 * 1024 * 1024,
+            allow_patterns: false,
+        })
+        .unwrap();
+        let result = engine.execute(
+            r#"return (string.gsub("aaa", "a*a*b", ""))"#,
+            HashMap::new(),
+        );
+        assert!(
+            result.is_err(),
+            "string.gsub should error when allow_patterns=false, got Ok: {:?}",
+            result.ok()
+        );
+    }
+
+    /// The gate is a refusal of the pattern engine, not of `gsub`: with
+    /// patterns allowed the function still works.
+    #[test]
+    fn sandbox_allow_patterns_true_keeps_string_gsub_working() {
+        let engine = LuaEngine::with_config(SandboxConfig {
+            max_execution_ms: 1_000,
+            max_memory: 8 * 1024 * 1024,
+            allow_patterns: true,
+        })
+        .unwrap();
+        let result = engine
+            .execute(
+                r#"local s = string.gsub("hello", "l", "L"); return s"#,
+                HashMap::new(),
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("heLLo"));
     }
 
     #[test]

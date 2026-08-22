@@ -21,14 +21,14 @@ use crate::snapshot::{CompiledConfig, CompiledEgressGates, CompiledOrigin};
 use crate::types::{
     AttestationBillableConfig, AttestationConfig, AttestationLedgerConfig,
     AttestationMeasuredConfig, AttestationOriginHeaderConfig, AttestationQueueConfig,
-    AttestationRole, AttestationRouteWeightConfig, AuditConfig, AuditSinkKind, ConfigFile,
-    ConnectionPoolConfig, EgressPurposeConfig, EgressTopLevelConfig, EnforcementMode,
-    EventSinkKind, EventsConfig, FailureMode, L2CacheConfig, L2CacheParams,
+    AttestationRole, AttestationRouteWeightConfig, AuditConfig, AuditSinkKind, CompressionConfig,
+    ConfigFile, ConnectionPoolConfig, CorsConfig, EgressPurposeConfig, EgressTopLevelConfig,
+    EnforcementMode, EventSinkKind, EventsConfig, FailureMode, L2CacheConfig, L2CacheParams,
     OriginAttestationConfig, RawOriginConfig, UpstreamTimeouts, UpstreamTimeoutsConfig,
-    WebBotAuthConfig, ATTESTATION_SIGN_WITH_WEB_BOT_AUTH, DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS,
-    DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS, DEFAULT_UPSTREAM_READ_TIMEOUT_MS,
-    DEFAULT_UPSTREAM_TOTAL_CONNECT_TIMEOUT_MS, DEFAULT_UPSTREAM_WRITE_TIMEOUT_MS,
-    MAX_ATTESTATION_QUEUE_ENTRIES,
+    WebBotAuthConfig, ATTESTATION_SIGN_WITH_WEB_BOT_AUTH, COMPRESSION_ALGORITHM_TOKENS,
+    DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS, DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS,
+    DEFAULT_UPSTREAM_READ_TIMEOUT_MS, DEFAULT_UPSTREAM_TOTAL_CONNECT_TIMEOUT_MS,
+    DEFAULT_UPSTREAM_WRITE_TIMEOUT_MS, MAX_ATTESTATION_QUEUE_ENTRIES,
 };
 
 const MAX_REDIS_TLS_FILE_BYTES: u64 = 1_048_576;
@@ -899,6 +899,19 @@ fn yaml_uses_top_level_model_aliases(yaml: &str) -> bool {
         .is_some_and(|root| root.get("model_aliases").is_some())
 }
 
+/// Whether the document sets `model_groups:` at the top level.
+///
+/// Same shape and same reason as
+/// [`yaml_uses_top_level_model_aliases`]: named model groups are read
+/// from the `ai_proxy` action, next to the providers their members
+/// name, and the root of the file ignores unknown keys, so a root-level
+/// block would parse and silently do nothing.
+fn yaml_uses_top_level_model_groups(yaml: &str) -> bool {
+    serde_yaml::from_str::<serde_yaml::Value>(yaml)
+        .ok()
+        .is_some_and(|root| root.get("model_groups").is_some())
+}
+
 /// The legacy `proxy.secrets` keys this document authors, in schema order.
 ///
 /// Read off the raw YAML rather than off the typed block because presence
@@ -1551,6 +1564,19 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
              Model aliases belong to the AI gateway action that serves them: move the block to \
              `origins.<hostname>.action.model_aliases` alongside that action's `providers:`. \
              See the `Model aliases` section of `docs/ai-gateway.md`."
+        );
+    }
+
+    // WOR-2657: the same refusal for a top-level `model_groups:` block.
+    // A group's members name providers on one action, so the block is
+    // meaningless anywhere else, and at the root it would parse and be
+    // dropped.
+    if yaml_uses_top_level_model_groups(&yaml) {
+        anyhow::bail!(
+            "config compile: `model_groups:` is set at the top level, where nothing reads it. \
+             Model groups belong to the AI gateway action whose providers serve their members: \
+             move the block to `origins.<hostname>.action.model_groups` alongside that action's \
+             `providers:`. See the `Model groups` section of `docs/ai-gateway.md`."
         );
     }
 
@@ -2866,6 +2892,54 @@ fn validate_events(events: &EventsConfig) -> Result<()> {
     Ok(())
 }
 
+/// The YAML spelling of an attestation role.
+///
+/// A refusal has to name the value the operator wrote rather than the
+/// Rust variant, and an exhaustive match with no wildcard arm means
+/// adding a fifth role stops the build here, where the refusals that
+/// have to decide about it live.
+fn attestation_role_label(role: AttestationRole) -> &'static str {
+    match role {
+        AttestationRole::Off => "off",
+        AttestationRole::Claim => "claim",
+        AttestationRole::Receipt => "receipt",
+        AttestationRole::Both => "both",
+    }
+}
+
+/// Refuse a role that promises the claim half of attestation.
+///
+/// WOR-2623: `claim` and `both` parse, validate, and produce nothing.
+/// Nothing in the request path writes a claim before a call is served,
+/// nothing ever reads `proxy.attestation.queue`, and no ceiling is
+/// computed for `proxy.attestation.enforcement_mode` to act on, so a
+/// config declaring either role compiled clean and served traffic
+/// producing neither a claim nor a receipt. That is worse than not
+/// offering the role at all: the operator believes their spend is
+/// bounded. Both roles stay in the vocabulary so the refusal can say
+/// what is missing instead of reporting an unknown value, and the
+/// message names the half that is complete.
+///
+/// Written once and called from both the proxy-wide check and the
+/// per-origin one, because an origin that widens `receipt` to `both`
+/// reaches exactly the same nothing. `subject` is the clause the
+/// spelling attaches to, so each caller can name the key the operator
+/// actually edited.
+fn refuse_claim_role(subject: &str, role: AttestationRole) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{subject} `{}`, which promises the claim half of attestation, and this build does \
+         not implement it: no claim is written before a call is served, nothing ever reads \
+         proxy.attestation.queue, and proxy.attestation.enforcement_mode acts on a verdict \
+         that is never reached because no ceiling is computed to reach it. A proxy that \
+         announces a metering posture it cannot honor is worse than one that announces \
+         none, so this is refused at load rather than at the moment somebody disputes an \
+         invoice. Set `role: receipt` for the half that is complete: a signed, hash-chained \
+         record of what each call actually consumed, written after it is served. See the \
+         `role` section of `docs/metering.md`.",
+        attestation_role_label(role)
+    )
+}
+
 /// Validate `proxy.attestation` before anything is built from it.
 ///
 /// Runs on every compile, including the one behind `sbproxy validate`,
@@ -2875,11 +2949,13 @@ fn validate_events(events: &EventsConfig) -> Result<()> {
 /// would give them.
 ///
 /// The rule the whole block turns on is that a declared role has to be
-/// honourable. A role with no queue drops unsettled claims on restart,
-/// a role with no ledger cannot prove a gap, a role with an incomplete
-/// billing table charges by accident, and a receipt with no signing
-/// identity is a log line. Each of those fails here rather than at the
-/// moment somebody disputes an invoice.
+/// honorable. A role this build cannot perform at all is the first
+/// case of that rule and is refused before anything else is read; see
+/// [`refuse_claim_role`]. After that, a role with no queue drops
+/// unsettled claims on restart, a role with no ledger cannot prove a
+/// gap, a role with an incomplete billing table charges by accident,
+/// and a receipt with no signing identity is a log line. Each of those
+/// fails here rather than at the moment somebody disputes an invoice.
 fn validate_attestation(
     attestation: &AttestationConfig,
     web_bot_auth: Option<&WebBotAuthConfig>,
@@ -2887,7 +2963,19 @@ fn validate_attestation(
     let role: AttestationRole = attestation.role;
     let failure_mode: FailureMode = attestation.failure_mode;
     let enforcement_mode: EnforcementMode = attestation.enforcement_mode;
-    let engaged = role.makes_claims() || role.writes_receipts();
+
+    // First, and before the keys a claim role would need: the operator
+    // is owed the reason their whole posture is refused, not a demand
+    // for a queue that would never be read either way.
+    if role.makes_claims() {
+        return Err(refuse_claim_role("proxy.attestation.role is", role));
+    }
+
+    // Every claim-making role is refused above, so the only role left
+    // that engages the block is one that writes receipts. Spelled that
+    // way rather than as the old disjunction, so a reader does not go
+    // looking for a claim branch below that can no longer be reached.
+    let engaged = role.writes_receipts();
 
     if engaged && !failure_mode.admits() {
         tracing::warn!(
@@ -3236,11 +3324,14 @@ fn validate_attestation_billable(billable: &AttestationBillableConfig) -> Result
 /// Validate one origin's attestation override against the proxy block
 /// it inherits from.
 ///
-/// The check worth having is the widening one. `proxy.attestation` only
-/// has to declare a signing identity when the proxy-wide role writes
-/// receipts, so an origin that widens `claim` to `both` can reach a
-/// receipt with nothing to sign it. That hole is invisible in either
-/// block on its own, which is why this runs where both are in scope.
+/// The checks worth having are the widening ones. `proxy.attestation`
+/// only has to declare a signing identity when the proxy-wide role
+/// writes receipts, so an origin that widens `off` to `receipt` can
+/// reach a receipt with nothing to sign it. And the proxy-wide refusal
+/// of the claim half only sees the proxy-wide role, so an origin that
+/// widens `receipt` to `both` would otherwise walk straight past it.
+/// Both holes are invisible in either block on its own, which is why
+/// this runs where both are in scope.
 fn validate_origin_attestation(
     hostname: &str,
     proxy: &AttestationConfig,
@@ -3249,6 +3340,17 @@ fn validate_origin_attestation(
     let role: Option<AttestationRole> = attestation.role;
     let agreement_id: Option<&str> = attestation.agreement_id.as_deref();
     let resolved: AttestationRole = role.unwrap_or(proxy.role);
+
+    // WOR-2623: the resolved role, not the authored one. An origin
+    // inheriting a refused proxy-wide role never gets here, because the
+    // proxy-wide check runs first; what this catches is the override
+    // that introduces the claim half one origin at a time.
+    if resolved.makes_claims() {
+        return Err(refuse_claim_role(
+            &format!("origin `{hostname}`: attestation.role resolves to"),
+            resolved,
+        ));
+    }
 
     if resolved.writes_receipts() && proxy.sign_with.is_none() {
         anyhow::bail!(
@@ -3540,13 +3642,58 @@ fn validate_origin_host_key(hostname: &str) -> Result<()> {
     Ok(())
 }
 
+/// Refuse a `cors:` block the CORS middleware would answer with silence.
+///
+/// `allowed_origins: ["*"]` plus `allow_credentials: true` is the pair
+/// browsers reject outright. The middleware has always refused to emit any
+/// header for it, but only at request time, which turned a config mistake
+/// into a browser app that fails with no server-side error and a warn line
+/// per request. The predicate is
+/// [`CorsConfig::wildcard_with_credentials`], shared with the runtime
+/// guard so this refusal cannot drift narrower than that one.
+fn validate_origin_cors(hostname: &str, cors: &CorsConfig) -> Result<()> {
+    if cors.wildcard_with_credentials() {
+        anyhow::bail!(
+            "origin {hostname}: cors.allowed_origins contains `*` and cors.allow_credentials is \
+             true. Browsers refuse that pair per the Fetch standard, so the proxy emits no CORS \
+             headers at all for it and the browser app breaks with nothing in the response \
+             saying why. Pick one: list the origins you mean in `allowed_origins`, or drop \
+             `allow_credentials`."
+        );
+    }
+    Ok(())
+}
+
+/// Refuse a `compression.algorithms` entry that names no codec.
+///
+/// An unrecognized name used to make every codec unnegotiable for the
+/// origin, so `algorithms: [deflate]` served every response uncompressed
+/// with no load-time error and nothing in the logs or metrics separating
+/// it from a client that advertised no encodings at all.
+fn validate_origin_compression(hostname: &str, compression: &CompressionConfig) -> Result<()> {
+    for entry in &compression.algorithms {
+        let token = entry.trim().to_ascii_lowercase();
+        if !COMPRESSION_ALGORITHM_TOKENS.contains(&token.as_str()) {
+            let supported = COMPRESSION_ALGORITHM_TOKENS.join(", ");
+            anyhow::bail!(
+                "origin {hostname}: compression.algorithms contains `{entry}`, which names no \
+                 codec this proxy can produce. Supported entries are: {supported}. The list is \
+                 a priority order, so the first entry the client accepts is the one served."
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Compile a single origin from its raw config.
 ///
 /// # Errors
 ///
 /// Returns an error if any of the origin's configured modules (action,
 /// auth, policy, or transform) names an unknown type or has invalid
-/// parameters, or if a referenced module cannot be built.
+/// parameters, if a referenced module cannot be built, or if its `cors:`
+/// or `compression:` block carries a setting the runtime would have to
+/// ignore.
 pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<CompiledOrigin> {
     // Before any work: reject the keys that would otherwise be accepted
     // into a snapshot that does not honor them (WOR-2310).
@@ -4128,6 +4275,17 @@ pub fn compile_origin(hostname: &str, mut config: RawOriginConfig) -> Result<Com
         &mut config.expose_openapi,
         action_type,
     )?;
+
+    // Middleware blocks whose only previous defense was a runtime no-op.
+    // Both run here, on the way into the compiled origin, so a broken
+    // setting is a load-time error rather than a silently disabled
+    // feature nothing reports.
+    if let Some(cors) = config.cors.as_ref() {
+        validate_origin_cors(hostname, cors)?;
+    }
+    if let Some(compression) = config.compression.as_ref() {
+        validate_origin_compression(hostname, compression)?;
+    }
 
     let mut compiled = CompiledOrigin {
         hostname: CompactString::new(hostname),
@@ -6591,6 +6749,93 @@ origins:
         );
     }
 
+    /// `allowed_origins: ["*"]` with `allow_credentials: true` used to
+    /// pass `sbproxy validate` and then emit zero CORS headers plus one
+    /// warn line per request, forever. It fails the load now.
+    #[test]
+    fn compile_origin_rejects_cors_wildcard_with_credentials() {
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3000
+    cors:
+      allowed_origins:
+        - "*"
+      allow_credentials: true
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("wildcard plus credentials must fail compile");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("allow_credentials") && msg.contains("api.example.com"),
+            "unhelpful error: {msg}"
+        );
+    }
+
+    /// The same wildcard without credentials is a legitimate public API
+    /// and still compiles, so the refusal is no wider than its claim.
+    #[test]
+    fn compile_origin_accepts_cors_wildcard_without_credentials() {
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3000
+    cors:
+      allowed_origins:
+        - "*"
+"#;
+        compile_config(yaml).expect("wildcard alone is a valid public-API CORS policy");
+    }
+
+    /// An algorithm name naming no codec used to disable compression for
+    /// the whole origin in silence.
+    #[test]
+    fn compile_origin_rejects_unknown_compression_algorithm() {
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3000
+    compression:
+      enabled: true
+      algorithms:
+        - deflate
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("an unknown codec name must fail compile");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("deflate") && msg.contains("gzip"),
+            "the error must name the bad entry and the supported set: {msg}"
+        );
+    }
+
+    /// Every supported token, in any case, still compiles.
+    #[test]
+    fn compile_origin_accepts_every_supported_compression_algorithm() {
+        let yaml = r#"
+origins:
+  api.example.com:
+    action:
+      type: proxy
+      url: http://localhost:3000
+    compression:
+      enabled: true
+      algorithms:
+        - GZIP
+        - br
+        - zstd
+"#;
+        compile_config(yaml).expect("the documented codec tokens must compile");
+    }
+
     /// A `timeouts:` block resolves onto the compiled origin as concrete
     /// durations, so the request path reads them without Option juggling.
     #[test]
@@ -6865,6 +7110,70 @@ origins:
           model_id: gpt-4o-mini
 "#;
         compile_config(yaml).expect("aliases on the AI action compile");
+    }
+
+    /// A top-level `model_groups:` block is refused with the live path,
+    /// for the same reason the alias block above is: the root ignores
+    /// unknown keys, so it would parse and load-balance nothing.
+    #[test]
+    fn compile_rejects_top_level_model_groups() {
+        let yaml = r#"
+model_groups:
+  - name: pool
+    members:
+      - provider: openai
+        model: gpt-4o-mini
+origins:
+  ai.local:
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: dummy
+          models: [gpt-4o-mini]
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("a top-level model_groups: block should be rejected at compile");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("model_groups") && msg.contains("action.model_groups"),
+            "unhelpful error: {msg}"
+        );
+    }
+
+    /// The same group on the AI action compiles. `compile_config` parses
+    /// the action body without building its handler, so this pins the key
+    /// as accepted here and nothing more; the group validator itself runs
+    /// where the action is compiled, which
+    /// `a_group_two_members_on_one_provider_is_refused_at_pipeline_build`
+    /// in `sbproxy-core` covers.
+    #[test]
+    fn compile_accepts_model_groups_on_the_ai_action() {
+        let yaml = r#"
+origins:
+  ai.local:
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: dummy
+          models: [gpt-4o-mini]
+        - name: azure
+          api_key: dummy
+          models: [gpt-4o-mini-deployment]
+      model_groups:
+        - name: pool
+          routing: weighted
+          members:
+            - provider: openai
+              model: gpt-4o-mini
+              weight: 9
+            - provider: azure
+              model: gpt-4o-mini-deployment
+              weight: 1
+"#;
+        compile_config(yaml).expect("groups on the AI action compile");
     }
 
     /// An `ai_provider` credential at proxy scope lowers onto every
@@ -10631,15 +10940,73 @@ origins:
         )
     }
 
+    /// WOR-2623: `claim` and `both` compiled clean and served traffic
+    /// that produced neither a claim nor a receipt. Nothing in the
+    /// request path writes a pre-call claim, nothing reads
+    /// `proxy.attestation.queue`, and no ceiling is computed for
+    /// `enforcement_mode` to act on, so the operator who set a ceiling
+    /// and a bounded queue got an unmetered proxy and no signal at all.
+    /// A posture the build cannot perform is refused at load.
+    #[test]
+    fn attestation_claim_roles_are_refused_because_the_claim_half_is_not_implemented() {
+        for spelling in ["claim", "both"] {
+            let yaml = attestation_yaml(&format!("\n    role: {spelling}"));
+            let error = compile_config(&yaml)
+                .err()
+                .unwrap_or_else(|| panic!("`role: {spelling}` must not compile"));
+            let rendered = error.to_string();
+
+            assert!(
+                rendered.contains(&format!("`{spelling}`")),
+                "the refusal names the value the operator wrote: {rendered}"
+            );
+            assert!(
+                rendered.contains("proxy.attestation.queue"),
+                "the refusal names the surface that is never read: {rendered}"
+            );
+            assert!(
+                rendered.contains("enforcement_mode"),
+                "the refusal names the ceiling that is never computed: {rendered}"
+            );
+            assert!(
+                rendered.contains("role: receipt"),
+                "the refusal points at the half that is complete: {rendered}"
+            );
+        }
+    }
+
+    /// The proxy-wide refusal reads the proxy-wide role, so an origin
+    /// that widens `receipt` into `both` would walk straight past it and
+    /// reach the same unimplemented half one host at a time.
+    #[test]
+    fn attestation_origin_widening_into_the_claim_half_is_refused() {
+        let yaml = attestation_yaml("\n    role: receipt").replace(
+            "      body: \"ok\"\n",
+            "      body: \"ok\"\n    attestation:\n      role: both\n",
+        );
+
+        let error = compile_config(&yaml)
+            .err()
+            .expect("an origin cannot widen into a half the build does not have");
+        let rendered = error.to_string();
+
+        assert!(
+            rendered.contains("api.partner.example"),
+            "the refusal names the origin the operator has to fix: {rendered}"
+        );
+        assert!(rendered.contains("`both`"), "{rendered}");
+        assert!(rendered.contains("role: receipt"), "{rendered}");
+    }
+
     #[test]
     fn attestation_valid_config_compiles() {
-        let compiled = compile_config(&attestation_yaml("\n    role: both")).expect("compile");
+        let compiled = compile_config(&attestation_yaml("\n    role: receipt")).expect("compile");
         let attestation = compiled
             .server
             .attestation
             .expect("the attestation block survives compilation");
 
-        assert_eq!(attestation.role, AttestationRole::Both);
+        assert_eq!(attestation.role, AttestationRole::Receipt);
         // The whole reason this key departs from the surface-wide
         // `closed`: billing is not a security boundary, so an unwritable
         // ledger must not take the API down.
@@ -10687,8 +11054,9 @@ origins:
             ("degraded", FailureMode::Degraded),
             ("observe", FailureMode::Observe),
         ] {
-            let yaml =
-                attestation_yaml(&format!("\n    role: claim\n    failure_mode: {spelling}"));
+            let yaml = attestation_yaml(&format!(
+                "\n    role: receipt\n    failure_mode: {spelling}"
+            ));
             let compiled =
                 compile_config(&yaml).unwrap_or_else(|e| panic!("{spelling} must compile: {e}"));
             assert_eq!(
@@ -10706,7 +11074,7 @@ origins:
     #[test]
     fn attestation_incomplete_billable_names_every_missing_outcome() {
         let yaml = format!(
-            "proxy:{ATTESTATION_SIGNER}\n  attestation:\n    role: claim\
+            "proxy:{ATTESTATION_SIGNER}\n  attestation:\n    role: receipt\
              \n    sign_with: proxy.web_bot_auth\
              \n    queue:\n      path: /tmp/sbproxy-attestation/claims.q\
              \n    ledger:\n      path: /tmp/sbproxy-attestation/receipts.ndjson\
@@ -10729,7 +11097,7 @@ origins:
     #[test]
     fn attestation_role_without_a_billing_table_fails_config_load() {
         let yaml = format!(
-            "proxy:{ATTESTATION_SIGNER}\n  attestation:\n    role: claim\
+            "proxy:{ATTESTATION_SIGNER}\n  attestation:\n    role: receipt\
              \n    sign_with: proxy.web_bot_auth\
              \n    queue:\n      path: /tmp/sbproxy-attestation/claims.q\
              \n    ledger:\n      path: /tmp/sbproxy-attestation/receipts.ndjson\
@@ -10748,7 +11116,7 @@ origins:
     #[test]
     fn attestation_role_without_a_queue_fails_config_load() {
         let yaml = format!(
-            "proxy:{ATTESTATION_SIGNER}\n  attestation:\n    role: claim\
+            "proxy:{ATTESTATION_SIGNER}\n  attestation:\n    role: receipt\
              \n    sign_with: proxy.web_bot_auth\
              \n    ledger:\n      path: /tmp/sbproxy-attestation/receipts.ndjson\
              {ATTESTATION_BILLABLE}\n{ATTESTATION_ORIGIN}"
@@ -10762,8 +11130,8 @@ origins:
 
     #[test]
     fn attestation_zero_queue_capacity_fails_config_load() {
-        let yaml =
-            attestation_yaml("\n    role: claim").replace("max_entries: 100000", "max_entries: 0");
+        let yaml = attestation_yaml("\n    role: receipt")
+            .replace("max_entries: 100000", "max_entries: 0");
 
         let error = compile_config(&yaml)
             .err()
@@ -10800,10 +11168,13 @@ origins:
 
     #[test]
     fn attestation_origin_override_survives_compilation() {
+        // A narrowing override: the proxy meters, this one origin does
+        // not. Narrowing is the only direction left now that widening
+        // into the claim half is refused.
         let override_block =
-            "      body: \"ok\"\n    attestation:\n      role: claim\n      agreement_id: acme-2026\n";
+            "      body: \"ok\"\n    attestation:\n      role: off\n      agreement_id: acme-2026\n";
         let yaml =
-            attestation_yaml("\n    role: both").replace("      body: \"ok\"\n", override_block);
+            attestation_yaml("\n    role: receipt").replace("      body: \"ok\"\n", override_block);
 
         let compiled = compile_config(&yaml).expect("a per-origin override compiles");
         let origin = compiled
@@ -10814,7 +11185,7 @@ origins:
             .as_ref()
             .expect("the override survives compilation");
 
-        assert_eq!(attestation.role, Some(AttestationRole::Claim));
+        assert_eq!(attestation.role, Some(AttestationRole::Off));
         assert_eq!(attestation.agreement_id.as_deref(), Some("acme-2026"));
     }
 
@@ -10829,7 +11200,7 @@ origins:
       content_type: text/plain
       body: "ok"
     attestation:
-      role: claim
+      role: receipt
       agreement_id: acme-2026
 "#;
         let error = compile_config(yaml)
@@ -10844,14 +11215,14 @@ origins:
     #[test]
     fn attestation_origin_widening_past_the_signer_fails_config_load() {
         // `proxy.attestation` only has to name a signer when the
-        // proxy-wide role writes receipts. An origin that widens `claim`
-        // to `both` reaches a receipt with nothing to sign it, and that
-        // hole is invisible in either block on its own.
-        let yaml = attestation_yaml("\n    role: claim")
+        // proxy-wide role writes receipts. An origin that widens `off`
+        // to `receipt` reaches a receipt with nothing to sign it, and
+        // that hole is invisible in either block on its own.
+        let yaml = attestation_yaml("\n    role: off")
             .replace("\n    sign_with: proxy.web_bot_auth", "")
             .replace(
                 "      body: \"ok\"\n",
-                "      body: \"ok\"\n    attestation:\n      role: both\n",
+                "      body: \"ok\"\n    attestation:\n      role: receipt\n",
             );
 
         let error = compile_config(&yaml)
@@ -10864,7 +11235,7 @@ origins:
 
     #[test]
     fn attestation_empty_agreement_id_fails_config_load() {
-        let yaml = attestation_yaml("\n    role: both").replace(
+        let yaml = attestation_yaml("\n    role: receipt").replace(
             "      body: \"ok\"\n",
             "      body: \"ok\"\n    attestation:\n      agreement_id: \"\"\n",
         );

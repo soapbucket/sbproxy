@@ -42,21 +42,50 @@ pub use types::{
 
 use std::fmt;
 
+/// The reason code every refusal carries until its call site names a
+/// narrower one.
+///
+/// Deliberately coarse. A code is a metric label and a decision-audit
+/// field, so an uncoded refusal has to land on a value that says "this
+/// refusal has not been classified yet" rather than on a value an
+/// analyst could mistake for a specific finding.
+const UNCODED_REFUSAL_REASON: &str = "malformed_request";
+
 /// Error returned from any `ChatFormat` operation. Errors map to HTTP
 /// status codes via `status()`; the gateway uses that to surface a
 /// matching response to the client.
+///
+/// `reason` is the half that is safe to put on a metric label and a
+/// SIEM record: a `&'static str` chosen at the refusal site, never
+/// derived from the request. `message` is the opposite and often
+/// interpolates caller bytes (`invalid JSON body: {e}`, `unsupported
+/// message role: {other}`), so it goes to the client and to the scrubbed
+/// audit reason and nowhere else.
 #[derive(Debug, Clone)]
 pub struct ChatError {
     status: u16,
     message: String,
+    reason: &'static str,
 }
 
 impl ChatError {
-    /// HTTP 400 with a client-visible message.
+    /// HTTP 400 with a client-visible message, under the generic
+    /// `malformed_request` reason code.
     pub fn bad_request(msg: impl Into<String>) -> Self {
+        Self::bad_request_coded(UNCODED_REFUSAL_REASON, msg)
+    }
+
+    /// HTTP 400 with a client-visible message and a bounded reason code.
+    ///
+    /// `reason` must be a literal, not a value derived from the request:
+    /// it becomes a Prometheus label value and a decision-audit field,
+    /// both of which are unbounded-cardinality hazards and neither of
+    /// which is scrubbed.
+    pub fn bad_request_coded(reason: &'static str, msg: impl Into<String>) -> Self {
         Self {
             status: 400,
             message: msg.into(),
+            reason,
         }
     }
 
@@ -65,6 +94,7 @@ impl ChatError {
         Self {
             status: 501,
             message: msg.into(),
+            reason: UNCODED_REFUSAL_REASON,
         }
     }
 
@@ -76,6 +106,14 @@ impl ChatError {
     /// Human-readable message safe to surface to the client.
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// Bounded reason code for metrics and decision-audit records.
+    ///
+    /// `malformed_request` when the refusal site has not named a
+    /// narrower one.
+    pub fn reason(&self) -> &'static str {
+        self.reason
     }
 }
 
@@ -428,18 +466,20 @@ pub trait ChatFormat: Send + Sync + 'static {
 pub(crate) fn parse_role(
     obj: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<Role, ChatError> {
-    let role_s = obj
-        .get("role")
-        .and_then(|r| r.as_str())
-        .ok_or_else(|| ChatError::bad_request("chat message is missing a 'role' field"))?;
+    let role_s = obj.get("role").and_then(|r| r.as_str()).ok_or_else(|| {
+        ChatError::bad_request_coded("role_missing", "chat message is missing a 'role' field")
+    })?;
     match role_s {
         "user" => Ok(Role::User),
         "assistant" => Ok(Role::Assistant),
         "system" => Ok(Role::System),
         "tool" => Ok(Role::Tool),
-        other => Err(ChatError::bad_request(format!(
-            "unsupported message role: {other}"
-        ))),
+        // The code is a literal; `other` stays in the message only,
+        // because it is caller bytes and the code is a metric label.
+        other => Err(ChatError::bad_request_coded(
+            "role_unsupported",
+            format!("unsupported message role: {other}"),
+        )),
     }
 }
 

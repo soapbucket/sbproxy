@@ -6,13 +6,13 @@
 
 Three providers behind one wire format ([config](../examples/ai-gateway-quickstart/)).
 
-SBproxy includes an AI gateway that sits between your application and LLM providers. You get one API endpoint with automatic failover, cost tracking, rate limits, and programmable routing across OpenAI, Anthropic, and other providers. The proxy ships with 72 native providers behind one OpenAI-compatible API. That count is worth unpacking: 66 of the 72 catalog entries speak the OpenAI wire format and pass through unchanged, 3 (Anthropic, Gemini, Bedrock) get in-tree request and response translation, and 3 custom-format entries (SageMaker, Oracle OCI, Watsonx) are forwarded in their native shape with no translation. You bring your own provider keys and the model name passes straight through, so you reach 200+ models without waiting on us to add them.
+SBproxy includes an AI gateway that sits between your application and LLM providers. You get one API endpoint with automatic failover, cost tracking, rate limits, and programmable routing across OpenAI, Anthropic, and other providers. The proxy ships with 70 native providers behind one OpenAI-compatible API. That count is worth unpacking: 63 of the 70 catalog entries speak the OpenAI wire format and pass through unchanged, 3 (Anthropic, Gemini, Bedrock) get in-tree request and response translation, and 4 custom-format entries (SageMaker, Oracle OCI, Watsonx, Writer) are forwarded in their native shape with no translation. You bring your own provider keys and the model name passes straight through, so you reach 200+ models without waiting on us to add them.
 
 This guide owns the end-to-end picture: provider setup, wire compatibility, routing, streaming, budgets, caching, prompt controls, and per-request attribution. Coming from an agent framework? [langchain.md](langchain.md) is the shortest path: it points LangChain's model client and MCP tools at the gateway and runs a first request end to end. Seven features get a summary here and a full page of their own: the [guardrail mesh](ai-guardrail-mesh.md), [outcome-aware routing](ai-outcome-aware-routing.md), the [AI policy plane](ai-policy-cel.md), [budget soft-landing](ai-predictive-budget.md), the [verifiable usage ledger](ai-usage-ledger.md), [LLM-aware resilience](ai-llm-aware-resilience.md), and [AI context compression](ai-context-compression.md). For those seven, the linked page is canonical; it carries the semantics, tuning advice, and reference tables.
 
 ## Provider setup
 
-Configure one or more providers under the `action` block. Each provider needs a name, API key, and model list. Callers of hosted providers should send an explicit `model`. A `default_model` can select among locally served models and appears in model metadata, but the hosted dynamic-routing path does not inject one into a request that omitted `model`:
+Configure one or more providers under the `action` block. Each provider needs a name, API key, and model list. A request that omits `model` falls back to the origin's `default_model`, on the hosted dispatch path as well as the locally served one, provided the origin names exactly one (see [Defaulting the model](#defaulting-the-model) below):
 
 **Fragment:** This is one `origins` entry; it needs a sibling top-level `proxy:` block (at minimum `proxy.http_bind_port`) to be a runnable `sb.yml`. See [Full example](#full-example) below or [`examples/ai-gateway-quickstart/`](../examples/ai-gateway-quickstart/) for a complete file.
 
@@ -32,12 +32,155 @@ origins:
         strategy: round_robin
 ```
 
-API keys support environment variable interpolation with `${VAR_NAME}` syntax. Never put raw keys in config files. `default_model` is a per-provider field, not an `action`-level one; an action-level `default_model` key is ignored. Context compression also requires the request's effective `model` to be non-empty, so hosted requests that omit it do not run the compression pipeline.
+API keys support environment variable interpolation with `${VAR_NAME}` syntax. Never put raw keys in config files.
+
+#### Defaulting the model
+
+`default_model` is a per-provider field, not an `action`-level one; an action-level `default_model` key is ignored. A request that omits `model` takes the origin's default when every enabled provider that names one names the same one. Providers that name nothing abstain, and a provider with `enabled: false` gets no vote, because a request can never land on it. Two enabled providers naming different defaults leave the request modelless rather than routing it to whichever is listed first, which is a choice the operator did not make.
+
+Getting a concrete model in there is not cosmetic. Every model-aware gate in the pipeline is written as "if a model was named": the `allowed_models` and `blocked_models` lists, a virtual key's per-key model scoping, model-scoped budgets, provider eligibility, and the context-compression pipeline. A request with no model skips all of them. Against an upstream that infers the model itself, an Azure deployment-scoped `base_url` or a single-model vLLM or Ollama, omitting `model` therefore reached the provider with the allowlist and the block list never consulted. With a default in place the request is gated on the model it will actually run:
+
+```yaml
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      blocked_models: [retired-model]
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          models: [gpt-4o]
+          default_model: retired-model
+```
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Host: ai.example.com' \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"hi"}]}'
+```
+
+```text
+403
+```
+
+The provider is never contacted. Before this, the same request reached it with an empty `model`.
+
+Two carve-outs, called out rather than left to be discovered.
+
+The fallback applies on the three chat-shaped surfaces only: `POST /v1/chat/completions`, `POST /v1/messages`, and `POST /v1/responses`. `default_model` names a chat model, and the other JSON surfaces on the same origin have their own model vocabularies. `POST /v1/moderations` and `POST /v1/images/generations` in particular treat `model` as optional and default it upstream, so writing a chat model into one of those bodies would turn a request the provider accepts into a 400. Those surfaces still forward no `model`, and their model gates still do not run.
+
+The second is multipart: an audio transcription, image edit, or image variation request that carries no `model` form field is still forwarded without one, for the same reason. The multipart rewrite can replace a `model` part and cannot add one.
 
 Two more per-provider fields bound dispatch. `timeout_ms` caps one attempt's wall clock, measured from connect through the end of the response body, so it cuts a streaming completion off mid-stream if the stream outlives it; pick it with your slowest legitimate stream in mind, not your median. `max_retries` re-dispatches on retryable failures, each attempt with a fresh timeout window, so the worst case a client waits on one provider is `(timeout_ms + backoff) x (max_retries + 1)` before routing moves on.
 
+That is one provider. A fallback chain multiplies it again, because the dispatch loop visits each configured candidate at most once: worst case across the whole request is `(timeout_ms + backoff) x (max_retries + 1) x candidate count`. Four providers at `timeout_ms: 30000` is a two-minute wait before the caller sees an error. Nobody sizes for that on purpose, which is what the next section is about.
+
+#### Bounding a wedged provider on a streaming request
+
+`timeout_ms` is the wrong instrument for a provider that accepts the connection and then goes quiet. It cannot be short, because it also has to cover a legitimate three-minute completion, and while it runs no failover happens. Set `resilience.pre_header_timeout_ms` instead. It bounds connect through the provider's response headers on streaming requests only, and an elapse fails over to the next candidate:
+
+```yaml
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      routing: fallback_chain
+      resilience:
+        pre_header_timeout_ms: 2000
+      providers:
+        - name: primary
+          api_key: ${OPENAI_API_KEY}
+          priority: 1
+          timeout_ms: 180000
+        - name: secondary
+          api_key: ${BACKUP_API_KEY}
+          priority: 2
+          timeout_ms: 180000
+```
+
+The two budgets measure different spans of the same request:
+
+```mermaid
+gantt
+    title One streaming attempt, and which key bounds what
+    dateFormat X
+    axisFormat %s
+    section Request
+    connect and TLS         :a1, 0, 1
+    provider thinking       :a2, 1, 2
+    response headers        :milestone, m1, 3, 0
+    SSE events to client    :a3, 3, 9
+    section Budgets
+    pre_header_timeout_ms   :crit, b1, 0, 3
+    timeout_ms              :b2, 0, 9
+```
+
+`pre_header_timeout_ms` is the red span and it stops at the milestone. `timeout_ms` runs past it to the last byte, and a failover is possible only inside the red span.
+
+The milestone is the commit point: once the provider answers `200 text/event-stream` the gateway is relaying bytes the caller is already reading, and no later candidate can take them back. A stall after that ends the stream, and it is counted on `sbproxy_ai_stream_post_commit_failures_total` rather than on the failover counter.
+
+Send a streaming request at a primary that never answers:
+
+```bash
+curl -N -sS http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Host: ai.example.com' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+The caller gets `secondary`'s stream about two seconds in. Without the key it waits out `timeout_ms`, three minutes here, and then gets the same stream. The failover is on the metric either way, but only the bounded one carries the reason:
+
+```
+sbproxy_ai_failovers_total{from_provider="primary",to_provider="secondary",reason="pre_header_timeout"} 1
+```
+
+Two things to know about its edges. It never applies to a non-streaming request: a buffered call has no partial output to protect, so it keeps waiting out `timeout_ms`. And it only ever shortens an attempt, so a value above the attempt's own transport budget never fires: keep it under `timeout_ms`, or under 30000 on a provider that sets no `timeout_ms` and so runs on the gateway's HTTP client default.
+
+One more, on a cluster: a `managed_model` served by another node is dispatched over the model plane from inside the same bounded attempt, so this budget bounds that dispatch too, cold start included. A cold start is legitimately slower than any hosted provider's headers. On an origin that can route to a managed model, size the budget above your cold-start allowance or leave it unset there.
+
+With it set, the worst case above becomes `(pre_header_timeout_ms + backoff) x candidate count` for a provider that never answers, while a provider that does answer still gets its full `timeout_ms` to finish generating.
+
+#### Letting a caller set its own budget
+
+An agent that will abandon a call after four seconds should not be held on a provider budget sized for a two-minute batch job, and a caller doing deep research needs the opposite. `x-sbproxy-timeout-ms` lets the caller say which, replacing the selected provider's `timeout_ms` for that one request. It is off by default and the flag alone is refused at config load, because a caller who can raise a timeout holds a downstream connection, a `quota_pool` slot, and an upstream generation open for as long as you let it:
+
+```yaml
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      allow_request_timeout_override: true
+      max_request_timeout_ms: 20000
+      providers:
+        - name: openai
+          api_key: ${OPENAI_API_KEY}
+          timeout_ms: 60000
+```
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Host: ai.example.com' \
+  -H 'Content-Type: application/json' \
+  -H 'x-sbproxy-timeout-ms: 4000' \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+```
+
+That attempt now runs on 4 seconds instead of 60. Ask for more than the ceiling and the request is refused rather than quietly clamped, so the caller can correct it in one round trip:
+
+```bash
+$ curl -sS -H 'x-sbproxy-timeout-ms: 60000' ...
+{"error":{"type":"invalid_request_timeout","message":"x-sbproxy-timeout-ms of 60000 exceeds this origin's max_request_timeout_ms of 20000; ask for between 1 and 20000"}}
+```
+
+With `allow_request_timeout_override` off, the same header is dropped and the request dispatches on the configured budget. That is deliberate: callers hitting a fleet where only some origins have opted in should not collect 400s from the rest. The drop is still counted, on `sbproxy_ai_request_timeout_override_total{outcome="ignored_override_disabled"}`, along with `applied`, `over_ceiling`, and `invalid_header`.
+
+The ceiling bounds one attempt, not the request. With `max_retries: 3` a caller asking for 20 seconds can hold four attempts of it, so the worst case is `max_request_timeout_ms x (max_retries + 1) x candidate count`. Size the ceiling against a single attempt and then do that multiplication before you pick it. Note that an honored header replaces the gateway's 30-second HTTP client default along with the provider's `timeout_ms`, so a ceiling above 30000 does buy a caller a longer attempt. Nothing else bounds it, which is why the ceiling is mandatory.
+
+The override does not reach the gateway's own routing work. Semantic-cache embeddings, semantic-route embeddings, and shadow copies keep the shared client and its configured budgets, because a caller's completion budget is not a budget for work the caller did not ask for. It does reach a `managed_model` this process serves locally, which is dialed over the same provider HTTP client once the engine is up. It does not reach a `managed_model` served by another node in a cluster: that dispatch goes over the model plane on its own deadlines.
+
 ### Native providers
-72 native providers ship in-tree. The split: 66 entries are OpenAI-format passthrough, 3 (Anthropic, Gemini, Bedrock) carry in-tree translators, and 3 custom-format entries (SageMaker, Oracle OCI, Watsonx) pass through untranslated, so clients must send those three their native body shape. You bring your own key per provider and the `model` field passes straight through, so the gateway reaches 200+ models (and any model a provider ships next) without enumerating them. Direct adapters include `openai`, `anthropic`, `gemini`, `azure`, `bedrock`, `cohere`, `mistral`, `groq`, `deepseek`, `together`, `fireworks`, `cerebras`, `sambanova`, `nvidia`, `vertex`, `databricks`, `huggingface`, `vllm`, and `openrouter`. For the AWS entries, SBproxy does not mint SigV4 signatures: `bedrock` and `sagemaker` requests must arrive with an operator-provided, pre-signed `Authorization` header, which the gateway forwards verbatim.
+70 native providers ship in-tree. The split: 63 entries are OpenAI-format passthrough, 3 (Anthropic, Gemini, Bedrock) carry in-tree translators, and 4 custom-format entries (SageMaker, Oracle OCI, Watsonx, Writer) pass through untranslated, so clients must send those four their native body shape. You bring your own key per provider and the `model` field passes straight through, so the gateway reaches 200+ models (and any model a provider ships next) without enumerating them. Direct adapters include `openai`, `anthropic`, `gemini`, `azure`, `bedrock`, `cohere`, `mistral`, `groq`, `deepseek`, `together`, `fireworks`, `cerebras`, `sambanova`, `nvidia`, `vertex`, `databricks`, `huggingface`, `vllm`, and `openrouter`. For the AWS entries, SBproxy signs the request itself: add `aws_sigv4:` to a `bedrock` or `sagemaker` provider and the gateway computes the SigV4 `Authorization` header per request, with credentials from the standard AWS provider chain, a static key pair, or a renewed STS role session.
 
 Any model a listed provider serves works without extra config. For a self-hosted or proprietary endpoint, point `vllm` or any provider at it with a custom `base_url`. `openrouter` is available as one of the providers when you want many vendors behind a single key. See `providers.md` for the full per-provider table.
 
@@ -76,8 +219,57 @@ OpenAI-compatible logical list built from its configured eligible providers and
 models. Managed entries report aggregate `ready`, `cold`, or `unavailable`
 state, ready and desired replica counts, and bounded capability names. The list
 omits worker identity, engine ports, and private endpoints. It does not call an
-ordinary provider's native model-list endpoint or reproduce provider-specific
-model metadata.
+ordinary provider's native model-list endpoint.
+
+The list carries every name a caller may send as `model`, not only the ids in
+the providers' `models:` lists: a [`model_aliases`](#model-aliases) entry
+appears under its own name, and a [`model_groups`](#model-groups) entry appears
+under the group name. An alias is listed under the gates that apply to the id it
+resolves to, so an alias whose target `blocked_models` refuses is left off
+rather than advertised as a name that answers 403.
+
+Each entry also carries `created`, which the OpenAI `Model` object declares
+required and without which an SDK-shaped client refuses to deserialize the
+response. This gateway does not know when a model was published and will not
+invent a date, so the value is the epoch constant: present for the schema, and
+not a claim about anything.
+
+Two token limits appear where this process knows them: `context_window` and
+`max_output_tokens`. Both are **omitted rather than nulled** when it does not,
+so a client can tell "the gateway was not told" from "the limit is zero". The
+window comes from the built-in table the compression pipeline already sizes
+prompts against, falling back to the `max_input_tokens` an operator's
+[`rate_card:`](#model-prices) declares. `max_output_tokens` has only the rate
+card as a source: nothing built in carries a completion cap, so an origin with
+no rate card publishes no completion limits. Both are the same resolution the
+`ai.catalog` routing base data reads, so a routing policy and a client are never
+told different numbers for one model. No provider-specific model metadata beyond
+these is reproduced.
+
+Each entry's `capabilities` array names the surfaces this gateway will forward
+for that model and that the provider catalog records the vendor as exposing.
+Both halves have to agree. The first is the same per-provider surface matrix
+that decides whether a request is served or answered with 501, so nothing named
+here comes back 501. The second keeps a listing from claiming an endpoint on a
+vendor's behalf just because its wire format implies one. Whether the upstream
+then answers 200 is the upstream's business.
+
+So the array is never wider than the 501 gate, and it is often narrower. Every
+provider with `format: openai` is forwarded the whole OpenAI path set, but its
+listing names only what the catalog knows that vendor serves: a DeepSeek model
+lists `chat_completions`, `messages`, `responses`, and `streaming`, and not
+`image_generation`. Absence is not a refusal. The request is still forwarded and
+the upstream decides. Where several providers serve one public model name, a
+capability appears when at least one of them has it.
+
+The names are the surface labels from
+[Supported endpoints](#supported-endpoints), narrowed to the ones a caller
+reaches by naming a model, plus `streaming`. Account-scoped surfaces (`models`,
+`files`, `batches`, `assistants`, `threads`, `fine_tuning`) belong to the
+provider rather than to any one model, so they are left out. `GET /model/info`
+and `GET /model_group/info` carry the same array. A group's array is the union
+across its members and its token limits are the floor across them, for the
+reasons in [Model groups](#model-groups).
 
 Successful completions add `x-sbproxy-logical-model` and an allowlisted
 `x-sbproxy-route-class` of `local`, `peer`, or `external`. Managed availability
@@ -133,7 +325,9 @@ A request for `gpt-4o-mini` reaches OpenAI, one for `claude-haiku-4-5` reaches A
 
 Every entry in the provider catalog declares a data-handling posture: whether the vendor's API retains prompt data on a stock account under its published data-processing terms (`retains_data`), and whether the vendor sells a zero-data-retention arrangement at all (`zdr_available`). An origin, or a single request, can then require a posture, and the requirement is a hard eligibility filter over the provider candidate set, applied before any routing strategy runs. A request left with no eligible provider is refused, with the constraint and the excluded providers named, rather than falling back to a provider that does not meet it.
 
-Offering an arrangement is not holding one. `zdr_available` never satisfies `require_zdr` on its own: OpenAI, Anthropic, Azure OpenAI, and Vertex all offer a zero-data-retention agreement and all retain by default, so reading the catalog flag as a held posture would route a `require_zdr` request straight to a stock retaining account. The flag is there so you know an agreement is available to go and sign; declaring that your deployment holds one is a line in your own config (`data_posture.zdr: true` on the provider entry). What does satisfy `require_zdr` without any declaration from you is a provider whose stock terms already store nothing (Bedrock) and a model you serve yourself (`serve:`, `managed_model`), where the prompt never leaves the deployment.
+Offering an arrangement is not holding one. `zdr_available` never satisfies `require_zdr` on its own: OpenAI, Anthropic, Azure OpenAI, Bedrock, and Vertex all offer a zero-data-retention agreement and all retain by default, so reading the catalog flag as a held posture would route a `require_zdr` request straight to a stock retaining account. The flag is there so you know an agreement is available to go and sign; declaring that your deployment holds one is a line in your own config (`data_posture.zdr: true` on the provider entry). What does satisfy `require_zdr` without any declaration from you is a provider whose stock terms already store nothing (Perplexity, Cerebras) and a model you serve yourself (`serve:`, `managed_model`), where the prompt never leaves the deployment.
+
+Bedrock used to be in that second group and is not any more. AWS still calls zero data retention the platform default, but its abuse-detection page now carves out named models: classifier-flagged traffic to the OpenAI GPT-5.x family is retained up to 30 days, and that carve-out needs no opt-in. Because the model name passes straight through from the caller, the gateway cannot tell in advance which side of the carve-out a request lands on, so the catalog records the pessimistic reading and Bedrock became `require_zdr`-eligible only by declaration.
 
 Like the rest of the catalog, the posture fields record what each vendor's published terms say, not the result of auditing an account (the same honesty rule [providers.md](providers.md) states for base URLs and auth headers). Entries with no published commitment carry the pessimistic default, `retains_data: true, zdr_available: false`, so a constrained origin fails closed on an unknown posture rather than optimistically routing to it.
 
@@ -284,11 +478,19 @@ routing:
 
 ### sticky
 
-Pins a user or session to the same provider. Falls back to round_robin for the initial pick.
+`strategy: sticky` behaves as `round_robin` today. The session-affinity map
+exists in the router and nothing on the request path supplies it a session key,
+so every request takes the round-robin fallback and no session is ever pinned.
+The strategy is accepted rather than refused so existing configs keep loading.
+
+For caller affinity that does work, use
+[prompt-cache affinity](#prompt-cache-affinity) below: it keys on a cache key
+the caller already sends, scopes it to the tenant and credential, and composes
+with whatever strategy you have configured, including `round_robin`.
 
 ```yaml
 routing:
-  strategy: sticky
+  strategy: sticky   # equivalent to round_robin
 ```
 
 ### random
@@ -591,6 +793,91 @@ score or a promptless request and at `warn` for an unavailable embedder.
 See [examples/semantic-routing](../examples/semantic-routing/) for a
 runnable two-pool config with a below-floor fallback walkthrough.
 
+## Service tier
+
+Several vendors sell the same model at more than one latency and price point,
+selected by a `service_tier` field on the request. That field is the operator's
+decision, not the caller's, because it sets the price and the operator pays the
+bill. Declare it on the provider entry:
+
+```yaml
+origins:
+  - match: { host: ai.internal }
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai-flex
+          provider_type: openai
+          api_key: ${OPENAI_API_KEY}
+          service_tier: flex
+        - name: openai-standard
+          provider_type: openai
+          api_key: ${OPENAI_API_KEY}
+          service_tier: standard
+      routing:
+        strategy: cost_optimized
+```
+
+The call, with a caller trying to buy themselves faster capacity:
+
+```bash
+curl https://ai.internal/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"gpt-5","service_tier":"priority",
+       "messages":[{"role":"user","content":"summarize this"}]}'
+```
+
+The outcome: whichever entry the router picks, the body that reaches OpenAI
+carries that entry's tier (`"service_tier": "flex"` or `"service_tier":
+"default"`), never `priority`. An entry that declares no tier sends no tier
+field at all, and the caller's is removed on the way through, so the vendor
+serves on its own default.
+
+Two tiers of one vendor are two `providers[]` entries, as above. The tier is a
+property of the destination, not of a request, so the router treats them as two
+candidates with independent weights, health, cooldowns, and observed latency,
+and every existing strategy works over them unchanged.
+
+```mermaid
+flowchart TD
+    A[request body] --> B[strip any caller service_tier]
+    B --> C{surface carries a tier?}
+    C -- "no (embeddings, images, audio)" --> Z[send no tier field]
+    C -- "yes (chat, messages, responses)" --> D{entry declares service_tier?}
+    D -- no --> Z
+    D -- yes --> E{catalog records this vendor's tier?}
+    E -- no --> F[refused at config load]
+    E -- yes --> G[write the vendor's wire value]
+```
+
+The canonical tiers are `flex`, `standard`, and `priority`. Each is translated
+to the vendor's own spelling by the provider catalog: OpenAI's entry maps
+`standard` to its wire value `default`, and keeps `flex` and `priority` as
+written. A vendor whose catalog entry declares no `service_tiers` block has no
+tier the gateway knows how to ask for, and an entry naming one is refused at
+config load rather than booted and served on a tier nobody chose:
+
+```
+ai provider "claude" service tier: `service_tier: flex` is not available: the
+provider catalog records no service-tier vocabulary for provider type
+"anthropic".
+```
+
+Only vendors whose tier vocabulary has been read off their own API reference
+are declared in the shipped catalog. To add one, override the catalog with
+`proxy.ai_providers_file` and give the vendor a `service_tiers` block naming
+the request field and its wire value for each tier you use.
+
+`sbproxy_ai_service_tier_decisions_total{disposition}` counts every attempt
+whose tier the gateway decided, so a caller quietly losing the tier they asked
+for is visible rather than silent. `caller_tier_replaced` overwrote a
+caller-supplied tier, `caller_tier_stripped` removed one from an entry that
+declares no tier, and `operator_tier_applied` wrote the entry's tier onto a
+request that asked for none. Nothing is counted when the caller sent no tier
+and the entry declares none, so an untiered deployment reads flat zero here
+instead of tracking its whole request rate. It counts attempts rather than
+requests, because two entries in one failover chain can carry two tiers.
+
 ## Routing policy
 
 The strategies above are a fixed menu. `ai_routing_policy` lets you write
@@ -878,6 +1165,26 @@ content_policy_fallbacks: [permissive]   # provider refused on safety grounds
 
 Each list names providers from the same action's `providers:` (a name matching nothing fails config load). An oversized prompt is caught by the pre-flight token estimate and rerouted to a larger-window provider before anything dispatches, so streaming requests participate too. The estimate runs on the three token-priced chat surfaces, `/v1/chat/completions`, `/v1/messages`, and `/v1/responses`, since the last two reach the trigger already normalized to the canonical chat body; on any other surface the pre-flight half stands down and only a provider that answers with a recognizable context-overflow body trips the trigger. A content-policy refusal reroutes to the aimed list instead of whatever the chain had queued next. A typed reroute is visible on `sbproxy_ai_failovers_total{reason="context_window"|"content_policy"}`. The generic availability hop is on the same counter under a different spelling: `reason="http_<status>"` for a status-code failover, `reason="transport"` for a connection failure, and `reason="managed_cold_fallback"` for a cold managed replica. `generic` is not a value of that label; it is the `failover_trigger` value on the admin console's request log, where the closed set is `context_window`, `content_policy`, and `generic`. Full decision-path diagram, scope notes, and the per-class retry and cooldown interplay are in [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md#typed-fallback-triggers); the runnable, credential-free walkthrough is [examples/typed-fallbacks](../examples/typed-fallbacks/).
 
+### Credential rejection is not a failover
+
+A `401` or `403` from a provider is a statement about the credential, not about the provider, and the two get different machinery. This is the single most misreadable thing in the resilience surface, so the ruling, in one line: **key fallback owns `401` and `403`; the provider failover and `cooldown_policy` own everything else.**
+
+A `429`, a `5xx`, or a timeout says the provider cannot serve you right now, and a different key against a rate-limited provider is still rate limited, so those advance to the next provider. A `401` is not retryable by default and opens no failover, so with nothing else configured it reaches the caller verbatim. An entry can instead name an operator-held credential to retry the *same* provider on, once:
+
+```yaml
+providers:
+  - name: openai
+    api_key: vault://primary/secret/data/acme/openai?key=api_key
+    fallback_credential_id: house-openai   # a key_management.seed.credentials[] id
+    on_key_failure: fallback               # the default; `fail_closed` opts out
+```
+
+The retry keeps the provider, the model, the base URL, and the price the request was quoted at. It does not spend the availability budget, and it happens at most once per request. When the operator's credential is also refused, or does not resolve, the untried tail of the failover chain is still there behind it, so an availability failover runs exactly as it would have.
+
+A request that arrived carrying a caller-owned native provider key never falls back, whatever the entry says: the caller presented their own credential and the provider refused it, so spending yours would bill you for their authorization failure.
+
+`credential_source` on the admin request row (`provider_entry`, `native_caller`, `fallback`) says which secret paid, one `credential_fallback` event lands on the typed feed per swap, and `sbproxy_ai_key_fallbacks_total{provider,outcome}` counts the same decision for anyone alerting off the scrape rather than off the feed. Full decision path, the `fail_closed` argument, and a runnable walkthrough are in [multi-tenant.md](multi-tenant.md#when-a-tenants-provider-key-is-refused) and [examples/tenant-key-fallback](../examples/tenant-key-fallback/).
+
 ## Shadow eval
 
 Mirror a sampled set of non-streaming chat evaluation requests to a second provider. V1 includes Chat Completions plus Messages and Responses requests after those native formats are normalized to the chat hub. Mutating and non-chat surfaces, including Assistants, Threads, Batches, Fine Tuning, Files, images, audio, embeddings, moderation, and reranking, are never copied. The copy is taken after request policy, guardrails, model rewrites, and context compression. Shadow admission is bounded by both 16 in-flight tasks and a 64 MiB reservation budget per live AI client, and the upstream call is fire-and-forget: a slow, failed, timed-out, policy-disallowed, or saturated shadow never delays or rejects the primary. Streaming requests are intentionally skipped.
@@ -889,6 +1196,24 @@ it never replaces or delays the primary response.
 
 The shadow body is drained while at most 1 MiB is retained for comparison metadata, which is logged at `target=sbproxy_ai_shadow` (status, latency, prompt/completion tokens, finish reason). Configured usage sinks also receive a separate row with `tag: shadow` and a fresh server-generated request ID ending in `:shadow`. That row estimates shadow cost for comparison, but it never debits the primary budget tracker.
 
+### Two or more targets
+
+```yaml
+shadow:
+  targets:
+    - provider: anthropic
+      model: claude-sonnet-4
+      sample_rate: 0.1
+      timeout_ms: 30000
+      task_timeout_ms: 30000
+    - provider: gemini
+      sample_rate: 0.1
+```
+
+Each target sees the same request and produces its own upstream call, its own usage-ledger row, and its own metric series. Two entries naming the same provider are refused at config load, and so is an empty `targets:` list: the provider name identifies the target everywhere it appears, and an empty list is a block that looks configured and evaluates nothing.
+
+The single-target form is still accepted verbatim and means a one-entry list:
+
 ```yaml
 shadow:
   provider: anthropic
@@ -897,7 +1222,35 @@ shadow:
   task_timeout_ms: 30000
 ```
 
-The shadow provider must appear in `providers`. Set `enabled: false` on a shadow-only provider to exclude it from primary routing; explicit shadow selection still uses it. Credential `allowed_providers` and `blocked_providers` rules apply to it independently; a disallowed shadow is suppressed while the primary continues. The `x-sbproxy-disallow-prompt-training` opt-out also suppresses a shadow provider unless it declares `no_prompt_training: true`. If the hosting process attaches a purpose-scoped egress authorizer to `AiClient`, v1 shadow dispatch fails closed because the shadow transport cannot yet consume authorized DNS pins and redirect checks. `sbproxy_ai_shadow_dropped_total{reason=...}` reports the closed skip/drop reasons `streaming`, `provider_not_found`, `provider_not_allowed`, `prompt_training_disallowed`, `egress_denied`, and `saturated`. Deliberate sample misses are not failures and do not increment that counter.
+**One admission ceiling, shared.** The 16-task and 64 MiB bounds are process-wide limits on how much optional work the gateway carries, so admission runs once per target rather than once per request. Three targets take three slots. A target that cannot get one is dropped as `saturated` and the others still run; the primary is never affected either way.
+
+**One sampling draw, shared.** `sample_rate` still means "one request in ten", but the ten are chosen once per request and every target is compared against that same draw. Target populations therefore nest rather than diverge: everything a `0.1` target saw, a `0.5` target on the same route also saw. That is what makes two targets comparable, on the smaller one's whole population. Independent per-target draws would give disjoint populations, and cost and latency measured on different requests do not compare.
+
+### Reading the comparison
+
+Per target, from the usage ledger:
+
+| Field | Says |
+|---|---|
+| `tag` | `shadow` on every shadow row |
+| `provider` | which target produced this row |
+| `shadow_of` | the primary request this row evaluated, and the join key back to the primary's row |
+| `request_id` | this row's own id, freshly minted per target and ending in `:shadow` |
+| `finish_reason` | the target's terminal finish reason, which is the cheapest disagreement signal: one target on `length` where another said `stop` truncated. Shadow rows only. The primary's finish reasons reach the request span as `gen_ai.response.finish_reasons`, not the ledger row, so a primary-versus-target comparison joins the ledger to the trace |
+| `cost_usd`, `latency_ms`, `prompt_tokens`, `completion_tokens` | the usual per-row figures |
+
+`shadow_of` is carried as data and is never the ledger's dedup key. The correlation-id feature lets a caller choose its own request id through `X-Request-Id`, so a shadow row whose key was derived from the primary's would let one caller suppress another caller's rows on ledger replay.
+
+Per target, from Prometheus:
+
+- `sbproxy_ai_shadow_calls_total{target, status_class, finish_reason}` counts completed calls. `finish_reason` is closed to the OpenAI chat vocabulary plus `none` and `other`, because the raw value comes off a provider response body.
+- `sbproxy_ai_shadow_latency_seconds{target}` uses the same buckets as `sbproxy_ai_request_duration_seconds`, so a target's distribution reads against the primary's without rescaling.
+
+Cost per target is answerable from the ledger rather than from a metric, deliberately: the ledger is non-lossy and the metrics feed is not, and a cost figure that silently drops samples under load is worse than no cost figure.
+
+Comparing the two answers' *text* is not part of this. Shadow response bodies are drained, not retained, so what you can compare today is cost, latency, tokens, and finish reason. Retaining the text (behind the same `capture_content` plus key-policy consent gate the primary content store uses) and scoring agreement between the answers are tracked separately.
+
+Every shadow target must appear in `providers`. Set `enabled: false` on a shadow-only provider to exclude it from primary routing; explicit shadow selection still uses it. Credential `allowed_providers` and `blocked_providers` rules apply to it independently; a disallowed shadow is suppressed while the primary continues. The `x-sbproxy-disallow-prompt-training` opt-out also suppresses a shadow provider unless it declares `no_prompt_training: true`. If the hosting process attaches a purpose-scoped egress authorizer to `AiClient`, v1 shadow dispatch fails closed because the shadow transport cannot yet consume authorized DNS pins and redirect checks. `sbproxy_ai_shadow_dropped_total{reason=...}` reports the closed skip/drop reasons `streaming`, `provider_not_found`, `provider_not_allowed`, `prompt_training_disallowed`, `egress_denied`, and `saturated`. Deliberate sample misses are not failures and do not increment that counter.
 
 See [examples/ai-shadow](../examples/ai-shadow/sb.yml).
 
@@ -959,7 +1312,7 @@ Two gaps are still open and are not surfaced this way, because nothing is droppe
 
 For Gemini, chat completions are rewritten to `generateContent`: roles become Gemini `contents`, system messages become `systemInstruction`, sampling options move under `generationConfig`, and Gemini candidates plus `usageMetadata` are converted back into OpenAI choices and usage. Gemini embeddings translate OpenAI `/v1/embeddings` requests to Gemini embedding calls and normalize the response back to OpenAI embedding objects.
 
-For Bedrock, chat completions are rewritten to the model-agnostic Converse API. System messages become Bedrock `system` entries, user and assistant turns become `messages`, supported sampling and tool fields move into Bedrock's native request shape, and Converse responses are converted back to OpenAI choices and usage. Bedrock and SageMaker SigV4 signing is still operator-provided; SBproxy forwards the signed `Authorization` header rather than minting AWS signatures itself.
+For Bedrock, chat completions are rewritten to the model-agnostic Converse API. System messages become Bedrock `system` entries, user and assistant turns become `messages`, supported sampling and tool fields move into Bedrock's native request shape, and Converse responses are converted back to OpenAI choices and usage. Bedrock and SageMaker requests are signed by SBproxy at the transport boundary, after this translation runs, so the SigV4 payload hash covers the translated Converse body.
 
 For streaming responses, the relay parses native Anthropic, Gemini, and Bedrock frames into the internal hub stream, then re-emits the client-facing format selected by the inbound route. Oracle OCI, Watsonx, SageMaker, and other `Custom` formats are not translated in-tree; send their native body shape or route through a custom/OpenRouter adapter.
 
@@ -1093,7 +1446,7 @@ Input guardrails inspect the parsed prompt ahead of egress ([config](../examples
 
 The built-in pipeline supports ten guardrail types: `pii`, `injection`, `jailbreak`, `toxicity`, `content_safety`, `schema`, `regex`, `context_poisoning`, `agent_alignment`, and `classifier`. Built-in guardrails run on input (before the provider call) or output (after), and they can block, flag, or rewrite content. For HTTP policy services, use [external guardrail adapters](guardrails.md). For CEL-based request gating see the CEL section below, and [configuration.md](configuration.md#guardrails-guardrails) for the per-type field schema.
 
-An external guardrail entry carries two independent settings that are easy to confuse. `mode` picks when the adapter runs and, in the `logging_only` case, says it must never refuse; that is the enforcement axis. `failure_posture` says what happens when the adapter cannot be reached, is too slow, or returns something that is not a verdict; that is the failure axis. They compose: a guardrail can sit in `mode: logging_only` during rollout while already declaring `failure_posture: closed` for the day it starts enforcing. Accepted values are `closed` (refuse, the default), `open` (admit), and `degraded` (admit, and record that the content was never scanned; prefer this over `open`). `observe` is rejected on this axis, because a provider that never answered leaves no verdict to shadow-record; `mode: logging_only` is the observe-shaped setting, on the other axis. The older boolean spelling `fail_open: true|false` still parses and still means `open` and `closed`; setting both to values that disagree is a config-load error naming both keys. Field reference and the per-provider contracts are in [guardrails.md](guardrails.md).
+An external guardrail entry carries two independent settings that are easy to confuse. `mode` picks when the adapter runs and, in the `logging_only` case, says it must never refuse; that is the enforcement axis. `failure_posture` says what happens when the adapter cannot be reached, is too slow, or returns something that is not a verdict; that is the failure axis. They compose: a guardrail can sit in `mode: logging_only` during rollout while already declaring `failure_posture: closed` for the day it starts enforcing. Accepted values are `closed` (refuse, the default), `open` (admit), and `degraded` (admit, and record that the content was never scanned; prefer this over `open`). `observe` is rejected on this axis, because a provider that never answered leaves no verdict to shadow-record; `mode: logging_only` is the observe-shaped setting, on the other axis. The older boolean spelling `fail_open: true|false` still parses and still means `open` and `closed`; setting both to values that disagree is a config-load error naming both keys. Field reference and the per-provider contracts are in [guardrails.md](guardrails.md). A Bedrock provider entry can also carry `bedrock_guardrail`, which asks Bedrock to evaluate the guardrail inside the `Converse` generation instead of as a separate `ApplyGuardrail` call; that control has no failure posture, and the two are compared in [guardrails.md](guardrails.md#bedrock-guardrails-inline-on-the-converse-call).
 
 Input guardrails apply to whichever body field the surface carries user text in:
 
@@ -1941,13 +2294,128 @@ At compile time each `ai_provider` credential is lowered onto the runtime key re
 
 ## Caching
 
-Two caches run on the serving path: the semantic cache and the idempotency middleware, both described below. Cache hit and miss counts land in `sbproxy_ai_cache_results_total`.
+Two caches run on the serving path: the semantic cache and the idempotency middleware, both described below. A third control, prompt-cache affinity, caches nothing itself; it routes a caller back to the provider whose own prompt cache is already warm for them. Cache hit and miss counts land in `sbproxy_ai_cache_results_total`.
 
 ### Exact replay
 
 For byte-identical replay of retried requests, use the idempotency middleware
 below. The gateway does not have a separate exact-prompt-cache configuration
 surface. For near-duplicate prompts, use the semantic cache.
+
+### Prompt-cache affinity
+
+Providers cache prompt prefixes on their own side and bill the cached part at a
+discount. That cache lives on one provider, so a caller who is routed somewhere
+else on their next turn pays full price for a prefix that is already warm
+elsewhere. `cache_affinity` remembers which provider served a caller's cache key
+and prefers that provider next time.
+
+This is not a routing strategy. It layers over the strategy you already
+configured, `round_robin` included, and only moves a live lease holder to the
+front of the order that strategy produced.
+
+Four strategies are the exception, because they own their ordering outright:
+`fallback_chain` sorts by declared priority, `cascade` walks tiers in cost
+order, `cost_quality` splits cheap against frontier per request, and a
+`routing_policy` plan names its providers. Each of those is an order an
+operator wrote down on purpose, so a lease would defeat it rather than compose
+with it. On those origins no lease is read and none is recorded.
+
+```yaml
+origins:
+  - match: { host: ai.internal }
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai-a
+          provider_type: openai
+          api_key: ${OPENAI_API_KEY}
+        - name: openai-b
+          provider_type: openai
+          api_key: ${OPENAI_API_KEY_B}
+      routing:
+        strategy: round_robin
+      cache_affinity:
+        ttl_secs: 300
+        max_keys_per_provider: 1024
+```
+
+`cache_affinity` sits beside `routing:`, not inside it. Written inside, config
+load refuses it and says so.
+
+The call. The caller sends its own key, the same one OpenAI reads to steer a
+request at the machine holding its warm cache:
+
+```bash
+curl https://ai.internal/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"gpt-5","prompt_cache_key":"agent-run-8f21",
+       "messages":[{"role":"system","content":"<12k of instructions>"},
+                   {"role":"user","content":"first question"}]}'
+```
+
+The outcome. Round robin would have sent the second turn to `openai-b`. The
+lease sends it back to `openai-a`, and the second response reports cache-read
+tokens where the first reported none:
+
+| turn | provider | `usage.prompt_tokens_details.cached_tokens` |
+|---|---|---|
+| 1 | `openai-a` | 0 |
+| 2 | `openai-a` | 12,032 |
+
+Those tokens are also counted on
+`sbproxy_ai_tokens_attributed_total{direction="cache_read"}`, and the cache
+writes on `direction="cache_write"`.
+
+```mermaid
+flowchart TD
+    A[request] --> B{prompt_cache_key or user present?}
+    B -- no --> M[strategy's own pick, outcome=missing_signal]
+    B -- yes --> C{live lease for this key?}
+    C -- no --> N[strategy's own pick, outcome=miss]
+    C -- yes --> D{holder still eligible?}
+    D -- "no (ejected, unhealthy, filtered)" --> O[strategy's own pick, outcome=ineligible]
+    D -- yes --> E{resolved model unchanged?}
+    E -- no --> P[lease dropped, outcome=model_changed]
+    E -- yes --> Q[holder moves to the front, outcome=hit]
+```
+
+The key the gateway leases on is `prompt_cache_key`, or `user` when that is
+absent. Nothing on the request path writes either field, so a caller who sends
+neither gets no lease and is routed by the strategy alone, and a caller who
+sends one has it forwarded unchanged.
+
+The lease is scoped, not global. Its identity is a digest over the tenant, the
+credential, the origin, the API surface, and the caller's key, so one tenant
+sending another tenant's key string never inherits their lease. The surface is
+part of that scope because provider prompt caches are per endpoint: the same key
+on `/v1/chat/completions` and on `/v1/responses` names two upstream caches, so
+it names two leases.
+
+It is a preference, never a pin. An unhealthy, breaker-open, ejected, or
+policy-ineligible holder is skipped and the strategy's own pick stands. A lease
+recorded against a different resolved model is dropped rather than followed,
+because the warm prefix on that provider is for a model this request is no
+longer asking for.
+
+State is process-local and bounded, the same as `prefix_affinity`: each replica
+learns its own directory, nothing is looked up across the cluster mesh, and
+nothing survives a restart. Behind a load balancer the hit rate is per gateway
+instance. Defaults are a five-minute TTL and 1,024 leases per provider; set
+`ttl_secs` near the provider's own prompt-cache lifetime, since a lease that
+outlives the upstream cache steers traffic for no benefit.
+
+`sbproxy_ai_cache_affinity_decisions_total{outcome}` carries the five outcomes
+in the diagram, and
+`sbproxy_ai_cache_affinity_evictions_total{reason}` counts removals by `ttl`,
+`capacity`, and `model_changed`. They are deliberately separate from the
+`prefix_affinity` counters: the two tables key on different things, and you need
+to be able to tell which one is working.
+
+`cache_affinity` and `routing.strategy: prefix_affinity` solve neighboring
+problems and compose. Prefix affinity keys on the prompt content, for
+self-hosted replicas reusing a local KV cache. Cache affinity keys on a
+caller-chosen string, for vendor prompt caches you are billed against.
 
 ### Semantic cache
 
@@ -2200,19 +2668,186 @@ Aliases are validated when the config compiles, because every one of these is a 
 
 Marking an alias `deprecated` keeps it serving while making its use visible. Every resolution logs a warning that names the alias, the model it resolved to, and the `replacement` to move to, so you can watch the log go quiet before you delete the entry.
 
+## Model groups
+
+A model group is one public name your callers send as `model`, served by several deployments. Each member names a provider on the same action, the upstream model id that provider serves, and its share of traffic. Members may serve **different** model ids, which is the point: one name can front an OpenAI model and an Azure deployment at once.
+
+Groups live on the `ai_proxy` action, beside the providers their members name:
+
+```yaml
+action:
+  type: ai_proxy
+  routing: round_robin          # the action's own strategy, unchanged
+  providers:
+    - name: openai-primary
+      api_key: ${OPENAI_API_KEY}
+      models: [gpt-4o-mini]
+    - name: azure-secondary
+      api_key: ${AZURE_API_KEY}
+      base_url: https://contoso.openai.azure.com/openai/deployments/mini
+      models: [mini-prod-2]
+    - name: openai-overflow
+      api_key: ${OPENAI_OVERFLOW_KEY}
+      models: [gpt-4o-mini]
+  model_groups:
+    # A 90/10 split across two vendors serving different model ids.
+    - name: chat
+      routing: weighted
+      members:
+        - provider: openai-primary
+          model: gpt-4o-mini
+          weight: 9
+        - provider: azure-secondary
+          model: mini-prod-2
+          weight: 1
+    # A second group over overlapping providers, with its own strategy
+    # and its own rotation cursor. The two never interleave.
+    - name: chat-spillover
+      routing: least_connections
+      members:
+        - provider: openai-primary
+          model: gpt-4o-mini
+        - provider: openai-overflow
+          model: gpt-4o-mini
+```
+
+Callers address the group and never learn which member answered:
+
+```bash
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Host: ai.example.com' \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "chat", "messages": [{"role": "user", "content": "hello"}]}' \
+  | jq -r .model
+```
+
+Nine of every ten of those requests reach OpenAI carrying `"model": "gpt-4o-mini"`; the tenth reaches Azure carrying `"model": "mini-prod-2"`. The name `chat` never reaches a provider. The tenth request's admin row reads `model_group: chat -> azure-secondary/mini-prod-2`, and `sbproxy_ai_model_group_selections_total{group="chat", provider="azure-secondary"}` counts it.
+
+### Where a group resolves
+
+A group resolves at the same point in the request as a [model alias](#model-aliases): before every model gate and before provider selection. That is what makes members with different model ids safe. Each gate below the pick judges the member's real model id, so a group can never be a way around a block list, a per-key allowlist, a per-model rate limit, or a budget scope.
+
+```mermaid
+flowchart TD
+    A["request model: chat"] --> B{"a model_groups: name?"}
+    B -- no --> C{"a model_aliases: name?"}
+    C -- no --> D["literal model id"]
+    C -- yes --> E["alias target + optional provider pin"]
+    B -- yes --> F["member set: this group's members"]
+    F --> G["drop disabled providers<br/>and any the credential forbids"]
+    G -- credential forbids all --> H1["403: no permitted member"]
+    G -- all providers disabled --> H2["503: no eligible member"]
+    G --> I["narrow by breaker, outlier, health"]
+    I --> J["pick with the group's strategy<br/>and the member's weight"]
+    J --> K["rewrite model to the member's id<br/>pin the member's provider"]
+    K --> L
+    E --> L
+    D --> L["blocked_models, credential allowlist,<br/>per-model rate limit, budget scope,<br/>price ceiling, guardrails"]
+    L --> M["provider order, narrowed to the pin"]
+    M --> N["dispatch"]
+```
+
+Three consequences worth stating outright.
+
+A pick is **resilience-aware but not fail-closed**. An open circuit breaker, an outlier ejection, or a failed health probe moves the group's traffic to a sibling member rather than refusing, which is what those three axes promise everywhere else in this gateway. A group whose members are *all* ejected still routes, because three advisory signals must not combine into an outage none of them can cause alone.
+
+A pick **does** fail closed on policy, rather than falling through to some other provider: falling through would dispatch a model id nobody declared for that vendor. The two ways that happens answer differently, because one is retryable and the other is not. When the calling credential's provider policy forbids every member, the request answers `403`, the same status every other credential refusal on this path uses. When every member's provider is switched off, it answers `503`. Either way the refusal is logged with the group name and published as an `ai.admission` decision record carrying `model_group_forbidden` or `model_group_no_member`, so a group that has quietly stopped serving is visible in the SIEM feed and not only in a client's error rate. See [events.md](events.md#decision-audit-the-other-nineteen).
+
+A pick is made **once per request**. The chosen member's provider becomes the request's routing pin, the same pin a `model_aliases` entry sets, so a transport failure or a retryable 5xx from that member does not move the request to a sibling member; whatever retry policy the action configures applies to that one member. Handing the request to a sibling would dispatch the first member's model id to a vendor that does not serve it. Health signals move the *next* request instead: the failure trips the breaker or the outlier ejector, and the pick that follows skips that member. Configure `resilience:` on the action if you want that to happen quickly.
+
+### Groups, aliases, and same-name pools
+
+Three mechanisms front one name over several upstreams. They are not interchangeable.
+
+| | What it fronts | Strategy | Weights |
+|---|---|---|---|
+| Same-name pool (several providers declaring one model in `models:`) | one model id | the action's `routing:` | the providers' `weight:` |
+| `model_aliases` entry | one model id, optionally pinned to one provider | the action's `routing:` | the providers' `weight:` |
+| `model_groups` entry | a mix of model ids | the group's own `routing:` | the members' `weight:` |
+
+The same-name pool still works and is still the right answer when every deployment serves the same model id and the action's strategy is the one you want. Reach for a group when the deployments' model ids differ, or when one public name needs a balancing policy of its own.
+
+One name cannot be two of these at once. A group that shadows a served model, a `model_map` key, a `default_model`, or an alias is refused at config load, and so is an alias whose `model_id` names a group: aliases resolve in one pass, so the group would never be looked up.
+
+### Which strategies a group may name
+
+A group accepts the thirteen selection strategies: `round_robin`, `weighted`, `fallback_chain`, `random`, `lowest_latency`, `peak_ewma`, `least_connections`, `cost_optimized`, `least_token_usage`, `sticky`, `outcome_aware`, `headroom`, and `reset_aware`. Omitting `routing:` gives `round_robin`.
+
+Six are refused at config load: `cascade`, `cost_quality`, `race`, `semantic_route`, `prefix_affinity`, and `token_rate`. Each of the first five runs a second dispatch pass at the action level (a tier walk, a prompt score, a fan-out, an embedding match, a prefix digest) that a per-group pick never reaches, so a group naming one would quietly get a plain rotation instead of the strategy you wrote. `token_rate` is refused origin-wide already. Set any of them on the action.
+
+Each group gets its own rotation cursor, so two `round_robin` groups over the same providers rotate independently, and neither is advanced by the action's own selections.
+
+### `model_groups` fields
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `name` | string | required | The public name callers send as `model`. |
+| `routing` | string | `round_robin` | This group's selection strategy, independent of the action's. |
+| `members` | list | required | At least one. No two may name the same provider. |
+
+### `model_groups[].members` fields
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `provider` | string | required | A provider configured on this action. |
+| `model` | string | required | The upstream model id this member serves, sent verbatim in place of the group name. |
+| `weight` | integer | `1` | Share of traffic under `routing: weighted`, relative to the other members. Ignored by every other strategy. |
+
+### What is refused at config load
+
+Every one of these is a misrouting that goes invisible once traffic is flowing:
+
+- A group whose **name shadows a real name**: a model a provider declares in `models:`, a `model_map` key, a `default_model`, or a `model_aliases` entry.
+- An **alias that resolves to a group name**. Aliases resolve in one pass, so the group would never be looked up and the group name would go upstream as a literal model id.
+- A **duplicate group name**, a name with leading or trailing whitespace, or an empty `members` list.
+- A member naming a **provider that is not configured** on the origin, or one whose declared `models:` list does not include the member's model.
+- **Two members on one provider.** A member is addressed by the provider that serves it, so a second member on the same provider could never be selected. Declare a second provider entry for the second deployment.
+- An **all-zero weighted split**. A zero total sends everything to the first member without saying so.
+- One of the **six refused strategies** above.
+
+`model_groups:` is an AI-gateway key and belongs to the action. Setting it at the top level of the config is refused with a pointer at the action path, rather than parsed and ignored.
+
+### Reading a group back
+
+A group is a name callers may send, so it appears in both model listings.
+
+```bash
+# The OpenAI-shaped listing carries the group alongside the model ids.
+curl -s -H 'Host: ai.example.com' http://127.0.0.1:8080/v1/models | jq '.data[] | select(.id == "chat")'
+# => {"id":"chat","object":"model","created":0,"owned_by":"sbproxy",
+#     "availability":{"state":"ready","ready_replicas":2,"desired_replicas":2},
+#     "capabilities":["chat_completions","messages","responses","streaming", ...],
+#     "context_window":128000}
+
+# The LiteLLM-parity endpoint carries the members.
+curl -s -H 'Host: ai.example.com' http://127.0.0.1:8080/model_group/info | jq '.data[] | select(.model_group == "chat")'
+# => {"model_group":"chat","num_deployments":2,
+#     "providers":["openai-primary","azure-secondary"],
+#     "capabilities":[...],
+#     "members":[{"provider":"openai-primary","model":"gpt-4o-mini","weight":9},
+#                {"provider":"azure-secondary","model":"mini-prod-2","weight":1}],
+#     "routing":"weighted"}
+```
+
+A group's `capabilities` array is the union across its members, matching the surface gate, which admits a request when any eligible provider handles it. Its `context_window` is the **floor** across the members whose window is known, because a prompt has to fit whichever member serves the request; publishing the largest would let a caller build a prompt the smaller member rejects. A group whose every member the calling credential's model or provider policy refuses is left off both listings, rather than advertised as a name that answers 503.
+
 ## Supported endpoints
 
 Every inbound request to an `action: ai_proxy` origin is classified into an `AiSurface` by `classify_surface(method, path)` in `crates/sbproxy-ai/src/handler.rs`. The classifier accepts canonical OpenAI paths with optional `/v1` or `/api/v1` prefix and any trailing slash. The surface label appears on the per-surface metrics, on the request tracing span, and on every per-surface decision (rate limit, guardrail extractor, 501 gate).
 
 Provider capability is the source of truth for which surfaces a configured provider can serve. The matrix lives in `crates/sbproxy-ai/src/api_routes.rs::provider_supports_surface` and keys on the provider type: the entry's `provider_type`, falling back to `name` when no type is set. A custom-named entry such as `name: team-openai` with `provider_type: openai` therefore keeps the full OpenAI surface set; the display name never narrows or widens capability. When no configured provider supports the requested surface, the proxy returns **501 Not Implemented** before any upstream call. The universal surfaces are chat completions, Anthropic Messages, OpenAI Responses, and models. Unknown surfaces fall through to the existing dispatch and 404 at the upstream.
 
+This matrix is a permission, not an advertisement. It answers on the wire format, so every entry with `format: openai` is forwarded the whole OpenAI path set; narrowing that would 501 an aggregator that does serve the surface. The model listings (`GET /v1/models`, `GET /model/info`, `GET /model_group/info`) publish the intersection of this matrix with the provider catalog's `supports_streaming`, `supports_embeddings`, and `supports_chat` keys in `crates/sbproxy-ai/data/ai_providers.yml`. A published `capabilities` array can therefore never name a surface this gate refuses, and can be narrower than the gate in two ways: the catalog may carry no per-vendor claim for the surface, and the array is a union across the providers serving that one model while the gate scans every allowed provider on the origin.
+
+The `Providers (today)` column below is the advertised set: which entries name each surface in a model listing, and what a reader should expect to see. The gate is wider than this column, in the safe direction.
+
 | Surface label | Method(s) | Path(s) | Providers (today) |
 |---|---|---|---|
-| `chat_completions` | POST | `/v1/chat/completions` | All |
-| `messages` | POST | `/v1/messages` | All |
-| `responses` | POST | `/v1/responses` | All, with stateless boundaries (see "Responses API boundaries" below) |
-| `models` | GET | `/v1/models`, `/v1/models/{id}` | All |
-| `embeddings` | POST | `/v1/embeddings` | OpenAI, Gemini, Cohere |
+| `chat_completions` | POST | `/v1/chat/completions` | All, except the `supports_chat: false` entries (Voyage, Jina, Mixedbread) |
+| `messages` | POST | `/v1/messages` | Same as `chat_completions`; the gateway translates down to it |
+| `responses` | POST | `/v1/responses` | Same as `chat_completions`, with stateless boundaries (see "Responses API boundaries" below) |
+| `models` | GET | `/v1/models`, `/v1/models/{id}` | All (account-scoped, so never in a model's `capabilities`) |
+| `embeddings` | POST | `/v1/embeddings` | The 32 entries with `supports_embeddings: true` on the `openai` or `google` formats (OpenAI, Gemini, Vertex, Cohere, Azure, Mistral, and 26 more). Bedrock and the `Custom` formats carry the flag but are not forwarded |
 | `assistants` | POST, GET, DELETE | `/v1/assistants[/{id}[/files[/{file_id}]]]` | OpenAI |
 | `threads` | POST, GET, DELETE | `/v1/threads[/{id}[/messages[/{id}] \| /runs[/{id}[/cancel]]]]`, `/v1/threads/runs` | OpenAI |
 | `batches` | POST, GET | `/v1/batches[/{id}[/cancel]]` | OpenAI |
@@ -2229,14 +2864,14 @@ Provider capability is the source of truth for which surfaces a configured provi
 
 ### Response shape contract
 
-"Supported" in the table above means the gateway accepts the surface and routes it. It does NOT mean the gateway normalizes the response. Per-surface translation behavior:
+Being named in the table above means the gateway accepts the surface, routes it, and advertises it on a model listing. It does NOT mean the gateway normalizes the response, and it is not the full set of what gets forwarded: the wire-format matrix admits more (see above). Per-surface translation behavior:
 
 | Surface | Response shape |
 |---|---|
 | `chat_completions` | normalized to / from the OpenAI shape on Anthropic and Google (gemini) formats; passthrough on OpenAI-compatible upstreams |
 | `messages`, `responses` | accepted in their native client shapes and governed through the chat hub. Successful generations return in the shape the client used. Provider error envelopes keep the provider's status and body. A safe Anthropic-to-Anthropic request can use the native bypass described below. |
 | `models` | `GET /v1/models` and `GET /models` are served locally for every AI origin as an OpenAI `{"object": "list", "data": [...]}` logical listing. Other model endpoints use the ordinary GET dispatch path and have no unified response shape. |
-| everything else | passthrough on the providers listed in the table; clients see the upstream's native response shape |
+| everything else | passthrough wherever the wire-format matrix forwards it; clients see the upstream's native response shape |
 
 The local list contract is deliberate: it gives clients one topology-free
 discovery shape across ordinary and managed providers without pretending to
@@ -2261,7 +2896,7 @@ What the gateway does not do is hold server-side response state, and it refuses 
 - `store: true` is refused with a 400, because the response id would never be retrievable from the gateway. `store: false`, or omitting the field, works: the stateless translation persists nothing, which is exactly what it asks for.
 - An `mcp` tool block is refused with a 400. It asks the model provider to contact an MCP server directly, bypassing the gateway's MCP governance (RBAC, sessions, audit, egress inventory). Front the server with a `type: mcp` action and point the client at that origin instead.
 - Every other non-`function` tool block (`file_search`, `web_search_preview`, `code_interpreter`, `image_generation`, and any unrecognized type) is dropped, never forwarded upstream, counted on `sbproxy_ai_translation_dropped_total`, and named in the request's one aggregated `AI proxy: request fields dropped in translation` warn. That warn lists at most eight distinct field labels; past eight, a drop is still counted but no longer named, so the log line cannot grow with the request body.
-- A `prompt` object (`{"id": ..., "version": ..., "variables": ...}`) is served from the gateway's own prompt store: `id` names a stored prompt on the origin, `version` picks a stored version label, and omitting `version` resolves the pinned default. The rendered template is prepended to `instructions` before translation, so it reaches every configured provider, not only OpenAI. An `id` or `version` the store does not hold is a 404 with one generic unknown-reference message, so a caller probing versions cannot tell a missing version from a missing prompt; the precise miss is logged server-side at debug level. A malformed object is a 400, and neither falls through to the raw input. A string-valued `prompt` is not the object form; it is dropped and logged with a warning, unchanged. See "Stored prompts and offline optimization" below.
+- A `prompt` object (`{"id": ..., "version": ..., "variables": ...}`) is served from the gateway's own prompt store: `id` names a stored prompt on the origin, `version` picks a stored version label, and omitting `version` resolves the pinned default. The rendered template is prepended to `instructions` before translation, so it reaches every configured provider, not only OpenAI. An `id` or `version` the store does not hold is a 404 with one generic unknown-reference message, so a caller probing versions cannot tell a missing version from a missing prompt; the precise miss is logged server-side at debug level. A malformed object is a 400, and neither falls through to the raw input. A string-valued `prompt` is the `name@version` reference form and resolves against the same store, with no caller variables. See "Stored prompts and offline optimization" below.
 
 The refusals are deliberate. A request that references state the gateway does not hold would otherwise succeed while quietly missing context, and that failure is harder to notice than a 400 that names the field and the fix.
 
@@ -2542,6 +3177,79 @@ run metadata. Runtime versions are added, replaced, and pinned through the
 authenticated Admin API. Use a new version label when you need immutable
 history.
 
+### Which surfaces resolve a reference
+
+`prompt` is a gateway field, not a field of any provider's wire format, so what
+happens to it depends on which inbound surface the request arrived on:
+
+| Inbound surface | `"prompt": "name@version"` (string) | `"prompt": {"id": ...}` (object) |
+|---|---|---|
+| `POST /v1/chat/completions` | Resolved, prepended as a system turn, key stripped. A name a configured store does not hold is a 400. On an origin with no prompt store at all the key passes through untouched, because `prompt` is also a legacy completions field a provider may accept. | Not the reference form. Passed through as-is. |
+| `POST /v1/messages` | Resolved, prepended as a system turn, key stripped before translation. A name a configured store does not hold is a 400; an origin with no prompt store at all answers 404 rather than forwarding the key. | Not the reference form. Dropped in translation and counted on `sbproxy_ai_translation_dropped_total`. |
+| `POST /v1/responses` | As `/v1/messages`. | Resolved against the same store and prepended to `instructions`. An unknown reference is a 404, a malformed object a 400. |
+
+The last column of the middle row is the difference worth knowing. On the two
+native surfaces `prompt` cannot be anything but a gateway reference, so a
+request naming one an origin cannot resolve is a caller error rather than a
+field the provider might want; forwarding it would ship a gateway-only key
+upstream while running the request without the template it named. On the
+canonical chat path the same case stays a pass-through, so an origin with no
+`prompts:` block behaves exactly as it did before the store existed.
+
+A refusal on either native surface publishes an `ai.admission` decision record
+when `observability.log.decision_audit.events.ai.admission` is on, carrying
+`surface` and a `verdict` of `prompt_reference_not_found` or
+`prompt_render_failed`. See [events.md](events.md).
+
+```yaml
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          provider_type: openai
+          api_key: "${OPENAI_API_KEY}"
+          models: [gpt-4o]
+      prompts:
+        templates:
+          greeting:
+            default_version: "1"
+            versions:
+              "1":
+                template: "You are a bot for {{ variables.product }}."
+                variables:
+                  product: "Acme"
+```
+
+```bash
+curl -s http://127.0.0.1:8080/v1/messages \
+  -H 'Host: ai.example.com' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4o","max_tokens":64,
+       "prompt":"greeting@1",
+       "messages":[{"role":"user","content":"hi"}]}'
+```
+
+The upstream receives the rendered template as the leading system turn, and no
+`prompt` key:
+
+```json
+{
+  "model": "gpt-4o",
+  "max_tokens": 64,
+  "messages": [
+    {"role": "system", "content": "You are a bot for Acme."},
+    {"role": "user", "content": "hi"}
+  ]
+}
+```
+
+Before this, the same request reached the provider with no system turn at all:
+the Anthropic translator has no representation for `prompt`, so it noted the
+drop on `sbproxy_ai_translation_dropped_total{surface="messages",field="anthropic.prompt"}`
+and carried on without the template.
+
 On `/v1/responses` the same store serves the OpenAI Responses `prompt`
 object. `id` maps onto the stored prompt name, `version` onto a stored
 version label, and omitting `version` resolves the pinned default:
@@ -2651,8 +3359,9 @@ touch. A version pinning `variables: {role: "customer"}` whose template says
 `variables.role` says. Put a constraint that has to hold regardless of the
 caller in the template text, not in `variables:`. The `"prompt": "name@version"`
 string form carries no variables at all, so the same stored version is
-caller-writable on `/v1/responses` and operator-only on
-`/v1/chat/completions`; there is no per-version variable lock today.
+caller-writable through the object form on `/v1/responses` and operator-only
+everywhere the string form is used, including `/v1/chat/completions` and
+`/v1/messages`; there is no per-version variable lock today.
 
 A malformed prompt object (a non-string `id`, an unknown key, a typed
 content-part variable) is a 400. The string form above is unchanged.
@@ -3277,9 +3986,9 @@ To help you get started with the AI gateway, we provide several runnable example
 
 | Example | What it is | How to use it | Outcome |
 |---------|------------|---------------|---------|
-| [`ai-bedrock-direct`](../examples/ai-bedrock-direct/) | Direct integration with AWS Bedrock. | Add a provider named `bedrock` (or set `provider_type: bedrock` on any name); SigV4 signing is operator-provided, and the gateway forwards the signed `Authorization` header verbatim. | Exposes Bedrock via the standard OpenAI-compatible API. |
+| [`ai-bedrock-direct`](../examples/ai-bedrock-direct/) | Direct integration with AWS Bedrock. | Add a provider named `bedrock` (or set `provider_type: bedrock` on any name) with an `aws_sigv4:` block naming the region; the gateway signs each request itself and needs no `api_key`. | Exposes Bedrock via the standard OpenAI-compatible API. |
 | [`ai-gemini-direct`](../examples/ai-gemini-direct/) | Direct integration with Google Gemini. | Add a provider named `gemini` (or set `provider_type: gemini`) with a Gemini API key. | Seamless integration with Gemini models without client SDK changes. |
-| [`ai-model-group`](../examples/ai-model-group/) | Model pooling. | List multiple providers that declare the same model name in `models`; there is no separate `model_group` key. | The routing strategy load-balances requests for that model name across every declaring provider. |
+| [`ai-model-group`](../examples/ai-model-group/) | Model pooling. | A `model_groups:` entry binds one public name to several members, each with its own provider, upstream model id, and weight; a same-model-name pool across providers' `models:` lists still works for the simpler case. | The group's own strategy load-balances across its members, and the member's model id is what reaches the wire. |
 | [`ai-streaming`](../examples/ai-streaming/) | Streaming LLM completions. | Send requests with `stream: true`. | SBproxy streams Server-Sent Events (SSE) securely back to the client. |
 | [`ai-routing-fallback`](../examples/ai-routing-fallback/) | High-availability failover. | Set `routing.strategy: fallback_chain` and give each provider a `priority`; there is no separate generic `fallbacks:` key. | Transport failures and retryable 5xx responses from the primary provider fail over to the next provider in priority order. |
 | [`typed-fallbacks`](../examples/typed-fallbacks/) | Typed fallback triggers. | Set `context_window_fallbacks:` and/or `content_policy_fallbacks:` as siblings of `routing:`, each naming providers. | An oversized prompt reroutes to a larger-window model before dispatch; a content-policy refusal reroutes to a more permissive provider; the admin request log names the trigger that fired. |

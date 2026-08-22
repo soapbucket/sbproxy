@@ -26,7 +26,7 @@ use kube::runtime::Controller;
 use kube::{Client, CustomResourceExt};
 use sbproxy_k8s_operator::crd::{AdminAuthSecretRef, SBProxy, SBProxyConfig};
 use sbproxy_k8s_operator::leader::{
-    acquire_lease, build_identity, discover_namespace_default, renew_loop, LeaderConfig,
+    acquire_lease, build_identity, discover_namespace_default, renew_loop, LeaderConfig, WriteGate,
 };
 use sbproxy_k8s_operator::reconcile;
 
@@ -83,6 +83,14 @@ enum Command {
 /// Per-controller context. Cloned into each reconcile invocation by kube-runtime.
 struct Ctx {
     client: Client,
+
+    /// Closed the moment this replica stops being able to prove it holds the
+    /// leader Lease. Every reconcile checks it before its first write, so a
+    /// deposed leader stops applying rather than relying on its controller
+    /// task being aborted (a task is only cancelled at its next await point,
+    /// and a request already dispatched to the apiserver still lands).
+    /// [`WriteGate::always`] under `--no-leader-election`.
+    write_gate: WriteGate,
 }
 
 #[tokio::main]
@@ -267,12 +275,18 @@ fn print_crds() -> Result<()> {
 /// Leader election. When `--no-leader-election` is unset (the default) the
 /// operator first acquires a `coordination.k8s.io/v1.Lease` named
 /// [`LEADER_LEASE_NAME`] in the namespace returned by
-/// [`leader::discover_namespace_default`]. While the lease is held the
-/// controller runs; if the lease is lost (network partition, theft, API
-/// timeout) the controller is cancelled and the function returns `Ok(())`
-/// so the binary exits with code 0. The pod is then restarted by the
+/// `leader::discover_namespace_default`. While the lease is held the
+/// controller runs; if the lease is lost (network partition, theft, an
+/// apiserver that stops answering) the `WriteGate` shared with the renew
+/// loop closes, the controller is cancelled, and the function returns
+/// `Ok(())` so the binary exits with code 0. The pod is then restarted by the
 /// Deployment and re-races for the lock. This matches the client-go pattern
 /// used by kube-controller-manager / kubelet.
+///
+/// The gate, not the cancellation, is the fence. Aborting a task only takes
+/// effect at its next await point, and an apply already dispatched to the
+/// apiserver lands regardless, so a deposed leader that relied on the abort
+/// alone kept writing for as long as its in-flight work took.
 async fn run(cli: Cli) -> Result<()> {
     let client = Client::try_default().await.context(
         "failed to construct Kubernetes client; is KUBECONFIG / in-cluster auth wired up?",
@@ -280,7 +294,9 @@ async fn run(cli: Cli) -> Result<()> {
 
     if cli.no_leader_election {
         tracing::info!("leader election disabled (--no-leader-election)");
-        return run_controller(client, &cli).await;
+        // No election means no fence to enforce: a single replica is always
+        // allowed to write.
+        return run_controller(client, &cli, WriteGate::always()).await;
     }
 
     let lease_namespace = discover_namespace_default().await;
@@ -301,17 +317,20 @@ async fn run(cli: Cli) -> Result<()> {
         identity = %leader_cfg.identity,
         "racing for leader lease"
     );
-    acquire_lease(&client, &leader_cfg)
-        .await
-        .context("failed to acquire leader lease")?;
+    // Starts closed and is opened by the acquire below, so a reconcile can
+    // never observe a leader that has not yet won the Lease.
+    let write_gate = WriteGate::for_election();
+    acquire_lease(&client, &leader_cfg, &write_gate).await;
 
     // Run the controller and the renew loop concurrently. The first task to
     // exit wins; we cancel the other and surface a step-down log.
     let controller_client = client.clone();
     let cli_clone = cli.clone();
-    let mut controller_handle =
-        tokio::spawn(async move { run_controller(controller_client, &cli_clone).await });
-    let mut renew_handle = tokio::spawn(renew_loop(client, leader_cfg));
+    let controller_gate = write_gate.clone();
+    let mut controller_handle = tokio::spawn(async move {
+        run_controller(controller_client, &cli_clone, controller_gate).await
+    });
+    let mut renew_handle = tokio::spawn(renew_loop(client, leader_cfg, write_gate));
 
     tokio::select! {
         res = &mut controller_handle => {
@@ -322,24 +341,16 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         res = &mut renew_handle => {
-            // Lock lost. Cancel the controller and exit 0 so the pod restarts.
+            // Leadership ended. The renew loop already closed the write gate
+            // before returning, so the controller is refusing applies by the
+            // time we get here; the abort below only stops it re-queueing.
+            // Exit 0 so the Deployment restarts the pod as a standby.
             controller_handle.abort();
-            match res {
-                Ok(Ok(())) => {
-                    // Renew loop returned Ok (only on shutdown signal in the
-                    // future); treat as a clean step-down.
-                    tracing::info!("renew loop exited cleanly; stepping down");
-                    Ok(())
-                }
-                Ok(Err(e)) => {
-                    tracing::info!(error = %e, "lost leader lease; stepping down");
-                    Ok(())
-                }
-                Err(join_err) => {
-                    tracing::warn!(error = %join_err, "renew task join error");
-                    Ok(())
-                }
+            if let Err(join_err) = res {
+                tracing::warn!(error = %join_err, "renew task join error");
             }
+            tracing::info!("lost leader lease; stepping down");
+            Ok(())
         }
     }
 }
@@ -347,7 +358,7 @@ async fn run(cli: Cli) -> Result<()> {
 /// Run the kube-runtime `Controller` until it exits (which only happens when
 /// the watcher's stream is dropped, e.g. via `controller_handle.abort()` from
 /// the leader-election step-down path).
-async fn run_controller(client: Client, cli: &Cli) -> Result<()> {
+async fn run_controller(client: Client, cli: &Cli, write_gate: WriteGate) -> Result<()> {
     let sbproxy_api: Api<SBProxy> = match &cli.namespace {
         Some(ns) => Api::namespaced(client.clone(), ns),
         None => Api::all(client.clone()),
@@ -388,7 +399,11 @@ async fn run_controller(client: Client, cli: &Cli) -> Result<()> {
         .watches(sbproxyconfig_api, WatcherConfig::default(), |_cfg| {
             std::iter::empty::<kube::runtime::reflector::ObjectRef<SBProxy>>()
         })
-        .run(reconcile_one, error_policy, Arc::new(Ctx { client }))
+        .run(
+            reconcile_one,
+            error_policy,
+            Arc::new(Ctx { client, write_gate }),
+        )
         .for_each(|res| async move {
             match res {
                 Ok((obj_ref, _)) => {
@@ -432,6 +447,7 @@ async fn reconcile_one(sbproxy: Arc<SBProxy>, ctx: Arc<Ctx>) -> Result<Action, R
     let elapsed = start.elapsed().as_secs_f64();
     let result_label = match &outcome {
         Ok(_) => "ok",
+        Err(ReconcileError::Fenced) => "fenced",
         Err(ReconcileError::MissingNamespace) | Err(ReconcileError::MissingName) => "crd_invalid",
         Err(ReconcileError::ConfigFetch { source, .. }) => match source {
             kube::Error::Api(e) if e.code == 409 => "conflict",
@@ -483,7 +499,7 @@ async fn reconcile_one_inner(
             "referenced SBProxyConfig failed validation; not rolling out"
         );
         patch_status(
-            &ctx.client,
+            &ctx,
             &ns,
             &name,
             serde_json::json!({ "status": { "lastError": msg } }),
@@ -507,7 +523,7 @@ async fn reconcile_one_inner(
             "multi-replica SBProxy drives ACME from a pod-local cert store; not rolling out"
         );
         patch_status(
-            &ctx.client,
+            &ctx,
             &ns,
             &name,
             serde_json::json!({ "status": { "lastError": msg } }),
@@ -534,7 +550,7 @@ async fn reconcile_one_inner(
                     "failed to render clustered config; not rolling out"
                 );
                 patch_status(
-                    &ctx.client,
+                    &ctx,
                     &ns,
                     &name,
                     serde_json::json!({ "status": { "lastError": msg } }),
@@ -548,17 +564,16 @@ async fn reconcile_one_inner(
     };
     let hash = reconcile::config_hash(&body);
 
-    // Config is valid: record the hash being rolled out and clear any prior
-    // error so a fixed config no longer shows the stale failure.
-    patch_status(
-        &ctx.client,
-        &ns,
-        &name,
-        serde_json::json!({ "status": { "configHash": hash, "lastError": "" } }),
-    )
-    .await;
+    // The config parsed and passed the guards, which is all this says. It
+    // deliberately does not touch `configHash` or clear `lastError`: both of
+    // those are documented as end-of-rollout signals, and nothing has been
+    // applied yet. Stamping them here made a 403 on the ConfigMap patch read
+    // as a completed rollout on the CR while every pod kept running the old
+    // config.
+    patch_status(&ctx, &ns, &name, reconcile::observed_status_patch(&hash)).await;
 
     // --- Apply ConfigMap + Service unconditionally ---
+    require_write_gate(&ctx, &ns, &name)?;
     let pp = PatchParams::apply(FIELD_MANAGER).force();
     let desired_cm = reconcile::desired_configmap_with_body(&sbproxy, &body);
     let desired_svc = reconcile::desired_service(&sbproxy);
@@ -591,11 +606,20 @@ async fn reconcile_one_inner(
         .await
         .map_err(ReconcileError::Apply)?;
 
-    if clustered {
-        reconcile_clustered_workload(&ctx, &sbproxy, &ns, &name, &hash, &pp).await
+    let action = if clustered {
+        reconcile_clustered_workload(&ctx, &sbproxy, &ns, &name, &hash, &pp).await?
     } else {
-        reconcile_deployment_workload(&ctx, &sbproxy, &ns, &name, &hash, &pp).await
-    }
+        reconcile_deployment_workload(&ctx, &sbproxy, &ns, &name, &hash, &pp).await?
+    };
+
+    // Everything landed. Only now is `configHash` the hash the pods are
+    // actually running, which is what the CRD documents it as, and only now
+    // is clearing `lastError` a true statement. Both writes are after the
+    // `?`s above, so any failed apply leaves the previous values in place and
+    // `observedConfigHash` ahead of `configHash` shows the rollout is stuck.
+    patch_status(&ctx, &ns, &name, reconcile::rolled_out_status_patch(&hash)).await;
+
+    Ok(action)
 }
 
 /// Non-clustered workload path: the original Deployment flow, plus
@@ -611,6 +635,10 @@ async fn reconcile_deployment_workload(
     hash: &str,
     pp: &PatchParams,
 ) -> Result<Action, ReconcileError> {
+    // The deletes below are the most destructive writes in the operator, so
+    // the fence is re-checked here rather than trusted from the caller.
+    require_write_gate(ctx, ns, name)?;
+
     // --- GC clustered children on the clustering-off transition ---
     let sts_api: Api<StatefulSet> = Api::namespaced(ctx.client.clone(), ns);
     let sts_name = reconcile::statefulset_name(sbproxy);
@@ -641,27 +669,44 @@ async fn reconcile_deployment_workload(
     // clustering later reuses the same key, and the owner reference
     // still cascades it on SBProxy deletion.
 
-    let desired_deploy = reconcile::desired_deployment(sbproxy, hash);
-
     // --- Decide hot-reload vs rollout-restart ---
     let deploy_api: Api<Deployment> = Api::namespaced(ctx.client.clone(), ns);
+    let existing_deploy = deploy_api
+        .get_opt(&reconcile::deployment_name(sbproxy))
+        .await
+        .unwrap_or(None);
+    let template_hash = existing_deploy
+        .as_ref()
+        .and_then(reconcile::previous_config_hash);
+    // What the pods are serving, which after a hot reload is ahead of what
+    // their template says they were started with.
+    let running_hash = reconcile::running_config_hash(sbproxy);
+
+    // The pod template only moves when the pods have to. Building the
+    // desired Deployment around that hash rather than around `hash` is what
+    // keeps the pass after a hot reload from rolling the fleet for a config
+    // it is already running.
+    let desired_deploy = reconcile::desired_deployment(
+        sbproxy,
+        reconcile::rollout_config_hash(template_hash.as_deref(), running_hash, hash),
+    );
     let deploy_name = desired_deploy
         .metadata
         .name
         .as_deref()
         .ok_or(ReconcileError::MissingName)?;
-    let existing_deploy = deploy_api.get_opt(deploy_name).await.unwrap_or(None);
-    let prev_hash = existing_deploy
-        .as_ref()
-        .and_then(reconcile::previous_config_hash);
 
     let hot_reload_eligible = reconcile::should_hot_reload(
         sbproxy,
         existing_deploy.as_ref(),
         &desired_deploy,
-        prev_hash.as_deref(),
+        running_hash,
         hash,
     );
+
+    // Re-checked after the reads above: a hot reload fans an authenticated
+    // POST out to every proxy pod, and the apply below rolls them.
+    require_write_gate(ctx, ns, name)?;
 
     if hot_reload_eligible {
         // Best-effort hot-reload across every running proxy pod.
@@ -676,11 +721,14 @@ async fn reconcile_deployment_workload(
                     config_revision = %hash,
                     "hot-reloaded all proxy pods via /admin/reload"
                 );
-                // Skip the Deployment patch entirely so the pod
-                // template's config-hash annotation stays stale
-                // until the next "real" Deployment edit. The
-                // ConfigMap is already up to date for any pod that
-                // restarts for unrelated reasons.
+                // Skip the Deployment patch entirely: the pod template's
+                // config-hash annotation is the rolling-restart trigger, so
+                // advancing it here would restart the pods a reload just
+                // spared. `status.configHash`, stamped by the caller once
+                // this returns Ok, is what records the delivery, and it is
+                // what gate 4 above reads on the next pass. The ConfigMap is
+                // already up to date for any pod that restarts for unrelated
+                // reasons.
                 return Ok(Action::requeue(Duration::from_secs(300)));
             }
             // `hot_reload_error`, not `e`: `HotReloadError::Request`
@@ -723,6 +771,8 @@ async fn reconcile_clustered_workload(
     hash: &str,
     pp: &PatchParams,
 ) -> Result<Action, ReconcileError> {
+    require_write_gate(ctx, ns, name)?;
+
     // --- Ensure the shared cluster key exists ---
     // Create-if-absent, never overwrite: existing key material is what
     // lets a rescheduled pod rejoin the mesh, so it must survive every
@@ -790,25 +840,38 @@ async fn reconcile_clustered_workload(
     }
 
     // --- Decide hot-reload vs rollout-restart, then apply ---
-    let desired_sts = reconcile::desired_statefulset(sbproxy, hash);
     let sts_api: Api<StatefulSet> = Api::namespaced(ctx.client.clone(), ns);
+    let existing_sts = sts_api
+        .get_opt(&reconcile::statefulset_name(sbproxy))
+        .await
+        .unwrap_or(None);
+    let template_hash = existing_sts
+        .as_ref()
+        .and_then(reconcile::previous_config_hash_statefulset);
+    let running_hash = reconcile::running_config_hash(sbproxy);
+
+    // Same reasoning as the Deployment path: the template hash is the roll
+    // trigger, so it holds still while the pods already run the config.
+    let desired_sts = reconcile::desired_statefulset(
+        sbproxy,
+        reconcile::rollout_config_hash(template_hash.as_deref(), running_hash, hash),
+    );
     let sts_name = desired_sts
         .metadata
         .name
         .as_deref()
         .ok_or(ReconcileError::MissingName)?;
-    let existing_sts = sts_api.get_opt(sts_name).await.unwrap_or(None);
-    let prev_hash = existing_sts
-        .as_ref()
-        .and_then(reconcile::previous_config_hash_statefulset);
 
     let hot_reload_eligible = reconcile::should_hot_reload_statefulset(
         sbproxy,
         existing_sts.as_ref(),
         &desired_sts,
-        prev_hash.as_deref(),
+        running_hash,
         hash,
     );
+
+    // Same re-check as the Deployment path, for the same reason.
+    require_write_gate(ctx, ns, name)?;
 
     if hot_reload_eligible {
         match try_hot_reload(&ctx.client, sbproxy, ns).await {
@@ -856,13 +919,52 @@ fn delete_ignoring_missing<T>(result: Result<T, kube::Error>) -> Result<(), Reco
     }
 }
 
+/// Refuse to continue when this replica can no longer prove it holds the
+/// leader Lease.
+///
+/// Called immediately before each group of writes rather than once at the
+/// top of the pass. A single entry check would leave the whole rest of the
+/// pass, which includes several apiserver round-trips and an HTTP fan-out to
+/// every proxy pod, running on a leadership claim that may have expired
+/// mid-flight.
+///
+/// What this cannot see: a request already handed to `reqwest` or to the
+/// kube client when the gate closes. Nothing in-process can recall those.
+/// The gate bounds how many further writes a deposed leader issues, and the
+/// Lease arithmetic in `leader` is what keeps the gate closing before a
+/// successor may legally start.
+fn require_write_gate(ctx: &Ctx, ns: &str, name: &str) -> Result<(), ReconcileError> {
+    if ctx.write_gate.allows() {
+        return Ok(());
+    }
+    tracing::warn!(
+        name = %name,
+        namespace = %ns,
+        "leader lease is no longer provable; abandoning this reconcile without writing"
+    );
+    Err(ReconcileError::Fenced)
+}
+
 /// Patch the `SBProxy` `status` subresource with a JSON merge patch.
 ///
 /// Best-effort: a status write failure is logged and swallowed so it never
 /// fails the reconcile (status is observability, not correctness). Used by
 /// the config preview-validation path to surface a bad config on
 /// the CRD and to clear the error once the config validates again.
-async fn patch_status(client: &Client, ns: &str, name: &str, body: serde_json::Value) {
+///
+/// Takes the whole context rather than the client so the leader fence is
+/// applied by construction: a deposed replica must not keep stamping status
+/// onto an object its successor now owns.
+async fn patch_status(ctx: &Ctx, ns: &str, name: &str, body: serde_json::Value) {
+    if !ctx.write_gate.allows() {
+        tracing::warn!(
+            name = %name,
+            namespace = %ns,
+            "leader lease is no longer provable; skipping status write"
+        );
+        return;
+    }
+    let client = &ctx.client;
     let api: Api<SBProxy> = Api::namespaced(client.clone(), ns);
     if let Err(e) = api
         .patch_status(name, &PatchParams::default(), &Patch::Merge(&body))
@@ -993,6 +1095,12 @@ enum ReconcileError {
         #[source]
         source: kube::Error,
     },
+
+    /// This replica can no longer prove it holds the leader Lease, so it
+    /// refuses to write. Not a failure of the object under reconcile: the
+    /// successor will do the pass.
+    #[error("this replica no longer holds the leader lease; refusing to write")]
+    Fenced,
 
     /// Server-side-apply patch failed.
     #[error("failed to apply child object: {0}")]
@@ -1160,5 +1268,80 @@ mod tests {
     fn shutdown_grace_unset_env_returns_default() {
         let _env = EnvVarGuard::set(&[("SBPROXY_SHUTDOWN_GRACE_MS", None)]);
         assert_eq!(resolve_shutdown_grace_ms(), DEFAULT_SHUTDOWN_GRACE_MS);
+    }
+
+    // --- Status ordering ---
+
+    /// This binary's own source, so the ordering below is checked against the
+    /// code that ships rather than against a paraphrase of it.
+    const MAIN_RS: &str = include_str!("main.rs");
+
+    /// Everything above this file's own `#[cfg(test)]` block: the code that
+    /// actually runs in the operator. Searching the whole file instead would
+    /// match this module's own assertions and count them as call sites.
+    fn production_source() -> &'static str {
+        let (production, _tests) = MAIN_RS
+            .split_once("#[cfg(test)]")
+            .expect("main.rs carries a test module");
+        production
+    }
+
+    /// `configHash` and the `lastError` clear are documented as end-of-pass
+    /// signals, and `reconcile_one_inner` used to write them right after
+    /// validation. A ConfigMap apply that then 403'd left the CR reading
+    /// `configHash: H1, lastError: ""` while every pod still ran H0.
+    ///
+    /// A live apiserver is the only thing that can observe the write order
+    /// directly, and the operator's reconcile takes one. So this pins the
+    /// order in the source instead, which is narrow in a specific way worth
+    /// naming: it proves the rolled-out patch is dispatched after the
+    /// workload calls in `reconcile_one_inner`, and it cannot see a write
+    /// issued from anywhere else. What keeps that from mattering is
+    /// `rolled_out_status_patch` being the only producer of `configHash` in
+    /// the crate, which the companion test below pins.
+    #[test]
+    fn the_rolled_out_status_patch_is_dispatched_after_the_workload_apply() {
+        let src = production_source();
+        let observed = src
+            .find("reconcile::observed_status_patch")
+            .expect("the pre-apply pass records observedConfigHash");
+        let deployment_apply = src
+            .find("reconcile_deployment_workload(&ctx,")
+            .expect("the Deployment workload is reconciled from reconcile_one_inner");
+        let clustered_apply = src
+            .find("reconcile_clustered_workload(&ctx,")
+            .expect("the clustered workload is reconciled from reconcile_one_inner");
+        let rolled_out = src
+            .find("reconcile::rolled_out_status_patch")
+            .expect("configHash is stamped once the rollout lands");
+
+        assert!(
+            observed < clustered_apply && observed < deployment_apply,
+            "observedConfigHash is the pre-apply signal and must be written first"
+        );
+        assert!(
+            rolled_out > deployment_apply && rolled_out > clustered_apply,
+            "configHash must not be stamped until both workload paths have \
+             had their chance to fail"
+        );
+    }
+
+    /// The other half of the claim above: nothing else in the operator can
+    /// produce a `configHash` status write, so pinning one call site's
+    /// position pins the behavior.
+    #[test]
+    fn config_hash_status_is_written_from_exactly_one_place() {
+        assert_eq!(
+            production_source()
+                .matches("rolled_out_status_patch")
+                .count(),
+            1,
+            "a second configHash writer would escape the ordering guard above"
+        );
+        assert!(
+            !production_source().contains("\"configHash\""),
+            "configHash belongs in reconcile::rolled_out_status_patch, not in an \
+             inline json! at some other point in the pass"
+        );
     }
 }

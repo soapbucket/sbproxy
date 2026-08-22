@@ -166,19 +166,68 @@ pub struct ResourceRequirements {
     pub limits: std::collections::BTreeMap<String, String>,
 }
 
-/// Status reported by the operator. Currently records the last reconciled
-/// config hash so operators can confirm a rollout happened.
+/// Status reported by the operator, so `kubectl get sbproxy -o yaml` answers
+/// two different questions: what the operator has seen, and what it has
+/// finished delivering.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SBProxyStatus {
-    /// Hash of the last `SBProxyConfig.spec.config` rolled out. Empty if the
-    /// referenced config has never been resolved.
+    /// Hash of the `SBProxyConfig.spec.config` the operator has finished
+    /// delivering. Written only after the ConfigMap, Service, and workload
+    /// have all been applied, or after every pod has accepted a hot reload.
+    /// Empty until the first rollout completes. A rolling restart is still
+    /// asynchronous after the apply lands, so pair this with the workload's
+    /// own rollout status when you need to know the pods have caught up.
+    /// When this trails `observedConfigHash`, the operator could not finish
+    /// delivering; check `lastError` and the operator log.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub config_hash: String,
 
-    /// Last error observed during reconcile, if any. Cleared on successful runs.
+    /// Hash of the `SBProxyConfig.spec.config` the operator most recently
+    /// read and validated. Written before anything is applied, so it says
+    /// only that the operator has seen this config, never that it reached the
+    /// pods.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub observed_config_hash: String,
+
+    /// Last error observed during reconcile, if any. Cleared only once a
+    /// rollout completes, so an empty value and a `configHash` that matches
+    /// `observedConfigHash` together mean the fleet is on the config you
+    /// applied.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub last_error: String,
+}
+
+impl SBProxyStatus {
+    /// The config hash the operator has finished delivering, or `None` when
+    /// nothing has been delivered yet.
+    ///
+    /// The emptiness rule lives here rather than at the call site because it
+    /// is a property of the field: `configHash` is
+    /// `skip_serializing_if = "String::is_empty"`, so a CR carrying a status
+    /// for `lastError` alone round-trips back with `config_hash` as `""`.
+    /// Treating that as a delivered hash would compare a real hash against
+    /// an empty string on every pass, which reads as "the config changed"
+    /// forever.
+    ///
+    /// An empty `observedConfigHash` disqualifies the hash too, and that
+    /// rule is what makes an operator upgrade safe. Before `configHash`
+    /// meant "delivered" it was written straight after validation and meant
+    /// only "seen", so a CR whose last pre-upgrade pass stamped a hash and
+    /// then failed its ConfigMap apply carries a `configHash` the pods never
+    /// received. Read as delivered, that value pins the pod template where
+    /// it is and suppresses the hot reload, and the fleet stays on the old
+    /// config while the CR reads healthy. Every pass of an operator that
+    /// separates the two writes `observedConfigHash` first, so its presence
+    /// is the proof that `configHash` was written under the newer meaning.
+    /// The cost when it is absent is one redundant delivery, in the same
+    /// direction the code is already wrong in.
+    pub fn delivered_config_hash(&self) -> Option<&str> {
+        if self.config_hash.is_empty() || self.observed_config_hash.is_empty() {
+            return None;
+        }
+        Some(self.config_hash.as_str())
+    }
 }
 
 // --- SBProxyConfig ---

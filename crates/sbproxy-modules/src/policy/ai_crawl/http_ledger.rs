@@ -252,7 +252,15 @@ impl HttpLedger {
                 content_shape: None,
             },
         };
+        // Every early return between the breaker gate above and the retry
+        // loop below has to hand the probe slot back. In HalfOpen the gate
+        // did not just answer a question, it took the one slot the breaker
+        // hands out per recovery cycle, and these two paths never reach
+        // `record_success` or `record_failure` to give it up. Nothing was
+        // dispatched, so the endpoint's health is exactly as unknown as it
+        // was a line earlier.
         let body_bytes = serde_json::to_vec(&envelope).map_err(|e| {
+            self.breaker.release_probe();
             LedgerError::hard("ledger.bad_request", format!("envelope encode: {e}"))
         })?;
         let body_hash_hex = sha256_hex(&body_bytes);
@@ -268,8 +276,11 @@ impl HttpLedger {
             path_only,
             &body_hash_hex,
         );
-        let signature_hex = hmac_sha256_hex(&self.config.key, signing_string.as_bytes())
-            .map_err(|e| LedgerError::hard("ledger.bad_request", format!("hmac init: {e}")))?;
+        let signature_hex =
+            hmac_sha256_hex(&self.config.key, signing_string.as_bytes()).map_err(|e| {
+                self.breaker.release_probe();
+                LedgerError::hard("ledger.bad_request", format!("hmac init: {e}"))
+            })?;
         let signature_header = format!("v1={signature_hex}");
 
         let url = format!(
@@ -343,9 +354,27 @@ impl HttpLedger {
                     }
                     // Hard failure: do not retry, do not flap the
                     // breaker. The policy will translate to 402.
+                    //
+                    // The breaker still has to get its slot back. A hard
+                    // error is what a perfectly healthy ledger answers
+                    // with when a crawler presents a spent or badly
+                    // signed token, and in HalfOpen this request is
+                    // holding the single probe slot. Leaving it out would
+                    // make one refused token answer every other redeem
+                    // with a synthetic `ledger.unavailable` for a whole
+                    // open duration, which the crawl policy turns into a
+                    // fail-closed 503 for crawlers whose tokens are fine.
+                    self.breaker.release_probe();
                     return Err(err);
                 }
             }
+        }
+        if last_err.is_none() {
+            // The loop fell out without ever dispatching an attempt: the
+            // total deadline had already lapsed. Nothing recorded an
+            // outcome, so the probe slot is still held and has to go back
+            // rather than wait out the stale-slot forgiveness.
+            self.breaker.release_probe();
         }
         Err(last_err.unwrap_or_else(|| {
             LedgerError::transient("ledger.unavailable", "max retries exhausted")

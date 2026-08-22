@@ -7317,6 +7317,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "toml_edit",
  "tracing",
  "tracing-subscriber",
  "yaml_serde",
@@ -7346,6 +7347,9 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sigv4",
  "base64 0.22.1",
  "bytes",
  "chrono",
@@ -7377,6 +7381,7 @@ dependencies = [
  "sbproxy-plugin",
  "sbproxy-security",
  "sbproxy-util",
+ "sbproxy-vault",
  "schemars",
  "serde",
  "serde_json",
@@ -7408,6 +7413,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rusqlite",
  "sbproxy-httpkit",
+ "sbproxy-util",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",
@@ -7829,6 +7835,7 @@ dependencies = [
  "redb 2.6.3",
  "redis",
  "sbproxy-security",
+ "sbproxy-util",
  "sbproxy-vault",
  "serde",
  "serde_json",
@@ -7885,6 +7892,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "parking_lot",
+ "sbproxy-util",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -9650,6 +9658,7 @@ dependencies = [
  "indexmap 2.14.0",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 
@@ -9661,6 +9670,12 @@ checksum = "a2abe9b86193656635d2411dc43050282ca48aa31c2451210f4202550afb7526"
 dependencies = [
  "winnow",
 ]
+
+[[package]]
+name = "toml_writer"
+version = "1.1.1+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "756daf9b1013ebe47a8776667b466417e2d4c5679d441c26230efd9ef78692db"
 
 [[package]]
 name = "tonic"

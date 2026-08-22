@@ -990,14 +990,14 @@ proxy:
       sandbox:
         max_execution_ms: 100   # wall-clock budget per invocation
         max_memory_mb: 8        # cap on the Lua VM's allocator footprint
-        allow_patterns: true    # expose string.find / string.match / string.gmatch
+        allow_patterns: true    # expose string.find / match / gmatch / gsub
 ```
 
 | Field | Default | Notes |
 |---|---|---|
 | `max_execution_ms` | `100` | Wall-clock budget per invocation. Scripts that exceed it abort with a sandbox-timeout error and the request fails closed. Set `0` to disable the timer (not recommended). |
 | `max_memory_mb` | `8` | Hard ceiling on the Lua VM's allocator footprint. Allocations past the cap fail the script rather than letting it grow the proxy's resident set. |
-| `allow_patterns` | `true` | Whether to expose the Lua pattern API (`string.find`, `string.match`, `string.gmatch`). The pattern engine has known pathological inputs; flip to `false` if your scripts do not need pattern matching. The rest of `string.*` keeps working either way. |
+| `allow_patterns` | `true` | Whether to expose the Lua pattern API (`string.find`, `string.match`, `string.gmatch`, `string.gsub`). Those four are every function in the `string` table that takes a pattern. The pattern engine has known pathological inputs, and `max_execution_ms` cannot stop one: the matcher runs inside the C string library, where the interrupt the timer relies on never fires. Flip to `false` if your scripts do not need pattern matching. The rest of `string.*` keeps working either way. |
 
 Limits apply to every Lua surface uniformly: request modifiers, response modifiers, JSON transforms, and WAF custom rules. Changes take effect on the next config reload (SIGHUP, admin reload, or filesystem watch) without restarting the process.
 
@@ -1236,6 +1236,14 @@ Declining is the cheap common case and means "the static config applies unchange
 
 **`admit_event` and `stale_while_revalidate` compose.** The revalidation refresh runs the event against the response it just fetched, from the same small request-side scope the initial request used, so an override or a refusal from `admit_event` still applies to what the background refresh writes back. The two were refused together before this evaluation path existed; that restriction is gone.
 
+**Neither event normally runs on the connection loop.** Both are evaluated on a separate worker pool, so a script that spends its whole CPU budget (`max_execution_ms`, 100 ms by default) occupies a pool thread instead of the worker that owns the connection, and the other connections that worker is serving keep moving.
+
+Three consequences worth knowing.
+
+- An origin with neither event is unchanged, because the scheduling hop is only paid when a script exists to run.
+- For an origin with an `admit_event`, the cache write-back is dispatched one hop later than before. `admit_event` decides whether a response is stored, never whether it is served, so nothing the client is waiting for moves with it.
+- The `admit_event` deferral is capped at 64 evaluations in flight across the whole process, because each one holds a copy of the response body until the script returns and nothing downstream is waiting to push back. Past the cap the event runs on the connection loop after all, which is slower but bounded, and which keeps a refusal from being skipped under load. A script expensive enough to reach that cap shows up on `sbproxy_decision_event_duration_seconds{event="cache.admit"}` before it gets there.
+
 Both events run under the sandboxes in [§4.6](#46-sandbox-limits) and [§5.1](#51-sandbox-limits), with a fresh VM per evaluation. Evaluations are counted on `sbproxy_decision_event_total{event="cache.key"}` and `{event="cache.admit"}`, and the two faults are counted differently on purpose: `cache.admit` fails open, so it records `outcome="allow"` plus `sbproxy_decision_event_fail_open_total`, while `cache.key` fails closed on the cache and records `outcome="error"`, or `outcome="timeout"` when the script ran out of its CPU budget, with no fail-open counter. The field-level reference for the block is in [configuration.md](configuration.md#response-cache).
 
 ---
@@ -1356,7 +1364,7 @@ The four bullets below describe `policies[] type: rego` and `ai_routing_policy` 
 - No network operations.
 - Wall-clock budget (default 100 ms) enforced via the Luau interrupt callback; memory cap (default 8 MB) enforced by the allocator.
 - Deliberately has no instruction metering: the interrupt callback bounds an infinite loop by wall clock, so counting instructions would duplicate a bound that already holds. Setting `max_execution_ms: 0` disables the timer and is not recommended.
-- Available standard library: `string.*` (pattern functions gated by `allow_patterns`), `table.*`, `math.*`, `tonumber`, `tostring`, `type`, `pairs`, `ipairs`, `select`, `pcall`, `error`.
+- Available standard library: `string.*` (the pattern functions `find`, `match`, `gmatch`, and `gsub` gated by `allow_patterns`), `table.*`, `math.*`, `tonumber`, `tostring`, `type`, `pairs`, `ipairs`, `select`, `pcall`, `error`.
 
 ### JavaScript
 

@@ -1,0 +1,113 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# AI gateway: provider-key failure fallback, with an explicit opt-out.
+#
+# A `401` or `403` from an AI provider is a statement about the
+# credential, not about the provider. It is not retryable, it opens no
+# availability failover, and with nothing configured here it reaches the
+# caller verbatim: one tenant's expired key is one tenant's outage.
+#
+# Two keys on a `providers[]` entry decide what happens instead:
+#
+#   fallback_credential_id:  the operator-held credential to retry the
+#     SAME provider with, once. It names a record under
+#     `key_management.seed.credentials[]`, never a second secret written
+#     here, so it rotates without a config reload and the key plane
+#     refuses it across tenants.
+#   on_key_failure:  `fallback` (the default) or `fail_closed`. Set
+#     `fail_closed` where the tenant's own key IS the authorization
+#     boundary and serving them on the house account would let a revoked
+#     tenant keep working.
+#
+# Key fallback owns `401`/`403` and nothing else. A `429`, a `5xx`, or a
+# timeout stays with the provider failover and `cooldown_policy`,
+# because a different key against a rate-limited provider is still rate
+# limited.
+#
+# A request that arrives carrying a caller-owned native provider key
+# never falls back, whatever these keys say. The caller presented their
+# own credential and the provider refused it; spending yours would bill
+# you for their authorization failure.
+#
+# Run (two processes):
+#   make run CONFIG=examples/tenant-key-fallback/upstream-provider.yml &
+#   make run CONFIG=examples/tenant-key-fallback/sb.yml
+#
+# See README.md for the two calls, what each returns, and the
+# `credential_fallback` event only the first one puts on the feed.
+
+proxy:
+  http_bind_port: 8080
+
+  # `GET /api/requests` on this port carries `credential_source` for
+  # every row: provider_entry | native_caller | fallback.
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: admin
+
+  # Two tenants, so the per-tenant credential decision below has two
+  # different right answers.
+  tenants:
+    - id: acme
+    - id: globex
+
+  key_management:
+    enabled: true
+    store:
+      backend: embedded
+      path: /tmp/sbproxy-tenant-key-fallback.redb
+    crypto:
+      pepper: demo-pepper-not-for-production
+      master_key: demo-master-not-for-production
+    seed:
+      credentials:
+        # The house account. `secret:` is envelope-encrypted at boot
+        # under `crypto.master_key`; in production use `vault_ref:` and
+        # the plaintext never touches this file at all.
+        - id: house-openai
+          name: house openai account
+          provider: openai
+          secret: sk-house-openai-not-a-real-key
+
+# The typed feed. `credential_fallback` fires once per swap, naming the
+# provider, the credential id, and the outcome, never the secret.
+events:
+  sink: file
+  path: tenant-key-fallback-events.ndjson
+  types:
+    - credential_fallback
+
+origins:
+  # Acme's key is dead. The fixture upstream refuses it, and the
+  # gateway retries the same provider on `house-openai`, so Acme keeps
+  # working while their key is fixed.
+  "acme.local":
+    tenant_id: acme
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai-acme
+          provider_type: openai
+          api_key: sk-acme-expired-not-a-real-key
+          base_url: http://127.0.0.1:8094
+          allow_private_base_url: true
+          models: [gpt-4o]
+          fallback_credential_id: house-openai
+
+  # Globex is billed on their own key, so their key IS the
+  # authorization boundary: if it stops working they must find out, not
+  # keep spending on the operator's account. `fail_closed` says so
+  # explicitly rather than leaving it to the absence of a credential id.
+  "globex.local":
+    tenant_id: globex
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai-globex
+          provider_type: openai
+          api_key: sk-globex-expired-not-a-real-key
+          base_url: http://127.0.0.1:8094
+          allow_private_base_url: true
+          models: [gpt-4o]
+          on_key_failure: fail_closed

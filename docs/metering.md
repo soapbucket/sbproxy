@@ -1,12 +1,12 @@
 # Attested metering
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 ![A metered request cuts a signed receipt, the chain verifies, one tampered entry on disk breaks it, and the verifier names the broken sequence number](assets/metering-verify.gif)
 
 Attested metering turns "trust my dashboard" into "check my math". When `proxy.attestation` is on, every request an attesting origin serves cuts a receipt: who consumed, on which route, how many units, under which outcome, priced by which configuration. Each receipt is Ed25519-signed and hash-chained to the one before it on an append-only ledger, so editing any past record breaks every link after it, and a buyer holding nothing but the operator's published key set can re-derive the whole chain and catch the edit.
 
-Two halves make up attestation, and they answer the two halves of a billing dispute. A claim is made before a call and says what it is going to cost. A receipt is written after it and says what it actually consumed. This page is about receipts: configuring the meter, reading it, verifying the chain, and handing a buyer something they can check without trusting you. For charging before the call is served, see [payment-settlement.md](payment-settlement.md).
+Two halves make up attestation, and they answer the two halves of a billing dispute. A claim is made before a call and says what it is going to cost. A receipt is written after it and says what it actually consumed. This build implements receipts, and only receipts: `role: claim` and `role: both` are refused at config load, with a message naming what is missing. This page is about receipts: configuring the meter, reading it, verifying the chain, and handing a buyer something they can check without trusting you. For charging before the call is served, see [payment-settlement.md](payment-settlement.md).
 
 ## Metrics are not the billing record
 
@@ -54,7 +54,9 @@ proxy:
 
   attestation:
     # This proxy records what calls actually consumed, after serving
-    # them. `claim` asserts cost before the call; `both` does both.
+    # them. `receipt` is the only role this build implements: `claim`
+    # and `both` are refused at config load, because nothing here
+    # writes a pre-call claim.
     role: receipt
 
     # What happens when metering itself breaks (full ledger disk,
@@ -63,14 +65,19 @@ proxy:
     failure_mode: degraded
 
     # What happens when attestation reaches a "refuse" verdict.
-    # `observe` records the verdict without acting on it.
+    # `observe` records the verdict without acting on it. Nothing
+    # reaches a verdict yet: the ceiling that produces one belongs to
+    # the claim half, so this key records a posture and no more.
     enforcement_mode: block
 
     # Receipts sign with the identity above; the ledger chain signs
     # with the same key, so a buyer fetches one key set for both.
     sign_with: proxy.web_bot_auth
 
-    # Claims wait here between "call started" and "call settled".
+    # Where claims would wait between "call started" and "call
+    # settled". Required whenever a role is declared, and written by
+    # nothing in this build; the path is validated and no directory is
+    # created for it.
     queue:
       path: '/tmp/sbproxy-metering/claims'
 
@@ -138,16 +145,18 @@ Each component, and when you would change it:
 
 ### `role`
 
-Which halves of attestation this proxy performs. Four values, because the two halves are independently useful:
+Which halves of attestation this proxy performs. Four values, because the two halves are independently useful, and two of the four are refused today:
 
 - `off`: attest to nothing. The default, and what every config that does not mention the block gets.
-- `claim`: assert what a call is going to cost, before it is served. The posture for a gateway in front of somebody else's metered API.
-- `receipt`: record what a call actually consumed, after it is served. The posture for a proxy selling its own upstream, and the one this page demonstrates.
-- `both`: claims and receipts. The posture for reselling metered capacity, where you answer to a buyer and a supplier at once.
+- `receipt`: record what a call actually consumed, after it is served. The posture for a proxy selling its own upstream, the one this page demonstrates, and the only working value besides `off`.
+- `claim`: assert what a call is going to cost, before it is served. **Refused at config load.** This build writes no pre-call claim, so a proxy set to `claim` would serve traffic and record nothing.
+- `both`: claims and receipts. **Refused at config load**, because the claim half is.
 
-Individual origins can narrow or widen the proxy-wide role through `origins.<host>.attestation.role`, because one gateway commonly fronts both a partner API it resells and its own service.
+Refusing beats accepting here. A `claim` config used to compile clean and serve traffic that produced neither a claim nor a receipt, so an operator who had configured a spend ceiling and a bounded queue got an unmetered proxy and no signal that anything was wrong. The refusal names the three things that are missing (no claim is written, nothing reads the queue, no ceiling is computed) and points at `role: receipt`. Both spellings stay in the vocabulary so you get that message rather than "unknown value".
 
-Once the role is anything but `off`, the queue, the ledger, and a complete `billable` table are all required, and `sign_with` is required whenever the role writes receipts. Each of those requirements fails at config compile, with a message naming what is missing, rather than at the moment somebody disputes an invoice.
+Individual origins can narrow the proxy-wide role through `origins.<host>.attestation.role`, because one gateway commonly fronts both a metered service and an unmetered one. Widening into the claim half is refused per origin as well, so `role: both` on a single host does not slip past the proxy-wide check.
+
+Once the role is `receipt`, the queue, the ledger, and a complete `billable` table are all required, and `sign_with` is required too. Each of those requirements fails at config compile, with a message naming what is missing, rather than at the moment somebody disputes an invoice.
 
 ### `failure_mode`
 
@@ -164,6 +173,8 @@ The `degraded` default is a deliberate departure from the fail-closed default th
 
 A different question from `failure_mode`, and the two are easy to conflate. `failure_mode` decides what happens when attestation cannot run. `enforcement_mode` decides what happens when it runs fine and the verdict is "refuse", for example a claim that exceeds an agreement's ceiling. `block` acts on the verdict; `observe` records it and admits the call anyway. A control can reasonably observe while it is being tuned and still fail closed when its backend disappears, which is why these are two knobs and not one.
 
+Nothing reaches such a verdict in this build. The only one attestation computes is a claim against an agreement's ceiling, and the claim half is refused at load, so `enforcement_mode` records the posture you intend and governs nothing yet. It is documented rather than dropped because the receipt half already ships and the key belongs to the same block.
+
 ### `sign_with` and the signing identity
 
 A receipt nobody can verify is a log line, so a role that writes receipts must name a signing identity. The only accepted value today is `proxy.web_bot_auth`, pointing at an identity your config already declares rather than inventing a second one. The same Ed25519 key signs the receipt tokens and the ledger chain entries, so a buyer fetches one key set and checks everything with it, instead of discovering a second key-distribution problem at the moment they are ready to pay.
@@ -172,9 +183,11 @@ The public half is published by opting the origin into `web_bot_auth_publish`, w
 
 ### `queue` and `ledger`
 
-The queue is where claims wait between "call started" and "call settled"; the gap between those two moments is where a crash loses money, and the queue is that gap made durable. The ledger is the receipt chain itself: an append-only JSONL file, one entry per metered call, each entry hash-chained to its predecessor and signed. Both paths become required as soon as a role is declared.
+The queue is where claims would wait between "call started" and "call settled"; the gap between those two moments is where a crash loses money, and the queue is that gap made durable. No claim is written in this build, so nothing writes the queue and nothing creates its directory: the path is validated at load and left alone on disk. The ledger is the receipt chain itself: an append-only JSONL file, one entry per metered call, each entry hash-chained to its predecessor and signed, and it is the path that gets created and written. Both keys are still required as soon as a role is declared, so the state layout a deployment declares does not change under it when the claim half lands.
 
-The ledger file is its own write-ahead log: each entry is serialized, written, and flushed before the append returns. Appends happen after the response is already sent, so metering never adds latency to the call it records, and a metering defect can never fail the request it is reporting on.
+The ledger file is its own write-ahead log: each entry is serialized, written with its newline in one syscall, and `fsync`ed before the append returns. Both details are the difference between a log and a ledger. One write means a process killed mid-entry cannot leave a payload with no terminator for the next append to run into, which would make the file unreadable and, under `failure_mode: closed`, stop traffic until somebody edited it. The `fsync` is what makes "written" mean the disk: a truncated hash chain still verifies clean, so entries lost to a power cut would leave no marker anywhere and simply not be billed.
+
+The price is one `fsync` per metered call, which is the ledger's throughput ceiling on a spinning disk or a network filesystem. It is inside the same lock that already serializes appends, and `sbproxy_meter_append_duration_seconds` measures that whole section, so watch that histogram rather than guessing. Appends happen after the response is already sent, so metering never adds latency to the call it records, and a metering defect can never fail the request it is reporting on.
 
 ### `billable`: the outcome table
 

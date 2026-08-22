@@ -185,6 +185,32 @@ pub fn load_pipeline(new_pipeline: CompiledPipeline) {
     // once at startup) keeps the seam installed for library embedders
     // that never run the binary's startup path.
     crate::admin::install_target_health_metrics_source();
+    // WOR-2289: the structured-log redactor's bundle field-key denylist
+    // belongs to whichever extension registry is serving, so it moves
+    // here and nowhere else. Loading a bundle candidate used to install
+    // it, which meant every validate-only load (a `/config/publish` dry
+    // run, doctor, the empty registry `CompiledPipeline::from_config`
+    // builds) reprogrammed the redactor for a candidate that was then
+    // dropped, leaving the still-serving config logging its own
+    // `secret_vars` in cleartext. Installing at the publication boundary
+    // makes the denylist as durable as the pipeline it describes.
+    //
+    // The union goes in before the swap and the adopted set after it,
+    // because neither ordering is safe on its own. Installing only
+    // before would un-redact a dropped bundle's field names for the
+    // generation still serving, which is a narrower version of the bug
+    // this moved to fix; installing only after would leave a newly
+    // added bundle's names in cleartext until the swap lands. Redacting
+    // the union across the boundary is the one direction with no window
+    // in it, and it costs an over-redacted field for a few microseconds
+    // on a reload.
+    let bundle_secret_fields = new_pipeline
+        .extension_registry()
+        .secret_field_names()
+        .to_vec();
+    let mut across_the_swap = sbproxy_observe::logging::bundle_secret_field_names().to_vec();
+    across_the_swap.extend_from_slice(&bundle_secret_fields);
+    sbproxy_observe::logging::set_bundle_secret_field_names(across_the_swap);
     // This is the only pipeline publisher. Hold the flag-store write lock
     // while the pipeline pointer is swapped, then install its matching flag
     // snapshot before CEL readers can resume. Direct/library callers therefore
@@ -197,6 +223,10 @@ pub fn load_pipeline(new_pipeline: CompiledPipeline) {
         pipeline_store().store(Arc::new(new_pipeline));
         advance_config_version();
     });
+    // Narrow the denylist from the union back to what the generation
+    // now serving actually declares, so a reload that drops a bundle
+    // also drops its names rather than leaking them forward forever.
+    sbproxy_observe::logging::set_bundle_secret_field_names(bundle_secret_fields);
 }
 
 /// Monotonically increasing counter used as the projection cache's
@@ -788,5 +818,97 @@ flags:
 
         clear_agent_detect_scorer();
         assert!(agent_detect_scorer().is_none());
+    }
+
+    /// Write a bundle whose one hook declares `billing_key` as a
+    /// `secret_var`, so a pipeline built over it has a non-empty
+    /// redactor denylist.
+    fn write_secret_var_bundle(root: &std::path::Path) {
+        let bundle = root.join("bundles").join("billing");
+        std::fs::create_dir_all(&bundle).expect("create bundle directory");
+        std::fs::write(bundle.join("entry.js"), "export function run() {}\n")
+            .expect("write bundle artifact");
+        std::fs::write(
+            bundle.join("bundle.yaml"),
+            r#"apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: billing
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+hooks:
+  - kind: policy
+    type: billing_policy
+    export: run
+    config_schema:
+      type: object
+      properties:
+        billing_key:
+          type: string
+    secret_vars: [billing_key]
+"#,
+        )
+        .expect("write bundle manifest");
+    }
+
+    /// WOR-2289 regression: the structured-log redactor's bundle
+    /// field-key denylist moves at publication and only at publication.
+    ///
+    /// The clobber this pins: `Candidate::finish` used to install the
+    /// names itself, so a validate-only load (a `/config/publish` dry
+    /// run with no `extensions:` block, doctor, or any
+    /// `CompiledPipeline::from_config` with its empty registry) replaced
+    /// the live denylist with its own and the config still serving began
+    /// logging its `secret_vars` in cleartext. Half of this test is
+    /// therefore the publish wiring (`load_pipeline` installs) and half
+    /// is the absence of the clobber (a dropped candidate does not).
+    #[test]
+    fn publishing_a_pipeline_owns_the_bundle_redactor_denylist() {
+        sbproxy_observe::logging::set_bundle_secret_field_names(Vec::new());
+
+        let directory = tempfile::TempDir::new().expect("temporary config directory");
+        write_secret_var_bundle(directory.path());
+        let mut config = make_config("billing.example.com");
+        config.extension_bundles.bundles_dir = Some("bundles".to_owned());
+        let pipeline = CompiledPipeline::from_config_at(config, directory.path())
+            .expect("a pipeline over the bundle compiles");
+
+        load_pipeline(pipeline);
+
+        let live = sbproxy_observe::logging::bundle_secret_field_names();
+        assert!(
+            live.iter().any(|name| name == "billing_key"),
+            "publication must install the adopted registry's secret field names: {live:?}"
+        );
+
+        // A candidate that is built and dropped, which is what a
+        // validate-only publish of a payload carrying no `extensions:`
+        // block does, must leave the serving generation's denylist alone.
+        let candidate = CompiledPipeline::from_config(make_config("candidate.example.com"))
+            .expect("the validate-only candidate compiles");
+        let candidate_names = candidate.extension_registry().secret_field_names();
+        assert!(candidate_names.is_empty(), "{candidate_names:?}");
+        drop(candidate);
+
+        let live = sbproxy_observe::logging::bundle_secret_field_names();
+        assert!(
+            live.iter().any(|name| name == "billing_key"),
+            "a dropped candidate must not disarm the serving config's redactor: {live:?}"
+        );
+
+        // Publishing a generation that drops the bundle drops its
+        // names too. Without the narrowing step after the swap, the
+        // union installed across the boundary would leak forward and
+        // the denylist would only ever grow.
+        let successor = CompiledPipeline::from_config(make_config("successor.example.com"))
+            .expect("the bundle-free successor compiles");
+        load_pipeline(successor);
+        let live = sbproxy_observe::logging::bundle_secret_field_names();
+        assert!(
+            !live.iter().any(|name| name == "billing_key"),
+            "a reload that drops a bundle must drop the names it declared: {live:?}"
+        );
+
+        sbproxy_observe::logging::set_bundle_secret_field_names(Vec::new());
     }
 }

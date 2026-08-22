@@ -13,6 +13,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::ai_metrics;
+use crate::aws_sigv4::AwsSigV4Signer;
 use crate::compression::{SummarizationOutput, SummarizerError};
 use crate::handler::AiHandlerConfig;
 use crate::provider::ProviderConfig;
@@ -40,6 +41,129 @@ const MAX_SHADOW_RESPONSE_METADATA_BYTES: usize = 1024 * 1024;
 const PROVIDER_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
 const PROVIDER_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 const PROVIDER_RETRY_JITTER_PCT: u64 = 25;
+
+/// One outbound credential scheme, applied to a fully built request
+/// immediately before it goes on the wire.
+///
+/// # Contract
+///
+/// This is the seam every non-bearer credential scheme plugs into, so
+/// these rules are the contract rather than an implementation detail
+/// of the one scheme that exists today,
+/// [`crate::aws_sigv4::AwsSigV4Signer`].
+///
+/// 1. **Position.** `send_governed` calls [`OutboundSigner::sign`]
+///    immediately before each `Client::execute`. Nothing between that
+///    call and the socket mutates the request except the headers hyper
+///    writes itself (`host`, `content-length`, `accept-encoding`). A
+///    scheme that covers a header therefore has to be able to
+///    guarantee that header's value, and has to leave the ones hyper
+///    owns alone.
+/// 2. **Per attempt, per hop.** `sign` runs again on every retry and
+///    again on every redirect hop, after the URL has been rewritten to
+///    the next target. A credential bound to a host, a path, or a body
+///    is always bound to the one being sent, never to the previous
+///    one. Any code that mutates a request has to run above this
+///    boundary; nothing below it may touch the body.
+/// 3. **Idempotence.** The same request object reaches `sign` more
+///    than once, because a same-origin redirect replays it. An
+///    implementation overwrites every header it owns rather than
+///    appending, and never lets one application's output become the
+///    next application's input.
+/// 4. **Fail closed.** An error from `sign` fails the attempt. There
+///    is no unsigned fallback, and a refusing implementation leaves no
+///    partially applied credential behind.
+/// 5. **Secrecy.** No implementation puts credential material into a
+///    log line, an error string, a `Debug` render, a metric label, or
+///    a panic message, and every header it writes is marked sensitive
+///    so `strip_sensitive_headers` drops it on a cross-origin hop.
+///
+/// A scheme that needs to see what the upstream said (an expiry
+/// signal, a challenge, a clock reading) implements
+/// [`OutboundSigner::observe_response`], called once per response with
+/// the status, the headers, and the round-trip time. It runs on the
+/// request path, so it must not block.
+#[async_trait::async_trait]
+pub trait OutboundSigner: Send + Sync + std::fmt::Debug {
+    /// Stable label for this scheme, for logs and diagnostics. Never
+    /// derived from a credential value.
+    fn scheme(&self) -> &'static str;
+
+    /// Apply this scheme's credential to `request` in place.
+    ///
+    /// # Errors
+    ///
+    /// Any failure fails the attempt; there is no unsigned fallback.
+    async fn sign(&self, request: &mut reqwest::Request) -> Result<()>;
+
+    /// Observe one upstream response. Ignored by default.
+    fn observe_response(
+        &self,
+        _status: reqwest::StatusCode,
+        _headers: &reqwest::header::HeaderMap,
+        _round_trip: Duration,
+    ) {
+    }
+}
+
+/// Per-provider outbound signers, built on first use.
+///
+/// Building a signer can cost an STS round trip, so it happens once
+/// per provider rather than once per request. A config reload replaces
+/// the whole [`AiClient`] (see `sbproxy_core::server::reload_ai_client`),
+/// which drops this cache with it, so a provider name is a sufficient
+/// key: an entry can never outlive the `aws_sigv4:` block that
+/// produced it.
+#[derive(Default)]
+struct SignerCache {
+    built: tokio::sync::Mutex<std::collections::HashMap<String, Arc<AwsSigV4Signer>>>,
+}
+
+impl SignerCache {
+    /// The signer for `provider`, or `None` when the provider carries
+    /// no `aws_sigv4:` block.
+    ///
+    /// Absence of the block is what selects verbatim credential
+    /// pass-through, so there is no runtime branch in which an
+    /// unsigned provider acquires a signer or a signed provider also
+    /// forwards a static credential header.
+    async fn signer_for(&self, provider: &ProviderConfig) -> Result<Option<Arc<AwsSigV4Signer>>> {
+        let Some(config) = provider.aws_sigv4.as_ref() else {
+            return Ok(None);
+        };
+        // Fail closed on a block that cannot sign, before anything
+        // dials AWS with it. This is the only place that check runs
+        // today: the handler's per-provider validation loop
+        // (`AiHandlerConfig::from_config`, alongside `validate_base_url`)
+        // is where it belongs, so the operator learns at config load
+        // rather than on the first request, and adding it there is the
+        // one follow-up this lane could not land itself.
+        provider
+            .validate_aws_sigv4()
+            .map_err(|reason| anyhow::anyhow!("provider {}: {reason}", provider.name))?;
+        let mut built = self.built.lock().await;
+        if let Some(existing) = built.get(provider.name.as_str()) {
+            return Ok(Some(existing.clone()));
+        }
+        let signer = Arc::new(
+            AwsSigV4Signer::build(config, provider.effective_provider_type())
+                .await
+                .map_err(anyhow::Error::new)?,
+        );
+        debug!(
+            provider = %provider.name,
+            scheme = %OutboundSigner::scheme(signer.as_ref()),
+            "built an outbound request signer for provider"
+        );
+        built.insert(provider.name.as_str().to_string(), signer.clone());
+        Ok(Some(signer))
+    }
+}
+
+/// Borrow an optional signer as the trait object `send_governed` takes.
+fn as_signer(signer: &Option<Arc<AwsSigV4Signer>>) -> Option<&dyn OutboundSigner> {
+    signer.as_deref().map(|s| s as &dyn OutboundSigner)
+}
 
 /// Supervisor for shadow / side-by-side eval tasks.
 ///
@@ -262,7 +386,18 @@ impl ShadowUsageRecord {
         // Never derive the ledger dedup key from a caller-controlled
         // correlation header. A different primary request could otherwise
         // deliberately choose that derived value and suppress this event.
-        event.request_id = Some(format!("{:032x}:shadow", rand::random::<u128>()));
+        //
+        // The primary's id is still worth carrying, as data: `shadow_of`
+        // is what lets a report put the primary row and its N target
+        // rows side by side. It is not the key, and nothing derives the
+        // key from it.
+        //
+        // The key itself is minted in `record`, once per target, not
+        // here. This record is cloned per target, so minting here would
+        // give every target row the same id and collapse N rows to one
+        // on ledger replay.
+        event.shadow_of = event.request_id.take();
+        event.request_id = None;
         event.tag = Some(ShadowAttribution::Shadow.as_str().to_string());
         event.engine_version = None;
         // WOR-2223: a shadow call is an extra evaluation copy, not the
@@ -277,6 +412,9 @@ impl ShadowUsageRecord {
     }
 
     fn record(mut self, provider: String, model: String, result: ShadowCallResult) {
+        // Minted per call, so each target's row is a distinct ledger
+        // entry. See the note in `new`.
+        self.event.request_id = Some(format!("{:032x}:shadow", rand::random::<u128>()));
         let usage = crate::budget::AiUsage::Tokens {
             input: result.prompt_tokens,
             output: result.completion_tokens,
@@ -293,23 +431,35 @@ impl ShadowUsageRecord {
         self.event.cost_usd = crate::budget::estimate_cost_for_usage(&self.event.model, &usage);
         self.event.latency_ms = result.latency_ms;
         self.event.status = result.status;
+        self.event.finish_reason = result.finish_reason;
         for sink in &self.sinks {
             sink.record(&self.event);
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ShadowCallResult {
     status: u16,
     latency_ms: u64,
     prompt_tokens: u64,
     completion_tokens: u64,
+    /// The target's terminal `finish_reason`, already parsed by
+    /// [`parse_shadow_metadata`] for the log line and previously
+    /// discarded. It is the cheapest disagreement signal there is: a
+    /// target that answered `length` where the primary answered `stop`
+    /// truncated, and no amount of cost comparison says that.
+    finish_reason: Option<String>,
 }
 
 struct PreparedShadowRequest {
     permit: ShadowPermit,
     http: reqwest::Client,
+    /// WOR-2648: a shadow copy is a real, billable upstream call, so a
+    /// SigV4 provider's shadow leg is signed exactly like its primary.
+    /// It reaches AWS as a genuine `InvokeModel` and appears in
+    /// CloudTrail as one; `x-sbproxy-shadow: 1` marks it on the wire.
+    signers: Arc<SignerCache>,
     provider: ProviderConfig,
     path: String,
     body: serde_json::Value,
@@ -324,12 +474,26 @@ struct PreparedShadowRequest {
 }
 
 /// HTTP client that forwards AI requests to upstream providers.
+///
+/// `Clone` is cheap and deliberate: every field is an `Arc` bump or a
+/// `reqwest::Client` handle, which is itself an `Arc`. That is what lets
+/// the dispatcher build a per-request copy carrying one caller's honored
+/// timeout instead of threading an options struct through twenty
+/// `forward_*` signatures.
+#[derive(Clone)]
 pub struct AiClient {
     http: reqwest::Client,
     shadow_supervisor: Arc<ShadowSupervisor>,
     /// Optional purpose-scoped egress authorizer. `None` preserves
     /// legacy ungated provider calls (omitted `proxy.egress` config).
     egress: Option<EgressAuthorizer>,
+    /// Per-provider outbound request signers, built on first use.
+    signers: Arc<SignerCache>,
+    /// A caller's honored `x-sbproxy-timeout-ms`, replacing
+    /// `ProviderConfig::timeout_ms` for the life of this client. `None`
+    /// on the shared process client, which is the only one that outlives
+    /// a request.
+    request_timeout_override: Option<Duration>,
 }
 
 impl AiClient {
@@ -349,6 +513,8 @@ impl AiClient {
                 .expect("AI HTTP client builder failed; cannot enforce the request timeout"),
             shadow_supervisor: Arc::new(ShadowSupervisor::default()),
             egress: None,
+            signers: Arc::new(SignerCache::default()),
+            request_timeout_override: None,
         }
     }
 
@@ -357,6 +523,20 @@ impl AiClient {
     /// before any I/O (fail closed).
     pub fn with_egress(mut self, authorizer: EgressAuthorizer) -> Self {
         self.egress = Some(authorizer);
+        self
+    }
+
+    /// A per-request copy of this client that stamps `timeout` on every
+    /// provider request in place of the provider's own `timeout_ms`.
+    ///
+    /// Cloning is an `Arc` bump per field, so this is cheap enough to do
+    /// once per request that carries an honored `x-sbproxy-timeout-ms`.
+    /// Carrying the budget on the client rather than as a parameter is
+    /// what makes the race path, the cascade fan-out, and every retry
+    /// attempt inherit it without twenty signature changes.
+    #[must_use]
+    pub fn with_request_timeout_override(mut self, timeout: Duration) -> Self {
+        self.request_timeout_override = Some(timeout);
         self
     }
 
@@ -376,6 +556,8 @@ impl AiClient {
                 .expect("AI HTTP client builder failed; cannot enforce the request timeout"),
             shadow_supervisor: supervisor,
             egress: None,
+            signers: Arc::new(SignerCache::default()),
+            request_timeout_override: None,
         }
     }
 
@@ -448,13 +630,34 @@ impl AiClient {
 
     /// Send one already-built provider request under the governed
     /// redirect contract (WOR-2165).
+    /// Boxed body. Every await on the AI request path is inlined into
+    /// one state machine on a Pingora worker thread, whose stack is the
+    /// std default of 2MB, and that machine was already within a few
+    /// hundred kilobytes of it. Adding the signer lookup and the signed
+    /// hop loop pushed it over, so an AI request aborted the worker
+    /// thread with a stack overflow before it reached a provider.
+    /// Boxing here puts this subtree on the heap and takes the frame
+    /// back under the limit. Unit tests never caught it because they
+    /// call this off a test runtime with a much larger stack; only the
+    /// e2e harness runs the real Pingora thread.
     async fn send_provider_request(
         &self,
         mut request: reqwest::Request,
         provider: &ProviderConfig,
     ) -> Result<reqwest::Response> {
-        apply_provider_timeout(&mut request, provider);
-        send_governed(&self.http, self.egress.as_ref(), &provider.name, request).await
+        Box::pin(async move {
+            apply_provider_timeout(&mut request, provider, self.request_timeout_override);
+            let signer = self.signers.signer_for(provider).await?;
+            send_governed(
+                &self.http,
+                self.egress.as_ref(),
+                &provider.name,
+                as_signer(&signer),
+                request,
+            )
+            .await
+        })
+        .await
     }
 
     /// Borrow the shadow supervisor (test + diagnostic accessor).
@@ -477,8 +680,8 @@ impl AiClient {
         blocked_providers: &[String],
         disallow_prompt_training: bool,
         usage: Option<ShadowUsageRecord>,
-    ) -> ShadowDispatchOutcome {
-        match self.prepare_shadow(
+    ) -> Vec<ShadowDispatchOutcome> {
+        match self.prepare_shadows(
             config,
             path,
             body,
@@ -489,8 +692,14 @@ impl AiClient {
             usage,
             None,
         ) {
-            Ok(prepared) => Self::spawn_prepared_shadow(prepared),
-            Err(outcome) => outcome,
+            Ok(prepared) => prepared
+                .into_iter()
+                .map(|target| match target {
+                    Ok(prepared) => Self::spawn_prepared_shadow(prepared),
+                    Err(outcome) => outcome,
+                })
+                .collect(),
+            Err(outcome) => vec![outcome],
         }
     }
 
@@ -513,8 +722,8 @@ impl AiClient {
         usage: Option<ShadowUsageRecord>,
         quota: &crate::quota_pool::QuotaPoolAdmission,
         quota_reservation_prefix: &str,
-    ) -> std::result::Result<ShadowDispatchOutcome, crate::quota_pool::PoolError> {
-        let mut prepared = match self.prepare_shadow(
+    ) -> std::result::Result<Vec<ShadowDispatchOutcome>, crate::quota_pool::PoolError> {
+        let targets = match self.prepare_shadows(
             config,
             path,
             body,
@@ -525,15 +734,30 @@ impl AiClient {
             usage,
             None,
         ) {
-            Ok(prepared) => prepared,
-            Err(outcome) => return Ok(outcome),
+            Ok(targets) => targets,
+            Err(outcome) => return Ok(vec![outcome]),
         };
-        prepared.quota_attempt = Some(
-            quota
-                .reserve_attempt(&format!("{quota_reservation_prefix}:shadow"))
-                .await?,
-        );
-        Ok(Self::spawn_prepared_shadow(prepared))
+        let mut outcomes = Vec::with_capacity(targets.len());
+        for (index, target) in targets.into_iter().enumerate() {
+            let mut prepared = match target {
+                Ok(prepared) => prepared,
+                Err(outcome) => {
+                    outcomes.push(outcome);
+                    continue;
+                }
+            };
+            // One reservation per target, distinctly named: the pool
+            // dedups by reservation id, so reusing the request's single
+            // `:shadow` id across N targets would reserve one unit for
+            // N billable calls.
+            prepared.quota_attempt = Some(
+                quota
+                    .reserve_attempt(&format!("{quota_reservation_prefix}:shadow:{index}"))
+                    .await?,
+            );
+            outcomes.push(Self::spawn_prepared_shadow(prepared));
+        }
+        Ok(outcomes)
     }
 
     /// Queue quota admission and shadow transport without delaying the caller.
@@ -555,7 +779,7 @@ impl AiClient {
         usage: Option<ShadowUsageRecord>,
         quota: crate::quota_pool::QuotaPoolAdmission,
         quota_reservation_prefix: &str,
-    ) -> ShadowDispatchOutcome {
+    ) -> Vec<ShadowDispatchOutcome> {
         self.try_spawn_shadow_with_quota_detached_impl(
             config,
             path,
@@ -587,7 +811,7 @@ impl AiClient {
         quota: crate::quota_pool::QuotaPoolAdmission,
         quota_reservation_prefix: &str,
         reasoning_eligibility: crate::reasoning::ReasoningEligibility,
-    ) -> ShadowDispatchOutcome {
+    ) -> Vec<ShadowDispatchOutcome> {
         self.try_spawn_shadow_with_quota_detached_impl(
             config,
             path,
@@ -617,8 +841,8 @@ impl AiClient {
         quota: crate::quota_pool::QuotaPoolAdmission,
         quota_reservation_prefix: &str,
         reasoning_eligibility: Option<crate::reasoning::ReasoningEligibility>,
-    ) -> ShadowDispatchOutcome {
-        let mut prepared = match self.prepare_shadow(
+    ) -> Vec<ShadowDispatchOutcome> {
+        let targets = match self.prepare_shadows(
             config,
             path,
             body,
@@ -629,29 +853,55 @@ impl AiClient {
             usage,
             reasoning_eligibility,
         ) {
-            Ok(prepared) => prepared,
-            Err(outcome) => return outcome,
+            Ok(targets) => targets,
+            Err(outcome) => return vec![outcome],
         };
-        let reservation_id = format!("{quota_reservation_prefix}:shadow");
-        tokio::spawn(async move {
-            match quota.reserve_attempt(&reservation_id).await {
-                Ok(attempt) => {
-                    prepared.quota_attempt = Some(attempt);
-                    Self::spawn_prepared_shadow(prepared);
+        let mut outcomes = Vec::with_capacity(targets.len());
+        for (index, target) in targets.into_iter().enumerate() {
+            let mut prepared = match target {
+                Ok(prepared) => prepared,
+                Err(outcome) => {
+                    outcomes.push(outcome);
+                    continue;
                 }
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        "quota admission suppressed optional shadow request"
-                    );
+            };
+            let reservation_id = format!("{quota_reservation_prefix}:shadow:{index}");
+            let quota = quota.clone();
+            tokio::spawn(async move {
+                match quota.reserve_attempt(&reservation_id).await {
+                    Ok(attempt) => {
+                        prepared.quota_attempt = Some(attempt);
+                        Self::spawn_prepared_shadow(prepared);
+                    }
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            "quota admission suppressed optional shadow request"
+                        );
+                    }
                 }
-            }
-        });
-        ShadowDispatchOutcome::Spawned
+            });
+            outcomes.push(ShadowDispatchOutcome::Spawned);
+        }
+        outcomes
     }
 
+    /// Apply the request-level shadow gates once, then prepare one
+    /// request per configured target.
+    ///
+    /// `Err` carries a refusal that is true of the whole request (no
+    /// shadow block, an ineligible surface, a stream); those never
+    /// reach a target. `Ok` carries one entry per target, in config
+    /// order, each already resolved to either a prepared request or
+    /// its own per-target refusal.
+    ///
+    /// Sampling draws **once** here and every target compares against
+    /// that draw. Independent per-target draws would give disjoint
+    /// populations, and two targets whose measured cost and latency
+    /// come from different requests are not comparable, which is the
+    /// entire point of running two.
     #[allow(clippy::too_many_arguments)]
-    fn prepare_shadow(
+    fn prepare_shadows(
         &self,
         config: &AiHandlerConfig,
         path: &str,
@@ -662,7 +912,10 @@ impl AiClient {
         disallow_prompt_training: bool,
         usage: Option<ShadowUsageRecord>,
         reasoning_eligibility: Option<crate::reasoning::ReasoningEligibility>,
-    ) -> std::result::Result<PreparedShadowRequest, ShadowDispatchOutcome> {
+    ) -> std::result::Result<
+        Vec<std::result::Result<PreparedShadowRequest, ShadowDispatchOutcome>>,
+        ShadowDispatchOutcome,
+    > {
         let Some(shadow_cfg) = config.shadow.as_ref() else {
             return Err(ShadowDispatchOutcome::NotConfigured);
         };
@@ -673,13 +926,54 @@ impl AiClient {
             ai_metrics::record_shadow_dropped(ai_metrics::ShadowDropReason::Streaming);
             return Err(ShadowDispatchOutcome::StreamingSkipped);
         }
+        let draw: f32 = rand::random();
+        Ok(shadow_cfg
+            .targets
+            .iter()
+            .map(|target| {
+                self.prepare_shadow_target(
+                    config,
+                    target,
+                    draw,
+                    path,
+                    body,
+                    allowed_providers,
+                    blocked_providers,
+                    disallow_prompt_training,
+                    usage.clone(),
+                    reasoning_eligibility,
+                )
+            })
+            .collect())
+    }
 
+    /// Everything that is decided per target: sampling against the
+    /// request's one draw, provider resolution and policy, reasoning
+    /// policy, and admission.
+    ///
+    /// Admission runs once per target, so N targets take N slots out
+    /// of the one process-wide task and memory ceiling rather than
+    /// multiplying it by the length of the config.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_shadow_target(
+        &self,
+        config: &AiHandlerConfig,
+        shadow_cfg: &crate::handler::AiShadowTarget,
+        draw: f32,
+        path: &str,
+        body: &serde_json::Value,
+        allowed_providers: &[String],
+        blocked_providers: &[String],
+        disallow_prompt_training: bool,
+        usage: Option<ShadowUsageRecord>,
+        reasoning_eligibility: Option<crate::reasoning::ReasoningEligibility>,
+    ) -> std::result::Result<PreparedShadowRequest, ShadowDispatchOutcome> {
         let sampled = if shadow_cfg.sample_rate >= 1.0 {
             true
         } else if shadow_cfg.sample_rate <= 0.0 {
             false
         } else {
-            rand::random::<f32>() < shadow_cfg.sample_rate
+            draw < shadow_cfg.sample_rate
         };
         if !sampled {
             return Err(ShadowDispatchOutcome::SampledOut);
@@ -797,6 +1091,7 @@ impl AiClient {
         Ok(PreparedShadowRequest {
             permit,
             http: self.http.clone(),
+            signers: self.signers.clone(),
             provider: shadow_provider,
             path: path.to_string(),
             body: body_owned,
@@ -815,6 +1110,7 @@ impl AiClient {
         let PreparedShadowRequest {
             permit,
             http,
+            signers,
             provider,
             path,
             body,
@@ -833,17 +1129,42 @@ impl AiClient {
             ai_metrics::record_reasoning_policy_attempt(&provider.name, reasoning_outcome);
             match tokio::time::timeout(
                 task_timeout,
-                run_shadow_request(http, provider, path, body, http_timeout, quota_attempt),
+                run_shadow_request(
+                    http,
+                    signers,
+                    provider,
+                    path,
+                    body,
+                    http_timeout,
+                    quota_attempt,
+                ),
             )
             .await
             {
                 Ok(result) => {
+                    // Recorded here, beside the usage row, rather than
+                    // inside `run_shadow_request`: the timeout arm below
+                    // never reaches that function, and a target whose
+                    // calls all time out is exactly the one an operator
+                    // needs to see on this counter.
+                    ai_metrics::record_shadow_call(
+                        &usage_provider,
+                        result.status,
+                        result.finish_reason.as_deref(),
+                        result.latency_ms as f64 / 1000.0,
+                    );
                     if let Some(usage) = usage {
                         usage.record(usage_provider, usage_model, result);
                     }
                 }
                 Err(_) => {
                     ai_metrics::record_shadow_timeout();
+                    ai_metrics::record_shadow_call(
+                        &usage_provider,
+                        504,
+                        None,
+                        task_timeout_ms as f64 / 1000.0,
+                    );
                     if let Some(usage) = usage {
                         usage.record(
                             usage_provider,
@@ -853,6 +1174,7 @@ impl AiClient {
                                 latency_ms: task_timeout_ms,
                                 prompt_tokens: 0,
                                 completion_tokens: 0,
+                                finish_reason: None,
                             },
                         );
                     }
@@ -1058,7 +1380,8 @@ impl AiClient {
         quota_attempt: Option<crate::quota_pool::QuotaPoolAttemptGuard>,
     ) -> Result<reqwest::Response> {
         let format = provider_format(provider);
-        let (translated_body, translated_path) = translators::translate_request(format, path, body);
+        let (translated_body, translated_path) =
+            translators::translate_request(format, path, body, translate_options(provider));
         // Passthrough formats return `None`; send the original borrowed
         // body without a clone (WOR-1701).
         let send_body = translated_body.as_ref().unwrap_or(body);
@@ -1069,21 +1392,23 @@ impl AiClient {
         self.gate_provider_url(&url_string, &provider.name)?;
         let url = reqwest::Url::parse(&url_string)?;
 
-        let (auth_header, auth_value) = provider_auth_header(provider)?;
+        let auth = provider_auth_header(provider)?;
 
         debug!(
             url = %url,
             provider = %provider.name,
             format = ?format,
-            auth_header = %auth_header,
+            signed = provider.aws_sigv4.is_some(),
             "forwarding AI request to provider"
         );
 
         let mut req = self
             .http
             .post(url)
-            .header("content-type", "application/json")
-            .header(auth_header, &auth_value);
+            .header("content-type", "application/json");
+        if let Some((auth_header, auth_value)) = auth {
+            req = req.header(auth_header, auth_value);
+        }
 
         // Anthropic requires an api-version header; default the most
         // widely deployed value when the caller didn't set one.
@@ -1130,7 +1455,7 @@ impl AiClient {
         self.gate_provider_url(&url_string, &provider.name)?;
         let url = reqwest::Url::parse(&url_string)?;
 
-        let (auth_header, auth_value) = provider_auth_header(provider)?;
+        let auth = provider_auth_header(provider)?;
 
         debug!(
             url = %url,
@@ -1138,7 +1463,11 @@ impl AiClient {
             "forwarding AI GET request to provider"
         );
 
-        let req = self.http.get(url).header(auth_header, auth_value).build()?;
+        let mut req = self.http.get(url);
+        if let Some((auth_header, auth_value)) = auth {
+            req = req.header(auth_header, auth_value);
+        }
+        let req = req.build()?;
         commit_quota_attempt(quota_attempt).await?;
         let resp = self.send_provider_request(req, provider).await?;
 
@@ -1198,7 +1527,7 @@ impl AiClient {
         // return `None`, so `send_body` falls back to the original
         // borrowed body with no clone (WOR-1701).
         let (translated_body, translated_path) = match body {
-            Some(b) => translators::translate_request(format, path, b),
+            Some(b) => translators::translate_request(format, path, b, translate_options(provider)),
             None => (None, path.to_string()),
         };
         let send_body: Option<&serde_json::Value> = translated_body.as_ref().or(body);
@@ -1209,7 +1538,7 @@ impl AiClient {
         self.gate_provider_url(&url_string, &provider.name)?;
         let url = reqwest::Url::parse(&url_string)?;
 
-        let (auth_header, auth_value) = provider_auth_header(provider)?;
+        let auth = provider_auth_header(provider)?;
 
         debug!(
             url = %url,
@@ -1221,10 +1550,10 @@ impl AiClient {
 
         let reqwest_method = parse_http_method(method)?;
 
-        let mut req = self
-            .http
-            .request(reqwest_method, url)
-            .header(auth_header, &auth_value);
+        let mut req = self.http.request(reqwest_method, url);
+        if let Some((auth_header, auth_value)) = auth {
+            req = req.header(auth_header, auth_value);
+        }
 
         if matches!(format, ProviderFormat::Anthropic) {
             req = req.header("anthropic-version", "2023-06-01");
@@ -1332,7 +1661,7 @@ impl AiClient {
         let url_string = build_url(base_url, native_path);
         self.gate_provider_url(&url_string, &provider.name)?;
         let url = reqwest::Url::parse(&url_string)?;
-        let (auth_header, auth_value) = provider_auth_header(provider)?;
+        let auth = provider_auth_header(provider)?;
         let reqwest_method = parse_http_method(method)?;
 
         debug!(
@@ -1347,8 +1676,10 @@ impl AiClient {
         let mut req = self
             .http
             .request(reqwest_method, url)
-            .header(auth_header, &auth_value)
             .header("content-type", "application/json");
+        if let Some((auth_header, auth_value)) = auth {
+            req = req.header(auth_header, auth_value);
+        }
         if matches!(format, ProviderFormat::Anthropic) {
             req = req.header("anthropic-version", "2023-06-01");
         }
@@ -1416,7 +1747,7 @@ impl AiClient {
         let url_string = build_url(base_url, path);
         self.gate_provider_url(&url_string, &provider.name)?;
         let url = reqwest::Url::parse(&url_string)?;
-        let (auth_header, auth_value) = provider_auth_header(provider)?;
+        let auth = provider_auth_header(provider)?;
         let content_type_header = reqwest::header::HeaderValue::from_str(content_type)?;
         let reqwest_method = parse_http_method(method)?;
 
@@ -1429,13 +1760,14 @@ impl AiClient {
             "forwarding AI raw-body request to provider"
         );
 
-        let req = self
+        let mut req = self
             .http
             .request(reqwest_method, url)
-            .header(auth_header, auth_value)
-            .header("content-type", content_type_header)
-            .body(body)
-            .build()?;
+            .header("content-type", content_type_header);
+        if let Some((auth_header, auth_value)) = auth {
+            req = req.header(auth_header, auth_value);
+        }
+        let req = req.body(body).build()?;
         commit_quota_attempt(quota_attempt).await?;
         let resp = self.send_provider_request(req, provider).await?;
         Ok(resp)
@@ -1451,14 +1783,28 @@ async fn commit_quota_attempt(
     Ok(())
 }
 
+/// The verbatim credential header for `provider`, or `None` when the
+/// provider authenticates with a request signature instead.
+///
+/// WOR-2648: the bearer mode and the signing mode are structurally
+/// exclusive rather than a runtime branch. A provider entry carrying an
+/// `aws_sigv4:` block emits no static credential header at all, so
+/// there is no path on which an operator string could ride alongside a
+/// signature, and the "a signed provider never sends `api_key`"
+/// property holds by construction. Config validation refuses the two
+/// keys together, so this returning `None` is never a silently dropped
+/// credential.
 fn provider_auth_header(
     provider: &ProviderConfig,
-) -> Result<(reqwest::header::HeaderName, reqwest::header::HeaderValue)> {
+) -> Result<Option<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>> {
+    if provider.aws_sigv4.is_some() {
+        return Ok(None);
+    }
     let (name, value) = provider.auth_header();
     let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())?;
     let mut value = reqwest::header::HeaderValue::from_str(&value)?;
     value.set_sensitive(true);
-    Ok((name, value))
+    Ok(Some((name, value)))
 }
 
 /// Parse an HTTP method string into a `reqwest::Method`. Accepts the
@@ -1501,9 +1847,23 @@ pub(crate) fn strip_sensitive_headers(headers: &mut reqwest::header::HeaderMap) 
     headers.remove(reqwest::header::COOKIE);
 }
 
-fn apply_provider_timeout(request: &mut reqwest::Request, provider: &ProviderConfig) {
-    if let Some(timeout_ms) = provider.timeout_ms {
-        *request.timeout_mut() = Some(Duration::from_millis(timeout_ms));
+/// Stamp the effective per-attempt transport budget onto `request`.
+///
+/// `override_timeout` is a caller's honored `x-sbproxy-timeout-ms`, which
+/// replaces the provider's own `timeout_ms` rather than being clamped
+/// against it: the operator ceiling that bounds the caller's value was
+/// already applied at the request path, and applying a second one here
+/// would silently give the caller less than the gateway told them they
+/// could have.
+fn apply_provider_timeout(
+    request: &mut reqwest::Request,
+    provider: &ProviderConfig,
+    override_timeout: Option<Duration>,
+) {
+    if let Some(timeout) =
+        override_timeout.or_else(|| provider.timeout_ms.map(Duration::from_millis))
+    {
+        *request.timeout_mut() = Some(timeout);
     }
 }
 
@@ -1522,18 +1882,36 @@ fn apply_provider_timeout(request: &mut reqwest::Request, provider: &ProviderCon
 /// happens at all. With an authorizer, each hop is authorized against
 /// the allowlist for [`EgressPurpose::AiProvider`] and credentials are
 /// stripped when the hop crosses origin.
+///
+/// WOR-2648: this is also the signing boundary. `signer` runs against
+/// the fully built request immediately before each `execute`, which is
+/// the only place in the outbound path where the method, host, path,
+/// headers, and body are all final and all still mutable. A signature
+/// computed anywhere upstream would be invalidated by the redirect
+/// rewrite below, and one computed downstream is impossible. See
+/// [`OutboundSigner`] for the contract this position imposes on a
+/// scheme.
 async fn send_governed(
     http: &reqwest::Client,
     egress: Option<&EgressAuthorizer>,
     origin_label: &str,
+    signer: Option<&dyn OutboundSigner>,
     mut request: reqwest::Request,
 ) -> Result<reqwest::Response> {
     let mut hop = 0usize;
     loop {
+        // The signing boundary. This runs once per attempt and once per
+        // hop, after `*replay.url_mut() = next.url` below has moved the
+        // request to the next host and path, so the credential is
+        // always bound to the request actually being sent.
+        if let Some(signer) = signer {
+            signer.sign(&mut request).await?;
+        }
         // Clone before the send consumes the request so a hop can reuse
         // the method, headers, and body.
         let replay = request.try_clone();
         let from = request.url().clone();
+        let started = std::time::Instant::now();
         // `without_url` rather than a bare `?`. A provider dial carries
         // an API key, some providers carry it in the query string, and a
         // `reqwest::Error`'s Display ends with `" for url ({url})"`. This
@@ -1547,6 +1925,12 @@ async fn send_governed(
             .execute(request)
             .await
             .map_err(reqwest::Error::without_url)?;
+        if let Some(signer) = signer {
+            // Lets a scheme learn from the answer: SigV4 reads the
+            // `Date` header off a rejection to measure local clock
+            // skew, which is otherwise indistinguishable from a bad key.
+            signer.observe_response(resp.status(), resp.headers(), started.elapsed());
+        }
         if !resp.status().is_redirection() {
             return Ok(resp);
         }
@@ -1693,13 +2077,22 @@ impl AiClient {
                 prepare_provider_attempt_body(config, &provider, body);
             let http = self.http.clone();
             let egress = self.egress.clone();
+            let timeout_override = self.request_timeout_override;
+            // Resolved before the spawn so a provider whose credentials
+            // cannot be built refuses the whole race rather than losing
+            // one leg silently mid-flight.
+            let signer = self.signers.signer_for(&provider).await?;
             let i = *idx;
             // Pre-authorize before spawning so an unlisted host is
             // denied without opening a connection.
             {
                 let format = provider_format(&provider);
-                let (_translated_body, translated_path) =
-                    translators::translate_request(format, &path_owned, &body_owned);
+                let (_translated_body, translated_path) = translators::translate_request(
+                    format,
+                    &path_owned,
+                    &body_owned,
+                    translate_options(&provider),
+                );
                 let base_url_owned = provider.effective_base_url();
                 let base_url = base_url_owned.trim_end_matches('/');
                 let url = build_url(base_url, &translated_path);
@@ -1707,8 +2100,12 @@ impl AiClient {
             }
             tasks.push(async move {
                 let format = provider_format(&provider);
-                let (translated_body, translated_path) =
-                    translators::translate_request(format, &path_owned, &body_owned);
+                let (translated_body, translated_path) = translators::translate_request(
+                    format,
+                    &path_owned,
+                    &body_owned,
+                    translate_options(&provider),
+                );
                 let send_body = translated_body.as_ref().unwrap_or(&body_owned);
                 let base_url_owned = provider.effective_base_url();
                 let base_url = base_url_owned.trim_end_matches('/');
@@ -1717,12 +2114,12 @@ impl AiClient {
                 // cross-origin hop strips it, the same as every other
                 // provider dial. The raw `provider.auth_header()` pair
                 // this leg used to build did not.
-                let auth = provider_auth_header(&provider);
-                let mut req = match auth {
-                    Ok((auth_header, auth_value)) => http
+                let mut req = match provider_auth_header(&provider) {
+                    Ok(Some((auth_header, auth_value))) => http
                         .post(&url)
                         .header("content-type", "application/json")
                         .header(auth_header, auth_value),
+                    Ok(None) => http.post(&url).header("content-type", "application/json"),
                     Err(error) => return (i, provider, Err(error)),
                 };
                 if matches!(format, ProviderFormat::Anthropic) {
@@ -1731,8 +2128,15 @@ impl AiClient {
                 ai_metrics::record_reasoning_policy_attempt(&provider.name, reasoning_outcome);
                 let resp = match req.json(send_body).build() {
                     Ok(mut request) => {
-                        apply_provider_timeout(&mut request, &provider);
-                        send_governed(&http, egress.as_ref(), &provider.name, request).await
+                        apply_provider_timeout(&mut request, &provider, timeout_override);
+                        send_governed(
+                            &http,
+                            egress.as_ref(),
+                            &provider.name,
+                            as_signer(&signer),
+                            request,
+                        )
+                        .await
                     }
                     Err(error) => Err(anyhow::Error::new(error)),
                 };
@@ -2436,6 +2840,7 @@ fn response_is_empty_or_refused(body: &[u8]) -> bool {
 /// drain the body so connections return to the pool.
 async fn run_shadow_request(
     http: reqwest::Client,
+    signers: Arc<SignerCache>,
     provider: ProviderConfig,
     path: String,
     body: serde_json::Value,
@@ -2443,7 +2848,8 @@ async fn run_shadow_request(
     quota_attempt: Option<crate::quota_pool::QuotaPoolAttemptGuard>,
 ) -> ShadowCallResult {
     let format = provider_format(&provider);
-    let (translated_body, translated_path) = translators::translate_request(format, &path, &body);
+    let (translated_body, translated_path) =
+        translators::translate_request(format, &path, &body, translate_options(&provider));
     let send_body = translated_body.as_ref().unwrap_or(&body);
     let base_url_owned = provider.effective_base_url();
     let base_url = base_url_owned.trim_end_matches('/');
@@ -2456,19 +2862,34 @@ async fn run_shadow_request(
             return failed_shadow_call(started);
         }
     };
-    let (auth_header, auth_value) = match provider_auth_header(&provider) {
+    let auth = match provider_auth_header(&provider) {
         Ok(header) => header,
         Err(error) => {
             warn!(provider = %provider.name, %error, "shadow request auth header is invalid");
             return failed_shadow_call(started);
         }
     };
+    // WOR-2648: a shadow copy of a SigV4 provider is signed with the
+    // same credential as the primary and reaches AWS as a real
+    // `InvokeModel`. Excluding signed providers from shadow would be an
+    // undocumented routing carve-out, and a shadow copy already costs
+    // real money at every other vendor; `shadow:` is the switch for
+    // operators who do not want the extra call.
+    let signer = match signers.signer_for(&provider).await {
+        Ok(signer) => signer,
+        Err(error) => {
+            warn!(provider = %provider.name, %error, "shadow request signer is unavailable");
+            return failed_shadow_call(started);
+        }
+    };
     let mut req = http
         .post(url)
-        .header(auth_header, auth_value)
         .header("x-sbproxy-shadow", "1")
         .json(send_body)
         .timeout(timeout);
+    if let Some((auth_header, auth_value)) = auth {
+        req = req.header(auth_header, auth_value);
+    }
     if matches!(format, ProviderFormat::Anthropic) {
         req = req.header("anthropic-version", "2023-06-01");
     }
@@ -2492,22 +2913,24 @@ async fn run_shadow_request(
             return failed_shadow_call(started);
         }
     };
-    let mut resp = match send_governed(&http, None, &provider.name, request).await {
-        Ok(r) => r,
-        // `transport_error`, not `e`: `send_governed` strips the URL off
-        // the `reqwest::Error` before it becomes an `anyhow::Error`, and
-        // the name says at the log site which error is in hand rather
-        // than leaving the next reader to go and check (WOR-2629).
-        Err(transport_error) => {
-            warn!(
-                provider = %provider.name,
-                error = %transport_error,
-                "shadow request transport error"
-            );
-            ai_metrics::record_provider_error(&provider.name, "transport");
-            return failed_shadow_call(started);
-        }
-    };
+    let mut resp =
+        match send_governed(&http, None, &provider.name, as_signer(&signer), request).await {
+            Ok(r) => r,
+            // `transport_error`, not `e`: `send_governed` strips the URL
+            // off the `reqwest::Error` before it becomes an
+            // `anyhow::Error`, and the name says at the log site which
+            // error is in hand rather than leaving the next reader to go
+            // and check (WOR-2629).
+            Err(transport_error) => {
+                warn!(
+                    provider = %provider.name,
+                    error = %transport_error,
+                    "shadow request transport error"
+                );
+                ai_metrics::record_provider_error(&provider.name, "transport");
+                return failed_shadow_call(started);
+            }
+        };
     let status = resp.status();
     if !status.is_success() {
         let kind = if status.is_server_error() {
@@ -2539,6 +2962,7 @@ async fn run_shadow_request(
                     latency_ms: started.elapsed().as_millis() as u64,
                     prompt_tokens: 0,
                     completion_tokens: 0,
+                    finish_reason: None,
                 };
             }
         }
@@ -2567,6 +2991,7 @@ async fn run_shadow_request(
         latency_ms: elapsed.as_millis() as u64,
         prompt_tokens: prompt_tokens.unwrap_or(0),
         completion_tokens: completion_tokens.unwrap_or(0),
+        finish_reason,
     }
 }
 
@@ -2576,6 +3001,10 @@ fn failed_shadow_call(started: std::time::Instant) -> ShadowCallResult {
         latency_ms: started.elapsed().as_millis() as u64,
         prompt_tokens: 0,
         completion_tokens: 0,
+        // A call that never produced a response has no finish reason.
+        // `None` rather than a synthetic value, so a report counting
+        // `length` truncations cannot pick up transport failures.
+        finish_reason: None,
     }
 }
 
@@ -2613,6 +3042,17 @@ fn serialized_json_len(value: &serde_json::Value) -> usize {
 /// Best-effort extraction of token counts and finish_reason from an
 /// OpenAI-shaped response body. Returns `None`s when the upstream
 /// shape differs.
+/// Longest `finish_reason` a shadow row or log line will carry.
+///
+/// The value is copied out of a target's response body, and since it
+/// started reaching a durable usage-ledger row as well as a log line it
+/// needs a bound: a broken or hostile target can put a megabyte of text
+/// in that field, up to the response metadata cap, and every shadow row
+/// would carry it. The metric label is already closed to a vocabulary;
+/// this bounds the two surfaces that keep the raw string. The longest
+/// legitimate value, `content_filter`, is 14 bytes.
+const MAX_SHADOW_FINISH_REASON_BYTES: usize = 64;
+
 fn parse_shadow_metadata(body: &[u8]) -> (Option<u64>, Option<u64>, Option<String>) {
     let v: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -2631,7 +3071,13 @@ fn parse_shadow_metadata(body: &[u8]) -> (Option<u64>, Option<u64>, Option<Strin
         .and_then(|c| c.get(0))
         .and_then(|c| c.get("finish_reason"))
         .and_then(|s| s.as_str())
-        .map(str::to_string);
+        .map(|reason| {
+            let mut end = MAX_SHADOW_FINISH_REASON_BYTES.min(reason.len());
+            while end > 0 && !reason.is_char_boundary(end) {
+                end -= 1;
+            }
+            reason[..end].to_string()
+        });
     (prompt, completion, finish)
 }
 
@@ -2647,6 +3093,18 @@ fn cascade_provider_is_eligible(
 impl Default for AiClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Collect the per-provider settings the canonical OpenAI body cannot
+/// carry into the translator's options struct.
+///
+/// One place, so a new option reaches every dial (single forward,
+/// method forward, the race's pre-authorize and send legs, and the
+/// shadow leg) instead of the subset a caller sweep remembered.
+pub(crate) fn translate_options(provider: &ProviderConfig) -> translators::TranslateOptions<'_> {
+    translators::TranslateOptions {
+        bedrock_guardrail: provider.bedrock_guardrail.as_deref(),
     }
 }
 
@@ -2705,6 +3163,56 @@ pub(crate) fn build_url(base_url: &str, path: &str) -> String {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+
+    /// The composition every dial performs: read the provider entry,
+    /// pick its wire format, and translate. Written against the pair
+    /// rather than against `request_to_native` because the failure
+    /// mode is a provider setting that parses, validates, and then
+    /// never reaches the body.
+    #[test]
+    fn a_bedrock_entrys_guardrail_reaches_the_converse_body() {
+        let provider: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "bedrock",
+            "aws_sigv4": {"region": "us-east-1"},
+            "bedrock_guardrail": {"identifier": "gr-abc123", "version": "2", "trace": true},
+        }))
+        .expect("fixture provider parses");
+        let body = serde_json::json!({
+            "model": "anthropic.claude-3-5-sonnet-20240620-v1:0",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let (translated, _path) = translators::translate_request(
+            provider_format(&provider),
+            "/v1/chat/completions",
+            &body,
+            translate_options(&provider),
+        );
+        let translated = translated.expect("Bedrock always translates");
+        assert_eq!(
+            translated["guardrailConfig"]["guardrailIdentifier"],
+            "gr-abc123"
+        );
+        assert_eq!(translated["guardrailConfig"]["guardrailVersion"], "2");
+
+        let unguarded: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "bedrock",
+            "aws_sigv4": {"region": "us-east-1"},
+        }))
+        .expect("fixture provider parses");
+        let (translated, _path) = translators::translate_request(
+            provider_format(&unguarded),
+            "/v1/chat/completions",
+            &body,
+            translate_options(&unguarded),
+        );
+        assert!(
+            translated
+                .expect("Bedrock always translates")
+                .get("guardrailConfig")
+                .is_none(),
+            "an entry with no guardrail must send no guardrailConfig"
+        );
+    }
 
     static SHADOW_METRIC_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
@@ -3493,7 +4001,7 @@ mod tests {
             .await
             .expect("sampling out is not a quota failure");
 
-        assert_eq!(outcome, ShadowDispatchOutcome::SampledOut);
+        assert_eq!(outcome, vec![ShadowDispatchOutcome::SampledOut]);
         assert!(
             store
                 .reservation_ids
@@ -3550,15 +4058,19 @@ mod tests {
             .await
             .expect("quota admits shadow");
 
-        assert_eq!(outcome, ShadowDispatchOutcome::Spawned);
+        assert_eq!(outcome, vec![ShadowDispatchOutcome::Spawned]);
         captured.await.expect("shadow request reached provider");
+        // The trailing index is the target's position in
+        // `shadow.targets`. The pool dedups by reservation id, so one
+        // shared `:shadow` id across N targets would reserve a single
+        // unit for N billable calls.
         assert_eq!(
             *store.reservation_ids.lock().expect("recording quota lock"),
-            vec!["request-1:quota-pool:shadow".to_string()]
+            vec!["request-1:quota-pool:shadow:0".to_string()]
         );
         assert_eq!(
             *store.settled_ids.lock().expect("recording quota lock"),
-            vec!["request-1:quota-pool:shadow".to_string()]
+            vec!["request-1:quota-pool:shadow:0".to_string()]
         );
     }
 
@@ -3606,11 +4118,11 @@ mod tests {
             .await
             .expect("reservation succeeds before local shadow construction");
 
-        assert_eq!(outcome, ShadowDispatchOutcome::Spawned);
+        assert_eq!(outcome, vec![ShadowDispatchOutcome::Spawned]);
         wait_for_quota_release(&store).await;
         assert_eq!(
             *store.released_ids.lock().expect("recording quota lock"),
-            vec!["request-local-shadow:shadow".to_string()]
+            vec!["request-local-shadow:shadow:0".to_string()]
         );
         assert!(store
             .settled_ids
@@ -3647,13 +4159,45 @@ mod tests {
             workflow_id: None,
             logical_model: None,
             served_model: None,
+            finish_reason: None,
+            shadow_of: None,
+            credential_source: None,
         }
+    }
+
+    fn shadow_result(status: u16, finish_reason: Option<&str>) -> ShadowCallResult {
+        ShadowCallResult {
+            status,
+            latency_ms: 12,
+            prompt_tokens: 3,
+            completion_tokens: 4,
+            finish_reason: finish_reason.map(str::to_string),
+        }
+    }
+
+    /// Emit `count` rows from one `ShadowUsageRecord`, the way a
+    /// multi-target request does: build once, clone per target.
+    fn recorded_shadow_rows(count: usize) -> Vec<LlmUsageEvent> {
+        let sink = Arc::new(CapturingUsageSink::default());
+        let record = ShadowUsageRecord::new(
+            shadow_usage_event("caller-id"),
+            vec![sink.clone() as Arc<dyn UsageSink>],
+        );
+        for index in 0..count {
+            record.clone().record(
+                format!("target-{index}"),
+                "m".to_string(),
+                shadow_result(200, Some("stop")),
+            );
+        }
+        let events = sink.events.lock().expect("capturing usage sink lock");
+        events.clone()
     }
 
     #[test]
     fn shadow_usage_id_is_server_generated_and_cannot_collide_with_primary_id() {
-        let usage = ShadowUsageRecord::new(shadow_usage_event("caller-id"), Vec::new());
-        let request_id = usage.event.request_id.expect("shadow request id");
+        let rows = recorded_shadow_rows(1);
+        let request_id = rows[0].request_id.clone().expect("shadow request id");
 
         assert_ne!(request_id, "caller-id:shadow");
         assert!(request_id.ends_with(":shadow"));
@@ -3661,6 +4205,96 @@ mod tests {
         assert!(request_id[..32]
             .chars()
             .all(|character| character.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn each_shadow_target_row_gets_its_own_ledger_id() {
+        // `ShadowUsageRecord` is built once per request and cloned per
+        // target. Minting the id in `new` gave every clone the same
+        // one, and that id is the verifiable ledger's dedup key: three
+        // targets would collapse to one row on replay, silently, with
+        // no test failing.
+        let rows = recorded_shadow_rows(3);
+        assert_eq!(rows.len(), 3);
+        let ids: std::collections::BTreeSet<_> = rows
+            .iter()
+            .map(|row| row.request_id.clone().expect("shadow request id"))
+            .collect();
+        assert_eq!(ids.len(), 3, "each target row needs its own dedup key");
+    }
+
+    #[test]
+    fn shadow_row_carries_shadow_of_but_never_derives_its_id_from_it() {
+        let rows = recorded_shadow_rows(2);
+        for row in &rows {
+            assert_eq!(
+                row.shadow_of.as_deref(),
+                Some("caller-id"),
+                "shadow_of is the join key back to the primary row"
+            );
+            let request_id = row.request_id.as_deref().expect("shadow request id");
+            assert!(
+                !request_id.contains("caller-id"),
+                "the correlation-id feature lets a caller pick the primary's \
+                 request id, so a derived shadow id would let one caller \
+                 suppress another's rows on ledger replay: {request_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_targets_finish_reason_is_bounded_before_it_reaches_a_row() {
+        // The string is copied out of the target's response body and
+        // now lands on a durable ledger row, so a target that answers
+        // with a very long finish reason must not be able to size that
+        // row. Multi-byte on purpose: truncating mid-character would
+        // panic on the slice.
+        let long = "\u{00e9}".repeat(4096);
+        let body = serde_json::json!({
+            "choices": [{"finish_reason": long}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        })
+        .to_string();
+        let (_, _, finish) = parse_shadow_metadata(body.as_bytes());
+        let finish = finish.expect("a finish reason was present");
+        assert!(
+            finish.len() <= MAX_SHADOW_FINISH_REASON_BYTES,
+            "finish reason kept {} bytes",
+            finish.len()
+        );
+        assert!(finish.chars().all(|c| c == '\u{00e9}'));
+
+        let (_, _, finish) = parse_shadow_metadata(
+            serde_json::json!({"choices": [{"finish_reason": "content_filter"}]})
+                .to_string()
+                .as_bytes(),
+        );
+        assert_eq!(
+            finish.as_deref(),
+            Some("content_filter"),
+            "the longest legitimate value must survive intact"
+        );
+    }
+
+    #[test]
+    fn shadow_finish_reason_reaches_the_usage_row() {
+        // Parsed by `parse_shadow_metadata` since the feature shipped
+        // and then dropped on the floor. A target that stopped on
+        // `length` where the primary stopped on `stop` truncated, and
+        // no cost or latency comparison says so.
+        let sink = Arc::new(CapturingUsageSink::default());
+        let record = ShadowUsageRecord::new(
+            shadow_usage_event("caller-id"),
+            vec![sink.clone() as Arc<dyn UsageSink>],
+        );
+        record.record(
+            "anthropic".to_string(),
+            "claude".to_string(),
+            shadow_result(200, Some("length")),
+        );
+        let events = sink.events.lock().expect("capturing usage sink lock");
+        assert_eq!(events[0].finish_reason.as_deref(), Some("length"));
+        assert_eq!(events[0].tag.as_deref(), Some("shadow"));
     }
 
     #[test]
@@ -3730,7 +4364,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(outcome, ShadowDispatchOutcome::Spawned);
+        assert_eq!(outcome, vec![ShadowDispatchOutcome::Spawned]);
         let request = captured.await.expect("test provider task");
         let request_text = String::from_utf8(request).expect("HTTP request is UTF-8");
         let body = request_text.split_once("\r\n\r\n").expect("HTTP body").1;
@@ -3776,7 +4410,7 @@ mod tests {
         let client = AiClient::with_shadow_supervisor(Arc::new(ShadowSupervisor::new(1)));
 
         let prepared = client
-            .prepare_shadow(
+            .prepare_shadows(
                 &config,
                 "/v1/chat/completions",
                 &compressed,
@@ -3787,11 +4421,220 @@ mod tests {
                 None,
                 Some(eligibility),
             )
+            .expect("the request-level gates admit this request")
+            .pop()
+            .expect("one configured target")
             .expect("shadow is admitted");
 
         assert_eq!(prepared.reasoning_outcome, "code_bypass");
         assert!(prepared.body.get("reasoning_effort").is_none());
         assert_eq!(prepared.body["messages"], compressed["messages"]);
+    }
+
+    fn multi_target_handler_config(targets: serde_json::Value) -> AiHandlerConfig {
+        AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {
+                    "name": "primary",
+                    "api_key": "primary-test-key",
+                    "base_url": "http://127.0.0.1:9/v1",
+                    "allow_private_base_url": true
+                },
+                {
+                    "name": "shadow-a",
+                    "api_key": "a-test-key",
+                    "base_url": "http://127.0.0.1:9/v1",
+                    "allow_private_base_url": true
+                },
+                {
+                    "name": "shadow-b",
+                    "api_key": "b-test-key",
+                    "base_url": "http://127.0.0.1:9/v1",
+                    "allow_private_base_url": true
+                },
+                {
+                    "name": "shadow-c",
+                    "api_key": "c-test-key",
+                    "base_url": "http://127.0.0.1:9/v1",
+                    "allow_private_base_url": true
+                }
+            ],
+            "shadow": {"targets": targets}
+        }))
+        .expect("valid multi-target shadow fixture")
+    }
+
+    #[tokio::test]
+    async fn two_shadow_targets_share_one_admission_ceiling() {
+        // The supervisor's task and memory ceilings are process-wide
+        // bounds on how much optional work a gateway will carry. If
+        // admission ran once per request rather than once per target,
+        // an operator could multiply that bound by editing a config
+        // list, which is exactly the thing the supervisor exists to
+        // stop. With three targets and two slots, the third is dropped
+        // as saturated.
+        let _metric_guard = SHADOW_METRIC_TEST_LOCK.lock().await;
+        let client = AiClient::with_shadow_supervisor(Arc::new(ShadowSupervisor::new(2)));
+        let config = multi_target_handler_config(serde_json::json!([
+            {"provider": "shadow-a", "timeout_ms": 50, "task_timeout_ms": 50},
+            {"provider": "shadow-b", "timeout_ms": 50, "task_timeout_ms": 50},
+            {"provider": "shadow-c", "timeout_ms": 50, "task_timeout_ms": 50},
+        ]));
+        let before = ai_metrics::shadow_dropped_value(ai_metrics::ShadowDropReason::Saturated);
+
+        let outcomes = client.try_spawn_shadow(
+            &config,
+            "/v1/chat/completions",
+            &serde_json::json!({"model": "primary-model"}),
+            false,
+            &[],
+            &[],
+            false,
+            None,
+        );
+
+        assert_eq!(
+            outcomes,
+            vec![
+                ShadowDispatchOutcome::Spawned,
+                ShadowDispatchOutcome::Spawned,
+                ShadowDispatchOutcome::Saturated,
+            ]
+        );
+        assert_eq!(
+            ai_metrics::shadow_dropped_value(ai_metrics::ShadowDropReason::Saturated) - before,
+            1.0,
+            "exactly one target is dropped, not the whole request"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_sampling_draw_nests_target_populations() {
+        // Independent per-target draws would give disjoint populations,
+        // and two targets measured on different requests are not
+        // comparable, which is the only reason to run two. One draw per
+        // request, compared against each rate, makes the 0.1 target's
+        // population a strict subset of the 0.5 target's, so the two
+        // are comparable on the smaller one's whole population.
+        // Capacity zero, so a target that clears sampling is refused at
+        // the next gate and never spawns a task. Sampling is the only
+        // thing under test here, and 500 spawned background calls would
+        // otherwise exhaust any finite supervisor partway through the
+        // loop and turn a later `Spawned` into a `Saturated` that reads
+        // exactly like "this target did not fire".
+        //
+        // The metric lock is held even though this test asserts on no
+        // metric: capacity zero means every sampled target is refused
+        // as `saturated`, so the loop bumps
+        // `sbproxy_ai_shadow_dropped_total{reason="saturated"}` a few
+        // hundred times, and two sibling tests assert an exact delta of
+        // one on that process-global series.
+        let _metric_guard = SHADOW_METRIC_TEST_LOCK.lock().await;
+        let client = AiClient::with_shadow_supervisor(Arc::new(ShadowSupervisor::new(0)));
+        let config = multi_target_handler_config(serde_json::json!([
+            {"provider": "shadow-a", "sample_rate": 0.1, "timeout_ms": 50, "task_timeout_ms": 50},
+            {"provider": "shadow-b", "sample_rate": 0.5, "timeout_ms": 50, "task_timeout_ms": 50},
+        ]));
+
+        let mut narrow_fired = 0_u32;
+        let mut wide_fired = 0_u32;
+        for _ in 0..500 {
+            let outcomes = client.try_spawn_shadow(
+                &config,
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "primary-model"}),
+                false,
+                &[],
+                &[],
+                false,
+                None,
+            );
+            assert_eq!(outcomes.len(), 2);
+            let narrow = outcomes[0] != ShadowDispatchOutcome::SampledOut;
+            let wide = outcomes[1] != ShadowDispatchOutcome::SampledOut;
+            assert!(
+                !narrow || wide,
+                "the 0.1 target fired on a request the 0.5 target skipped; \
+                 the populations are disjoint, not nested"
+            );
+            narrow_fired += u32::from(narrow);
+            wide_fired += u32::from(wide);
+        }
+        // Loose bounds, because this is a real RNG. The nesting
+        // assertion above is the exact one; these only catch a rate
+        // that stopped being honored at all.
+        assert!(narrow_fired > 0, "the 0.1 target never fired in 500 draws");
+        assert!(
+            wide_fired > narrow_fired,
+            "a 0.5 rate must fire more often than a 0.1 rate: \
+             {wide_fired} vs {narrow_fired}"
+        );
+        assert!(
+            wide_fired < 500,
+            "a 0.5 rate must not fire on every request: {wide_fired}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_shadow_target_records_its_own_call_metric() {
+        let _metric_guard = SHADOW_METRIC_TEST_LOCK.lock().await;
+        let (url_a, _a) = serve_one_json_response(
+            r#"{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"a"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+        )
+        .await;
+        let (url_b, _b) = serve_one_json_response(
+            r#"{"choices":[{"finish_reason":"length","message":{"role":"assistant","content":"b"}}],"usage":{"prompt_tokens":1,"completion_tokens":9,"total_tokens":10}}"#,
+        )
+        .await;
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "primary", "api_key": "k", "base_url": "http://127.0.0.1:9/v1", "allow_private_base_url": true},
+                {"name": "shadow-a", "api_key": "k", "base_url": url_a, "allow_private_base_url": true},
+                {"name": "shadow-b", "api_key": "k", "base_url": url_b, "allow_private_base_url": true},
+            ],
+            "shadow": {"targets": [
+                {"provider": "shadow-a", "timeout_ms": 2000, "task_timeout_ms": 2000},
+                {"provider": "shadow-b", "timeout_ms": 2000, "task_timeout_ms": 2000},
+            ]}
+        }))
+        .expect("valid two-target shadow fixture");
+        let before_a = ai_metrics::shadow_calls_value("shadow-a", "2xx", "stop");
+        let before_b = ai_metrics::shadow_calls_value("shadow-b", "2xx", "length");
+
+        let client = AiClient::with_shadow_supervisor(Arc::new(ShadowSupervisor::new(4)));
+        let outcomes = client.try_spawn_shadow(
+            &config,
+            "/v1/chat/completions",
+            &serde_json::json!({"model": "primary-model"}),
+            false,
+            &[],
+            &[],
+            false,
+            None,
+        );
+        assert_eq!(
+            outcomes,
+            vec![
+                ShadowDispatchOutcome::Spawned,
+                ShadowDispatchOutcome::Spawned
+            ]
+        );
+
+        // The tasks are detached; poll the counters rather than sleep a
+        // fixed amount, so a slow machine does not make this flaky.
+        for _ in 0..200 {
+            if ai_metrics::shadow_calls_value("shadow-a", "2xx", "stop") - before_a >= 1.0
+                && ai_metrics::shadow_calls_value("shadow-b", "2xx", "length") - before_b >= 1.0
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "both targets must record their own call: a={} b={}",
+            ai_metrics::shadow_calls_value("shadow-a", "2xx", "stop") - before_a,
+            ai_metrics::shadow_calls_value("shadow-b", "2xx", "length") - before_b,
+        );
     }
 
     #[tokio::test]
@@ -3809,7 +4652,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(outcome, ShadowDispatchOutcome::UnsupportedSurface);
+        assert_eq!(outcome, vec![ShadowDispatchOutcome::UnsupportedSurface]);
         assert_eq!(client.shadow_supervisor().available(), 1);
     }
 
@@ -3828,7 +4671,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(outcome, ShadowDispatchOutcome::StreamingSkipped);
+        assert_eq!(outcome, vec![ShadowDispatchOutcome::StreamingSkipped]);
         assert_eq!(client.shadow_supervisor().available(), 1);
     }
 
@@ -3847,7 +4690,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(outcome, ShadowDispatchOutcome::SampledOut);
+        assert_eq!(outcome, vec![ShadowDispatchOutcome::SampledOut]);
         assert_eq!(client.shadow_supervisor().available(), 1);
     }
 
@@ -3866,7 +4709,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(outcome, ShadowDispatchOutcome::ProviderNotAllowed);
+        assert_eq!(outcome, vec![ShadowDispatchOutcome::ProviderNotAllowed]);
         assert_eq!(client.shadow_supervisor().available(), 1);
     }
 
@@ -3888,7 +4731,10 @@ mod tests {
             None,
         );
 
-        assert_eq!(outcome, ShadowDispatchOutcome::PromptTrainingDisallowed);
+        assert_eq!(
+            outcome,
+            vec![ShadowDispatchOutcome::PromptTrainingDisallowed]
+        );
         assert!(
             ai_metrics::shadow_dropped_value(
                 ai_metrics::ShadowDropReason::PromptTrainingDisallowed
@@ -3920,20 +4766,16 @@ mod tests {
             None,
         );
 
-        assert_eq!(outcome, ShadowDispatchOutcome::Spawned);
+        assert_eq!(outcome, vec![ShadowDispatchOutcome::Spawned]);
     }
 
     #[tokio::test]
     async fn shadow_dispatch_records_each_closed_drop_reason_exactly_once() {
         let _metric_guard = SHADOW_METRIC_TEST_LOCK.lock().await;
-        let reasons = [
-            ai_metrics::ShadowDropReason::Streaming,
-            ai_metrics::ShadowDropReason::ProviderNotFound,
-            ai_metrics::ShadowDropReason::ProviderNotAllowed,
-            ai_metrics::ShadowDropReason::PromptTrainingDisallowed,
-            ai_metrics::ShadowDropReason::EgressDenied,
-            ai_metrics::ShadowDropReason::Saturated,
-        ];
+        // The canonical list, not a copy of it: a hand-written array
+        // here compiled fine when a variant was added and quietly
+        // stopped covering it.
+        let reasons = ai_metrics::ALL_SHADOW_DROP_REASONS;
         let snapshot = || reasons.map(ai_metrics::shadow_dropped_value);
 
         let before_sampling = snapshot();
@@ -3948,7 +4790,7 @@ mod tests {
                 false,
                 None,
             ),
-            ShadowDispatchOutcome::SampledOut
+            vec![ShadowDispatchOutcome::SampledOut]
         );
         assert_eq!(snapshot(), before_sampling, "sampling is not a drop");
 
@@ -3979,12 +4821,12 @@ mod tests {
                 false,
                 None,
             ),
-            ShadowDispatchOutcome::StreamingSkipped
+            vec![ShadowDispatchOutcome::StreamingSkipped]
         );
         assert_one_increment(before, ai_metrics::ShadowDropReason::Streaming);
 
         let mut missing = shadow_handler_config(1.0);
-        missing.shadow.as_mut().expect("shadow config").provider = "missing".to_string();
+        missing.shadow.as_mut().expect("shadow config").targets[0].provider = "missing".to_string();
         let before = snapshot();
         assert_eq!(
             client.try_spawn_shadow(
@@ -3997,7 +4839,7 @@ mod tests {
                 false,
                 None,
             ),
-            ShadowDispatchOutcome::ProviderNotFound
+            vec![ShadowDispatchOutcome::ProviderNotFound]
         );
         assert_one_increment(before, ai_metrics::ShadowDropReason::ProviderNotFound);
 
@@ -4013,7 +4855,7 @@ mod tests {
                 false,
                 None,
             ),
-            ShadowDispatchOutcome::ProviderNotAllowed
+            vec![ShadowDispatchOutcome::ProviderNotAllowed]
         );
         assert_one_increment(before, ai_metrics::ShadowDropReason::ProviderNotAllowed);
 
@@ -4029,7 +4871,7 @@ mod tests {
                 true,
                 None,
             ),
-            ShadowDispatchOutcome::PromptTrainingDisallowed
+            vec![ShadowDispatchOutcome::PromptTrainingDisallowed]
         );
         assert_one_increment(
             before,
@@ -4049,7 +4891,7 @@ mod tests {
                 false,
                 None,
             ),
-            ShadowDispatchOutcome::EgressDenied
+            vec![ShadowDispatchOutcome::EgressDenied]
         );
         assert_one_increment(before, ai_metrics::ShadowDropReason::EgressDenied);
 
@@ -4068,7 +4910,7 @@ mod tests {
                 false,
                 None,
             ),
-            ShadowDispatchOutcome::Saturated
+            vec![ShadowDispatchOutcome::Saturated]
         );
         assert_one_increment(before, ai_metrics::ShadowDropReason::Saturated);
         drop(held);
@@ -4094,7 +4936,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(outcome, ShadowDispatchOutcome::Saturated);
+        assert_eq!(outcome, vec![ShadowDispatchOutcome::Saturated]);
         assert!(
             ai_metrics::shadow_dropped_value(ai_metrics::ShadowDropReason::Saturated)
                 - dropped_before
@@ -4265,7 +5107,7 @@ mod tests {
                 false,
                 Some(usage),
             ),
-            ShadowDispatchOutcome::Spawned
+            vec![ShadowDispatchOutcome::Spawned]
         );
 
         let event = tokio::time::timeout(Duration::from_secs(2), async {
@@ -4506,6 +5348,197 @@ mod tests {
         )
     }
 
+    /// Serve a sequence of responses on one listener, one connection
+    /// each, and hand back the raw text of every request received.
+    ///
+    /// `dial_fixture` accepts a single connection, which is enough for
+    /// a refused hop but not for a redirect that is actually followed.
+    /// `build` receives the bound address so a response can name the
+    /// listener's own port, which a plain `Vec<String>` cannot do.
+    fn dial_sequence(
+        build: impl FnOnce(std::net::SocketAddr) -> Vec<String>,
+    ) -> Option<(std::net::SocketAddr, Arc<parking_lot::Mutex<Vec<String>>>)> {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+        let addr = listener.local_addr().ok()?;
+        let responses = build(addr);
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let writer = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for response in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut scratch = [0u8; 4096];
+                let read = stream.read(&mut scratch).unwrap_or(0);
+                let text = String::from_utf8_lossy(&scratch[..read]).to_string();
+                writer.lock().push(text);
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        Some((addr, seen))
+    }
+
+    /// A signer that records the URL it was handed and stamps a marker
+    /// header, so a test can see exactly when and against what the
+    /// signing boundary fired.
+    #[derive(Debug)]
+    struct RecordingSigner {
+        seen: parking_lot::Mutex<Vec<String>>,
+        fail: bool,
+    }
+
+    impl RecordingSigner {
+        fn new(fail: bool) -> Self {
+            Self {
+                seen: parking_lot::Mutex::new(Vec::new()),
+                fail,
+            }
+        }
+
+        fn urls(&self) -> Vec<String> {
+            self.seen.lock().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl OutboundSigner for RecordingSigner {
+        fn scheme(&self) -> &'static str {
+            "recording"
+        }
+
+        async fn sign(&self, request: &mut reqwest::Request) -> Result<()> {
+            self.seen.lock().push(request.url().to_string());
+            if self.fail {
+                return Err(anyhow::anyhow!("signing refused"));
+            }
+            let index = self.seen.lock().len();
+            let mut value = reqwest::header::HeaderValue::from_str(&format!("signed-{index}"))?;
+            value.set_sensitive(true);
+            request
+                .headers_mut()
+                .insert(reqwest::header::AUTHORIZATION, value);
+            Ok(())
+        }
+    }
+
+    fn sigv4_provider_json(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "provider_type": "bedrock",
+            "aws_sigv4": {"region": "us-east-1"},
+        })
+    }
+
+    #[test]
+    fn a_signed_provider_emits_no_verbatim_credential_header() {
+        // The bearer mode and the signing mode have to be exclusive at
+        // the point the header is built, not merely refused at config
+        // load, because the signer overwrites `Authorization` and a
+        // static credential riding along would be invisible.
+        let signed: ProviderConfig =
+            serde_json::from_value(sigv4_provider_json("bedrock")).expect("config parses");
+        assert!(
+            provider_auth_header(&signed)
+                .expect("header resolution succeeds")
+                .is_none(),
+            "a SigV4 provider must contribute no static credential header"
+        );
+
+        let bearer: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test",
+        }))
+        .expect("config parses");
+        let (name, value) = provider_auth_header(&bearer)
+            .expect("header resolution succeeds")
+            .expect("a bearer provider still sends its credential");
+        assert_eq!(name.as_str(), "authorization");
+        assert!(value.is_sensitive());
+    }
+
+    #[tokio::test]
+    async fn the_signer_runs_again_on_every_hop_against_the_rewritten_url() {
+        // A signature is bound to the host and path it covers, so
+        // replaying hop one's signature onto hop two is an
+        // authentication failure that looks like a network problem.
+        // `send_governed` must therefore sign after the URL rewrite,
+        // once per hop.
+        let Some((addr, seen)) = dial_sequence(|addr| {
+            vec![
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{}/v1/moved\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    addr.port()
+                ),
+                ok_response("{}"),
+            ]
+        }) else {
+            return;
+        };
+
+        let client = AiClient::new();
+        let request = client
+            .http
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .json(&serde_json::json!({"model": "m"}))
+            .build()
+            .expect("test request builds");
+        let signer = RecordingSigner::new(false);
+        let resp = send_governed(&client.http, None, "test-provider", Some(&signer), request)
+            .await
+            .expect("a same-origin hop is followed");
+        assert_eq!(resp.status().as_u16(), 200);
+
+        let urls = signer.urls();
+        assert_eq!(urls.len(), 2, "one signature per hop, got {urls:?}");
+        assert!(urls[0].ends_with("/v1/chat/completions"));
+        assert!(
+            urls[1].ends_with("/v1/moved"),
+            "the second signature must cover the redirect target, got {}",
+            urls[1]
+        );
+
+        let requests = seen.lock().clone();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0].contains("signed-1"),
+            "hop one carries the first signature"
+        );
+        assert!(
+            requests[1].contains("signed-2") && !requests[1].contains("signed-1"),
+            "hop two carries the second signature and not the first: {}",
+            requests[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_signer_failure_fails_the_attempt_without_dialing() {
+        // Fail closed. An unsigned request to a SigV4 endpoint is a 403
+        // and a wasted round trip; worse, a scheme that silently fell
+        // through would send the credential-free request as if it were
+        // fine.
+        let Some((addr, hit)) = dial_fixture(ok_response("{}")) else {
+            return;
+        };
+        let client = AiClient::new();
+        let request = client
+            .http
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .build()
+            .expect("test request builds");
+        let signer = RecordingSigner::new(true);
+        let error = send_governed(&client.http, None, "test-provider", Some(&signer), request)
+            .await
+            .expect_err("a signing failure fails the attempt");
+        assert!(format!("{error:#}").contains("signing refused"));
+        assert!(
+            !hit.load(Ordering::SeqCst),
+            "nothing may be dialed once signing has failed"
+        );
+    }
+
     #[tokio::test]
     async fn provider_dial_refuses_a_cross_origin_redirect_hop() {
         // Hop one is the host the operator configured and serves a 302
@@ -4535,7 +5568,7 @@ mod tests {
             .build()
             .expect("test request builds");
 
-        let err = send_governed(&client.http, None, "test-provider", request)
+        let err = send_governed(&client.http, None, "test-provider", None, request)
             .await
             .expect_err("a cross-origin hop must be refused, not followed");
         let rendered = format!("{err:#}");
@@ -4568,7 +5601,7 @@ mod tests {
             .get(format!("http://{addr}/v1/models"))
             .build()
             .expect("test request builds");
-        let resp = send_governed(&client.http, None, "test-provider", request)
+        let resp = send_governed(&client.http, None, "test-provider", None, request)
             .await
             .expect("a non-redirect response returns unchanged");
         assert_eq!(resp.status().as_u16(), 200);

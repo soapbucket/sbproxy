@@ -24,6 +24,42 @@
 //! events are opt-in and absent by default. Pooling would need one pool
 //! per tenant to avoid state bleeding between them, which is the same
 //! reasoning that keeps the WASM path on a fresh `Store` per call.
+//!
+//! What is *not* per-evaluation is the Lua **engine**. A
+//! `sbproxy_extension::lua::LuaEngine` holds no Lua state: it is a
+//! snapshot of the sandbox limits, and every `execute` builds its own
+//! fresh `mlua::Lua`. Constructing one still costs a throwaway state
+//! (`with_config` builds one so allocator and sandbox setup errors
+//! surface at construction rather than on the first script), so calling
+//! `LuaEngine::new()` per evaluation built **two** VMs where one was
+//! needed. The `"lua"` arm takes the process-wide engine
+//! `crate::server::shared_lua_engine` instead, which is the same
+//! instance the script modifiers use and drops the count back to one
+//! with no isolation traded away.
+//!
+//! The `"js"` arm deliberately does not do this. A `JsEngine` owns a
+//! live QuickJS context that `execute` reuses, so one shared instance
+//! would carry whatever one tenant's script left behind into the next
+//! tenant's evaluation. That is the cross-tenant channel this module
+//! exists to avoid, so JS keeps a per-evaluation engine.
+//!
+//! ## Who calls this
+//!
+//! `evaluate` is **blocking**, by design: an operator script runs to its
+//! CPU budget (`max_execution_ms`, 100 ms by default) with no await
+//! points, and a Luau interrupt only fires between back-edges. Every
+//! caller therefore runs it through `tokio::task::spawn_blocking` rather
+//! than inline on a reactor thread, because a script that burns its
+//! whole budget on the reactor stalls every other connection that
+//! worker owns for the duration.
+//!
+//! What that does **not** cover, so nobody reads it wider than it is:
+//! only the decision events routed through this module. `custom_log`,
+//! the `lua` transform, the WAF's Lua matcher and the MCP action each
+//! still build a `LuaEngine` per invocation and each still evaluate
+//! inline on whatever thread called them. The remedy there is the same
+//! two lines, but those are separate hot files and folding them in here
+//! would say more than this change did.
 
 use std::collections::HashMap;
 
@@ -74,7 +110,16 @@ pub(crate) fn evaluate(
     globals.insert("ctx".to_owned(), context.clone());
 
     match script.engine.as_str() {
-        "lua" => match sbproxy_extension::lua::LuaEngine::new() {
+        // WOR-2404: the shared engine, not `LuaEngine::new()`. The
+        // engine is a sandbox-limits snapshot with no Lua state of its
+        // own, so reusing it isolates nothing less than a fresh one
+        // does: `execute` still builds its own `mlua::Lua` per call.
+        // What it removes is the throwaway state `with_config` builds to
+        // surface setup errors early, which made every evaluation pay
+        // for two VMs. A hot reload of `proxy.scripting.lua.sandbox`
+        // swaps the cached engine, so a limits change still reaches the
+        // next evaluation.
+        "lua" => match crate::server::shared_lua_engine() {
             Ok(engine) => match engine.execute(&script.source, globals) {
                 Ok(value) => Ok(value),
                 Err(error) => {

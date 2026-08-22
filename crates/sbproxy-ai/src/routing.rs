@@ -14,7 +14,10 @@ use serde::{Deserialize, Deserializer};
 
 use crate::provider::ProviderConfig;
 use crate::provider_ratelimit::{ProviderQuotaSnapshot, ProviderRateLimitTracker};
-use crate::routing_state::{PrefixAffinityConfig, PrefixDigest, ReplicaRoutingState};
+use crate::routing_state::{
+    CacheAffinityConfig, CacheAffinityKey, CacheAffinityLookup, PrefixAffinityConfig, PrefixDigest,
+    ReplicaRoutingState,
+};
 
 /// Explicit reason a policy-filtered selection fell back to round-robin.
 ///
@@ -38,6 +41,37 @@ pub fn provider_allowed_by_policy(
 ) -> bool {
     !blocked.iter().any(|name| name == provider_name)
         && (allowed.is_empty() || allowed.iter().any(|name| name == provider_name))
+}
+
+/// The snake_case wire name of a routing strategy.
+///
+/// A free function rather than a `Router` method because a named model
+/// group carries its own strategy without a router of its own, and the
+/// two must render the same name: the group listing and the load
+/// balancer's `strategy` label are read side by side.
+#[must_use]
+pub fn strategy_name(strategy: &RoutingStrategy) -> &'static str {
+    match strategy {
+        RoutingStrategy::RoundRobin => "round_robin",
+        RoutingStrategy::Weighted => "weighted",
+        RoutingStrategy::FallbackChain => "fallback_chain",
+        RoutingStrategy::Random => "random",
+        RoutingStrategy::LowestLatency => "lowest_latency",
+        RoutingStrategy::LeastConnections => "least_connections",
+        RoutingStrategy::CostOptimized => "cost_optimized",
+        RoutingStrategy::TokenRate => "token_rate",
+        RoutingStrategy::LeastTokenUsage => "least_token_usage",
+        RoutingStrategy::PrefixAffinity(_) => "prefix_affinity",
+        RoutingStrategy::Sticky => "sticky",
+        RoutingStrategy::Race => "race",
+        RoutingStrategy::PeakEwma(_) => "peak_ewma",
+        RoutingStrategy::Cascade(_) => "cascade",
+        RoutingStrategy::CostQuality(_) => "cost_quality",
+        RoutingStrategy::OutcomeAware => "outcome_aware",
+        RoutingStrategy::Headroom => "headroom",
+        RoutingStrategy::ResetAware => "reset_aware",
+        RoutingStrategy::SemanticRoute(_) => "semantic_route",
+    }
 }
 
 /// Strategy for selecting a provider.
@@ -357,6 +391,12 @@ pub struct ProviderRuntimeState {
 pub struct Router {
     strategy: RoutingStrategy,
     counter: AtomicU64,
+    /// One rotation cursor per named model group (WOR-2657), sized at
+    /// creation from the config's group list. Sharing `counter` would
+    /// make two `round_robin` groups interleave each other's rotation,
+    /// so a two-member group would alternate only when the other group
+    /// happened not to be taking traffic.
+    group_counters: std::collections::HashMap<String, AtomicU64>,
     /// Round-robin cursor for outcome-aware warm-up traffic. Kept separate
     /// from the confidence schedule so learned slots cannot starve whichever
     /// providers occupy the same schedule positions.
@@ -466,6 +506,7 @@ impl Router {
         Self {
             strategy,
             counter: AtomicU64::new(0),
+            group_counters: std::collections::HashMap::new(),
             outcome_fallback_counter: AtomicU64::new(0),
             latencies,
             peak_ewma,
@@ -556,6 +597,86 @@ impl Router {
     pub fn with_outlier_detection(mut self, config: OutlierDetectorConfig) -> Self {
         self.outlier = Some(Arc::new(OutlierDetector::new(config)));
         self
+    }
+
+    /// Give each named model group its own rotation cursor (WOR-2657).
+    ///
+    /// Sized from the config's group list at construction, for the same
+    /// reason the per-provider vectors are: a cursor allocated lazily on
+    /// the request path would need a lock, and a cursor shared between
+    /// groups makes each group's rotation depend on the other group's
+    /// traffic.
+    ///
+    /// A group absent from this list falls back to the action's own
+    /// cursor in [`Self::select_group`]. That can only happen when a
+    /// router was built without its config's groups, which
+    /// `AiHandlerConfig::router` does not do.
+    #[must_use]
+    pub fn with_model_groups<'a>(mut self, names: impl IntoIterator<Item = &'a str>) -> Self {
+        self.group_counters = names
+            .into_iter()
+            .map(|name| (name.to_string(), AtomicU64::new(0)))
+            .collect();
+        self
+    }
+
+    /// Pick one member of a named model group.
+    ///
+    /// `candidates` is the caller's already-permitted provider index
+    /// set, narrowed to the group's members: credential provider
+    /// policy, the enabled switch, and the resilience axes have run
+    /// before this. Selection uses the **group's** strategy and, under
+    /// `weighted`, the **member's** weight rather than the provider's,
+    /// on the group's own rotation cursor.
+    ///
+    /// Members are keyed by provider index, which the config validator
+    /// makes unambiguous by refusing two members on one provider.
+    pub fn select_group(
+        &self,
+        providers: &[ProviderConfig],
+        candidate_indices: &[usize],
+        group: &crate::model_group::ModelGroup,
+    ) -> Option<usize> {
+        // Only the `Weighted` arm reads the map, so the other twelve
+        // strategies do not pay a per-request allocation on the AI
+        // request path for a field they ignore.
+        let member_weights: Option<std::collections::HashMap<usize, u32>> =
+            matches!(group.routing, RoutingStrategy::Weighted).then(|| {
+                group
+                    .members
+                    .iter()
+                    .filter_map(|member| {
+                        providers
+                            .iter()
+                            .position(|provider| provider.name.as_str() == member.provider.as_str())
+                            .map(|index| (index, member.weight))
+                    })
+                    .collect()
+            });
+        let enabled = candidate_indices
+            .iter()
+            .filter_map(|&index| providers.get(index).map(|provider| (index, provider)))
+            .collect::<Vec<_>>();
+        let counter = self
+            .group_counters
+            .get(group.name.as_str())
+            .unwrap_or(&self.counter);
+        let picked = self.select_from_candidates_with(
+            &enabled,
+            false,
+            &group.routing,
+            counter,
+            member_weights.as_ref(),
+        );
+        if let Some(index) = picked {
+            if let Some(provider) = providers.get(index) {
+                crate::ai_metrics::record_model_group_selection(
+                    group.name.as_str(),
+                    provider.name.as_str(),
+                );
+            }
+        }
+        picked
     }
 
     /// Attach the per-error-class cooldown policy (WOR-2556).
@@ -1067,13 +1188,44 @@ impl Router {
         self.select_from_candidates(&enabled, false)
     }
 
-    /// Shared strategy dispatch over an already-narrowed candidate list.
+    /// Shared strategy dispatch over an already-narrowed candidate list,
+    /// using this router's own strategy and rotation cursor.
+    ///
     /// When `record_fallback` is true, intentional round-robin fallbacks
     /// (missing prefix/session signal) are recorded for tests and ops.
     fn select_from_candidates(
         &self,
         enabled: &[(usize, &ProviderConfig)],
         record_fallback: bool,
+    ) -> Option<usize> {
+        self.select_from_candidates_with(
+            enabled,
+            record_fallback,
+            &self.strategy,
+            &self.counter,
+            None,
+        )
+    }
+
+    /// The same dispatch, parameterized on the strategy, the rotation
+    /// cursor, and an optional per-candidate weight override.
+    ///
+    /// A named model group ([`Self::select_group`]) supplies all three:
+    /// its own strategy, its own cursor so two groups do not interleave
+    /// each other's rotation, and its members' weights, which live on
+    /// the group entry rather than on `ProviderConfig`. Only the
+    /// `Weighted` arm reads `member_weights`; every other axis
+    /// (breakers, latency, sticky, replica state, quota) is per-provider
+    /// runtime state and stays on `&self`, shared with the action's own
+    /// selections, which is what makes a group's picks respond to the
+    /// same live signals.
+    fn select_from_candidates_with(
+        &self,
+        enabled: &[(usize, &ProviderConfig)],
+        record_fallback: bool,
+        strategy: &RoutingStrategy,
+        counter: &AtomicU64,
+        member_weights: Option<&std::collections::HashMap<usize, u32>>,
     ) -> Option<usize> {
         if enabled.is_empty() {
             if record_fallback {
@@ -1095,26 +1247,39 @@ impl Router {
             }
         };
 
-        match self.strategy {
+        match strategy {
             RoutingStrategy::RoundRobin => {
                 clear_fallback();
-                let idx = self.counter.fetch_add(1, Ordering::Relaxed);
+                let idx = counter.fetch_add(1, Ordering::Relaxed);
                 Some(enabled[idx as usize % enabled.len()].0)
             }
             RoutingStrategy::Weighted => {
                 clear_fallback();
-                let total: u32 = enabled.iter().map(|(_, p)| p.weight).sum();
+                // A group's weights live on its members, not on the
+                // providers, so a provider carrying `weight: 1` for the
+                // action's own balancing does not also decide a group's
+                // split. Absent an override this reads `p.weight`
+                // exactly as before.
+                let weight_of = |idx: usize, provider: &ProviderConfig| -> u32 {
+                    member_weights
+                        .and_then(|weights| weights.get(&idx).copied())
+                        .unwrap_or(provider.weight)
+                };
+                let total: u64 = enabled
+                    .iter()
+                    .map(|&(idx, p)| u64::from(weight_of(idx, p)))
+                    .sum();
                 if total == 0 {
                     return Some(enabled[0].0);
                 }
-                let counter = self.counter.fetch_add(1, Ordering::Relaxed);
-                let mut target =
-                    (counter.wrapping_mul(6364136223846793005).wrapping_add(1)) % total as u64;
+                let cursor = counter.fetch_add(1, Ordering::Relaxed);
+                let mut target = (cursor.wrapping_mul(6364136223846793005).wrapping_add(1)) % total;
                 for &(idx, provider) in enabled {
-                    if target < provider.weight as u64 {
+                    let weight = u64::from(weight_of(idx, provider));
+                    if target < weight {
                         return Some(idx);
                     }
-                    target -= provider.weight as u64;
+                    target -= weight;
                 }
                 Some(enabled[0].0)
             }
@@ -1126,7 +1291,7 @@ impl Router {
             }
             RoutingStrategy::Random => {
                 clear_fallback();
-                let idx = self.counter.fetch_add(1, Ordering::Relaxed);
+                let idx = counter.fetch_add(1, Ordering::Relaxed);
                 let hash = idx
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);
@@ -1156,8 +1321,8 @@ impl Router {
                     best_idx.or(Some(enabled[0].0))
                 } else {
                     mark_missing_signal();
-                    let counter = self.counter.fetch_add(1, Ordering::Relaxed);
-                    Some(enabled[counter as usize % enabled.len()].0)
+                    let cursor = counter.fetch_add(1, Ordering::Relaxed);
+                    Some(enabled[cursor as usize % enabled.len()].0)
                 }
             }
             RoutingStrategy::PeakEwma(_) => {
@@ -1165,7 +1330,7 @@ impl Router {
                 if enabled.len() == 1 {
                     return Some(enabled[0].0);
                 }
-                let c = self.counter.fetch_add(1, Ordering::Relaxed);
+                let c = counter.fetch_add(1, Ordering::Relaxed);
                 let a =
                     (c.wrapping_mul(6364136223846793005).wrapping_add(1)) as usize % enabled.len();
                 let mut b = (c.wrapping_mul(2862933555777941757).wrapping_add(3037000493)) as usize
@@ -1247,20 +1412,20 @@ impl Router {
             RoutingStrategy::PrefixAffinity(_) => {
                 // Basic select API has no prefix; intentional RR fallback.
                 mark_missing_signal();
-                let counter = self.counter.fetch_add(1, Ordering::Relaxed);
-                Some(enabled[counter as usize % enabled.len()].0)
+                let cursor = counter.fetch_add(1, Ordering::Relaxed);
+                Some(enabled[cursor as usize % enabled.len()].0)
             }
             RoutingStrategy::LeastTokenUsage => {
                 clear_fallback();
                 let candidates = enabled.iter().map(|(idx, _)| *idx).collect::<Vec<_>>();
-                let tie_cursor = self.counter.fetch_add(1, Ordering::Relaxed);
+                let tie_cursor = counter.fetch_add(1, Ordering::Relaxed);
                 self.replica_state.least_loaded(&candidates, tie_cursor)
             }
             RoutingStrategy::Sticky => {
                 // Sticky without a session key: intentional RR fallback.
                 mark_missing_signal();
-                let counter = self.counter.fetch_add(1, Ordering::Relaxed);
-                Some(enabled[counter as usize % enabled.len()].0)
+                let cursor = counter.fetch_add(1, Ordering::Relaxed);
+                Some(enabled[cursor as usize % enabled.len()].0)
             }
             RoutingStrategy::Race => {
                 clear_fallback();
@@ -1288,7 +1453,7 @@ impl Router {
             }
             RoutingStrategy::OutcomeAware => {
                 clear_fallback();
-                self.select_outcome_aware(enabled)
+                self.select_outcome_aware(enabled, counter)
             }
             RoutingStrategy::Headroom => {
                 clear_fallback();
@@ -1307,8 +1472,8 @@ impl Router {
                 // where the embedding, the floor, and the declared
                 // `fallback` deployment apply.
                 mark_missing_signal();
-                let counter = self.counter.fetch_add(1, Ordering::Relaxed);
-                Some(enabled[counter as usize % enabled.len()].0)
+                let cursor = counter.fetch_add(1, Ordering::Relaxed);
+                Some(enabled[cursor as usize % enabled.len()].0)
             }
         }
     }
@@ -1383,13 +1548,17 @@ impl Router {
     /// fallback has its own cursor, so learned schedule positions cannot
     /// starve providers of exploration. A fresh process still begins with
     /// pure round-robin.
-    fn select_outcome_aware(&self, enabled: &[(usize, &ProviderConfig)]) -> Option<usize> {
+    fn select_outcome_aware(
+        &self,
+        enabled: &[(usize, &ProviderConfig)],
+        counter: &AtomicU64,
+    ) -> Option<usize> {
         if enabled.is_empty() {
             return None;
         }
         let names: Vec<&str> = enabled.iter().map(|(_, p)| p.name.as_str()).collect();
         let store = crate::routing_feedback::FeedbackStore::global();
-        let cursor = self.counter.fetch_add(1, Ordering::Relaxed);
+        let cursor = counter.fetch_add(1, Ordering::Relaxed);
         let (learned_slots, total_slots) = store.confidence(&names);
         if learned_slots > 0 && cursor % total_slots < learned_slots {
             if let Some(pos) = store.best_among(&names) {
@@ -1489,6 +1658,94 @@ impl Router {
         Some(picked)
     }
 
+    /// Arm caller-keyed prompt-cache affinity for this router.
+    ///
+    /// Builder-shaped like [`Self::with_circuit_breakers`] and attached by
+    /// the origin's `cache_affinity` block and by nothing else, so a router
+    /// whose operator did not ask for affinity allocates no lease tables.
+    /// Bounds are validated at config load, so a rejection here means the
+    /// load-time check was bypassed. The router stays usable with affinity
+    /// off and logs the reason rather than panicking a live proxy.
+    #[must_use]
+    pub fn with_cache_affinity(mut self, config: CacheAffinityConfig) -> Self {
+        let provider_count = self.latencies.len();
+        if let Err(error) = self
+            .replica_state
+            .enable_cache_affinity(provider_count, config)
+        {
+            tracing::error!(
+                %error,
+                "ai prompt-cache affinity bounds rejected; affinity stays disabled"
+            );
+        }
+        self
+    }
+
+    /// Whether caller-keyed prompt-cache affinity is armed on this router.
+    #[must_use]
+    pub fn cache_affinity_enabled(&self) -> bool {
+        self.replica_state.cache_affinity_enabled()
+    }
+
+    /// Prefer the provider already holding this caller's warm prompt cache.
+    ///
+    /// Returns an index from `candidate_indices` only. The list is first
+    /// narrowed by [`Self::eligible_candidate_indices`], so health, circuit
+    /// breakers, outlier ejection, and everything the dispatcher already
+    /// filtered on keep winning: this is a preference over the strategy's
+    /// pick, never a pin. `None` leaves the strategy's ordering untouched.
+    ///
+    /// Every call records exactly one
+    /// `sbproxy_ai_cache_affinity_decisions_total` outcome. The dispatcher
+    /// records `missing_signal` on the requests that never reach here for
+    /// want of a cache key, so the five outcomes together total the requests
+    /// an affinity-enabled origin evaluated.
+    pub fn select_cache_affinity(
+        &self,
+        providers: &[ProviderConfig],
+        key: &CacheAffinityKey,
+        resolved_model: &str,
+        candidate_indices: &[usize],
+    ) -> Option<usize> {
+        if !self.replica_state.cache_affinity_enabled() {
+            return None;
+        }
+        let eligible = self.eligible_candidate_indices(providers, candidate_indices);
+        match self
+            .replica_state
+            .select_cache_holder(key, resolved_model, &eligible)
+        {
+            CacheAffinityLookup::Hit(provider_idx) => {
+                crate::ai_metrics::record_cache_affinity_decision("hit");
+                Some(provider_idx)
+            }
+            CacheAffinityLookup::Miss => {
+                crate::ai_metrics::record_cache_affinity_decision("miss");
+                None
+            }
+            CacheAffinityLookup::Ineligible => {
+                crate::ai_metrics::record_cache_affinity_decision("ineligible");
+                None
+            }
+            CacheAffinityLookup::ModelChanged => {
+                crate::ai_metrics::record_cache_affinity_decision("model_changed");
+                None
+            }
+        }
+    }
+
+    /// Record that an accepted response left one provider holding this
+    /// caller's warm prompt cache for `resolved_model`.
+    pub fn record_cache_affinity(
+        &self,
+        provider_idx: usize,
+        key: CacheAffinityKey,
+        resolved_model: &str,
+    ) {
+        self.replica_state
+            .record_cache_holder(provider_idx, key, resolved_model);
+    }
+
     /// Record that an accepted response populated one provider's prefix cache.
     pub fn record_prefix(&self, provider_idx: usize, prefix: PrefixDigest) {
         self.replica_state.record_prefix(provider_idx, prefix);
@@ -1514,27 +1771,7 @@ impl Router {
     /// `strategy` label on `sbproxy_ai_lb_decisions_total` and any
     /// other strategy-tagged telemetry.
     pub fn strategy_name(&self) -> &'static str {
-        match self.strategy {
-            RoutingStrategy::RoundRobin => "round_robin",
-            RoutingStrategy::Weighted => "weighted",
-            RoutingStrategy::FallbackChain => "fallback_chain",
-            RoutingStrategy::Random => "random",
-            RoutingStrategy::LowestLatency => "lowest_latency",
-            RoutingStrategy::LeastConnections => "least_connections",
-            RoutingStrategy::CostOptimized => "cost_optimized",
-            RoutingStrategy::TokenRate => "token_rate",
-            RoutingStrategy::LeastTokenUsage => "least_token_usage",
-            RoutingStrategy::PrefixAffinity(_) => "prefix_affinity",
-            RoutingStrategy::Sticky => "sticky",
-            RoutingStrategy::Race => "race",
-            RoutingStrategy::PeakEwma(_) => "peak_ewma",
-            RoutingStrategy::Cascade(_) => "cascade",
-            RoutingStrategy::CostQuality(_) => "cost_quality",
-            RoutingStrategy::OutcomeAware => "outcome_aware",
-            RoutingStrategy::Headroom => "headroom",
-            RoutingStrategy::ResetAware => "reset_aware",
-            RoutingStrategy::SemanticRoute(_) => "semantic_route",
-        }
+        strategy_name(&self.strategy)
     }
 
     /// Returns true when the configured strategy is `Cascade`. The
@@ -1717,7 +1954,12 @@ mod tests {
             allow_private_base_url: false,
             no_prompt_training: false,
             data_posture: None,
+            service_tier: None,
+            on_key_failure: crate::provider::KeyFailurePosture::Fallback,
+            fallback_credential_id: None,
             serve: None,
+            aws_sigv4: None,
+            bedrock_guardrail: None,
         }
     }
 
@@ -3298,6 +3540,86 @@ mod tests {
         );
     }
 
+    // --- WOR-2651: caller-keyed prompt-cache affinity ---
+
+    fn affinity_key(caller_key: &str) -> crate::routing_state::CacheAffinityKey {
+        crate::routing_state::CacheAffinityKey::derive(
+            crate::routing_state::CacheAffinityKeyInput {
+                tenant_id: "tenant-a",
+                credential_identity: "key-1",
+                origin: "ai.test",
+                api_surface: "chat_completions",
+                caller_key,
+            },
+        )
+    }
+
+    /// Affinity is a preference, never a pin. The lease holder still has to
+    /// clear the resilience filter the dispatcher already applied, or a
+    /// single ejected provider would keep serving every request its lease
+    /// names.
+    #[test]
+    fn an_unhealthy_lease_holder_is_skipped() {
+        let providers = vec![
+            make_provider("healthy", 1, None, true),
+            make_provider("lease-holder", 1, None, true),
+        ];
+        let router = Router::new(RoutingStrategy::RoundRobin, providers.len())
+            .with_cache_affinity(crate::routing_state::CacheAffinityConfig::default());
+        let key = affinity_key("session-7");
+        router.record_cache_affinity(1, key, "gpt-4o");
+
+        assert_eq!(
+            router.select_cache_affinity(&providers, &key, "gpt-4o", &[0, 1]),
+            Some(1)
+        );
+
+        router.set_provider_health(1, false);
+        assert_eq!(
+            router.select_cache_affinity(&providers, &key, "gpt-4o", &[0, 1]),
+            None,
+            "an ejected lease holder must leave the strategy's own pick in place"
+        );
+    }
+
+    /// The lease composes with the strategy rather than replacing it: the
+    /// router is a plain round robin and still answers the lookup.
+    #[test]
+    fn cache_affinity_answers_under_a_non_affinity_strategy() {
+        let providers = vec![
+            make_provider("a", 1, None, true),
+            make_provider("b", 1, None, true),
+        ];
+        let router = Router::new(RoutingStrategy::RoundRobin, providers.len())
+            .with_cache_affinity(crate::routing_state::CacheAffinityConfig::default());
+        assert!(router.cache_affinity_enabled());
+        let key = affinity_key("session-7");
+        assert_eq!(
+            router.select_cache_affinity(&providers, &key, "gpt-4o", &[0, 1]),
+            None
+        );
+        router.record_cache_affinity(0, key, "gpt-4o");
+        assert_eq!(
+            router.select_cache_affinity(&providers, &key, "gpt-4o", &[0, 1]),
+            Some(0)
+        );
+    }
+
+    /// An origin without the config key gets no lease table, so the lookup
+    /// short-circuits before it can allocate or record anything.
+    #[test]
+    fn an_unconfigured_router_never_leases() {
+        let providers = vec![make_provider("a", 1, None, true)];
+        let router = Router::new(RoutingStrategy::RoundRobin, providers.len());
+        assert!(!router.cache_affinity_enabled());
+        let key = affinity_key("session-7");
+        router.record_cache_affinity(0, key, "gpt-4o");
+        assert_eq!(
+            router.select_cache_affinity(&providers, &key, "gpt-4o", &[0]),
+            None
+        );
+    }
+
     // --- WOR-1881: headroom / reset-aware / explicit filtered fallback ---
 
     #[test]
@@ -3454,6 +3776,139 @@ mod tests {
         assert_eq!(
             router.last_filtered_fallback(),
             Some(FilteredSelectionFallback::RoundRobinMissingSignal)
+        );
+    }
+
+    // --- Named model groups (WOR-2657) ---
+
+    fn group_fixture(
+        name: &str,
+        routing: &str,
+        members: &[(&str, &str, u32)],
+    ) -> crate::model_group::ModelGroup {
+        let members: Vec<serde_json::Value> = members
+            .iter()
+            .map(|(provider, model, weight)| {
+                serde_json::json!({"provider": provider, "model": model, "weight": weight})
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "routing": routing,
+            "members": members,
+        }))
+        .expect("group fixture parses")
+    }
+
+    #[test]
+    fn a_weighted_group_splits_by_member_weight_not_provider_weight() {
+        // Both providers carry `weight: 1`, which is what the action's
+        // own weighted balancing would use. The group's 9/1 split has to
+        // come from the members instead, or the pick is the action's
+        // balance wearing the group's name.
+        let providers = vec![
+            make_provider("openai-a", 1, None, true),
+            make_provider("azure-b", 1, None, true),
+        ];
+        let group = group_fixture(
+            "pool",
+            "weighted",
+            &[("openai-a", "gpt-4o-mini", 9), ("azure-b", "deployment", 1)],
+        );
+        let router =
+            Router::new(RoutingStrategy::RoundRobin, providers.len()).with_model_groups(["pool"]);
+
+        let mut counts = [0u32; 2];
+        for _ in 0..100 {
+            let picked = router
+                .select_group(&providers, &[0, 1], &group)
+                .expect("a two-member group always picks");
+            counts[picked] += 1;
+        }
+        // The weighted arm hashes a monotonic cursor, so the split is
+        // deterministic rather than sampled: assert the exact counts.
+        assert_eq!(
+            counts,
+            [90, 10],
+            "the group must split 9:1 by member weight; equal provider weights would give 100:0"
+        );
+    }
+
+    #[test]
+    fn the_group_strategy_overrides_the_action_strategy() {
+        // The action is `fallback_chain`, which always returns the
+        // lowest-priority provider. A group asking for round_robin must
+        // rotate anyway.
+        let providers = vec![
+            make_provider("a", 1, Some(0), true),
+            make_provider("b", 1, Some(1), true),
+        ];
+        let group = group_fixture("pool", "round_robin", &[("a", "m1", 1), ("b", "m2", 1)]);
+        let router = Router::new(RoutingStrategy::FallbackChain, providers.len())
+            .with_model_groups(["pool"]);
+
+        let picks: Vec<usize> = (0..4)
+            .map(|_| {
+                router
+                    .select_group(&providers, &[0, 1], &group)
+                    .expect("group picks")
+            })
+            .collect();
+        assert_eq!(picks, vec![0, 1, 0, 1], "the group's own strategy decides");
+    }
+
+    #[test]
+    fn two_groups_do_not_share_a_rotation_cursor() {
+        // Interleaved selections. On a shared cursor each group would
+        // see every other tick and would pin to one member forever; on
+        // its own cursor each rotates.
+        let providers = vec![
+            make_provider("a", 1, None, true),
+            make_provider("b", 1, None, true),
+        ];
+        let left = group_fixture("left", "round_robin", &[("a", "m1", 1), ("b", "m2", 1)]);
+        let right = group_fixture("right", "round_robin", &[("a", "m1", 1), ("b", "m2", 1)]);
+        let router = Router::new(RoutingStrategy::RoundRobin, providers.len())
+            .with_model_groups(["left", "right"]);
+
+        let mut left_picks = Vec::new();
+        let mut right_picks = Vec::new();
+        for _ in 0..4 {
+            left_picks.push(
+                router
+                    .select_group(&providers, &[0, 1], &left)
+                    .expect("left"),
+            );
+            right_picks.push(
+                router
+                    .select_group(&providers, &[0, 1], &right)
+                    .expect("right"),
+            );
+        }
+        assert_eq!(left_picks, vec![0, 1, 0, 1]);
+        assert_eq!(right_picks, vec![0, 1, 0, 1]);
+    }
+
+    #[test]
+    fn a_group_pick_never_reads_the_action_cursor() {
+        // The action's own rotation and a group's must not advance each
+        // other: a request routed by the action between two group
+        // requests would otherwise skip the group's next member.
+        let providers = vec![
+            make_provider("a", 1, None, true),
+            make_provider("b", 1, None, true),
+        ];
+        let group = group_fixture("pool", "round_robin", &[("a", "m1", 1), ("b", "m2", 1)]);
+        let router =
+            Router::new(RoutingStrategy::RoundRobin, providers.len()).with_model_groups(["pool"]);
+
+        assert_eq!(router.select_group(&providers, &[0, 1], &group), Some(0));
+        // One action-level selection in between.
+        assert_eq!(router.select(&providers), Some(0));
+        assert_eq!(
+            router.select_group(&providers, &[0, 1], &group),
+            Some(1),
+            "the action's rotation must not consume the group's cursor"
         );
     }
 }

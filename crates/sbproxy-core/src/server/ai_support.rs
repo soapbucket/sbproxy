@@ -1902,6 +1902,52 @@ pub(super) fn map_upstream_failure(e: &Error) -> (u16, Option<&'static str>) {
     }
 }
 
+/// Rebuild an origin-form request URI as the absolute URI RFC 9421
+/// §2.2.2 defines `@target-uri` as.
+///
+/// The scheme is not on an HTTP/1.1 request line and the authority is
+/// only in the `Host` header, so the middleware that derives
+/// `@target-uri` cannot see either. This is the layer that can: the
+/// caller knows whether the listener terminated TLS. Stamping both onto
+/// the URI here means the verifier reconstructs the same absolute URI a
+/// conformant signer signed, instead of guessing.
+///
+/// Returns the URI unchanged when it already carries a scheme (HTTP/2,
+/// where pingora fills the pseudo-headers in) or when nothing names an
+/// authority (HTTP/1.0 with no `Host`), because there is nothing to
+/// assemble then.
+pub(super) fn absolute_request_uri(
+    uri: &http::Uri,
+    headers: &http::HeaderMap,
+    scheme: &str,
+) -> http::Uri {
+    if uri.scheme().is_some() {
+        return uri.clone();
+    }
+    let Some(authority) = uri.authority().map(|a| a.as_str().to_string()).or_else(|| {
+        headers
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    }) else {
+        return uri.clone();
+    };
+    let path_and_query = uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    http::Uri::builder()
+        .scheme(scheme)
+        .authority(authority.as_str())
+        .path_and_query(path_and_query.as_str())
+        .build()
+        // An authority the `Host` header carried can be anything a
+        // client typed, so the build can fail. Falling back to the
+        // origin form keeps verification on the derivation it had
+        // before rather than failing the request here.
+        .unwrap_or_else(|_| uri.clone())
+}
+
 /// Build the `http::Request<bytes::Bytes>` view of the inbound
 /// Pingora session that the RFC 9421 verifier expects.
 ///
@@ -1911,13 +1957,19 @@ pub(super) fn map_upstream_failure(e: &Error) -> (u16, Option<&'static str>) {
 /// whose signature covers no body component, and the drained replay
 /// buffer when it does; a partial body would be worse than no body,
 /// because it fails a signature that is in fact valid.
+///
+/// `scheme` is `https` when the listener terminated TLS (or a trusted
+/// proxy said so) and `http` otherwise. It is stamped onto the
+/// reconstructed URI so `@target-uri` and `@scheme` derive the values
+/// the client's own signer used.
 pub(super) fn build_signature_verification_request(
     session: &Session,
     body: bytes::Bytes,
+    scheme: &str,
 ) -> Option<http::Request<bytes::Bytes>> {
     let req_header = session.req_header();
     let method = req_header.method.clone();
-    let uri = req_header.uri.clone();
+    let uri = absolute_request_uri(&req_header.uri, &req_header.headers, scheme);
     let mut builder = http::Request::builder().method(method).uri(uri);
     if let Some(hmap) = builder.headers_mut() {
         for (name, value) in &req_header.headers {
@@ -2037,9 +2089,19 @@ pub(super) fn emit_ai_billing_event(
     // join on provider+model. The recorder skips zero counts, so an
     // image / audio event records its USD cost without phantom token
     // rows.
-    let (input_tokens, output_tokens) = match &usage {
-        sbproxy_ai::budget::AiUsage::Tokens { input, output, .. } => (*input, *output),
-        _ => (0, 0),
+    // WOR-2651: the cache subsets travel with the usage and were being
+    // dropped here, so a prompt-cache hit showed up in dollars (the cost
+    // math already discounts it) and nowhere in tokens. They are subsets of
+    // `input`, not additions to it, so a sum across the `direction` label
+    // double counts; each direction is its own series for that reason.
+    let (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens) = match &usage {
+        sbproxy_ai::budget::AiUsage::Tokens {
+            input,
+            output,
+            cached_input,
+            cache_creation,
+        } => (*input, *output, *cached_input, *cache_creation),
+        _ => (0, 0, 0, 0),
     };
     let model_label = model.as_deref().unwrap_or("");
     ai_span.record("gen_ai.system", provider_name);
@@ -2061,8 +2123,8 @@ pub(super) fn emit_ai_billing_event(
         tags,
         input_tokens,
         output_tokens,
-        0,
-        0,
+        cache_read_tokens,
+        cache_write_tokens,
         0,
         cost_usd,
     );
@@ -2269,6 +2331,15 @@ fn usage_event_from_context(
         // is present exactly when the request never left the box.
         logical_model: ctx.ai_logical_model.clone(),
         served_model: ctx.ai_serve_model.clone(),
+        // Both are shadow-row fields. `shadow_of` because an ordinary
+        // completion is nobody's shadow; `finish_reason` because the
+        // primary's reasons reach the request span as
+        // `gen_ai.response.finish_reasons` and nothing carries them
+        // this far, so putting a value here would mean re-parsing the
+        // response body on the billing path.
+        finish_reason: None,
+        shadow_of: None,
+        credential_source: ctx.ai_credential_source.map(str::to_string),
     }
 }
 
@@ -3170,24 +3241,45 @@ pub(super) async fn send_response_with_extra(
 ///
 /// `original` is the inbound native bytes (Anthropic Messages JSON
 /// today). `resolved_model` is the post-`map_model` model name the
-/// router chose. The helper rewrites `body["model"]` in the native
-/// JSON when it differs from the original, then reserialises. When no
-/// remap is needed (the common case for native-native traffic where
-/// operators do not configure a model_map), the original bytes are
-/// returned as-is so the request truly is a byte forward.
+/// router chose. `operator_tier` is the provider entry's resolved
+/// service tier as a `(wire field, wire value)` pair, or `None` when the
+/// entry declares none.
+///
+/// The helper rewrites `body["model"]` and the tier field in the native
+/// JSON when either differs from the original, then reserialises. When
+/// neither needs a rewrite (the common case for native-native traffic
+/// where operators configure no model_map and no tier), the original
+/// bytes are returned as-is so the request truly is a byte forward.
+///
+/// The tier arm exists because this path does not go through
+/// `attempt_body`: it reconstructs the request from the inbound bytes.
+/// A tier applied only at `attempt_body` would silently not apply here
+/// (WOR-2652).
 pub(super) fn make_native_bypass_body(
     original: &bytes::Bytes,
     resolved_model: &str,
+    operator_tier: Option<(&str, &str)>,
 ) -> Result<bytes::Bytes, serde_json::Error> {
-    if resolved_model.is_empty() {
+    let model_needs_rewrite = !resolved_model.is_empty();
+    if !model_needs_rewrite && operator_tier.is_none() {
         return Ok(original.clone());
     }
     let mut parsed: serde_json::Value = serde_json::from_slice(original)?;
-    let existing = parsed.get("model").and_then(|v| v.as_str()).unwrap_or("");
-    if existing == resolved_model {
+    let model_matches = !model_needs_rewrite
+        || parsed.get("model").and_then(|v| v.as_str()) == Some(resolved_model);
+    let tier_matches = match operator_tier {
+        Some((field, value)) => parsed.get(field).and_then(|v| v.as_str()) == Some(value),
+        None => true,
+    };
+    if model_matches && tier_matches {
         return Ok(original.clone());
     }
-    parsed["model"] = serde_json::Value::String(resolved_model.to_string());
+    if model_needs_rewrite {
+        parsed["model"] = serde_json::Value::String(resolved_model.to_string());
+    }
+    if let Some((field, value)) = operator_tier {
+        parsed[field] = serde_json::Value::String(value.to_string());
+    }
     let remapped = serde_json::to_vec(&parsed)?;
     Ok(bytes::Bytes::from(remapped))
 }
@@ -4931,6 +5023,78 @@ mod budget_window_tests {
             healthy_score < failing_score,
             "the succeeding provider must win even though it costs more \
              (healthy {healthy_score}, failing {failing_score})"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cache_token_attribution_tests {
+    /// One `sbproxy_ai_tokens_attributed_total` series, selected by the
+    /// dimensions this test sets. Absent series read as zero, which is what
+    /// a direction nobody has recorded yet looks like.
+    fn attributed_tokens(model: &str, direction: &str) -> f64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "sbproxy_ai_tokens_attributed_total")
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        let labeled = |name: &str, want: &str| {
+                            metric
+                                .get_label()
+                                .iter()
+                                .any(|label| label.name() == name && label.value() == want)
+                        };
+                        labeled("model", model) && labeled("direction", direction)
+                    })
+                    .map(|metric| metric.get_counter().value())
+                    .sum()
+            })
+            .unwrap_or_default()
+    }
+
+    /// WOR-2651: the billing choke point destructured `input` and `output`
+    /// and threw the two cache subsets away, then passed literal zeros for
+    /// them. A prompt-cache hit therefore showed up in dollars, because
+    /// `estimate_token_cost` already discounts both, and nowhere in tokens.
+    ///
+    /// The seam is `emit_ai_billing_event`'s argument list, not
+    /// `record_ai_request_attributed`, which has accepted both counts since
+    /// it was written.
+    #[test]
+    fn cache_read_and_write_tokens_reach_the_attributed_metric() {
+        let model = "cache-token-wiring-fixture";
+        let before_read = attributed_tokens(model, "cache_read");
+        let before_write = attributed_tokens(model, "cache_write");
+
+        super::emit_ai_billing_event(
+            "ai.test",
+            "chat_completions",
+            "anthropic",
+            Some(model.to_string()),
+            sbproxy_ai::budget::AiUsage::Tokens {
+                input: 1_000,
+                output: 20,
+                cached_input: 700,
+                cache_creation: 120,
+            },
+            0.0,
+            Vec::new(),
+            &sbproxy_ai::attribution::AttributionTags::default(),
+            "tenant-cache",
+            "key-cache",
+            &std::collections::BTreeMap::new(),
+            sbproxy_ai::budget::AgentIdentity::default(),
+            &tracing::Span::none(),
+            sbproxy_ai::budget::TokenDebit::Measured,
+        );
+
+        assert_eq!(attributed_tokens(model, "cache_read") - before_read, 700.0);
+        assert_eq!(
+            attributed_tokens(model, "cache_write") - before_write,
+            120.0
         );
     }
 }

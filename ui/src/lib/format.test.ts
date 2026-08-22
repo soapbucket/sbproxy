@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatTime, toDate } from "./format";
+import { formatShare, formatTime, toDate } from "./format";
 
 describe("toDate", () => {
   it("parses the forms the admin API actually sends", () => {
@@ -47,5 +47,33 @@ describe("formatTime", () => {
     const raw = "2026-08-11T20:27:18Z";
     expect(formatTime(toDate(raw))).toBe(formatTime(raw));
     expect(formatTime(toDate(raw))).not.toBe("n/a");
+  });
+});
+
+describe("formatShare", () => {
+  it("never rounds a real share away to zero", () => {
+    // The failure this exists for: a 0.4% fallback price share printed
+    // as "0%" tells the reader no price was invented, on the one line
+    // whose job is to say some were.
+    expect(formatShare(0.004)).toBe("<1%");
+    expect(formatShare(0.00004, 1)).toBe("<0.1%");
+    expect(formatShare(0)).toBe("0%");
+  });
+
+  it("never rounds a share below the whole up to it", () => {
+    // 99.6% coverage printed as "100%" says nothing is unattributed.
+    expect(formatShare(0.996)).toBe(">99%");
+    expect(formatShare(1)).toBe("100%");
+  });
+
+  it("formats the ordinary case at the requested precision", () => {
+    expect(formatShare(0.1823)).toBe("18%");
+    expect(formatShare(0.1823, 1)).toBe("18.2%");
+  });
+
+  it("returns n/a for an absent value rather than 0%", () => {
+    expect(formatShare(undefined)).toBe("n/a");
+    expect(formatShare(null)).toBe("n/a");
+    expect(formatShare(Number.NaN)).toBe("n/a");
   });
 });

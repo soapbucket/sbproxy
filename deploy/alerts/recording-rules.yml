@@ -177,6 +177,70 @@ groups:
             sum by (le) (rate(sbproxy_audit_emit_duration_seconds_bucket[1h]))
           )
 
+  # --- AI gateway pre-provider admission (WOR-2595) ---
+  - name: sbproxy_ai_admission
+    interval: 30s
+    rules:
+      # Share of the requests arriving on an AI surface that the gateway
+      # refused before it called any provider.
+      #
+      # The join is exact rather than approximate: `record_surface_request`
+      # increments sbproxy_ai_surface_requests_total on arrival, before any
+      # of the five refusal arms can run, so a refusal is always counted in
+      # the denominator too, and both families carry the same `surface`
+      # vocabulary.
+      #
+      # This is the one class of AI failure the availability SLO cannot see.
+      # A refused request answers 4xx, so sbproxy:slo:substrate:availability
+      # stays at 1.0 while every caller on a surface is being turned away,
+      # and no provider-side series moves at all because no provider was
+      # dialed. clamp_min guards a zero denominator; it cannot mask a real
+      # refusal, because a refusal implies an arrival.
+      - record: sbproxy:ai:admission_refusal_share:5m
+        expr: |
+          sum by (surface) (rate(sbproxy_ai_admission_decisions_total{outcome="deny"}[5m]))
+          /
+          clamp_min(sum by (surface) (rate(sbproxy_ai_surface_requests_total[5m])), 0.000001)
+
+  # --- AI gateway post-commit streaming failures (WOR-2650) ---
+  - name: sbproxy_ai_stream_post_commit
+    interval: 30s
+    rules:
+      # Share of the provider responses this gateway accepted that then
+      # failed part way through the stream.
+      #
+      # Past the commit point there is no honest way to tell the caller.
+      # Headers are already on the wire with a 200 on them, so
+      # sbproxy:slo:substrate:availability scores the request a success, and
+      # the attempt loop has closed by the time the relay runs, so
+      # sbproxy_ai_failovers_total cannot move either. The caller is handed a
+      # truncated body and nothing in the response says so.
+      #
+      # `cause!="guardrail"` drops the arm where the gateway ended the stream
+      # itself on an output guardrail or stream-safety verdict. That is the
+      # configured answer rather than a fault, and alerting on it would be
+      # alerting on a policy working. The negation is safe here for a reason
+      # worth writing down, because a negated matcher on a label a family
+      # does not carry selects every series: `cause` is declared on this
+      # family, all three write sites set it, and verify_references checks
+      # every selector label against the registry, so a matcher naming a
+      # label this family lacks fails the build.
+      #
+      # The denominator is every provider response the gateway kept, which
+      # includes non-streaming ones. That dilutes the ratio on a mixed
+      # workload, so this reads low rather than high and the alert on it is
+      # conservative by construction. The numerator is a strict subset of the
+      # denominator: a stream only reaches the relay after the attempt loop
+      # recorded its `success`, so clamp_min guards a zero denominator
+      # without ever masking a real failure. Both families sanitize
+      # `provider` through the same shared cardinality limiter, so the join
+      # holds on the same string.
+      - record: sbproxy:ai:stream_post_commit_failure_share:5m
+        expr: |
+          sum by (provider) (rate(sbproxy_ai_stream_post_commit_failures_total{cause!="guardrail"}[5m]))
+          /
+          clamp_min(sum by (provider) (rate(sbproxy_ai_provider_attempts_total{outcome="success"}[5m])), 0.000001)
+
   # --- Outbound + cardinality (informational) ---
   - name: sbproxy_slo_outbound
     interval: 30s
@@ -205,3 +269,87 @@ groups:
       - record: sbproxy:cardinality:policy_triggers_total
         expr: |
           count(count by (origin, policy_type, action, agent_id, agent_class) (sbproxy_policy_triggers_total))
+
+  # --- Certificate store ---
+  #
+  # sbproxy_cert_store_degraded is a Gauge, not a counter, so there is no
+  # rate() here: the value is 1 when the configured certificate-store backend
+  # could not be opened and the process fell back to an in-memory store, and 0
+  # when it opened. It is written once, during TLS init, and never again, so
+  # the series is flat for the life of the process and a change means a
+  # restart happened.
+  #
+  # max_over_time keeps a single missed scrape from clearing the condition,
+  # and max by (backend) collapses replicas so one degraded pod in a fleet
+  # still reads 1. Per-pod attribution comes from the raw series, which the
+  # runbook points at; the alert only needs to know that some pod is running
+  # without its certificate store.
+  #
+  # The series is absent entirely when no ACME certificate store was opened,
+  # which is the normal shape with ACME unconfigured. Absent is not 0 and the
+  # alert must not read it as one, which == 1 handles: an absent series
+  # produces no sample and no alert.
+  - name: sbproxy_slo_certs
+    interval: 30s
+    rules:
+      - record: sbproxy:slo:certs:store_degraded:5m
+        expr: |
+          max by (backend) (max_over_time(sbproxy_cert_store_degraded[5m]))
+
+  # --- Mesh inbound admission ---
+  #
+  # mesh_transport_inbound_rejected_total carries six reasons and only five of
+  # them are a fault. `idle_timeout` is the client half's connection recycle
+  # seen from the server side: the client only re-evaluates its connection when
+  # it next issues a request, so a peer pair with nothing to say for the whole
+  # idle window is reclaimed here as routine housekeeping, and a quiet cluster
+  # moves that reason on its own. Recording the alertable subset once keeps the
+  # exclusion in one place instead of copied into every rule and panel.
+  #
+  # `reason` is a real label on this family and the drift guard checks it. That
+  # matters more than usual for a `!=` matcher: on a label the family did not
+  # carry, `{reason!="idle_timeout"}` would select every series rather than
+  # none, and the alert below would fire on the housekeeping it is written to
+  # ignore.
+  - name: sbproxy_mesh_admission
+    interval: 30s
+    rules:
+      - record: sbproxy:mesh:inbound_rejected:5m
+        expr: |
+          sum by (reason) (rate(mesh_transport_inbound_rejected_total{reason!="idle_timeout"}[5m]))
+
+      - record: sbproxy:mesh:inbound_rejected:1h
+        expr: |
+          sum by (reason) (rate(mesh_transport_inbound_rejected_total{reason!="idle_timeout"}[1h]))
+
+  # --- Storage backend operations ---
+  #
+  # There is no storage operation counter. The latency histogram is observed on
+  # success and on failure alike, so its `_count` series is the denominator and
+  # it contains the numerator, which is what makes the ratio genuinely bounded
+  # to 0 and 1.
+  #
+  # Both families are absent, not zero, on a deployment that never calls the
+  # storage layer: `crates/sbproxy-mesh/src/backend/redis.rs` is its only
+  # production caller today. An absent numerator makes the ratio return nothing
+  # rather than 0, which is the behavior we want here. A rule that manufactured
+  # a zero would read as a healthy backend on a deployment that has none.
+  - name: sbproxy_storage_ops
+    interval: 30s
+    rules:
+      - record: sbproxy:storage:op_errors:5m
+        expr: |
+          sum by (backend, error_kind) (rate(sbproxy_storage_op_errors_total[5m]))
+
+      - record: sbproxy:storage:op_error_ratio:5m
+        expr: |
+          sum by (backend) (rate(sbproxy_storage_op_errors_total[5m]))
+          /
+          sum by (backend) (rate(sbproxy_storage_op_duration_seconds_count[5m]))
+
+      - record: sbproxy:storage:op_latency_p99:5m
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le, op) (rate(sbproxy_storage_op_duration_seconds_bucket[5m]))
+          )

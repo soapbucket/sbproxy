@@ -22,6 +22,7 @@ What a consumer may rely on from the decision-audit feed. Retrofitting a field i
 | `ai.stream.event` | never | Fires once per streamed chunk, so it is refused ahead of both the per-event map and the master switch. `ai.close` carries the stream's summary once instead. |
 | `ai.close` | yes |  |
 | `ai.failure` | yes |  |
+| `ai.admission` | yes |  |
 | `transform` | not yet | No emitter. Enabling it publishes nothing. |
 | `action` | not yet | No emitter. Enabling it publishes nothing. |
 | `log.custom_field` | not yet | No emitter. Enabling it publishes nothing. |
@@ -111,6 +112,13 @@ One record per judged streamed tool call, not per chunk. `verdict` is the guard'
 - `unmapped.verdict`
 
 `selected_provider` names which provider's response failed. `verdict` carries the classified failure kind (`rate_limited`, `content_filter`, `upstream_5xx`, `provider_error`), a closed vocabulary rather than the raw upstream status text, which can carry a prompt fragment. The record's own `outcome` is always `error`: this is an upstream fact, not a proxy policy decision.
+
+### `ai.admission`
+
+- `unmapped.surface`
+- `unmapped.verdict`
+
+The pre-provider refusal record. `surface` is the inbound AI surface the request arrived on, the same vocabulary `sbproxy_ai_surface_requests_total` uses, so a refusal rate is a join rather than a guess: `messages` or `responses` for a refusal at the native-format shim, and any JSON surface, `chat_completions` included, for one at the shared stored-prompt resolver. `verdict` is the refusal's bounded reason code (`tools_mcp_unsupported`, `previous_response_id_unsupported`, `conversation_unsupported`, `store_unsupported`, `prompt_object_unresolved`, `malformed_json`, `body_not_object`, `role_missing`, `role_unsupported`, `prompt_reference_not_found`, `prompt_object_unrenderable`, `prompt_render_failed`, and `malformed_request` for a refusal whose site has not been coded yet). The refusal message is deliberately not a field: it interpolates caller bytes on several of those codes, and details ship unredacted. Coverage is the three inbound native-shim refusal arms plus the two stored-prompt resolver arms; a request refused later by a model gate, guardrail, budget, or policy records under that plane's own event.
 
 ### `ai.close`
 

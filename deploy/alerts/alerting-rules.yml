@@ -315,6 +315,126 @@ groups:
             Backlog risk; investigate sink throughput.
           runbook_url: "https://docs.sbproxy.dev/runbook#rb-audit-latency"
 
+  # --- AI gateway pre-provider admission (WOR-2595) ---
+  #
+  # A pre-provider refusal is the one AI failure no other rule in this file
+  # can reach. It answers 4xx, so the availability burn-rate alerts stay
+  # quiet; it never dials a provider, so no provider error, latency, token,
+  # or cost series moves; and it is not a policy verdict, so the decision
+  # planes stay quiet too. Left unalerted, a client integration that broke
+  # against this gateway is silent until somebody notices the spend fell.
+  #
+  # Ticket rather than page. The refusals are correct: the gateway is
+  # refusing what it was configured to refuse. What needs a human is the
+  # caller, and that is next-business-day work, not a 3am page.
+  - name: sbproxy_alerts_ai_admission
+    rules:
+      - alert: SBPROXY-AI-ADMISSION-REFUSAL-SHARE
+        expr: sbproxy:ai:admission_refusal_share:5m > 0.05
+        for: 15m
+        labels:
+          severity: ticket
+          slo_id: SLO-AI-ADMISSION
+          runbook_id: RB-AI-ADMISSION
+          window: 5m
+        annotations:
+          summary: "More than 5% of {{ $labels.surface }} traffic refused before any provider was called"
+          description: |
+            sbproxy_ai_admission_decisions_total is taking more than 5% of
+            the requests arriving on this AI surface, sustained for 15
+            minutes. These requests were refused at the inbound shim or the
+            stored-prompt resolver, so no provider saw them and no
+            provider-side panel shows the loss. Open the AI Gateway
+            dashboard and read the refusal reason: a bounded code names
+            whether a caller is asking for a governed provider feature, a
+            stored prompt is missing, or a client is sending unreadable
+            bodies.
+          runbook_url: "https://docs.sbproxy.dev/runbook#rb-ai-admission"
+
+  # --- AI gateway post-commit streaming failures (WOR-2650) ---
+  #
+  # Ticket, not page. The damage is per request and bounded: one caller gets
+  # one truncated answer. It is not a fleet outage, and both remedies, widening
+  # a transport budget and steering traffic off a provider, are config changes
+  # that hold until morning.
+  #
+  # What makes it worth an alert at all is that nothing else reports it.
+  # Response headers carried a 200 before the failure happened, so
+  # sbproxy:slo:substrate:availability scores every one of these a success.
+  # Failover is impossible past the commit point, so sbproxy_ai_failovers_total
+  # cannot carry them. sbproxy_ai_provider_errors_total does move for the two
+  # upstream causes, but it counts pre-commit errors on the same series, and
+  # those ended in a retry or a clean error status the caller could act on.
+  # This is the only family that separates "the provider failed" from "the
+  # caller was already being answered when the provider failed".
+  - name: sbproxy_alerts_ai_stream_post_commit
+    rules:
+      - alert: SBPROXY-AI-STREAM-POST-COMMIT
+        expr: sbproxy:ai:stream_post_commit_failure_share:5m > 0.01
+        for: 15m
+        labels:
+          severity: ticket
+          slo_id: SLO-AI-STREAM-COMMIT
+          runbook_id: RB-AI-STREAM-POST-COMMIT
+          window: 5m
+        annotations:
+          summary: "More than 1% of {{ $labels.provider }} responses failed after the gateway committed to them"
+          description: |
+            More than 1% of the responses this gateway accepted from this
+            provider then failed part way through the stream, sustained for
+            15 minutes. Headers were already sent with a 200 on them, so
+            each of those callers received a truncated body with nothing in
+            the response saying so, and no failover was possible. Open the
+            AI Gateway dashboard and read the cause: upstream_timeout is a
+            transport budget cutting generations that are still running and
+            is yours to widen, and upstream_error is the provider resetting
+            its own stream. Guardrail terminations are excluded from this
+            rule.
+          runbook_url: "https://docs.sbproxy.dev/runbook#rb-ai-stream-post-commit"
+
+  # --- Certificate store ---
+  #
+  # The one TLS failure that looks like a working proxy. A pod whose
+  # certificate store fell back to memory serves traffic normally and keeps
+  # every other panel green, and the cost only lands on the next restart,
+  # when the certificate it was holding is gone and it opens a fresh ACME
+  # order. Let's Encrypt allows five duplicate certificates per hostname set
+  # per week, so a restart loop turns a storage-path mistake into a hostname
+  # that cannot get a certificate at all, days after the mistake was made.
+  #
+  # Ticket, not page. A shared backend (file, redis, s3, gcs, azure) that
+  # will not open now refuses to start, so the fleet-wide issuance lock
+  # cannot be lost silently and this alert can only be a pod-local backend
+  # (redb, sqlite, memory). One node re-issuing on restart is real damage on
+  # a clock of days, and the fix is a disk or a path, which is
+  # next-business-day work.
+  #
+  # `== 1` rather than `> 0` so an absent series stays absent: the gauge
+  # exists only in a process that opened a certificate store, and no ACME
+  # configuration at all must not read as a healthy 0 or as a firing 1.
+  - name: sbproxy_alerts_certs
+    rules:
+      - alert: SBPROXY-CERT-STORE-DEGRADED
+        expr: |
+          sbproxy:slo:certs:store_degraded:5m == 1
+        for: 10m
+        labels:
+          severity: ticket
+          slo_id: SLO-CERT-STORE
+          runbook_id: RB-CERT-STORE-DEGRADED
+          window: 5m
+        annotations:
+          summary: "Certificate store degraded to in-memory on backend {{ $labels.backend }}"
+          description: |
+            The configured certificate-store backend could not be opened and
+            at least one process is running on an in-memory store.
+            Certificates do not survive a restart, so each restart opens a
+            fresh ACME order against the same hostname set and the CA's
+            duplicate-certificate limit is the deadline. Read the error-level
+            log line naming the backend, fix acme.storage_path or the
+            backend, and restart.
+          runbook_url: "https://docs.sbproxy.dev/runbook#rb-cert-store-degraded"
+
   # --- Cardinality and deprecation (log-only) ---
   - name: sbproxy_alerts_log_only
     rules:
@@ -343,6 +463,80 @@ groups:
       #
       # Restoring it means emitting the counter first. The alert can come back
       # in the same commit that does.
+
+  # --- Mesh inbound admission (WOR-2637) ---
+  #
+  # The mesh refuses inbound cache RPC connections at six controls and only
+  # five of them are a fault, so the rule reads the recorded series that
+  # already drops `idle_timeout` rather than the raw counter. A quiet cluster
+  # reclaims idle peer connections by itself; alerting on that would page on
+  # housekeeping and train on-call to ignore the rule.
+  #
+  # Ticket rather than page. The mesh is a shared cache and membership plane,
+  # not the inbound serving path: a node turning peers away degrades cache
+  # coherence and owner routing while it keeps answering its own traffic. What
+  # needs a human is a connection cap, a certificate, or a peer, and all three
+  # are next-business-day work.
+  #
+  # The counter is absent, not zero, on a deployment with no mesh, so this rule
+  # is silent there rather than permanently satisfied.
+  - name: sbproxy_alerts_mesh_admission
+    rules:
+      - alert: SBPROXY-MESH-INBOUND-REJECTED
+        expr: |
+          sbproxy:mesh:inbound_rejected:5m > 0
+        for: 10m
+        labels:
+          severity: ticket
+          slo_id: SLO-MESH-ADMISSION
+          runbook_id: RB-MESH-ADMISSION
+          window: 5m
+        annotations:
+          summary: "Mesh is refusing inbound peer connections ({{ $labels.reason }})"
+          description: |
+            This node has been rejecting inbound cache RPC connections for 10
+            minutes under a reason that is not the routine idle reclaim.
+            connection_limit means the inbound connection cap is reached and
+            peers are being turned away. handshake_timeout and
+            handshake_failed are mesh mTLS. frame_timeout and write_timeout
+            are a peer that opened a request and then stopped talking. The
+            peer address is in the transport log line, not in a label.
+          runbook_url: "https://docs.sbproxy.dev/runbook#rb-mesh-admission"
+
+  # --- Storage backend operations ---
+  #
+  # `crates/sbproxy-storage/src/metrics.rs` asks for exactly this rule in its
+  # module docs: group the error counter by `error_kind` so a disconnected
+  # backend surfaces on its own rather than as a shape in someone else's
+  # latency chart.
+  #
+  # Ticket rather than page, on the same reasoning as the mesh rule above: the
+  # mesh Redis backend is the only production caller of the storage layer
+  # today, so losing it costs shared mesh state and not inbound serving. A
+  # deployment that grows a second caller on the request path should raise this
+  # tier locally and say so in its own runbook.
+  - name: sbproxy_alerts_storage
+    rules:
+      - alert: SBPROXY-STORAGE-BACKEND-ERRORS
+        expr: |
+          sbproxy:storage:op_errors:5m > 0
+        for: 10m
+        labels:
+          severity: ticket
+          slo_id: SLO-STORAGE-OPS
+          runbook_id: RB-STORAGE-BACKEND
+          window: 5m
+        annotations:
+          summary: "Storage backend {{ $labels.backend }} returning {{ $labels.error_kind }} errors"
+          description: |
+            sbproxy_storage_op_errors_total has been moving for 10 minutes.
+            disconnected and timeout are the backend or the network between
+            here and it, and the mesh is running without its shared store
+            until they clear. key_too_large and value_too_large are a caller
+            writing past the storage layer's caps and will repeat until that
+            call site is fixed. Read the error ratio on the Mesh Admission and
+            Storage dashboard to size the damage before deciding which.
+          runbook_url: "https://docs.sbproxy.dev/runbook#rb-storage-backend"
 
   # --- Forward stubs (Waves 2-5) ---
   #

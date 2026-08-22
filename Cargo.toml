@@ -214,6 +214,14 @@ prometheus = "0.14"
 # Apache-2.0-only crates).
 quick-xml = "0.37"
 
+# WOR-2653: `sbproxy connect` edits a client's TOML config structurally so
+# comments, key order, and unrelated tables survive a rewrite. Format-
+# preserving editing is the whole point; a serde round trip would drop the
+# operator's comments on the floor. Already in the lockfile as a transitive
+# dependency of proc-macro-crate at this version, so this adds an edge plus
+# the `display` half (toml_writer). Dual MIT/Apache-2.0, no NOTICE stanza.
+toml_edit = "0.25"
+
 # WOR-1081: JSON Schema generation from the Rust config types.
 # `preserve_order` keeps the generated schema stable across runs
 # so the regenerator's CI gate diffs byte-for-byte (otherwise a

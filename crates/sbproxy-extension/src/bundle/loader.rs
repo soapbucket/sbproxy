@@ -183,6 +183,7 @@ pub struct DynamicBundleRegistry {
     hooks: BTreeMap<(BundleHookKind, String), Arc<LoadedBundleHook>>,
     inventory: ExtensionInventorySnapshot,
     git_revisions: Vec<ResolvedRevision>,
+    secret_field_names: Vec<String>,
 }
 
 impl std::fmt::Debug for DynamicBundleRegistry {
@@ -320,6 +321,21 @@ impl DynamicBundleRegistry {
     #[must_use]
     pub fn git_revisions(&self) -> &[ResolvedRevision] {
         &self.git_revisions
+    }
+
+    /// Every `secret_vars`/`masked_vars` name this candidate's hooks
+    /// declare, in hook order.
+    ///
+    /// These are the field keys the structured-log redactor masks while
+    /// this registry is the one serving. Loading a candidate does not
+    /// install them: the caller that publishes the pipeline owning this
+    /// registry hands them to
+    /// `sbproxy_observe::logging::set_bundle_secret_field_names`, so a
+    /// candidate that is validated and dropped never touches the live
+    /// redactor.
+    #[must_use]
+    pub fn secret_field_names(&self) -> &[String] {
+        &self.secret_field_names
     }
 
     /// Identity used to skip a reload when every Git source resolved to the
@@ -730,24 +746,31 @@ impl<'a> Candidate<'a> {
         inventory
             .sort_stably()
             .map_err(|_| BundleLoadError::new("inventory", "duplicate stable inventory id"))?;
-        // WOR-2289: register this candidate's declared secret/masked var
-        // names with the process-wide log redactor. A name here is
+        // WOR-2289: collect this candidate's declared secret/masked var
+        // names for the process-wide log redactor. A name here is
         // redacted by key in every structured sink regardless of scope,
         // matching that `secret_vars`/`masked_vars` are always resolved
         // and always masked regardless of which attachment used them.
-        // Replaces whatever the previous candidate registered, so a
-        // reload that drops a bundle also drops its names.
+        //
+        // Collected, not installed. Candidate construction is not
+        // adoption: validation-only loads (`/config/publish` dry runs,
+        // doctor, `CompiledPipeline::from_config`'s empty registry) build
+        // a candidate that is then dropped, and installing here let any
+        // of them replace the live config's denylist with their own,
+        // un-redacting the secrets of the generation still serving. The
+        // single pipeline publisher installs these names instead, so the
+        // denylist only ever moves when the registry that owns it does.
         let secret_field_names: Vec<String> = self
             .hooks
             .values()
             .flat_map(|hook| hook.hook.secret_vars.iter().chain(&hook.hook.masked_vars))
             .cloned()
             .collect();
-        sbproxy_observe::logging::set_bundle_secret_field_names(secret_field_names);
         Ok(DynamicBundleRegistry {
             hooks: self.hooks,
             inventory,
             git_revisions: self.git_revisions,
+            secret_field_names,
         })
     }
 }

@@ -687,7 +687,16 @@ impl PaymentsRuntimeCandidate {
         let path = Path::new(&config.state_path);
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
+                // Owner-only (`0o700`) for every component this call
+                // creates. A `0o600` settlement database inside a
+                // `0o755` directory still tells any account on the
+                // host that this node settles payments, how large the
+                // ledger is, and when it last moved. A directory that
+                // already exists keeps the mode its operator gave it,
+                // because `state_path` is operator configuration and
+                // narrowing a shared parent is how a hardening change
+                // becomes an outage.
+                sbproxy_util::secure_fs::create_dir_all_owner_only(parent)
                     .map_err(|_| PaymentsRuntimeError::StatePath("create the parent directory"))?;
             }
         }
@@ -1668,6 +1677,48 @@ fn record_worker_delta(observed: &ObservedStatus, current: WorkerStatus) {
             .envelopes_purged
             .saturating_sub(previous.envelopes_purged),
     );
+    // A sweep that could not run at all. Distinct from `terminal`, which is
+    // a row the sweep moved to a settled outcome: these moved nothing, so the
+    // queue behind them is still there and the flat series beside this one is
+    // an outage rather than an idle queue. Alert on the rate.
+    for (operation, failures, previous_failures) in [
+        (
+            "expire_challenge",
+            current.stage_failures.expire_challenges,
+            previous.stage_failures.expire_challenges,
+        ),
+        (
+            "recover_lease",
+            current.stage_failures.recover_leases,
+            previous.stage_failures.recover_leases,
+        ),
+        (
+            "strand_intent",
+            current.stage_failures.strand_intents,
+            previous.stage_failures.strand_intents,
+        ),
+        (
+            "reconcile",
+            current.stage_failures.reconciliation,
+            previous.stage_failures.reconciliation,
+        ),
+        (
+            "report_usage",
+            current.stage_failures.usage,
+            previous.stage_failures.usage,
+        ),
+        (
+            "purge_envelope",
+            current.stage_failures.purge_envelopes,
+            previous.stage_failures.purge_envelopes,
+        ),
+    ] {
+        record_payment_recovery(
+            operation,
+            "failed",
+            failures.saturating_sub(previous_failures),
+        );
+    }
     record_payment_worker_ticks(current.ticks.saturating_sub(previous.ticks));
 
     *previous = current;
@@ -1675,6 +1726,9 @@ fn record_worker_delta(observed: &ObservedStatus, current: WorkerStatus) {
 
 #[cfg(test)]
 mod tests {
+    // Only the tests construct a stage-failure snapshot directly.
+    use sbproxy_billing::worker::WorkerStageFailures;
+
     use super::*;
 
     /// Fails a test without requiring `Debug` on the success type. The
@@ -1848,6 +1902,38 @@ mod tests {
             (recovery_count("expire_challenge", "terminal") - clean_failures_before).abs()
                 < f64::EPSILON,
             "an aged-out hold must not land in the clean-failure series",
+        );
+    }
+
+    #[test]
+    fn a_sweep_that_could_not_run_is_counted_apart_from_the_rows_it_moves() {
+        // The observability half of making the worker's stages independent.
+        // A sweep that returns a store error no longer takes the rest of the
+        // tick down with it, so the only way an operator sees it is a series
+        // that moves: without this, a reconciliation queue that stopped
+        // draining looks exactly like one with nothing to drain.
+        let failures_before = recovery_count("reconcile", "failed");
+        let rows_before = recovery_count("reconcile", "succeeded");
+        let observed: ObservedStatus = Arc::new(Mutex::new(WorkerStatus::default()));
+
+        record_worker_delta(
+            &observed,
+            WorkerStatus {
+                stage_failures: WorkerStageFailures {
+                    reconciliation: 1,
+                    ..WorkerStageFailures::default()
+                },
+                ..WorkerStatus::default()
+            },
+        );
+
+        assert!(
+            (recovery_count("reconcile", "failed") - failures_before - 1.0).abs() < f64::EPSILON,
+            "a sweep that could not run is one observation on its own outcome",
+        );
+        assert!(
+            (recovery_count("reconcile", "succeeded") - rows_before).abs() < f64::EPSILON,
+            "a sweep that moved nothing must not land in the series counting rows it moved",
         );
     }
 

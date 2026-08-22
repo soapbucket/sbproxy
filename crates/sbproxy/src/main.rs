@@ -15,6 +15,13 @@ use std::path::PathBuf;
 use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
+/// `sbproxy connect` / `sbproxy disconnect`: detect the coding agents on this
+/// machine and point them at the gateway. Its own module because it is the
+/// only verb here that writes files belonging to other programs, and the
+/// reasoning about backups, atomic replacement, and what it deliberately
+/// refuses to write belongs next to the code that does it.
+mod connect;
+
 // mimalloc is Microsoft's high-performance allocator. Typically 5-10% faster
 // than glibc malloc on server workloads; negligible on allocation-light
 // paths. See sbproxy-bench/docs/RUST_OPTIMIZATIONS.md A2.
@@ -210,6 +217,20 @@ enum Cmd {
     /// certified catalog model running in the background (macOS only).
     /// Reuses the same secure config generation as `sbproxy run`.
     Service(ServiceCmd),
+    /// Point the coding agents installed on this machine at this gateway.
+    /// Detects each one, writes the config files it can write atomically
+    /// (with a one-time backup), and prints the exact fields for the ones
+    /// that only have a settings screen. `--dry-run` shows the diff and
+    /// changes nothing. No credential is read or written: every client this
+    /// touches takes its key from an environment variable, and this verb
+    /// writes the variable's name.
+    Connect(ConnectArgs),
+    /// Undo `connect`: remove the profile it wrote and name what to clear by
+    /// hand. The profile's current contents are copied to
+    /// `<path>.sbproxy.removed` before it goes, so a hand edit survives the
+    /// removal; the one-time `.sbproxy.bak`, which holds the file as it was
+    /// before the first `connect`, is left exactly where it is.
+    Disconnect(DisconnectArgs),
     /// Print a shell-completion script to stdout for the requested
     /// shell. Pipe into the shell's completion sink.
     Completions {
@@ -1017,6 +1038,54 @@ struct HashPasswordArgs {
     password_stdin: bool,
 }
 
+/// Arguments to `sbproxy connect`.
+///
+/// There is no `--key` and no `--key-stdin`, so unlike `ApplyArgs` this
+/// needs no hand-written redacting `Debug`: there is nothing here to redact.
+/// Every client this verb configures reads its credential from an environment
+/// variable, so the verb writes the variable's name and the operator exports
+/// the value. See the module docs on `connect` for why that is a decision
+/// rather than an omission.
+#[derive(clap::Args, Debug)]
+struct ConnectArgs {
+    /// Clients to configure. Default: every client this verb knows
+    /// (`codex`, `claude-code`, `cursor`, `cline`, `copilot`), skipping the
+    /// ones that are not installed. Naming a client that is not installed is
+    /// an error; the default sweep says so and exits clean.
+    #[arg(value_name = "CLIENT")]
+    clients: Vec<String>,
+    /// Gateway base URL, with or without a trailing `/v1`.
+    #[arg(long = "base-url", default_value = connect::DEFAULT_BASE_URL)]
+    base_url: String,
+    /// Model id or alias to select in the clients that take one. Left alone
+    /// when absent, because writing a model nobody asked for is a behavior
+    /// change wearing a convenience's clothes.
+    #[arg(long = "model")]
+    model: Option<String>,
+    /// Print the diff and change nothing.
+    #[arg(long = "dry-run", action = ArgAction::SetTrue)]
+    dry_run: bool,
+    /// Output format. `text` (default) prints per-client blocks and a unified
+    /// diff; `json` emits one structured object.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+/// Arguments to `sbproxy disconnect`. No base URL: reversing does not need to
+/// know where the gateway was.
+#[derive(clap::Args, Debug)]
+struct DisconnectArgs {
+    /// Clients to disconnect. Default: every client this verb knows.
+    #[arg(value_name = "CLIENT")]
+    clients: Vec<String>,
+    /// Print the diff and change nothing.
+    #[arg(long = "dry-run", action = ArgAction::SetTrue)]
+    dry_run: bool,
+    /// Output format. `text` (default) or `json`.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
 #[derive(clap::Args, Debug)]
 struct ProjectionsCmd {
     #[command(subcommand)]
@@ -1765,6 +1834,34 @@ fn main() {
         }
         Some(Cmd::Service(cmd)) => {
             run_subcommand("service", 2, handle_service_subcommand(&cmd));
+        }
+        Some(Cmd::Connect(args)) => {
+            run_subcommand(
+                "connect",
+                2,
+                connect::run(&connect::Request {
+                    direction: connect::Direction::Connect,
+                    clients: args.clients,
+                    base_url: args.base_url,
+                    model: args.model,
+                    dry_run: args.dry_run,
+                    json: matches!(args.format, OutputFormat::Json),
+                }),
+            );
+        }
+        Some(Cmd::Disconnect(args)) => {
+            run_subcommand(
+                "disconnect",
+                2,
+                connect::run(&connect::Request {
+                    direction: connect::Direction::Disconnect,
+                    clients: args.clients,
+                    base_url: connect::DEFAULT_BASE_URL.to_string(),
+                    model: None,
+                    dry_run: args.dry_run,
+                    json: matches!(args.format, OutputFormat::Json),
+                }),
+            );
         }
         Some(Cmd::Completions { shell }) => {
             print_completions(shell);

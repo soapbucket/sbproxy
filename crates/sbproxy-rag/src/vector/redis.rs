@@ -14,8 +14,11 @@
 //! connection is created lazily on the first search and cached. On an
 //! I/O, closed-connection, or timeout error the cached connection is
 //! discarded so the next search reconnects, which resolves and
-//! revalidates DNS again. Construction never connects, which keeps
-//! validation-mode builds free of network activity.
+//! revalidates DNS again. The cache slot carries a generation and a
+//! discard only evicts the generation that actually failed, so a late
+//! failure on a long-dead socket cannot throw away the replacement a
+//! concurrent search already dialed. Construction never connects, which
+//! keeps validation-mode builds free of network activity.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -117,12 +120,37 @@ pub fn escape_redis_tag(value: &str) -> String {
     escaped
 }
 
+/// The cached multiplexed connection and the generation naming it.
+///
+/// A caller carries the generation of the connection its command ran on
+/// and hands it back when discarding, so a discard evicts only the
+/// connection that actually failed.
+///
+/// Without the tag every discard cleared the slot unconditionally. Two
+/// searches sharing a socket that Redis then dropped would each discard
+/// on failure, and because their failures do not land together the
+/// straggler evicted whatever a search in between had already dialed.
+/// Under sustained traffic against a flapping Redis every late failure
+/// threw away a healthy connection, so the store re-dialed (and re-ran
+/// the protected DNS resolution) far more often than the outage
+/// justified and could fail to settle on a connection at all.
+#[derive(Default)]
+struct ConnectionSlot {
+    /// The live connection: absent before the first dial and after a
+    /// discard.
+    current: Option<MultiplexedConnection>,
+    /// Names `current`. Only ever increments, so a stale tag cannot
+    /// match a later connection. Reuse needs 2^64 dials on one store,
+    /// which is why the counter is not recycled on discard.
+    generation: u64,
+}
+
 /// Redis vector store using `FT.SEARCH` with a KNN clause, a pinned
 /// resolver, and a lazily created cached multiplexed connection.
 pub struct RedisVectorStore {
     client: redis::Client,
     connection_config: AsyncConnectionConfig,
-    connection: tokio::sync::Mutex<Option<MultiplexedConnection>>,
+    connection: tokio::sync::Mutex<ConnectionSlot>,
     resolver_note: Arc<parking_lot::Mutex<Option<&'static str>>>,
     index: String,
     vector_field: String,
@@ -233,7 +261,7 @@ impl RedisVectorStore {
         Ok(Self {
             client,
             connection_config,
-            connection: tokio::sync::Mutex::new(None),
+            connection: tokio::sync::Mutex::new(ConnectionSlot::default()),
             resolver_note: note,
             index: index.clone(),
             vector_field: vector_field.clone(),
@@ -254,11 +282,19 @@ impl RedisVectorStore {
     }
 
     /// Returns the cached connection or creates one, resolving and
-    /// revalidating DNS through the protected resolver.
-    async fn connection(&self) -> Result<MultiplexedConnection, VectorStoreError> {
-        let mut cached = self.connection.lock().await;
-        if let Some(connection) = cached.as_ref() {
-            return Ok(connection.clone());
+    /// revalidating DNS through the protected resolver. The generation
+    /// travels with the connection so the caller can name it again when
+    /// discarding.
+    ///
+    /// The lock is deliberately held across the dial: it makes at most
+    /// one dial in flight per store, so concurrent callers that arrive
+    /// after a discard join one replacement rather than racing several.
+    /// The cost is that they wait out that dial, bounded by
+    /// `self.timeout`, which is the same bound their own search carries.
+    async fn connection(&self) -> Result<(u64, MultiplexedConnection), VectorStoreError> {
+        let mut slot = self.connection.lock().await;
+        if let Some(connection) = slot.current.as_ref() {
+            return Ok((slot.generation, connection.clone()));
         }
         *self.resolver_note.lock() = None;
         let connect = self
@@ -273,27 +309,44 @@ impl RedisVectorStore {
                 ))
             }
             Ok(Ok(connection)) => {
-                *cached = Some(connection.clone());
-                Ok(connection)
+                // Bump before publishing so no two connections ever
+                // share a generation, including across a failed dial.
+                slot.generation = slot.generation.wrapping_add(1);
+                slot.current = Some(connection.clone());
+                Ok((slot.generation, connection))
             }
         }
     }
 
     /// Drops the cached connection so the next search reconnects
-    /// through the resolver.
-    async fn discard_connection(&self) {
-        let _ = self.connection.lock().await.take();
+    /// through the resolver, but only if the slot still holds the
+    /// generation that failed.
+    ///
+    /// A caller that failed on an older generation is a straggler: the
+    /// connection it is complaining about is already gone and something
+    /// else has since dialed a replacement, which must survive.
+    ///
+    /// What this cannot see: whether the connection currently in the
+    /// slot is itself healthy. It only knows that this caller has no
+    /// evidence against it. A replacement that is broken for its own
+    /// reasons is discarded by the first caller that actually fails on
+    /// it, one round later, not by this one.
+    async fn discard_connection(&self, generation: u64) {
+        let mut slot = self.connection.lock().await;
+        if slot.generation == generation {
+            slot.current = None;
+        }
     }
 
     /// Maps a command failure to a non-secret error, discarding the
-    /// cached connection for transport-level failures.
-    async fn classify(&self, error: redis::RedisError) -> VectorStoreError {
+    /// generation the command ran on for transport-level failures.
+    async fn classify(&self, generation: u64, error: redis::RedisError) -> VectorStoreError {
         if error.is_timeout() {
-            self.discard_connection().await;
+            self.discard_connection(generation).await;
             return VectorStoreError::Timeout;
         }
         if error.is_io_error() || error.is_connection_dropped() || error.is_unrecoverable_error() {
-            self.discard_connection().await;
+            self.discard_connection(generation).await;
             return VectorStoreError::MalformedResponse("redis connection failed");
         }
         // Server-side rejections, including a missing Search module,
@@ -502,7 +555,7 @@ impl VectorStore for RedisVectorStore {
         query: VectorQuery<'_>,
     ) -> Result<Vec<RetrievedChunk>, VectorStoreError> {
         let command = self.build_command(&query)?;
-        let mut connection = self.connection().await?;
+        let (generation, mut connection) = self.connection().await?;
         match tokio::time::timeout(
             self.timeout,
             command.query_async::<redis::Value>(&mut connection),
@@ -511,11 +564,15 @@ impl VectorStore for RedisVectorStore {
         {
             Err(_) => {
                 // A stalled multiplexed pipeline cannot be reused; the
-                // late reply would misalign with the next request.
-                self.discard_connection().await;
+                // late reply would misalign with the next request. Only
+                // this generation goes: a search that timed out on an
+                // earlier socket must not evict a later one, and two
+                // searches stalled on the same socket time out at
+                // different moments.
+                self.discard_connection(generation).await;
                 Err(VectorStoreError::Timeout)
             }
-            Ok(Err(error)) => Err(self.classify(error).await),
+            Ok(Err(error)) => Err(self.classify(generation, error).await),
             Ok(Ok(value)) => parse_search_reply(value, &self.content_field, query.top_k),
         }
     }

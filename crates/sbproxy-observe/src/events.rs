@@ -1,5 +1,6 @@
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -238,6 +239,12 @@ pub enum EventType {
     /// (WOR-2571). Fires once per actual resolution, never on the
     /// per-request cache hit.
     CredentialResolved,
+    /// Event name `credential_fallback`. An AI provider refused the
+    /// provider entry's own key with a `401`/`403` and the request was
+    /// retried against the same provider on the operator's
+    /// `fallback_credential_id`. Names the provider, the credential id,
+    /// and whether the retry was served; never any secret.
+    CredentialFallback,
 }
 
 impl ProxyEvent {
@@ -277,10 +284,10 @@ impl ProxyEvent {
 ///
 /// The array length is written out, so a variant added to the enum and
 /// not added here fails to compile. That is deliberate. The failure
-/// mode this prevents is a nineteenth event type that no `events:` sink
+/// mode this prevents is a twentieth event type that no `events:` sink
 /// can ever be told to deliver, which looks exactly like a working sink
 /// to everyone except the operator waiting for the event.
-pub const ALL_EVENT_TYPES: [EventType; 18] = [
+pub const ALL_EVENT_TYPES: [EventType; 19] = [
     EventType::RequestStarted,
     EventType::RequestCompleted,
     EventType::RequestError,
@@ -299,6 +306,7 @@ pub const ALL_EVENT_TYPES: [EventType; 18] = [
     EventType::KeyRotated,
     EventType::KeyBlocked,
     EventType::CredentialResolved,
+    EventType::CredentialFallback,
 ];
 
 impl EventType {
@@ -329,6 +337,7 @@ impl EventType {
             Self::KeyRotated => "key_rotated",
             Self::KeyBlocked => "key_blocked",
             Self::CredentialResolved => "credential_resolved",
+            Self::CredentialFallback => "credential_fallback",
         }
     }
 
@@ -363,6 +372,7 @@ impl EventType {
             Self::KeyRotated => 15,
             Self::KeyBlocked => 16,
             Self::CredentialResolved => 17,
+            Self::CredentialFallback => 18,
         }
     }
 
@@ -404,6 +414,10 @@ impl EventType {
                 | Self::KeyRotated
                 | Self::KeyBlocked
                 | Self::CredentialResolved
+                // The AI provider-key fallback publishes from the one
+                // arm in `sbproxy_core::server::ai_dispatch` that swaps
+                // the credential mid-request.
+                | Self::CredentialFallback
         )
         // `CacheHit` and `CacheMiss` are deliberately absent: wiring
         // them per-request would put an NDJSON line on every configured
@@ -416,7 +430,72 @@ impl EventType {
 /// Event subscriber callback type.
 pub type EventHandler = Box<dyn Fn(&ProxyEvent) + Send + Sync>;
 
+/// How many nested [`EventBus::publish`] calls one thread may stack
+/// before the bus starts dropping events.
+///
+/// A handler is allowed to publish, and two handlers that publish each
+/// other's type are a cycle with no natural end. While the fan-out ran
+/// under the handler-map lock the cycle stopped itself by deadlocking on
+/// the second publish, which is a hang rather than a bound. With the
+/// lock released before handlers run, the same cycle recurses instead,
+/// and unbounded recursion on the publisher's thread overflows the stack
+/// and aborts the process. The cap turns that into a dropped event and
+/// one `warn`.
+///
+/// Eight is past any fan-out chain a real embedder writes on purpose and
+/// far short of the frame budget eight nested handlers could exhaust.
+const MAX_PUBLISH_DEPTH: usize = 8;
+
+thread_local! {
+    /// Nested [`EventBus::publish`] calls on this thread's stack.
+    ///
+    /// Counted per thread across every bus rather than per bus: what the
+    /// cap protects is one thread's stack, and two buses whose handlers
+    /// publish into each other build exactly the stack a single bus
+    /// does. Thread-local also keeps a parallel test run from making one
+    /// test's depth depend on another's.
+    static PUBLISH_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Restores the thread's fan-out depth when a `publish` returns,
+/// including when a handler unwinds through it.
+///
+/// A bare decrement in the happy path would leak depth on every
+/// panicking handler until the thread hit the cap permanently and
+/// stopped delivering anything.
+struct PublishDepthGuard {
+    previous: usize,
+}
+
+impl Drop for PublishDepthGuard {
+    fn drop(&mut self) {
+        PUBLISH_DEPTH.with(|depth| depth.set(self.previous));
+    }
+}
+
 /// Event bus for publishing and subscribing to proxy events.
+///
+/// # What the lock covers
+///
+/// The handler map is locked to read or write the subscriber list and
+/// unlocked before any handler runs. [`EventBus::publish`] clones the
+/// `Arc<EventHandler>` list for one event type, which is a refcount bump
+/// per subscriber and not a copy of any closure, drops the guard, and
+/// only then calls handlers. Nothing arbitrary runs under the lock, so:
+///
+/// - A handler that blocks on a socket delays its own publisher and
+///   nobody else. Other threads keep publishing, subscribing, and
+///   counting while it runs.
+/// - A handler that calls back into [`EventBus::subscribe`],
+///   [`EventBus::publish`], or [`EventBus::subscriber_count`] returns
+///   instead of waiting forever on a lock its own caller is holding.
+///   `parking_lot::Mutex` is not reentrant and blocks rather than
+///   panicking, so re-entry used to be a permanent hang on a thread with
+///   no diagnostic attached to it.
+/// - A handler that panics unwinds through `publish` and the handlers
+///   after it do not run, but the bus stays usable: `parking_lot` has no
+///   poisoning, and the guard is gone before the handler is entered, so
+///   the next publish reads the same list and runs it from the start.
 pub struct EventBus {
     handlers: Mutex<HashMap<EventType, Vec<Arc<EventHandler>>>>,
 }
@@ -430,6 +509,12 @@ impl EventBus {
     }
 
     /// Subscribe to events of a specific type.
+    ///
+    /// Handlers run in registration order, so this appends. Subscribing
+    /// from inside a handler is allowed and joins the list for the
+    /// *next* [`EventBus::publish`]: the fan-out in flight already took
+    /// its snapshot, and the new handler does not run for the event
+    /// being delivered.
     pub fn subscribe(&self, event_type: EventType, handler: EventHandler) {
         let mut handlers = self.handlers.lock();
         handlers
@@ -439,16 +524,56 @@ impl EventBus {
     }
 
     /// Publish an event to all subscribers.
+    ///
+    /// Synchronous on the calling thread, in registration order, over the
+    /// subscribers registered at the moment this call started. The
+    /// handler map is unlocked before the first handler runs; see the
+    /// type-level docs for what that buys a slow, re-entrant, or
+    /// panicking handler.
+    ///
+    /// Nested publishes on one thread are capped at `MAX_PUBLISH_DEPTH`.
+    /// Past the cap the event is dropped and a `warn` names the type, so
+    /// a handler cycle ends in a counted-off event rather than a blown
+    /// stack.
     pub fn publish(&self, event: &ProxyEvent) {
-        let handlers = self.handlers.lock();
-        if let Some(subscribers) = handlers.get(&event.event_type) {
-            for handler in subscribers {
-                handler(event);
-            }
+        let depth = PUBLISH_DEPTH.with(Cell::get);
+        if depth >= MAX_PUBLISH_DEPTH {
+            tracing::warn!(
+                event_type = event.event_type.as_str(),
+                depth,
+                max_depth = MAX_PUBLISH_DEPTH,
+                "event bus fan-out hit its nesting cap; dropping this event \
+                 rather than recursing further. A handler publishes an event \
+                 that reaches it again."
+            );
+            return;
+        }
+
+        // The snapshot is the fix. Clone the `Arc` list under the lock,
+        // drop the guard at the end of this block, and call handlers
+        // with nothing held.
+        let subscribers = {
+            let handlers = self.handlers.lock();
+            let Some(subscribers) = handlers.get(&event.event_type) else {
+                return;
+            };
+            subscribers.clone()
+        };
+
+        PUBLISH_DEPTH.with(|current| current.set(depth + 1));
+        let _depth_guard = PublishDepthGuard { previous: depth };
+        for handler in &subscribers {
+            handler(event);
         }
     }
 
     /// Number of subscribers for an event type.
+    ///
+    /// Safe to call from inside a handler: a fan-out in flight is not
+    /// holding the handler map. The count includes handlers registered
+    /// after that fan-out took its snapshot, so a handler that
+    /// subscribes and then counts sees its own addition even though the
+    /// addition will not run until the next publish.
     pub fn subscriber_count(&self, event_type: &EventType) -> usize {
         let handlers = self.handlers.lock();
         handlers.get(event_type).map(|v| v.len()).unwrap_or(0)
@@ -464,7 +589,10 @@ impl Default for EventBus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     fn make_event(event_type: EventType) -> ProxyEvent {
         ProxyEvent {
@@ -646,6 +774,41 @@ mod tests {
         }
     }
 
+    /// WOR-2655: the nineteenth type, pinned across all four
+    /// hand-maintained surfaces at once.
+    ///
+    /// The array length is compile-checked; `index()`, `as_str()` and
+    /// `has_emitter()` are hand-written matches that are not checked
+    /// against the array by the compiler. A half-added variant
+    /// compiles, resolves from `events.types:`, and then routes to
+    /// another type's mask bit, which reads as a working sink to
+    /// everyone except the operator waiting for the event.
+    #[test]
+    fn credential_fallback_is_declared_on_every_hand_maintained_surface() {
+        assert_eq!(
+            EventType::CredentialFallback.as_str(),
+            "credential_fallback"
+        );
+        assert_eq!(
+            EventType::from_name("credential_fallback"),
+            Some(EventType::CredentialFallback)
+        );
+        assert!(
+            ALL_EVENT_TYPES.contains(&EventType::CredentialFallback),
+            "an events.types: entry can only name a type the array lists"
+        );
+        assert_eq!(
+            EventType::CredentialFallback.index(),
+            ALL_EVENT_TYPES.len() - 1,
+            "the new variant is appended, so its bit is the last one"
+        );
+        assert!(
+            EventType::CredentialFallback.has_emitter(),
+            "sbproxy_core::server::ai_dispatch publishes it from the \
+             provider-key fallback arm"
+        );
+    }
+
     #[test]
     fn cache_hit_and_cache_miss_are_the_only_events_with_no_emitter() {
         // WOR-2486: the boot warning in
@@ -692,5 +855,211 @@ mod tests {
         bus.publish(&make_event(EventType::RequestError));
         assert_eq!(started_count.load(Ordering::SeqCst), 1);
         assert_eq!(error_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// Runs `body` on its own thread and fails the test if it has not
+    /// returned inside `DEADLINE`.
+    ///
+    /// Every re-entrancy test below hangs forever against the pre-fix
+    /// bus, because the handler blocks on the handler-map mutex its own
+    /// `publish` is still holding and `parking_lot::Mutex` waits rather
+    /// than panicking on a same-thread relock. Running the publish on a
+    /// borrowed thread converts that hang into a failed assertion: the
+    /// test thread stops waiting, reports, and lets the run finish. The
+    /// wedged worker stays parked until the process exits, which is the
+    /// price of not wedging the runner with it.
+    fn run_with_deadline(what: &str, body: impl FnOnce() + Send + 'static) {
+        const DEADLINE: Duration = Duration::from_secs(10);
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            body();
+            let _ = done_tx.send(());
+        });
+
+        match done_rx.recv_timeout(DEADLINE) {
+            Ok(()) => {}
+            // The worker unwound before it could send. Fall through to
+            // the join, which re-raises its panic with its own message
+            // rather than reporting a deadline that was never missed.
+            Err(mpsc::RecvTimeoutError::Disconnected) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+                "{what} did not finish within {DEADLINE:?}: publish is \
+                 holding the handler map while a handler waits for it"
+            ),
+        }
+
+        if let Err(payload) = worker.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn publish_does_not_deadlock_when_a_handler_reenters_the_bus() {
+        // The regression test for WOR-2613. Against the pre-fix
+        // `publish`, which held the handler-map guard across the whole
+        // fan-out, `subscriber_count` inside the handler blocks forever
+        // on that same mutex and this never returns.
+        let bus = Arc::new(EventBus::new());
+        let weak_bus = Arc::downgrade(&bus);
+        // u64::MAX distinguishes "the handler never ran" from a real
+        // count of zero.
+        let observed = Arc::new(AtomicU64::new(u64::MAX));
+        let recorder = observed.clone();
+
+        bus.subscribe(
+            EventType::RequestStarted,
+            Box::new(move |_event| {
+                let Some(bus) = weak_bus.upgrade() else {
+                    return;
+                };
+                let count = bus.subscriber_count(&EventType::RequestStarted);
+                recorder.store(count as u64, Ordering::SeqCst);
+            }),
+        );
+
+        let publisher = bus.clone();
+        run_with_deadline("a handler that counts subscribers", move || {
+            publisher.publish(&make_event(EventType::RequestStarted));
+        });
+
+        assert_eq!(
+            observed.load(Ordering::SeqCst),
+            1,
+            "the re-entrant handler should have read the live subscriber count"
+        );
+    }
+
+    #[test]
+    fn a_handler_that_subscribes_is_delivered_to_from_the_next_publish() {
+        // Two contracts at once: subscribing from inside a handler does
+        // not deadlock (pre-fix, `subscribe` blocks on the guard
+        // `publish` holds), and the fan-out set is frozen at publish
+        // entry, so the handler added mid-flight does not see the event
+        // in flight.
+        let bus = Arc::new(EventBus::new());
+        let weak_bus = Arc::downgrade(&bus);
+        let late_handler_runs = Arc::new(AtomicU64::new(0));
+        let late_counter = late_handler_runs.clone();
+        let already_added = Arc::new(AtomicBool::new(false));
+
+        bus.subscribe(
+            EventType::CacheHit,
+            Box::new(move |_event| {
+                if already_added.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let Some(bus) = weak_bus.upgrade() else {
+                    return;
+                };
+                let counter = late_counter.clone();
+                bus.subscribe(
+                    EventType::CacheHit,
+                    Box::new(move |_event| {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    }),
+                );
+            }),
+        );
+
+        let publisher = bus.clone();
+        run_with_deadline("a handler that subscribes another handler", move || {
+            publisher.publish(&make_event(EventType::CacheHit));
+        });
+
+        assert_eq!(bus.subscriber_count(&EventType::CacheHit), 2);
+        assert_eq!(
+            late_handler_runs.load(Ordering::SeqCst),
+            0,
+            "a handler subscribed during a fan-out must not receive the event \
+             that fan-out is already delivering"
+        );
+
+        let publisher = bus.clone();
+        run_with_deadline("the next publish", move || {
+            publisher.publish(&make_event(EventType::CacheHit));
+        });
+
+        assert_eq!(
+            late_handler_runs.load(Ordering::SeqCst),
+            1,
+            "the late handler should receive every publish after the one it \
+             was added during"
+        );
+    }
+
+    #[test]
+    fn a_handler_that_republishes_its_own_type_stops_at_the_depth_cap() {
+        // Releasing the lock is what makes this cycle possible: pre-fix
+        // it deadlocked on the second publish. The cap is what keeps it
+        // from becoming a stack overflow, which aborts the process
+        // instead of failing one call.
+        let bus = Arc::new(EventBus::new());
+        let weak_bus = Arc::downgrade(&bus);
+        let invocations = Arc::new(AtomicU64::new(0));
+        let counter = invocations.clone();
+
+        bus.subscribe(
+            EventType::RequestError,
+            Box::new(move |event| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                if let Some(bus) = weak_bus.upgrade() {
+                    bus.publish(event);
+                }
+            }),
+        );
+
+        let publisher = bus.clone();
+        run_with_deadline("a self-republishing handler", move || {
+            publisher.publish(&make_event(EventType::RequestError));
+        });
+
+        // Invocation n runs at depth n, and the publish it makes sees
+        // depth n, so the cap refuses the one that would run invocation
+        // MAX_PUBLISH_DEPTH + 1.
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            MAX_PUBLISH_DEPTH as u64,
+            "the recursion cap should have bounded the cycle"
+        );
+    }
+
+    #[test]
+    fn the_depth_counter_is_restored_after_a_handler_panics() {
+        // The cap is per thread and outlives any single publish, so a
+        // depth left incremented by an unwinding handler would ratchet
+        // the thread shut: after MAX_PUBLISH_DEPTH panics it would
+        // silently stop delivering anything.
+        let bus = Arc::new(EventBus::new());
+        let survivor_runs = Arc::new(AtomicU64::new(0));
+        let counter = survivor_runs.clone();
+
+        bus.subscribe(
+            EventType::AuthDenied,
+            Box::new(|_event| panic!("handler under test")),
+        );
+        bus.subscribe(
+            EventType::PolicyDenied,
+            Box::new(move |_event| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        let publisher = bus.clone();
+        run_with_deadline("publishes that survive a panicking handler", move || {
+            for _ in 0..(MAX_PUBLISH_DEPTH + 2) {
+                let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    publisher.publish(&make_event(EventType::AuthDenied));
+                }));
+                assert!(panicked.is_err(), "the handler was supposed to panic");
+                publisher.publish(&make_event(EventType::PolicyDenied));
+            }
+        });
+
+        assert_eq!(
+            survivor_runs.load(Ordering::SeqCst),
+            (MAX_PUBLISH_DEPTH + 2) as u64,
+            "every publish after a panicking one should still fan out"
+        );
     }
 }

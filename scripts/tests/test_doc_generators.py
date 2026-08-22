@@ -776,11 +776,10 @@ class DocDriftCatalogTests(unittest.TestCase):
         root = self._root()
         self.assertEqual(self._run(root).returncode, 0, "baseline should be clean")
 
-        lines = (
-            (root / "crates" / "sbproxy-ai" / "data" / "ai_providers.yml")
-            .read_text()
-            .split("\n")
-        )
+        catalog_before = (
+            root / "crates" / "sbproxy-ai" / "data" / "ai_providers.yml"
+        ).read_text()
+        lines = catalog_before.split("\n")
         for index, line in enumerate(lines):
             if line.startswith("  - name: "):
                 name = line[len("  - name: "):]
@@ -791,9 +790,13 @@ class DocDriftCatalogTests(unittest.TestCase):
         else:
             self.fail("no provider entry led with `name:`")
         swapped = "\n".join(lines)
+        # Derived, not written down: the catalog's size is exactly the thing
+        # this suite exists to stop anyone hardcoding, and a literal here goes
+        # stale the first time a provider is added or removed.
+        entries = len(re.findall(r"^  - name:", catalog_before, re.MULTILINE))
         self.assertEqual(
             len(re.findall(r"^  - name:", swapped, re.MULTILINE)),
-            72 - 1,
+            entries - 1,
             "the old regex should miscount this catalog, which is the point",
         )
         self._write_catalog(root, swapped)
@@ -813,21 +816,27 @@ class DocDriftCatalogTests(unittest.TestCase):
     def test_the_format_split_is_held_even_when_the_total_is_right(self) -> None:
         """The breakdown drifts on its own, and only the breakdown sees it.
 
-        Retyping one `custom` entry as `openai` leaves the total at 72,
+        Retyping one `custom` entry as `openai` leaves the total alone,
         so every total claim in the tree stays green while "3
         custom-format entries" on four pages goes wrong.
         """
         root = self._root()
         catalog = root / "crates" / "sbproxy-ai" / "data" / "ai_providers.yml"
+        before = catalog.read_text()
+        # One fewer than the catalog ships, because the line below retypes
+        # exactly one. Derived for the same reason as the total above.
+        remaining = len(re.findall(r"^    format: custom$", before, re.MULTILINE)) - 1
         self._write_catalog(
-            root, catalog.read_text().replace("    format: custom\n", "    format: openai\n", 1)
+            root, before.replace("    format: custom\n", "    format: openai\n", 1)
         )
         result = self._run(root)
         self.assertEqual(result.returncode, 1)
         self.assertNotIn("providers$", result.stderr)
         for page in ("ai-gateway.md", "features.md", "providers.md"):
             self.assertIn(f"docs/{page}", result.stderr)
-        self.assertIn("but the catalog has 2 custom-format entries", result.stderr)
+        self.assertIn(
+            f"but the catalog has {remaining} custom-format entries", result.stderr
+        )
 
     def test_the_generated_corpus_is_still_in_the_fixed_string_scan(self) -> None:
         """Excluding it for the derived check must not narrow the old one."""

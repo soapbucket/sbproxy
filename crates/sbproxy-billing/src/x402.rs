@@ -16,14 +16,44 @@
 //!    attempt is prepared and no settle request is sent.
 //! 4. Commit the durable dispatch stamp through [`SettleDispatchGate`].
 //! 5. Call `settle` on the same facilitator.
-//! 6. Require `success = true`, a non-empty transaction, the exact
-//!    network, agreeing payer values when both responses carry them,
-//!    and the exact amount whenever the settlement response states one.
+//! 6. Require a 2xx status, then `success = true`, a non-empty
+//!    transaction, the exact network, agreeing payer values when both
+//!    responses carry them, and the exact amount whenever the settlement
+//!    response states one.
 //! 7. Only then does the caller commit `Succeeded` and let the request
 //!    reach the origin.
 //!
 //! Steps 2 through 6 run inside one [`tokio::time::timeout`] whose
 //! configured maximum is [`MAX_TOTAL_DEADLINE_MS`].
+//!
+//! # Three answers, not two
+//!
+//! A settle has three outcomes, and the middle one is the whole reason
+//! this rail has a dispatch gate:
+//!
+//! - **Accepted.** A 2xx whose body is the pinned shape saying
+//!   `success = true`, with a transaction and matching terms.
+//! - **Refused.** A 2xx whose body is the pinned shape saying
+//!   `success = false`. The facilitator answered, in its own protocol,
+//!   that no funds moved. This is the only answer that concludes the
+//!   dispatch, closes the attempt `Terminal`, and bills the payer
+//!   nothing.
+//! - **Unknown.** Everything else: a 5xx, a 4xx, a timeout, a dropped
+//!   connection, a body that does not parse, an oversized body, a 2xx
+//!   with `success` absent, or a 2xx success whose transaction, network,
+//!   amount, or payer does not hold up. All of it is
+//!   [`BillingError::NeedsReconciliation`].
+//!
+//! The status is read before the body, because the two failure
+//! directions are not symmetric. Calling an unknown outcome a refusal
+//! tells the payer their payment was declined and closes the record,
+//! while the facilitator may have broadcast the settlement: the money is
+//! gone, the service was not rendered, and nothing is left on the
+//! reconciliation queue to ever ask about it. Calling a genuine refusal
+//! unknown costs one row on that queue and a 503 instead of a 402. On a
+//! rail whose status query is [`X402QueryResult::Unsupported`] that row
+//! is an operator's work, which is the price this module pays
+//! deliberately rather than closing a live payment on a guess.
 //!
 //! # What this adapter will not do
 //!
@@ -435,6 +465,26 @@ impl FacilitatorBreaker {
         })
     }
 
+    /// Reports whether the breaker is currently refusing calls.
+    ///
+    /// Unlike [`Self::admit`] this claims nothing, so it is safe to ask
+    /// from a selection path that may not go on to make a call.
+    ///
+    /// Private on purpose: the only caller is the candidate filter in
+    /// this file, and a `pub` predicate nothing outside names is what
+    /// the pub-item ratchet exists to catch.
+    #[must_use]
+    fn is_open(&self, now_ms: i64) -> bool {
+        let state = self.lock();
+        match state.opened_at_ms {
+            None => false,
+            Some(opened_at) => {
+                now_ms.saturating_sub(opened_at) < self.open_ms
+                    || state.probes_in_flight >= self.half_open_max
+            }
+        }
+    }
+
     /// Asks whether a call may be made, and claims the half-open probe
     /// when one is available.
     #[must_use]
@@ -452,22 +502,6 @@ impl FacilitatorBreaker {
                 } else {
                     BreakerVerdict::Open
                 }
-            }
-        }
-    }
-
-    /// Reports whether the breaker is currently refusing calls.
-    ///
-    /// Unlike [`Self::admit`] this claims nothing, so it is safe to ask
-    /// from a selection path that may not go on to make a call.
-    #[must_use]
-    pub fn is_open(&self, now_ms: i64) -> bool {
-        let state = self.lock();
-        match state.opened_at_ms {
-            None => false,
-            Some(opened_at) => {
-                now_ms.saturating_sub(opened_at) < self.open_ms
-                    || state.probes_in_flight >= self.half_open_max
             }
         }
     }
@@ -733,6 +767,19 @@ pub struct VerifyResponse {
 /// Every field that decides authorization is optional on the wire, so an
 /// incomplete answer is ambiguous rather than being read as a success or
 /// as an authoritative failure.
+///
+/// # Why this shape is not `deny_unknown_fields`
+///
+/// The request and challenge shapes in this module are strict, because
+/// the proxy either builds them or compares an echo of one it signed
+/// byte for byte. This one is a third party's answer, and strictness
+/// here fails in the expensive direction: a facilitator that adds an
+/// optional field would turn every settled payment into an unparseable
+/// body, which this adapter reads as ambiguous, on a rail with no status
+/// query to resolve it. The cost of the looser decode is that a foreign
+/// error envelope carrying `"success"` deserializes cleanly, which is
+/// why the settle path refuses anything outside 2xx on the status alone
+/// and never lets such a body speak for the facilitator.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SettleResponse {
     /// Whether the settlement succeeded.
@@ -1118,10 +1165,13 @@ impl<T: FacilitatorTransport> X402ExactSettler<T> {
     /// the facilitator is unreachable before dispatch,
     /// [`BillingError::ProviderTimeout`] when the deadline elapses
     /// before dispatch, [`BillingError::ProviderRejected`] for an
-    /// authoritative failure, [`BillingError::ProviderMalformed`] for a
-    /// response outside the pinned contract, and
-    /// [`BillingError::NeedsReconciliation`] for anything ambiguous
-    /// after the settle dispatch stamp is committed.
+    /// authoritative failure, which on the settle leg means a 2xx body in
+    /// the pinned shape saying `success = false` and nothing else,
+    /// [`BillingError::ProviderMalformed`] for a response outside the
+    /// pinned contract, and [`BillingError::NeedsReconciliation`] for
+    /// anything ambiguous after the settle dispatch stamp is committed,
+    /// which includes every settle status outside 2xx whatever its body
+    /// deserializes to.
     pub async fn authorize_and_settle(
         &self,
         request: X402AuthorizationRequest<'_>,
@@ -1221,15 +1271,43 @@ impl<T: FacilitatorTransport> X402ExactSettler<T> {
             Err(TransportFailure::TooLarge) => return Err(BillingError::NeedsReconciliation),
         };
 
+        // The status decides what kind of answer this is, before the body
+        // is allowed to say what the answer is. Only a 2xx is the pinned
+        // `/settle` contract. x402 v2 at the pinned revision publishes no
+        // error-response shape at all, and the configured facilitator root
+        // is an operator-supplied URL that may sit behind a gateway, so a
+        // non-2xx body is some other party's error page rather than a
+        // settle answer. `SettleResponse` is deliberately not
+        // `deny_unknown_fields` (see its type doc), so such a page carrying
+        // `"success": false` deserializes cleanly. Reading that as a
+        // refusal is the one direction that loses money: it concludes the
+        // dispatch as authoritative, closes the attempt `Terminal`, and
+        // takes it off the reconciliation queue for a settle the
+        // facilitator may already have broadcast.
+        if !(200..300).contains(&response.status) {
+            if response.status >= 500 {
+                // The same signal `verify` feeds the breaker for the same
+                // status, so the write leg stops being the one leg whose
+                // 5xx the breaker never hears about. It contributes rather
+                // than decides: a facilitator whose `verify` still answers
+                // 200 resets the consecutive-failure count on the leg
+                // before this one, so settle 5xx alone does not open the
+                // breaker.
+                self.breaker.record_transport_failure(request.now_ms);
+            }
+            return Err(BillingError::NeedsReconciliation);
+        }
+
         let settled: SettleResponse = match decode_x402_json(&response.body) {
             Ok(settled) => settled,
             Err(_) => return Err(BillingError::NeedsReconciliation),
         };
         if settled.success == Some(false) {
-            // Authoritative: the facilitator says no funds moved.
+            // Authoritative, and only here: a 2xx answer in the pinned
+            // shape whose own `success` field states that no funds moved.
             return Err(BillingError::ProviderRejected);
         }
-        if !(200..300).contains(&response.status) || settled.success != Some(true) {
+        if settled.success != Some(true) {
             return Err(BillingError::NeedsReconciliation);
         }
         self.breaker.record_success();

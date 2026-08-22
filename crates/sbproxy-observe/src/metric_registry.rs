@@ -599,6 +599,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_ai_admission_decisions_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_admission_decision"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["surface", "reason", "outcome"],
+        description: "Pre-provider AI gateway admission decisions: a request refused at the inbound native-format shim before any provider saw it, by inbound surface and bounded reason code.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_ai_audio_seconds_attributed_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_audio_seconds_attributed"),
@@ -951,6 +962,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_ai_key_fallbacks_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_key_fallback"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["provider", "outcome"],
+        description: "AI provider-key fallback decisions, by the provider entry whose own key was refused and the outcome (`engaged` when the operator's `fallback_credential_id` resolved and the retry was queued, `unavailable` when it did not and the provider's rejection stands). `unavailable` is the alertable one: it means the house credential is broken and the only other evidence is a `401` that reads like the tenant's fault.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_ai_lb_decisions_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_lb_decision"),
@@ -959,6 +981,17 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["strategy", "provider"],
         description: "AI router provider selections by strategy.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_ai_model_group_selections_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_model_group_selection"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        registry: Registry::Default,
+        labels: &["group", "provider"],
+        description: "Named model group member selections: which group a request addressed and which provider's deployment served it. Both labels are operator-declared config names.",
         dead_reason: None,
     },
     MetricCapability {
@@ -981,6 +1014,39 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["reason"],
         description: "Entries evicted from the bounded prefix-affinity table.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_ai_cache_affinity_decisions_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_cache_affinity_decision"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["outcome"],
+        description: "Caller-keyed prompt-cache affinity selections by lease outcome.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_ai_cache_affinity_evictions_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_cache_affinity_eviction"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["reason"],
+        description: "Leases removed from the bounded prompt-cache affinity table.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_ai_service_tier_decisions_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_service_tier_decision"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["disposition"],
+        description: "Upstream attempts whose service tier the operator's provider entry decided.",
         dead_reason: None,
     },
     MetricCapability {
@@ -1275,6 +1341,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_ai_request_timeout_override_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_request_timeout_override"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        registry: Registry::Default,
+        labels: &["outcome"],
+        description: "Per-request `x-sbproxy-timeout-ms` outcomes: `applied` (honored, replacing the provider's `timeout_ms`), `ignored_override_disabled` (the origin has not opted in, so the header was dropped), `over_ceiling` (above `max_request_timeout_ms`, refused with 400 rather than clamped), `invalid_header` (not a positive integer, refused with 400).",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_ai_requests_attributed_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_ai_outcome_attributed"),
@@ -1341,6 +1418,28 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_ai_shadow_calls_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_shadow_call"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["target", "status_class", "finish_reason"],
+        description: "Completed shadow evaluation calls by target, status class, and finish reason.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_ai_shadow_latency_seconds",
+        kind: MetricKind::Histogram,
+        writer: Writer::Recorder("record_shadow_call"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["target"],
+        description: "Shadow evaluation call latency by target, in seconds.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_ai_shadow_inflight",
         kind: MetricKind::Gauge,
         writer: Writer::Recorder("dec_shadow_inflight"),
@@ -1393,6 +1492,17 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &[],
         description: "Streaming chunks where guardrails fell back to raw-frame matching because delta decoding failed.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_ai_stream_post_commit_failures_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_stream_post_commit_failure"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        registry: Registry::Default,
+        labels: &["provider", "cause"],
+        description: "Streaming responses that failed after the gateway committed to a provider, by cause: `upstream_timeout` (a transport budget cut a running generation), `upstream_error` (a reset or truncated provider stream), `guardrail` (the gateway ended the stream on an output guardrail or stream-safety verdict). Failover is impossible past the commit point, so these are the failures `sbproxy_ai_failovers_total` can never carry. A caller that disconnects mid-stream is not counted: the failed downstream write aborts the relay before the counter is reached.",
         dead_reason: None,
     },
     MetricCapability {
@@ -1723,6 +1833,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_cert_store_degraded",
+        kind: MetricKind::Gauge,
+        writer: Writer::Recorder("set_cert_store_degraded"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["backend"],
+        description: "1 when the configured certificate store could not be opened and an in-memory fallback is in use, 0 when the configured backend opened.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_circuit_breaker_transitions_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_circuit_breaker"),
@@ -1918,6 +2039,17 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["sha"],
         description: "Commit the config source resolved to; always 1, the commit is the label.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_cors_refusals_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_cors_refusal"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["reason"],
+        description: "Responses the CORS middleware refused to add headers to, by reason.",
         dead_reason: None,
     },
     MetricCapability {
@@ -2189,6 +2321,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_key_cache_invalidation_failures_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_key_cache_invalidation_failure"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        registry: Registry::Default,
+        labels: &["scope"],
+        description: "Keystore cache-tier invalidations that did not reach the shared tier or its peers, by scope (key or all).",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_key_lookup_cache_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_key_lookup_cache"),
@@ -2450,6 +2593,17 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &[],
         description: "MCP peer-profile observations that could not be tracked because the peer registry was at capacity, globally or for the caller's tenant.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_mcp_tool_quota_registry_saturated_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_mcp_tool_quota_registry_saturated"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &[],
+        description: "MCP tools/call refused because the per-tool quota store was at capacity, globally or for the caller's tenant.",
         dead_reason: None,
     },
     MetricCapability {
@@ -3118,7 +3272,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["operation", "outcome"],
-        description: "Durable rows the settlement recovery worker moved, by recovery operation and committed outcome.",
+        description: "Durable rows the settlement recovery worker moved, by recovery operation and committed outcome. `outcome=\"failed\"` is the exception and counts sweeps rather than rows: one per sweep of that operation that returned a store error and moved nothing.",
         dead_reason: None,
     },
     MetricCapability {
@@ -3328,6 +3482,32 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["scan_path", "tenant"],
         description: "Requests blocked by the prompt_injection_v2 policy, by scan path (header_scan, body_scan, ai_body, a2a).",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_prompt_injection_v2_results_total",
+        kind: MetricKind::Counter,
+        // `body_aware_counter`, not the `record_metric` that increments it.
+        // Writer matching is textual and unqualified, and `record_metric`
+        // is a name a closure parameter in `sbproxy-core`'s
+        // `compression_value.rs` also carries, so it counts as a call site
+        // for a function that has nothing to do with this family. That is
+        // a live-writer guard that stays green after the real writer loses
+        // its last caller. `body_aware_counter` is unique in the
+        // workspace, is called only from `record_metric`, and builds this
+        // exact vec.
+        writer: Writer::Recorder("body_aware_counter"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        // Registered into the ProxyMetrics registry rather than the global
+        // one: the writer above builds the vec by hand and hands it to
+        // `metrics().registry`. Written without the trailing parenthesis on
+        // purpose. Recorder call sites are counted textually over raw
+        // source, comments included, so `name(` written here would count as
+        // a call and keep the live-writer check green on its own.
+        registry: Registry::Proxy,
+        labels: &["action", "label", "detector"],
+        description: "Body-aware prompt-injection detector results, by action taken, detection label, and detector name.",
         dead_reason: None,
     },
     MetricCapability {
@@ -3619,6 +3799,23 @@ pub const METRICS: &[MetricCapability] = &[
         description: "Content-Security-Policy headers emitted by the security_headers policy, by mode (enforce, report_only).",
         dead_reason: None,
     },
+    // The deprecation window on the pre-RFC-9421 derivations of
+    // `@target-uri` and `@request-target` cannot close on a log line:
+    // acceptance is announced once per process, which says a signer
+    // somewhere has not moved and nothing about whether that is still
+    // true. This is the series an operator watches to zero before the
+    // fallback is removed.
+    MetricCapability {
+        name: "sbproxy_signature_legacy_derivation_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_signature_legacy_derivation"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["component"],
+        description: "RFC 9421 signatures accepted only against the pre-conformance derivation of a request-target component, by component.",
+        dead_reason: None,
+    },
     MetricCapability {
         name: "sbproxy_silent_degradations_total",
         kind: MetricKind::Counter,
@@ -3653,6 +3850,38 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &[],
         description: "Failed installs of the process-wide telemetry sink dispatcher.",
+        dead_reason: None,
+    },
+    // Both storage families are written by the same `observe_op` wrapper in
+    // `crates/sbproxy-storage/src/metrics.rs`, which every RedisStore trait
+    // method goes through. They shipped as `storage_op_*`, outside both
+    // sanctioned prefixes, which made them invisible twice over: the
+    // coverage guard only looked at sanctioned names, and a scrape config
+    // built from the prefixes this doc sanctions dropped them at the
+    // scrape. Renamed with the registry entries they always owed.
+    MetricCapability {
+        name: "sbproxy_storage_op_duration_seconds",
+        kind: MetricKind::Histogram,
+        // The static rather than `observe_op`: the wrapper is generic
+        // (`fn observe_op<F, T>(`), so the scanner's `fn observe_op(`
+        // definition needle would never match it.
+        writer: Writer::Recorder("STORAGE_OP_DURATION_SECONDS"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        registry: Registry::Default,
+        labels: &["op", "backend", "kind"],
+        description: "Latency of storage backend operations, by operation, backend, and record kind.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_storage_op_errors_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("STORAGE_OP_ERRORS_TOTAL"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        registry: Registry::Default,
+        labels: &["op", "backend", "kind", "error_kind"],
+        description: "Errors returned by storage backend operations, by operation, backend, record kind, and error variant.",
         dead_reason: None,
     },
     MetricCapability {

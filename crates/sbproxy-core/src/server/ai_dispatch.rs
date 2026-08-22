@@ -20,13 +20,149 @@ fn provider_matches_native_key(
     provider.accepts_native_credential_for(native_provider)
 }
 
+/// Which secret an AI attempt presents upstream (WOR-2655).
+///
+/// The outbound counterpart to the inbound `key_mode`, and a closed set
+/// for the same reason: it labels a request row, a usage-ledger record,
+/// and a typed event, so a new spelling has to be added here rather
+/// than invented at a call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CredentialSource {
+    /// The provider entry's own `api_key`, exactly as configured.
+    ProviderEntry,
+    /// A caller-owned native provider key, forwarded verbatim.
+    NativeCaller,
+    /// The operator's `fallback_credential_id`, presented after the
+    /// entry's own key was refused with a `401` / `403`.
+    Fallback,
+}
+
+impl CredentialSource {
+    /// Stable label for the request row, the ledger, and the event.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderEntry => "provider_entry",
+            Self::NativeCaller => "native_caller",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
+/// Write the credential this attempt will present into `provider`, and
+/// name which one it was.
+///
+/// Only `provider.api_key` is written, never a header: the vendor's
+/// wire shape stays with `ProviderConfig::auth_header`, so an Anthropic
+/// entry still sends a bare `x-api-key` and an OpenAI entry still sends
+/// `Bearer `.
+///
+/// A caller-owned native key wins over an operator fallback whenever
+/// both are somehow present. That ordering is the money-safe one and it
+/// is deliberate rather than incidental: the caller presented their own
+/// credential, so a rejection is theirs to fix, and spending the house
+/// credential on it would bill the operator for someone else's
+/// authorization failure. The retry-loop arm that supplies
+/// `fallback_material` already refuses to run when a native key is in
+/// flight; this is the second lock on the same door, because the two
+/// conditions live several thousand lines apart.
+fn select_upstream_credential(
+    provider: &mut sbproxy_ai::ProviderConfig,
+    native_api_key: Option<&str>,
+    fallback_material: Option<&str>,
+) -> CredentialSource {
+    if let Some(api_key) = native_api_key {
+        provider.api_key = Some(api_key.to_string());
+        return CredentialSource::NativeCaller;
+    }
+    if let Some(material) = fallback_material {
+        provider.api_key = Some(material.to_string());
+        return CredentialSource::Fallback;
+    }
+    CredentialSource::ProviderEntry
+}
+
+/// Whether this attempt's rejection should be retried against the same
+/// provider on the operator's fallback credential (WOR-2655).
+///
+/// Extracted from the retry loop rather than written inline, because
+/// the loop sits six thousand lines inside `handle_ai_proxy` and only
+/// the e2e harness reaches it. The rule this gate carries is a money
+/// rule, so it is testable by name.
+///
+/// `native_key_in_flight` is the important one. A request whose
+/// credential came from the caller (`inbound_key_mode: native`) never
+/// falls back: the caller presented their own key, the provider refused
+/// it, and spending the operator's credential there would bill the
+/// operator for someone else's authorization failure and let a caller
+/// whose upstream key was revoked keep working on the house account.
+///
+/// What this gate cannot see: whether the named credential actually
+/// resolves, whether it belongs to this tenant, and whether the retry
+/// succeeds. Those are the key plane's decisions and are made at the
+/// call site, after this returns `true`.
+fn wants_provider_key_fallback(
+    provider: &sbproxy_ai::ProviderConfig,
+    status: u16,
+    native_key_in_flight: bool,
+    already_used: bool,
+) -> bool {
+    !already_used
+        && !native_key_in_flight
+        && provider.on_key_failure == sbproxy_ai::KeyFailurePosture::Fallback
+        && provider.fallback_credential_id.is_some()
+        && sbproxy_ai::failure_cause::FailureCause::classify(status, "").triggers_key_fallback()
+}
+
+/// Build the `credential_fallback` typed event for one AI provider-key
+/// fallback decision (WOR-2655).
+///
+/// A free function so the field set is testable without a running event
+/// egress, the same shape as `credential_resolved_event` in
+/// `crate::key_plane`. The payload mirrors that family's
+/// `op`/`resource`/`id`/`outcome` vocabulary so one SIEM rule covers
+/// both, and adds the provider entry and the upstream status that
+/// triggered the swap. It never carries the entry's own key, the
+/// fallback credential's material, or a vault reference: only which
+/// credential record was named.
+///
+/// `outcome` is `engaged` when the operator's credential resolved and
+/// the retry was queued, and `unavailable` when it did not resolve and
+/// the provider's rejection stands. The second one is the alertable
+/// event: it means the house credential is broken, and the only other
+/// evidence is a `401` that looks like the tenant's fault.
+fn credential_fallback_event(
+    hostname: &str,
+    tenant_id: &str,
+    provider: &str,
+    credential_id: &str,
+    status: u16,
+    outcome: &'static str,
+) -> sbproxy_observe::ProxyEvent {
+    sbproxy_observe::ProxyEvent::new(
+        sbproxy_observe::EventType::CredentialFallback,
+        hostname.to_string(),
+        tenant_id.to_string(),
+        serde_json::json!({
+            "op": "credential_fallback",
+            "resource": "credential",
+            "id": credential_id,
+            "provider": provider,
+            "status": status,
+            "outcome": outcome,
+        }),
+    )
+}
+
+/// [`select_upstream_credential`] with no fallback credential in play.
+///
+/// The four dispatch paths that never run the provider-key fallback
+/// retry loop (the pre-flight resolution sites and the raced dispatch)
+/// keep the same one-line shape they had.
 fn apply_native_provider_credential(
     provider: &mut sbproxy_ai::ProviderConfig,
     native_api_key: Option<&str>,
-) {
-    if let Some(api_key) = native_api_key {
-        provider.api_key = Some(api_key.to_string());
-    }
+) -> CredentialSource {
+    select_upstream_credential(provider, native_api_key, None)
 }
 
 #[cfg(test)]
@@ -578,24 +714,28 @@ fn upstream_response_is_successful_stream(status: u16, content_type: Option<&str
 /// Compare the canonical request captured immediately after native inbound
 /// parsing with the body that is about to be dispatched. Provider model
 /// mapping is intentionally ignored because `make_native_bypass_body` applies
-/// the resolved model to the native body. Any other top-level change means a
-/// request transform would be lost by replaying the original native bytes.
+/// the resolved model to the native body. `tier_field` is ignored for the same
+/// reason and no other: the operator's service tier is written into
+/// `attempt_body` before this comparison runs, and `make_native_bypass_body`
+/// re-applies it to the native bytes, so counting it as a lost transform would
+/// disable the bypass for every tiered entry and make the tier the one thing
+/// the bypass could not carry. Any other top-level change means a request
+/// transform really would be lost by replaying the original native bytes.
 fn native_bypass_body_changed(
     baseline: &serde_json::Value,
     attempt_body: &serde_json::Value,
+    tier_field: Option<&str>,
 ) -> bool {
     let (Some(baseline), Some(attempt)) = (baseline.as_object(), attempt_body.as_object()) else {
         return baseline != attempt_body;
     };
-    let baseline_len = baseline
-        .keys()
-        .filter(|key| key.as_str() != "model")
-        .count();
-    let attempt_len = attempt.keys().filter(|key| key.as_str() != "model").count();
+    let reapplied = |key: &str| key == "model" || tier_field == Some(key);
+    let baseline_len = baseline.keys().filter(|key| !reapplied(key)).count();
+    let attempt_len = attempt.keys().filter(|key| !reapplied(key)).count();
     baseline_len != attempt_len
         || baseline
             .iter()
-            .filter(|(key, _)| key.as_str() != "model")
+            .filter(|(key, _)| !reapplied(key))
             .any(|(key, value)| attempt.get(key) != Some(value))
 }
 
@@ -812,6 +952,439 @@ fn resolve_model_alias(
             .as_ref()
             .map(|provider| provider.as_str().to_string()),
     ))
+}
+
+/// One member picked out of a named model group (WOR-2657).
+#[derive(Debug, PartialEq, Eq)]
+struct ModelGroupPick {
+    /// The group name the caller sent as `model`.
+    group: String,
+    /// The member's upstream model id, which replaces the group name
+    /// everywhere below: on the wire, in the gates, and in the budget.
+    model: String,
+    /// The member's provider, applied as the same routing pin a model
+    /// alias uses.
+    provider: String,
+}
+
+/// Why a named model group could not serve a request (WOR-2657).
+///
+/// The two causes answer with different statuses on purpose. A
+/// credential whose provider policy excludes every member is a
+/// permanent decision about this caller, and every other credential
+/// refusal on this path answers `403`; returning `503` there would tell
+/// a client with retry logic to come back and be refused again. A group
+/// whose members are all switched off is an operator-side condition the
+/// same client should retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelGroupRefusal {
+    /// The calling credential's provider policy forbids every member.
+    CredentialForbidsEveryMember,
+    /// Every member's provider is disabled, or the candidate narrowing
+    /// left nothing to pick from.
+    NoMemberAvailable,
+}
+
+impl ModelGroupRefusal {
+    /// The status this refusal answers with.
+    fn status(self) -> u16 {
+        match self {
+            Self::CredentialForbidsEveryMember => 403,
+            Self::NoMemberAvailable => 503,
+        }
+    }
+
+    /// The message sent to the caller. Neither names a provider: which
+    /// vendors an origin configures is not the caller's to learn from a
+    /// refusal.
+    fn message(self) -> &'static str {
+        match self {
+            Self::CredentialForbidsEveryMember => {
+                "no member of this model group is permitted for this credential"
+            }
+            Self::NoMemberAvailable => {
+                "the model group for this request has no eligible member provider"
+            }
+        }
+    }
+
+    /// The bounded reason code carried on the admission decision family
+    /// and its audit record.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::CredentialForbidsEveryMember => "model_group_forbidden",
+            Self::NoMemberAvailable => "model_group_no_member",
+        }
+    }
+}
+
+/// Resolve a requested model name against the origin's group registry
+/// and pick one member.
+///
+/// Returns `None` when the name is not a group, which the caller then
+/// tries as an alias and finally as a literal model id. `Some(Err(..))`
+/// means the name *is* a group and every member is out of the request's
+/// candidate set, which is a refusal rather than a fallthrough: routing
+/// a group name to some other provider would dispatch a model id nobody
+/// declared.
+///
+/// Callers must apply this before the model gates and before building
+/// the provider candidate set, for the reason the alias resolver states
+/// and one more of its own. A group's members may serve *different*
+/// upstream model ids, so a late pick would leave `blocked_models`, the
+/// credential allowlist, the per-model rate limiter, and the budget
+/// scope all judging the group name instead of the model that is about
+/// to be dispatched. The routing-policy path documents exactly that
+/// failure where it changes the model late and has to re-gate.
+///
+/// The pick is resilience-aware: breaker, outlier, and health narrow the
+/// member set through `Router::routable_candidate_indices` before the
+/// group's strategy runs, so an open breaker moves traffic to a sibling
+/// member instead of turning the group into a refusal. Those three axes
+/// stay advisory, so an all-ejected group gives its members back rather
+/// than refusing.
+fn resolve_model_group(
+    config: &AiHandlerConfig,
+    router: &sbproxy_ai::routing::Router,
+    allowed_providers: &[String],
+    blocked_providers: &[String],
+    requested: &str,
+) -> Option<Result<ModelGroupPick, ModelGroupRefusal>> {
+    let registry = config.model_group_registry();
+    if registry.is_empty() || requested.is_empty() {
+        return None;
+    }
+    let group = registry.resolve(requested)?;
+
+    // Two hard filters, kept apart so the refusal can say which one
+    // emptied the set: the enabled switch is the operator's and answers
+    // 503, the credential's provider policy is the caller's and answers
+    // 403. Neither is a health signal; those are advisory and run below.
+    let enabled = group
+        .members
+        .iter()
+        .filter_map(|member| {
+            let index = config
+                .providers
+                .iter()
+                .position(|provider| provider.name.as_str() == member.provider.as_str())?;
+            config.providers[index].enabled.then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if enabled.is_empty() {
+        return Some(Err(ModelGroupRefusal::NoMemberAvailable));
+    }
+    let members = enabled
+        .into_iter()
+        .filter(|&index| {
+            provider_allowed_for_request(
+                &config.providers[index],
+                allowed_providers,
+                blocked_providers,
+            )
+        })
+        .collect::<Vec<_>>();
+    if members.is_empty() {
+        return Some(Err(ModelGroupRefusal::CredentialForbidsEveryMember));
+    }
+
+    let routable = router.routable_candidate_indices(&config.providers, &members);
+    let Some(picked) = router.select_group(&config.providers, &routable, group) else {
+        return Some(Err(ModelGroupRefusal::NoMemberAvailable));
+    };
+    // A pick outside the member set cannot happen: the candidates are
+    // member indices and the narrowing only ever removes from that set.
+    // Refuse rather than fall through if it ever does, because falling
+    // through would send the group name upstream as a literal model id.
+    let Some(provider) = config.providers.get(picked) else {
+        return Some(Err(ModelGroupRefusal::NoMemberAvailable));
+    };
+    let Some(member) = group
+        .members
+        .iter()
+        .find(|member| member.provider.as_str() == provider.name.as_str())
+    else {
+        return Some(Err(ModelGroupRefusal::NoMemberAvailable));
+    };
+    Some(Ok(ModelGroupPick {
+        group: group.name.as_str().to_string(),
+        model: member.model.as_str().to_string(),
+        provider: provider.name.as_str().to_string(),
+    }))
+}
+
+/// Resolve a JSON request body's `model` field against the group
+/// registry, rewriting both representations to the picked member's
+/// upstream model id.
+///
+/// Same contract as [`resolve_body_model_alias`]: the request that
+/// reaches the upstream, the one the budget prices, and the one the
+/// cache keys are all the same model.
+fn resolve_body_model_group(
+    config: &AiHandlerConfig,
+    router: &sbproxy_ai::routing::Router,
+    allowed_providers: &[String],
+    blocked_providers: &[String],
+    model: &mut String,
+    body: &mut serde_json::Value,
+) -> Option<Result<ModelGroupPick, ModelGroupRefusal>> {
+    let pick =
+        match resolve_model_group(config, router, allowed_providers, blocked_providers, model) {
+            Some(Ok(pick)) => pick,
+            other => return other,
+        };
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "model".to_string(),
+            serde_json::Value::String(pick.model.clone()),
+        );
+    }
+    model.clone_from(&pick.model);
+    Some(Ok(pick))
+}
+
+/// Log and publish a refused model group before the caller answers.
+///
+/// Without this a group that refuses every request is invisible: the
+/// selection counter only counts picks that happened, and the 503 or
+/// 403 reaches the client with nothing naming the group behind it. The
+/// refusal is decided before any provider is chosen, so it publishes on
+/// the same pre-provider admission funnel the inbound shim's refusals
+/// use, which puts it on the decision metric, the `ai.admission`
+/// decision family, and the audit feed at once.
+///
+/// `group` is safe to log: the name matched a `model_groups[].name` the
+/// operator declared, so it is bounded by the config rather than by the
+/// request.
+fn record_model_group_refusal(
+    ctx: &RequestContext,
+    surface_label: &str,
+    group: &str,
+    refusal: ModelGroupRefusal,
+) {
+    warn!(
+        ai.surface = surface_label,
+        model_group = %group,
+        reason = refusal.reason(),
+        status = refusal.status(),
+        "AI proxy: named model group has no eligible member; refusing"
+    );
+    record_ai_admission_refusal(ctx, surface_label, refusal.reason());
+}
+
+/// The admin routing-decisions reason a group pick writes.
+fn model_group_route_reason(pick: &ModelGroupPick) -> String {
+    format!(
+        "model_group: {} -> {}/{}",
+        pick.group, pick.provider, pick.model
+    )
+}
+
+/// The origin's default model, when every enabled provider that names
+/// one names the same one.
+///
+/// `default_model` is documented on `ProviderConfig` as "Default model
+/// used when the request omits an explicit model", and that rustdoc
+/// ships verbatim as the operator-facing JSON schema. The served and
+/// `/v1/models` paths honored it; the main JSON dispatch path never read
+/// it at all, so a hosted request that omitted `model` carried the empty
+/// string all the way to the wire (WOR-2531).
+///
+/// The empty string is not a harmless placeholder there. `model.is_empty()`
+/// short-circuits `is_model_allowed`, the virtual-key model gate,
+/// model-scoped budgets, provider eligibility, and the compression
+/// runtime, so against an upstream that infers the model itself (an Azure
+/// deployment-scoped `base_url`, a single-model vLLM or Ollama) omitting
+/// `model` reached the provider with the action allowlist,
+/// `blocked_models`, and per-key model scoping all skipped. Substituting
+/// a concrete model is what puts those gates back in the path.
+///
+/// `default_model` is per-provider and provider selection happens
+/// thousands of lines later, so there is no one provider to ask at this
+/// seam. The rule is the one `pick_local_model_name` already states for
+/// the served path: a default applies only when it is unambiguous.
+/// Providers that name nothing abstain; providers disabled for routing
+/// do not get a vote, because a request can never land on one. Two
+/// enabled providers naming different defaults leave the request
+/// modelless exactly as before, which is the honest answer to "which one
+/// did the operator mean".
+///
+/// **Where this does not apply.** The chat-shaped JSON surfaces only,
+/// gated by [`surface_takes_the_origin_default_model`]. A multipart
+/// request (audio transcription, image edits, image variations) that
+/// carries no `model` form field keeps the old behavior, because the
+/// multipart rewrite can replace a `model` part and cannot add one; the
+/// multipart seam carries the long version of that limit. Nothing here
+/// reaches the served or `/v1/models` paths either, which read
+/// `default_model` per provider through `pick_local_model_name` and
+/// `model_discovery` and always did.
+fn unambiguous_default_model(config: &AiHandlerConfig) -> Option<String> {
+    let mut chosen: Option<&str> = None;
+    for provider in config.providers.iter().filter(|p| p.enabled) {
+        let Some(candidate) = provider.default_model.as_ref().map(|m| m.as_str()) else {
+            continue;
+        };
+        match chosen {
+            None => chosen = Some(candidate),
+            Some(existing) if existing == candidate => {}
+            Some(_) => return None,
+        }
+    }
+    chosen.map(str::to_owned)
+}
+
+/// Whether an omitted `model` on this inbound surface may be filled in
+/// from the origin's `default_model`.
+///
+/// `default_model` names a chat-shaped model: it is what the served
+/// path hands `pick_local_model_name` and what `/v1/models` advertises.
+/// Only the three surfaces that carry a canonical chat request can
+/// therefore take it. Every other JSON surface reaching the same
+/// dispatch path (`moderations`, `image_generation`, `embeddings`,
+/// `audio_speech`, ...) has its own model vocabulary, and several of
+/// them treat `model` as optional with a provider-side default of their
+/// own. Writing a chat model into one of those bodies would turn a
+/// request the provider accepts today into an upstream 400, so the
+/// origin default stops here and those surfaces keep the pre-WOR-2531
+/// behavior of forwarding no `model` at all.
+///
+/// The family is the one `semantic_cache_surface_class` already names,
+/// deliberately: `chat_completions`, `messages`, and `responses` are
+/// exactly the surfaces that wrap the same canonical chat request, and
+/// two independent definitions of that set would drift.
+fn surface_takes_the_origin_default_model(surface_label: &'static str) -> bool {
+    semantic_cache_surface_class(surface_label) == "chat"
+}
+
+#[cfg(test)]
+mod default_model_tests {
+    use super::{surface_takes_the_origin_default_model, unambiguous_default_model};
+
+    /// One origin, described as `(provider name, default_model, enabled)`.
+    ///
+    /// `provider_type` is pinned to `openai` on every entry because
+    /// `from_config` refuses a provider whose catalog key is unknown and
+    /// which carries no `base_url`, and these fixtures deliberately have
+    /// neither a real vendor nor an upstream.
+    fn config(providers: &[(&str, Option<&str>, bool)]) -> sbproxy_ai::AiHandlerConfig {
+        let providers: Vec<serde_json::Value> = providers
+            .iter()
+            .map(|(name, default_model, enabled)| {
+                let mut provider = serde_json::json!({
+                    "name": name,
+                    "provider_type": "openai",
+                    "api_key": "fixture-key",
+                    "enabled": enabled,
+                });
+                if let Some(model) = default_model {
+                    provider["default_model"] = serde_json::Value::String((*model).to_owned());
+                }
+                provider
+            })
+            .collect();
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({ "providers": providers }))
+            .expect("AI handler config fixture")
+    }
+
+    #[test]
+    fn one_provider_naming_a_default_supplies_it() {
+        let config = config(&[("openai", Some("gpt-4o"), true)]);
+        assert_eq!(
+            unambiguous_default_model(&config).as_deref(),
+            Some("gpt-4o")
+        );
+    }
+
+    #[test]
+    fn providers_agreeing_on_a_default_supply_it() {
+        let config = config(&[
+            ("openai", Some("gpt-4o"), true),
+            ("azure", Some("gpt-4o"), true),
+        ]);
+        assert_eq!(
+            unambiguous_default_model(&config).as_deref(),
+            Some("gpt-4o")
+        );
+    }
+
+    #[test]
+    fn a_provider_naming_nothing_abstains_rather_than_disagreeing() {
+        // The common shape: one provider carries the default and the
+        // rest say nothing. Reading an absent value as a disagreement
+        // would make the field unusable on any multi-provider origin.
+        let config = config(&[("openai", None, true), ("azure", Some("gpt-4o"), true)]);
+        assert_eq!(
+            unambiguous_default_model(&config).as_deref(),
+            Some("gpt-4o")
+        );
+    }
+
+    #[test]
+    fn disagreeing_providers_supply_nothing() {
+        // Picking the first would route a modelless request to whichever
+        // provider happens to be listed first, which is not a decision
+        // the operator made.
+        let config = config(&[
+            ("openai", Some("gpt-4o"), true),
+            ("azure", Some("gpt-4o-mini"), true),
+        ]);
+        assert_eq!(unambiguous_default_model(&config), None);
+    }
+
+    #[test]
+    fn a_disabled_provider_does_not_get_a_vote() {
+        // A request can never land on a disabled provider, so its
+        // default cannot be the one the operator meant, and letting it
+        // vote would turn an unambiguous origin ambiguous.
+        let config = config(&[
+            ("openai", Some("gpt-4o"), true),
+            ("retired", Some("gpt-4o-mini"), false),
+        ]);
+        assert_eq!(
+            unambiguous_default_model(&config).as_deref(),
+            Some("gpt-4o")
+        );
+    }
+
+    #[test]
+    fn no_provider_naming_one_supplies_nothing() {
+        let config = config(&[("openai", None, true)]);
+        assert_eq!(unambiguous_default_model(&config), None);
+    }
+
+    #[test]
+    fn only_the_chat_shaped_surfaces_take_the_origin_default() {
+        // `default_model` is a chat model. Writing it into a
+        // `/v1/moderations` or `/v1/images/generations` body, both of
+        // which treat `model` as optional and default it provider-side
+        // to something from their own vocabulary, turns a request the
+        // provider accepts into an upstream 400.
+        for surface in [
+            sbproxy_ai::handler::AiSurface::ChatCompletions,
+            sbproxy_ai::handler::AiSurface::Messages,
+            sbproxy_ai::handler::AiSurface::Responses,
+        ] {
+            assert!(
+                surface_takes_the_origin_default_model(surface.label()),
+                "{} carries a canonical chat request",
+                surface.label()
+            );
+        }
+        for surface in [
+            sbproxy_ai::handler::AiSurface::Moderations,
+            sbproxy_ai::handler::AiSurface::Embeddings,
+            sbproxy_ai::handler::AiSurface::ImageGeneration,
+            sbproxy_ai::handler::AiSurface::AudioSpeech,
+            sbproxy_ai::handler::AiSurface::Reranking,
+            sbproxy_ai::handler::AiSurface::Unknown,
+        ] {
+            assert!(
+                !surface_takes_the_origin_default_model(surface.label()),
+                "{} has its own model vocabulary",
+                surface.label()
+            );
+        }
+    }
 }
 
 /// Resolve a JSON request body's `model` field against the alias registry.
@@ -1618,6 +2191,10 @@ fn try_spawn_governed_shadow_after_primary(
     }
     let usage = super::ai_support::shadow_usage_record_from_context(ctx);
     let reservation_prefix = format!("{}:quota-pool", ctx.request_id);
+    // Shared client on purpose. A shadow copy outlives the caller's
+    // request and is the operator's evaluation traffic, so a caller's
+    // honored `x-sbproxy-timeout-ms` has no business setting its budget;
+    // the shadow supervisor's own `timeout_ms` does.
     let _ = AI_CLIENT
         .load()
         .try_spawn_shadow_with_quota_detached_with_reasoning_eligibility(
@@ -2933,58 +3510,9 @@ fn any_allowed_provider_supports_surface(
             && sbproxy_ai::api_routes::provider_supports_surface_for_modality(
                 provider,
                 surface,
-                served_provider_modality(provider, surface),
+                sbproxy_ai::api_routes::served_provider_modality(provider),
             )
     })
-}
-
-/// The modality of a locally served (`serve:`) provider that could handle
-/// `surface`, or `None` for a non-served provider (WOR-1908). A served
-/// provider is not in the provider catalog, so without this it would
-/// blanket-501 a non-chat surface even while serving an embedder. The
-/// served model's task comes from the built-in catalog (the certified
-/// catalog an embedding model is added to); an operator's custom-catalog
-/// modality is not resolved on this pre-dispatch path and keeps the
-/// chat-only default.
-fn served_provider_modality(
-    provider: &sbproxy_ai::ProviderConfig,
-    surface: &sbproxy_ai::handler::AiSurface,
-) -> Option<sbproxy_model_host::Modality> {
-    // Only the non-universal surfaces need a modality answer; chat/models
-    // are already universal, so skip the catalog work for them.
-    if matches!(
-        surface,
-        sbproxy_ai::handler::AiSurface::ChatCompletions
-            | sbproxy_ai::handler::AiSurface::Models
-            | sbproxy_ai::handler::AiSurface::Messages
-            | sbproxy_ai::handler::AiSurface::Responses
-    ) {
-        return None;
-    }
-    let serve = provider.serve.as_ref()?;
-    let catalog = builtin_catalog();
-    // A served provider hosts one or more models; report the first served
-    // model whose modality is non-chat, so its surface becomes legal. An
-    // explicit `modality:` on the serve entry wins (the only way to declare
-    // it for a raw `hf:` reference, which has no catalog entry); otherwise
-    // fall back to the certified catalog entry's modality.
-    serve
-        .models
-        .iter()
-        .filter_map(|entry| {
-            entry
-                .modality
-                .or_else(|| catalog.get(&entry.model).map(|model| model.modality))
-        })
-        .find(|modality| !modality.uses_kv_cache())
-}
-
-/// The certified built-in catalog, parsed once. Used by the surface gate
-/// to resolve a served model's modality without re-parsing the embedded
-/// YAML per request.
-fn builtin_catalog() -> &'static sbproxy_model_host::Catalog {
-    static BUILTIN: std::sync::OnceLock<sbproxy_model_host::Catalog> = std::sync::OnceLock::new();
-    BUILTIN.get_or_init(sbproxy_model_host::Catalog::builtin)
 }
 
 fn has_allowed_openai_passthrough(
@@ -3908,6 +4436,135 @@ fn effective_price_ceiling(
     })
 }
 
+/// What a caller's `x-sbproxy-timeout-ms` came to on this request.
+///
+/// `IgnoredDisabled` is a variant rather than something the call site
+/// infers from the flag, because that is what makes the "operator left
+/// the flag off and a caller sent the header anyway" branch testable
+/// without a live session, and it is the branch an operator most needs
+/// counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeoutOverrideOutcome {
+    /// No header on the request.
+    Absent,
+    /// A header arrived on an origin that has not opted in. Dropped.
+    IgnoredDisabled,
+    /// A header the origin allows and the ceiling admits.
+    Applied(std::time::Duration),
+}
+
+impl TimeoutOverrideOutcome {
+    /// The closed metric label for this outcome, or `None` for the
+    /// common case where the caller sent no header and there is nothing
+    /// to count.
+    fn metric_label(self) -> Option<&'static str> {
+        match self {
+            Self::Absent => None,
+            Self::IgnoredDisabled => Some("ignored_override_disabled"),
+            Self::Applied(_) => Some("applied"),
+        }
+    }
+}
+
+/// A refused `x-sbproxy-timeout-ms`: the closed metric label this
+/// refusal belongs on, and the message the caller gets back.
+///
+/// Both travel together because the alternative was reading the label
+/// back out of the message at the call site, which quietly reclassifies
+/// a series the next time anyone rewords a sentence.
+#[derive(Debug, PartialEq, Eq)]
+struct TimeoutOverrideRefusal {
+    /// `over_ceiling` or `invalid_header`; the two 400 members of the
+    /// `sbproxy_ai_request_timeout_override_total` outcome set.
+    outcome: &'static str,
+    /// Caller-facing text. Safe to return in the response body; it never
+    /// carries anything but the caller's own parsed number.
+    message: String,
+}
+
+impl TimeoutOverrideRefusal {
+    fn invalid(message: String) -> Self {
+        Self {
+            outcome: "invalid_header",
+            message,
+        }
+    }
+
+    fn over_ceiling(message: String) -> Self {
+        Self {
+            outcome: "over_ceiling",
+            message,
+        }
+    }
+}
+
+/// Resolve a caller's `x-sbproxy-timeout-ms` against the origin's opt-in
+/// and ceiling.
+///
+/// A malformed or out-of-range header is an error rather than an ignore,
+/// for the same reason `effective_price_ceiling` refuses a mistyped
+/// `x-sbproxy-max-price`: a caller who asked for 60 seconds and silently
+/// got 5 builds a retry schedule on a budget it never had. The whole
+/// `x-sbproxy-*` family refuses rather than adjusting, and an
+/// inconsistent family is worse than either rule.
+///
+/// With the flag off the header is dropped instead, because there is
+/// nothing to correct: the caller asked for something this origin does
+/// not offer at any value, and refusing would break callers that send the
+/// header to a fleet where only some origins have opted in. Ignoring it
+/// is still visible, on
+/// `sbproxy_ai_request_timeout_override_total{outcome="ignored_override_disabled"}`.
+///
+/// Err carries the closed metric label alongside the operator-safe
+/// message, so the call site never has to read the message back to
+/// decide which series the refusal belongs on. The message never
+/// interpolates anything but the caller's own number, which is already
+/// bounded by the parse.
+fn effective_request_timeout(
+    allow_override: bool,
+    ceiling_ms: Option<u64>,
+    header_value: Option<&str>,
+) -> Result<TimeoutOverrideOutcome, TimeoutOverrideRefusal> {
+    let Some(raw) = header_value else {
+        return Ok(TimeoutOverrideOutcome::Absent);
+    };
+    if !allow_override {
+        return Ok(TimeoutOverrideOutcome::IgnoredDisabled);
+    }
+    let Ok(requested) = raw.trim().parse::<u64>() else {
+        return Err(TimeoutOverrideRefusal::invalid(format!(
+            "x-sbproxy-timeout-ms is not a whole number of milliseconds: {raw:?}"
+        )));
+    };
+    if requested == 0 {
+        return Err(TimeoutOverrideRefusal::invalid(
+            "x-sbproxy-timeout-ms must be above zero milliseconds".to_string(),
+        ));
+    }
+    // The ceiling is required whenever the flag is on, refused at config
+    // load otherwise, so this `None` is unreachable through a loaded
+    // config. Treating it as a refusal rather than as "no ceiling" keeps
+    // the fail-closed direction if that validation is ever loosened, and
+    // it counts as `over_ceiling` because that is what it is: no value a
+    // caller can send clears an absent ceiling.
+    let Some(ceiling) = ceiling_ms else {
+        return Err(TimeoutOverrideRefusal::over_ceiling(
+            "x-sbproxy-timeout-ms cannot be honored: this origin has no \
+             max_request_timeout_ms ceiling configured"
+                .to_string(),
+        ));
+    };
+    if requested > ceiling {
+        return Err(TimeoutOverrideRefusal::over_ceiling(format!(
+            "x-sbproxy-timeout-ms of {requested} exceeds this origin's \
+             max_request_timeout_ms of {ceiling}; ask for between 1 and {ceiling}"
+        )));
+    }
+    Ok(TimeoutOverrideOutcome::Applied(
+        std::time::Duration::from_millis(requested),
+    ))
+}
+
 /// Build the WOR-2559 fail-closed refusal body for a candidate set the
 /// price ceiling fully excluded. Names the ceiling and carries each
 /// excluded candidate's resolved price, so a caller sees what the
@@ -4528,6 +5185,44 @@ fn record_price_ceiling_request_refusal(
     ctx.deny_reason = Some(reason);
 }
 
+/// The bounded admin reason for a refused `x-sbproxy-timeout-ms`.
+///
+/// The caller's header value never appears, for the same reason it never
+/// appears in [`price_ceiling_request_refusal_reason`]: it is untrusted
+/// request text and this string is retained on the admin ring row. The
+/// caller still gets the number back, in the response body, which is not
+/// retained.
+fn request_timeout_refusal_reason(outcome: &str) -> String {
+    match outcome {
+        "over_ceiling" => {
+            "request_timeout: x-sbproxy-timeout-ms above max_request_timeout_ms".to_string()
+        }
+        _ => "request_timeout: malformed x-sbproxy-timeout-ms header".to_string(),
+    }
+}
+
+/// Record a refused `x-sbproxy-timeout-ms` on the same four surfaces
+/// [`record_price_ceiling_request_refusal`] uses: the metric, the admin
+/// decision verdict, a bounded deny reason, and an error on the request
+/// span. A bare 400 would leave the refusal invisible to all four.
+fn record_request_timeout_refusal(
+    ctx: &mut RequestContext,
+    span: &tracing::Span,
+    outcome: &'static str,
+    reason: String,
+) {
+    sbproxy_ai::ai_metrics::record_request_timeout_override(outcome);
+    ctx.record_policy_decision("request_timeout", "deny");
+    // `invalid_request`: the caller's own input was unusable. This is not
+    // a capacity decision and must not alert alongside one.
+    sbproxy_ai::tracing_spans::record_error(
+        span,
+        sbproxy_ai::tracing_spans::error_type::INVALID_REQUEST,
+        &reason,
+    );
+    ctx.deny_reason = Some(reason);
+}
+
 /// Fail closed on a candidate set the price ceiling fully excluded
 /// (WOR-2559): record the refusal on the metric, the admin decision
 /// row, the attributed-outcome label, and the typed audit funnel, then
@@ -4813,6 +5508,93 @@ fn apply_semantic_route_outcome(
     }
 }
 
+/// Make the request's service tier the operator's choice, not the caller's.
+///
+/// A caller's `service_tier` is removed first, unconditionally: raising the
+/// tier raises the bill and the operator pays it, and on the OpenAI-chat
+/// surface the field otherwise reaches the upstream verbatim because that
+/// surface never round-trips through the canonical hub request. The
+/// provider entry's own tier is then written in the vendor's wire spelling,
+/// on the surfaces that document the field.
+///
+/// Both halves are needed. Writing without stripping would leave a caller's
+/// tier in place on a provider that declares none; stripping without writing
+/// would make the config key inert.
+///
+/// Every outcome that changed the request is counted on
+/// `sbproxy_ai_service_tier_decisions_total`, because a caller silently losing
+/// the tier they asked for is otherwise invisible: this surface emits no
+/// lossiness note the way the hub translators do.
+///
+/// Returns the `(wire field, wire value)` pair it wrote, so the native bypass
+/// can re-apply the same pair to the inbound bytes it replays without
+/// resolving the catalog a second time.
+fn apply_operator_service_tier(
+    provider: &sbproxy_ai::provider::ProviderConfig,
+    surface: &sbproxy_ai::handler::AiSurface,
+    attempt_body: &mut serde_json::Value,
+) -> Option<(String, String)> {
+    let object = attempt_body.as_object_mut()?;
+    // The one field name every vendor with a tier axis uses today, and the
+    // one the catalog declares. Stripping it on every JSON surface rather
+    // than only the tier-capable ones is the fail-closed half: a vendor that
+    // honors it somewhere undocumented still cannot be steered by a caller.
+    let caller_tier = object.remove("service_tier");
+    let operator_tier = surface
+        .supports_service_tier()
+        .then(|| sbproxy_ai::service_tier::resolved_wire_tier(provider))
+        .flatten();
+    match operator_tier {
+        Some((field, value)) => {
+            object.insert(field.clone(), serde_json::Value::String(value.clone()));
+            sbproxy_ai::ai_metrics::record_service_tier_decision(if caller_tier.is_some() {
+                "caller_tier_replaced"
+            } else {
+                "operator_tier_applied"
+            });
+            Some((field, value))
+        }
+        None => {
+            if caller_tier.is_some() {
+                sbproxy_ai::ai_metrics::record_service_tier_decision("caller_tier_stripped");
+            }
+            None
+        }
+    }
+}
+
+/// Derive one caller-scoped prompt-cache lease identity for a request.
+///
+/// Reads the caller's own cache key: `prompt_cache_key` first, then `user`,
+/// which SDKs sent for the same steering purpose before `prompt_cache_key`
+/// existed. Nothing on this path writes either field, so a caller who sends
+/// neither is never given one and never gets a lease.
+///
+/// The caller-chosen string is only one of five hashed inputs. Tenant,
+/// credential, origin, and surface come from the request context, so
+/// guessing another tenant's key buys nothing.
+fn cache_affinity_key_for_request(
+    ctx: &RequestContext,
+    origin: &str,
+    api_surface: &str,
+    body: &serde_json::Value,
+) -> Option<sbproxy_ai::CacheAffinityKey> {
+    let caller_key = ["prompt_cache_key", "user"]
+        .into_iter()
+        .find_map(|field| body.get(field).and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|caller_key| !caller_key.is_empty())?;
+    Some(sbproxy_ai::CacheAffinityKey::derive(
+        sbproxy_ai::CacheAffinityKeyInput {
+            tenant_id: ctx.tenant_id.as_str(),
+            credential_identity: ctx.principal.api_key_id(),
+            origin,
+            api_surface,
+            caller_key,
+        },
+    ))
+}
+
 pub(super) async fn handle_ai_proxy(
     session: &mut Session,
     config: &AiHandlerConfig,
@@ -5042,6 +5824,63 @@ pub(super) async fn handle_ai_proxy(
         send_response(session, 400, "application/json", &bytes).await?;
         return Ok(());
     }
+
+    // Resolved here, immediately after the price ceiling and for the
+    // same reasons: below the per-surface counter, the latency guard and
+    // identity resolution so a refusal is counted, timed, traced and
+    // authenticated, but above the multipart, audio and cached-replay
+    // branches, which answer and return before any provider is picked.
+    // A per-provider placement could not fire on those at all, which is
+    // also why the two keys are origin-level rather than on
+    // `providers[]`.
+    let timeout_override_header = req_header_value(session, "x-sbproxy-timeout-ms");
+    let timeout_override = match effective_request_timeout(
+        config.allow_request_timeout_override,
+        config.max_request_timeout_ms,
+        timeout_override_header.as_deref(),
+    ) {
+        Ok(outcome) => outcome,
+        Err(refusal) => {
+            // Over the ceiling and malformed are both 400 and both the
+            // caller's mistake, but they are separate series: one says
+            // the client library is broken, the other says the ceiling
+            // is smaller than callers expect. The refusal carries which
+            // one it is, so the split cannot drift with the wording.
+            record_request_timeout_refusal(
+                ctx,
+                &ai_span,
+                refusal.outcome,
+                request_timeout_refusal_reason(refusal.outcome),
+            );
+            let bytes = ErrorEnvelope::new("invalid_request_timeout", &refusal.message)
+                .request_id(ctx.request_id.as_str())
+                .to_bytes();
+            send_response(session, 400, "application/json", &bytes).await?;
+            return Ok(());
+        }
+    };
+    if let Some(label) = timeout_override.metric_label() {
+        sbproxy_ai::ai_metrics::record_request_timeout_override(label);
+    }
+    // One clone per request that carries an honored header, and an
+    // `Arc` bump per field at that. Every dispatch site below reads
+    // this instead of `AI_CLIENT` so the race legs, the cascade tiers
+    // and each retry attempt inherit the budget without a parameter on
+    // twenty `forward_*` signatures. The three auxiliary call sites (the
+    // semantic-cache embedding, the semantic-route embedding, and the
+    // shadow spawn) deliberately stay on `AI_CLIENT`: a caller's
+    // completion budget is not a budget for the gateway's own routing
+    // work.
+    let dispatch_client: std::sync::Arc<sbproxy_ai::AiClient> = match timeout_override {
+        TimeoutOverrideOutcome::Applied(timeout) => std::sync::Arc::new(
+            AI_CLIENT
+                .load_full()
+                .as_ref()
+                .clone()
+                .with_request_timeout_override(timeout),
+        ),
+        _ => AI_CLIENT.load_full(),
+    };
 
     let router = config.router();
     if ctx.inbound_key_mode == crate::context::InboundKeyMode::Native
@@ -5476,7 +6315,10 @@ pub(super) async fn handle_ai_proxy(
             }
         };
         let mut resolved_provider = config.providers[provider_idx].clone();
-        apply_native_provider_credential(&mut resolved_provider, native_api_key.as_deref());
+        ctx.ai_credential_source = Some(
+            apply_native_provider_credential(&mut resolved_provider, native_api_key.as_deref())
+                .as_str(),
+        );
         let provider = &resolved_provider;
         ctx.admin_load_balancer_strategy = Some(router.strategy_name().to_string());
         ctx.admin_load_balancer_target = Some(provider.name.to_string());
@@ -5485,27 +6327,18 @@ pub(super) async fn handle_ai_proxy(
         // engine is spawned, and `effective_base_url` would fall back to
         // a localhost default, which on a stock config is this gateway's
         // own data plane (a request loop ending in a confusing 502).
-        // Answer the models listing from the serve config, and reject
-        // any other GET with a clear not-ready error instead of dialing
+        // Reject the GET with a clear not-ready error instead of dialing
         // the fallback.
+        //
+        // WOR-2647: this used to answer `/v1/models` and `/models` from
+        // the serve config with a third listing shape, one that carried
+        // no capability names at all. It was unreachable: the models
+        // branch at the top of this GET arm matches the same two paths
+        // (on the same unmutated `path`, which `Uri::path` returns
+        // without a query string) and returns unconditionally, so a
+        // served provider's models already come back from
+        // `logical_model_listing`, which does publish capabilities.
         if provider.serve.is_some() {
-            if matches!(path.trim_end_matches('/'), "/v1/models" | "/models") {
-                let data: Vec<_> = provider
-                    .models
-                    .iter()
-                    .map(|m| {
-                        serde_json::json!({
-                            "id": m.as_str(),
-                            "object": "model",
-                            "owned_by": provider.name.as_str(),
-                        })
-                    })
-                    .collect();
-                let body = serde_json::json!({ "object": "list", "data": data });
-                let bytes = serde_json::to_vec(&body).unwrap_or_default();
-                send_response(session, 200, "application/json", &bytes).await?;
-                return Ok(());
-            }
             let message = format!(
                 "provider {} serves its model locally; `GET {}` has no upstream \
                  to forward to. The engine starts on the first completion request.",
@@ -5531,8 +6364,7 @@ pub(super) async fn handle_ai_proxy(
         };
         ctx.record_admin_ai_attempt(&provider.name);
         let resp = match run_routed_provider_attempt(&router, provider_idx, async {
-            AI_CLIENT
-                .load()
+            dispatch_client
                 .forward_get_request_with_quota(provider, &path, quota_attempt)
                 .await
         })
@@ -5681,7 +6513,31 @@ pub(super) async fn handle_ai_proxy(
             // sent; re-judge it on what that name resolved to, or an alias
             // would be a way around the credential's block-list.
             if let Some(model) = effective_model.as_mut() {
-                alias_provider = resolve_body_model_alias(config, model, body);
+                // WOR-2657: a named model group is the outer name, so it
+                // resolves ahead of the alias registry. The pick sets the
+                // same provider pin an alias pin sets, and the member's
+                // upstream model id is what every gate below judges.
+                match resolve_body_model_group(
+                    config,
+                    &router,
+                    allowed_providers,
+                    blocked_providers,
+                    model,
+                    body,
+                ) {
+                    Some(Ok(pick)) => {
+                        append_ai_route_reason(ctx, model_group_route_reason(&pick));
+                        alias_provider = Some(pick.provider);
+                    }
+                    Some(Err(refusal)) => {
+                        record_model_group_refusal(ctx, surface_label, model, refusal);
+                        send_error(session, refusal.status(), refusal.message()).await?;
+                        return Ok(());
+                    }
+                    None => {
+                        alias_provider = resolve_body_model_alias(config, model, body);
+                    }
+                }
             }
             if let Some(model) = effective_model.as_deref() {
                 let credential_allows = resolved_request_vk
@@ -5795,7 +6651,11 @@ pub(super) async fn handle_ai_proxy(
             })
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
-        // WOR-2312: an alias that named a provider narrows the set to it.
+        // WOR-2312: an alias that named a provider narrows the set to
+        // it, and WOR-2657: so does the member a model group picked.
+        // The refusal below names neither, because from here the two
+        // are one pin and an operator with only groups configured
+        // should not be told about aliases.
         if !retain_alias_pinned_providers(
             &mut provider_candidates,
             &config.providers,
@@ -5804,7 +6664,7 @@ pub(super) async fn handle_ai_proxy(
             send_error(
                 session,
                 503,
-                "the model alias for this request targets a provider that is not eligible",
+                "the model routing pin for this request targets a provider that is not eligible",
             )
             .await?;
             return Ok(());
@@ -5869,7 +6729,10 @@ pub(super) async fn handle_ai_proxy(
                 }
             };
         let mut resolved_provider = config.providers[provider_idx].clone();
-        apply_native_provider_credential(&mut resolved_provider, native_api_key.as_deref());
+        ctx.ai_credential_source = Some(
+            apply_native_provider_credential(&mut resolved_provider, native_api_key.as_deref())
+                .as_str(),
+        );
         let provider = &resolved_provider;
         ctx.admin_load_balancer_strategy = Some(router.strategy_name().to_string());
         ctx.admin_load_balancer_target = Some(provider.name.to_string());
@@ -5891,8 +6754,7 @@ pub(super) async fn handle_ai_proxy(
         };
         ctx.record_admin_ai_attempt(&provider.name);
         let resp = match run_routed_provider_attempt(&router, provider_idx, async {
-            AI_CLIENT
-                .load()
+            dispatch_client
                 .forward_with_method_and_quota(
                     provider,
                     &method_str,
@@ -6024,21 +6886,39 @@ pub(super) async fn handle_ai_proxy(
     // inbound format id is stamped on the request context so the
     // relay path can wrap the response body back into the format the
     // client expects.
+    //
+    // WOR-2597: `"prompt": "name@version"` is this gateway's
+    // stored-prompt reference and belongs to no native wire format, so
+    // both translators drop it and the shared resolver further down,
+    // which reads the already-translated canonical body, never saw one
+    // on `/v1/messages` or `/v1/responses`. The reference is lifted off
+    // the inbound body here and put back on the canonical body after
+    // the parse, which is the only place the resolver looks.
+    let mut lifted_prompt_reference: Option<String> = None;
     let body_bytes = match surface {
         sbproxy_ai::handler::AiSurface::Messages => {
+            let (inbound_bytes, reference) = lift_gateway_prompt_reference(&body_bytes);
             match sbproxy_ai::format::anthropic_messages::translate_anthropic_request_to_openai(
-                body_bytes.as_ref(),
+                inbound_bytes.as_ref(),
                 hostname,
                 translation_tenant,
             ) {
                 Ok(translated) => {
                     ctx.ai_inbound_format = Some("anthropic".into());
                     path = "/v1/chat/completions".into();
+                    lifted_prompt_reference = reference;
                     bytes::Bytes::from(translated)
                 }
                 Err(e) => {
+                    // WOR-2595: the typed record goes out here rather
+                    // than from the terminal logging hook, because the
+                    // reason code does not survive to `logging` and both
+                    // refusal arms `return Ok(())` immediately, which is
+                    // what makes one call here exactly one record.
+                    record_ai_admission_refusal(ctx, surface_label, e.reason());
                     warn!(
                         error = %e,
+                        reason = e.reason(),
                         "AI proxy: failed to parse Anthropic Messages inbound body"
                     );
                     send_error(session, e.status(), e.message()).await?;
@@ -6055,9 +6935,10 @@ pub(super) async fn handle_ai_proxy(
             // to any configured provider. An unknown id or version
             // fails closed with a 404 naming the reference, and a
             // malformed object is a 400; neither falls through to the
-            // raw input. A string `prompt` is not the object form and
-            // keeps its pre-bridge behavior (the translator notes and
-            // drops it). The byte scan keeps the extra JSON parse off
+            // raw input. A string `prompt` is not the object form; it
+            // is the `name@version` reference form, lifted just below
+            // by `lift_gateway_prompt_reference` (WOR-2597). The byte
+            // scan keeps the extra JSON parse off
             // bodies that cannot carry the field; a false positive
             // only costs the parse, and the translator's own
             // unresolved-object refusal backstops anything the scan
@@ -6097,8 +6978,20 @@ pub(super) async fn handle_ai_proxy(
                                 }
                             }
                             Some(Err((status, message))) => {
+                                // The bridge returns prose rather than a
+                                // `ChatError`, so the code is chosen here.
+                                // Its two shapes (an unknown reference,
+                                // and a malformed or unrenderable object)
+                                // split on the status the bridge picked.
+                                let reason = if status == 404 {
+                                    "prompt_reference_not_found"
+                                } else {
+                                    "prompt_object_unrenderable"
+                                };
+                                record_ai_admission_refusal(ctx, surface_label, reason);
                                 warn!(
                                     error = %message,
+                                    reason,
                                     "AI proxy: Responses prompt bridge refused request"
                                 );
                                 send_error(session, status, &message).await?;
@@ -6109,6 +7002,12 @@ pub(super) async fn handle_ai_proxy(
                     }
                 }
             }
+            // The string form of the same reference. The object bridge
+            // above already stripped `prompt` on a hit, so this only
+            // fires for `"prompt": "name@version"`, which the translator
+            // would otherwise note as `responses.prompt` and drop. A
+            // non-string, non-object `prompt` keeps that note.
+            let (inbound_bytes, reference) = lift_gateway_prompt_reference(&inbound_bytes);
             match sbproxy_ai::format::openai_responses::translate_responses_request_to_openai(
                 inbound_bytes.as_ref(),
                 hostname,
@@ -6117,11 +7016,14 @@ pub(super) async fn handle_ai_proxy(
                 Ok(translated) => {
                     ctx.ai_inbound_format = Some("responses".into());
                     path = "/v1/chat/completions".into();
+                    lifted_prompt_reference = reference;
                     bytes::Bytes::from(translated)
                 }
                 Err(e) => {
+                    record_ai_admission_refusal(ctx, surface_label, e.reason());
                     warn!(
                         error = %e,
+                        reason = e.reason(),
                         "AI proxy: failed to parse OpenAI Responses inbound body"
                     );
                     send_error(session, e.status(), e.message()).await?;
@@ -6307,15 +7209,62 @@ pub(super) async fn handle_ai_proxy(
             })?;
             requested_model = Some(route_to.to_string());
         }
+        // WOR-2531 does NOT reach here, and the gap is deliberate. The
+        // JSON path substitutes the origin's unambiguous `default_model`
+        // when the body omits one, which puts the model gates back in
+        // the path. A multipart body cannot take the same treatment:
+        // `rewrite_engine_model` replaces an existing `model` part and
+        // cannot add one (`rewrite_multipart_model` errors when
+        // `multipart_field_range` finds no `model` field), and
+        // `requested_model` being `None` here means exactly that the
+        // part is absent. Calling it anyway would turn a transcription
+        // that works today into a 400 the moment an operator declares a
+        // `default_model` anywhere on the origin, which is a worse
+        // answer than the gap. So on a multipart request with no `model`
+        // form field the allow/block gate below still does not run, the
+        // same as before. Closing it needs a part-insertion helper in
+        // `model_plane`, not a call from here.
+        //
         // WOR-2312: the multipart surfaces (audio transcription, image
         // edits) resolve global aliases too, so one alias means the same
         // model everywhere rather than only on the JSON surfaces. The
         // rewrite runs against the body as it stands, so a governed route
         // override composes with it, and it lands before the budget gate
         // and both model gates below.
-        let alias_resolution = requested_model
-            .as_deref()
-            .and_then(|requested| resolve_model_alias(config, requested));
+        //
+        // WOR-2657: a named model group resolves first, ahead of the
+        // alias registry, and rewrites the same `model` part. This seam
+        // has no JSON body to rewrite alongside it, so it calls the
+        // non-body resolver and hands the picked member's model id to
+        // `rewrite_engine_model` exactly as an alias target is handed.
+        let group_resolution = requested_model.as_deref().and_then(|requested| {
+            resolve_model_group(
+                config,
+                &router,
+                allowed_providers,
+                blocked_providers,
+                requested,
+            )
+        });
+        let alias_resolution = match group_resolution {
+            Some(Ok(pick)) => {
+                append_ai_route_reason(ctx, model_group_route_reason(&pick));
+                Some((pick.model, Some(pick.provider)))
+            }
+            Some(Err(refusal)) => {
+                record_model_group_refusal(
+                    ctx,
+                    surface_label,
+                    requested_model.as_deref().unwrap_or_default(),
+                    refusal,
+                );
+                send_error(session, refusal.status(), refusal.message()).await?;
+                return Ok(());
+            }
+            None => requested_model
+                .as_deref()
+                .and_then(|requested| resolve_model_alias(config, requested)),
+        };
         let mut alias_provider = None;
         if let Some((resolved, pinned)) = alias_resolution {
             forwarded_body = crate::model_plane::rewrite_engine_model(
@@ -6476,8 +7425,9 @@ pub(super) async fn handle_ai_proxy(
             {
                 AiIdempotencyEngagement::Replayed { response } => {
                     if let Some(block) = ai_output_guardrail_block(
-                        ctx,
+                        Some(ctx),
                         response.status,
+                        None,
                         None,
                         multipart_external,
                         &response.body,
@@ -6517,7 +7467,11 @@ pub(super) async fn handle_ai_proxy(
             })
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
-        // WOR-2312: an alias that named a provider narrows the set to it.
+        // WOR-2312: an alias that named a provider narrows the set to
+        // it, and WOR-2657: so does the member a model group picked.
+        // The refusal below names neither, because from here the two
+        // are one pin and an operator with only groups configured
+        // should not be told about aliases.
         if !retain_alias_pinned_providers(
             &mut provider_order,
             &config.providers,
@@ -6526,7 +7480,7 @@ pub(super) async fn handle_ai_proxy(
             send_error(
                 session,
                 503,
-                "the model alias for this request targets a provider that is not eligible",
+                "the model routing pin for this request targets a provider that is not eligible",
             )
             .await?;
             return Ok(());
@@ -6608,7 +7562,10 @@ pub(super) async fn handle_ai_proxy(
                 break;
             }
             let mut resolved_provider = config.providers[provider_idx].clone();
-            apply_native_provider_credential(&mut resolved_provider, native_api_key.as_deref());
+            ctx.ai_credential_source = Some(
+                apply_native_provider_credential(&mut resolved_provider, native_api_key.as_deref())
+                    .as_str(),
+            );
             let provider = &resolved_provider;
             let reservation_id = format!("{}:quota-pool:multipart:{attempt}", ctx.request_id);
             let Some(quota_attempt) = reserve_quota_pool_attempt_or_respond(
@@ -6693,8 +7650,7 @@ pub(super) async fn handle_ai_proxy(
                             }
                         }
                     } else {
-                        AI_CLIENT
-                            .load()
+                        dispatch_client
                             .forward_bytes_with_quota(
                                 provider,
                                 &method_str,
@@ -6911,6 +7867,20 @@ pub(super) async fn handle_ai_proxy(
             return Ok(());
         }
     };
+    // WOR-2597: put the lifted stored-prompt reference back on the
+    // canonical body, which is where the shared WOR-800 resolver below
+    // reads it. It cannot escape to a provider from here: the resolver
+    // strips the key on a hit, refuses on a miss, and the native
+    // byte-forward bypass is already unavailable to a body that carried
+    // one, because `prompt` is absent from
+    // `native_request_is_losslessly_governable`'s allowlist.
+    if let Some(reference) = &lifted_prompt_reference {
+        let reference = reference.clone();
+        if let Some(object) = body.as_object_mut() {
+            object.insert("prompt".to_string(), serde_json::Value::String(reference));
+        }
+    }
+
     // Native bypass may only reuse the original client bytes while every
     // content-bearing field still matches this post-parse baseline. Keep the
     // snapshot only for the one native surface that can currently bypass.
@@ -7017,14 +7987,21 @@ pub(super) async fn handle_ai_proxy(
     // library API at sbproxy_ai::prompts) shadows config so an
     // operator can mint or pin a prompt at runtime without a full
     // config reload. A miss on both layers leaves the prompt field
-    // untouched (the request proceeds with no synthesized system
-    // message, same as today's "no `prompt` field" path).
+    // untouched on the canonical chat path (the request proceeds with
+    // no synthesized system message, same as today's "no `prompt`
+    // field" path). WOR-2597: a miss on a reference lifted off a
+    // NATIVE inbound body is a 404 instead, because `prompt` is not a
+    // field of those wire formats and forwarding it would ship a
+    // gateway-only key upstream. See the `None` arms below.
     //
     // The Responses-surface OBJECT form (`"prompt": {"id", ...}`) is
     // bridged earlier, before the inbound shim translated the body to
     // this canonical shape (WOR-2514); by this point a bridged request
     // carries its rendered template in `instructions` and no `prompt`
-    // field at all.
+    // field at all. The STRING form on either native surface is lifted
+    // by `lift_gateway_prompt_reference` at that same shim and put back
+    // on this body after the parse, which is how it reaches this block
+    // at all (WOR-2597).
     if let Some(reference) = body
         .get("prompt")
         .and_then(|v| v.as_str())
@@ -7040,24 +8017,54 @@ pub(super) async fn handle_ai_proxy(
                     .as_ref()
                     .map(|store| store.render(&reference, &request_ctx))
             });
-        if let Some(outcome) = result {
-            match outcome {
-                Ok(rendered) => {
-                    prepend_system_message(&mut body, &rendered.text);
-                    ctx.ai_prompt_name = Some(rendered.name);
-                    ctx.ai_prompt_version = Some(rendered.version);
-                    // Drop the gateway-only `prompt` field so it is not
-                    // forwarded to the provider.
-                    if let Some(obj) = body.as_object_mut() {
-                        obj.remove("prompt");
-                    }
-                }
-                Err(e) => {
-                    warn!(reference = %reference, error = %e, "AI proxy: prompt render failed");
-                    send_error(session, 400, &format!("prompt error: {e}")).await?;
-                    return Ok(());
+        match result {
+            Some(Ok(rendered)) => {
+                prepend_system_message(&mut body, &rendered.text);
+                ctx.ai_prompt_name = Some(rendered.name);
+                ctx.ai_prompt_version = Some(rendered.version);
+                // Drop the gateway-only `prompt` field so it is not
+                // forwarded to the provider.
+                if let Some(obj) = body.as_object_mut() {
+                    obj.remove("prompt");
                 }
             }
+            Some(Err(e)) => {
+                record_ai_admission_refusal(ctx, surface_label, "prompt_render_failed");
+                warn!(
+                    reference = %prompt_reference_for_log(&reference),
+                    error = %e,
+                    "AI proxy: prompt render failed"
+                );
+                send_error(session, 400, &format!("prompt error: {e}")).await?;
+                return Ok(());
+            }
+            // A miss on both layers. On the canonical chat path this
+            // stays a pass-through: `prompt` is a legacy completions
+            // field there, an origin may have no `prompts:` block at
+            // all, and a provider that understands the field has every
+            // right to receive it. WOR-2597: on a native inbound
+            // surface it cannot be either of those things. `prompt` is
+            // not a field of the Anthropic Messages or OpenAI Responses
+            // wire format, so a caller who sent one meant this
+            // gateway's store, and forwarding the key to the provider
+            // would ship a gateway-only field upstream while running
+            // the request without the template it named. Refuse, and
+            // strip the key on the way out so no later path can
+            // forward it.
+            None if lifted_prompt_reference.is_some() => {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.remove("prompt");
+                }
+                record_ai_admission_refusal(ctx, surface_label, "prompt_reference_not_found");
+                warn!(
+                    reference = %prompt_reference_for_log(&reference),
+                    surface = surface_label,
+                    "AI proxy: stored prompt reference not found on a native inbound surface"
+                );
+                send_error(session, 404, "prompt error: unknown prompt reference").await?;
+                return Ok(());
+            }
+            None => {}
         }
     }
 
@@ -7067,6 +8074,29 @@ pub(super) async fn handle_ai_proxy(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+
+    // WOR-2531: the origin's `default_model` applies here, at the one
+    // seam every downstream plane reads its model from, and not at the
+    // per-provider dispatch arms thousands of lines below. Every gate
+    // between here and the wire (`is_model_allowed`, the virtual-key
+    // model gate, model-scoped budgets, provider eligibility, the
+    // compression runtime) short-circuits on an empty model, so a
+    // default applied any later would leave them all skipped for
+    // exactly the requests it was meant to name a model for.
+    //
+    // Gated on the surface, because this seam is shared with every other
+    // JSON surface the AI path serves. `default_model` is a chat model;
+    // `/v1/moderations` and `/v1/images/generations` also reach here with
+    // an optional `model` they default provider-side from their own
+    // vocabulary, and writing a chat model into one of those bodies would
+    // break a request that works today. See
+    // `surface_takes_the_origin_default_model`.
+    if model.is_empty() && surface_takes_the_origin_default_model(surface_label) {
+        if let Some(default_model) = unambiguous_default_model(config) {
+            model = default_model;
+            set_body_model(&mut body, &model);
+        }
+    }
 
     // A governed key's route override defines the effective model for this
     // request. Update both representations before any model gate, budget,
@@ -7092,7 +8122,31 @@ pub(super) async fn handle_ai_proxy(
     // dispatched, so an alias can never route around a `blocked_models`
     // entry. The alias's optional provider pin is applied to the routing
     // set further down.
-    let alias_provider = resolve_body_model_alias(config, &mut model, &mut body);
+    // WOR-2657: the group registry is consulted first, for the same
+    // reason and at the same point. A group name is the outer name a
+    // caller sends, and the member it resolves to carries its own
+    // upstream model id, so resolving here is what keeps `blocked_models`,
+    // the credential allowlist, the per-model rate limiter, and the
+    // budget scope judging the model that will actually be dispatched.
+    let alias_provider = match resolve_body_model_group(
+        config,
+        &router,
+        allowed_providers,
+        blocked_providers,
+        &mut model,
+        &mut body,
+    ) {
+        Some(Ok(pick)) => {
+            append_ai_route_reason(ctx, model_group_route_reason(&pick));
+            Some(pick.provider)
+        }
+        Some(Err(refusal)) => {
+            record_model_group_refusal(ctx, surface_label, &model, refusal);
+            send_error(session, refusal.status(), refusal.message()).await?;
+            return Ok(());
+        }
+        None => resolve_body_model_alias(config, &mut model, &mut body),
+    };
 
     // Check model allow/block lists.
     if !model.is_empty() && !config.is_model_allowed(&model) {
@@ -8639,8 +9693,9 @@ pub(super) async fn handle_ai_proxy(
     {
         AiIdempotencyEngagement::Replayed { response } => {
             if let Some(block) = ai_output_guardrail_block(
-                ctx,
+                Some(ctx),
                 response.status,
+                None,
                 guardrail_pipeline.as_deref(),
                 output_external,
                 &response.body,
@@ -8798,6 +9853,14 @@ pub(super) async fn handle_ai_proxy(
                                 else {
                                     return Ok(());
                                 };
+                                // Deliberately the shared client, not
+                                // `dispatch_client`: a caller's
+                                // `x-sbproxy-timeout-ms` is a budget for
+                                // its own completion, not for the
+                                // gateway's cache lookup, and letting a
+                                // caller stretch this one would let it
+                                // hold an embedding call open with no
+                                // completion to show for it.
                                 let ai_client = AI_CLIENT.load_full();
                                 sbproxy_ai::semantic_cache::compute_embedding_with_quota(
                                     &ai_client,
@@ -8988,8 +10051,9 @@ pub(super) async fn handle_ai_proxy(
                             // not a copy of the response.
                             let mut body = hit.response.body.clone();
                             if let Some(block) = ai_output_guardrail_block(
-                                ctx,
+                                Some(ctx),
                                 hit.response.status,
+                                None,
                                 guardrail_pipeline.as_deref(),
                                 output_external,
                                 body.as_ref(),
@@ -9256,6 +10320,16 @@ pub(super) async fn handle_ai_proxy(
         .map(|r| r.content_policy_fallback)
         .unwrap_or(false);
 
+    // The pre-header streaming budget. Resolved once here, beside the
+    // other `resilience` reads, because the attempt loop below is inside
+    // a `for` and re-reading per attempt would say the same thing three
+    // times. `None` leaves the loop byte-for-byte as it was.
+    let pre_header_timeout = config
+        .resilience
+        .as_ref()
+        .and_then(|r| r.pre_header_timeout_ms)
+        .map(std::time::Duration::from_millis);
+
     // WOR-2556: a configured typed fallback list opens the sequential
     // loop the same way `content_policy_fallback` does, or the reroute
     // it aims could never take a second attempt. Configuration, not the
@@ -9361,11 +10435,12 @@ pub(super) async fn handle_ai_proxy(
     let shadow_allowed_providers = allowed_providers.to_vec();
     let shadow_blocked_providers = blocked_providers.to_vec();
 
-    // WOR-2312: an alias that named a provider pins the routing set to it.
-    // This is stricter than the `models:` filter below on purpose: the
-    // alias already resolved the caller's name to that vendor's model id,
-    // so handing the request to another vendor would dispatch an id it
-    // does not serve. Failing here is the honest answer.
+    // WOR-2312: an alias that named a provider pins the routing set to
+    // it, and WOR-2657: so does the member a model group picked. This is
+    // stricter than the `models:` filter below on purpose: both already
+    // resolved the caller's name to that vendor's model id, so handing
+    // the request to another vendor would dispatch an id it does not
+    // serve. Failing here is the honest answer.
     if !retain_alias_pinned_providers(
         &mut provider_order,
         &config.providers,
@@ -9374,7 +10449,7 @@ pub(super) async fn handle_ai_proxy(
         send_error(
             session,
             503,
-            "the model alias for this request targets a provider that is not eligible",
+            "the model routing pin for this request targets a provider that is not eligible",
         )
         .await?;
         return Ok(());
@@ -9629,6 +10704,9 @@ pub(super) async fn handle_ai_proxy(
         // digest on every request of a `semantic_route` origin would be
         // a hot-path cost with no reader.
         let prompt = semantic_query_text(&body);
+        // Shared client on purpose, the same reason as the semantic-cache
+        // embedding above: routing work is the gateway's, not the
+        // caller's, so it is not covered by a caller's honored timeout.
         let ai_client = AI_CLIENT.load_full();
         // WOR-2564: a routing embedding through `source: provider` or
         // `source: openai` is an upstream call, so it meters against the
@@ -9720,6 +10798,52 @@ pub(super) async fn handle_ai_proxy(
                 let p = provider_order.remove(pos);
                 provider_order.insert(0, p);
             }
+        }
+    }
+    // WOR-2651: prompt-cache affinity is a preference layered over whatever
+    // the strategy just picked, not a strategy of its own. It runs after the
+    // primary-selection block rather than inside it because that block's body
+    // is gated on `is_prefix_affinity()`; a hook inside would have been dead
+    // under round_robin and every other strategy, which is exactly the
+    // composition this feature is for.
+    //
+    // "Whatever the strategy picked" excludes the four that own their
+    // ordering outright, which is the same set the block above skips plus
+    // `fallback_chain`. A cascade's tiers, cost_quality's cheap/frontier
+    // split, an authored routing-policy plan, and a priority-sorted failover
+    // chain are all orderings the operator wrote down on purpose; a lease
+    // jumping that queue would quietly defeat the strategy rather than
+    // compose with it. Nothing is recorded on those origins either, so the
+    // table never fills with leases no lookup will read.
+    let cache_affinity_applies = config.cache_affinity.is_some()
+        && !is_failover
+        && routing_policy_cascade.is_none()
+        && router.cascade_config().is_none()
+        && router.cost_quality_config().is_none();
+    // The key is derived once and reused at the record site below, so the
+    // lease is written under the same identity it was read under.
+    let cache_affinity_key = cache_affinity_applies
+        .then(|| cache_affinity_key_for_request(ctx, hostname, surface_label, &body))
+        .flatten();
+    if cache_affinity_applies {
+        match cache_affinity_key.as_ref() {
+            Some(key) => {
+                if let Some(preferred) = router.select_cache_affinity(
+                    &config.providers,
+                    key,
+                    model.as_str(),
+                    &provider_order,
+                ) {
+                    if let Some(pos) = provider_order.iter().position(|&i| i == preferred) {
+                        let p = provider_order.remove(pos);
+                        provider_order.insert(0, p);
+                    }
+                }
+            }
+            // Counted, not silent: an operator who turned affinity on and
+            // sees only this outcome is looking at callers that send no
+            // cache key, not at a broken table.
+            None => sbproxy_ai::ai_metrics::record_cache_affinity_decision("missing_signal"),
         }
     }
     // WOR-2556: typed fallback triggers. Resolve each authored list to
@@ -10052,8 +11176,7 @@ pub(super) async fn handle_ai_proxy(
                 return Ok(());
             }
             let cascade_quota_reservation = format!("{}:quota-pool:cascade", ctx.request_id);
-            let outcome = AI_CLIENT
-                .load()
+            let outcome = dispatch_client
                 .forward_cascade_with_policy_and_quota_with_reasoning_eligibility(
                     config,
                     cascade_cfg,
@@ -10139,6 +11262,7 @@ pub(super) async fn handle_ai_proxy(
                         ctx.ai_tokens_in = Some(prompt_tokens);
                         ctx.ai_tokens_out = Some(completion_tokens);
                         ctx.ai_tokens_cached = (cached_input > 0).then_some(cached_input);
+                        ctx.ai_tokens_cache_write = (cache_creation > 0).then_some(cache_creation);
                     }
                     let cost_micros = emit_ai_billing_event(
                         hostname,
@@ -10183,10 +11307,33 @@ pub(super) async fn handle_ai_proxy(
                             .as_ref()
                             .map(|guardrails| guardrails.external.as_slice())
                             .unwrap_or_default();
-                        if let Some(block) =
-                            external_output_guardrail_block(output_external, &o.body, &o.model)
-                                .await
-                        {
+                        // Through the same funnel the relay and the two
+                        // replay paths use, so this arm publishes an
+                        // `ai.guardrail.output` record like they do.
+                        // Cascade materializes its body outside the
+                        // relay, so it used to call the external
+                        // adapter directly and recorded nothing, which
+                        // left `docs/events.md`'s claim wider than the
+                        // code for every cascade route. `builtin` is
+                        // `None` because that is exactly the set of
+                        // guardrails this arm already ran; routing it
+                        // here adds the record and changes nothing
+                        // about what is evaluated.
+                        //
+                        // Boxed for the same reason the relay's call
+                        // is: this frame is on the Pingora worker's 2MB
+                        // stack.
+                        let cascade_block = Box::pin(ai_output_guardrail_block(
+                            Some(&*ctx),
+                            o.status,
+                            None,
+                            None,
+                            output_external,
+                            &o.body,
+                            &o.model,
+                        ))
+                        .await;
+                        if let Some(block) = cascade_block {
                             warn!(
                                 guardrail = %block.name,
                                 reason = %block.reason,
@@ -10298,13 +11445,27 @@ pub(super) async fn handle_ai_proxy(
             Quota(QuotaPoolErrorDisposition),
         }
 
-        let client = AI_CLIENT.load();
+        let client = std::sync::Arc::clone(&dispatch_client);
         let race_start = std::time::Instant::now();
+        // WOR-2655: every racer presents the same class of credential,
+        // so the request row is stamped once here rather than from
+        // inside the racing loop, which cannot borrow `ctx`. A raced
+        // dispatch never runs the provider-key fallback: the sequential
+        // loop below is skipped entirely, and there is no attempt left
+        // to retry on another key.
+        ctx.ai_credential_source = Some(if native_api_key.is_some() {
+            CredentialSource::NativeCaller.as_str()
+        } else {
+            CredentialSource::ProviderEntry.as_str()
+        });
         let mut futs = FuturesUnordered::new();
         for (race_attempt, &idx) in provider_order.iter().enumerate() {
             let mut provider = config.providers[idx].clone();
             apply_native_provider_credential(&mut provider, native_api_key.as_deref());
             let mut attempt_body = body.clone();
+            // The raced path never takes the native bypass, so the resolved
+            // pair has no second consumer here.
+            let _ = apply_operator_service_tier(&provider, &surface, &mut attempt_body);
             let resolved_model = if !model.is_empty() {
                 let mapped = provider.map_model(&model);
                 if mapped != model {
@@ -10471,7 +11632,26 @@ pub(super) async fn handle_ai_proxy(
     // is the provider count: entries are unique by construction and a
     // splice only appends indices not already present, so the order can
     // never grow past it.
-    let max_provider_visits = config.providers.len().max(provider_order.len());
+    //
+    // WOR-2655: `+ 1` reserves the one visit the provider-key fallback
+    // can add, and it is the only duplicate index the order ever holds.
+    // The typed splice above only appends indices not already present,
+    // so it stays inside the provider count; the key fallback
+    // deliberately re-visits the provider it just tried, on a different
+    // credential, and its budget is one per request
+    // (`key_fallback_used`). Without the reservation a single-provider
+    // origin would run out of visits before the retry it just queued.
+    let max_provider_visits = config.providers.len().max(provider_order.len()) + 1;
+    // WOR-2655: the provider-key fallback's whole state. `Some((idx,
+    // secret))` means the next visit to `idx` presents the operator's
+    // credential instead of the entry's own; `key_fallback_used` is the
+    // budget, so two refused credentials terminate rather than loop.
+    let mut key_fallback_used = false;
+    let mut key_fallback_material: Option<(usize, String)> = None;
+    // An auth retry is not an availability attempt, so it does not
+    // spend the operator's `max_retries` budget. One, at most, per
+    // request.
+    let mut key_fallback_extra_attempts = 0usize;
     for attempt in 0..max_provider_visits {
         let Some(&provider_idx) = provider_order.get(attempt) else {
             break;
@@ -10484,7 +11664,7 @@ pub(super) async fn handle_ai_proxy(
         let effective_max_attempts = if ctx.managed_fallback_reason.is_some() {
             provider_order.len()
         } else {
-            max_attempts
+            max_attempts + key_fallback_extra_attempts
         };
         if attempt >= effective_max_attempts {
             break;
@@ -10499,7 +11679,22 @@ pub(super) async fn handle_ai_proxy(
         ctx.managed_route_trace = None;
         ctx.managed_route_class = None;
         let mut resolved_provider = config.providers[provider_idx].clone();
-        apply_native_provider_credential(&mut resolved_provider, native_api_key.as_deref());
+        // WOR-2655: the fallback credential is keyed by provider index,
+        // so only the queued re-visit picks it up and a later
+        // availability failover to a different provider goes back to
+        // that entry's own key.
+        let queued_fallback = key_fallback_material
+            .as_ref()
+            .filter(|(idx, _)| *idx == provider_idx)
+            .map(|(_, material)| material.as_str());
+        ctx.ai_credential_source = Some(
+            select_upstream_credential(
+                &mut resolved_provider,
+                native_api_key.as_deref(),
+                queued_fallback,
+            )
+            .as_str(),
+        );
         let mut local_public_model = None;
         let mut local_engine_model = None;
         let distributed_managed =
@@ -10590,6 +11785,7 @@ pub(super) async fn handle_ai_proxy(
 
         // Map model name for this provider.
         let mut attempt_body = body.clone();
+        let operator_tier = apply_operator_service_tier(provider, &surface, &mut attempt_body);
         let resolved_model = if !model.is_empty() {
             let mapped = provider.map_model(&model);
             if mapped != model {
@@ -10666,7 +11862,13 @@ pub(super) async fn handle_ai_proxy(
             || !native_request_is_losslessly_governable
             || native_bypass_canonical_baseline
                 .as_ref()
-                .is_some_and(|baseline| native_bypass_body_changed(baseline, &attempt_body));
+                .is_some_and(|baseline| {
+                    native_bypass_body_changed(
+                        baseline,
+                        &attempt_body,
+                        operator_tier.as_ref().map(|(field, _)| field.as_str()),
+                    )
+                });
         let bypass = if !native_bypass_is_safe(
             is_stream,
             request_transform_selected,
@@ -10687,7 +11889,16 @@ pub(super) async fn handle_ai_proxy(
                 // substituted in) to the upstream's `/v1/messages`
                 // path. The OpenAI Chat hub body that lives in
                 // `attempt_body` is discarded for this iteration.
-                match make_native_bypass_body(&native_request_bytes_for_bypass, &resolved_model) {
+                // The bypass rebuilds the request from the inbound bytes, so
+                // the operator tier written into `attempt_body` above never
+                // reaches it; `operator_tier` carries it across.
+                match make_native_bypass_body(
+                    &native_request_bytes_for_bypass,
+                    &resolved_model,
+                    operator_tier
+                        .as_ref()
+                        .map(|(field, value)| (field.as_str(), value.as_str())),
+                ) {
                     Ok(body) => {
                         sbproxy_ai::ai_metrics::record_native_bypass(
                             sbproxy_ai::format::NativeBypass::AnthropicMessages.inbound_label(),
@@ -10763,58 +11974,79 @@ pub(super) async fn handle_ai_proxy(
             provider = %provider.name,
             attempt = attempt,
         );
+        // The pre-header budget bounds exactly this binding, and only
+        // for a streaming request. The inner future resolves at the
+        // provider's response headers (`forward_request_impl` hands back
+        // a `reqwest::Response` before any body byte is read), so
+        // `tokio::time::timeout` around it is a headers-only deadline
+        // with nothing to reconcile against `providers[].timeout_ms`,
+        // which reqwest measures through end-of-body. An elapse is
+        // turned into an ordinary `Err` so the arm below fails over
+        // through its existing `continue` rather than growing a second
+        // control path.
+        //
+        // The attempt is boxed because the AI request path runs on a
+        // Pingora worker with the std 2MB stack and was already close to
+        // it: `Timeout<F>` would otherwise add `F` plus a timer to the
+        // frame. Boxed, the frame carries a pointer, which is smaller
+        // than what was there before.
+        let pre_header_budget = pre_header_timeout.filter(|_| is_stream);
         let result: anyhow::Result<reqwest::Response> =
-            run_routed_provider_attempt(&router, provider_idx, async {
-                if distributed_managed {
-                    let managed_body = serde_json::to_vec(&attempt_body)
-                        .map(bytes::Bytes::from)
-                        .map_err(anyhow::Error::from);
-                    match managed_body {
-                        Ok(managed_body) => {
-                            let origin = ctx
-                                .origin_idx
-                                .and_then(|index| ctx.pipeline.config.origins.get(index))
-                                .map(|origin| origin.origin_id.to_string())
-                                .unwrap_or_else(|| ctx.hostname.to_string());
-                            let prefix_key = extract_prefix_key(&attempt_body, 1024);
-                            let requested_adapter = attempt_body
-                                .get("adapter")
-                                .or_else(|| attempt_body.get("lora_adapter"))
-                                .and_then(serde_json::Value::as_str)
-                                .map(str::to_string);
-                            let preferred_region = ctx
-                                .principal
-                                .attrs
-                                .metadata
-                                .get("region")
-                                .cloned()
-                                .or_else(|| ctx.request_geo.clone());
-                            let maximum = buffered_body_limit(config.max_body_size);
-                            let managed = crate::server::model_host::distributed_managed_upstream(
-                                crate::server::model_host::ManagedDistributedRequest {
-                                    origin: &origin,
-                                    provider,
-                                    requested_model: (!model.is_empty()).then_some(model.as_str()),
-                                    request_id: ctx.request_id.as_str(),
-                                    tenant_id: ctx.tenant_id.as_str(),
-                                    governed_key_id: ctx.principal.api_key_id(),
-                                    policy_revision: &peer_policy_revision,
-                                    path: &path,
-                                    body: managed_body,
-                                    content_type: Some("application/json"),
-                                    priority: crate::server::model_host::lane_class_for(
-                                        ctx.ai_lane_priority,
-                                    ),
-                                    prefix_key: &prefix_key,
-                                    preferred_region: preferred_region.as_deref(),
-                                    requested_adapter: requested_adapter.as_deref(),
-                                    max_body_bytes: maximum,
-                                    quota_attempt,
-                                },
-                            )
-                            .instrument(attempt_span)
-                            .await;
-                            match managed {
+            {
+                let attempt_future =
+                    Box::pin(run_routed_provider_attempt(&router, provider_idx, async {
+                        if distributed_managed {
+                            let managed_body = serde_json::to_vec(&attempt_body)
+                                .map(bytes::Bytes::from)
+                                .map_err(anyhow::Error::from);
+                            match managed_body {
+                                Ok(managed_body) => {
+                                    let origin = ctx
+                                        .origin_idx
+                                        .and_then(|index| ctx.pipeline.config.origins.get(index))
+                                        .map(|origin| origin.origin_id.to_string())
+                                        .unwrap_or_else(|| ctx.hostname.to_string());
+                                    let prefix_key = extract_prefix_key(&attempt_body, 1024);
+                                    let requested_adapter = attempt_body
+                                        .get("adapter")
+                                        .or_else(|| attempt_body.get("lora_adapter"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::to_string);
+                                    let preferred_region = ctx
+                                        .principal
+                                        .attrs
+                                        .metadata
+                                        .get("region")
+                                        .cloned()
+                                        .or_else(|| ctx.request_geo.clone());
+                                    let maximum = buffered_body_limit(config.max_body_size);
+                                    let managed =
+                                        crate::server::model_host::distributed_managed_upstream(
+                                            crate::server::model_host::ManagedDistributedRequest {
+                                                origin: &origin,
+                                                provider,
+                                                requested_model: (!model.is_empty())
+                                                    .then_some(model.as_str()),
+                                                request_id: ctx.request_id.as_str(),
+                                                tenant_id: ctx.tenant_id.as_str(),
+                                                governed_key_id: ctx.principal.api_key_id(),
+                                                policy_revision: &peer_policy_revision,
+                                                path: &path,
+                                                body: managed_body,
+                                                content_type: Some("application/json"),
+                                                priority: crate::server::model_host::lane_class_for(
+                                                    ctx.ai_lane_priority,
+                                                ),
+                                                prefix_key: &prefix_key,
+                                                preferred_region: preferred_region.as_deref(),
+                                                requested_adapter: requested_adapter.as_deref(),
+                                                max_body_bytes: maximum,
+                                                quota_attempt,
+                                            },
+                                        )
+                                        .instrument(attempt_span)
+                                        .await;
+                                    match managed {
                                 Ok(Some(upstream)) => {
                                     local_public_model = Some(upstream.public_model);
                                     ctx.managed_model_permit = upstream.local_permit;
@@ -10838,39 +12070,46 @@ pub(super) async fn handle_ai_proxy(
                                     Err(anyhow::Error::new(error))
                                 }
                             }
-                        }
-                        Err(error) => Err(error),
-                    }
-                } else {
-                    async {
-                        if let Some((bypass_body, native_path)) = upstream_call {
-                            AI_CLIENT
-                                .load()
-                                .forward_native_bypass_with_quota(
-                                    provider,
-                                    &method_str,
-                                    native_path,
-                                    bypass_body,
-                                    quota_attempt,
-                                )
-                                .await
+                                }
+                                Err(error) => Err(error),
+                            }
                         } else {
-                            AI_CLIENT
-                                .load()
-                                .forward_request_with_quota(
-                                    provider,
-                                    &path,
-                                    &attempt_body,
-                                    quota_attempt,
-                                )
-                                .await
+                            async {
+                                if let Some((bypass_body, native_path)) = upstream_call {
+                                    dispatch_client
+                                        .forward_native_bypass_with_quota(
+                                            provider,
+                                            &method_str,
+                                            native_path,
+                                            bypass_body,
+                                            quota_attempt,
+                                        )
+                                        .await
+                                } else {
+                                    dispatch_client
+                                        .forward_request_with_quota(
+                                            provider,
+                                            &path,
+                                            &attempt_body,
+                                            quota_attempt,
+                                        )
+                                        .await
+                                }
+                            }
+                            .instrument(attempt_span)
+                            .await
                         }
-                    }
-                    .instrument(attempt_span)
-                    .await
+                    }));
+                match pre_header_budget {
+                    Some(budget) => match tokio::time::timeout(budget, attempt_future).await {
+                        Ok(inner) => inner,
+                        Err(_elapsed) => Err(anyhow::Error::new(PreHeaderTimeoutElapsed {
+                            budget_ms: u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
+                        })),
+                    },
+                    None => attempt_future.await,
                 }
-            })
-            .await;
+            };
         ctx.ai_serve_model = local_public_model.clone();
 
         match result {
@@ -10917,6 +12156,145 @@ pub(super) async fn handle_ai_proxy(
                     && !takes_managed_break
                     && (content_policy_fallback || typed_fallbacks_active)
                     && body_refinable_client_status(status);
+                // WOR-2655: provider-key fallback. A `401`/`403` is a
+                // statement about the credential rather than about the
+                // provider, and it is precisely the class
+                // `is_retryable_default` excludes, so today it reaches
+                // the caller verbatim. When this entry names an
+                // operator-held `fallback_credential_id`, retry the same
+                // provider once on that credential instead.
+                //
+                // Placed ahead of `takes_availability_failover`, and the
+                // ordering is load-bearing on exactly one config: a
+                // `retry_policy` that retries `auth` makes a 401 open
+                // the availability failover too. Trying a fresh
+                // credential against the provider the caller asked for
+                // is the narrower repair, and it does not cost the
+                // wider one: the splice leaves the untried tail of
+                // `provider_order` intact behind the re-visit, so an
+                // availability failover still runs when the operator's
+                // credential is refused as well.
+                //
+                // Also placed ahead of `note_classified_failure`, so a
+                // rejection the house credential recovers from does not
+                // feed `cooldown_policy.auth` and park a provider that
+                // is serving fine. The retry it queues is itself
+                // classified when it lands, and a second refusal
+                // records there.
+                //
+                // `native_api_key` is `Some` exactly when
+                // `ctx.inbound_key_mode` is `Native`, which is the
+                // "caller presented their own key" case the gate
+                // refuses.
+                let key_fallback_wanted = wants_provider_key_fallback(
+                    provider,
+                    status,
+                    native_api_key.is_some(),
+                    key_fallback_used,
+                );
+                if let Some(credential_id) = provider
+                    .fallback_credential_id
+                    .as_deref()
+                    .filter(|_| key_fallback_wanted)
+                {
+                    // A credential the *inbound key* is bound to is a
+                    // different thing and never falls back; see
+                    // `CredentialResolveError`'s rustdoc. This resolves
+                    // the provider entry's own operator-owned
+                    // alternative, under the request's tenant scope, so
+                    // the key plane refuses a cross-tenant record here
+                    // exactly as it does at the admin boundary.
+                    let tenant_scope = Some(ctx.tenant_id.as_str())
+                        .filter(|tenant| *tenant != sbproxy_observe::decision::DEFAULT_TENANT);
+                    // Boxed: `handle_ai_proxy` already runs close to the
+                    // 2MB Pingora worker stack limit, and an inline
+                    // await here would grow the frame for every request
+                    // on the AI path, not only the ones that fall back.
+                    let resolved = match key_plane.as_deref() {
+                        Some(plane) => {
+                            Box::pin(plane.resolve_credential_material(credential_id, tenant_scope))
+                                .await
+                                .map_err(|error| error.to_string())
+                        }
+                        None => Err("no key plane is installed".to_string()),
+                    };
+                    match resolved {
+                        Ok(material) => {
+                            key_fallback_used = true;
+                            key_fallback_extra_attempts = 1;
+                            key_fallback_material = Some((provider_idx, material));
+                            provider_order.insert(attempt + 1, provider_idx);
+                            sbproxy_observe::metrics::record_provider_attempt(
+                                &provider.name,
+                                "error",
+                            );
+                            // Scrapeable from day one, because the typed
+                            // event only reaches a deployment that
+                            // configured an `events:` sink for it, and
+                            // "the house credential is now paying" is a
+                            // thing to alert on rather than to discover.
+                            sbproxy_ai::ai_metrics::record_key_fallback(&provider.name, "engaged");
+                            warn!(
+                                provider = %provider.name,
+                                status = %status,
+                                credential_id = %credential_id,
+                                "AI proxy: provider refused this entry's key, retrying on the \
+                                 operator's fallback credential"
+                            );
+                            sbproxy_observe::publish_proxy_event(
+                                sbproxy_observe::EventType::CredentialFallback,
+                                || {
+                                    credential_fallback_event(
+                                        ctx.hostname.as_str(),
+                                        ctx.tenant_id.as_str(),
+                                        provider.name.as_str(),
+                                        credential_id,
+                                        status,
+                                        "engaged",
+                                    )
+                                },
+                            );
+                            // Consume the body to avoid a connection leak,
+                            // exactly as the availability arm below does.
+                            let _ = resp.bytes().await;
+                            continue;
+                        }
+                        Err(error) => {
+                            // Fail to the provider's own rejection, not
+                            // to a 503: the caller's request already has
+                            // a truthful upstream answer, and inventing
+                            // a different status would hide it. The
+                            // credential is named, never its material,
+                            // and `error` is `CredentialResolveError`'s
+                            // Display, which carries no secret either.
+                            sbproxy_ai::ai_metrics::record_key_fallback(
+                                &provider.name,
+                                "unavailable",
+                            );
+                            warn!(
+                                provider = %provider.name,
+                                status = %status,
+                                credential_id = %credential_id,
+                                error = %error,
+                                "AI proxy: provider refused this entry's key and the fallback \
+                                 credential did not resolve; returning the provider's rejection"
+                            );
+                            sbproxy_observe::publish_proxy_event(
+                                sbproxy_observe::EventType::CredentialFallback,
+                                || {
+                                    credential_fallback_event(
+                                        ctx.hostname.as_str(),
+                                        ctx.tenant_id.as_str(),
+                                        provider.name.as_str(),
+                                        credential_id,
+                                        status,
+                                        "unavailable",
+                                    )
+                                },
+                            );
+                        }
+                    }
+                }
                 if (400..600).contains(&status) && !body_refines_cause {
                     router.note_classified_failure(
                         provider_idx,
@@ -11241,6 +12619,13 @@ pub(super) async fn handle_ai_proxy(
                     if let Some(prefix) = routing_prefix {
                         router.record_prefix(provider_idx, prefix);
                     }
+                    // The logical model, matching what `select_cache_affinity`
+                    // compared against above. A provider's own `model_map`
+                    // rename is not known at selection time, so leasing on the
+                    // renamed value would never match on the next request.
+                    if let Some(key) = cache_affinity_key {
+                        router.record_cache_affinity(provider_idx, key, model.as_str());
+                    }
                 }
                 last_resp = Some(resp);
                 break;
@@ -11263,6 +12648,11 @@ pub(super) async fn handle_ai_proxy(
                     &provider.name,
                     ai_metric_error_kind_for_span_error_type(last_error_type),
                 );
+                // Read before the error is moved into `last_error`. A
+                // wedged provider and a refused connection both arrive
+                // here, and an operator sizing `pre_header_timeout_ms`
+                // needs to tell which of the two the budget is producing.
+                let pre_header_elapsed = e.downcast_ref::<PreHeaderTimeoutElapsed>().is_some();
                 last_error = Some(e);
                 if ctx.managed_fallback_reason.is_some() && attempt + 1 < provider_order.len() {
                     let to_provider = provider_order
@@ -11288,10 +12678,18 @@ pub(super) async fn handle_ai_proxy(
                 sbproxy_ai::ai_metrics::record_failover(
                     &provider.name,
                     &to_provider,
-                    "transport",
+                    if pre_header_elapsed {
+                        "pre_header_timeout"
+                    } else {
+                        "transport"
+                    },
                     ctx.tenant_id.as_str(),
                 );
                 // WOR-2556: a transport failover is the generic trigger.
+                // A pre-header elapse is one too: the admin
+                // `failover_trigger` set stays closed, because the
+                // distinction an operator needs is already on the
+                // metric's `reason` label.
                 record_generic_failover_trigger(ctx);
                 continue;
             }
@@ -11641,7 +13039,41 @@ fn record_ai_transport_failure(
     }
 }
 
+/// A streaming attempt that ran out its `resilience.pre_header_timeout_ms`
+/// budget before the provider sent response headers.
+///
+/// Carried as an `anyhow` cause rather than as a separate control-flow
+/// arm so the elapse lands in the dispatch loop's existing `Err` arm and
+/// inherits its failover, its per-provider error accounting, and its
+/// `continue`. The `Err` arm downcasts to this type for one decision
+/// only: whether the handover it is about to count is labeled
+/// `pre_header_timeout` or `transport`.
+#[derive(Debug)]
+struct PreHeaderTimeoutElapsed {
+    budget_ms: u64,
+}
+
+impl std::fmt::Display for PreHeaderTimeoutElapsed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "provider did not send response headers within the {}ms \
+             resilience.pre_header_timeout_ms budget",
+            self.budget_ms
+        )
+    }
+}
+
+impl std::error::Error for PreHeaderTimeoutElapsed {}
+
 fn ai_transport_error_type(error: &anyhow::Error) -> &'static str {
+    // A pre-header budget elapse is a timeout the same way reqwest's own
+    // is; classifying it as a generic provider error would send it to
+    // `record_provider_error`'s wrong bucket and put the wrong error type
+    // on the span.
+    if error.downcast_ref::<PreHeaderTimeoutElapsed>().is_some() {
+        return sbproxy_ai::tracing_spans::error_type::TIMEOUT;
+    }
     if error
         .downcast_ref::<reqwest::Error>()
         .is_some_and(reqwest::Error::is_timeout)
@@ -11752,6 +13184,90 @@ fn record_ai_failure_decision(
         &ctx.tenant_id,
         &reason,
         DecisionDetails::ai_failure(provider, kind),
+    );
+}
+
+/// Record `ai.admission` on the decision family, the AI admission
+/// counter, and, when enabled, the audit feed (WOR-2595).
+///
+/// The funnel behind the six refusals the AI dispatch path can take
+/// before any provider is chosen: the three arms of the inbound
+/// native-format shim (the Anthropic Messages translate, the Responses
+/// stored-prompt bridge, and the Responses translate), the two
+/// refusal arms of the shared stored-prompt resolver (a render failure,
+/// and a reference lifted off a native body that no prompt layer holds),
+/// and a named model group with no eligible member
+/// (`model_group_no_member`, `model_group_forbidden`), which is decided
+/// at the same point for the same reason: the request names something
+/// this origin cannot dispatch, and no provider has been chosen yet.
+/// Before it, an MCP-governance-bypass attempt (`tools: [{"type":
+/// "mcp", ...}]` on `/v1/responses`) produced one free-text warn and a
+/// bare 400, which is metrically and forensically indistinguishable
+/// from a typo'd JSON body.
+///
+/// **What this cannot see.** Only those six. A request refused later
+/// by the model allow/block gate, a virtual-key policy, a guardrail, a
+/// budget, a rate limiter, or a CEL/Rego policy is that plane's
+/// decision and publishes under that plane's own event; none of them
+/// route through here. On the canonical `/v1/chat/completions` path
+/// there is no inbound shim, so the refusals that reach this funnel
+/// from there are a stored-prompt render failure and an unservable
+/// model group. `docs/events.md` states the same boundary for
+/// operators.
+///
+/// `reason` is a `&'static str` from [`sbproxy_ai::format::ChatError::reason`],
+/// or one of the two model-group codes, and never the error's message:
+/// several of the coded refusals
+/// interpolate caller bytes into the message (a serde parse error, an
+/// unrecognized role name), and both the metric label and
+/// `DecisionDetails` ship unscrubbed. The message reaches the client and
+/// the audit record's scrubbed `reason` prose, and nowhere else.
+fn record_ai_admission_refusal(ctx: &RequestContext, surface: &str, reason: &'static str) {
+    use sbproxy_observe::decision::{
+        DecisionDetails, DecisionEngine, DecisionEvent, DecisionOutcome,
+    };
+
+    sbproxy_ai::ai_metrics::record_admission_decision(surface, reason, "deny");
+
+    let origin_id = ctx
+        .origin_idx
+        .and_then(|idx| ctx.pipeline.config.origins.get(idx))
+        .map(|origin| origin.origin_id.to_string());
+    let origin_for_family = origin_id.as_deref().unwrap_or("__unmatched__");
+    sbproxy_observe::decision::record_decision(
+        DecisionEvent::AiAdmission,
+        DecisionEngine::BuiltIn,
+        DecisionOutcome::Deny,
+        origin_for_family,
+        &ctx.tenant_id,
+    );
+
+    let Some(origin_id) = origin_id else {
+        return;
+    };
+    if !crate::server::proxy_http::audit_publishes(
+        &ctx.pipeline,
+        DecisionEvent::AiAdmission,
+        Some(&ctx.tenant_id),
+        Some(&origin_id),
+    ) {
+        return;
+    }
+    // Prose built from the two bounded codes only, for the same reason
+    // the detail fields are: this string is scrubbed on the way into the
+    // record, but scrubbing is a redaction pass over operator-configured
+    // patterns, not a guarantee about an arbitrary parse error.
+    let audit_reason = format!("{surface} surface refused the request before dispatch: {reason}");
+    crate::policy_bus::emit_decision_audit_detailed(
+        DecisionEvent::AiAdmission,
+        DecisionEngine::BuiltIn,
+        DecisionOutcome::Deny,
+        &ctx.request_id,
+        &origin_id,
+        &origin_id,
+        &ctx.tenant_id,
+        &audit_reason,
+        DecisionDetails::ai_admission(surface, reason),
     );
 }
 
@@ -12249,15 +13765,48 @@ async fn external_output_guardrail_block(
     blocked.map(|(name, reason)| sbproxy_ai::guardrails::GuardrailBlock { name, reason })
 }
 
+/// Run the output guardrails for one response and record the verdict
+/// on the `ai.guardrail.output` funnel.
+///
+/// `provider_block` is a verdict the upstream itself already returned,
+/// ahead of anything SBproxy evaluates: today the only source is an
+/// inline Bedrock Converse `guardrailConfig` intervention, detected in
+/// [`relay_ai_response_with_cache`] off the native body before
+/// translation throws the assessment trace away. It takes precedence
+/// because the provider already refused to serve the completion; there
+/// is nothing for our own guardrails to add.
+///
+/// `ctx` is `Option` because [`relay_ai_response_with_cache`] also
+/// serves callers with no request context. Without one there is no
+/// origin or tenant to attribute the decision to, so the guardrails
+/// still run and still block but nothing is recorded.
+///
+/// Callers: the live relay, the cascade arm (which materializes its
+/// body outside the relay and passes `builtin: None`, the set it has
+/// always evaluated), the JSON and multipart idempotency replays, and
+/// the semantic-cache hit.
+///
+/// **What this cannot see.** Streaming responses. An SSE relay never
+/// materializes a response body here, so neither the guardrails nor
+/// this record run for one, including for a `ConverseStream` guardrail
+/// intervention (`format::native_streams` maps that to a
+/// `content_filter` finish reason and the client sees it, but no
+/// decision record is emitted). The live multipart relay also runs its
+/// own `multipart_external_output_guardrail_block` and does not route
+/// through here; only a multipart idempotency replay does.
 async fn ai_output_guardrail_block(
-    ctx: &RequestContext,
+    ctx: Option<&RequestContext>,
     status: u16,
+    provider_block: Option<sbproxy_ai::guardrails::GuardrailBlock>,
     builtin: Option<&sbproxy_ai::guardrails::GuardrailPipeline>,
     external: &[sbproxy_ai::external_guardrail::ExternalGuardrailConfig],
     body: &[u8],
     model: &str,
 ) -> Option<sbproxy_ai::guardrails::GuardrailBlock> {
-    let block = ai_output_guardrail_block_inner(status, builtin, external, body, model).await;
+    let block = match provider_block {
+        Some(block) if (200..300).contains(&status) => Some((None, block)),
+        _ => ai_output_guardrail_block_inner(status, builtin, external, body, model).await,
+    };
     // A non-2xx response is not a guardrail decision: the inner
     // function returns before inspecting anything, so recording here
     // would manufacture an allow for a response no guardrail read.
@@ -12299,16 +13848,18 @@ async fn ai_output_guardrail_block(
         } else {
             (Vec::new(), 0)
         };
-    record_guardrail_decision(
-        ctx,
-        sbproxy_observe::decision::DecisionEvent::AiGuardrailOutput,
-        outcome,
-        name,
-        0,
-        "output",
-        &spans,
-        spans_dropped,
-    );
+    if let Some(ctx) = ctx {
+        record_guardrail_decision(
+            ctx,
+            sbproxy_observe::decision::DecisionEvent::AiGuardrailOutput,
+            outcome,
+            name,
+            0,
+            "output",
+            &spans,
+            spans_dropped,
+        );
+    }
     block.map(|(_, block)| block)
 }
 
@@ -12540,6 +14091,33 @@ pub(super) async fn relay_ai_response_with_cache(
     };
 
     let raw_body = read_capped_response_body(resp, max_body_size).await?;
+
+    // A Bedrock Converse guardrail configured through the provider
+    // entry's `bedrock_guardrail` evaluates inside the generation call
+    // and reports an intervention as a 200 with
+    // `stopReason: guardrail_intervened`. Read it here, off the native
+    // body: `translate_success_response_bytes` below rebuilds the
+    // response from a fresh object and keeps only `output.message`,
+    // `stopReason`, and `usage`, so the `trace.guardrail` assessment
+    // that names the policies is gone by the next statement.
+    let provider_guardrail_block: Option<sbproxy_ai::guardrails::GuardrailBlock> =
+        (format == sbproxy_ai::providers::ProviderFormat::Bedrock && (200..300).contains(&status))
+            .then(|| sbproxy_ai::translators::bedrock::guardrail_intervention(&raw_body))
+            .flatten();
+    if provider_guardrail_block.is_some() {
+        // Only the block arm records. There is no provider config in
+        // scope here to say whether an inline guardrail was configured
+        // at all, so an `allow` counter would be indistinguishable from
+        // "this response was never guarded"; the denominator is the
+        // ordinary per-provider request count. `docs/guardrails.md`
+        // states the same.
+        sbproxy_ai::ai_metrics::record_external_guardrail_verdict(
+            "bedrock_inline",
+            "output",
+            "block",
+        );
+    }
+
     let inbound_format: Option<String> = ctx.as_ref().and_then(|c| c.ai_inbound_format.clone());
     let native_bypass = ctx.as_ref().map(|c| c.ai_native_bypass).unwrap_or(false);
     let direct_response_body = native_bypass.then(|| raw_body.clone());
@@ -12616,27 +14194,35 @@ pub(super) async fn relay_ai_response_with_cache(
     // Only 2xx bodies are checked; external runs only when the sync pipeline
     // did not already block, and applies its configured fail mode when bytes
     // cannot be represented as text.
-    let output_block: Option<sbproxy_ai::guardrails::GuardrailBlock> =
-        if (200..300).contains(&status) {
-            let governed_client_body = direct_client_body.as_ref().unwrap_or(&resp_body);
-            let sync_block = output_guardrails
-                .as_ref()
-                .and_then(|g| g.check_output_bytes(governed_client_body));
-            if sync_block.is_some() {
-                sync_block
-            } else {
-                external_output_guardrail_block(
-                    output_external,
-                    governed_client_body,
-                    ctx.as_ref()
-                        .and_then(|context| context.ai_model.as_deref())
-                        .unwrap_or(""),
-                )
-                .await
-            }
-        } else {
-            None
-        };
+    //
+    // WOR-2649: this runs through `ai_output_guardrail_block` rather
+    // than calling the evaluators inline, so the live path emits the
+    // same `ai.guardrail.output` decision record the idempotency and
+    // semantic-cache replays already emitted. It previously emitted
+    // none: an operator with `decision_audit` on saw output-guardrail
+    // decisions for replayed responses and nothing at all for the
+    // responses the provider actually generated.
+    //
+    // Boxed: this frame is on the Pingora worker's 2MB stack and the
+    // funnel's future is materially larger than the bare
+    // `external_output_guardrail_block` future it replaces.
+    let output_block: Option<sbproxy_ai::guardrails::GuardrailBlock> = {
+        let governed_client_body = direct_client_body.as_ref().unwrap_or(&resp_body);
+        let model = ctx
+            .as_ref()
+            .and_then(|context| context.ai_model.as_deref())
+            .unwrap_or("");
+        Box::pin(ai_output_guardrail_block(
+            ctx.as_deref(),
+            status,
+            provider_guardrail_block,
+            output_guardrails.as_deref(),
+            output_external,
+            governed_client_body,
+            model,
+        ))
+        .await
+    };
     if let Some(block) = output_block {
         warn!(
             guardrail = %block.name,
@@ -12869,6 +14455,7 @@ pub(super) async fn relay_ai_response_with_cache(
                 ctx.ai_tokens_in = Some(prompt_tokens);
                 ctx.ai_tokens_out = Some(completion_tokens);
                 ctx.ai_tokens_cached = (cached_input > 0).then_some(cached_input);
+                ctx.ai_tokens_cache_write = (cache_creation > 0).then_some(cache_creation);
                 let project = ctx.principal.attrs.project.as_deref().unwrap_or("");
                 let user = ctx.principal.attrs.user.as_deref().unwrap_or("");
                 if ctx.principal.attrs.tags.is_empty() {
@@ -13029,6 +14616,7 @@ pub(super) async fn relay_ai_response_with_cache(
                 ctx.ai_tokens_in = Some(prompt_tokens);
                 ctx.ai_tokens_out = Some(completion_tokens);
                 ctx.ai_tokens_cached = (cached_input > 0).then_some(cached_input);
+                ctx.ai_tokens_cache_write = (cache_creation > 0).then_some(cache_creation);
                 let usage = sbproxy_ai::budget::AiUsage::Tokens {
                     input: prompt_tokens,
                     output: completion_tokens,
@@ -14691,6 +16279,12 @@ pub(super) async fn relay_ai_stream(
     // SSE body never lands in memory.
     let mut stream = resp.bytes_stream();
     let mut upstream_complete = false;
+    // Which upstream read failure ended the stream, when one did. Read
+    // once after the loop to label
+    // `sbproxy_ai_stream_post_commit_failures_total`; a timeout there
+    // means a whole-call budget cut a generation that was still running,
+    // which is a different operator action from a reset.
+    let mut upstream_stream_error: Option<&'static str> = None;
     // WOR-895: track TTFT + output throughput. `stream_started` anchors
     // the generation window; `first_token_at` is set on the first chunk
     // that carries any payload. Both feed `sbproxy_ai_ttft_seconds` +
@@ -15202,6 +16796,11 @@ pub(super) async fn relay_ai_stream(
                     ai_metric_error_kind_for_span_error_type(kind),
                 );
                 warn!(error = %e, "AI proxy: error reading SSE chunk from upstream");
+                upstream_stream_error = Some(if e.is_timeout() {
+                    "upstream_timeout"
+                } else {
+                    "upstream_error"
+                });
                 break;
             }
             None => {
@@ -15465,6 +17064,26 @@ pub(super) async fn relay_ai_stream(
                 break;
             }
         }
+    }
+
+    // Everything reaching this relay has already been committed to a
+    // provider: the dispatcher only calls it once
+    // `upstream_response_is_successful_stream` accepted the response, and
+    // the attempt loop has closed by then. So a stream that did not run
+    // to its natural end here can never be failed over, and this counter
+    // is where that failure is visible. Counted before the close-out
+    // writes below, because a failed downstream write leaves this
+    // function on `?` and would otherwise swallow an upstream cause the
+    // operator needs.
+    if !upstream_complete {
+        let cause = upstream_stream_error.unwrap_or(if safety_blocked || output_guard_blocked {
+            "guardrail"
+        } else {
+            // Every other way out of the chunk loop leaves through `?`,
+            // so this is a floor rather than a live branch.
+            "upstream_error"
+        });
+        sbproxy_ai::ai_metrics::record_stream_post_commit_failure(router_sink.provider_name, cause);
     }
 
     if let Some(block) = pending_builtin_block.take() {
@@ -15818,6 +17437,75 @@ fn prepend_responses_instructions(body: &mut serde_json::Value, text: &str) {
         "instructions".to_string(),
         serde_json::Value::String(merged),
     );
+}
+
+/// Lift a gateway-only string `prompt` reference out of a native
+/// inbound body, returning the body without it and the reference.
+///
+/// `"prompt": "name@version"` is this gateway's stored-prompt reference,
+/// not a field of the Anthropic Messages or OpenAI Responses wire
+/// formats. Both native translators therefore drop it: the Anthropic
+/// catch-all notes `anthropic.prompt`, the Responses translator notes
+/// `responses.prompt`, and the shared resolver downstream reads the
+/// ALREADY-TRANSLATED canonical body, where the field no longer exists.
+/// A `prompts:` origin plus a `/v1/messages` request naming a stored
+/// prompt therefore ran without the template it asked for, which is
+/// silent context loss.
+///
+/// Lifting the reference before translation and re-inserting it into
+/// the translated body puts it where the resolver looks, without
+/// teaching the hub about a field no provider accepts. `HubRequest`
+/// gains nothing, `REPRESENTED_TOP_LEVEL_KEYS` gains nothing, and the
+/// native-bypass allowlist gains nothing, so the lossless-bypass path
+/// stays disabled for a body carrying this key.
+///
+/// Only a string is lifted. An object-valued `prompt` is the Responses
+/// stored-prompt OBJECT form, bridged separately and refused by the
+/// translator if it was not; any other type keeps its note-and-drop
+/// behavior. A body that is not a JSON object, or whose reserialization
+/// fails, is returned untouched with `None`, so a failure here can only
+/// leave the pre-existing behavior rather than invent a new one.
+/// A stored-prompt reference, bounded for a log field.
+///
+/// The reference is caller bytes taken straight off the request body,
+/// and both refusal arms below name it in a `warn!`. A `name@version`
+/// is tens of characters; nothing stops a client sending the whole body
+/// budget as one string, and a request that costs the caller one POST
+/// should not cost the operator a megabyte of log. The value is
+/// truncated for the log only; resolution still sees it whole, so a
+/// long legitimate name resolves normally.
+fn prompt_reference_for_log(reference: &str) -> std::borrow::Cow<'_, str> {
+    /// Comfortably past any plausible `name@version` and short enough
+    /// that a flood of refusals cannot outrun log rotation.
+    const MAX_LOGGED_REFERENCE_BYTES: usize = 256;
+    sbproxy_util::truncate_utf8_with_marker(reference, MAX_LOGGED_REFERENCE_BYTES, "...[truncated]")
+}
+
+fn lift_gateway_prompt_reference(bytes: &bytes::Bytes) -> (bytes::Bytes, Option<String>) {
+    // Same byte scan the Responses object bridge uses: it keeps the
+    // extra JSON parse off bodies that cannot carry the field, and a
+    // false positive costs only the parse.
+    if !bytes.as_ref().windows(8).any(|w| w == b"\"prompt\"") {
+        return (bytes.clone(), None);
+    }
+    let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(bytes.as_ref()) else {
+        return (bytes.clone(), None);
+    };
+    let Some(object) = parsed.as_object_mut() else {
+        return (bytes.clone(), None);
+    };
+    let Some(reference) = object
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+    else {
+        return (bytes.clone(), None);
+    };
+    object.remove("prompt");
+    match serde_json::to_vec(&parsed) {
+        Ok(rewritten) => (bytes::Bytes::from(rewritten), Some(reference)),
+        Err(_) => (bytes.clone(), None),
+    }
 }
 
 /// WOR-2514: bridge an object-valued Responses `prompt` onto the
@@ -16605,6 +18293,10 @@ mod external_guardrail_context_tests {
         ) {
             self.puts.fetch_add(1, Ordering::SeqCst);
             *self.stored.lock().expect("idempotency stored lock") = Some(response);
+        }
+
+        fn backend_label(&self) -> &'static str {
+            "memory"
         }
     }
 
@@ -17485,6 +19177,361 @@ origins:
                 .any(|e| e.tenant_id.as_deref() == Some("tenant-b")),
             "the cross-tenant inject_mcp miss must be an audited event, not only a log line: {events:?}"
         );
+    }
+
+    /// An upstream that answers `accepts` requests instead of one.
+    ///
+    /// The single-shot fixtures above cannot express "the same provider
+    /// served both requests", which is the whole claim a routing-affinity
+    /// test has to make.
+    async fn repeating_upstream_fixture(
+        body: &'static str,
+        accepts: usize,
+    ) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind repeating upstream");
+        let address = listener.local_addr().expect("repeating upstream address");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&hits);
+        tokio::spawn(async move {
+            for _ in 0..accepts {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                observed.fetch_add(1, Ordering::SeqCst);
+                drain_upstream_request(&mut stream).await;
+                let response = format!(
+                    "HTTP/1.1 200 Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{address}/v1"), hits)
+    }
+
+    fn two_provider_affinity_config(
+        first_url: String,
+        second_url: String,
+        cache_affinity: bool,
+    ) -> sbproxy_ai::AiHandlerConfig {
+        let mut action = serde_json::json!({
+            "providers": [
+                {
+                    "name": "provider-one",
+                    "provider_type": "openai",
+                    "base_url": first_url,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key"
+                },
+                {
+                    "name": "provider-two",
+                    "provider_type": "openai",
+                    "base_url": second_url,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key"
+                }
+            ],
+            "routing": "round_robin"
+        });
+        if cache_affinity {
+            action["cache_affinity"] = serde_json::json!({});
+        }
+        sbproxy_ai::AiHandlerConfig::from_config(action).expect("affinity proxy config")
+    }
+
+    async fn dispatch_chat_request(config: &sbproxy_ai::AiHandlerConfig, body: serde_json::Value) {
+        let (mut session, client) = downstream_session(body).await;
+        let mut context = crate::context::RequestContext::new();
+        context.tenant_id = "tenant-a".into();
+        super::handle_ai_proxy(
+            &mut session,
+            config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("affinity request dispatches");
+        drop(session);
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+    }
+
+    /// WOR-2651: the control for the affinity test below.
+    ///
+    /// It asserts the premise rather than narrating it. Without it, an
+    /// affinity test that saw both requests land on one provider could be
+    /// measuring a broken second fixture instead of a working lease.
+    #[tokio::test]
+    async fn two_requests_without_a_cache_key_alternate_providers_under_round_robin() {
+        let (first_url, first_hits) = repeating_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+            2,
+        )
+        .await;
+        let (second_url, second_hits) = repeating_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+            2,
+        )
+        .await;
+        let config = two_provider_affinity_config(first_url, second_url, true);
+
+        for _ in 0..2 {
+            dispatch_chat_request(
+                &config,
+                serde_json::json!({
+                    "model": "fixture-model",
+                    "messages": [{"role": "user", "content": "same prompt"}]
+                }),
+            )
+            .await;
+        }
+
+        assert_eq!(
+            (
+                first_hits.load(Ordering::SeqCst),
+                second_hits.load(Ordering::SeqCst)
+            ),
+            (1, 1),
+            "round robin must alternate when no caller cache key is present, \
+             otherwise the affinity test below proves nothing"
+        );
+    }
+
+    /// WOR-2651: prompt-cache affinity has to compose with every strategy.
+    ///
+    /// The existing prefix-affinity hook is gated on
+    /// `Router::is_prefix_affinity`, so a lease evaluated inside that gate
+    /// would never run under `round_robin`. This exercises the
+    /// strategy-independent reorder that runs after the primary selection
+    /// block instead.
+    #[tokio::test]
+    async fn two_requests_with_one_cache_key_reach_one_provider_under_round_robin() {
+        let (first_url, first_hits) = repeating_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+            2,
+        )
+        .await;
+        let (second_url, second_hits) = repeating_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+            2,
+        )
+        .await;
+        let config = two_provider_affinity_config(first_url, second_url, true);
+
+        for _ in 0..2 {
+            dispatch_chat_request(
+                &config,
+                serde_json::json!({
+                    "model": "fixture-model",
+                    "prompt_cache_key": "tenant-a-session-7",
+                    "messages": [{"role": "user", "content": "same prompt"}]
+                }),
+            )
+            .await;
+        }
+
+        let mut served = [
+            first_hits.load(Ordering::SeqCst),
+            second_hits.load(Ordering::SeqCst),
+        ];
+        served.sort_unstable();
+        assert_eq!(
+            served,
+            [0, 2],
+            "the second request must return to the provider that already holds \
+             this caller's warm prompt cache"
+        );
+    }
+
+    /// WOR-2651: the gateway leases on a key the caller sent and never
+    /// invents one. A synthesized `prompt_cache_key` would silently change
+    /// what the upstream caches and bills for.
+    #[tokio::test]
+    async fn the_gateway_never_adds_a_cache_key_the_caller_did_not_send() {
+        let (upstream_url, hits, captured) = capturing_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        )
+        .await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "provider-one",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }],
+            "routing": "round_robin",
+            "cache_affinity": {}
+        }))
+        .expect("affinity proxy config");
+
+        // `user` is present, so a lease *is* derived for this request. That
+        // is the interesting case: the key the gateway leases on must stay
+        // inside the gateway.
+        dispatch_chat_request(
+            &config,
+            serde_json::json!({
+                "model": "fixture-model",
+                "user": "caller-42",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }),
+        )
+        .await;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let upstream_request = captured.await.expect("capturing upstream task");
+        let request_text = String::from_utf8(upstream_request).expect("upstream request UTF-8");
+        let body: serde_json::Value = serde_json::from_str(
+            request_text
+                .split_once("\r\n\r\n")
+                .expect("upstream request body")
+                .1,
+        )
+        .expect("upstream JSON body");
+        assert!(
+            body.get("prompt_cache_key").is_none(),
+            "the gateway must not write a prompt cache key the caller omitted: {body}"
+        );
+        assert_eq!(
+            body["user"], "caller-42",
+            "the caller's own field must reach the upstream unchanged"
+        );
+    }
+
+    /// WOR-2652: the security regression test.
+    ///
+    /// Before this change a caller POSTing `{"service_tier": "priority"}`
+    /// to `/v1/chat/completions` reached the upstream verbatim, because
+    /// that surface never round-trips through the canonical hub request.
+    /// Raising the tier raises the bill, and the operator pays it.
+    #[tokio::test]
+    async fn a_caller_service_tier_is_replaced_by_the_operator_tier() {
+        let before = service_tier_decisions("caller_tier_replaced");
+        let (upstream_url, hits, captured) = capturing_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        )
+        .await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai-flex",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "service_tier": "flex"
+            }]
+        }))
+        .expect("service tier proxy config");
+
+        dispatch_chat_request(
+            &config,
+            serde_json::json!({
+                "model": "fixture-model",
+                "service_tier": "priority",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }),
+        )
+        .await;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let body = captured_upstream_json(captured).await;
+        assert_eq!(
+            body["service_tier"], "flex",
+            "the operator's tier must overwrite the caller's: {body}"
+        );
+        // The caller silently loses the tier they paid to ask for, and this
+        // surface emits no lossiness note, so the counter is the only thing
+        // an operator can see the enforcement on.
+        assert_eq!(
+            service_tier_decisions("caller_tier_replaced") - before,
+            1.0,
+            "overwriting a caller's tier must be scrapeable"
+        );
+    }
+
+    /// One `sbproxy_ai_service_tier_decisions_total` disposition. Absent
+    /// series read as zero, which is what a disposition nobody has recorded
+    /// yet looks like.
+    fn service_tier_decisions(disposition: &str) -> f64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "sbproxy_ai_service_tier_decisions_total")
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        metric.get_label().iter().any(|label| {
+                            label.name() == "disposition" && label.value() == disposition
+                        })
+                    })
+                    .map(|metric| metric.get_counter().value())
+                    .sum()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The other half of the same decision. An entry that declares no tier
+    /// must strip the caller's, or the config key would only work as an
+    /// upgrade and a caller could still escalate on every untiered entry.
+    #[tokio::test]
+    async fn a_caller_service_tier_is_stripped_when_the_entry_declares_none() {
+        let before = service_tier_decisions("caller_tier_stripped");
+        let (upstream_url, hits, captured) = capturing_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        )
+        .await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai-default",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }]
+        }))
+        .expect("untiered proxy config");
+
+        dispatch_chat_request(
+            &config,
+            serde_json::json!({
+                "model": "fixture-model",
+                "service_tier": "priority",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }),
+        )
+        .await;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let body = captured_upstream_json(captured).await;
+        assert!(
+            body.get("service_tier").is_none(),
+            "an entry with no tier must send no tier field: {body}"
+        );
+        assert_eq!(
+            service_tier_decisions("caller_tier_stripped") - before,
+            1.0,
+            "stripping a caller's tier must be scrapeable"
+        );
+    }
+
+    async fn captured_upstream_json(
+        captured: tokio::task::JoinHandle<Vec<u8>>,
+    ) -> serde_json::Value {
+        let upstream_request = captured.await.expect("capturing upstream task");
+        let request_text = String::from_utf8(upstream_request).expect("upstream request UTF-8");
+        serde_json::from_str(
+            request_text
+                .split_once("\r\n\r\n")
+                .expect("upstream request body")
+                .1,
+        )
+        .expect("upstream JSON body")
     }
 
     /// WOR-2312: a global alias resolves before provider selection, which
@@ -20101,6 +22148,215 @@ origins:
         }
     }
 
+    /// Read one `sbproxy_decision_event_total` sample by its labels.
+    /// Sampled before and after so a concurrently running test in the
+    /// same process cannot make a delta assertion pass on someone
+    /// else's increment.
+    fn decision_event_total(labels: &[(&str, &str)]) -> f64 {
+        sbproxy_observe::metrics::metrics()
+            .render()
+            .lines()
+            .find(|line| {
+                line.starts_with("sbproxy_decision_event_total")
+                    && labels
+                        .iter()
+                        .all(|(key, value)| line.contains(&format!("{key}=\"{value}\"")))
+            })
+            .and_then(|line| line.rsplit(' ').next()?.parse().ok())
+            .unwrap_or(0.0)
+    }
+
+    /// Read one `sbproxy_ai_external_guardrail_verdicts_total` sample.
+    fn external_guardrail_verdict_total(labels: &[(&str, &str)]) -> f64 {
+        let families = prometheus::gather();
+        families
+            .iter()
+            .find(|family| family.name() == "sbproxy_ai_external_guardrail_verdicts_total")
+            .into_iter()
+            .flat_map(|family| family.get_metric())
+            .filter(|metric| {
+                labels.iter().all(|(key, value)| {
+                    metric
+                        .get_label()
+                        .iter()
+                        .any(|label| label.name() == *key && label.value() == *value)
+                })
+            })
+            .map(|metric| metric.get_counter().value())
+            .sum()
+    }
+
+    /// WOR-2649 (Seam C). The live upstream response never reached the
+    /// `ai.guardrail.output` funnel: an idempotency replay and a
+    /// semantic-cache hit each emitted a decision record, and the
+    /// response the provider actually generated emitted none. An
+    /// operator with `decision_audit` on therefore saw output-guardrail
+    /// decisions only for replays, which is the least interesting
+    /// subset.
+    ///
+    /// This has nothing to do with Bedrock, and that is the point: the
+    /// fix belongs to the funnel, not to one provider's detector.
+    #[tokio::test]
+    async fn a_live_output_guardrail_block_emits_one_output_guardrail_decision() {
+        // Scoped to a tenant label no other test uses:
+        // `sbproxy_decision_event_total` is process-global and several
+        // tests in this module publish the same event, so a bare delta
+        // would pass on a sibling's increment under `cargo test`.
+        let deny = [
+            ("event", "ai.guardrail.output"),
+            ("outcome", "deny"),
+            ("tenant", "wor2649-live-block"),
+        ];
+        let before = decision_event_total(&deny);
+
+        let (guardrail_url, _received) = blocking_guardrail().await;
+        let (upstream_url, _upstream_hits) = upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"provider-controlled text"}}]}"#,
+        )
+        .await;
+        let config = proxy_config(&upstream_url, guardrail_url, "post_call");
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        context.tenant_id = "wor2649-live-block".into();
+        let (pipeline, _semantic, _idempotency) = pipeline_with_recording_caches().await;
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("output block is a handled response");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "response was {response}"
+        );
+        assert_eq!(
+            decision_event_total(&deny) - before,
+            1.0,
+            "the live response path must publish exactly one ai.guardrail.output deny"
+        );
+    }
+
+    /// WOR-2649 (Seam A + Seam B). A Bedrock Converse guardrail
+    /// configured on the provider entry answers an intervention with a
+    /// **200** carrying `stopReason: guardrail_intervened`. Nothing in
+    /// the product read that: `body_refinable_client_status` only
+    /// classifies 400/422, so the intervention relayed to the caller as
+    /// a successful, empty completion.
+    #[tokio::test]
+    async fn a_bedrock_inline_guardrail_intervention_blocks_the_live_response() {
+        let deny = [
+            ("event", "ai.guardrail.output"),
+            ("outcome", "deny"),
+            ("tenant", "wor2649-bedrock-inline"),
+        ];
+        let before_deny = decision_event_total(&deny);
+        let inline = [("provider", "bedrock_inline"), ("outcome", "block")];
+        let before_metric = external_guardrail_verdict_total(&inline);
+
+        // A Converse intervention: 200, no content, and a trace whose
+        // `customWords[].match` is the caller's own text.
+        let (upstream_url, upstream_hits) = upstream_fixture(
+            r#"{"stopReason":"guardrail_intervened","output":{"message":{"role":"assistant","content":[{"text":""}]}},"usage":{"inputTokens":11,"outputTokens":0,"totalTokens":11},"trace":{"guardrail":{"outputAssessments":{"gr-abc123":[{"contentPolicy":{"filters":[{"type":"VIOLENCE","action":"BLOCKED","detected":true}]},"wordPolicy":{"customWords":[{"match":"hunter2-secret-passphrase","action":"BLOCKED","detected":true}]}}]}}}}"#,
+        )
+        .await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "bedrock",
+                "provider_type": "bedrock",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "bedrock_guardrail": {
+                    "identifier": "gr-abc123",
+                    "version": "DRAFT",
+                    "trace": true,
+                },
+            }],
+        }))
+        .expect("bedrock proxy config");
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "anthropic.claude-3-5-sonnet-20240620-v1:0",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        context.tenant_id = "wor2649-bedrock-inline".into();
+        let (pipeline, _semantic, recording_idempotency) = pipeline_with_recording_caches().await;
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("a provider guardrail block is a handled response");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response utf8");
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "a Converse intervention must not relay as a 200 completion: {response}"
+        );
+        assert!(
+            response.contains("guardrail_violation"),
+            "response was {response}"
+        );
+        assert!(
+            response.contains("bedrock_guardrail"),
+            "the envelope names the layer that refused: {response}"
+        );
+        assert!(
+            response.contains("content_filter:VIOLENCE"),
+            "the reason names the policy that fired: {response}"
+        );
+        assert!(
+            !response.contains("hunter2-secret-passphrase"),
+            "the assessment's matched span is caller content and must never \
+             reach the envelope: {response}"
+        );
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            context.ai_outcome.as_deref(),
+            Some("guardrail_block"),
+            "a provider-native block reports the same outcome every other \
+             output-guardrail block reports, or two dashboards counting \
+             guardrail blocks stop agreeing"
+        );
+        assert_eq!(
+            recording_idempotency.puts.load(Ordering::SeqCst),
+            0,
+            "a blocked generation must not be admitted to any cache"
+        );
+        assert_eq!(
+            decision_event_total(&deny) - before_deny,
+            1.0,
+            "exactly one ai.guardrail.output deny"
+        );
+        assert_eq!(
+            external_guardrail_verdict_total(&inline) - before_metric,
+            1.0,
+            "the inline verdict is labeled bedrock_inline, distinct from the \
+             out-of-band ApplyGuardrail provider label"
+        );
+    }
+
     #[tokio::test]
     async fn external_output_guardrail_rejects_buffered_provider_text_before_it_can_be_served() {
         let (guardrail_url, received) = blocking_guardrail().await;
@@ -20308,6 +22564,14 @@ origins:
 
     #[tokio::test]
     async fn cascade_external_output_guardrail_blocks_the_selected_tier_model() {
+        // Scoped to a tenant label no other test uses, because
+        // `sbproxy_decision_event_total` is process-global.
+        let deny = [
+            ("event", "ai.guardrail.output"),
+            ("outcome", "deny"),
+            ("tenant", "wor2649-cascade-block"),
+        ];
+        let before_deny = decision_event_total(&deny);
         let (guardrail_url, received) = blocking_guardrail().await;
         let (upstream_url, upstream_hits) = upstream_fixture(
             r#"{"confidence_score":1.0,"choices":[{"message":{"role":"assistant","content":"cascade provider text"}}]}"#,
@@ -20320,6 +22584,7 @@ origins:
         }))
         .await;
         let mut context = crate::context::RequestContext::new();
+        context.tenant_id = "wor2649-cascade-block".into();
         let (pipeline, recording_semantic, recording_idempotency) =
             pipeline_with_recording_caches().await;
 
@@ -20374,6 +22639,17 @@ origins:
                 "model": "cascade-selected-model",
                 "phase": "output"
             })
+        );
+        // Cascade materializes its response outside the relay, so it is
+        // a third live path into the output-guardrail funnel and has to
+        // publish the record the other two publish. `docs/events.md`
+        // names the two exceptions (streamed, live multipart); a
+        // cascade route is not one of them.
+        assert_eq!(
+            decision_event_total(&deny) - before_deny,
+            1.0,
+            "a cascade output-guardrail block must publish one \
+             ai.guardrail.output deny"
         );
     }
 
@@ -21533,6 +23809,1306 @@ origins:
         );
         assert_eq!(chat_hits.load(Ordering::SeqCst), 0);
     }
+
+    // Dispatch-seam tests for the origin default model and the
+    // pre-provider admission record. They sit in this module rather than
+    // beside the error-classification unit tests because they drive real
+    // requests through `handle_ai_proxy`, and the session, upstream, and
+    // proxy-config fixtures that needs are declared here.
+
+    /// WOR-2531: red first, and red on the security half rather than on
+    /// the rule.
+    ///
+    /// `handle_ai_proxy` read `body["model"]` and substituted the EMPTY
+    /// STRING when the request omitted it, and `default_model` appeared
+    /// nowhere in this file. Empty is not a harmless placeholder: the
+    /// model allow/block gate is `if !model.is_empty() &&
+    /// !config.is_model_allowed(&model)`, so a request that omitted
+    /// `model` walked past a `blocked_models` entry naming the very
+    /// model the origin would have used, and reached the provider. On
+    /// main this test sees a 200 and one upstream hit.
+    #[tokio::test]
+    async fn an_omitted_model_takes_the_origin_default_and_faces_the_block_list() {
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"id":"chatcmpl-1"}"#).await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "default_model": "retired-model"
+            }],
+            "blocked_models": ["retired-model"]
+        }))
+        .expect("default-model proxy config");
+
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the blocked default model is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 403"),
+            "the origin's default model is blocked, so the gate must refuse: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            0,
+            "a blocked model must not reach the provider"
+        );
+    }
+
+    /// The positive half: with nothing blocking it, the origin's default
+    /// becomes the request's model everywhere downstream, which is what
+    /// puts a value on the access log, the span, and the model-scoped
+    /// budget key that previously carried none.
+    #[tokio::test]
+    async fn an_omitted_model_takes_the_origin_default_on_the_wire() {
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"id":"chatcmpl-1"}"#).await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "default_model": "gpt-4o"
+            }]
+        }))
+        .expect("default-model proxy config");
+
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the defaulted request is dispatched");
+        drop(session);
+        let _ = live_downstream_body(client).await;
+
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            context.ai_logical_model.as_deref(),
+            Some("gpt-4o"),
+            "the model every downstream plane reads was the empty string before WOR-2531"
+        );
+    }
+
+    /// The boundary the fallback must not cross: two enabled providers
+    /// naming different defaults leave the request modelless, exactly as
+    /// before, rather than routing it to whichever one is listed first.
+    #[tokio::test]
+    async fn disagreeing_defaults_leave_the_request_modelless() {
+        let (upstream_url, upstream_hits) = upstream_fixture(r#"{"id":"chatcmpl-1"}"#).await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "default_model": "gpt-4o"
+            }, {
+                "name": "second",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "default_model": "gpt-4o-mini"
+            }]
+        }))
+        .expect("ambiguous default-model proxy config");
+
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the ambiguous request is dispatched unchanged");
+        drop(session);
+        let _ = live_downstream_body(client).await;
+
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            context.ai_logical_model, None,
+            "an ambiguous origin must not pick a default for the operator"
+        );
+    }
+
+    /// One `sbproxy_ai_admission_decisions_total` series, or 0 when
+    /// nothing has created it yet.
+    ///
+    /// `prometheus::gather()` reads a process-global registry and the
+    /// sibling tests in this module can run in the same process, so
+    /// callers assert a strict increase rather than an exact value.
+    fn admission_decisions_count(surface: &str, reason: &str) -> f64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "sbproxy_ai_admission_decisions_total")
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        let labelled = |name: &str, want: &str| {
+                            metric
+                                .get_label()
+                                .iter()
+                                .any(|label| label.name() == name && label.value() == want)
+                        };
+                        labelled("surface", surface)
+                            && labelled("reason", reason)
+                            && labelled("outcome", "deny")
+                    })
+                    .map(|metric| metric.get_counter().value())
+                    .sum()
+            })
+            .unwrap_or_default()
+    }
+
+    /// WOR-2595: red first, at the dispatch seam rather than at the
+    /// funnel.
+    ///
+    /// Before this wiring the whole handling of a Responses-shim refusal
+    /// was `warn!` plus `send_error`: no `record_decision`, no audit
+    /// record, and no counter. An MCP-governance-bypass attempt was
+    /// therefore indistinguishable in metrics from a typo'd JSON body,
+    /// both landing on `record_ai_gateway_decision("rejected",
+    /// "client_error")`. This drives a real `POST /v1/responses` through
+    /// `handle_ai_proxy` so it fails if the shim's refusal arm stops
+    /// calling the funnel, not merely if the funnel itself breaks. On
+    /// main the counter family does not exist and the first assertion
+    /// reads 0 against 0.
+    #[tokio::test]
+    async fn responses_mcp_tool_refusal_counts_an_ai_admission_deny() {
+        let config = openai_proxy_config("http://127.0.0.1:9");
+        let request = serde_json::json!({
+            "model": "requested-model",
+            "input": "fixture prompt",
+            "tools": [{
+                "type": "mcp",
+                "server_url": "https://evil.invalid/?token=SECRETTOKEN",
+                "server_label": "internal"
+            }]
+        });
+        let (mut session, client) = downstream_bytes_session(
+            "/v1/responses",
+            "application/json",
+            serde_json::to_vec(&request).expect("request JSON"),
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let before = admission_decisions_count("responses", "tools_mcp_unsupported");
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the MCP tool refusal is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 400"), "{response:?}");
+        assert!(
+            admission_decisions_count("responses", "tools_mcp_unsupported") >= before + 1.0,
+            "the refusal must tick sbproxy_ai_admission_decisions_total\
+             {{surface=\"responses\",reason=\"tools_mcp_unsupported\",outcome=\"deny\"}}"
+        );
+        // The refusal message names the governed alternative and nothing
+        // the caller sent; the URL can carry a credential.
+        let rendered = String::from_utf8_lossy(&response);
+        assert!(
+            !rendered.contains("SECRETTOKEN") && !rendered.contains("server_url"),
+            "the refusal must not echo the caller's MCP server URL: {rendered}"
+        );
+        assert_eq!(
+            context.admin_ai_attempts, 0,
+            "a refused request never reaches a provider"
+        );
+    }
+
+    /// The audit half of the pair above: with `ai.admission` enabled the
+    /// same refusal publishes exactly one typed record, and the record
+    /// carries the bounded surface and reason codes rather than the
+    /// refusal prose.
+    #[tokio::test]
+    async fn responses_mcp_tool_refusal_publishes_ai_admission_when_enabled() {
+        let compiled = sbproxy_config::compile_config(
+            r#"
+proxy:
+  tenants:
+    - id: acme
+  observability:
+    log:
+      decision_audit:
+        enabled: false
+        events:
+          ai.admission: true
+origins:
+  "ai.test":
+    tenant_id: acme
+    action:
+      type: static
+      body: ok
+"#,
+        )
+        .expect("ai.admission fixture config");
+        let pipeline = std::sync::Arc::new(
+            crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+                .expect("ai.admission fixture pipeline"),
+        );
+
+        let config = openai_proxy_config("http://127.0.0.1:9");
+        let request = serde_json::json!({
+            "model": "requested-model",
+            "input": "fixture prompt",
+            "tools": [{
+                "type": "mcp",
+                "server_url": "https://evil.invalid/?token=SECRETTOKEN"
+            }]
+        });
+        let (mut session, client) = downstream_bytes_session(
+            "/v1/responses",
+            "application/json",
+            serde_json::to_vec(&request).expect("request JSON"),
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        context.pipeline = std::sync::Arc::clone(&pipeline);
+        context.origin_idx = Some(0);
+        context.tenant_id = "acme".into();
+        context.request_id = "req-ai-admission".into();
+
+        let (bus, mut rx) = crate::policy_bus::channel(16);
+        crate::policy_bus::init_global_bus(bus);
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            pipeline.as_ref(),
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("the MCP tool refusal is handled");
+        drop(session);
+        let _ = live_downstream_body(client).await;
+
+        let mut ours = Vec::new();
+        while let Ok(record) = rx.try_recv() {
+            if let crate::policy_bus::AuditRecord::Decision(audit) = record {
+                if audit.request_id == "req-ai-admission" {
+                    ours.push(audit);
+                }
+            }
+        }
+        assert_eq!(
+            ours.len(),
+            1,
+            "the refusal returns immediately, so it publishes exactly one record"
+        );
+        let audit = &ours[0];
+        assert_eq!(
+            audit.event,
+            sbproxy_observe::decision::DecisionEvent::AiAdmission
+        );
+        assert_eq!(
+            audit.outcome,
+            sbproxy_observe::decision::DecisionOutcome::Deny
+        );
+        assert_eq!(audit.origin, "ai.test");
+        assert_eq!(audit.tenant, "acme");
+        assert_eq!(audit.details.surface.as_deref(), Some("responses"));
+        assert_eq!(
+            audit.details.verdict.as_deref(),
+            Some("tools_mcp_unsupported")
+        );
+        let rendered = audit.to_ocsf().to_string();
+        assert!(
+            !rendered.contains("SECRETTOKEN") && !rendered.contains("server_url"),
+            "details ship unscrubbed, so the record must carry codes only: {rendered}"
+        );
+    }
+
+    /// The negative case: a request the shim admits with a lossiness
+    /// note must publish no `ai.admission` record at all.
+    ///
+    /// An unsupported non-`mcp` tool block is dropped and counted on
+    /// `sbproxy_ai_translation_dropped_total`, not refused. A guard that
+    /// counted this as an admission denial would report a refusal rate
+    /// that no client ever saw a 400 for.
+    #[tokio::test]
+    async fn an_admitted_lossy_responses_request_publishes_no_ai_admission() {
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture(
+            serde_json::to_vec(&serde_json::json!({
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }]
+            }))
+            .expect("upstream JSON"),
+            "application/json",
+        )
+        .await;
+        let compiled = sbproxy_config::compile_config(
+            r#"
+proxy:
+  observability:
+    log:
+      decision_audit:
+        enabled: true
+origins:
+  "ai.test":
+    action:
+      type: static
+      body: ok
+"#,
+        )
+        .expect("ai.admission negative fixture config");
+        let pipeline = std::sync::Arc::new(
+            crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+                .expect("ai.admission negative fixture pipeline"),
+        );
+
+        let config = openai_proxy_config(&upstream_url);
+        let request = serde_json::json!({
+            "model": "requested-model",
+            "input": "fixture prompt",
+            "tools": [{"type": "web_search_preview"}]
+        });
+        let (mut session, client) = downstream_bytes_session(
+            "/v1/responses",
+            "application/json",
+            serde_json::to_vec(&request).expect("request JSON"),
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        context.pipeline = std::sync::Arc::clone(&pipeline);
+        context.origin_idx = Some(0);
+        context.request_id = "req-ai-admission-lossy".into();
+
+        let (bus, mut rx) = crate::policy_bus::channel(16);
+        crate::policy_bus::init_global_bus(bus);
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            pipeline.as_ref(),
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("the lossy request is admitted");
+        drop(session);
+        let _ = live_downstream_body(client).await;
+
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            1,
+            "the request was admitted, so it reached the provider"
+        );
+        while let Ok(record) = rx.try_recv() {
+            if let crate::policy_bus::AuditRecord::Decision(audit) = record {
+                assert!(
+                    !(audit.request_id == "req-ai-admission-lossy"
+                        && audit.event == sbproxy_observe::decision::DecisionEvent::AiAdmission),
+                    "a dropped-with-a-note field is lossiness, not an admission denial"
+                );
+            }
+        }
+    }
+
+    // --- Named model groups through the live dispatch path (WOR-2657) ---
+
+    /// The wiring test the resolver's own unit tests cannot be: a real
+    /// request through `handle_ai_proxy`, asserting on the bytes the
+    /// provider received. Coverage of `resolve_model_group` proves the
+    /// pick; only this proves the pick is applied to the request that
+    /// leaves the gateway.
+    #[tokio::test]
+    async fn a_group_name_is_rewritten_before_the_request_leaves_the_gateway() {
+        let (upstream_url, hits, captured) = capturing_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        )
+        .await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "deployment-a",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "models": ["deployment-model-id"]
+            }],
+            "model_groups": [{
+                "name": "chat-pool",
+                "members": [{"provider": "deployment-a", "model": "deployment-model-id"}]
+            }]
+        }))
+        .expect("model group dispatch config");
+        let request = serde_json::json!({
+            "model": "chat-pool",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        });
+        let (mut session, client) = downstream_session(request).await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("a group request dispatches");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let upstream_request = captured.await.expect("capturing upstream task");
+        let request_text = String::from_utf8(upstream_request).expect("upstream request UTF-8");
+        let body = request_text
+            .split_once("\r\n\r\n")
+            .expect("upstream request body")
+            .1;
+        let body: serde_json::Value = serde_json::from_str(body).expect("upstream JSON body");
+        assert_eq!(
+            body["model"], "deployment-model-id",
+            "the group name must never reach a provider: {body}"
+        );
+        assert_eq!(
+            context.ai_route_reason.as_deref(),
+            Some("model_group: chat-pool -> deployment-a/deployment-model-id"),
+            "the admin row has to name the member that served the request"
+        );
+    }
+
+    /// The group validator has to run where an operator can see it.
+    /// `compile_config` parses the action body without building its
+    /// handler, so a config test there proves only that the key is
+    /// accepted; the refusal lands when the action compiles, which is
+    /// what `sbproxy validate` and boot both do.
+    #[test]
+    fn a_group_two_members_on_one_provider_is_refused_at_pipeline_build() {
+        let compiled = sbproxy_config::compile_config(
+            r#"
+origins:
+  "ai.test":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: dummy
+          models: [gpt-4o-mini, gpt-4o]
+      model_groups:
+        - name: pool
+          members:
+            - provider: openai
+              model: gpt-4o-mini
+            - provider: openai
+              model: gpt-4o
+"#,
+        )
+        .expect("the key parses; the validator runs a layer up");
+        let error = crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+            .err()
+            .expect("two members on one provider is refused when the action compiles");
+        let message = error.to_string();
+        assert!(
+            message.contains("already a member of this group"),
+            "the refusal must name the validator's reason: {message}"
+        );
+    }
+
+    /// A group with no eligible member refuses, and the refusal is
+    /// visible to the pipeline operators actually watch: an
+    /// `ai.admission` decision record carrying the bounded code, not
+    /// only a status line on the wire.
+    #[tokio::test]
+    async fn an_unservable_group_refuses_and_publishes_an_admission_record() {
+        let compiled = sbproxy_config::compile_config(
+            r#"
+proxy:
+  observability:
+    log:
+      decision_audit:
+        enabled: true
+origins:
+  "ai.test":
+    action:
+      type: static
+      body: ok
+"#,
+        )
+        .expect("model group refusal fixture config");
+        let pipeline = std::sync::Arc::new(
+            crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+                .expect("model group refusal fixture pipeline"),
+        );
+        // The group's only member is switched off while a second,
+        // non-member provider stays up, so a fallthrough would have had
+        // somewhere to go and the refusal is the group's own decision
+        // rather than an empty origin.
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "parked", "provider_type": "openai", "api_key": "k",
+                 "enabled": false, "base_url": "http://127.0.0.1:9",
+                 "allow_private_base_url": true, "models": ["parked-model"]},
+                {"name": "live", "provider_type": "openai", "api_key": "k",
+                 "base_url": "http://127.0.0.1:9", "allow_private_base_url": true,
+                 "models": ["live-model"]}
+            ],
+            "model_groups": [{
+                "name": "chat-pool",
+                "members": [{"provider": "parked", "model": "parked-model"}]
+            }]
+        }))
+        .expect("model group refusal config");
+        let request = serde_json::json!({
+            "model": "chat-pool",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        });
+        let (mut session, client) = downstream_session(request).await;
+        let mut context = crate::context::RequestContext::new();
+        context.pipeline = std::sync::Arc::clone(&pipeline);
+        context.origin_idx = Some(0);
+        context.tenant_id = "acme".into();
+        context.request_id = "req-model-group-refusal".into();
+
+        let (bus, mut rx) = crate::policy_bus::channel(16);
+        crate::policy_bus::init_global_bus(bus);
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            pipeline.as_ref(),
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("the group refusal is handled");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(response.starts_with(b"HTTP/1.1 503"), "{response:?}");
+
+        let mut ours = Vec::new();
+        while let Ok(record) = rx.try_recv() {
+            if let crate::policy_bus::AuditRecord::Decision(audit) = record {
+                if audit.request_id == "req-model-group-refusal" {
+                    ours.push(audit);
+                }
+            }
+        }
+        assert_eq!(ours.len(), 1, "the refusal publishes exactly one record");
+        assert_eq!(
+            ours[0].event,
+            sbproxy_observe::decision::DecisionEvent::AiAdmission
+        );
+        assert_eq!(
+            ours[0].outcome,
+            sbproxy_observe::decision::DecisionOutcome::Deny
+        );
+        assert_eq!(
+            ours[0].details.verdict.as_deref(),
+            Some("model_group_no_member")
+        );
+    }
+
+    // --- Pre-header streaming budget ---
+
+    /// An upstream that accepts a connection, reads the whole request,
+    /// and then never answers. The socket stays open, so nothing on the
+    /// upstream side can end the attempt: only a gateway-side budget can.
+    async fn wedged_upstream_fixture() -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind wedged upstream");
+        let address = listener.local_addr().expect("wedged upstream address");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&hits);
+        tokio::spawn(async move {
+            // Held rather than dropped. A dropped `TcpStream` sends FIN,
+            // which reqwest reports as a connection error, and the test
+            // would then pass on the wrong mechanism.
+            let mut held = Vec::new();
+            loop {
+                match listener.accept().await {
+                    Ok((mut stream, _)) => {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        drain_upstream_request(&mut stream).await;
+                        held.push(stream);
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        (format!("http://{address}/v1"), hits)
+    }
+
+    /// An upstream that commits to a stream (`200 text/event-stream`),
+    /// writes one chunked SSE frame, and then drops the connection
+    /// without the terminating zero-length chunk. The client-side body
+    /// therefore ends in a transport error rather than at its natural
+    /// end, which is the post-commit failure this counter exists for.
+    async fn truncated_stream_upstream_fixture() -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind truncated stream upstream");
+        let address = listener
+            .local_addr()
+            .expect("truncated stream upstream address");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&hits);
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept upstream request");
+            observed.fetch_add(1, Ordering::SeqCst);
+            drain_upstream_request(&mut stream).await;
+            let frame = concat!(
+                "data: {\"id\":\"chatcmpl-truncated\",\"object\":\"chat.completion.chunk\",",
+                "\"created\":1,\"model\":\"requested-model\",\"choices\":[{\"index\":0,",
+                "\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                 transfer-encoding: chunked\r\n\r\n{:x}\r\n{}\r\n",
+                frame.len(),
+                frame
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write committed stream prefix");
+            stream.flush().await.expect("flush committed stream prefix");
+            // No `0\r\n\r\n`: the body is cut mid-stream.
+            drop(stream);
+        });
+        (format!("http://{address}/v1"), hits)
+    }
+
+    /// A wedged primary and a working SSE secondary, with the
+    /// primary's whole-call `timeout_ms` deliberately far above the
+    /// pre-header budget so the two budgets are distinguishable by the
+    /// clock alone.
+    fn pre_header_timeout_config(
+        wedged_url: &str,
+        stream_url: &str,
+        pre_header_timeout_ms: Option<u64>,
+        wedged_timeout_ms: u64,
+    ) -> sbproxy_ai::AiHandlerConfig {
+        let mut action = serde_json::json!({
+            "providers": [
+                {
+                    "name": "primary",
+                    "provider_type": "openai",
+                    "base_url": wedged_url,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key",
+                    "priority": 1,
+                    "timeout_ms": wedged_timeout_ms
+                },
+                {
+                    "name": "secondary",
+                    "provider_type": "openai",
+                    "base_url": stream_url,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key",
+                    "priority": 2
+                }
+            ],
+            "routing": {"strategy": "fallback_chain"}
+        });
+        if let Some(budget) = pre_header_timeout_ms {
+            action["resilience"] = serde_json::json!({"pre_header_timeout_ms": budget});
+        }
+        sbproxy_ai::AiHandlerConfig::from_config(action).expect("pre-header timeout config")
+    }
+
+    /// Serializes the two tests that read
+    /// `sbproxy_ai_failovers_total{reason="transport"}`.
+    ///
+    /// `prometheus::gather()` reads a process-global registry.
+    /// `a_pre_header_timeout_is_labeled_as_such` asserts that the
+    /// `transport` series did *not* move, and
+    /// `a_non_streaming_request_is_not_bounded_by_the_pre_header_budget`
+    /// moves it. nextest gives each test its own process and would hide
+    /// that, but `cargo test` runs both on threads in one process, where
+    /// the pair interleaves and the equality assertion fails for a
+    /// reason that has nothing to do with the code under test.
+    static FAILOVER_REASON_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// One `sbproxy_ai_failovers_total` series, or 0 when nothing has
+    /// created it yet.
+    ///
+    /// Callers assert a strict increase rather than an exact value
+    /// wherever a sibling could also move the series; the one place that
+    /// needs an exact value takes [`FAILOVER_REASON_LOCK`] instead.
+    fn failovers_count(reason: &str) -> f64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "sbproxy_ai_failovers_total")
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        metric
+                            .get_label()
+                            .iter()
+                            .any(|label| label.name() == "reason" && label.value() == reason)
+                    })
+                    .map(|metric| metric.get_counter().value())
+                    .sum()
+            })
+            .unwrap_or_default()
+    }
+
+    /// One `sbproxy_ai_stream_post_commit_failures_total` series, or 0
+    /// when nothing has created it yet. Same process-global caveat as
+    /// [`failovers_count`].
+    fn stream_post_commit_failures_count(provider: &str, cause: &str) -> f64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "sbproxy_ai_stream_post_commit_failures_total")
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        let labelled = |name: &str, want: &str| {
+                            metric
+                                .get_label()
+                                .iter()
+                                .any(|label| label.name() == name && label.value() == want)
+                        };
+                        labelled("provider", provider) && labelled("cause", cause)
+                    })
+                    .map(|metric| metric.get_counter().value())
+                    .sum()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The seam: the `tokio::time::timeout` wrapped around the dispatch
+    /// loop's attempt binding.
+    ///
+    /// The wedged provider's own `timeout_ms` is 5000, so without the
+    /// pre-header budget the failover cannot happen for five seconds
+    /// (and without any `timeout_ms` at all it would be the client
+    /// default's thirty). With a 200ms budget the handover is inside the
+    /// bound asserted here.
+    #[tokio::test]
+    async fn a_wedged_provider_fails_over_before_the_client_timeout() {
+        let (wedged_url, wedged_hits) = wedged_upstream_fixture().await;
+        let (stream_url, stream_hits) =
+            upstream_bytes_fixture(openai_tool_call_stream(), "text/event-stream").await;
+        let config = pre_header_timeout_config(&wedged_url, &stream_url, Some(200), 5_000);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let started = std::time::Instant::now();
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the wedged candidate is abandoned and the next one serves");
+        let elapsed = started.elapsed();
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(wedged_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            stream_hits.load(Ordering::SeqCst),
+            1,
+            "the second candidate serves the stream"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the pre-header budget, not the provider's whole-call timeout_ms, \
+             has to end the wedged attempt; took {elapsed:?}"
+        );
+    }
+
+    /// The seam: the failover reason at the dispatch loop's `Err` arm.
+    /// Every timeout was labeled `transport` before, which put a wedged
+    /// provider on the same series as a refused connection.
+    #[tokio::test]
+    async fn a_pre_header_timeout_is_labeled_as_such() {
+        // Held for the whole test: the `transport` assertion below is an
+        // equality on a process-global counter a sibling also writes.
+        let _serialized = FAILOVER_REASON_LOCK.lock().await;
+        let (wedged_url, _wedged_hits) = wedged_upstream_fixture().await;
+        let (stream_url, _stream_hits) =
+            upstream_bytes_fixture(openai_tool_call_stream(), "text/event-stream").await;
+        let config = pre_header_timeout_config(&wedged_url, &stream_url, Some(200), 5_000);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let labeled_before = failovers_count("pre_header_timeout");
+        let transport_before = failovers_count("transport");
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the wedged candidate is abandoned and the next one serves");
+        drop(session);
+        let _ = live_downstream_body(client).await;
+
+        assert!(
+            failovers_count("pre_header_timeout") > labeled_before,
+            "a handover taken on the pre-header budget carries its own reason"
+        );
+        assert_eq!(
+            failovers_count("transport"),
+            transport_before,
+            "and it is not also counted as a generic transport failure"
+        );
+    }
+
+    /// The seam: the `is_stream` gate on the budget.
+    ///
+    /// A buffered request has no commit point to protect and no partial
+    /// output to lose, so the pre-header budget must not touch it. The
+    /// assertion is a floor rather than a ceiling on purpose: the
+    /// wedged provider's own 800ms `timeout_ms` is what ends this
+    /// attempt, and a budget applied to a non-streaming request would
+    /// end it four times sooner.
+    #[tokio::test]
+    async fn a_non_streaming_request_is_not_bounded_by_the_pre_header_budget() {
+        // This failover writes `reason="transport"`, which the sibling
+        // above asserts did not move. Same lock, opposite side.
+        let _serialized = FAILOVER_REASON_LOCK.lock().await;
+        let (wedged_url, wedged_hits) = wedged_upstream_fixture().await;
+        let (json_url, json_hits) =
+            upstream_bytes_fixture(canonical_chat_response("buffered"), "application/json").await;
+        let config = pre_header_timeout_config(&wedged_url, &json_url, Some(200), 800);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let started = std::time::Instant::now();
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the buffered request still fails over on the provider timeout");
+        let elapsed = started.elapsed();
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(wedged_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(json_hits.load(Ordering::SeqCst), 1);
+        assert!(
+            elapsed >= Duration::from_millis(500),
+            "a non-streaming request keeps waiting out providers[].timeout_ms; \
+             a 200ms pre-header budget must not reach it, but this took {elapsed:?}"
+        );
+    }
+
+    /// The seam: `upstream_response_is_successful_stream` as the commit
+    /// point, and the post-commit counter that reports what happens
+    /// past it.
+    ///
+    /// The no-failover half of this passes on main with no change: the
+    /// dispatch loop has already closed by the time the relay is called,
+    /// so a candidate switch is structurally impossible and this is a
+    /// regression lock rather than evidence of new behavior. The counter
+    /// half is what is new.
+    ///
+    /// The budget is deliberately generous. This test needs it set (so a
+    /// budget that leaked past the commit point would show up) but never
+    /// needs it to fire, and a 200ms budget would turn a loaded build
+    /// machine into a failover to the second provider and a red test
+    /// about nothing.
+    #[tokio::test]
+    async fn a_stall_after_upstream_headers_does_not_fail_over() {
+        let (truncated_url, truncated_hits) = truncated_stream_upstream_fixture().await;
+        let (stream_url, stream_hits) =
+            upstream_bytes_fixture(openai_tool_call_stream(), "text/event-stream").await;
+        let config = pre_header_timeout_config(&truncated_url, &stream_url, Some(5_000), 30_000);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let failures_before = stream_post_commit_failures_count("primary", "upstream_error");
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("a committed stream that dies is relayed as far as it got");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "the commit already put stream headers on the wire: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(truncated_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            stream_hits.load(Ordering::SeqCst),
+            0,
+            "no candidate switch is possible once the response was accepted as a stream"
+        );
+        assert!(
+            stream_post_commit_failures_count("primary", "upstream_error") > failures_before,
+            "the failure past the commit point is counted where an operator can see it"
+        );
+    }
+
+    // --- Per-request timeout override ---
+
+    /// An upstream that accepts, reads the whole request, waits
+    /// `delay_ms`, and only then answers 200. The one way this request
+    /// completes is if something raised the transport budget above
+    /// `delay_ms`.
+    async fn upstream_slow_fixture(delay_ms: u64, body: Vec<u8>) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind slow upstream");
+        let address = listener.local_addr().expect("slow upstream address");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&hits);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                observed.fetch_add(1, Ordering::SeqCst);
+                let body = body.clone();
+                tokio::spawn(async move {
+                    drain_upstream_request(&mut stream).await;
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                });
+            }
+        });
+        (format!("http://{address}/v1"), hits)
+    }
+
+    /// One provider on a 100ms whole-call budget, with the origin's
+    /// caller-override flag and ceiling under test.
+    fn request_timeout_override_config(
+        upstream_url: &str,
+        allow_override: bool,
+        ceiling_ms: Option<u64>,
+    ) -> sbproxy_ai::AiHandlerConfig {
+        let mut action = serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "timeout_ms": 100
+            }],
+            "allow_request_timeout_override": allow_override
+        });
+        if let Some(ceiling) = ceiling_ms {
+            action["max_request_timeout_ms"] = serde_json::json!(ceiling);
+        }
+        sbproxy_ai::AiHandlerConfig::from_config(action).expect("timeout override config")
+    }
+
+    /// One `sbproxy_ai_request_timeout_override_total` series, or 0 when
+    /// nothing has created it yet. Same process-global caveat as
+    /// [`failovers_count`].
+    fn request_timeout_override_count(outcome: &str) -> f64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "sbproxy_ai_request_timeout_override_total")
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        metric
+                            .get_label()
+                            .iter()
+                            .any(|label| label.name() == "outcome" && label.value() == outcome)
+                    })
+                    .map(|metric| metric.get_counter().value())
+                    .sum()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The seam: `apply_provider_timeout` reading the client's honored
+    /// override instead of the provider's `timeout_ms`.
+    ///
+    /// This is the test that proves the override reaches
+    /// `reqwest::Request::timeout_mut`, not just the config struct. The
+    /// upstream sleeps four times the provider budget, so a 200 is only
+    /// possible if the header replaced it.
+    #[tokio::test]
+    async fn an_honored_timeout_header_outlives_the_provider_timeout() {
+        let (upstream_url, upstream_hits) =
+            upstream_slow_fixture(400, canonical_chat_response("slow but fine")).await;
+        let config = request_timeout_override_config(&upstream_url, true, Some(5_000));
+        let (mut session, client) = downstream_method_bytes_session_with_headers(
+            "POST",
+            "/v1/chat/completions",
+            "application/json",
+            serde_json::to_vec(&serde_json::json!({
+                "model": "requested-model",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }))
+            .expect("request JSON"),
+            &[("x-sbproxy-timeout-ms", "3000")],
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let applied_before = request_timeout_override_count("applied");
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the honored budget carries the request");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert!(
+            request_timeout_override_count("applied") > applied_before,
+            "an honored override is counted"
+        );
+    }
+
+    /// The seam: the `allow_override` gate inside
+    /// `effective_request_timeout`, end to end.
+    ///
+    /// Identical request and identical upstream, minus the operator
+    /// opt-in. The header is dropped rather than refused, the provider's
+    /// own 100ms budget kills the attempt, and the drop is visible on the
+    /// metric, which is the whole point of counting an ignore.
+    #[tokio::test]
+    async fn the_same_request_fails_with_the_flag_off() {
+        let (upstream_url, upstream_hits) =
+            upstream_slow_fixture(400, canonical_chat_response("never reaches the caller")).await;
+        let config = request_timeout_override_config(&upstream_url, false, None);
+        let (mut session, client) = downstream_method_bytes_session_with_headers(
+            "POST",
+            "/v1/chat/completions",
+            "application/json",
+            serde_json::to_vec(&serde_json::json!({
+                "model": "requested-model",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }))
+            .expect("request JSON"),
+            &[("x-sbproxy-timeout-ms", "3000")],
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let ignored_before = request_timeout_override_count("ignored_override_disabled");
+        let result = super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await;
+        drop(session);
+        let mut client = client;
+        client.abort_and_wait().await;
+
+        // Every candidate having failed at the transport level is the one
+        // outcome the dispatcher hands back to pingora rather than
+        // answering itself, so there is no downstream body to read here.
+        assert!(
+            result.is_err(),
+            "the provider's own 100ms timeout_ms still ends the attempt"
+        );
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            1,
+            "the header is ignored, not refused, so the request still dispatches"
+        );
+        assert_eq!(
+            request_timeout_override_count("ignored_override_disabled"),
+            ignored_before + 1.0,
+            "ignoring a caller's header has to be visible somewhere an operator can find"
+        );
+    }
+
+    /// The seam: the over-ceiling branch, refusing rather than clamping.
+    /// A caller who asked for 60s and silently got 5s builds a retry
+    /// schedule on a budget it never had.
+    #[tokio::test]
+    async fn a_timeout_header_over_the_ceiling_refuses_with_400() {
+        let (upstream_url, upstream_hits) =
+            upstream_slow_fixture(0, canonical_chat_response("never dispatched")).await;
+        let config = request_timeout_override_config(&upstream_url, true, Some(5_000));
+        let (mut session, client) = downstream_method_bytes_session_with_headers(
+            "POST",
+            "/v1/chat/completions",
+            "application/json",
+            serde_json::to_vec(&serde_json::json!({
+                "model": "requested-model",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }))
+            .expect("request JSON"),
+            &[("x-sbproxy-timeout-ms", "60000")],
+        )
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        let refused_before = request_timeout_override_count("over_ceiling");
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("the refusal is answered");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        let text = String::from_utf8_lossy(&response).to_string();
+        assert!(text.starts_with("HTTP/1.1 400"), "{text}");
+        assert!(text.contains("invalid_request_timeout"), "{text}");
+        assert!(
+            text.contains("5000"),
+            "the refusal names the accepted range so the caller can correct in one trip: {text}"
+        );
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            0,
+            "the refusal precedes any upstream call"
+        );
+        assert_eq!(
+            request_timeout_override_count("over_ceiling"),
+            refused_before + 1.0
+        );
+        assert!(
+            context
+                .policy_decisions
+                .iter()
+                .any(|decision| decision == "request_timeout:deny"),
+            "the refusal reaches the admin decision row: {:?}",
+            context.policy_decisions
+        );
+    }
 }
 
 #[cfg(test)]
@@ -21579,6 +25155,22 @@ fn ai_management_response(
 /// `/model_group/info`, and the `/health[/readiness|/liveliness|/liveness]`
 /// aliases. Returns `None` for any other path so the caller falls through to
 /// normal handling.
+///
+/// WOR-2647: the two model surfaces carry the same `capabilities` array
+/// `/v1/models` does, from the same
+/// [`sbproxy_ai::api_routes::surface_capability_names`]. Three places
+/// that publish per-model facts and derive them three ways is how one of
+/// them goes stale; one derivation is what keeps a listing from
+/// advertising a surface the request path refuses.
+///
+/// A `/model_group/info` group is the union across its deployments,
+/// matching the 501 gate, which admits a surface when any eligible
+/// provider handles it. Each deployment's array is already a subset of
+/// that gate, so the union is too.
+/// `model_group_info_unions_capabilities_across_deployments` pins the
+/// union against last-wins with two entries whose arrays are disjoint;
+/// a fixture of two openai deployments cannot, because both operands
+/// are equal.
 fn ai_management_response_with_policy(
     path: &str,
     config: &sbproxy_ai::handler::AiHandlerConfig,
@@ -21608,6 +25200,7 @@ fn ai_management_response_with_policy(
                     .provider_type
                     .clone()
                     .unwrap_or_else(|| p.name.to_string());
+                let capabilities = sbproxy_ai::api_routes::surface_capability_names(p);
                 for m in p
                     .models
                     .iter()
@@ -21616,40 +25209,97 @@ fn ai_management_response_with_policy(
                     data.push(serde_json::json!({
                         "model_name": m.as_str(),
                         "litellm_provider": provider,
+                        "capabilities": &capabilities,
                     }));
                 }
             }
             Some(serde_json::json!({ "data": data }))
         }
         "/model_group/info" => {
-            use std::collections::BTreeMap;
-            let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            use std::collections::{BTreeMap, BTreeSet};
+            type Group = (Vec<String>, BTreeSet<&'static str>);
+            let mut groups: BTreeMap<String, Group> = BTreeMap::new();
             for p in config
                 .providers
                 .iter()
                 .filter(|provider| provider_allowed(provider))
             {
+                let capabilities = sbproxy_ai::api_routes::surface_capability_names(p);
                 for m in p
                     .models
                     .iter()
                     .filter(|model| model_allowed(model.as_str()))
                 {
-                    groups
-                        .entry(m.as_str().to_string())
-                        .or_default()
-                        .push(p.name.to_string());
+                    let group = groups.entry(m.as_str().to_string()).or_default();
+                    group.0.push(p.name.to_string());
+                    group.1.extend(capabilities.iter().copied());
                 }
             }
-            let data: Vec<_> = groups
+            let mut data: Vec<_> = groups
                 .into_iter()
-                .map(|(model_group, providers)| {
+                .map(|(model_group, (providers, capabilities))| {
                     serde_json::json!({
                         "model_group": model_group,
                         "num_deployments": providers.len(),
                         "providers": providers,
+                        "capabilities": capabilities,
                     })
                 })
                 .collect();
+            // WOR-2657: a configured `model_groups:` entry is a real
+            // group and the derived scan above cannot see it, because a
+            // group name is deliberately absent from every provider's
+            // `models:` list. A LiteLLM client that reads this endpoint
+            // to discover what it may address would otherwise never
+            // learn the one name the operator actually published.
+            //
+            // These entries carry `members`, which the derived ones
+            // cannot: a derived group is several providers behind one
+            // model id, so there is nothing per-deployment to say. A
+            // named group's members each carry their own upstream model
+            // id and weight.
+            for group in config.model_group_registry().groups() {
+                let mut providers = Vec::new();
+                let mut members = Vec::new();
+                let mut capabilities = BTreeSet::new();
+                for member in &group.members {
+                    let Some(entry) = config
+                        .providers
+                        .iter()
+                        .find(|provider| provider.name.as_str() == member.provider.as_str())
+                    else {
+                        continue;
+                    };
+                    if !provider_allowed(entry) || !model_allowed(member.model.as_str()) {
+                        continue;
+                    }
+                    providers.push(entry.name.to_string());
+                    members.push(serde_json::json!({
+                        "provider": entry.name.as_str(),
+                        "model": member.model.as_str(),
+                        "weight": member.weight,
+                    }));
+                    capabilities.extend(
+                        sbproxy_ai::api_routes::surface_capability_names(entry)
+                            .iter()
+                            .copied(),
+                    );
+                }
+                // Every member filtered out by this credential's policy
+                // means the group is unusable for this caller, so listing
+                // it would advertise a name that answers 503.
+                if members.is_empty() {
+                    continue;
+                }
+                data.push(serde_json::json!({
+                    "model_group": group.name.as_str(),
+                    "num_deployments": members.len(),
+                    "providers": providers,
+                    "capabilities": capabilities,
+                    "members": members,
+                    "routing": group.routing_name(),
+                }));
+            }
             Some(serde_json::json!({ "data": data }))
         }
         // LiteLLM spells one of these "liveliness"; accept both spellings.
@@ -22084,6 +25734,245 @@ mod model_routing_tests {
         .expect("AiHandlerConfig fixture")
     }
 
+    // --- Named model groups (WOR-2657) ---
+
+    /// An origin with two providers serving *different* upstream model
+    /// ids behind one group name. The mixed ids are the point: it is
+    /// what a same-model-name pool cannot express.
+    fn group_config(routing: &str, blocked: &[&str]) -> sbproxy_ai::handler::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "openai-a", "api_key": "k", "provider_type": "openai",
+                 "models": ["gpt-4o-mini"]},
+                {"name": "azure-b", "api_key": "k", "provider_type": "openai",
+                 "models": ["gpt-4o-mini-deployment"]}
+            ],
+            "blocked_models": blocked,
+            "model_groups": [{
+                "name": "pool",
+                "routing": routing,
+                "members": [
+                    {"provider": "openai-a", "model": "gpt-4o-mini", "weight": 9},
+                    {"provider": "azure-b", "model": "gpt-4o-mini-deployment", "weight": 1}
+                ]
+            }]
+        }))
+        .expect("group fixture")
+    }
+
+    #[test]
+    fn a_group_member_serves_its_own_model_id_and_pins_its_provider() {
+        // The seam: the group name never reaches the wire. What replaces
+        // it is the picked member's upstream id, and the pin is the same
+        // one an alias sets, so `retain_alias_pinned_providers` narrows
+        // the order to that member downstream.
+        let config = group_config("round_robin", &[]);
+        let router = config.router();
+        let pick = super::resolve_model_group(&config, &router, &[], &[], "pool")
+            .expect("pool is a group")
+            .expect("a member is eligible");
+        assert_eq!(pick.group, "pool");
+        assert_eq!(pick.provider, "openai-a");
+        assert_eq!(pick.model, "gpt-4o-mini");
+
+        let next = super::resolve_model_group(&config, &router, &[], &[], "pool")
+            .expect("pool is a group")
+            .expect("a member is eligible");
+        assert_eq!(next.provider, "azure-b");
+        assert_eq!(
+            next.model, "gpt-4o-mini-deployment",
+            "the second member serves a different upstream id, which is what a group is for"
+        );
+    }
+
+    #[test]
+    fn a_literal_model_name_is_not_a_group() {
+        let config = group_config("round_robin", &[]);
+        let router = config.router();
+        assert!(super::resolve_model_group(&config, &router, &[], &[], "gpt-4o-mini").is_none());
+        assert!(super::resolve_model_group(&config, &router, &[], &[], "").is_none());
+    }
+
+    #[test]
+    fn resolving_a_group_rewrites_both_the_model_and_the_body() {
+        // Both representations move together, so the id the upstream
+        // sees, the one the budget prices, and the one the cache keys are
+        // the same. A rewrite of only `model` would leave the body's
+        // `"model": "pool"` on the wire.
+        let config = group_config("round_robin", &[]);
+        let router = config.router();
+        let mut model = "pool".to_string();
+        let mut body = serde_json::json!({"model": "pool", "messages": []});
+        let pick =
+            super::resolve_body_model_group(&config, &router, &[], &[], &mut model, &mut body)
+                .expect("pool is a group")
+                .expect("a member is eligible");
+        assert_eq!(model, pick.model);
+        assert_eq!(body["model"], serde_json::Value::String(pick.model.clone()));
+        assert_ne!(model, "pool");
+    }
+
+    #[test]
+    fn a_group_resolves_before_the_model_allowlist_sees_the_name() {
+        // The security seam. `blocked_models: [gpt-4o-mini]` names a
+        // member's upstream id, not the group name, and the group name
+        // is not blocked. Because the group resolves first, the gate
+        // below it judges `gpt-4o-mini` and refuses. Resolving late
+        // would have handed the gate the string `pool`, which passes.
+        let config = group_config("round_robin", &["gpt-4o-mini"]);
+        assert!(
+            config.is_model_allowed("pool"),
+            "the group name itself is not blocked, so the gate can only bite on the member"
+        );
+        let router = config.router();
+        let pick = super::resolve_model_group(&config, &router, &[], &[], "pool")
+            .expect("pool is a group")
+            .expect("a member is eligible");
+        assert_eq!(pick.model, "gpt-4o-mini");
+        assert!(
+            !config.is_model_allowed(&pick.model),
+            "the gate that runs after resolution sees the member's real id and refuses it"
+        );
+    }
+
+    #[test]
+    fn a_group_pick_skips_a_member_whose_breaker_is_open() {
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "openai-a", "api_key": "k", "provider_type": "openai",
+                 "models": ["gpt-4o-mini"]},
+                {"name": "azure-b", "api_key": "k", "provider_type": "openai",
+                 "models": ["gpt-4o-mini-deployment"]}
+            ],
+            "resilience": {"circuit_breaker": {"failure_threshold": 1, "open_duration_secs": 60}},
+            "model_groups": [{
+                "name": "pool",
+                "routing": "round_robin",
+                "members": [
+                    {"provider": "openai-a", "model": "gpt-4o-mini"},
+                    {"provider": "azure-b", "model": "gpt-4o-mini-deployment"}
+                ]
+            }]
+        }))
+        .expect("group fixture with a breaker");
+        let router = config.router();
+        // Trip openai-a's breaker.
+        router.record_provider_failure(0, "openai-a");
+        assert!(
+            router.provider_runtime_states()[0].circuit_open,
+            "the fixture must actually open the breaker, or this test proves nothing"
+        );
+
+        for _ in 0..4 {
+            let pick = super::resolve_model_group(&config, &router, &[], &[], "pool")
+                .expect("pool is a group")
+                .expect("the healthy member is eligible");
+            assert_eq!(
+                pick.provider, "azure-b",
+                "an open breaker must move group traffic to the sibling member"
+            );
+        }
+    }
+
+    #[test]
+    fn a_group_whose_members_the_credential_forbids_refuses_rather_than_routes() {
+        // Falling through to some other provider would dispatch a model
+        // id nobody declared, so the honest answer is a refusal. It is
+        // a permanent decision about this caller, so it answers 403 like
+        // every other credential refusal on this path; 503 would tell a
+        // client with retry logic to come back and be refused again.
+        let config = group_config("round_robin", &[]);
+        let router = config.router();
+        let blocked = vec!["openai-a".to_string(), "azure-b".to_string()];
+        let outcome = super::resolve_model_group(&config, &router, &[], &blocked, "pool")
+            .expect("pool is still a group");
+        assert_eq!(
+            outcome,
+            Err(super::ModelGroupRefusal::CredentialForbidsEveryMember)
+        );
+        assert_eq!(
+            super::ModelGroupRefusal::CredentialForbidsEveryMember.status(),
+            403
+        );
+    }
+
+    #[test]
+    fn a_group_whose_members_are_all_disabled_is_unavailable_not_forbidden() {
+        // The operator switched the deployments off, which is a
+        // retryable condition and not a statement about this caller, so
+        // the two refusals must not collapse into one status.
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "openai-a", "api_key": "k", "provider_type": "openai",
+                 "enabled": false, "models": ["gpt-4o-mini"]},
+                {"name": "azure-b", "api_key": "k", "provider_type": "openai",
+                 "enabled": false, "models": ["gpt-4o-mini-deployment"]}
+            ],
+            "model_groups": [{
+                "name": "pool",
+                "members": [
+                    {"provider": "openai-a", "model": "gpt-4o-mini"},
+                    {"provider": "azure-b", "model": "gpt-4o-mini-deployment"}
+                ]
+            }]
+        }))
+        .expect("group fixture with disabled providers");
+        let router = config.router();
+        let outcome = super::resolve_model_group(&config, &router, &[], &[], "pool")
+            .expect("pool is still a group");
+        assert_eq!(outcome, Err(super::ModelGroupRefusal::NoMemberAvailable));
+        assert_eq!(super::ModelGroupRefusal::NoMemberAvailable.status(), 503);
+    }
+
+    #[test]
+    fn model_group_info_reports_a_configured_group_with_its_members() {
+        // Red on main: the endpoint derives groups by scanning
+        // `providers[].models`, and a group name appears in no such
+        // list, so the one name the operator published was invisible to
+        // every LiteLLM client.
+        let config = group_config("weighted", &[]);
+        let resp = super::ai_management_response("/model_group/info", &config).unwrap();
+        let groups = resp["data"].as_array().unwrap();
+        let pool = groups
+            .iter()
+            .find(|group| group["model_group"] == "pool")
+            .expect("the configured group is listed");
+        assert_eq!(pool["num_deployments"], 2);
+        assert_eq!(pool["routing"], "weighted");
+        assert_eq!(
+            pool["members"],
+            serde_json::json!([
+                {"provider": "openai-a", "model": "gpt-4o-mini", "weight": 9},
+                {"provider": "azure-b", "model": "gpt-4o-mini-deployment", "weight": 1}
+            ])
+        );
+        // The derived per-model groups are still there beside it.
+        assert!(groups
+            .iter()
+            .any(|group| group["model_group"] == "gpt-4o-mini"));
+    }
+
+    #[test]
+    fn model_group_info_drops_a_group_whose_every_member_the_policy_refuses() {
+        // Listing it would advertise a name that answers 503.
+        let config = group_config("round_robin", &[]);
+        let blocked_providers = vec!["openai-a".to_string(), "azure-b".to_string()];
+        let resp = super::ai_management_response_with_policy(
+            "/model_group/info",
+            &config,
+            &[],
+            &blocked_providers,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(!resp["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|group| group["model_group"] == "pool"));
+    }
+
     #[test]
     fn model_group_info_groups_deployments_by_public_name() {
         let cfg = handler_config_two_deployments();
@@ -22127,7 +26016,11 @@ mod model_routing_tests {
             resp["data"],
             serde_json::json!([{
                 "model_name": "claude-haiku-4-5",
-                "litellm_provider": "anthropic"
+                "litellm_provider": "anthropic",
+                // WOR-2647: the same array `/v1/models` publishes, from
+                // the surface matrix the dispatch path enforces. No
+                // `embeddings`: anthropic's non-universal surfaces 501.
+                "capabilities": ["chat_completions", "messages", "responses", "streaming"]
             }])
         );
     }
@@ -22155,7 +26048,54 @@ mod model_routing_tests {
             serde_json::json!([{
                 "model_group": "claude-haiku-4-5",
                 "num_deployments": 1,
-                "providers": ["anthropic"]
+                "providers": ["anthropic"],
+                // WOR-2647: union across the group's deployments, which
+                // is one anthropic entry here.
+                "capabilities": ["chat_completions", "messages", "responses", "streaming"]
+            }])
+        );
+    }
+
+    /// WOR-2647: a group's array is the union across its deployments,
+    /// not whichever one the loop visited last.
+    ///
+    /// The two entries are chosen to be disjoint so the union is
+    /// neither of them: `voyage` is embeddings-only (`supports_chat:
+    /// false`, so no chat, messages, responses or streaming) and
+    /// `anthropic` serves the chat surfaces and no embeddings.
+    /// Replacing the `extend` with an assignment fails here; a
+    /// two-openai fixture would not, because both operands are equal.
+    #[test]
+    fn model_group_info_unions_capabilities_across_deployments() {
+        let cfg: sbproxy_ai::handler::AiHandlerConfig = serde_json::from_value(serde_json::json!({
+            "providers": [
+                {"name": "embedder", "api_key": "k", "provider_type": "voyage", "models": ["shared"]},
+                {"name": "chat", "api_key": "k", "provider_type": "anthropic", "models": ["shared"]}
+            ]
+        }))
+        .expect("AiHandlerConfig fixture");
+
+        // Each deployment on its own, so the union below is visibly
+        // wider than either operand rather than asserted in a vacuum.
+        assert_eq!(
+            sbproxy_ai::api_routes::surface_capability_names(&cfg.providers[0]),
+            ["embeddings"]
+        );
+        assert_eq!(
+            sbproxy_ai::api_routes::surface_capability_names(&cfg.providers[1]),
+            ["chat_completions", "messages", "responses", "streaming"]
+        );
+
+        let resp = super::ai_management_response("/model_group/info", &cfg).unwrap();
+        assert_eq!(
+            resp["data"],
+            serde_json::json!([{
+                "model_group": "shared",
+                "num_deployments": 2,
+                "providers": ["embedder", "chat"],
+                "capabilities": [
+                    "chat_completions", "embeddings", "messages", "responses", "streaming"
+                ]
             }])
         );
     }
@@ -22641,15 +26581,45 @@ mod compression_selection_tests {
         });
         let mut mapped = baseline.clone();
         mapped["model"] = serde_json::Value::String("provider-model".to_string());
-        assert!(!native_bypass_body_changed(&baseline, &mapped));
+        assert!(!native_bypass_body_changed(&baseline, &mapped, None));
 
         let mut redacted = mapped.clone();
         redacted["messages"][0]["content"] = serde_json::Value::String("[REDACTED]".to_string());
-        assert!(native_bypass_body_changed(&baseline, &redacted));
+        assert!(native_bypass_body_changed(&baseline, &redacted, None));
 
         let mut injected = mapped;
         injected["tools"] = serde_json::json!([{"name": "lookup"}]);
-        assert!(native_bypass_body_changed(&baseline, &injected));
+        assert!(native_bypass_body_changed(&baseline, &injected, None));
+    }
+
+    /// WOR-2652: the operator's tier is written into `attempt_body` before
+    /// this comparison runs and re-applied to the native bytes by
+    /// `make_native_bypass_body`, so counting it as a lost transform would
+    /// disable the bypass for exactly the entries the tier is configured on,
+    /// leaving the tier plumbing in `make_native_bypass_body` unreachable.
+    #[test]
+    fn native_body_comparison_ignores_the_reapplied_service_tier() {
+        let baseline = serde_json::json!({
+            "model": "public-model",
+            "messages": [{"role": "user", "content": "original"}],
+        });
+        let mut tiered = baseline.clone();
+        tiered["service_tier"] = serde_json::Value::String("flex".to_string());
+        assert!(native_bypass_body_changed(&baseline, &tiered, None));
+        assert!(!native_bypass_body_changed(
+            &baseline,
+            &tiered,
+            Some("service_tier")
+        ));
+
+        // The carve-out is one field wide. Anything else still vetoes.
+        let mut also_edited = tiered;
+        also_edited["messages"][0]["content"] = serde_json::Value::String("edited".to_string());
+        assert!(native_bypass_body_changed(
+            &baseline,
+            &also_edited,
+            Some("service_tier")
+        ));
     }
 
     #[test]
@@ -25363,6 +29333,90 @@ mod price_ceiling_tests {
     }
 
     #[test]
+    fn timeout_override_header_that_is_not_a_number_is_an_error() {
+        for bad in ["soon", "", "3.5", "-100", "3000ms"] {
+            let refusal = super::effective_request_timeout(true, Some(5_000), Some(bad))
+                .expect_err("not a whole number of milliseconds");
+            assert_eq!(
+                refusal.outcome, "invalid_header",
+                "{bad:?} is a malformed header, not a ceiling breach"
+            );
+        }
+    }
+
+    #[test]
+    fn timeout_override_header_of_zero_is_an_error() {
+        // A zero budget refuses the request it was asked to bound, the
+        // same reading as a zero price ceiling.
+        let refusal = super::effective_request_timeout(true, Some(5_000), Some("0"))
+            .expect_err("a zero budget is refused");
+        assert_eq!(refusal.outcome, "invalid_header");
+    }
+
+    /// The label rides on the refusal rather than being recovered from
+    /// its wording. Reading it back out of the message put the
+    /// "origin has no ceiling" refusal, which names the same key, on the
+    /// caller-mistake series, and would have moved any of these the next
+    /// time a sentence was reworded.
+    #[test]
+    fn a_refused_timeout_override_carries_its_own_metric_label() {
+        let over = super::effective_request_timeout(true, Some(5_000), Some("60000"))
+            .expect_err("above the ceiling");
+        assert_eq!(over.outcome, "over_ceiling");
+        let no_ceiling = super::effective_request_timeout(true, None, Some("3000"))
+            .expect_err("the flag on with no ceiling refuses, fail-closed");
+        assert_eq!(no_ceiling.outcome, "over_ceiling");
+    }
+
+    #[test]
+    fn timeout_override_above_the_ceiling_names_the_accepted_range() {
+        let refusal = super::effective_request_timeout(true, Some(5_000), Some("60000"))
+            .expect_err("a header above the ceiling is refused, not clamped");
+        let message = refusal.message;
+        assert!(message.contains("60000"), "{message}");
+        assert!(message.contains("5000"), "{message}");
+        // The message reaches the caller verbatim in the 400 body, and
+        // docs/ai-gateway.md quotes it, so a stray run of whitespace
+        // from a wrapped literal is a shipped defect.
+        assert!(
+            !message.contains("  "),
+            "the refusal is one clean sentence: {message:?}"
+        );
+    }
+
+    /// The seam that decides whether an operator who left the flag off
+    /// can be surprised by a caller. Off must ignore, never apply, and
+    /// never refuse: a caller sending the header to a fleet where only
+    /// some origins opted in must not get a 400 from the rest.
+    #[test]
+    fn timeout_override_with_the_flag_off_reports_ignored_not_applied() {
+        assert_eq!(
+            super::effective_request_timeout(false, Some(5_000), Some("3000")),
+            Ok(super::TimeoutOverrideOutcome::IgnoredDisabled)
+        );
+        assert_eq!(
+            super::effective_request_timeout(false, None, Some("60000")),
+            Ok(super::TimeoutOverrideOutcome::IgnoredDisabled),
+            "with the flag off nothing about the value matters, including \
+             whether it would have been over a ceiling"
+        );
+    }
+
+    #[test]
+    fn a_header_within_the_ceiling_is_applied_and_no_header_is_absent() {
+        assert_eq!(
+            super::effective_request_timeout(true, Some(5_000), Some("3000")),
+            Ok(super::TimeoutOverrideOutcome::Applied(
+                std::time::Duration::from_millis(3_000)
+            ))
+        );
+        assert_eq!(
+            super::effective_request_timeout(true, Some(5_000), None),
+            Ok(super::TimeoutOverrideOutcome::Absent)
+        );
+    }
+
+    #[test]
     fn the_refusal_body_names_the_ceiling_and_lists_resolved_prices() {
         let excluded = vec![
             sbproxy_ai::budget::PriceCeilingExclusion {
@@ -26214,5 +30268,214 @@ mod routing_batch_seam_tests {
                  the client its relay headers"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod provider_key_fallback_tests {
+    //! WOR-2655: the provider-key fallback's gate and its labels.
+    //!
+    //! The arm itself lives six thousand lines inside `handle_ai_proxy`
+    //! and only the e2e harness reaches it, so the two decisions that
+    //! carry money are extracted and tested here by name:
+    //! [`super::wants_provider_key_fallback`], which decides whether the
+    //! operator's credential is spent at all, and
+    //! [`super::select_upstream_credential`], which decides which secret
+    //! actually reaches the wire.
+    //!
+    //! What these cannot see: the splice into `provider_order`, the
+    //! visit budget, and whether the retried attempt succeeds. Those are
+    //! the loop's, and only the e2e test reaches them.
+
+    use super::{select_upstream_credential, wants_provider_key_fallback, CredentialSource};
+
+    fn provider(extra: serde_json::Value) -> sbproxy_ai::ProviderConfig {
+        let mut json = serde_json::json!({
+            "name": "openai-acme",
+            "provider_type": "openai",
+            "api_key": "sk-tenant-key"
+        });
+        let object = json.as_object_mut().expect("fixture is an object");
+        for (key, value) in extra.as_object().expect("extra is an object") {
+            object.insert(key.clone(), value.clone());
+        }
+        serde_json::from_value(json).expect("ProviderConfig fixture")
+    }
+
+    /// The money-leak test. A caller who presented their own native
+    /// provider key and had it refused must never be served on the
+    /// operator's credential: it bills the operator for someone else's
+    /// authorization failure, and it lets a caller whose upstream key
+    /// was revoked keep working on the house account.
+    #[test]
+    fn a_native_caller_credential_never_falls_back() {
+        let entry = provider(serde_json::json!({"fallback_credential_id": "house-openai"}));
+        assert!(
+            wants_provider_key_fallback(&entry, 401, false, false),
+            "the operator's own key being refused is what the fallback is for"
+        );
+        assert!(
+            !wants_provider_key_fallback(&entry, 401, true, false),
+            "a caller-owned native key in flight must never spend the house credential"
+        );
+        assert!(
+            !wants_provider_key_fallback(&entry, 403, true, false),
+            "and the same holds for a 403"
+        );
+    }
+
+    /// Even with a native key somehow in flight alongside a resolved
+    /// fallback, the caller's key is the one presented. The gate above
+    /// already refuses to produce that pair; this is the second lock,
+    /// because the two conditions live thousands of lines apart.
+    #[test]
+    fn the_caller_key_wins_over_an_operator_fallback_on_the_wire() {
+        let mut entry = provider(serde_json::json!({}));
+        assert_eq!(
+            select_upstream_credential(&mut entry, Some("caller-native"), Some("house-material")),
+            CredentialSource::NativeCaller
+        );
+        assert_eq!(entry.api_key.as_deref(), Some("caller-native"));
+    }
+
+    #[test]
+    fn the_selected_source_matches_the_key_written() {
+        let mut entry = provider(serde_json::json!({}));
+        assert_eq!(
+            select_upstream_credential(&mut entry, None, None),
+            CredentialSource::ProviderEntry
+        );
+        assert_eq!(entry.api_key.as_deref(), Some("sk-tenant-key"));
+
+        assert_eq!(
+            select_upstream_credential(&mut entry, None, Some("house-material")),
+            CredentialSource::Fallback
+        );
+        assert_eq!(
+            entry.api_key.as_deref(),
+            Some("house-material"),
+            "only api_key is written; the vendor's header stays with auth_header()"
+        );
+
+        assert_eq!(CredentialSource::ProviderEntry.as_str(), "provider_entry");
+        assert_eq!(CredentialSource::NativeCaller.as_str(), "native_caller");
+        assert_eq!(CredentialSource::Fallback.as_str(), "fallback");
+    }
+
+    /// The explicit opt-out, and the inert default. An entry that names
+    /// no fallback credential behaves exactly as `fail_closed` does,
+    /// which is what makes `fallback` a safe default on an existing
+    /// config.
+    ///
+    /// The `fail_closed` fixture carries a `fallback_credential_id` on
+    /// purpose, even though `ProviderConfig::validate_key_failure_posture`
+    /// refuses that pair at config load. Without it the assertion would
+    /// pass on the missing credential and prove nothing about the
+    /// posture, and the posture check would be the one term of this gate
+    /// no test holds. It is also what a reader needs to see if the
+    /// validation is ever relaxed to let the two coexist.
+    #[test]
+    fn fail_closed_and_a_missing_credential_both_refuse_the_fallback() {
+        let opted_out = provider(serde_json::json!({
+            "on_key_failure": "fail_closed",
+            "fallback_credential_id": "house-openai"
+        }));
+        assert!(
+            !wants_provider_key_fallback(&opted_out, 401, false, false),
+            "the posture alone must refuse, with a credential named and \
+             everything else identical to the engaging case"
+        );
+        let opted_in = provider(serde_json::json!({
+            "on_key_failure": "fallback",
+            "fallback_credential_id": "house-openai"
+        }));
+        assert!(
+            wants_provider_key_fallback(&opted_in, 401, false, false),
+            "the differential: only on_key_failure differs from the fixture above"
+        );
+
+        let nothing_to_fall_back_to = provider(serde_json::json!({}));
+        assert!(!wants_provider_key_fallback(
+            &nothing_to_fall_back_to,
+            401,
+            false,
+            false
+        ));
+    }
+
+    /// One retry per request. Both credentials failing must terminate
+    /// rather than queue a third visit to the same provider.
+    #[test]
+    fn the_fallback_budget_is_one_per_request() {
+        let entry = provider(serde_json::json!({"fallback_credential_id": "house-openai"}));
+        assert!(wants_provider_key_fallback(&entry, 401, false, false));
+        assert!(
+            !wants_provider_key_fallback(&entry, 401, false, true),
+            "the retried attempt's own 401 must not queue another"
+        );
+    }
+
+    /// The precedence ruling, at the gate rather than only on the enum:
+    /// a rate limit or a server error is a statement about the
+    /// provider, and stays with the availability failover.
+    #[test]
+    fn only_an_auth_rejection_reaches_the_gate() {
+        let entry = provider(serde_json::json!({"fallback_credential_id": "house-openai"}));
+        for status in [401, 403] {
+            assert!(wants_provider_key_fallback(&entry, status, false, false));
+        }
+        for status in [200, 400, 404, 408, 429, 500, 502, 503] {
+            assert!(
+                !wants_provider_key_fallback(&entry, status, false, false),
+                "{status} belongs to the availability failover"
+            );
+        }
+    }
+
+    /// The typed event names the credential and never its material,
+    /// the same rule the bound-credential resolver in `proxy_http`
+    /// follows. Asserted by searching the serialized payload for the
+    /// fixture secret rather than by reading the field list, so a
+    /// future field that happens to carry the secret also fails.
+    #[test]
+    fn the_fallback_event_names_the_credential_and_carries_no_secret() {
+        let event = super::credential_fallback_event(
+            "acme.example.com",
+            "acme",
+            "openai-acme",
+            "house-openai",
+            401,
+            "engaged",
+        );
+        assert_eq!(
+            event.event_type,
+            sbproxy_observe::EventType::CredentialFallback
+        );
+        assert_eq!(event.hostname, "acme.example.com");
+        assert_eq!(event.tenant_id, "acme");
+        assert_eq!(event.data["op"], "credential_fallback");
+        assert_eq!(event.data["resource"], "credential");
+        assert_eq!(event.data["id"], "house-openai");
+        assert_eq!(event.data["provider"], "openai-acme");
+        assert_eq!(event.data["status"], 401);
+        assert_eq!(event.data["outcome"], "engaged");
+
+        let serialized = serde_json::to_string(&event).expect("event serializes");
+        for secret in ["sk-tenant-key", "sk-house-openai", "vault://"] {
+            assert!(
+                !serialized.contains(secret),
+                "the event must not carry credential material: {serialized}"
+            );
+        }
+
+        let unavailable = super::credential_fallback_event(
+            "acme.example.com",
+            "acme",
+            "openai-acme",
+            "house-openai",
+            403,
+            "unavailable",
+        );
+        assert_eq!(unavailable.data["outcome"], "unavailable");
     }
 }

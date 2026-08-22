@@ -6472,10 +6472,38 @@ pub(super) async fn handle_mcp_action(
                                     // client must not follow redirects
                                     // on its own; `mint_token_exchange`
                                     // re-authorizes each hop instead.
-                                    let http = reqwest::Client::builder()
+                                    //
+                                    // Fail closed when that client will not
+                                    // build. This used to fall back to
+                                    // `reqwest::Client::new()`, which carries
+                                    // the default policy of following up to
+                                    // ten hops, so the fallback reinstated
+                                    // exactly the hole the line above closes
+                                    // and did it on the runs where something
+                                    // was already wrong. `GovernedEgress`
+                                    // refuses a dial it cannot pin for the
+                                    // same reason; an unmintable token is a
+                                    // failed tool call, not a reason to post
+                                    // the subject token somewhere unchecked.
+                                    let Ok(http) = reqwest::Client::builder()
                                         .redirect(reqwest::redirect::Policy::none())
                                         .build()
-                                        .unwrap_or_else(|_| reqwest::Client::new());
+                                    else {
+                                        let response = JsonRpcResponse::error(
+                                            request.id.clone(),
+                                            INTERNAL_ERROR,
+                                            "token exchange client unavailable",
+                                        );
+                                        return write_mcp_application_response(
+                                            session,
+                                            &response,
+                                            &request_id,
+                                            &rpc_method,
+                                            modern_server.as_ref(),
+                                            None,
+                                        )
+                                        .await;
+                                    };
                                     let token_exchange_egress = mcp_token_exchange_gate();
                                     let subject_token = session
                                         .req_header()
@@ -8309,6 +8337,9 @@ fn emit_mcp_tool_attribution(
         // not a model any lane could have served (WOR-2223).
         logical_model: None,
         served_model: None,
+        finish_reason: None,
+        shadow_of: None,
+        credential_source: None,
     };
     for sink in mcp.usage_sinks() {
         sink.record(&event);
@@ -9085,6 +9116,14 @@ fn mcp_governance_event_data_for_method(
     fields.insert("sbproxy.tool.server".to_string(), server.into());
     fields.insert("sbproxy.tenant.id".to_string(), tenant_id.into());
     fields.insert("sbproxy.evidence.seq".to_string(), seq.into());
+    // The sequence is process-local and restarts at 1 in every replica,
+    // so it only identifies a record once the emitter is named beside
+    // it: a receiver groups by (instance, tenant) to find a hole. See
+    // `sbproxy_observe::evidence_seq`'s module docs.
+    fields.insert(
+        "sbproxy.evidence.instance".to_string(),
+        sbproxy_observe::instance::instance_id().into(),
+    );
     if let Some(rule_id) = rule_id {
         fields.insert("sbproxy.decision.rule_id".to_string(), rule_id.into());
     }
@@ -10156,6 +10195,7 @@ mod mcp_governance_evidence_tests {
                 "mcp.protocol.version",
                 "mcp.session.id",
                 "sbproxy.decision.verdict",
+                "sbproxy.evidence.instance",
                 "sbproxy.evidence.seq",
                 "sbproxy.tenant.id",
                 "sbproxy.tool.arguments_hash",
@@ -10167,6 +10207,15 @@ mod mcp_governance_evidence_tests {
         assert_eq!(data["mcp.method.name"], "tools/call");
         assert_eq!(data["sbproxy.decision.verdict"], "allow");
         assert_eq!(data["sbproxy.evidence.seq"], 7);
+        // The sequence restarts at 1 in every replica and after every
+        // restart, so a receiver can only group it into a gapless run
+        // once the record names the process that minted it. Without
+        // this pin the payload ships a counter no consumer can scope.
+        assert_eq!(
+            data["sbproxy.evidence.instance"],
+            sbproxy_observe::instance::instance_id(),
+            "every evidence record must name the process that minted its sequence: {data:?}"
+        );
         assert!(
             data.get("error.type").is_none(),
             "an allow must not carry error.type: {data:?}"

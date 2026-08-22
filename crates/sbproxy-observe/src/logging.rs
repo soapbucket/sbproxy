@@ -849,11 +849,23 @@ pub fn apply_redaction(json: &str, sink: Sink) -> String {
     apply_redaction_for(json, sink, None, None)
 }
 
-/// Sink-agnostic line redaction: the ten secret regexes plus the
+/// Sink-agnostic line redaction: the twelve secret regexes plus the
 /// field-key denylist (`prompt`, `messages`, `tool_arguments`, ...),
 /// without the per-tenant operator rules that `apply_redaction_for`
 /// layers on. For emitters that write JSON lines outside the
 /// StructuredLog path (request events, access log). WOR-2473.
+///
+/// # The two layers are not independent
+///
+/// The denylist runs only when the secret pass left something that
+/// still parses. A pattern that consumed a key separator therefore did
+/// not just mangle its own field: it dropped the denylist for the
+/// entire record, and `prompt` / `cookie` / a bundle secret var later
+/// on the same line shipped verbatim. Three patterns did exactly that
+/// until they were given capture groups; the module docs on
+/// [`crate::redact`] carry the rule. The `Err` arm here is a floor for
+/// genuinely non-JSON input (a `tracing` text line), not a tolerated
+/// outcome for a rendered record.
 pub fn redact_json_line(input: &str) -> String {
     let secrets_scrubbed = crate::redact::redact_secrets(input);
     match serde_json::from_str::<serde_json::Value>(&secrets_scrubbed) {
@@ -998,13 +1010,19 @@ fn is_swept_header(k: &str) -> bool {
 }
 
 /// WOR-2289: field-key denylist additions declared by the currently
-/// loaded extension bundles (a hook manifest's `secret_vars` and
-/// `masked_vars`). Same shape as [`SWEPT_HEADERS`]: a bundle candidate
-/// load replaces the whole set, so a reload that drops a bundle also
-/// drops the names it declared. Additive on top of the built-in
+/// serving extension bundles (a hook manifest's `secret_vars` and
+/// `masked_vars`). Same shape as [`SWEPT_HEADERS`]: publishing a
+/// pipeline replaces the whole set, so a reload that drops a bundle
+/// also drops the names it declared. Additive on top of the built-in
 /// baseline and every operator-configured scope; there is no config
 /// key that can disable it, matching the guarantee `OpRedactState`
 /// makes for its own `fields`.
+///
+/// The set moves at pipeline publication, not at bundle candidate
+/// load. Loading is not adopting: validate-only loads (a publish dry
+/// run, doctor) build a registry that is dropped, and installing from
+/// there let a candidate carrying no bundles un-redact the secrets of
+/// the generation still serving.
 static BUNDLE_SECRET_FIELD_NAMES: OnceLock<std::sync::RwLock<std::sync::Arc<Vec<String>>>> =
     OnceLock::new();
 
@@ -1016,11 +1034,24 @@ fn bundle_secret_field_names_slot() -> &'static std::sync::RwLock<std::sync::Arc
 /// Replace the set of bundle-declared secret/masked var names treated
 /// as key-bearing for redaction.
 ///
-/// Call once per bundle candidate load with the union of every loaded
-/// hook's `secret_vars` and `masked_vars`. A name here is redacted by
-/// key in every structured sink, regardless of tenant or origin scope,
-/// the same way a `secret_vars` value is always resolved and always
-/// masked regardless of which attachment used it.
+/// Call it from pipeline publication with every `secret_vars` and
+/// `masked_vars` the adopted registry's hooks declare
+/// (`DynamicBundleRegistry::secret_field_names`). A name here is
+/// redacted by key in every structured sink, regardless of tenant or
+/// origin scope, the same way a `secret_vars` value is always resolved
+/// and always masked regardless of which attachment used it.
+///
+/// Twice per publication, in practice: the publisher installs the
+/// union of the outgoing and incoming sets before the pipeline swap
+/// and narrows to the incoming set after it, so no field is
+/// under-redacted on either side of the boundary. Going only one way
+/// leaves a window: install early and a dropped bundle's fields are in
+/// cleartext while its generation is still serving; install late and a
+/// newly added bundle's fields are in cleartext once its generation
+/// is.
+///
+/// Do not call it from a load path. A candidate that is built and
+/// dropped must leave the serving generation's denylist alone.
 pub fn set_bundle_secret_field_names(names: Vec<String>) {
     let lowered: Vec<String> = names
         .into_iter()
@@ -1429,6 +1460,64 @@ mod tests {
     fn redact_json_line_on_non_json_still_scrubs_secrets() {
         let out = redact_json_line("bearer sk-abc123def456ghi789jkl012");
         assert!(!out.contains("sk-abc123def456ghi789jkl012"), "{out}");
+    }
+
+    /// A captured `x-api-key` header used to leave the rendered line
+    /// unparseable, and this function answers a parse failure by
+    /// returning the string as it stands, so the field-key denylist
+    /// never ran and the `prompt` on the same record shipped verbatim.
+    /// Both halves are asserted: the line is still JSON, and the
+    /// second secret is still masked. A test that only checked the api
+    /// key was gone passed before the fix as well.
+    #[test]
+    fn a_captured_api_key_header_does_not_disable_the_denylist_for_the_line() {
+        let line = concat!(
+            r#"{"request_headers":{"x-api-key":"abcdefghijklmnop1234"},"#,
+            r#""prompt":"steal the plans","status":200}"#
+        );
+        let out = redact_json_line(line);
+        let parsed: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("redacted access-log line is not JSON ({e}): {out}"));
+        assert_eq!(parsed["prompt"], "[REDACTED:PROMPT_BODY]", "{out}");
+        assert!(!out.contains("steal the plans"), "{out}");
+        assert!(!out.contains("abcdefghijklmnop1234"), "{out}");
+        assert_eq!(parsed["status"], 200, "{out}");
+    }
+
+    /// The same coupling for the other two patterns that ate their
+    /// separator. One denylisted field on each line, so a skipped
+    /// denylist is visible.
+    #[test]
+    fn a_keyed_secret_earlier_in_the_line_does_not_cost_the_prompt() {
+        for (label, line) in [
+            (
+                "aws secret label",
+                concat!(
+                    r#"{"secret_hash":"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY","#,
+                    r#""prompt":"steal the plans"}"#
+                ),
+            ),
+            (
+                "password",
+                r#"{"upstream_password":"hunter2xyz","prompt":"steal the plans"}"#,
+            ),
+            (
+                "api key",
+                r#"{"api_key":"abcdefghijklmnop1234","prompt":"steal the plans"}"#,
+            ),
+        ] {
+            let out = redact_json_line(line);
+            let parsed: serde_json::Value = serde_json::from_str(&out)
+                .unwrap_or_else(|e| panic!("{label}: redacted line is not JSON ({e}): {out}"));
+            assert_eq!(
+                parsed["prompt"], "[REDACTED:PROMPT_BODY]",
+                "{label}: denylist did not run: {out}"
+            );
+            assert!(
+                !out.contains("steal the plans"),
+                "{label}: prompt survived: {out}"
+            );
+        }
     }
 
     #[test]

@@ -198,6 +198,29 @@ static AI_FAILOVERS: LazyLock<CounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Provider-key fallback decisions, by the provider entry whose own key
+/// was refused and what happened next.
+///
+/// `outcome` is the closed pair `engaged` (the operator's credential
+/// resolved and the retry was queued) and `unavailable` (it did not
+/// resolve, so the provider's rejection stands). The second is the one
+/// worth an alert: it means the house credential is broken and the only
+/// other evidence is a `401` that reads like the tenant's fault.
+///
+/// `provider` is a configured provider entry name, bounded by the
+/// config the same way [`AI_FAILOVERS`] above is, so it is passed
+/// through unsanitized for the same reason.
+static AI_KEY_FALLBACKS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_key_fallbacks_total",
+            "AI provider-key fallback decisions by provider and outcome"
+        ),
+        &["provider", "outcome"]
+    )
+    .unwrap()
+});
+
 /// Route reasoning-policy outcomes for each provider attempt.
 ///
 /// `provider` is bounded by configured provider names and `outcome` comes
@@ -283,6 +306,42 @@ static AI_PREFIX_AFFINITY_EVICTIONS: LazyLock<CounterVec> = LazyLock::new(|| {
             "Entries evicted from the bounded prefix-affinity table"
         ),
         &["reason"]
+    )
+    .unwrap()
+});
+
+/// Caller-keyed prompt-cache affinity selections by lease outcome.
+static AI_CACHE_AFFINITY_DECISIONS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_cache_affinity_decisions_total",
+            "Caller-keyed prompt-cache affinity selections by lease outcome"
+        ),
+        &["outcome"]
+    )
+    .unwrap()
+});
+
+/// Bounded cache-affinity lease table removals by cause.
+static AI_CACHE_AFFINITY_EVICTIONS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_cache_affinity_evictions_total",
+            "Leases removed from the bounded prompt-cache affinity table"
+        ),
+        &["reason"]
+    )
+    .unwrap()
+});
+
+/// Requests whose upstream service tier the operator's entry decided.
+static AI_SERVICE_TIER_DECISIONS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_service_tier_decisions_total",
+            "Upstream attempts whose service tier the operator's provider entry decided"
+        ),
+        &["disposition"]
     )
     .unwrap()
 });
@@ -584,6 +643,59 @@ pub(crate) fn translation_dropped_value(surface: &str, field: &str) -> u64 {
         .get() as u64
 }
 
+// --- Pre-provider admission refusals (WOR-2595) ---
+
+/// Registered without `.unwrap()` for the same reason as
+/// `AI_PRICE_CEILING` below: the production unwrap/expect ratchet in
+/// `scripts/check-unwrap-ratchet.sh` is at its baseline and one metric
+/// family is not worth a panic path.
+static AI_ADMISSION_DECISIONS: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_admission_decisions_total",
+            "Pre-provider AI gateway admission decisions by inbound surface and reason (WOR-2595)"
+        ),
+        &["surface", "reason", "outcome"]
+    )
+    .ok()
+});
+
+/// Record a pre-provider AI admission decision (WOR-2595).
+///
+/// `surface` is the inbound surface label from `AiSurface::label`, so
+/// the series joins `sbproxy_ai_surface_requests_total` on the same
+/// values: `messages` or `responses` for a refusal at the native-format
+/// shim, and any JSON surface, `chat_completions` included, for one at
+/// the shared stored-prompt resolver. `reason` is
+/// the refusal's bounded code from `ChatError::reason`
+/// (`tools_mcp_unsupported`, `store_unsupported`, `malformed_json`, ...),
+/// the prompt-bridge codes the dispatcher names
+/// (`prompt_reference_not_found`, `prompt_object_unrenderable`), or
+/// `malformed_request` where a refusal site has not been coded.
+/// `outcome` is `deny` today and is carried anyway so an admit-side
+/// counterpart can share the family rather than mint a second one.
+///
+/// Every label value is a `&'static str` at the call site; the
+/// cardinality limiter is a backstop, not the contract. Never pass a
+/// `ChatError::message`: several of the coded refusals interpolate
+/// caller bytes into it.
+pub fn record_admission_decision(surface: &str, reason: &str, outcome: &str) {
+    let Some(counter) = &*AI_ADMISSION_DECISIONS else {
+        return;
+    };
+    let metric = "sbproxy_ai_admission_decisions_total";
+    let surface = sbproxy_observe::metrics::sanitize_label_budget(metric, "surface", surface);
+    let reason = sbproxy_observe::metrics::sanitize_label_budget(metric, "reason", reason);
+    // `outcome` is a literal at the only call site, but it goes through
+    // the limiter like its two neighbors: an exemption held by "the
+    // caller passes a constant" is exactly the invariant a second caller
+    // breaks silently.
+    let outcome = sbproxy_observe::metrics::sanitize_label_budget(metric, "outcome", outcome);
+    counter
+        .with_label_values(&[surface.as_str(), reason.as_str(), outcome.as_str()])
+        .inc();
+}
+
 // --- Per-request price ceiling (WOR-2559) ---
 
 /// Registered without `.unwrap()` (mirroring
@@ -626,6 +738,49 @@ static AI_PRICE_CEILING: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
 /// and both were over.
 pub fn record_price_ceiling(outcome: &str) {
     let Some(counter) = &*AI_PRICE_CEILING else {
+        return;
+    };
+    counter.with_label_values(&[outcome]).inc();
+}
+
+// --- Per-request timeout override ---
+
+/// Registered without `.unwrap()` for the same reason as
+/// `AI_PRICE_CEILING` above.
+static AI_REQUEST_TIMEOUT_OVERRIDE: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_request_timeout_override_total",
+            "Per-request transport timeout override outcomes"
+        ),
+        &["outcome"]
+    )
+    .ok()
+});
+
+/// Record one `x-sbproxy-timeout-ms` outcome. `outcome` is a closed set
+/// of four:
+///
+/// - `applied`: the header was honored and replaced the selected
+///   provider's `timeout_ms` for this request.
+/// - `ignored_override_disabled`: a caller sent the header on an origin
+///   whose `allow_request_timeout_override` is off, so it was dropped and
+///   the request dispatched on the configured budget.
+/// - `over_ceiling`: the header exceeded `max_request_timeout_ms`, and
+///   the request was refused with 400 rather than clamped.
+/// - `invalid_header`: the header was not a positive integer, answered
+///   400.
+///
+/// A rising `ignored_override_disabled` rate is the one to read first:
+/// it means callers believe they can set a budget the operator has not
+/// granted, and the answer is either to turn the flag on with a ceiling
+/// or to tell them to stop. `applied` rising toward the request rate
+/// means the ceiling is now the effective per-attempt timeout for this
+/// origin, which is worth knowing before sizing capacity. The two 400s
+/// are caller mistakes rather than gateway decisions, so alert on them
+/// separately or not at all.
+pub fn record_request_timeout_override(outcome: &str) {
+    let Some(counter) = &*AI_REQUEST_TIMEOUT_OVERRIDE else {
         return;
     };
     counter.with_label_values(&[outcome]).inc();
@@ -675,6 +830,68 @@ pub fn record_provider_cooldown(provider: &str, cause: &str) {
         return;
     };
     let metric = "sbproxy_ai_provider_cooldowns_total";
+    let provider = sbproxy_observe::metrics::sanitize_label_budget(metric, "provider", provider);
+    let cause = sbproxy_observe::metrics::sanitize_label_budget(metric, "cause", cause);
+    counter.with_label_values(&[&provider, &cause]).inc();
+}
+
+// --- Post-commit streaming failures ---
+
+/// Registered without `.unwrap()` for the same reason as
+/// `AI_PROVIDER_COOLDOWNS` above: the production unwrap/expect ratchet
+/// is at its baseline and one metric family is not worth a panic path.
+static AI_STREAM_POST_COMMIT_FAILURES: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_stream_post_commit_failures_total",
+            "Streaming responses that failed after the gateway committed to a provider"
+        ),
+        &["provider", "cause"]
+    )
+    .ok()
+});
+
+/// Record one streaming response that failed after the request was
+/// committed to a provider.
+///
+/// A streaming request is committed the moment the provider answers with
+/// a streaming content type: from there the relay is writing bytes the
+/// caller is already consuming, and a later candidate cannot replace
+/// them. Everything that goes wrong after that point is therefore a
+/// stream failure rather than a failover, and this counter is the only
+/// place it is visible as one. `sbproxy_ai_failovers_total` counts the
+/// other side of the same line, so the two never double count a request.
+///
+/// `cause` is a closed set of three:
+///
+/// - `upstream_timeout`: reading the next chunk from the provider hit a
+///   transport timeout, so `providers[].timeout_ms` or the gateway's
+///   30-second client default cut a generation that was still running. A
+///   rising rate here means a budget is sized below the completions the
+///   origin actually serves.
+/// - `upstream_error`: the provider's stream ended in a transport error
+///   that was not a timeout, most often a reset or a truncated body.
+/// - `guardrail`: the gateway itself ended the stream, on an output
+///   guardrail block or a stream-safety verdict. Operator policy working
+///   as configured, not a provider fault; it is carried here so the
+///   provider-fault rate can be read without it.
+///
+/// What this counter cannot see. A caller that disconnects mid-stream:
+/// the failed downstream write aborts the relay before this point, so a
+/// client cancel is counted nowhere in this family rather than being
+/// guessed at as one of the three values above. And an extension `close`
+/// hook that blocks after the upstream stream already reached its end:
+/// the counter keys on the upstream stream not finishing, so a block
+/// that lands past that point is outside it.
+///
+/// This is not a rename of [`WasteKind::AbandonedStream`]. That marker
+/// is only emitted when a budget recorder is wired to the origin, and
+/// this counter has to fire whether or not anyone configured budgets.
+pub fn record_stream_post_commit_failure(provider: &str, cause: &str) {
+    let Some(counter) = &*AI_STREAM_POST_COMMIT_FAILURES else {
+        return;
+    };
+    let metric = "sbproxy_ai_stream_post_commit_failures_total";
     let provider = sbproxy_observe::metrics::sanitize_label_budget(metric, "provider", provider);
     let cause = sbproxy_observe::metrics::sanitize_label_budget(metric, "cause", cause);
     counter.with_label_values(&[&provider, &cause]).inc();
@@ -740,6 +957,52 @@ pub enum ShadowDropReason {
     Saturated,
 }
 
+/// Every [`ShadowDropReason`], in label order.
+///
+/// A variant added to the enum and not added here fails to compile,
+/// enforced by `ShadowDropReason::next_in_label_order` and the const
+/// walk below rather than by the written-out array length, which on
+/// its own would happily stay at six. Before this, the exhaustiveness
+/// test held a hand-written copy of this list: a seventh variant would
+/// have compiled, shipped, and never been asserted on, and
+/// `docs/observability.md` states this family's cardinality as a
+/// number that would then have been wrong.
+///
+/// What it still cannot see: the two prose enumerations of the same
+/// vocabulary, `docs/observability.md` and `docs/ai-gateway.md`. A new
+/// variant has to be written into both by hand.
+pub const ALL_SHADOW_DROP_REASONS: [ShadowDropReason; 6] = [
+    ShadowDropReason::Streaming,
+    ShadowDropReason::ProviderNotFound,
+    ShadowDropReason::ProviderNotAllowed,
+    ShadowDropReason::PromptTrainingDisallowed,
+    ShadowDropReason::EgressDenied,
+    ShadowDropReason::Saturated,
+];
+
+// Walks the variant chain against the array at compile time. A seventh
+// variant makes `next_in_label_order` non-exhaustive, and the arm its
+// author has to add puts a seventh link in the chain, which indexes one
+// slot past a six-element array and fails const evaluation. Written as
+// a walk rather than as a length assertion because a length written out
+// beside the array is a copy of the array, not a check on it.
+const _: () = {
+    let mut index = 0usize;
+    let mut current = Some(ShadowDropReason::Streaming);
+    while let Some(reason) = current {
+        assert!(
+            ALL_SHADOW_DROP_REASONS[index] as u8 == reason as u8,
+            "ALL_SHADOW_DROP_REASONS is out of order with the variant chain"
+        );
+        index += 1;
+        current = reason.next_in_label_order();
+    }
+    assert!(
+        index == ALL_SHADOW_DROP_REASONS.len(),
+        "ALL_SHADOW_DROP_REASONS has an entry no variant claims"
+    );
+};
+
 impl ShadowDropReason {
     /// Stable Prometheus label value.
     pub const fn as_str(self) -> &'static str {
@@ -750,6 +1013,23 @@ impl ShadowDropReason {
             Self::PromptTrainingDisallowed => "prompt_training_disallowed",
             Self::EgressDenied => "egress_denied",
             Self::Saturated => "saturated",
+        }
+    }
+
+    /// The variant that follows this one in [`ALL_SHADOW_DROP_REASONS`],
+    /// or `None` for the last.
+    ///
+    /// This exists only so the array's contents are enforced rather
+    /// than asserted in prose. The match is exhaustive, so a new
+    /// variant cannot compile without joining the chain.
+    const fn next_in_label_order(self) -> Option<Self> {
+        match self {
+            Self::Streaming => Some(Self::ProviderNotFound),
+            Self::ProviderNotFound => Some(Self::ProviderNotAllowed),
+            Self::ProviderNotAllowed => Some(Self::PromptTrainingDisallowed),
+            Self::PromptTrainingDisallowed => Some(Self::EgressDenied),
+            Self::EgressDenied => Some(Self::Saturated),
+            Self::Saturated => None,
         }
     }
 }
@@ -765,6 +1045,103 @@ pub fn record_shadow_dropped(reason: ShadowDropReason) {
 /// timeout and was cancelled.
 pub fn record_shadow_timeout() {
     AI_SHADOW_TIMEOUT.inc();
+}
+
+/// Per-target outcome counter for completed shadow calls.
+///
+/// `target` is the shadow target's provider name, bounded by the
+/// route's `shadow.targets` list, which refuses a duplicate provider
+/// so the label identifies exactly one target. `status_class` and
+/// `finish_reason` are normalized to closed sets below.
+///
+/// This is the per-target comparison surface. Cost per target is
+/// answerable from the usage ledger instead (`tag == "shadow"`, grouped
+/// by `provider`, joined to the primary through `shadow_of`), which is
+/// why there is no cost metric here: the ledger is non-lossy and this
+/// counter is not.
+static AI_SHADOW_CALLS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_shadow_calls_total",
+            "Completed shadow evaluation calls by target, status class, and finish reason"
+        ),
+        &["target", "status_class", "finish_reason"]
+    )
+    .unwrap()
+});
+
+/// Per-target latency of a completed shadow call, in seconds.
+///
+/// Same bucket layout as `sbproxy_ai_request_duration_seconds`, so a
+/// target's latency distribution can be read against the primary's
+/// without rescaling.
+static AI_SHADOW_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        HistogramOpts::new(
+            "sbproxy_ai_shadow_latency_seconds",
+            "Shadow evaluation call latency by target"
+        )
+        .buckets(vec![0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]),
+        &["target"]
+    )
+    .unwrap()
+});
+
+/// Record one completed shadow call against one target.
+///
+/// `status` is the HTTP status the target answered, 504 when the
+/// wall-clock supervisor timeout fired (the same status the ledger row
+/// records for that case, so the two surfaces agree), and 0 when the
+/// transport never produced a response at all, which lands in the
+/// `error` class. `sbproxy_ai_shadow_timeout_total` is what separates
+/// a supervisor timeout from an upstream 504. `finish_reason` is
+/// whatever the target reported, normalized here.
+pub fn record_shadow_call(target: &str, status: u16, finish_reason: Option<&str>, secs: f64) {
+    let status_class = match status {
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        // 0 is what the transport paths report when no response
+        // arrived at all; anything else is not a status we produce.
+        _ => "error",
+    };
+    let finish_reason = normalize_shadow_finish_reason(finish_reason);
+    AI_SHADOW_CALLS
+        .with_label_values(&[target, status_class, finish_reason])
+        .inc();
+    if secs.is_finite() && secs >= 0.0 {
+        AI_SHADOW_LATENCY.with_label_values(&[target]).observe(secs);
+    }
+}
+
+/// Close the `finish_reason` label to the OpenAI chat vocabulary the
+/// hub normalizes every provider into, plus `none` for a call that
+/// reported none and `other` for anything else.
+///
+/// Closed because the value reaches a Prometheus label and comes off a
+/// provider response body. A provider that invents a finish reason, or
+/// a translated native shape that passes an unmapped `stopReason`
+/// through, would otherwise mint a new series per distinct string.
+fn normalize_shadow_finish_reason(finish_reason: Option<&str>) -> &'static str {
+    match finish_reason {
+        None => "none",
+        Some("stop") => "stop",
+        Some("length") => "length",
+        Some("tool_calls") => "tool_calls",
+        Some("content_filter") => "content_filter",
+        Some("function_call") => "function_call",
+        Some("") => "none",
+        Some(_) => "other",
+    }
+}
+
+/// Read one `sbproxy_ai_shadow_calls_total` sample (test accessor).
+#[cfg(test)]
+pub(crate) fn shadow_calls_value(target: &str, status_class: &str, finish_reason: &str) -> f64 {
+    AI_SHADOW_CALLS
+        .with_label_values(&[target, status_class, finish_reason])
+        .get()
 }
 
 // --- Cascade routing metrics ---
@@ -1027,6 +1404,18 @@ fn provider_selected_event(
     )
 }
 
+/// Record one provider-key fallback decision.
+///
+/// Deliberately not folded into [`record_failover`]: `from == to` on a
+/// same-provider retry, and that recorder also publishes
+/// `EventType::ProviderSelected`, which would be false here. The typed
+/// `credential_fallback` event is published at the call site instead.
+pub fn record_key_fallback(provider: &str, outcome: &'static str) {
+    AI_KEY_FALLBACKS
+        .with_label_values(&[provider, outcome])
+        .inc();
+}
+
 /// Record one closed reasoning-policy outcome for a provider attempt.
 pub fn record_reasoning_policy_attempt(provider: &str, outcome: &'static str) {
     AI_REASONING_POLICY_ATTEMPTS
@@ -1041,6 +1430,45 @@ pub fn record_reasoning_policy_attempt(provider: &str, outcome: &'static str) {
 pub fn record_lb_decision(strategy: &str, provider: &str) {
     AI_LB_DECISIONS
         .with_label_values(&[strategy, provider])
+        .inc();
+}
+
+// --- Named model groups (WOR-2657) ---
+
+/// Registered without `.unwrap()` for the same reason as
+/// `AI_PRICE_CEILING`: the production unwrap/expect ratchet is at its
+/// baseline and one metric family is not worth a panic path.
+static AI_MODEL_GROUP_SELECTIONS: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_model_group_selections_total",
+            "Named model group member selections by group and picked provider (WOR-2657)"
+        ),
+        &["group", "provider"]
+    )
+    .ok()
+});
+
+/// Record one member pick inside a named model group (WOR-2657).
+///
+/// This is a second family rather than a `group` label on
+/// `sbproxy_ai_lb_decisions_total`, which is a stable metric: adding a
+/// label there would change a stable label set and make every origin
+/// carry a dimension that is empty on the ones configuring no groups.
+///
+/// Both labels are operator-declared config values, a `model_groups[].name`
+/// and a `providers[].name`, so they are bounded by the config rather
+/// than by traffic. They still pass the workspace cardinality limiter as
+/// a backstop, the same contract [`record_provider_cooldown`] holds.
+pub fn record_model_group_selection(group: &str, provider: &str) {
+    let Some(counter) = &*AI_MODEL_GROUP_SELECTIONS else {
+        return;
+    };
+    let metric = "sbproxy_ai_model_group_selections_total";
+    let group = sbproxy_observe::metrics::sanitize_label_budget(metric, "group", group);
+    let provider = sbproxy_observe::metrics::sanitize_label_budget(metric, "provider", provider);
+    counter
+        .with_label_values(&[group.as_str(), provider.as_str()])
         .inc();
 }
 
@@ -1094,6 +1522,65 @@ pub fn record_prefix_affinity_eviction(reason: &str) {
     };
     AI_PREFIX_AFFINITY_EVICTIONS
         .with_label_values(&[reason])
+        .inc();
+}
+
+/// Record whether caller-keyed prompt-cache affinity found a live lease.
+///
+/// The outcome vocabulary is closed and deliberately distinct from
+/// [`record_prefix_affinity_decision`]: the two tables key on different
+/// things (a caller-chosen string against a prompt prefix), and an operator
+/// has to be able to tell which one is working.
+///
+/// `hit` reordered the candidate list. `miss` found no lease. `ineligible`
+/// found a live lease whose holder health, resilience, or policy had already
+/// removed from the candidate set. `model_changed` found a lease recorded
+/// against a different resolved model and dropped it. `missing_signal` means
+/// the request carried no cache key for the gateway to lease on.
+pub fn record_cache_affinity_decision(outcome: &str) {
+    let outcome = match outcome {
+        "hit" | "miss" | "missing_signal" | "ineligible" | "model_changed" => outcome,
+        _ => "unknown",
+    };
+    AI_CACHE_AFFINITY_DECISIONS
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+/// Record removal from the bounded cache-affinity lease table.
+pub fn record_cache_affinity_eviction(reason: &str) {
+    let reason = match reason {
+        "ttl" | "capacity" | "model_changed" => reason,
+        _ => "unknown",
+    };
+    AI_CACHE_AFFINITY_EVICTIONS
+        .with_label_values(&[reason])
+        .inc();
+}
+
+/// Record that the operator's provider entry decided one attempt's upstream
+/// service tier.
+///
+/// Counted once per upstream attempt, not once per request, because the
+/// decision is per destination: two entries in a failover chain can carry
+/// two different tiers.
+///
+/// Nothing is recorded for the ordinary case where the caller sent no tier
+/// and the entry declares none, so an untiered deployment keeps a flat zero
+/// here rather than a counter that tracks its whole request rate.
+///
+/// `caller_tier_replaced` overwrote a caller-supplied tier with the entry's.
+/// `caller_tier_stripped` removed a caller-supplied tier from an entry that
+/// declares none, so the vendor serves on its own default.
+/// `operator_tier_applied` wrote the entry's tier onto a request that asked
+/// for none.
+pub fn record_service_tier_decision(disposition: &str) {
+    let disposition = match disposition {
+        "caller_tier_replaced" | "caller_tier_stripped" | "operator_tier_applied" => disposition,
+        _ => "unknown",
+    };
+    AI_SERVICE_TIER_DECISIONS
+        .with_label_values(&[disposition])
         .inc();
 }
 
@@ -1232,6 +1719,14 @@ fn normalize_external_guardrail_labels<'a>(
         | "aporia"
         | "azure_content_safety"
         | "bedrock"
+        // Not a `GuardrailProvider` variant. `bedrock` is an
+        // out-of-band `ApplyGuardrail` side call; `bedrock_inline` is
+        // the same AWS guardrail evaluated inside the Converse
+        // generation via a provider entry's `bedrock_guardrail`.
+        // Sharing one label would make the two layers
+        // indistinguishable on the dashboard that exists to say which
+        // one stopped a request.
+        | "bedrock_inline"
         | "crowdstrike"
         | "mistral"
         | "pangea"
@@ -2234,6 +2729,27 @@ pub(crate) fn replica_selection_excluded_value(stage: &str) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bedrock_inline_verdict_is_labeled_separately_from_apply_guardrail() {
+        // An operator's whole reason for reading this metric is to see
+        // which layer stopped a request. Folding the inline Converse
+        // guardrail into the `bedrock` label (or into `unknown`) makes
+        // that unanswerable.
+        assert_eq!(
+            normalize_external_guardrail_labels("bedrock_inline", "output", "block"),
+            ("bedrock_inline", "output", "block")
+        );
+        assert_eq!(
+            normalize_external_guardrail_labels("bedrock", "input", "block"),
+            ("bedrock", "input", "block")
+        );
+        assert_eq!(
+            normalize_external_guardrail_labels("bedrock-inline", "output", "block").0,
+            "unknown",
+            "the set stays closed; only the exact spelling is admitted"
+        );
+    }
 
     #[test]
     fn stream_guardrail_counters_register_and_increment() {

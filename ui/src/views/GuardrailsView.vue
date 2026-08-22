@@ -10,6 +10,12 @@ import {
   sumSamples,
   type MetricFamily,
 } from "../lib/metrics";
+import {
+  corsRefusals,
+  legacySignatureDerivations,
+  CORS_REFUSALS_FAMILY,
+  SIGNATURE_LEGACY_DERIVATION_FAMILY,
+} from "../lib/security-signals";
 import { formatNumber, formatUsd } from "../lib/format";
 import PageHeader from "../components/PageHeader.vue";
 import StatCard from "../components/StatCard.vue";
@@ -45,6 +51,29 @@ const poisoningBlockCount = computed(() =>
 const wafBlocks = computed(() => fam("sbproxy_waf_persistent_blocks_total"));
 const framingBlocks = computed(() => fam("sbproxy_http_framing_blocks_total"));
 const objectAuthz = computed(() => fam("sbproxy_object_authz_violations_total"));
+
+// --- Edge refusals and signature acceptance ---
+//
+// Both families are registered on first use, so an absent family is not a
+// measured zero and neither panel renders one. See lib/security-signals.ts
+// for the absent/zero split.
+//
+// `sbproxy_cors_refusals_total` counts one thing today: a response the CORS
+// middleware would not decorate because `allowed_origins: ["*"]` was
+// combined with `allow_credentials: true`. An origin simply missing from
+// the allowlist is not counted, so the panel says what the number covers
+// rather than calling it "CORS refusals" and letting an operator read a
+// zero as "every cross-origin request was allowed".
+const cors = computed(() => corsRefusals(families.value));
+
+// `sbproxy_signature_legacy_derivation_total` is the number that closes the
+// RFC 9421 deprecation window. Acceptance of the pre-conformance
+// `@target-uri` / `@request-target` base is announced in one `warn` line
+// per process, which says a signer somewhere has not moved and nothing
+// about whether that is still true today.
+const legacySignatures = computed(() =>
+  legacySignatureDerivations(families.value),
+);
 
 const blocksByCategory = computed(() => groupByLabel(guardrailBlocks.value, "category"));
 const streamByGuardrail = computed(() => groupByLabel(streamViolations.value, "guardrail"));
@@ -117,14 +146,16 @@ const hasAnySignal = computed(
     totalWafPlane.value > 0 ||
     totalWastedTokens.value > 0 ||
     sumSamples(streamSkipped.value) > 0 ||
-    a2aTotal.value > 0,
+    a2aTotal.value > 0 ||
+    cors.value !== undefined ||
+    legacySignatures.value !== undefined,
 );
 </script>
 
 <template>
   <PageHeader
     title="Guardrails"
-    subtitle="Governance outcomes: what the guardrail, WAF, and authz planes blocked, and what wasted spend the gateway flagged."
+    subtitle="Governance outcomes: what the guardrail, WAF, authz, and CORS planes refused, what wasted spend the gateway flagged, and whether any peer still signs on the deprecated RFC 9421 request-target base."
   >
     <template #actions>
       <RouterLink class="sb-btn" :to="{ path: '/logs', query: { guardrail_action: 'block' } }">
@@ -139,8 +170,10 @@ const hasAnySignal = computed(
     <p>
       No guardrail activity recorded since the proxy started. This view fills in
       once an origin declares guardrails (input or output) and one intervenes,
-      or once the gateway flags wasted spend (duplicate requests, abandoned
-      streams, validation failures).
+      once the gateway flags wasted spend (duplicate requests, abandoned
+      streams, validation failures), once the CORS middleware withholds
+      headers from a response, or once an RFC 9421 signature is accepted on
+      the deprecated request-target base.
     </p>
     <p class="sb-faint">
       Guardrails are configured per origin under the AI handler's
@@ -235,7 +268,7 @@ const hasAnySignal = computed(
       </div>
     </section>
 
-    <section class="panel" v-if="totalWafPlane > 0">
+    <section class="panel" v-if="totalWafPlane > 0 || cors">
       <h2>Protocol-plane blocks</h2>
       <div class="subgrid">
         <div v-if="sumSamples(wafBlocks) > 0">
@@ -250,6 +283,48 @@ const hasAnySignal = computed(
           <h3>Object authz violations (kind)</h3>
           <MiniBars :items="groupByLabels(objectAuthz, ['kind'])" :format="formatNumber" />
         </div>
+        <div v-if="cors">
+          <h3>CORS headers withheld (reason)</h3>
+          <MiniBars :items="cors.breakdown" :format="formatNumber" />
+          <p class="hint">
+            Responses the CORS middleware would not decorate.
+            <code>wildcard_with_credentials</code> means the origin set
+            <code>allowed_origins: ["*"]</code> together with
+            <code>allow_credentials: true</code>, which browsers reject, so
+            the proxy withholds the headers rather than appear to authorize
+            something the browser will strip. An origin that is simply not on
+            the allowlist is denied without being counted here.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" v-if="legacySignatures">
+      <h2>RFC 9421 signature deprecation</h2>
+
+      <div class="notice" v-if="legacySignatures.total > 0">
+        <strong>A signer is still on the pre-RFC-9421 request-target base.</strong>
+        These signatures verified only against the derivation sbproxy used
+        before it became conformant, and the proxy accepts them under a
+        deprecation window that will be removed. Move the signing peers to a
+        conformant RFC 9421 library. The count has to reach zero and stay
+        there before the fallback can go; the acceptance is otherwise
+        announced in one log line per process, which cannot tell you whether
+        it is still happening today.
+      </div>
+
+      <div class="tiles">
+        <StatCard
+          label="Legacy base accepted"
+          :value="formatNumber(legacySignatures.total)"
+          :tone="legacySignatures.total > 0 ? 'accent' : undefined"
+          sub="signatures verified on the old derivation, since start"
+        />
+      </div>
+
+      <div v-if="legacySignatures.breakdown.length">
+        <h3>By covered component</h3>
+        <MiniBars :items="legacySignatures.breakdown" :format="formatNumber" color="var(--sb-warn)" />
       </div>
     </section>
 
@@ -311,6 +386,11 @@ const hasAnySignal = computed(
   font-size: 13px;
   color: var(--sb-text-muted);
   margin: 4px 0 0;
+  max-width: 68ch;
+  line-height: 1.5;
+}
+.hint code {
+  font-size: 12px;
 }
 .notice {
   border: 1px solid var(--sb-border);

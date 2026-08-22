@@ -12,7 +12,7 @@
 //! per-connection tasks finish their in-flight request and then observe the
 //! peer-side close on the next frame read.
 //!
-//! # Inbound admission (WOR-2637)
+//! # Inbound admission
 //!
 //! Everything a peer can make this node spend is bounded before it is spent.
 //! `TransportLimits` carries the whole set: a hard cap on connections
@@ -66,7 +66,7 @@ const SNAPSHOT_REJECTED: &str = "invalid cache snapshot request";
 /// Maximum inbound cache RPC connections served at once.
 ///
 /// The sizing rule is cluster shape, not request rate: [`PeerClient`] holds
-/// exactly one connection per destination and serialises every operation
+/// exactly one connection per destination and serializes every operation
 /// over it, so a healthy node's inbound count tracks how many peers exist,
 /// not how busy they are. A 200-node cluster needs 200 even under saturation.
 /// 1024 is therefore several times the largest mesh anyone runs here, which
@@ -114,8 +114,16 @@ const INBOUND_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// would evict healthy peers on a schedule.
 ///
 /// The client half recycles its own connections at a fifth of this
-/// (`CLIENT_IDLE_REUSE_MAX`), so a peer running this build reconnects on its
-/// own terms and never meets this reaper on a healthy link.
+/// (`CLIENT_IDLE_REUSE_MAX`), which is what makes the reclaim free rather
+/// than what prevents it. That recycle is evaluated when the client next
+/// issues a request, not from a timer, so a link quiet for longer than this
+/// whole window is reaped here. What the fifth buys is that the client's next
+/// request after such a gap is past its own 60-second mark too, so it opens a
+/// fresh connection instead of writing into the socket this side already
+/// closed: the reclaim costs a handshake, never a failed RPC. A steady
+/// `idle_timeout` rate on a quiet cluster is therefore normal, and only the
+/// other five reasons on
+/// [`crate::metrics::MESH_TRANSPORT_INBOUND_REJECTED`] are worth an alert.
 const INBOUND_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// How long a frame has to finish arriving once its length prefix has landed.
@@ -184,9 +192,12 @@ impl Default for TransportLimits {
 
 /// The single chokepoint every inbound refusal goes through.
 ///
-/// One place that increments the counter and one place that logs, so the
-/// `reason` set cannot quietly grow a seventh value in a branch nobody
-/// reviewed, and so the log stays bounded no matter how many refusals arrive.
+/// One place that increments the counter, so the `reason` set cannot quietly
+/// grow a seventh value in a branch nobody reviewed, and one rate-limited
+/// `warn` for the five reasons an operator should read, so the log stays
+/// bounded no matter how many refusals arrive. The sixth, the idle reclaim, a
+/// healthy cluster produces on its own and it logs at `debug` outside that
+/// limiter; see `reject` below.
 struct RefusalSink {
     /// Refusals counted since the last line was emitted.
     suppressed: AtomicU64,
@@ -206,14 +217,35 @@ impl RefusalSink {
         }
     }
 
-    /// Count one refused or torn-down inbound connection, and log it if the
-    /// rate limiter allows. `detail` is free text for the log line only; it
-    /// never reaches a label.
+    /// Count one refused or torn-down inbound connection, and log it: at
+    /// `warn` if the rate limiter allows, or at `debug` and unlimited when
+    /// the reason is the routine idle reclaim. `detail` is free text for the
+    /// log line only; it never reaches a label.
     fn reject(&self, reason: &'static str, peer: SocketAddr, detail: &str) {
         // `None` only if the family failed to register at startup; the
         // refusal still closes the connection and still logs.
         if let Some(counter) = &*MESH_TRANSPORT_INBOUND_REJECTED {
             counter.with_label_values(&[reason]).inc();
+        }
+
+        // An idle reclaim is the one member of the set a healthy cluster
+        // reaches on its own. The client half recycles at a fifth of the idle
+        // window, but it evaluates that lazily on its next request rather
+        // than from a timer, so a link with nothing to say for the whole
+        // window is reaped here rather than replaced ahead of time, and a
+        // node owning no hot keys goes that quiet routinely. It leaves before
+        // the rate limiter, not inside it, for two reasons: warning about a
+        // normal reclaim is how a channel gets tuned out, and letting one
+        // take the shared window would defer the refusal that mattered by a
+        // whole interval and discard the suppressed count it was standing
+        // for. Nothing is lost, because the counter above carries every one.
+        if reason == INBOUND_REJECT_IDLE_TIMEOUT {
+            tracing::debug!(
+                reason,
+                peer = %peer,
+                "transport: inbound connection reclaimed after its idle window"
+            );
+            return;
         }
 
         let now_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -542,7 +574,7 @@ impl Drop for TransportServer {
 /// "recover" by resyncing on the framing boundary after a crypto error, so
 /// there is no reason to keep the socket open.
 ///
-/// # Deadlines (WOR-2637)
+/// # Deadlines
 ///
 /// Every await in the loop below is bounded. The read is bounded twice, by
 /// an idle deadline on starting a frame and a frame deadline on finishing
@@ -1486,5 +1518,32 @@ mod tests {
         assert_eq!(limits.idle, Duration::from_secs(300));
         assert_eq!(limits.frame, Duration::from_secs(30));
         assert_eq!(limits.write, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn the_client_recycles_well_inside_the_inbound_idle_window() {
+        // The two halves are tuned against each other across two modules, and
+        // each module's own default test would stay green while the pairing
+        // broke. What the pairing buys: because the client re-checks its
+        // recycle mark on its next request, and that mark is shorter than
+        // this window, a request arriving after the peer reclaimed the
+        // connection is guaranteed to dial fresh instead of writing into a
+        // socket the peer already closed. Raise the client's mark past this
+        // window, or drop this window below it, and every quiet period costs
+        // a failed RPC instead of a handshake.
+        let client = crate::transport::client::PeerTimeouts::default();
+        let inbound = TransportLimits::default();
+        assert!(
+            client.idle_reuse_max < inbound.idle,
+            "the client recycle ({:?}) must fire before the inbound idle reclaim ({:?})",
+            client.idle_reuse_max,
+            inbound.idle
+        );
+        // Not merely shorter: shorter with room for a slow round trip and a
+        // reconnect, so the ordering does not depend on scheduling luck.
+        assert!(
+            client.idle_reuse_max * 2 < inbound.idle,
+            "the recycle needs real margin under the reclaim, not a hair"
+        );
     }
 }

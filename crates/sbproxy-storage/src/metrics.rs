@@ -10,16 +10,23 @@
 //!
 //! # Cardinality
 //!
-//! All three labels draw from small fixed enums:
+//! All three labels draw from small fixed enums, taken from the
+//! `observe_op` call sites rather than from intent:
 //!
-//! * `op`: `get | put | take | delete | publish | subscribe | list_prefix`
-//! * `backend`: `in_memory | redis | mesh | postgres`
-//! * `kind`: `ephemeral | persistent | pubsub`
+//! * `op`: `get | put | take | delete | exists | list_prefix | publish |
+//!   subscribe | hget | hset | hset_multi | hgetall | hdel | hexists |
+//!   sadd | srem | sismember | smembers | scard | xadd | xread | xtrim`
+//! * `backend`: `redis` is the only one wired today
+//! * `kind`: `ephemeral | persistent | pubsub | hash | set | stream`
 //! * `error_kind` (errors counter only): the variant returned by
 //!   [`StorageError::kind`].
 //!
-//! Operators should add an alert on `storage_op_errors_total` grouped
-//! by `error_kind` so disconnected backends surface immediately.
+//! Operators should add an alert on `sbproxy_storage_op_errors_total` grouped
+//! by `error_kind` so disconnected backends surface immediately. Both families
+//! carry the sanctioned `sbproxy_` prefix and are declared in the metric
+//! registry; a family outside that prefix is dropped by any scrape config
+//! built from `docs/metrics-stability.md`, which is what happened to these
+//! two while they were named `storage_op_*`.
 
 use std::future::Future;
 use std::sync::LazyLock;
@@ -40,7 +47,7 @@ use crate::error::StorageError;
 pub static STORAGE_OP_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         HistogramOpts::new(
-            "storage_op_duration_seconds",
+            "sbproxy_storage_op_duration_seconds",
             "Latency of storage backend operations"
         )
         .buckets(vec![
@@ -48,7 +55,7 @@ pub static STORAGE_OP_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|
         ]),
         &["op", "backend", "kind"]
     )
-    .expect("register storage_op_duration_seconds")
+    .expect("register sbproxy_storage_op_duration_seconds")
 });
 
 /// Total errors returned by storage backends, partitioned by error
@@ -56,12 +63,12 @@ pub static STORAGE_OP_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|
 pub static STORAGE_OP_ERRORS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         Opts::new(
-            "storage_op_errors_total",
+            "sbproxy_storage_op_errors_total",
             "Errors returned by storage backend operations"
         ),
         &["op", "backend", "kind", "error_kind"]
     )
-    .expect("register storage_op_errors_total")
+    .expect("register sbproxy_storage_op_errors_total")
 });
 
 /// Wrap a backend call so latency and error variant are recorded

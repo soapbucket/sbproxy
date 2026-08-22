@@ -64,7 +64,8 @@ impl AgentPurpose {
 ///
 /// Loaded from YAML at startup and held read-only for the rest of the
 /// process lifetime; the resolver compiles `expected_user_agent_pattern`
-/// once into a `Regex` to avoid per-request recompilation.
+/// once into a `Regex`, exactly as written, to avoid per-request
+/// recompilation.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AgentClass {
     /// Stable identifier. Kebab-case `vendor-bot`. Also serves as the
@@ -77,8 +78,29 @@ pub struct AgentClass {
     /// Operator's published contact / documentation URL. Optional.
     #[serde(default)]
     pub contact_url: Option<String>,
-    /// Anchored, case-insensitive regex matched against the request's
-    /// `User-Agent` header.
+    /// Regex matched against the request's `User-Agent` header, compiled
+    /// exactly as written.
+    ///
+    /// Two properties to write the pattern around, because neither is
+    /// supplied for you:
+    ///
+    /// - It is case-sensitive. Add an inline `(?i)` for a case-insensitive
+    ///   match, which is what every entry in the shipped catalog does. A
+    ///   pattern without it does not match a `User-Agent` that differs only
+    ///   in case, and the request falls through to `unknown`.
+    /// - It is unanchored, and matching a `User-Agent` anywhere in the
+    ///   header is the point: a real header is compound, so `GPTBot/` has to
+    ///   match inside `Mozilla/5.0 (compatible; GPTBot/1.2; +https://...)`.
+    ///   The cost is that a bare literal also matches a header that merely
+    ///   contains it, so `MyPartnerBot` classifies
+    ///   `Mozilla/5.0 (compatible; MyPartnerBot-imposter)` as your partner
+    ///   and hands it whatever allowance this entry carries. Give the
+    ///   pattern a delimiter the impersonator cannot add after your name,
+    ///   such as `(?i)MyPartnerBot/\d` or `(?i)\bMyPartnerBot\b`.
+    ///
+    /// A `User-Agent` header is unauthenticated in both directions, so this
+    /// pattern classifies traffic; it does not verify it. Verification is
+    /// `expected_reverse_dns_suffixes` and `expected_keyids`.
     pub expected_user_agent_pattern: String,
     /// Suffixes accepted by the forward-confirmed reverse-DNS check.
     /// Empty list disables rDNS verification for this entry.
@@ -295,6 +317,50 @@ struct CatalogFile {
     agent_classes: Vec<AgentClass>,
 }
 
+/// Whether a UA pattern will be compiled case-sensitively.
+///
+/// A free function rather than a closure inside the loader so the load-time
+/// warning and the test that asserts the shipped catalog never trips it are
+/// the same test. A warning whose condition only the loader knows drifts
+/// away from whatever a test asserts about it.
+///
+/// It reads the flag letters of every inline `(?flags)` or `(?flags:` group
+/// rather than searching for the literal `(?i)`, because `(?si)` and `(?im)`
+/// set the same flag and an operator who wrote one of those should not be
+/// told at every boot to add a flag they already have. A `-` ends the run,
+/// so `(?-i)` is not mistaken for turning the flag on, and any letter that
+/// is not an inline flag ends it too, so the `i` in `(?P<id>...)` is a group
+/// name rather than a flag.
+///
+/// Deliberately nothing cleverer than that. It cannot tell a flag scoped to
+/// a group from one covering the whole expression, and it does not know that
+/// a pattern built only from character classes needs no flag at all. It
+/// reports the shape operators actually get wrong, a bare literal, and stays
+/// quiet about the rest.
+fn pattern_is_case_sensitive(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut index = 0;
+    while index + 1 < bytes.len() {
+        if bytes[index] != b'(' || bytes[index + 1] != b'?' {
+            index += 1;
+            continue;
+        }
+        let mut cursor = index + 2;
+        while cursor < bytes.len() {
+            match bytes[cursor] {
+                b'i' => return false,
+                // The rest of the regex crate's inline flag letters. Anything
+                // else, including `)`, `:` and the `-` that starts the unset
+                // half, ends the run.
+                b'm' | b's' | b'u' | b'U' | b'x' | b'R' => cursor += 1,
+                _ => break,
+            }
+        }
+        index += 2;
+    }
+    true
+}
+
 impl AgentClassCatalog {
     /// Build a catalog from a parsed entry list. Each entry is
     /// validated and its UA pattern compiled once.
@@ -306,6 +372,21 @@ impl AgentClassCatalog {
             entry
                 .validate()
                 .with_context(|| format!("invalid agent class entry at index {idx}"))?;
+            // Said once at load, where somebody can still change it. The
+            // pattern is compiled exactly as written, so a missing `(?i)` is
+            // not an error and not a match either: the entry silently never
+            // catches a header whose case differs and the request falls
+            // through to `unknown`, which for a priced or allowed agent
+            // class is a bill nobody sends. The pattern itself stays out of
+            // the line; it is operator configuration and the id is enough to
+            // find it.
+            if pattern_is_case_sensitive(&entry.expected_user_agent_pattern) {
+                tracing::warn!(
+                    agent_class = %entry.id,
+                    "agent class user-agent pattern is compiled verbatim and is therefore \
+                     case-sensitive; add an inline `(?i)` unless the case is deliberate",
+                );
+            }
             let ua_regex = Regex::new(&entry.expected_user_agent_pattern)
                 .expect("validate() above guarantees the UA pattern compiles");
             if by_id.insert(entry.id.clone(), idx).is_some() {
@@ -371,6 +452,14 @@ impl AgentClassCatalog {
     /// Look up the first entry whose `expected_user_agent_pattern`
     /// matches the supplied `User-Agent` header. Falls back to scanning
     /// `aliases` (case-insensitive substring) on no UA-regex match.
+    ///
+    /// The regex pass is `is_match`, so a pattern matches anywhere in the
+    /// header rather than having to describe the whole of it, and it is
+    /// case-sensitive unless the pattern says otherwise. Both are properties
+    /// of the pattern the operator wrote; see
+    /// [`AgentClass::expected_user_agent_pattern`]. Declaration order
+    /// decides ties, so the first entry whose pattern matches wins even when
+    /// a later one would match more of the header.
     pub fn lookup_by_user_agent(&self, user_agent: &str) -> Option<&AgentClass> {
         for entry in &self.entries {
             if entry.ua_regex.is_match(user_agent) {
@@ -560,5 +649,112 @@ mod tests {
         assert_eq!(suffixes.len(), lower_sorted.len());
         // Spot-check a known suffix.
         assert!(suffixes.iter().any(|s| s == ".googlebot.com"));
+    }
+
+    /// One entry with a caller-chosen UA pattern and nothing else set.
+    fn entry_with_pattern(id: &str, pattern: &str) -> AgentClass {
+        AgentClass {
+            id: id.to_string(),
+            vendor: "v".to_string(),
+            purpose: AgentPurpose::Search,
+            contact_url: None,
+            expected_user_agent_pattern: pattern.to_string(),
+            expected_reverse_dns_suffixes: vec![],
+            expected_keyids: vec![],
+            robots_compliance_score: None,
+            crawl_to_refer_ratio: None,
+            aliases: vec![],
+            deprecated: false,
+        }
+    }
+
+    #[test]
+    fn every_shipped_pattern_carries_its_own_case_insensitive_flag() {
+        // The loader warns once per entry compiled case-sensitively. A
+        // warning the shipped catalog trips on its own is a warning
+        // operators learn to scroll past, so the default catalog has to be
+        // clean under the same condition the loader uses. The three
+        // headless sentinels are included deliberately: they never match
+        // anything, which is exactly why nobody would notice them
+        // producing the line.
+        for entry in AgentClassCatalog::defaults().iter() {
+            assert!(
+                !pattern_is_case_sensitive(&entry.expected_user_agent_pattern),
+                "shipped agent class {:?} would warn at every boot",
+                entry.id,
+            );
+        }
+    }
+
+    #[test]
+    fn the_case_sensitivity_check_reads_the_pattern_and_not_the_intent() {
+        assert!(pattern_is_case_sensitive("Acme-Crawler/\\d"));
+        assert!(pattern_is_case_sensitive("^__sbproxy_never_matches__$"));
+        assert!(!pattern_is_case_sensitive("(?i)Acme-Crawler/\\d"));
+        // Scoped flags count too: the check cannot tell how far the flag
+        // reaches, and says so rather than guessing.
+        assert!(!pattern_is_case_sensitive("Acme-((?i)crawler)"));
+
+        // Every spelling of the flag, because a warning that fires on a
+        // pattern which already has it is a warning operators mute. `(?i)`
+        // is not the only way to write it and a substring test for that
+        // exact string calls three of these case-sensitive.
+        assert!(!pattern_is_case_sensitive("(?si)Acme-Crawler"));
+        assert!(!pattern_is_case_sensitive("(?im)Acme-Crawler"));
+        assert!(!pattern_is_case_sensitive("(?i-u)Acme-Crawler"));
+        assert!(!pattern_is_case_sensitive("(?i:Acme-Crawler)"));
+
+        // And the two shapes that look like the flag and are not. `(?-i)`
+        // turns it off, and the `i` in a capture-group name is a name.
+        assert!(pattern_is_case_sensitive("(?-i)Acme-Crawler"));
+        assert!(pattern_is_case_sensitive("(?P<id>Acme-Crawler)"));
+        assert!(pattern_is_case_sensitive("(?:Acme-Crawler)"));
+    }
+
+    #[test]
+    fn a_user_agent_pattern_is_compiled_verbatim_and_matched_unanchored() {
+        // This is the rustdoc on `expected_user_agent_pattern`, asserted.
+        // Both properties are load-bearing for an operator writing a
+        // pattern, so a change to either has to change the documentation in
+        // the same commit, and this test is what makes that happen.
+        let catalog = AgentClassCatalog::from_entries(vec![entry_with_pattern(
+            "acme-crawler",
+            "Acme-Crawler/\\d",
+        )])
+        .expect("catalog builds");
+
+        assert!(
+            catalog.lookup_by_user_agent("acme-crawler/2.1").is_none(),
+            "the pattern is compiled as written, so the match is case-sensitive",
+        );
+        assert_eq!(
+            catalog
+                .lookup_by_user_agent("Acme-Crawler/2.1")
+                .map(|entry| entry.id.as_str()),
+            Some("acme-crawler"),
+        );
+
+        // Unanchored, which is what lets a pattern find its bot inside a
+        // compound header, and equally what lets an impersonator carry a
+        // partner's name into a header of its own.
+        let partner = AgentClassCatalog::from_entries(vec![entry_with_pattern(
+            "my-partner-bot",
+            "(?i)MyPartnerBot",
+        )])
+        .expect("catalog builds");
+        assert_eq!(
+            partner
+                .lookup_by_user_agent("Mozilla/5.0 (compatible; MyPartnerBot/1.0)")
+                .map(|entry| entry.id.as_str()),
+            Some("my-partner-bot"),
+        );
+        assert_eq!(
+            partner
+                .lookup_by_user_agent("Mozilla/5.0 (compatible; MyPartnerBot-imposter)")
+                .map(|entry| entry.id.as_str()),
+            Some("my-partner-bot"),
+            "a bare literal has no boundary, which is why the field docs tell an \
+             operator to write one",
+        );
     }
 }

@@ -1210,6 +1210,16 @@ pub struct RequestContext {
     /// field to this name, because a local engine reports its weights
     /// file path there, which is not the id any plane routed on.
     pub ai_serve_model: Option<String>,
+    /// Which secret the accepted AI attempt presented upstream
+    /// (WOR-2655). Closed set, an outbound counterpart to the inbound
+    /// `key_mode`: `provider_entry` (the provider entry's own
+    /// `api_key`), `native_caller` (a caller-owned native provider key
+    /// forwarded verbatim), or `fallback` (the operator's
+    /// `fallback_credential_id`, presented after the entry's own key
+    /// was refused). `None` on requests the AI gateway did not
+    /// dispatch. Never carries the credential itself, only which one
+    /// paid.
+    pub ai_credential_source: Option<&'static str>,
     /// Prompt / input tokens reported by the provider response.
     pub ai_tokens_in: Option<u64>,
     /// WOR-1499: estimated prompt tokens computed on the request path
@@ -1230,6 +1240,11 @@ pub struct RequestContext {
     /// (Anthropic `cache_read_input_tokens`, OpenAI `cached_tokens`).
     /// `None` when the provider reported no cache activity.
     pub ai_tokens_cached: Option<u64>,
+    /// Tokens written into the upstream provider's prompt cache
+    /// (Anthropic `cache_creation_input_tokens`). `None` when the provider
+    /// reported no cache write, which includes every provider that only
+    /// reports reads.
+    pub ai_tokens_cache_write: Option<u64>,
     /// Rate-limiter bucket for the authenticated virtual key, set only
     /// when the key carries a tokens-per-minute cap (WOR-1833). The
     /// request-completion path uses it to charge the response's token
@@ -1935,11 +1950,13 @@ impl RequestContext {
             ai_model: None,
             ai_logical_model: None,
             ai_serve_model: None,
+            ai_credential_source: None,
             ai_tokens_in: None,
             ai_prompt_tokens_est: None,
             ai_prompt_fingerprint: None,
             ai_tokens_out: None,
             ai_tokens_cached: None,
+            ai_tokens_cache_write: None,
             ai_key_tpm_bucket: None,
             ai_lane_priority: None,
             managed_model_permit: None,

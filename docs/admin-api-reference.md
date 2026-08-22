@@ -290,6 +290,40 @@ when the process has no dynamic key plane configured (no `keystore:`
 backend wired). List/get failures against the store are `500`; a
 missing key/credential id is `404`.
 
+### When the invalidation did not reach the shared cache
+
+Every mutation above invalidates the policy cache. With a shared L2
+tier configured (Redis, or the mesh distributed cache) that invalidation
+has to travel, and it can fail while the store write succeeds: the tier
+is unreachable, or the announcement to peer replicas did not go out.
+
+The response stays 2xx, because the record really did change in the
+keystore and re-running the mutation would not help. What it grows is a
+`cache_propagation` object saying the rest of the fleet has not heard:
+
+```json
+{
+  "key": { "key_id": "a1b2c3d4e5f60789", "status": "revoked" },
+  "cache_propagation": {
+    "status": "failed",
+    "detail": "reach the shared cache tier to invalidate an id: connection refused",
+    "effect": "other replicas may serve the previous record until their cache TTL lapses"
+  }
+}
+```
+
+The field is absent on a clean propagation, and on any deployment with
+no shared tier. The same event logs a `warn` on the replica that handled
+the request and increments
+`sbproxy_key_cache_invalidation_failures_total{scope="key"}`, which is
+the series to alert on: on a revoke it means a credential every other
+replica keeps accepting until its cache TTL expires. This replica's own
+L1 copy is always dropped, so the node that served the mutation is
+correct immediately either way.
+
+`POST /admin/cache/key-policy/evict` answers `502` in the same situation
+rather than 2xx; see that route below.
+
 ### Key record shape (`KeyView`)
 
 `GET`/`POST`/`PATCH` responses wrap a `KeyView` under `"key"`:
@@ -565,6 +599,7 @@ Response body: an array of `RequestLogEntry`:
 | `api_key_id` | string | Canonical public id of the key that governed the request, when one resolved. Matches the access log column, the `sbproxy_inbound_key_requests_total{api_key_id}` label, and the `sbproxy.key_id` span attribute. Never the secret. |
 | `key_mode` | string | Inbound credential mode: `none`, `minted`, or `native`. |
 | `key_provider` | string | Recognized native provider label, present on `native` rows. |
+| `credential_source` | string | Which secret the AI attempt presented upstream, the outbound counterpart to `key_mode`: `provider_entry` (the provider entry's own `api_key`), `native_caller` (a caller-owned native provider key, forwarded verbatim), or `fallback` (the operator's `fallback_credential_id`, presented after the entry's own key was refused). Absent on rows the AI gateway did not dispatch. Never credential material. |
 | `tenant_id` | string | Origin-scoped tenant label (`__default__` when the origin declares none). |
 | `user_id` | string | Resolved end-user identifier when user capture resolved one, already capped and redacted. |
 | `error_class` | string | Coarse failure class (`auth_denied`, `rate_limited`, `upstream_5xx`, ...). Absent on success. |
@@ -960,9 +995,9 @@ curl -s -u "admin:${SB_ADMIN_PASSWORD}" \
 <!-- CAPTURE: curl -s -u admin:demo-change-me 'http://127.0.0.1:9090/api/requests/export?format=csv&tenant=acme' | head -3 -->
 
 ```text
-timestamp,origin,method,path,status,latency_ms,client_ip,request_id,trace_id,session_id,parent_session_id,cache_status,retry_count,failover_engaged,failover_from,failover_to,load_balancer_strategy,load_balancer_target,provider,model,tokens_in,tokens_out,cost_usd_micros,guardrail_category,guardrail_action,api_key_id,key_mode,key_provider,tenant_id,user_id,error_class,config_revision,policy_version,deny_reason,policy_decisions,properties
-2026-08-21T01:11:55.226687+00:00,acme.ai.local,POST,/v1/chat/completions,200,1.887458,127.0.0.1:64696,01a021dfe05874f1b6ba866697bd518b,6531cb754eae46b5ba1b255f2c61eadb,,,disabled,0,false,,,round_robin,openai,openai,gpt-4o-mini,120,40,42,,,cfg:4:acme:13:acme.ai.local:acme-research,minted,,acme,sci@acme.test,,8cb4b33d8ffc,c:8cb4b33d8ffc:ae10235dbb7fdde7,,[],"{""feature"":""literature-scan""}"
-2026-08-21T01:11:55.214716+00:00,acme.ai.local,POST,/v1/chat/completions,200,1.116375,127.0.0.1:64695,01a021dfe04d7b11960a65be634aca3e,c4f486ae935b41fa854201f66422ad16,,,disabled,0,false,,,round_robin,openai,openai,gpt-4o,900,300,5250,,,cfg:4:acme:13:acme.ai.local:acme-platform,minted,,acme,ops@acme.test,,8cb4b33d8ffc,c:8cb4b33d8ffc:cd949575bc0dca2d,,[],"{""feature"":""incident-triage""}"
+timestamp,origin,method,path,status,latency_ms,client_ip,request_id,trace_id,session_id,parent_session_id,cache_status,retry_count,failover_engaged,failover_from,failover_to,load_balancer_strategy,load_balancer_target,provider,model,tokens_in,tokens_out,cost_usd_micros,guardrail_category,guardrail_action,api_key_id,key_mode,key_provider,tenant_id,user_id,error_class,config_revision,policy_version,deny_reason,policy_decisions,properties,credential_source
+2026-08-21T01:11:55.226687+00:00,acme.ai.local,POST,/v1/chat/completions,200,1.887458,127.0.0.1:64696,01a021dfe05874f1b6ba866697bd518b,6531cb754eae46b5ba1b255f2c61eadb,,,disabled,0,false,,,round_robin,openai,openai,gpt-4o-mini,120,40,42,,,cfg:4:acme:13:acme.ai.local:acme-research,minted,,acme,sci@acme.test,,8cb4b33d8ffc,c:8cb4b33d8ffc:ae10235dbb7fdde7,,[],"{""feature"":""literature-scan""}",
+2026-08-21T01:11:55.214716+00:00,acme.ai.local,POST,/v1/chat/completions,200,1.116375,127.0.0.1:64695,01a021dfe04d7b11960a65be634aca3e,c4f486ae935b41fa854201f66422ad16,,,disabled,0,false,,,round_robin,openai,openai,gpt-4o,900,300,5250,,,cfg:4:acme:13:acme.ai.local:acme-platform,minted,,acme,ops@acme.test,,8cb4b33d8ffc,c:8cb4b33d8ffc:cd949575bc0dca2d,,[],"{""feature"":""incident-triage""}",
 ```
 
 The `globex` row is absent because the filter removed it, not because
@@ -2886,6 +2921,16 @@ body `{}` evicts every cached policy. On the Redis key-plane tier this
 publishes the invalidation to every replica in the fleet, not just the
 node that received the request. `409 {"error":"dynamic key plane not enabled"}`
 when `key_management` has no keystore backend configured.
+
+Unlike a key mutation, propagating is the whole operation here, so a
+failure to reach the shared tier is
+`502 {"error":"eviction did not reach the shared cache tier: ...","local_cache_cleared":true}`
+rather than a 2xx with a warning attached. An operator who called this
+because a key leaked needs to know it did not happen. This node's own
+cache is cleared regardless, which is what `local_cache_cleared` reports.
+The refusal also logs a `warn` and increments
+`sbproxy_key_cache_invalidation_failures_total{scope}`, where `scope` is
+`key` for a single id and `all` for the whole-tier purge.
 
 ### `GET /admin/cache/semantic`
 

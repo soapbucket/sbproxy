@@ -1015,8 +1015,15 @@ fn sign_for_path(secret_hex: &str, key_id: &str, target_uri: &str) -> (String, S
     use sha2::Sha256;
     type HmacSha256 = hmac::Hmac<Sha256>;
 
+    // `created` is live: the verifier's freshness window is symmetric,
+    // so a signature pinned to a fixed past epoch is refused as stale
+    // before any of the path binding these tests are about is reached.
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the epoch")
+        .as_secs();
     let raw_input = format!(
-            "sig1=(\"@method\" \"@target-uri\");created=1700000000;keyid=\"{key_id}\";alg=\"hmac-sha256\""
+            "sig1=(\"@method\" \"@target-uri\");created={created};keyid=\"{key_id}\";alg=\"hmac-sha256\""
         );
     let entry = sbproxy_middleware::signatures::parse_signature_input(&raw_input)
         .unwrap()
@@ -1143,6 +1150,73 @@ async fn bot_auth_includes_query_string_in_target_uri() {
     assert!(
         matches!(result, AuthResult::Allow { .. }),
         "expected Allow when path+query matches signed @target-uri"
+    );
+}
+
+#[test]
+fn signature_verification_request_carries_the_listener_scheme() {
+    // The seam the RFC 9421 `@target-uri` fix turns on. The middleware
+    // derives the absolute URI and cannot see the listener's TLS state
+    // from an `http::Request`, so this layer stamps the scheme and the
+    // `Host` authority onto the origin-form request line before handing
+    // the request over. Without the stamp, a TLS-terminated request
+    // derives `http://` and no conformant partner's signature verifies.
+    let mut headers = http::HeaderMap::new();
+    headers.insert("host", "api.example.com".parse().unwrap());
+    let uri: http::Uri = "/v1/orders?page=2".parse().unwrap();
+
+    assert_eq!(
+        super::ai_support::absolute_request_uri(&uri, &headers, "https").to_string(),
+        "https://api.example.com/v1/orders?page=2"
+    );
+    assert_eq!(
+        super::ai_support::absolute_request_uri(&uri, &headers, "http").to_string(),
+        "http://api.example.com/v1/orders?page=2"
+    );
+
+    // And the derivation the verifier runs reads that absolute URI.
+    let req = http::Request::builder()
+        .method("GET")
+        .uri(super::ai_support::absolute_request_uri(
+            &uri, &headers, "https",
+        ))
+        .body(bytes::Bytes::new())
+        .unwrap();
+    let entry =
+        sbproxy_middleware::signatures::parse_signature_input(r#"sig1=("@target-uri");keyid="k""#)
+            .unwrap()
+            .pop()
+            .unwrap()
+            .1;
+    let base = sbproxy_middleware::signatures::build_signature_base(&req, &entry).unwrap();
+    assert!(
+        base.starts_with("\"@target-uri\": https://api.example.com/v1/orders?page=2\n"),
+        "got: {base}"
+    );
+}
+
+#[test]
+fn signature_verification_request_does_not_repoint_an_absolute_uri() {
+    // A `Host` header must never override an authority the request line
+    // already carries, or a client could sign one host and be verified
+    // against another.
+    let mut headers = http::HeaderMap::new();
+    headers.insert("host", "shadow.example".parse().unwrap());
+    let uri: http::Uri = "https://api.example.com/v1/orders".parse().unwrap();
+    assert_eq!(
+        super::ai_support::absolute_request_uri(&uri, &headers, "http").to_string(),
+        "https://api.example.com/v1/orders"
+    );
+}
+
+#[test]
+fn signature_verification_request_without_an_authority_stays_origin_form() {
+    // HTTP/1.0 with no `Host`: there is no absolute URI to assemble.
+    let headers = http::HeaderMap::new();
+    let uri: http::Uri = "/health".parse().unwrap();
+    assert_eq!(
+        super::ai_support::absolute_request_uri(&uri, &headers, "https").to_string(),
+        "/health"
     );
 }
 
@@ -2050,6 +2124,150 @@ async fn any_of_no_credential_at_all_is_missing_not_suspicious() {
         matches!(outcome, AuthTrustOutcome::Missing),
         "no credential offered anywhere must stay a neutral Missing"
     );
+}
+
+// --- WOR-2525: basic_auth's realm reaches the 401 ---
+//
+// The seam is the `Auth::BasicAuth` denial arm of
+// `check_auth_with_tls_outcome`. Before the fix it returned a bare
+// `AuthResult::Deny(401, "unauthorized")`, which carries no header
+// vector at all, so the emitter in `request_phase` had nothing to
+// stamp and the configured `realm` was parsed and then dropped. These
+// go through `compile_auth` rather than constructing the provider
+// directly so the config key an operator writes is on the path.
+
+/// A scalar `basic_auth` origin that configured a realm.
+fn compiled_basic_auth(realm: Option<&str>) -> sbproxy_modules::Auth {
+    let mut value = serde_json::json!({
+        "type": "basic_auth",
+        "users": [{"username": "admin", "password": "s3cret"}],
+    });
+    if let Some(realm) = realm {
+        value["realm"] = serde_json::Value::String(realm.to_string());
+    }
+    sbproxy_modules::compile::compile_auth(&value).expect("basic_auth must compile")
+}
+
+#[tokio::test]
+async fn basic_auth_denial_carries_the_configured_realm_challenge() {
+    let auth = compiled_basic_auth(Some("Admin Panel"));
+    let headers = http::HeaderMap::new();
+
+    let (result, _principal, outcome) =
+        check_auth_with_tls_outcome(&auth, &headers, None, "GET", "/", test_tenant(), None, None)
+            .await;
+
+    match result {
+        AuthResult::DenyWithHeaders(status, msg, hdrs) => {
+            assert_eq!(status, 401);
+            assert_eq!(msg, "unauthorized");
+            assert_eq!(
+                hdrs,
+                vec![(
+                    "WWW-Authenticate".to_string(),
+                    r#"Basic realm="Admin Panel""#.to_string()
+                )],
+                "the configured realm must reach the challenge header"
+            );
+        }
+        other => panic!(
+            "a basic_auth denial must carry a challenge; got {}",
+            auth_result_label(&other)
+        ),
+    }
+    assert_eq!(
+        outcome,
+        AuthTrustOutcome::Missing,
+        "adding a challenge must not change the trust verdict for an absent credential"
+    );
+}
+
+#[tokio::test]
+async fn basic_auth_denial_without_a_configured_realm_still_challenges() {
+    // RFC 9110 section 11.6.1 makes `realm` mandatory on a Basic
+    // challenge, so an origin that configured none still gets one
+    // rather than falling back to a header-less 401.
+    let auth = compiled_basic_auth(None);
+    let headers = http::HeaderMap::new();
+
+    let (result, _principal, _outcome) =
+        check_auth_with_tls_outcome(&auth, &headers, None, "GET", "/", test_tenant(), None, None)
+            .await;
+
+    match result {
+        AuthResult::DenyWithHeaders(401, _, hdrs) => assert_eq!(
+            hdrs,
+            vec![(
+                "WWW-Authenticate".to_string(),
+                r#"Basic realm="restricted""#.to_string()
+            )]
+        ),
+        other => panic!(
+            "an unconfigured realm must not cost the origin its challenge; got {}",
+            auth_result_label(&other)
+        ),
+    }
+}
+
+#[tokio::test]
+async fn basic_auth_wrong_password_still_challenges_and_stays_invalid_proof() {
+    // A rejected credential is the case where a client most needs to be
+    // told the scheme and realm to retry against, and the offered-proof
+    // trust verdict must survive the variant change.
+    let auth = compiled_basic_auth(Some("Admin Panel"));
+    let mut headers = http::HeaderMap::new();
+    // base64("admin:wrong")
+    headers.insert(
+        http::header::AUTHORIZATION,
+        "Basic YWRtaW46d3Jvbmc=".parse().unwrap(),
+    );
+
+    let (result, _principal, outcome) =
+        check_auth_with_tls_outcome(&auth, &headers, None, "GET", "/", test_tenant(), None, None)
+            .await;
+
+    assert!(
+        matches!(result, AuthResult::DenyWithHeaders(401, _, ref hdrs)
+            if hdrs.iter().any(|(name, value)| name.eq_ignore_ascii_case("www-authenticate")
+                && value.as_str() == r#"Basic realm="Admin Panel""#)),
+        "a rejected password must still be told which scheme and realm to retry with; got {}",
+        auth_result_label(&result)
+    );
+    assert_eq!(outcome, AuthTrustOutcome::InvalidProof);
+}
+
+#[tokio::test]
+async fn basic_auth_challenge_joins_a_merged_any_of_denial() {
+    // The composition seam: `check_any_of_auth` reads challenge headers
+    // off `DenyWithHeaders` only. With basic_auth returning a bare
+    // `Deny`, a `[basic_auth, bearer]` origin exhausted into a
+    // `Deny(401)` with no header at all, so composing basic_auth with
+    // anything erased its challenge as well.
+    let auth = sbproxy_modules::compile::compile_auth(&serde_json::json!([
+        {"type": "basic_auth", "realm": "Admin Panel",
+         "users": [{"username": "admin", "password": "s3cret"}]},
+        {"type": "bearer", "tokens": ["composed-token"]},
+    ]))
+    .expect("a two-provider auth list must compile");
+    let headers = http::HeaderMap::new();
+
+    let (result, _principal) =
+        check_auth(&auth, &headers, None, "GET", "/", test_tenant(), None).await;
+
+    match result {
+        AuthResult::DenyWithHeaders(401, _, hdrs) => {
+            let challenges: Vec<&str> = hdrs
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("www-authenticate"))
+                .map(|(_, value)| value.as_str())
+                .collect();
+            assert_eq!(challenges, vec![r#"Basic realm="Admin Panel""#]);
+        }
+        other => panic!(
+            "the composite 401 must carry the basic slot's challenge; got {}",
+            auth_result_label(&other)
+        ),
+    }
 }
 
 #[tokio::test]
@@ -4666,7 +4884,7 @@ fn wor_229_bypass_body_empty_model_returns_original_bytes() {
     let original = bytes::Bytes::from_static(
         br#"{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"hi"}]}"#,
     );
-    let out = super::make_native_bypass_body(&original, "").unwrap();
+    let out = super::make_native_bypass_body(&original, "", None).unwrap();
     // Empty resolved_model means the router did not map; passing
     // the original bytes through verbatim preserves the byte
     // forward guarantee of the bypass.
@@ -4678,7 +4896,7 @@ fn wor_229_bypass_body_same_model_returns_original_bytes() {
     let original = bytes::Bytes::from_static(
         br#"{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"hi"}]}"#,
     );
-    let out = super::make_native_bypass_body(&original, "claude-3-5-sonnet").unwrap();
+    let out = super::make_native_bypass_body(&original, "claude-3-5-sonnet", None).unwrap();
     // No mutation needed when the resolved model already matches
     // the body's model. The original bytes flow through.
     assert_eq!(out.as_ref(), original.as_ref());
@@ -4689,7 +4907,8 @@ fn wor_229_bypass_body_remaps_model_when_router_chose_different() {
     let original = bytes::Bytes::from_static(
         br#"{"model":"sonnet-alias","messages":[{"role":"user","content":"hi"}]}"#,
     );
-    let out = super::make_native_bypass_body(&original, "claude-3-5-sonnet-20241022").unwrap();
+    let out =
+        super::make_native_bypass_body(&original, "claude-3-5-sonnet-20241022", None).unwrap();
     let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(
         parsed["model"].as_str().unwrap(),
@@ -4701,8 +4920,42 @@ fn wor_229_bypass_body_remaps_model_when_router_chose_different() {
 #[test]
 fn wor_229_bypass_body_propagates_parse_errors() {
     let invalid = bytes::Bytes::from_static(b"{not valid json");
-    let err = super::make_native_bypass_body(&invalid, "claude-3-5-sonnet").unwrap_err();
+    let err = super::make_native_bypass_body(&invalid, "claude-3-5-sonnet", None).unwrap_err();
     assert!(err.is_syntax() || err.is_data());
+}
+
+/// WOR-2652: the bypass rebuilds the request from the inbound bytes, so
+/// the operator tier written into `attempt_body` never reaches it. Without
+/// the tier argument, a tiered Anthropic entry would forward whatever the
+/// caller sent on the one surface the gateway forwards byte for byte.
+#[test]
+fn bypass_body_writes_the_operator_tier_over_the_callers() {
+    let original = bytes::Bytes::from_static(
+        br#"{"model":"claude-3-5-sonnet","service_tier":"priority","messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    let out = super::make_native_bypass_body(
+        &original,
+        "claude-3-5-sonnet",
+        Some(("service_tier", "default")),
+    )
+    .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(parsed["service_tier"].as_str().unwrap(), "default");
+    assert_eq!(parsed["model"].as_str().unwrap(), "claude-3-5-sonnet");
+}
+
+#[test]
+fn bypass_body_stays_a_byte_forward_when_the_tier_already_matches() {
+    let original = bytes::Bytes::from_static(
+        br#"{"model":"claude-3-5-sonnet","service_tier":"default","messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    let out = super::make_native_bypass_body(
+        &original,
+        "claude-3-5-sonnet",
+        Some(("service_tier", "default")),
+    )
+    .unwrap();
+    assert_eq!(out.as_ref(), original.as_ref());
 }
 
 // --- WOR-525: ARDP discovery JSON shape ---

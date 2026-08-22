@@ -176,6 +176,26 @@ pub const FIELD_CONTRACTS: &[FieldContract] = &[
                this is an upstream fact, not a proxy policy decision.",
     },
     FieldContract {
+        event: DecisionEvent::AiAdmission,
+        fields: &["surface", "verdict"],
+        note: "The pre-provider refusal record. `surface` is the inbound AI surface the \
+               request arrived on, the same vocabulary \
+               `sbproxy_ai_surface_requests_total` uses, so a refusal rate is a join rather \
+               than a guess: `messages` or `responses` for a refusal at the native-format \
+               shim, and any JSON surface, `chat_completions` included, for one at the \
+               shared stored-prompt resolver. `verdict` is the refusal's bounded reason code \
+               (`tools_mcp_unsupported`, `previous_response_id_unsupported`, \
+               `conversation_unsupported`, `store_unsupported`, `prompt_object_unresolved`, \
+               `malformed_json`, `body_not_object`, `role_missing`, `role_unsupported`, \
+               `prompt_reference_not_found`, `prompt_object_unrenderable`, \
+               `prompt_render_failed`, and `malformed_request` for a refusal whose site has \
+               not been coded yet). The refusal message is deliberately not a field: it \
+               interpolates caller bytes on several of those codes, and details ship \
+               unredacted. Coverage is the three inbound native-shim refusal arms plus the \
+               two stored-prompt resolver arms; a request refused later by a model gate, \
+               guardrail, budget, or policy records under that plane's own event.",
+    },
+    FieldContract {
         event: DecisionEvent::AiClose,
         fields: &["verdict"],
         note: "`verdict` carries the terminal `finish_reason` (`stop`, `length`, `tool_calls`, \
@@ -368,6 +388,7 @@ mod tests {
             flagged_count: Some(0),
             guardrail_spans: vec![sbproxy_security::span::DetectionSpan::new("a", 0, 1)],
             guardrail_spans_dropped: Some(0),
+            surface: Some("a".into()),
         };
         let wire = serde_json::to_value(&populated).expect("serializes");
         let object = wire.as_object().expect("detail is an object");

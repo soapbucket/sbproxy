@@ -27,16 +27,24 @@
 //! # => 2iFjyCUlIZVN/xib7q/lEQEIsrLGbwc5K/6PZu2F6Ys=
 //! ```
 //!
-//! `created` is in the past, which the verifier accepts (only future
-//! `created` values fail freshness). No `expires` is set. The HMAC
-//! key is supplied as a hex string so `decode_secret` reliably ends
-//! up with the same 15 bytes both at signing time (Python) and at
+//! `created` sits far in the past, which the verifier now refuses as
+//! stale unless the window covers it. That is why every config here
+//! that expects a signature to verify sets
+//! `clock_skew_seconds: 9999999999`: the fixture signature is a
+//! committed constant and cannot be re-minted per run, so the window is
+//! what has to move. The `directory_*` configs leave the default,
+//! because none of them asserts a successful verification: they assert
+//! directory fetch counts and refusals. No `expires` is set. The HMAC
+//! key is supplied as a hex string so `decode_secret` reliably ends up
+//! with the same 15 bytes both at signing time (Python) and at
 //! verification time (the proxy).
 //!
-//! We sign for the root path `/` because that is the most stable
-//! `@target-uri` value the proxy reconstructs. The e2e harness sends
-//! every request to a small static-action origin so the request line
-//! is `GET / HTTP/1.1`.
+//! We sign `"@target-uri": /`, which is the derivation earlier releases
+//! used. RFC 9421 §2.2.2 defines it as the absolute URI, and the proxy
+//! derives that now; this fixture rides the deprecation window that
+//! still accepts the old shape, so it also covers that fallback. The
+//! e2e harness sends every request to a small static-action origin so
+//! the request line is `GET / HTTP/1.1`.
 
 use sbproxy_e2e::{MockUpstream, ProxyHarness};
 use serde_json::json;

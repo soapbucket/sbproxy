@@ -9,7 +9,10 @@
 #
 # Test:
 #   curl -v -H 'Host: api.local' http://127.0.0.1:8080/headers
+#   # A preflight needs Access-Control-Request-Method; OPTIONS carrying
+#   # only Origin is a normal request and is proxied upstream.
 #   curl -v -H 'Host: api.local' -H 'Origin: https://example.com' \
+#        -H 'Access-Control-Request-Method: POST' \
 #        -X OPTIONS http://127.0.0.1:8080/headers
 
 proxy:

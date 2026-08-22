@@ -1,6 +1,6 @@
 # Running sbproxy on Kubernetes
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 The Kubernetes operator at `crates/sbproxy-k8s-operator/` reconciles two CustomResources into a running proxy: an `SBProxy` describes the deployment shape, and an `SBProxyConfig` carries the `sb.yml` document the proxy reads on startup. The operator owns a Deployment, Service, and ConfigMap per `SBProxy`. With `spec.clustering.enabled: true` the Deployment is replaced by a StatefulSet plus a headless Service and a shared-key Secret, and the replicas form a gossip mesh; see "Clustered proxies" below. Everything else on this page applies to both shapes.
 
@@ -20,7 +20,7 @@ flowchart TD
     Validate -->|valid| AcmeCheck{"replicas > 1 and ACME on a\npod-local store (redb / sqlite /\nmemory / omitted)?"}
     AcmeCheck -->|yes| Status1
     AcmeCheck -->|no| Render["Render sb.yml: clustered adds\nproxy.cluster, non-clustered\nships it verbatim"]
-    Render --> Hash["Hash the rendered body,\nclear status.lastError"]
+    Render --> Hash["Hash the rendered body,\npatch status.observedConfigHash"]
     Hash --> Apply["Apply ConfigMap + Service\nunconditionally"]
     Apply --> Shape{"spec.clustering.enabled?"}
     Shape -->|no| GCSts["Delete any leftover StatefulSet\n+ headless Service"]
@@ -29,13 +29,32 @@ flowchart TD
     HotCheck -->|yes| HotReload["POST /admin/reload\nto every pod IP"]
     HotCheck -->|no| RolloutD["Patch Deployment: config-hash\nannotation triggers a rolling restart"]
     HotReload -->|any pod fails| RolloutD
-    HotReload -->|all pods ok| Requeue["Requeue in 300s"]
-    RolloutD --> Requeue
+    HotReload -->|all pods ok| Stamp["Patch status.configHash,\nclear status.lastError"]
+    RolloutD --> Stamp
     GCDeploy --> StsApply["Apply shared-key Secret, headless\nService, StatefulSet (a cluster\ntopology change always rolls)"]
-    StsApply --> Requeue
+    StsApply --> Stamp
+    Stamp --> Requeue["Requeue in 300s"]
 ```
 
+### Reading the status
+
+Two hashes, because the pass has two interesting moments and they answer different questions.
+
+| Field | Written | Means |
+|---|---|---|
+| `status.observedConfigHash` | after validation, before anything is applied | the operator has read and validated this config |
+| `status.configHash` | after the ConfigMap, Service, and workload have all been applied, or after every pod accepted a hot reload | this is the config the pods are running |
+| `status.lastError` | cleared at the same point as `configHash`; set by any of the pre-rollout guards (config validation, the multi-replica ACME store check, clustered config rendering) | the reason nothing moved |
+
+So `configHash` equal to `observedConfigHash` with an empty `lastError` is the fleet being on the config you applied. `configHash` trailing `observedConfigHash` means the rollout is in progress or is stuck. The two used to be one field written straight after validation, which reported a completed rollout while a 403 on the very next ConfigMap patch left every pod on the previous config.
+
+Read `lastError` carefully while a rollout is stuck. It carries the last guard refusal and is cleared only when a rollout completes, so during a stuck rollout it can still name a refusal from an earlier pass that no longer applies. Failures after the guards (a 403 on the ConfigMap patch, a rejected apply) do not write it at all. The hash gap is what tells you the rollout is stuck; the operator's own log is what tells you why.
+
 Config-only changes prefer the hot-reload branch; a cluster-topology change (replica count, ports, flipping `clustering.enabled`) always takes the rollout path, because those are process-owned identity and never swap on a live reload. See [Hot-reload (recommended)](#hot-reload-recommended) and [Clustered proxies](#clustered-proxies) below for what each branch actually does to the pods.
+
+A pass over an unchanged `SBProxy` writes nothing and reloads nothing. Deciding that needs the two hashes above rather than the pod template's `sbproxy.dev/config-hash` annotation: a successful hot reload deliberately leaves that annotation alone, since changing it is the rolling restart the reload exists to avoid. The operator reads `status.configHash` for "what have the pods been given" and keeps the annotation at whatever the pods were started with until something actually has to roll them.
+
+Upgrade the CRDs along with the operator image. `observedConfigHash` is new, and until the CRD carries it the apiserver prunes the field on every status write. The operator only trusts a `configHash` that has an `observedConfigHash` beside it, because an older build wrote `configHash` before applying anything and a hash that means "seen" would read as "delivered". So an operator running against the old CRD reloads the fleet once per requeue instead of skipping the pass, which is wasteful rather than wrong and stops as soon as the CRD is applied. `helm upgrade` handles this; a raw `kubectl apply` needs `deploy/crds/sbproxy.yaml` reapplied too.
 
 ## Install the chart
 
@@ -514,7 +533,15 @@ The check lives in the operator rather than in config validation because the rep
 
 ## Leader election
 
-The operator runs more than one replica safely. Each replica races for a `coordination.k8s.io/v1` Lease named `sbproxy-operator-leader` in its own namespace. The replica that wins the race runs the reconciler; the others wait. When the leader's pod is deleted, restarted, or partitioned from the API server, the renew loop fails, the leader exits with code 0, and a standby replica wins the next acquire pass within ~15s (the lease duration).
+The operator runs more than one replica safely. Each replica races for a `coordination.k8s.io/v1` Lease named `sbproxy-operator-leader` in its own namespace. The replica that wins the race runs the reconciler; the others wait. When the leader's pod is deleted, restarted, or partitioned from the API server, the leader fences its own writes, exits with code 0, and a standby replica wins the next acquire pass within ~15s (the lease duration).
+
+Two things make "safely" a claim rather than a hope, and both are worth knowing if you are reading the Lease or the operator log.
+
+**One winner per race.** A standby that finds the Lease expired takes it over with a write conditional on the exact `resourceVersion` it read the staleness decision from. Two standbys polling the same stale Lease therefore see one 200 and one 409; the loser keeps polling. `spec.leaseTransitions` counts the handoffs, so a number climbing faster than your pod restarts is worth looking at.
+
+**Step-down happens before takeover becomes legal, not at the same instant.** The holder measures a 10s safety deadline from the start of its last successful renewal, which is the same instant the `renewTime` a successor reads was stamped. The deadline caps the inter-renewal sleep and each individual API call, so an apiserver that hangs rather than erroring cannot push the step-down past it. At the deadline the operator closes an internal write gate; every reconcile checks that gate before it patches status, applies a ConfigMap, Service, Deployment, or StatefulSet, or POSTs `/admin/reload` to a proxy pod, and abandons the pass rather than writing. That leaves a full 5s between the fence and the earliest moment a standby's `is_expired` returns true, which is the margin for clock skew between the two pods.
+
+A pass abandoned that way is counted on `sbproxy_operator_reconcile_total{result="fenced"}` and logged with the reason. A single transient apiserver error is not a step-down: renewals are retried until the deadline, so a 500 during an apiserver rollout costs one request rather than a pod restart.
 
 The chart enables leader election by default:
 
@@ -551,7 +578,7 @@ The Lease lives in the operator's own namespace, so the namespaced Role covers i
 
 The Lease namespace is discovered in this order: `K8S_NAMESPACE` env var (the chart wires this from the downward API), the service-account namespace file at `/var/run/secrets/kubernetes.io/serviceaccount/namespace`, then the literal string `default` as a last resort.
 
-The lease timing matches client-go defaults: `leaseDurationSeconds=15`, renew every 5s, retry every 2s, abort the renew loop after a 10s API call timeout.
+The lease timing matches client-go defaults: `leaseDurationSeconds=15`, renew every 5s, retry every 2s. Each renewal call is cut off after 5s, and the holder fences itself 10s after the start of its last successful renewal.
 
 ## Graceful shutdown
 

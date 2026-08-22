@@ -155,7 +155,9 @@ pub use store::{
     SharedSettlementStore, SystemClock, UsageOutcome,
 };
 #[cfg(feature = "runtime")]
-pub use worker::{SettlementWorker, SettlementWorkerHandle, WorkerConfig, WorkerStatus};
+pub use worker::{
+    SettlementWorker, SettlementWorkerHandle, WorkerConfig, WorkerStageFailures, WorkerStatus,
+};
 
 #[cfg(feature = "recovery-crypto")]
 pub use recovery_crypto::{RecoveryBinding, RecoveryCipher};

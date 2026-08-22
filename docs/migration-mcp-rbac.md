@@ -1,6 +1,6 @@
 # Migrating MCP tool access policies
 
-*Last modified: 2026-08-08*
+*Last modified: 2026-08-21*
 
 This is a migration record for one breaking change, kept so an operator upgrading from a config
 written before it can find the shape their file needs to become. It is reference material: the
@@ -191,9 +191,19 @@ tenant A's traffic cannot starve tenant B's of the same tool. A
 caller over quota gets JSON-RPC error code `-32099` with a
 human-readable message; the upstream is never contacted.
 
-Window units: `ms`, `s`, `m`, `h`, `d`. The store is per-action and
-lives in process memory; SIGHUP reload rebuilds the action and
-resets the counters.
+Window units: `ms`, `s`, `m`, `h`, `d`. Anything else is refused at
+config load with an error naming the policy and the rule. The store is
+per-action and lives in process memory; SIGHUP reload rebuilds the
+action and resets the counters. Windows are held per
+`(tenant_id, principal_id, tool_name)` and reclaimed once they age
+out; past 10,000 live windows for one tenant, or 100,000 across the
+process, a principal with no window of its own is refused rather than
+admitted unmetered. The per-tenant ceiling is what keeps the sentence
+above true under load: without it, one tenant authenticating under
+many distinct `sub` values fills the whole map and every other
+tenant's next unseen principal is refused too. That refusal is counted
+on `sbproxy_mcp_tool_quota_registry_saturated_total`, which is what
+tells it apart from a caller genuinely over quota.
 
 ## See also
 

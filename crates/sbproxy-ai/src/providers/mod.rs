@@ -37,7 +37,10 @@ use serde::{Deserialize, Serialize};
 /// Embedded gzipped catalog. The build copies the file at
 /// `data/ai_providers.yml.gz` into the binary so a fresh checkout
 /// does not need to know about the file path. Regenerate via
-/// `gzip -k -9 data/ai_providers.yml`.
+/// `gzip -n -9 -c data/ai_providers.yml > data/ai_providers.yml.gz`.
+/// `-n` drops the source filename and mtime from the gzip header, so
+/// the same YAML always compresses to the same bytes and a rebuild does
+/// not show up as a diff.
 const EMBEDDED_PROVIDERS_GZ: &[u8] = include_bytes!("../../data/ai_providers.yml.gz");
 
 /// Known provider metadata.
@@ -61,13 +64,42 @@ pub struct ProviderInfo {
     /// Wire format family this provider's API speaks.
     pub format: ProviderFormat,
     /// Whether the provider supports Server-Sent Events streaming.
+    ///
+    /// A per-vendor claim about the vendor's API, not a gateway
+    /// decision; see the note on [`Self::supports_chat`].
     pub supports_streaming: bool,
     /// Whether the provider exposes an embeddings endpoint.
+    ///
+    /// A per-vendor claim about the vendor's API, not a gateway
+    /// decision; see the note on [`Self::supports_chat`].
     pub supports_embeddings: bool,
     /// Whether the provider exposes a chat-completions endpoint.
     /// Defaults to `true`; set to `false` for embeddings-only or
-    /// reranker-only providers (e.g. Voyage, Jina) so chat configs
-    /// fail closed at validation time instead of 404ing at runtime.
+    /// reranker-only providers (e.g. Voyage, Jina).
+    ///
+    /// This and its two neighbours are claims about the vendor's own
+    /// API. They decide nothing on the request path: whether the
+    /// gateway forwards a surface or answers 501 comes from
+    /// [`crate::api_routes::provider_supports_surface`], which keys on
+    /// the wire format.
+    ///
+    /// What they decide is what a model listing may advertise.
+    /// [`crate::api_routes::surface_capability_names`] publishes the
+    /// intersection of the two, so the array is never wider than the
+    /// gate (nothing named can be refused) and never claims a surface
+    /// on a vendor's behalf that the catalog has no record of. Setting
+    /// one to `false` narrows a listing and changes nothing about what
+    /// is forwarded.
+    ///
+    /// Before WOR-2647 the listing read these alone while the matrix
+    /// answered the request, and the two disagreed on 43 of the 72
+    /// shipped entries in both directions: a bedrock listing advertised
+    /// the `embeddings` surface the request path answers with 501, and
+    /// a vertex listing hid one it serves. Bedrock keeps
+    /// `supports_embeddings: true` because Titan does embed, through a
+    /// shape the gateway does not forward, and the intersection is what
+    /// keeps it off the listing; vertex's entry was simply wrong and
+    /// was corrected.
     #[serde(default = "default_true")]
     pub supports_chat: bool,
     /// Declared data-handling posture of the vendor's API, per its
@@ -78,6 +110,12 @@ pub struct ProviderInfo {
     /// the pessimistic default.
     #[serde(default)]
     pub data_posture: CatalogDataPosture,
+    /// Service tiers this vendor's API sells, and the wire spelling of
+    /// each. Absent means the vendor has no tier axis the gateway knows
+    /// about, so a provider entry asking for one is refused at config
+    /// load. See [`crate::service_tier`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tiers: Option<crate::service_tier::CatalogServiceTiers>,
 }
 
 fn default_true() -> bool {
@@ -107,7 +145,7 @@ pub struct CatalogDataPosture {
     ///
     /// Informational, and deliberately not an input to the routing
     /// eligibility filter: it says an arrangement is available to go
-    /// and sign, not that this deployment holds one. Four catalog
+    /// and sign, not that this deployment holds one. Five catalog
     /// entries offer one and retain by default, so treating this flag
     /// as a held posture would let `require_zdr` route to a stock
     /// retaining account. Declaring that a specific deployment
@@ -179,6 +217,8 @@ struct YamlProvider {
     supports_chat: bool,
     #[serde(default)]
     data_posture: CatalogDataPosture,
+    #[serde(default)]
+    service_tiers: Option<crate::service_tier::CatalogServiceTiers>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -228,7 +268,7 @@ fn registry_slot() -> &'static ArcSwap<Registry> {
 /// the file cannot be read, the embedded gzipped catalog is used
 /// instead.
 ///
-/// Behaviour on a second call: the new registry replaces the live
+/// Behavior on a second call: the new registry replaces the live
 /// one atomically (so this entrypoint can also drive an explicit
 /// reload). For SIGHUP / file-watcher / admin reload paths, prefer
 /// [`reload_provider_registry`] for clarity.
@@ -406,6 +446,7 @@ fn build_registry(override_path: Option<&Path>) -> anyhow::Result<Registry> {
             supports_embeddings: entry.supports_embeddings,
             supports_chat: entry.supports_chat,
             data_posture: entry.data_posture,
+            service_tiers: entry.service_tiers,
         };
         let idx = providers.len();
         providers.push(info);
@@ -474,19 +515,20 @@ mod tests {
     ///
     /// These assertions read `>= 43` until WOR-2627. A floor is true of
     /// every count above it, so the suite agreed with the catalog at 43,
-    /// at 72, and with `MIGRATION.md`'s claim of "90+" at the same time,
+    /// at 70, and with `MIGRATION.md`'s claim of "90+" at the same time,
     /// and none of the three could be wrong as far as any test here was
     /// concerned. `scripts/check-doc-drift.sh` derives the same number
     /// from the YAML and holds the prose to it, so a provider added
     /// without updating this constant fails here, and one added without
     /// updating the docs fails there.
-    const CATALOG_PROVIDERS: usize = 72;
+    const CATALOG_PROVIDERS: usize = 70;
 
     /// Wire-format split of the catalog, as `docs/providers.md`,
-    /// `docs/features.md`, and `docs/ai-gateway.md` all publish it: 66
+    /// `docs/features.md`, and `docs/ai-gateway.md` all publish it: 63
     /// OpenAI-format passthroughs, three in-tree translators (Anthropic,
-    /// Gemini, Bedrock), three custom-format entries.
-    const CATALOG_FORMAT_SPLIT: (usize, usize, usize, usize, usize) = (66, 1, 1, 1, 3);
+    /// Gemini, Bedrock), four custom-format entries (SageMaker, Oracle,
+    /// Watsonx, Writer).
+    const CATALOG_FORMAT_SPLIT: (usize, usize, usize, usize, usize) = (63, 1, 1, 1, 4);
 
     /// The checked-in plain-text catalog.
     ///
@@ -689,22 +731,35 @@ mod tests {
     #[test]
     fn declared_catalog_postures_parse_into_provider_info() {
         // Vendors whose published terms declare no prompt storage.
-        let bedrock = get_provider_info("bedrock").unwrap();
-        assert!(!bedrock.data_posture.retains_data);
-        assert!(bedrock.data_posture.zdr_available);
+        for name in ["perplexity", "cerebras"] {
+            let info = get_provider_info(name).unwrap();
+            assert!(
+                !info.data_posture.retains_data,
+                "{name} publishes no-retention terms"
+            );
+            assert!(info.data_posture.zdr_available, "{name} is zero-retention");
+        }
 
         // Vendors that retain by default but offer a ZDR arrangement.
         // Offering one is not holding one: these entries stay outside a
         // `require_zdr` candidate set until an operator declares the
         // agreement on their own provider entry.
-        for name in ["openai", "anthropic", "azure", "vertex"] {
+        //
+        // Bedrock belongs here rather than above: AWS calls zero data
+        // retention the platform default, but its abuse-detection page
+        // carves out named models whose classifier-flagged traffic is
+        // retained up to 30 days with no opt-in, and the model name
+        // passes straight through from the caller.
+        for name in ["openai", "anthropic", "azure", "bedrock", "vertex"] {
             let info = get_provider_info(name).unwrap();
             assert!(info.data_posture.retains_data, "{name} retains by default");
             assert!(info.data_posture.zdr_available, "{name} offers ZDR");
         }
 
         // Local engines keep the prompt on the operator's own host.
-        for name in ["ollama", "vllm", "tgi", "lmstudio", "llamacpp"] {
+        for name in [
+            "ollama", "vllm", "sglang", "localai", "tgi", "lmstudio", "llamacpp",
+        ] {
             let info = get_provider_info(name).unwrap();
             assert!(!info.data_posture.retains_data, "{name} is local");
             assert!(info.data_posture.zdr_available, "{name} is local");

@@ -3,6 +3,8 @@ import { computed, onMounted, ref, onUnmounted } from "vue";
 import { api, asList, type HealthComponent, type ResidentModel } from "../api";
 import { useAsync } from "../composables/useAsync";
 import { formatBytes, formatDuration, formatNumber } from "../lib/format";
+import { parsePrometheus } from "../lib/metrics";
+import { certStoreStatus } from "../lib/security-signals";
 import PageHeader from "../components/PageHeader.vue";
 import StatCard from "../components/StatCard.vue";
 import StatusBadge from "../components/StatusBadge.vue";
@@ -24,11 +26,21 @@ const clusterVram = useAsync(() => api.clusterVram(), {
   refreshLabel: "Cluster VRAM",
 });
 
+// The certificate store is the one startup fact with no other symptom.
+// `/health` does not carry it, so this page reads the scrape for the single
+// `sbproxy_cert_store_degraded` gauge. It is set once at startup, so 30s is
+// as often as it can usefully be read.
+const certMetrics = useAsync(() => api.metrics(), {
+  pollMs: 30_000,
+  refreshLabel: "Certificate store",
+});
+
 function refresh() {
   health.run();
   stats.run();
   modelHost.run();
   clusterVram.run();
+  certMetrics.run();
 }
 
 const liveRps = ref(0);
@@ -57,6 +69,48 @@ onUnmounted(() => {
   if (rpsInterval) {
     clearInterval(rpsInterval);
   }
+});
+
+// Four states, and the reason this reads the family rather than summing it:
+// an absent gauge means no certificate store was opened at all, which is the
+// normal state for a node with no ACME configuration and must not be drawn
+// as the healthy zero. See lib/security-signals.ts.
+const certStore = computed(() => {
+  const text = certMetrics.data.value;
+  if (text === null || text === undefined) return null;
+  return certStoreStatus(parsePrometheus(text));
+});
+
+// A scrape that did not answer is its own state. Dropping the row on a
+// failed fetch would make an unreachable /metrics look exactly like a node
+// with no certificate store, which is the distinction this row exists to
+// draw. Every other panel on this page renders an ErrorState; one row
+// cannot, so it says so in place.
+const certRow = computed<{
+  label: string;
+  tone: "ok" | "warn" | "neutral";
+  summary: string;
+  title: string;
+} | null>(() => {
+  const store = certStore.value;
+  if (store) {
+    return {
+      label: store.label,
+      tone: store.tone,
+      summary: store.summary,
+      title: store.detail,
+    };
+  }
+  if (certMetrics.error.value) {
+    return {
+      label: "unavailable",
+      tone: "neutral",
+      summary: "The metrics scrape did not answer.",
+      title:
+        "This row reads sbproxy_cert_store_degraded from GET /metrics. That request failed, so whether this node opened the certificate store its config asked for is unknown. It is not a report that no store was opened.",
+    };
+  }
+  return null;
 });
 
 // Health components can arrive as an array or a map of name -> value.
@@ -121,7 +175,7 @@ function optionalNumber(v: unknown): number | undefined {
 <template>
   <PageHeader
     title="Overview"
-    subtitle="Live health, aggregate stats, and the local model host at a glance."
+    subtitle="Live health, the certificate store this node opened, aggregate stats, and the local model host at a glance."
   >
     <template #actions>
       <button class="sb-btn" @click="refresh">Refresh</button>
@@ -148,13 +202,36 @@ function optionalNumber(v: unknown): number | undefined {
       <StatCard label="Uptime" :value="uptime ?? 'n/a'" />
       <StatCard label="Components" :value="healthComponents.length || '0'" />
     </div>
-    <div class="card-list" v-if="healthComponents.length">
+    <!--
+      A certificate store that is not persisting has no other symptom until
+      the CA rate-limits the hostname, and it is not a health component, so
+      it is hoisted to a warning block rather than left as a row an operator
+      has to read past. `headline` is set for both states that qualify: the
+      backend that could not be opened, and the backend configured in memory,
+      which opens cleanly and still persists nothing.
+    -->
+    <div
+      v-if="certStore?.headline"
+      class="cert-alert"
+      role="status"
+      aria-live="polite"
+    >
+      <strong>{{ certStore.headline }}</strong>
+      {{ certStore.detail }}
+    </div>
+
+    <div class="card-list" v-if="healthComponents.length || certRow">
       <div class="check" v-for="(c, i) in healthComponents" :key="i">
         <span class="check__name sb-mono">{{ c.name ?? "component" }}</span>
         <span class="check__detail sb-muted" v-if="c.detail || c.message">
           {{ c.detail ?? c.message }}
         </span>
         <StatusBadge :label="String(c.status ?? 'unknown')" />
+      </div>
+      <div class="check" v-if="certRow" :title="certRow.title">
+        <span class="check__name sb-mono">certificate store</span>
+        <span class="check__detail sb-muted">{{ certRow.summary }}</span>
+        <StatusBadge :label="certRow.label" :tone="certRow.tone" />
       </div>
     </div>
   </section>
@@ -275,6 +352,17 @@ function optionalNumber(v: unknown): number | undefined {
   grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
   gap: var(--sb-space-4);
   margin-bottom: var(--sb-space-4);
+}
+.cert-alert {
+  border: 1px solid var(--sb-border);
+  border-left: 3px solid var(--sb-warn);
+  background: var(--sb-warn-bg);
+  color: var(--sb-warn-fg);
+  padding: 10px 12px;
+  margin-bottom: var(--sb-space-4);
+  font-size: 13px;
+  line-height: 1.5;
+  max-width: 90ch;
 }
 .card-list {
   display: flex;

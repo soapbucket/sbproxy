@@ -26,6 +26,39 @@
 //! characters, and a rule that treated a language as an attack would be both
 //! wrong and insulting. Only the *controls* that reorder or hide are flagged,
 //! never the scripts that need them.
+//!
+//! # Variation selectors, and why they are flagged despite the false positives
+//!
+//! `U+FE00..=U+FE0F` and `U+E0100..=U+E01EF` are 256 code points of general
+//! category `Mn` that render as nothing on their own, are not controls, and
+//! tokenize as text. That is the channel current smuggling work uses, because
+//! it is wide enough to carry a byte per code point and survives every
+//! reviewer view the TAG block does.
+//!
+//! `U+FE0F` is also the emoji presentation selector, so a tool description
+//! ending in an emoji carries one legitimately. Nothing in the code point
+//! distinguishes the two uses: the same character after a base emoji is
+//! presentation and after a letter is payload, and payload can be written
+//! after an emoji too. This module flags both, on the reasoning that a
+//! reviewer being told "this description contains invisible characters" is a
+//! recoverable annoyance while a smuggled instruction reaching the model is
+//! not. [`ConcealmentClass::VariationSelector`] is its own class rather than
+//! folded into [`ConcealmentClass::ZeroWidth`] so an operator watching the
+//! per-class metric can see which findings are the noisy ones.
+//!
+//! The emoji selector is not the only legitimate use, and this is the one
+//! place the "never the scripts that need them" rule above is bent rather
+//! than kept. `U+E0100..=U+E01EF` is the Ideographic Variation Sequence
+//! range: Japanese and Chinese text uses it to pick a specific glyph for a
+//! kanji or hanzi, so a tool description written in Japanese can carry
+//! several without anything being hidden. `U+180E`, flagged under
+//! [`ConcealmentClass::ZeroWidth`] below, is the Mongolian vowel separator
+//! and is the same story. Both are reported anyway, because the code point a
+//! script needs and the code point a payload rides on are the same code
+//! point, and there is no signal in the text that separates them. An operator
+//! whose catalogue is CJK or Mongolian should expect a standing
+//! `variation_selector` finding rate and read it as noise, which is exactly
+//! why the class is broken out rather than merged into the others.
 
 /// A class of character that hides content from a reader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -39,6 +72,13 @@ pub enum ConcealmentClass {
     /// Zero-width characters, which can split a word a reviewer is scanning
     /// for or pad text that renders as nothing.
     ZeroWidth,
+    /// `U+FE00..=U+FE0F` and `U+E0100..=U+E01EF`, the variation selectors.
+    /// 256 invisible, non-control code points, wide enough to carry a byte
+    /// each. Includes `U+FE0F`, which legitimate emoji carry, and the
+    /// Ideographic Variation Sequence range, which legitimate CJK text
+    /// carries; see the module docs for why those false positives are
+    /// accepted.
+    VariationSelector,
     /// C0 and C1 controls other than tab, line feed, and carriage return.
     OtherControl,
 }
@@ -51,6 +91,7 @@ impl ConcealmentClass {
             Self::TagBlock => "tag_block",
             Self::BidiControl => "bidi_control",
             Self::ZeroWidth => "zero_width",
+            Self::VariationSelector => "variation_selector",
             Self::OtherControl => "other_control",
         }
     }
@@ -70,6 +111,14 @@ impl ConcealmentClass {
             // newline a reviewer expects, and they terminate a line in some
             // parsers and not others.
             '\u{2028}' | '\u{2029}' => Some(Self::ZeroWidth),
+            // Soft hyphen and the Mongolian vowel separator render as nothing
+            // outside the narrow contexts they exist for; the invisible math
+            // operators (function application, times, separator, plus) and the
+            // interlinear annotation anchors are invisible everywhere.
+            '\u{00ad}' | '\u{180e}' => Some(Self::ZeroWidth),
+            '\u{2061}'..='\u{2064}' | '\u{fff9}'..='\u{fffb}' => Some(Self::ZeroWidth),
+            // Variation Selectors and Variation Selectors Supplement.
+            '\u{fe00}'..='\u{fe0f}' | '\u{e0100}'..='\u{e01ef}' => Some(Self::VariationSelector),
             '\t' | '\n' | '\r' => None,
             other if other.is_control() => Some(Self::OtherControl),
             _ => None,
@@ -191,6 +240,89 @@ mod tests {
     fn stripping_leaves_the_visible_text_a_reviewer_saw() {
         let text = "dele\u{200b}te\u{202e} everything\u{e0041}";
         assert_eq!(strip_concealed(text), "delete everything");
+    }
+
+    /// The variation-selector channel is the one current smuggling work
+    /// uses, and it was invisible to this detector.
+    ///
+    /// `ConcealmentClass::of` covered the TAG block, five bidi ranges, six
+    /// zero-width code points, and `char::is_control()`. Variation selectors
+    /// are category `Mn`, render as nothing, and are not controls, so a
+    /// description carrying a payload encoded one nibble per code point in
+    /// `U+E0100..=U+E01EF` returned no classes at all: no finding from
+    /// `concealed_text_findings`, no change record, and `strip_concealed`
+    /// handed the smuggled bytes straight back to the reviewer.
+    #[test]
+    fn variation_selector_payload_is_detected_and_removed() {
+        // One nibble per code point, the shape published smuggling work uses.
+        let payload = "\u{e0100}\u{e0101}\u{e010f}\u{e01ef}";
+        let text = format!("Search public repositories{payload}");
+
+        assert!(conceals_text(&text));
+        assert_eq!(
+            concealment_classes(&text),
+            vec![ConcealmentClass::VariationSelector]
+        );
+        assert_eq!(strip_concealed(&text), "Search public repositories");
+    }
+
+    /// The basic Variation Selectors block is covered too, including
+    /// `U+FE0F` on a legitimate emoji.
+    ///
+    /// The emoji case is a deliberate false positive, not an oversight:
+    /// nothing in the code point separates presentation from payload. Pinning
+    /// it here means a later narrowing has to break this test on purpose
+    /// rather than quietly.
+    #[test]
+    fn emoji_presentation_selector_classifies_deliberately() {
+        assert_eq!(
+            concealment_classes("Deploy \u{2705}\u{fe0f}"),
+            vec![ConcealmentClass::VariationSelector]
+        );
+        assert_eq!(
+            strip_concealed("Deploy \u{2705}\u{fe0f}"),
+            "Deploy \u{2705}"
+        );
+    }
+
+    /// A CJK ideographic variation sequence classifies too, and that is
+    /// also deliberate.
+    ///
+    /// `U+E0100..=U+E01EF` is not only a smuggling channel: it is the range
+    /// Japanese and Chinese text uses to select a specific glyph for a
+    /// character. Nothing in the code point separates that from a payload,
+    /// so the detector reports both and the operator baselines the noise.
+    /// Pinned here so a later narrowing has to break this on purpose.
+    #[test]
+    fn cjk_ideographic_variation_sequence_classifies_deliberately() {
+        // U+845B (kanji) followed by variation selector 18, a real IVS.
+        let text = "\u{845b}\u{e0101}";
+        assert_eq!(
+            concealment_classes(text),
+            vec![ConcealmentClass::VariationSelector]
+        );
+        assert_eq!(strip_concealed(text), "\u{845b}");
+    }
+
+    /// The nearby invisible format characters, none of which are controls.
+    #[test]
+    fn other_invisible_format_characters_are_zero_width() {
+        // Soft hyphen and the Mongolian vowel separator, the four
+        // invisible math operators, and the three interlinear
+        // annotation anchors.
+        let separators = "\u{00ad}\u{180e}";
+        let invisible_operators = "\u{2061}\u{2062}\u{2063}\u{2064}";
+        let annotation_anchors = "\u{fff9}\u{fffa}\u{fffb}";
+        let all = format!("{separators}{invisible_operators}{annotation_anchors}");
+        for character in all.chars() {
+            let text = format!("dele{character}te");
+            assert_eq!(
+                concealment_classes(&text),
+                vec![ConcealmentClass::ZeroWidth],
+                "{character:?} must be flagged",
+            );
+            assert_eq!(strip_concealed(&text), "delete");
+        }
     }
 
     /// Map an ASCII character to its Unicode TAG-block counterpart.

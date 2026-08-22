@@ -1,0 +1,113 @@
+# promtool unit test for the certificate-store degradation alert.
+#
+# Three cases, because two of them are the ones a hand-written rule gets
+# wrong:
+#
+#   1. One replica of a fleet degraded. `max by (backend)` has to surface it
+#      even though every other replica reports 0. A rule written with avg(),
+#      or one that forgot to aggregate at all, reads healthy here.
+#   2. Every replica healthy. The gauge is present and 0, and nothing fires.
+#   3. No certificate store opened anywhere, so the family is absent from the
+#      scrape entirely. This is the normal shape with ACME unconfigured, and
+#      it must produce no recorded sample and no alert. `> 0` would behave
+#      the same, but a rule that filled the gap with `or vector(0)`, or one
+#      that alerted on `absent()`, would page every deployment that does not
+#      terminate TLS.
+#
+# The gauge is written once during TLS init and never again, so the input
+# series are flat on purpose: that is what the real series looks like.
+
+rule_files:
+  - ../recording-rules.yml
+  - ../alerting-rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # One pod of two could not open its redb store. Fleet-wide the condition is
+  # true, so the recorded series reads 1 and the ticket-tier alert fires once
+  # `for: 10m` has elapsed.
+  - interval: 1m
+    input_series:
+      - series: 'sbproxy_cert_store_degraded{backend="redb", instance="pod-a:9090"}'
+        values: '1x60'
+      - series: 'sbproxy_cert_store_degraded{backend="redb", instance="pod-b:9090"}'
+        values: '0x60'
+
+    promql_expr_test:
+      # round() drops the recording rule's __name__ so the empty-name label
+      # set matches; the values are exact 0 and 1 either way.
+      - expr: round(sbproxy:slo:certs:store_degraded:5m)
+        eval_time: 30m
+        exp_samples:
+          - labels: '{backend="redb"}'
+            value: 1
+
+    alert_rule_test:
+      # Nine minutes in the condition holds but `for: 10m` has not elapsed,
+      # so the alert is pending rather than firing.
+      - eval_time: 9m
+        alertname: SBPROXY-CERT-STORE-DEGRADED
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: SBPROXY-CERT-STORE-DEGRADED
+        exp_alerts:
+          - exp_labels:
+              backend: redb
+              severity: ticket
+              slo_id: SLO-CERT-STORE
+              runbook_id: RB-CERT-STORE-DEGRADED
+              window: 5m
+            exp_annotations:
+              summary: "Certificate store degraded to in-memory on backend redb"
+              description: |
+                The configured certificate-store backend could not be opened and
+                at least one process is running on an in-memory store.
+                Certificates do not survive a restart, so each restart opens a
+                fresh ACME order against the same hostname set and the CA's
+                duplicate-certificate limit is the deadline. Read the error-level
+                log line naming the backend, fix acme.storage_path or the
+                backend, and restart.
+              runbook_url: "https://docs.sbproxy.dev/runbook#rb-cert-store-degraded"
+
+  # Control: every replica opened its configured backend. The gauge is present
+  # and 0, the recorded series is 0, and nothing fires.
+  - interval: 1m
+    input_series:
+      - series: 'sbproxy_cert_store_degraded{backend="sqlite", instance="pod-a:9090"}'
+        values: '0x60'
+      - series: 'sbproxy_cert_store_degraded{backend="sqlite", instance="pod-b:9090"}'
+        values: '0x60'
+
+    promql_expr_test:
+      # round() drops the recording rule's __name__ so the empty-name label
+      # set matches; the values are exact 0 and 1 either way.
+      - expr: round(sbproxy:slo:certs:store_degraded:5m)
+        eval_time: 30m
+        exp_samples:
+          - labels: '{backend="sqlite"}'
+            value: 0
+
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: SBPROXY-CERT-STORE-DEGRADED
+        exp_alerts: []
+
+  # Control: no certificate store was ever opened, so the family is absent.
+  # Absent is not 0 and it is not 1. Nothing is recorded and nothing fires.
+  - interval: 1m
+    input_series:
+      - series: 'sbproxy_requests_total{hostname="api.example.com", method="GET", status="200"}'
+        values: '0+10x60'
+
+    promql_expr_test:
+      # round() drops the recording rule's __name__ so the empty-name label
+      # set matches; the values are exact 0 and 1 either way.
+      - expr: round(sbproxy:slo:certs:store_degraded:5m)
+        eval_time: 30m
+        exp_samples: []
+
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: SBPROXY-CERT-STORE-DEGRADED
+        exp_alerts: []

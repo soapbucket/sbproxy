@@ -1,6 +1,6 @@
 # Operator runbook
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 This runbook is the dashboard/action companion to
 [`quickstart-operator.md`](quickstart-operator.md). Use the quickstart for first
@@ -30,6 +30,11 @@ what makes the label usable as a correlation key.
 | [`RB-METER-STALLED`](#rb-meter-stalled) | `SBPROXY-METER-STALLED` | ticket |
 | [`RB-AUDIT-WRITE`](#rb-audit-write) | `SBPROXY-AUDIT-WRITE-FAILURE` | page |
 | [`RB-AUDIT-LATENCY`](#rb-audit-latency) | `SBPROXY-AUDIT-LATENCY-P99` | ticket |
+| [`RB-AI-ADMISSION`](#rb-ai-admission) | `SBPROXY-AI-ADMISSION-REFUSAL-SHARE` | ticket |
+| [`RB-AI-STREAM-POST-COMMIT`](#rb-ai-stream-post-commit) | `SBPROXY-AI-STREAM-POST-COMMIT` | ticket |
+| [`RB-CERT-STORE-DEGRADED`](#rb-cert-store-degraded) | `SBPROXY-CERT-STORE-DEGRADED` | ticket |
+| [`RB-MESH-ADMISSION`](#rb-mesh-admission) | `SBPROXY-MESH-INBOUND-REJECTED` | ticket |
+| [`RB-STORAGE-BACKEND`](#rb-storage-backend) | `SBPROXY-STORAGE-BACKEND-ERRORS` | ticket |
 | [`RB-CARD-BUDGET`](#rb-card-budget) | `SBPROXY-CARD-BUDGET-NEAR-CAP` | log only |
 
 A guard in `crates/sbproxy-observe/tests/runbook_index.rs` fails the build when
@@ -337,6 +342,253 @@ stream.
 
 **Resolved when.** p99 is back under 5 s. Nothing has to drain first, because
 nothing was buffered.
+
+### RB-AI-ADMISSION
+
+`SBPROXY-AI-ADMISSION-REFUSAL-SHARE` (ticket, more than 5% of one AI surface's
+arriving requests refused before dispatch, sustained for 15 minutes).
+
+The gateway is turning away a large share of what a client is sending, at the
+inbound native-format shim or at the shared stored-prompt resolver, before it
+calls any provider. Nothing else in this file can see it. The refusal answers
+4xx, so `SBPROXY-SUBSTRATE-AVAIL-*` stays quiet; no provider was dialed, so
+provider error, latency, token, and cost series stay flat; and it is not a
+policy verdict, so the decision planes stay quiet too. The usual way this gets
+noticed without the alert is somebody asking why AI spend fell.
+
+The refusals themselves are almost certainly correct. The gateway is refusing
+what it was configured to refuse. What is broken is on the other side of the
+connection, or in what the deployment has enabled.
+
+**First check.** The reason breakdown. Open the AI Gateway dashboard
+([`sbproxy-ai-gateway`](../dashboards/grafana/sbproxy-ai-gateway.json)) and read
+"Pre-provider Refusals by Reason". The code sorts the fix into one of three
+piles:
+
+- `tools_mcp_unsupported`, `store_unsupported`, `previous_response_id_unsupported`,
+  `conversation_unsupported`. A caller is asking the model provider for a
+  feature this gateway governs, most often a request that the provider reach an
+  MCP server directly, which would route around MCP governance here. Change the
+  client, or send that traffic somewhere this gateway is not in the path.
+- `prompt_reference_not_found`, `prompt_object_unresolved`,
+  `prompt_object_unrenderable`, `prompt_render_failed`. A stored prompt is
+  missing or will not render. Check the prompt layer for the surface named on
+  the alert; a recently deleted or renamed prompt is the usual cause, and this
+  one is on the deployment rather than on the caller.
+- `malformed_json`, `body_not_object`, `role_missing`, `role_unsupported`. A
+  client is sending bodies the shim cannot read. Look at what changed in the
+  caller.
+
+The refusal message is deliberately not on the metric or on the `ai.admission`
+decision record: several of those codes interpolate caller bytes into it. The
+message reaches the client and the audit record's scrubbed prose, and nowhere
+else. To see individual refusals, enable
+`observability.log.decision_audit.events.ai.admission: true` and read
+`ai.admission` on the decision feed.
+
+**What the alert cannot see.** Only five refusal arms report here: the three of
+the inbound native-format shim and the two of the shared stored-prompt
+resolver. A request refused later by the model allow and block gate, a
+virtual-key policy, a guardrail, a budget, a rate limiter, or a CEL or Rego
+policy records on that plane instead. If "AI Requests Arrived, Dispatched, and
+Refused" shows a gap that Refused does not account for, the loss is one of
+those and this section is the wrong page.
+
+**Resolved when.** The share is back under 5%. That happens by fixing the
+caller, restoring the prompt, or accepting the traffic, not by changing this
+gateway's answer.
+
+### RB-AI-STREAM-POST-COMMIT
+
+`SBPROXY-AI-STREAM-POST-COMMIT` (ticket, more than 1% of one provider's
+accepted responses failing part way through the stream, sustained for 15
+minutes).
+
+The gateway committed to a provider, sent response headers with a 200 on them,
+and the stream then failed. Every caller in that share received a truncated
+body with nothing in the response saying it was truncated, and no failover was
+possible, because the attempt loop had already closed by the time the relay
+started.
+
+Nothing else on this page sees it. The status line was a success, so
+`SBPROXY-SUBSTRATE-AVAIL-*` stays quiet. Failover is impossible past the commit
+point, so `sbproxy_ai_failovers_total` cannot carry it.
+`sbproxy_ai_provider_errors_total` does move for the two upstream causes, but
+it counts pre-commit errors on the same series, and those ended in a retry or
+in a clean error status the caller could act on. The usual way this gets
+noticed without the alert is a user saying an answer stopped in the middle.
+
+**First check.** The cause breakdown. Open the AI Gateway dashboard
+([`sbproxy-ai-gateway`](../dashboards/grafana/sbproxy-ai-gateway.json)) and read
+"Post-commit Stream Failures by Cause". There are three causes and only two of
+them are in this alert:
+
+- `upstream_timeout`. A transport budget cut a generation that was still
+  running. This one is yours, and it is worth checking first: a `timeout_ms` on
+  the provider entry, or a `max_request_timeout_ms` ceiling, that is tighter
+  than the model needs for a long answer. Reasoning models and long-output
+  requests reach it first, so the alert often follows a model change rather
+  than a config change.
+- `upstream_error`. The provider reset or truncated its own stream. Check the
+  provider's status page, then decide whether to steer traffic off it. Read
+  "Post-commit Failure Share by Provider" to see whether one provider carries
+  all of it or the whole set is degraded.
+- `guardrail`. The gateway ended the stream itself on an output guardrail or a
+  stream-safety verdict. That is the configured answer rather than a fault, so
+  it is excluded from the rule, and it stays on the panel so a spike in it is
+  still visible. If that is the line that moved, this section is the wrong page
+  and the guardrail configuration is the right one.
+
+**What the alert cannot see.** A caller that disconnects mid-stream is not
+counted at all: the failed downstream write leaves the relay before the counter
+is reached, so a wave of client cancels neither shows up here nor inflates the
+share. The denominator is every provider response the gateway kept, streaming
+and non-streaming alike, so on a mixed workload the real per-stream failure
+rate is higher than the number on the alert. Treat it as a floor.
+
+**Resolved when.** The share is back under 1%. That happens by widening the
+transport budget that was cutting generations short, or by steering traffic off
+a provider whose streams keep breaking. It does not happen by changing what the
+gateway does at the commit point, because there is nothing to change there:
+once headers are on the wire, a truncated body is the only answer left.
+
+### RB-CERT-STORE-DEGRADED
+
+`SBPROXY-CERT-STORE-DEGRADED` (ticket, next business day).
+
+At least one process could not open the certificate-store backend named by
+`acme.storage_backend` and is serving from an in-memory store. Nothing about
+the proxy looks wrong from outside: it terminates TLS, it serves, and every
+other panel stays green. The cost lands on the next restart, when the
+certificate it was holding is gone and it opens a fresh ACME order for the same
+hostname set. Let's Encrypt allows five duplicate certificates per hostname set
+per week, so a pod that restarts often turns a storage-path mistake into a
+hostname that cannot get a certificate at all, several days after the mistake
+was made.
+
+This can only be a pod-local backend: `redb`, `sqlite`, or `memory`. A shared
+backend (`file`, `redis`, `s3`, `gcs`, `azure`) that will not open refuses to
+start rather than degrading, because an in-memory fallback there gives every
+replica its own issuance lease and its own HTTP-01 token store, and the fleet
+stampedes the CA. So if this is firing, the fleet-wide issuance lock was never
+in play.
+
+**First check.** The `error`-level log line from startup. It names the backend
+and a redacted detail (`cannot create storage dir ...`, `opening ... failed:
+...`) and deliberately carries no part of `acme.storage_path`, since a DSN or a
+bucket URL can hold a credential. A read-only volume, a mount that did not
+attach, and a directory owned by another uid are the three usual answers.
+
+**Second check.** Which replicas. The rule aggregates with `max by (backend)`,
+so one degraded pod out of fifty reads exactly like fifty. Query
+`sbproxy_cert_store_degraded == 1` without the aggregation for the instance
+list.
+
+**Resolved when.** The gauge reads 0 on every replica. It is written once,
+during TLS init, and never again, so fixing the volume does not clear it on its
+own: the pod has to restart before the value can change. Certificates issued
+while degraded were never persisted and are not recoverable, and the restart
+re-issues them, which is one more draw against the duplicate-certificate limit.
+Fix the storage first and restart once, rather than restarting to see whether
+it helps.
+
+The panel is "Certificate Store Degraded" on
+[`sbproxy-security`](../dashboards/grafana/sbproxy-security.json). Its second
+series reads 1 when `sbproxy_cert_store_degraded` is absent from the scrape
+altogether, which is what a deployment that does not terminate TLS looks like.
+That is not a healthy 0 and the alert does not fire on it.
+
+### RB-MESH-ADMISSION
+
+`SBPROXY-MESH-INBOUND-REJECTED` (ticket, next business day).
+
+This node has been refusing inbound cache RPC connections from its mesh peers
+for ten minutes, under one of the five reasons that are a fault rather than the
+routine idle reclaim. It keeps answering its own inbound traffic the whole time,
+which is why this is a ticket: what degrades is cache coherence and owner
+routing across the cluster, not this node's responses. A cluster that stays in
+this state long enough is a cluster whose peers each hold their own cache.
+
+The `reason` label on the alert names the control that fired, and each one has a
+different fix:
+
+- `connection_limit`. The node was already at its maximum inbound connections,
+  so the peer was closed without a per-connection task ever being spawned.
+  Either the peer set outgrew the cap or something is opening connections it
+  never uses. This is the only reason with a capacity answer.
+- `handshake_timeout`. The peer was admitted and its TLS handshake, including
+  the wait for a handshake slot, ran past the admission deadline. Under load
+  this is slot starvation rather than a certificate problem, and it usually
+  arrives together with `connection_limit`.
+- `handshake_failed`. The handshake completed and was rejected: no client
+  certificate, or one the mesh CA did not sign. A peer re-issued from a
+  different CA looks exactly like this.
+- `frame_timeout`. A request frame announced its length and then did not
+  deliver the body inside the frame deadline. The peer stopped sending
+  mid-request.
+- `write_timeout`. The response frame did not drain into the socket inside the
+  write deadline. The peer issued a request and then stopped reading.
+
+`idle_timeout` is the sixth reason on the same counter and is deliberately not
+in this alert. The client half of the transport only re-evaluates its connection
+recycle when it next issues a request, so a peer pair with nothing to say for
+the whole idle window is reclaimed here as a matter of course. A quiet cluster
+moves that reason by itself. Do not add it to the rule to "cover all six".
+
+**First check.** The mesh transport log. The peer address is deliberately not a
+metric label: it is attacker-chosen and would mint one series per source, so the
+counter says how much and the rate-limited `warn` line says who. Read that line
+before changing any setting. `connection_limit` from a single address is an
+entirely different problem from `connection_limit` spread evenly across a peer
+set that grew.
+
+**Second check.** The Mesh Admission and Storage dashboard
+([`sbproxy-mesh-storage`](../dashboards/grafana/sbproxy-mesh-storage.json)). Its
+"Mesh Admission Failures by Operator Fix" panel regroups the six reasons into
+the three things an operator can change: capacity, identity, and the peer.
+
+**Resolved when.** `sbproxy:mesh:inbound_rejected:5m` returns no samples for ten
+minutes. Note that no samples, not zero, is the healthy state: the counter has
+no series at all until something is rejected, and the dashboard says so on the
+panel rather than drawing a flat line.
+
+### RB-STORAGE-BACKEND
+
+`SBPROXY-STORAGE-BACKEND-ERRORS` (ticket, next business day).
+
+Storage backend operations are failing. The mesh Redis backend
+(`crates/sbproxy-mesh/src/backend/redis.rs`) is the only production caller of
+the storage layer today, so what is at risk is mesh membership persistence and
+shared mesh state, not inbound serving. A deployment that grows a second caller
+on the request path should raise this tier locally.
+
+The `error_kind` label is the triage:
+
+- `disconnected`. The backend is unreachable and the mesh is running without its
+  shared store. Check Redis and the network path between here and it first.
+- `timeout`. It answered, too slowly to be useful. Usually the same causes as
+  `disconnected` earlier in their progression, or a Redis that is busy.
+- `key_too_large` and `value_too_large`. A caller wrote past the storage layer's
+  key and value caps. This is a code-side bound, it repeats on every attempt,
+  and no amount of backend health clears it. Find the call site.
+- `invalid_config`. The store was constructed with settings it rejects.
+- `backend`. Everything Redis itself returned as an error, which is the bucket
+  to read the log for rather than the label.
+
+**First check.** The error ratio panel on the Mesh Admission and Storage
+dashboard. It divides the error counter by the latency histogram's `_count`
+series, which is observed on success and failure alike, so the ratio is really
+bounded to 0 and 1 and sizes the damage honestly. A ratio near 1 means the store
+is effectively down; a ratio of a few percent while the mesh is otherwise
+reporting is a slow or lossy path, not an outage.
+
+**Second check.** The per-operation error panel. All of the rate on one
+operation points at a single call site or a single Redis data structure. Rate
+spread evenly across every operation points at the connection.
+
+**Resolved when.** `sbproxy:storage:op_errors:5m` returns no samples for ten
+minutes. As with the mesh rule above, no samples is the healthy state and a
+deployment that never calls the storage layer never produces a series at all.
 
 ### RB-CARD-BUDGET
 

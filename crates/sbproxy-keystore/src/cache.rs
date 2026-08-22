@@ -63,9 +63,17 @@ impl Default for TtlCacheConfig {
     }
 }
 
-/// An optional second cache tier (Redis, mesh distributed cache). Best-effort:
-/// every method swallows its own errors and a miss simply falls through to the
-/// store. The store, not the tier, is the source of truth.
+/// An optional second cache tier (Redis, mesh distributed cache).
+///
+/// Lookups and publishes are best-effort: they swallow their own errors and a
+/// miss falls through to the store, which is the source of truth.
+///
+/// Invalidation is not in that bucket, and used to be. A lookup that fails
+/// best-effort is a cache miss; a revocation that fails best-effort is a
+/// credential that every replica keeps accepting until the TTL lapses, while
+/// the admin console reports it revoked. So the two invalidation methods
+/// return `Result` and the caller decides. Returning `Ok` means the tier's
+/// copy is gone and, where the tier broadcasts, that peers were told.
 #[async_trait]
 pub trait CacheTier: Send + Sync {
     /// Look up a key record in the tier.
@@ -77,9 +85,19 @@ pub trait CacheTier: Send + Sync {
     /// Publish a credential record to the tier.
     async fn put_credential(&self, record: &CredentialRecord, ttl: Duration);
     /// Drop a single id from the tier (key or credential).
-    async fn invalidate(&self, id: &str);
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the tier's copy may still be readable: the backend
+    /// was unreachable, the delete failed, or a broadcast the tier owes its
+    /// peers did not go out.
+    async fn invalidate(&self, id: &str) -> Result<()>;
     /// Drop everything from the tier.
-    async fn invalidate_all(&self);
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when any part of the purge did not land.
+    async fn invalidate_all(&self) -> Result<()>;
 }
 
 struct Entry<V> {
@@ -263,20 +281,38 @@ impl TtlCache {
 
     /// Drop a single id from L1 and the tier. Call after any mutation of that
     /// id so the next resolve reflects it immediately (instant revoke).
-    pub async fn invalidate(&self, id: &str) {
+    ///
+    /// L1 is always cleared, including on the error path: this replica's own
+    /// copy is the one thing that can always be dropped, and dropping it is
+    /// strictly better than not.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the shared tier could not be told. The mutation
+    /// itself already landed in the store, so this is not "the revoke
+    /// failed": it is "the revoke has not reached the other replicas, and
+    /// they will keep serving the old record until their TTL lapses". The
+    /// caller has to surface that rather than report a clean revoke.
+    pub async fn invalidate(&self, id: &str) -> Result<()> {
         self.keys.lock().remove(id);
         self.creds.lock().remove(id);
-        if let Some(tier) = &self.tier {
-            tier.invalidate(id).await;
+        match &self.tier {
+            Some(tier) => tier.invalidate(id).await,
+            None => Ok(()),
         }
     }
 
     /// Drop everything from L1 and the tier.
-    pub async fn invalidate_all(&self) {
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::invalidate`], for the whole cache rather than one id.
+    pub async fn invalidate_all(&self) -> Result<()> {
         self.keys.lock().clear();
         self.creds.lock().clear();
-        if let Some(tier) = &self.tier {
-            tier.invalidate_all().await;
+        match &self.tier {
+            Some(tier) => tier.invalidate_all().await,
+            None => Ok(()),
         }
     }
 
@@ -518,7 +554,10 @@ mod tests {
         let cache = TtlCache::new(store.clone(), TtlCacheConfig::default());
 
         cache.resolve_key("k1").await.unwrap();
-        cache.invalidate("k1").await;
+        cache
+            .invalidate("k1")
+            .await
+            .expect("no tier attached, so nothing can fail");
         cache.resolve_key("k1").await.unwrap();
         assert_eq!(store.loads(), 2, "invalidate forces a fresh store load");
     }
@@ -602,8 +641,12 @@ mod tests {
         async fn put_credential(&self, record: &CredentialRecord, _: Duration) {
             self.published.lock().push(record.clone());
         }
-        async fn invalidate(&self, _: &str) {}
-        async fn invalidate_all(&self) {}
+        async fn invalidate(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn invalidate_all(&self) -> Result<()> {
+            Ok(())
+        }
     }
 
     /// A tier that counts the calls that would have reached a shared,
@@ -624,12 +667,75 @@ mod tests {
             None
         }
         async fn put_credential(&self, _: &CredentialRecord, _: Duration) {}
-        async fn invalidate(&self, _: &str) {
+        async fn invalidate(&self, _: &str) -> Result<()> {
             self.invalidations.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
-        async fn invalidate_all(&self) {
+        async fn invalidate_all(&self) -> Result<()> {
             self.full_invalidations.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
+    }
+
+    /// A tier whose invalidation always fails, standing in for an
+    /// unreachable Redis or a mesh peer that will not answer.
+    struct UnreachableTier;
+
+    #[async_trait]
+    impl CacheTier for UnreachableTier {
+        async fn get_key(&self, _: &str) -> Option<KeyRecord> {
+            None
+        }
+        async fn put_key(&self, _: &KeyRecord, _: Duration) {}
+        async fn get_credential(&self, _: &str) -> Option<CredentialRecord> {
+            None
+        }
+        async fn put_credential(&self, _: &CredentialRecord, _: Duration) {}
+        async fn invalidate(&self, _: &str) -> Result<()> {
+            anyhow::bail!("tier unreachable")
+        }
+        async fn invalidate_all(&self) -> Result<()> {
+            anyhow::bail!("tier unreachable")
+        }
+    }
+
+    /// The seam: `TtlCache::invalidate` reporting whether the shared tier
+    /// was actually told.
+    ///
+    /// It used to return `()`, folding a failed revocation into the same
+    /// best-effort bucket as a failed lookup. A failed lookup is a cache
+    /// miss the store covers for. A failed revocation is a credential the
+    /// rest of the fleet keeps accepting for a full TTL while the admin
+    /// console reports it revoked, and nothing anywhere said so.
+    #[tokio::test]
+    async fn a_tier_that_could_not_be_told_is_reported_and_l1_is_still_dropped() {
+        let store = Arc::new(MemoryKeyStore::new());
+        store
+            .put_key(KeyRecord::new("k1", "h1", ts()))
+            .await
+            .unwrap();
+        let cache = TtlCache::new(store.clone(), TtlCacheConfig::default())
+            .with_tier(Arc::new(UnreachableTier) as Arc<dyn CacheTier>);
+        assert!(cache.resolve_key("k1").await.unwrap().is_some());
+
+        store.delete_key("k1").await.unwrap();
+        let outcome = cache.invalidate("k1").await;
+        assert!(
+            outcome.is_err(),
+            "an invalidation the shared tier never received must not report success"
+        );
+
+        // The local copy goes regardless: this replica can always drop its
+        // own entry, and doing so is strictly better than not.
+        assert!(
+            cache.resolve_key("k1").await.unwrap().is_none(),
+            "L1 must be dropped even when the tier could not be reached"
+        );
+
+        assert!(
+            cache.invalidate_all().await.is_err(),
+            "the same holds for a whole-tier purge"
+        );
     }
 
     /// A reaction to a peer's invalidation must not become another
@@ -690,8 +796,14 @@ mod tests {
 
         // The originating forms still do reach the tier: local-only is the
         // receiver's operation, not a replacement for the mutator's.
-        cache.invalidate("k1").await;
-        cache.invalidate_all().await;
+        cache
+            .invalidate("k1")
+            .await
+            .expect("the counting tier always succeeds");
+        cache
+            .invalidate_all()
+            .await
+            .expect("the counting tier always succeeds");
         assert_eq!(tier.invalidations.load(Ordering::SeqCst), 1);
         assert_eq!(tier.full_invalidations.load(Ordering::SeqCst), 1);
     }
@@ -818,8 +930,12 @@ mod tests {
                 None
             }
             async fn put_credential(&self, _: &CredentialRecord, _: Duration) {}
-            async fn invalidate(&self, _: &str) {}
-            async fn invalidate_all(&self) {}
+            async fn invalidate(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn invalidate_all(&self) -> Result<()> {
+                Ok(())
+            }
         }
         let tiered = TtlCache::new(store, TtlCacheConfig::default())
             .with_tier(Arc::new(AnsweringTier))

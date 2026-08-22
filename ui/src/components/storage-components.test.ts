@@ -9,7 +9,12 @@ import {
   shortDigest,
   storageRows,
 } from "../lib/storage";
+import {
+  STORAGE_OP_DURATION_FAMILY,
+  STORAGE_OP_ERRORS_FAMILY,
+} from "../lib/storage-ops";
 import filesTable from "./ModelFilesTable.vue?raw";
+import backendOps from "./StorageBackendOps.vue?raw";
 import storageView from "../views/StorageView.vue?raw";
 
 const QWEN_DIGEST =
@@ -51,6 +56,11 @@ const GC_FIXTURE: GcReport = {
   },
   budget_unsatisfied_bytes: 0,
 };
+
+/** Collapse runs of whitespace so a prose assertion survives a reflow. */
+function collapse(source: string): string {
+  return source.replace(/\s+/g, " ");
+}
 
 function stubFetch(rawBody: string, status = 200) {
   const fetchMock = vi.fn(
@@ -212,5 +222,71 @@ describe("cache GC", () => {
     ).toBeNull();
     expect(storageView).toContain(':title="gcDisabledReason ?? undefined"');
     expect(storageView).toContain("{{ gcDisabledReason }}");
+  });
+});
+
+describe("storage backend operations panel", () => {
+  it("loads the metrics scrape beside the artifact inventory", () => {
+    expect(storageView).toContain("api.metrics()");
+    expect(storageView).toContain("void metricsReq.run()");
+    expect(storageView).toContain("parsePrometheus(");
+  });
+
+  it("keeps the backend panel outside the files error branch", () => {
+    // A node with no model host 404s the files report. Backend health is a
+    // different question and is often the one being asked when it does.
+    // Matched on collapsed whitespace so a reformat of the template cannot
+    // fail this without changing where the panel sits.
+    expect(collapse(storageView)).toContain("</template> <StorageBackendOps");
+  });
+
+  it("names both storage families under their sanctioned prefix", () => {
+    expect(STORAGE_OP_DURATION_FAMILY).toBe("sbproxy_storage_op_duration_seconds");
+    expect(STORAGE_OP_ERRORS_FAMILY).toBe("sbproxy_storage_op_errors_total");
+    expect(backendOps).toContain("storageOps(props.families)");
+  });
+
+  it("says what would have to happen for data to appear", () => {
+    expect(backendOps).toContain('v-else-if="!report"');
+    expect(backendOps).toContain("No storage backend has run an operation");
+    expect(backendOps).toContain("serves its first read or write");
+  });
+
+  it("separates a missing latency reading from a zero one", () => {
+    expect(backendOps).toContain("not reported");
+    expect(collapse(backendOps)).toContain("true zero, not a missing reading");
+    // p95 is undefined when the histogram is absent; never render it as 0.
+    expect(backendOps).not.toMatch(/p95Seconds \?\? 0/);
+  });
+
+  it("marks any failure at all, not only a rate over a threshold", () => {
+    // These are lifetime counters. A backend that went down ten minutes ago
+    // on a node up for a week sits below any percentage worth alerting on,
+    // and a rate threshold would render it exactly like a backend that has
+    // never failed.
+    expect(backendOps).toContain("report.errors > 0 ? 'accent' : 'default'");
+    expect(backendOps).not.toContain("errorRate >= 0.01");
+  });
+
+  it("does not claim nothing has run when only the error family is present", () => {
+    // storageOps reports on the error family alone, so the latency note
+    // cannot say the histogram "appears after the first backend call" next
+    // to a tile counting failures.
+    expect(backendOps).not.toContain("appears after the first backend call");
+    expect(collapse(backendOps)).toContain(
+      "The duration histogram is absent from this scrape",
+    );
+  });
+
+  it("labels the numbers for an operator, not for the exporter", () => {
+    expect(backendOps).toContain('label="Backend operations"');
+    expect(backendOps).toContain('label="Failed operations"');
+    expect(backendOps).toContain('label="Slowest 5% of calls"');
+    expect(backendOps).not.toContain("sbproxy_storage_op_duration_seconds{");
+  });
+
+  it("renders errors and the retry through the shared components", () => {
+    expect(backendOps).toMatch(/<ErrorState\s+v-if="error"/);
+    expect(storageView).toContain('@retry="metricsReq.run"');
   });
 });

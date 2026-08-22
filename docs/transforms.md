@@ -247,7 +247,7 @@ No example directory ships this transform; the snippet is built directly from `S
 |-------|------|---------|-------------|
 | `remove_selectors` | list | `[]` | Tag names or `#id` selectors to strip. |
 | `inject` | list | `[]` | `{position, content}` entries. `position` is `head_end`, `body_start`, or `body_end`. |
-| `rewrite_attributes` | list | `[]` | `{selector, attribute, value}` entries. Every tag the selector matches is stamped: a tag that already carries the attribute has its value replaced, and a tag that does not gets the attribute added. |
+| `rewrite_attributes` | list | `[]` | `{selector, attribute, value}` entries. Every tag the selector matches is stamped: a tag that already carries the attribute has its value replaced, and a tag that does not gets the attribute added. The tag's attribute list is what gets read, so an unquoted upstream value (`<a target=_self>`) is replaced and requoted rather than duplicated, and the same characters inside a different attribute's value are left alone. |
 | `format_options` | object | none | Optional post-manipulation HTML optimization (see `optimize_html` below for the sub-fields). |
 
 ```yaml

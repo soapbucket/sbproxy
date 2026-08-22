@@ -1938,6 +1938,34 @@ fn cap_idle_for_service_discovery(
     }
 }
 
+/// How many `cache.admit` evaluations may be deferred off the reactor at
+/// once.
+///
+/// Evaluating the event inline was back pressure as well as a stall: the
+/// connection's worker was busy for the script's whole budget, so the
+/// next response queued behind it and the concurrency of running scripts
+/// could never exceed the worker count. A detached task per response
+/// bounds nothing, and each one retains a full copy of the response body
+/// until the script returns, so a script slow enough to fall behind the
+/// arrival rate turns a stalled reactor into unbounded resident memory
+/// on a path where nothing downstream is waiting to push back.
+///
+/// Past the cap the event evaluates inline instead. That is the latency
+/// posture this change moved away from, and deliberately so: it is
+/// bounded, it is what the origin had before, and it keeps an operator's
+/// refusal from being skipped under exactly the load that makes caching
+/// the wrong thing to get wrong.
+const MAX_DEFERRED_ADMIT_EVALUATIONS: usize = 64;
+
+/// Permits for `MAX_DEFERRED_ADMIT_EVALUATIONS`.
+///
+/// Process-wide rather than per-origin: the resource being protected is
+/// the blocking pool and the heap, and both are shared by every origin.
+static DEFERRED_ADMIT_SLOTS: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_DEFERRED_ADMIT_EVALUATIONS))
+    });
+
 /// Dispatch the response-cache store for a completed body.
 ///
 /// `final_body` is what a later hit will replay: the raw upstream
@@ -1970,8 +1998,6 @@ fn dispatch_response_cache_store(ctx: &mut RequestContext, final_body: &[u8]) {
             .map(|c| c.ttl_secs)
             .unwrap_or(300)
     };
-    let admit = evaluate_cache_admit(ctx, status, &headers, final_body.len());
-    let ttl = admit.ttl_secs.unwrap_or(static_ttl);
     let pipeline_for_write = ctx.pipeline.clone();
     // The write-back must seal under the same origin the lookup opened
     // under, so resolve the per-origin handle rather than the shared
@@ -1990,10 +2016,202 @@ fn dispatch_response_cache_store(ctx: &mut RequestContext, final_body: &[u8]) {
         .and_then(|idx| pipeline_for_write.config.origins.get(idx))
         .map(|o| o.cache_config_fingerprint.to_string())
         .unwrap_or_default();
-    // `admit.store` gates the write and nothing else. Returning early
-    // here would skip work the caller still owes, so the event refuses
-    // to *store* without refusing to serve.
-    if let Some(cache_store) = pipeline_for_write
+
+    // WOR-2404: `response_body_filter` runs on a reactor thread and it
+    // is not async, so an event evaluated here cannot be awaited. The
+    // event is an operator script with a CPU budget (100 ms by default)
+    // and no await points, so evaluating it inline stalls every other
+    // connection this worker owns for the script's whole budget. An
+    // origin that configures one gets the evaluation and the write-back
+    // on a tracked background task instead, subject to
+    // `MAX_DEFERRED_ADMIT_EVALUATIONS`.
+    //
+    // Deliberately conditional on the script existing rather than
+    // unconditional. The deferred path has to copy the body to own it
+    // and costs a task spawn, and the overwhelming majority of origins
+    // have no `admit_event`; those keep the path they had, where the
+    // only thing deferred is the store's own blocking write.
+    //
+    // The engine label is resolved here, on the reactor, because a
+    // task that never comes back still has to be recorded against the
+    // engine the operator configured.
+    let admit_scope = AdmitEventScope::from_ctx(ctx);
+    let admit_engine = admit_scope.as_ref().and_then(|scope| {
+        pipeline_for_write
+            .config
+            .origins
+            .get(scope.origin_idx)
+            .and_then(|origin| origin.response_cache.as_ref())
+            .and_then(|cache| cache.admit_event.as_ref())
+            .map(crate::decision_script::engine_label)
+    });
+
+    match (admit_scope, admit_engine) {
+        // Deferral is capped, and the cap is not decoration: see
+        // `MAX_DEFERRED_ADMIT_EVALUATIONS`. A refusal to defer runs the
+        // event where it used to run, on this thread, which is bounded.
+        (Some(scope), Some(engine)) => match DEFERRED_ADMIT_SLOTS.clone().try_acquire_owned() {
+            Ok(permit) => {
+                let body = final_body.to_vec();
+                let eval_pipeline = pipeline_for_write.clone();
+                let eval_scope = scope.clone();
+                let eval_headers = headers.clone();
+                let fallback_origin = write_origin_id.clone();
+                // Tracked rather than detached, on the same tracker the
+                // stale-while-revalidate refresh uses. With an
+                // `admit_event` configured this task now carries the
+                // write-back *and* the event's own audit record, so it
+                // is exactly the kind of work `shutdown_cache_revalidate_tasks`
+                // exists to drain, and a bare `tokio::spawn` would not
+                // even be eligible. Being eligible is all this buys
+                // today: nothing in the binary calls that drain yet, so
+                // a shutdown mid-flight still loses the write.
+                super::CACHE_REVALIDATE_TASKS.spawn(async move {
+                    // Held for the life of the task, so the permit comes
+                    // back whether the evaluation returned, faulted, or
+                    // panicked its way to a join error.
+                    let _permit = permit;
+                    let body_len = body.len();
+                    let admit = match tokio::task::spawn_blocking(move || {
+                        evaluate_cache_admit_for(
+                            &eval_pipeline,
+                            &eval_scope,
+                            status,
+                            &eval_headers,
+                            body_len,
+                        )
+                    })
+                    .await
+                    {
+                        Ok(plan) => plan,
+                        Err(join_error) => {
+                            // The event's documented posture on a fault
+                            // is to store under the static `ttl_secs`,
+                            // and a task that did not come back is a
+                            // fault: the decision was never made. Record
+                            // it as the fail-open it is, on the same two
+                            // counters the in-engine faults use, so a
+                            // panicking script does not read as an
+                            // origin with no event.
+                            tracing::warn!(
+                                target: "sbproxy::decision",
+                                event = "cache.admit",
+                                error = %join_error,
+                                "cache.admit evaluation task failed to join; storing under \
+                                 the static ttl_secs"
+                            );
+                            sbproxy_observe::decision::record_decision_fail_open(
+                                sbproxy_observe::decision::DecisionEvent::CacheAdmit,
+                                engine,
+                                &fallback_origin,
+                                &scope.tenant_id,
+                            );
+                            sbproxy_observe::decision::record_decision(
+                                sbproxy_observe::decision::DecisionEvent::CacheAdmit,
+                                engine,
+                                sbproxy_observe::decision::DecisionOutcome::Allow,
+                                &fallback_origin,
+                                &scope.tenant_id,
+                            );
+                            sbproxy_cache::cache_event::CacheAdmitPlan::default()
+                        }
+                    };
+                    store_admitted_response(
+                        &pipeline_for_write,
+                        &admit,
+                        key,
+                        status,
+                        headers,
+                        std::borrow::Cow::Owned(body),
+                        static_ttl,
+                        write_origin_id,
+                        write_config_fp,
+                    );
+                });
+            }
+            // Every deferral slot is taken, so the blocking pool is
+            // already carrying `MAX_DEFERRED_ADMIT_EVALUATIONS` bodies
+            // that nobody is waiting for. Queueing another would trade a
+            // stalled worker for unbounded memory. Run the event here,
+            // which stalls this worker for the script's budget and is
+            // exactly what the origin did before the deferral existed,
+            // and which is self-limiting: this connection cannot produce
+            // another response until it returns.
+            Err(_) => {
+                let admit = evaluate_cache_admit_for(
+                    &pipeline_for_write,
+                    &scope,
+                    status,
+                    &headers,
+                    final_body.len(),
+                );
+                store_admitted_response(
+                    &pipeline_for_write,
+                    &admit,
+                    key,
+                    status,
+                    headers,
+                    std::borrow::Cow::Borrowed(final_body),
+                    static_ttl,
+                    write_origin_id,
+                    write_config_fp,
+                );
+            }
+        },
+        // No `admit_event` on this origin, so there is no script to run
+        // and nothing to defer. `evaluate_cache_admit_for` would return
+        // the default plan without touching an engine; skip the call
+        // and use it directly.
+        _ => {
+            store_admitted_response(
+                &pipeline_for_write,
+                &sbproxy_cache::cache_event::CacheAdmitPlan::default(),
+                key,
+                status,
+                headers,
+                std::borrow::Cow::Borrowed(final_body),
+                static_ttl,
+                write_origin_id,
+                write_config_fp,
+            );
+        }
+    }
+}
+
+/// Store a completed response under an admission plan.
+///
+/// Split out of `dispatch_response_cache_store` and given wholly owned
+/// inputs so the same code runs on the reactor (no `admit_event`) and on
+/// a tracked background task (the event ran off-reactor first). Nothing
+/// here reads the request context, which is what makes that possible
+/// (WOR-2404).
+///
+/// `body` is a `Cow` because the two callers arrive with different
+/// ownership and the entry needs a `Vec` either way: the reactor path
+/// still borrows the response buffer, while the deferred path already
+/// copied it to cross the task boundary and would otherwise pay for a
+/// second copy of every cached body.
+///
+/// `admit.store` gates the write and nothing else. Returning early on a
+/// refusal would skip work the caller still owes, so the event refuses
+/// to *store* without refusing to serve.
+// Nine arguments because every one of them is a value lifted off the
+// request context before the deferral; bundling them into a struct would
+// name the same nine fields one indirection further away.
+#[allow(clippy::too_many_arguments)]
+fn store_admitted_response(
+    pipeline: &CompiledPipeline,
+    admit: &sbproxy_cache::cache_event::CacheAdmitPlan,
+    key: String,
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: std::borrow::Cow<'_, [u8]>,
+    static_ttl: u64,
+    write_origin_id: String,
+    write_config_fp: String,
+) {
+    let ttl = admit.ttl_secs.unwrap_or(static_ttl);
+    if let Some(cache_store) = pipeline
         .cache_store_for(&write_origin_id)
         .cloned()
         .filter(|_| admit.store)
@@ -2002,7 +2220,7 @@ fn dispatch_response_cache_store(ctx: &mut RequestContext, final_body: &[u8]) {
             generation: sbproxy_cache::new_cache_generation(),
             status,
             headers,
-            body: final_body.to_vec(),
+            body: body.into_owned(),
             cached_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -2020,8 +2238,8 @@ fn dispatch_response_cache_store(ctx: &mut RequestContext, final_body: &[u8]) {
         // moves `entry` so we don't have to round-trip through serde to
         // clone it.
         if let (Some(reserve), Some(admission)) = (
-            pipeline_for_write.cache_reserve.clone(),
-            pipeline_for_write.cache_reserve_admission,
+            pipeline.cache_reserve.clone(),
+            pipeline.cache_reserve_admission,
         ) {
             let origin_id_for_reserve = write_origin_id.clone();
             maybe_admit_to_reserve(
@@ -2066,14 +2284,6 @@ pub(super) fn audit_publishes(
     scopes.publishes(event.as_label(), tenant, route)
 }
 
-/// Run the origin's `cache.admit` event, or return the static default.
-///
-/// The returned plan is always usable: a declined event, an absent one,
-/// and a faulted one all yield `store: true` with no TTL override, which
-/// is exactly what a deployment without the event does. The three are
-/// distinguished on the metric rather than in the return value, because
-/// the caller's behavior is identical and only the operator's
-/// interpretation differs.
 /// The request-side facts the `cache.admit` event reads.
 ///
 /// Owned rather than borrowed from [`crate::context::RequestContext`],
@@ -2119,19 +2329,21 @@ impl AdmitEventScope {
     }
 }
 
-fn evaluate_cache_admit(
-    ctx: &crate::context::RequestContext,
-    status: u16,
-    headers: &[(String, String)],
-    body_len: usize,
-) -> sbproxy_cache::cache_event::CacheAdmitPlan {
-    let Some(scope) = AdmitEventScope::from_ctx(ctx) else {
-        return sbproxy_cache::cache_event::CacheAdmitPlan::default();
-    };
-    let pipeline = ctx.pipeline.clone();
-    evaluate_cache_admit_for(&pipeline, &scope, status, headers, body_len)
-}
-
+/// Run the origin's `cache.admit` event, or return the static default.
+///
+/// The returned plan is always usable: a declined event, an absent one,
+/// and a faulted one all yield `store: true` with no TTL override, which
+/// is exactly what a deployment without the event does. The three are
+/// distinguished on the metric rather than in the return value, because
+/// the caller's behavior is identical and only the operator's
+/// interpretation differs.
+///
+/// **Blocking.** The evaluation runs an operator script to its CPU
+/// budget with no await point in it, so both callers, the live response
+/// path and the stale-while-revalidate refresh, reach this through
+/// `tokio::task::spawn_blocking` rather than inline on a reactor thread
+/// (WOR-2404). Everything the event reads is already assembled into
+/// `scope` and the arguments, which is what makes that possible.
 pub(super) fn evaluate_cache_admit_for(
     pipeline: &crate::pipeline::CompiledPipeline,
     scope: &AdmitEventScope,
@@ -3058,6 +3270,15 @@ impl ProxyHttp for SbProxy {
             let _ = upstream_request.insert_header("content-type".to_string(), "application/grpc");
             let _ = upstream_request.insert_header("te".to_string(), "trailers");
             upstream_request.remove_header("content-length");
+            // The proxy is the gRPC client on this hop and it decodes the
+            // response frame itself to produce JSON, so it has to say
+            // which message encodings it can read. It can read exactly
+            // one. Sending nothing leaves the upstream to guess, and a
+            // guess of `gzip` yields a frame the transcoder cannot decode
+            // at all; the inbound REST request's own `accept-encoding` is
+            // about the HTTP body downstream, not about gRPC message
+            // framing, so it must not leak into this decision either.
+            let _ = upstream_request.insert_header("grpc-accept-encoding".to_string(), "identity");
         }
 
         // WOR-819: gRPC-Web request -> native gRPC. The path and method
@@ -3073,6 +3294,14 @@ impl ProxyHttp for SbProxy {
             // X-Grpc-Web is a CORS preflight marker the upstream gRPC
             // server does not expect.
             upstream_request.remove_header("x-grpc-web");
+            // The bridge forwards response message frames byte for byte
+            // to a browser, and no gRPC-Web client implementation reads
+            // message-level compression, so a compressed frame is
+            // undeliverable however the proxy handles it. Overriding
+            // whatever the browser sent is the point: the negotiation
+            // that matters is between this proxy and the upstream, and
+            // this proxy will not re-frame a payload it cannot read.
+            let _ = upstream_request.insert_header("grpc-accept-encoding".to_string(), "identity");
         }
 
         // Prepend the proxy action's URL path to the upstream request path.
@@ -4028,6 +4257,13 @@ impl ProxyHttp for SbProxy {
         if ctx.transcode_active {
             let _ = upstream_response.insert_header("content-type".to_string(), "application/json");
             upstream_response.remove_header("content-length");
+            // Unconditional here, unlike the gRPC-Web block below: no
+            // gRPC frame reaches the client on this path at all, only the
+            // JSON the transcoder builds from it, so a header describing
+            // gRPC message framing would describe nothing the client
+            // holds. Whether the frame was actually compressed is decided
+            // per message by its flag byte, which `transcode_response`
+            // reads and refuses.
             upstream_response.remove_header("grpc-encoding");
             if let Some(status) = upstream_response
                 .headers
@@ -4047,6 +4283,34 @@ impl ProxyHttp for SbProxy {
                 sbproxy_observe::metrics::record_grpc_status(
                     sbproxy_observe::metrics::grpc_status_label(code_u32),
                 );
+                // A gRPC upstream answers a failed call with HTTP 200 and
+                // puts the real outcome in `grpc-status`; the status line
+                // carries the transport's health, not the call's. The
+                // body this filter is about to replace is the JSON error
+                // envelope, so forwarding the 200 tells a REST client its
+                // call succeeded and leaves the failure discoverable only
+                // by parsing the document. `transcode_response` already
+                // decides the HTTP status for that envelope; use the same
+                // mapping here so the status line and the body agree.
+                //
+                // This is the trailers-only shape (tonic and grpc-go emit
+                // it for a unary `Err`), which is the only shape fixable
+                // from a header filter. When the upstream sends response
+                // headers first and `grpc-status` in real trailers,
+                // pingora has already written the downstream header by
+                // the time `response_trailer_filter` runs, so that
+                // response keeps the upstream's 200 and only the body
+                // reports the error. docs/routing.md states the limit.
+                //
+                // An operator `status` response modifier still wins: it
+                // is applied further down this same filter.
+                //
+                // `grpc-status: 0` is left alone rather than forced to
+                // 200; `transcoded_http_status_override` owns that rule
+                // and is unit-tested for it.
+                if let Some(mapped) = transcoded_http_status_override(status) {
+                    apply_response_status_override(upstream_response, mapped, None);
+                }
             }
         }
 
@@ -4067,7 +4331,23 @@ impl ProxyHttp for SbProxy {
             let resp_ct = sbproxy_transport::grpc::GrpcWebBridge::response_content_type(&req_ct);
             let _ = upstream_response.insert_header("content-type".to_string(), resp_ct);
             upstream_response.remove_header("content-length");
-            upstream_response.remove_header("grpc-encoding");
+            // `grpc-encoding` describes the framing of message bytes this
+            // bridge forwards byte for byte, so it may only be dropped
+            // when it describes nothing. The request advertised
+            // `grpc-accept-encoding: identity`, so a compliant upstream
+            // sends no header or `identity` and this strips it exactly as
+            // before. An upstream that ignored the negotiation keeps its
+            // header, and the browser client rejects a body it cannot
+            // read instead of parsing compressed bytes as protobuf. A
+            // header claiming compression over frames whose flag byte is
+            // clear is the harmless direction of the same mismatch: the
+            // client reads the flag per message, as the spec requires.
+            // A header present but unreadable as text keeps the same
+            // treatment as one naming an algorithm: it is not proof of
+            // identity, so it is not dropped.
+            if grpc_web_may_drop_grpc_encoding(&upstream_response.headers) {
+                upstream_response.remove_header("grpc-encoding");
+            }
             if let Some(status) = upstream_response
                 .headers
                 .get("grpc-status")
@@ -4307,7 +4587,28 @@ impl ProxyHttp for SbProxy {
         }
 
         // --- On-status fallback: rewrite response if upstream status matches ---
-        {
+        //
+        // Skipped on the two translated gRPC paths, which own the
+        // response body outright. `response_body_filter` returns from its
+        // `transcode_active` / `grpc_web_active` branch before it reaches
+        // the `ctx.fallback_body` swap below, so a fallback that fired
+        // here would send the fallback's status and its `content-length`
+        // over a body that is still the translated one (or, on a
+        // trailers-only response, no body at all). A body that does not
+        // match its declared length desynchronizes a keep-alive
+        // connection, which is worse than not applying the fallback.
+        //
+        // The mismatch is not new, but its reach is. Until the
+        // gRPC-status-to-HTTP-status mapping above, only a genuine
+        // non-gRPC HTTP status from the upstream could land here on a
+        // translated origin, since a transcoded RPC carried the
+        // upstream's own 200 whatever its outcome. Mapping the status
+        // makes 503 and 429 ordinary values at this point, so the
+        // exclusion has to be explicit. `on_error` is untouched: it fires
+        // in `fail_to_proxy`, before any upstream response exists, so
+        // there is no translated body to conflict with.
+        // docs/routing.md states the limit.
+        if !ctx.transcode_active && !ctx.grpc_web_active {
             let upstream_status = upstream_response.status.as_u16();
             if let Some(origin_idx) = ctx.origin_idx {
                 let pipeline = ctx.pipeline.clone();
@@ -8074,6 +8375,7 @@ impl ProxyHttp for SbProxy {
                 api_key_id: accountable_key_id,
                 key_mode: ctx.inbound_key_mode.as_str().to_string(),
                 key_provider: ctx.native_key_provider.clone(),
+                credential_source: ctx.ai_credential_source.map(str::to_string),
                 tenant_id: ctx.tenant_id.to_string(),
                 user_id: ctx.user_id.clone(),
                 // WOR-2094: explainability columns; every row names the
@@ -8512,6 +8814,51 @@ fn build_transcoded_json(ctx: &RequestContext, frame: &[u8]) -> Vec<u8> {
         },
         _ => b"{}".to_vec(),
     }
+}
+
+/// The HTTP status a transcoded REST response should carry for a
+/// header-borne `grpc-status`, or `None` to leave the upstream's status
+/// line alone.
+///
+/// `Some` for every non-OK code, using the same `google.rpc.Code` table
+/// the JSON error envelope in the body already uses, so the status line
+/// and the body agree. `None` for OK: on a successful call the
+/// upstream's own status line already says 200 and the override would be
+/// a no-op, and where it would not be a no-op the response is malformed
+/// (a non-2xx status line carrying an OK gRPC status). Overwriting a
+/// real HTTP failure with a 200 is the one direction this must never
+/// move in, so OK never produces an override at all.
+fn transcoded_http_status_override(grpc_status: i32) -> Option<u16> {
+    let grpc = sbproxy_transport::grpc::GrpcStatus::from_code(grpc_status);
+    if grpc == sbproxy_transport::grpc::GrpcStatus::Ok {
+        return None;
+    }
+    Some(grpc.to_http_status())
+}
+
+/// Whether the gRPC-Web bridge may strip the upstream's `grpc-encoding`
+/// response header.
+///
+/// The bridge forwards message frames byte for byte, so the header
+/// describes bytes the browser still holds and may only be dropped when
+/// it describes nothing: absent, or naming `identity`. A value that
+/// names an algorithm, or one that is not readable as text and so proves
+/// nothing, is kept. A free function rather than an inline `match`
+/// because the inline form sat inside `ProxyHttp::response_filter`,
+/// where a unit test cannot reach it.
+///
+/// Every value is checked, not just the first. `grpc-encoding` is
+/// single-valued per the gRPC spec, but an upstream that sent it twice
+/// would otherwise have its second value decide nothing while the first
+/// one licensed the drop. An empty iterator is the absent case and
+/// returns true, which is the behavior wanted there anyway.
+fn grpc_web_may_drop_grpc_encoding(headers: &http::HeaderMap) -> bool {
+    headers.get_all("grpc-encoding").iter().all(|value| {
+        value
+            .to_str()
+            .map(|v| v.trim().eq_ignore_ascii_case("identity"))
+            .unwrap_or(false)
+    })
 }
 
 /// Apply a response modifier's `status` override to the outgoing header.
@@ -9164,6 +9511,99 @@ origins:
 
         assert_eq!(response.status.as_u16(), 200);
         assert_eq!(response.get_reason_phrase(), Some("OK"));
+    }
+
+    #[test]
+    fn a_non_ok_grpc_status_maps_onto_the_http_status_line() {
+        // The four an operator is most likely to alert on, plus the
+        // out-of-range code a client is allowed to send: gRPC treats an
+        // unrecognized code as UNKNOWN, which is a 500 and not a 200.
+        assert_eq!(transcoded_http_status_override(5), Some(404), "NOT_FOUND");
+        assert_eq!(
+            transcoded_http_status_override(7),
+            Some(403),
+            "PERMISSION_DENIED"
+        );
+        assert_eq!(
+            transcoded_http_status_override(9),
+            Some(400),
+            "FAILED_PRECONDITION"
+        );
+        assert_eq!(
+            transcoded_http_status_override(14),
+            Some(503),
+            "UNAVAILABLE"
+        );
+        assert_eq!(
+            transcoded_http_status_override(99),
+            Some(500),
+            "an unrecognized code is UNKNOWN, not a success"
+        );
+    }
+
+    /// The safety half of the mapping, and the reason it returns an
+    /// `Option` rather than a `u16`. A response whose `grpc-status` is
+    /// OK must keep whatever status line the upstream sent: forcing 200
+    /// would turn a genuine HTTP failure carrying `grpc-status: 0` into
+    /// a success, which is the one direction this must never move in.
+    #[test]
+    fn an_ok_grpc_status_never_rewrites_the_http_status_line() {
+        assert_eq!(transcoded_http_status_override(0), None);
+
+        let mut response = pingora_http::ResponseHeader::build(502, None).expect("build header");
+        if let Some(mapped) = transcoded_http_status_override(0) {
+            apply_response_status_override(&mut response, mapped, None);
+        }
+        assert_eq!(
+            response.status.as_u16(),
+            502,
+            "an OK gRPC status must not overwrite an upstream HTTP failure"
+        );
+    }
+
+    #[test]
+    fn grpc_web_drops_grpc_encoding_only_when_it_proves_identity() {
+        let mut headers = http::HeaderMap::new();
+        assert!(
+            grpc_web_may_drop_grpc_encoding(&headers),
+            "no header describes nothing, so nothing is lost by dropping it"
+        );
+
+        headers.insert(
+            "grpc-encoding",
+            http::HeaderValue::from_static(" IDENTITY "),
+        );
+        assert!(
+            grpc_web_may_drop_grpc_encoding(&headers),
+            "identity is case-insensitive and may be padded"
+        );
+
+        let mut gzip = http::HeaderMap::new();
+        gzip.insert("grpc-encoding", http::HeaderValue::from_static("gzip"));
+        assert!(
+            !grpc_web_may_drop_grpc_encoding(&gzip),
+            "the bridge forwards the frames byte for byte, so the browser \
+             must keep the header that describes them"
+        );
+
+        // A value that is not readable as text proves nothing about the
+        // framing, so it gets the same treatment as one naming an
+        // algorithm. Dropping it would be the bridge asserting identity
+        // on the strength of bytes it could not read.
+        let mut opaque = http::HeaderMap::new();
+        opaque.insert(
+            "grpc-encoding",
+            http::HeaderValue::from_bytes(&[0xff, 0xfe]).expect("opaque header value"),
+        );
+        assert!(!grpc_web_may_drop_grpc_encoding(&opaque));
+
+        // Two values, the first of which reads as identity. Checking
+        // only `get("grpc-encoding")` would drop the header on the
+        // strength of the first and lose the second.
+        let mut two = http::HeaderMap::new();
+        two.append("grpc-encoding", http::HeaderValue::from_static("identity"));
+        two.append("grpc-encoding", http::HeaderValue::from_static("gzip"));
+        assert!(!grpc_web_may_drop_grpc_encoding(&two));
     }
 
     /// 299 has no canonical reason in the `http` crate, proving the
@@ -10632,9 +11072,10 @@ origins:
     #[test]
     fn the_emit_site_names_the_origin_id_and_publishes_only_when_the_config_asks() {
         // The call site, driven end to end. Everything else about this
-        // family can be green with the six lines in `evaluate_cache_admit`
-        // deleted: the constructor has tests, the bus has tests, the
-        // config parser has tests, and `audit_publishes` now has tests.
+        // family can be green with the six lines in
+        // `evaluate_cache_admit_for` that publish deleted: the
+        // constructor has tests, the bus has tests, the config parser
+        // has tests, and `audit_publishes` now has tests.
         // This is the one that reads a record off the bus that only the
         // emit site could have put there.
         //
@@ -10662,7 +11103,8 @@ origins:
 "#,
             "req-wildcard-audit-on",
         );
-        let plan = evaluate_cache_admit(&ctx, 200, &[], 2);
+        let scope = AdmitEventScope::from_ctx(&ctx).expect("the fixture resolves an origin");
+        let plan = evaluate_cache_admit_for(&ctx.pipeline, &scope, 200, &[], 2);
         assert!(
             !plan.store,
             "the fixture script refuses the store, so the emit site runs on the arm that \
@@ -10713,7 +11155,8 @@ origins:
         // And the gate is read here rather than only in isolation. Same
         // origin, same script, no `decision_audit:` block anywhere.
         let ctx = wildcard_admit_ctx("", "req-wildcard-audit-off");
-        let plan = evaluate_cache_admit(&ctx, 200, &[], 2);
+        let scope = AdmitEventScope::from_ctx(&ctx).expect("the fixture resolves an origin");
+        let plan = evaluate_cache_admit_for(&ctx.pipeline, &scope, 200, &[], 2);
         assert!(
             !plan.store,
             "the cache decision itself does not depend on whether it is audited"
@@ -10726,6 +11169,88 @@ origins:
                 );
             }
         }
+    }
+
+    /// The deferral seam, not the evaluator (WOR-2404).
+    ///
+    /// `dispatch_response_cache_store` no longer runs the event where it
+    /// is called: with an `admit_event` configured it hands the
+    /// evaluation and the whole write-back to a tracked task. Every
+    /// other test in this family calls `evaluate_cache_admit_for`
+    /// directly and stays green with that dispatch deleted outright, so
+    /// an arm that never spawns, a permit never released, or a task that
+    /// drops its work would leave an origin whose configured event
+    /// silently never runs, and nothing in this file would notice.
+    ///
+    /// The audit record is the proof because only the engine could have
+    /// produced it: the fixture's script is what supplies the `reason`,
+    /// so a record carrying it cannot have come from the default plan
+    /// the no-event arm uses.
+    #[tokio::test]
+    async fn a_deferred_admit_event_still_reaches_the_engine() {
+        let (bus, mut rx) = crate::policy_bus::channel(8);
+        // A sibling test in this binary may have installed a bus first.
+        // Under nextest, which is how the gate and CI run this lane,
+        // each test is its own process and this one wins.
+        let _ = crate::policy_bus::init_global_bus(bus);
+
+        let mut ctx = wildcard_admit_ctx(
+            r#"proxy:
+  http_bind_port: 8080
+  observability:
+    log:
+      decision_audit:
+        events:
+          cache.admit: true
+"#,
+            "req-deferred-admit",
+        );
+        // The capture state `dispatch_response_cache_store` consumes.
+        // Without all three it returns before reaching the event at all,
+        // which would make this test green for the wrong reason.
+        ctx.cache_key = Some("deferred-admit-key".to_owned());
+        ctx.cache_status = Some(200);
+        ctx.cache_headers = Some(vec![("content-type".to_owned(), "text/plain".to_owned())]);
+
+        dispatch_response_cache_store(&mut ctx, b"ok");
+
+        // The task is off this thread by construction, so the read has to
+        // wait for it. Bounded so a regression that never spawns fails
+        // rather than hangs.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut ours = None;
+        while ours.is_none() && std::time::Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(crate::policy_bus::AuditRecord::Decision(audit))
+                    if audit.request_id == "req-deferred-admit" =>
+                {
+                    ours = Some(audit);
+                }
+                // Somebody else's traffic on a shared bus, or nothing
+                // published yet. Sleeping rather than spinning, because
+                // on a current-thread runtime the deferred task only
+                // runs while this one is parked.
+                Ok(_) | Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+            }
+        }
+        let audit = ours.expect(
+            "the deferred cache.admit task never published; the event an operator configured \
+             did not run, and the response was stored as if there were no event at all",
+        );
+        assert_eq!(
+            audit.outcome,
+            sbproxy_observe::decision::DecisionOutcome::Deny,
+            "the fixture script refuses the store, so the deferred task has to carry that \
+             refusal and not the default allow-and-store plan"
+        );
+        assert!(
+            audit.reason.as_str().contains("declined by rule R-7"),
+            "only the engine produces this reason, so its absence means the plan came from \
+             the fallback rather than the script: {}",
+            audit.reason.as_str()
+        );
     }
 
     // --- WOR-2551 / WOR-2552: websocket teardown and enforcement telemetry ---

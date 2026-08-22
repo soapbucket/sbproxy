@@ -1,5 +1,5 @@
 # Observability
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 SBproxy ships metrics, logs, and traces from one process. This guide covers the Wave 1 substrate: the SLO catalog, the metric label budget, the log schema and redaction policy, the trace propagation contract, the health endpoints, the dashboards, and the reference Compose stack you can boot in one command.
 
@@ -136,6 +136,42 @@ Field schema:
 | `file` | `path`, `max_size_mb`, `max_backups`, `compress` | Reuses the access-log rotation + gzip stack. Defaults: 100 MiB rotation, 7 backups, gzip on. |
 | `otlp` | `endpoint`, `transport`, `timeout_secs` | Wraps `opentelemetry_otlp::LogExporter` behind a batch processor. Inherits `service_name`, `resource_attrs`, and (when omitted) `transport` from the top-level `telemetry:` block. |
 
+#### When a `file` sink cannot write
+
+Every way a file sink can lose a record is counted on
+`sbproxy_telemetry_dropped_total{kind="file_sink",reason}`, so a sink that
+has silently stopped growing is visible without reading the log stream it
+stopped writing to. The reasons are closed:
+
+| `reason` | What happened | Record |
+|---|---|---|
+| `mkdir_failed` | The parent directory could not be created | Lost |
+| `open_failed` | The file could not be opened for append (a permission change, a path that is now a directory) | Lost |
+| `write_error` | The append itself failed after a successful open: a full volume, a read-only remount, a failing disk | Lost |
+| `rotate_failed` | Rotation at `max_size_mb` failed | Kept, appended to the over-size file |
+
+`rotate_failed` rides the same family because the sink is degraded and an
+operator has to act, but it is the one reason that did not lose anything, so
+the alert for data loss excludes it:
+
+```promql
+sum by (reason) (
+  rate(sbproxy_telemetry_dropped_total{kind="file_sink", reason!="rotate_failed"}[5m])
+) > 0
+```
+
+Alert on `rotate_failed` separately. It means the active file is growing past
+`max_size_mb` with nothing pruning it, which ends as a full volume and then as
+`write_error`.
+
+Each of these also logs one WARN naming the path and the OS error, rate-limited
+to one per minute per sink path and per failure kind: the failures persist
+until an operator fixes them and the write path runs once per record, so an
+unthrottled warning would be a second log flood on top of the first problem.
+Keying the throttle on the kind as well as the path is what stops a rotation
+failure from swallowing the append failure a second later. Alert on the
+counter, not on the line.
+
 ### Sink scopes
 
 Sinks can be declared at three scopes, each with a different filter:
@@ -265,7 +301,12 @@ The Wave 1 substrate adds five labels: `agent_id`, `agent_class`, `agent_vendor`
 | SLO-DR-RESTORE | DR | restore drill | succeed monthly | calendar | Page on missed |
 | SLO-CONFIG-RELOAD | Config | hot-reload success | 100% | 24h | Page |
 | SLO-BOT-AUTH-DIR | Bot Auth | directory freshness (TTL not exceeded) | 99.9% | 7d | Ticket |
+| SLO-CERT-STORE | Certs | configured certificate-store backend open (not degraded to in-memory) | 100% | continuous | Ticket |
 | SLO-CARD-BUDGET | Substrate | per-metric series count under cap | 100% | continuous | Log-only (CI gate) |
+| SLO-AI-ADMISSION | AI Gateway | requests admitted past the inbound shim (1 - pre-provider refusal share, per surface) | 95% | 15 min sustained | Ticket |
+| SLO-AI-STREAM-COMMIT | AI Gateway | committed provider responses that stream to completion, per provider (guardrail terminations excluded) | 99% | 15 min sustained | Ticket |
+| SLO-MESH-ADMISSION | Mesh | inbound peer connections admitted (the idle reclaim is not a refusal and is excluded) | 100% | 10 min sustained | Ticket |
+| SLO-STORAGE-OPS | Storage | storage backend operations returning no error | 99.9% | 10 min sustained | Ticket |
 
 PromQL recording rules pre-compute each SLI at 1m, 5m, 1h, 6h, and 24h windows. Burn-rate alerts use the multi-window pattern from the SRE workbook (5m AND 1h at 14.4x for page tier, 30m AND 6h at 6x, 1h AND 24h at 3x for ticket). The full rule set lives in `deploy/alerts/`. These are the rules to page on. The proxy also evaluates one availability burn rate in process, covered under [Alerts](#alerts), and it is a fallback for deployments with no scrape target rather than a second copy of the set above.
 
@@ -337,19 +378,20 @@ Every family below is emitted by running code. That is worth stating because it 
 | `sbproxy_mirror_state_drift_total` | 1 | Counter; per-request increments when the request-mirror's primary and shadow responses diverge enough that a downstream replay would notice. Always sample to a debug log so the trigger is investigatable. |
 | `sbproxy_policy_audit_events_total` | 1 200 | Labels: `verdict` (allow\|deny\|warn), `surface` (http\|mcp\|a2a\|admin), `policy_id` (sanitized). Per-event audit-channel counter; the policy-decision path emits one per evaluated policy. |
 | `sbproxy_policy_audit_events_dropped_total` | 40 | Labels: `tenant` (sanitized). Counts the policy-audit events dropped because the per-tenant queue was full. A non-zero rate here means the operator should raise `policy.audit.queue_size` or shed load. |
-| `sbproxy_decision_audit_events_total` | 126 | Labels: `event` (the decision event's stable label), `outcome` (allow\|deny\|flag\|mutate\|decline\|error\|timeout). Counts decision-audit records accepted by the audit bus. Both labels are closed by construction, so the cap is the exact product of 18 events and 7 outcomes rather than an estimate. Read it beside the drop counter below: on its own a drop counter cannot tell a healthy quiet feed from a broken one, because both read zero. |
-| `sbproxy_decision_audit_events_dropped_total` | 18 000 | Labels: `event`, `tenant`. Counts decision-audit records lost before publication, because the shared audit queue was full or its consumer was gone. The cap is 18 closed event values against the shared `tenant` budget of 1000; in practice the family is sparse, since it only writes when a record is dropped. A non-zero rate is a lossy audit trail, and a lossy trail reads as an absence of decisions, so alert on it. |
+| `sbproxy_decision_audit_events_total` | 133 | Labels: `event` (the decision event's stable label), `outcome` (allow\|deny\|flag\|mutate\|decline\|error\|timeout). Counts decision-audit records accepted by the audit bus. Both labels are closed by construction, so the cap is the exact product of 19 events and 7 outcomes rather than an estimate. Read it beside the drop counter below: on its own a drop counter cannot tell a healthy quiet feed from a broken one, because both read zero. |
+| `sbproxy_decision_audit_events_dropped_total` | 19 000 | Labels: `event`, `tenant`. Counts decision-audit records lost before publication, because the shared audit queue was full or its consumer was gone. The cap is 19 closed event values against the shared `tenant` budget of 1000; in practice the family is sparse, since it only writes when a record is dropped. A non-zero rate is a lossy audit trail, and a lossy trail reads as an absence of decisions, so alert on it. |
 | `sbproxy_policy_decision_duration_seconds_bucket` | 60 | Labels: `surface`; histogram buckets 100us..1s. Time-to-decision per policy surface. Pair with `sbproxy_policy_evaluation_duration_seconds_bucket` for end-to-end policy latency. |
 | `sbproxy_mcp_policy_hook_invocations_total` | 2 000 | Labels: `verdict` (allow\|deny\|warn), `mcp_server` (sanitized), `tool_name` (sanitized). Counts per-tool MCP policy-hook decisions. |
 | `sbproxy_judge_calls_total` | 60 | Labels: `provider` (openai\|anthropic\|...), `verdict` (pass\|fail\|abstain), `cached` (true\|false). Counter for the AI judge surface (rubric / scorer eval calls). |
 | `sbproxy_judge_latency_seconds_bucket` | 240 | Labels: `provider`, `cached`; histogram buckets 100ms..30s. Per-judge call latency. |
 | `sbproxy_judge_cost_usd` | 10 | Labels: `provider`. Counter; per-provider judge spend in USD. |
 | `sbproxy_judge_budget_exhausted_total` | 40 | Labels: `tenant`. Counts judge calls refused because the per-tenant judge budget was exhausted. |
-| `sbproxy_ai_tokens_attributed_total` | 8 000 | Labels: `origin`, `provider`, `model`, `direction` (input\|output), `project`, `feature`, `team`, `agent_type`, `environment`, `agent_id`. `origin` is the config hostname the request arrived on, so it is bounded by the config. `agent_id` is appended last because the label list is positional. Note it is bounded differently from the other `agent_*` labels: those pass through the runtime cardinality limiter, and this one does not, because it is set in `sbproxy-ai`, which does not depend on `sbproxy-observe`. What bounds it is the rule that only a verified agent identity is ever written. An unverified caller names itself, so honoring the name would let one caller mint an agent per request and push every real agent into `__other__` permanently. Unverified spend records under the empty label here and keeps its claimed identity in the usage ledger instead, beside the flag saying it was not verified. The unified attribution token counter for AI traffic; same shape as the non-AI `sbproxy_tokens_attributed_total` but tagged with provider / model. |
+| `sbproxy_ai_tokens_attributed_total` | 8 000 | Labels: `origin`, `provider`, `model`, `direction` (input\|output\|cache_read\|cache_write\|reasoning), `project`, `feature`, `team`, `agent_type`, `environment`, `agent_id`. `origin` is the config hostname the request arrived on, so it is bounded by the config. `agent_id` is appended last because the label list is positional. Note it is bounded differently from the other `agent_*` labels: those pass through the runtime cardinality limiter, and this one does not, because it is set in `sbproxy-ai`, which does not depend on `sbproxy-observe`. What bounds it is the rule that only a verified agent identity is ever written. An unverified caller names itself, so honoring the name would let one caller mint an agent per request and push every real agent into `__other__` permanently. Unverified spend records under the empty label here and keeps its claimed identity in the usage ledger instead, beside the flag saying it was not verified. The unified attribution token counter for AI traffic; same shape as the non-AI `sbproxy_tokens_attributed_total` but tagged with provider / model. `cache_read` and `cache_write` are the provider prompt-cache counts (OpenAI `cached_tokens`, Anthropic `cache_read_input_tokens` and `cache_creation_input_tokens`). They are **subsets of `input`, not additions to it**, which is why each direction is its own series: `sum without (direction)` double counts a cached prompt. To chart cache effectiveness use `direction="cache_read"` against `direction="input"` rather than summing. |
 | `sbproxy_ai_cost_dollars_attributed_total` | 8 000 | Labels: same shape as `sbproxy_ai_tokens_attributed_total` but valued in USD, and without `direction`. Pair with the tokens counter to derive the per-attribution unit cost. `sum by (agent_id)` over this counter is the Prometheus answer to "which agent spent this"; the durable rollups below answer the same question across restarts. |
 | `sbproxy_ai_wasted_tokens_total` | 8 000 | Labels: `kind` (duplicate_request\|abandoned_stream\|validation_failed\|context_bloat\|failover_loser) plus the standard attribution labels. Counts tokens spent that did NOT survive to a useful response. Drives the FOCUS waste-signal export. |
 | `sbproxy_ai_wasted_cost_dollars_total` | 8 000 | Same shape as `sbproxy_ai_wasted_tokens_total` but valued in USD. |
 | `sbproxy_ai_cascade_tier_outcomes_total` | 200 | Labels: `tier` (the cascade-rule tier name, sanitized), `outcome` (advanced\|blocked\|served). Counts each cascade-rule tier outcome the AI router observed. |
+| `sbproxy_ai_key_fallbacks_total` | 40 | Labels: `provider` (a configured provider entry name, so the config bounds it), `outcome` (engaged\|unavailable). One observation per provider-key fallback decision, never per request: `engaged` means the entry's own `api_key` was refused with a `401`/`403` and the operator's `fallback_credential_id` resolved, so the same provider was retried on it; `unavailable` means that credential did not resolve and the provider's rejection was returned unchanged. Alert on `unavailable`, because the house credential being broken otherwise looks exactly like the tenant's key being broken. See [multi-tenant.md](multi-tenant.md#when-a-tenants-provider-key-is-refused). |
 | `sbproxy_ai_native_bypass_total` | 100 | Labels: `inbound_format`, `provider_format`. Counts requests where the inbound surface format matched the provider format so the AI dispatch could bypass the translate-and-re-translate path. |
 | `sbproxy_ai_output_throughput_tokens_per_second_bucket` | 800 | Labels: `provider`, `model`; histogram buckets 1..1000 tokens/sec. Per-completion output throughput; pair with `sbproxy_ai_ttft_seconds_bucket` for the full latency story. |
 | `sbproxy_ai_ratelimit_rejected_total` | 1 000 | Labels: `axis` (provider\|model\|virtual_key), `key_hash` (truncated stable hash of the rate-limited key), `model`. Counts AI requests refused at the per-axis rate limiter before reaching the provider. |
@@ -357,7 +399,9 @@ Every family below is emitted by running code. That is worth stating because it 
 | `sbproxy_ai_shadow_inflight` | 1 | Gauge; live in-flight shadow-evaluation count. Pair with `sbproxy_ai_shadow_dropped_total` to alert when shadow runs back up. |
 | `sbproxy_ai_shadow_dropped_total` | 6 | Counter; labels: `reason` (`streaming`\|`provider_not_found`\|`provider_not_allowed`\|`prompt_training_disallowed`\|`egress_denied`\|`saturated`). Counts configured shadow evaluations skipped or dropped before dispatch. Sampling out is intentionally excluded. |
 | `sbproxy_ai_shadow_timeout_total` | 1 | Counter; shadow evaluations dropped because the per-eval timeout fired. |
-| `sbproxy_ai_token_estimate_error_ratio_bucket` | 200 | Labels: `model`; histogram buckets `(estimate - actual) / actual` between -1 and +1. Drives the pre-flight estimator's accuracy alert. |
+| `sbproxy_ai_shadow_calls_total` | targets x 5 x 7 | Counter; labels: `target` (the shadow target's provider name, bounded by `shadow.targets`, which refuses a duplicate), `status_class` (`2xx`\|`3xx`\|`4xx`\|`5xx`\|`error`), `finish_reason` (the OpenAI chat vocabulary plus `none` and `other`). Counts completed shadow calls per target. |
+| `sbproxy_ai_shadow_latency_seconds` | targets | Histogram; label: `target`. Same buckets as `sbproxy_ai_request_duration_seconds`, so a target's latency distribution reads against the primary's without rescaling. |
+| `sbproxy_ai_token_estimate_error_ratio_bucket` | 200 | Labels: `model`; histogram buckets `(actual - estimated) / actual`, cut at +/- 0.10 and bounded at -1 and +1. Positive is an under-reservation (the request cost more than it debited); negative is an over-reservation. Read by the `Token estimate error by model (p05 and p95)` panel on the `sbproxy-ai-value` dashboard, which charts both tails because p95 alone cannot see a systematically high estimator. No alert fires on it. Recorded only on a reconciled rate-limit admission, so a model with no entry in `config.model_rate_limits` contributes no series while its estimate still drives budget debits and the price ceiling. |
 | `sbproxy_ai_budget_utilization_ratio` | 7 | Labels: `scope` (workspace\|api_key\|user\|model\|origin\|tag\|agent). Gauge; fraction of a scope's tightest configured cap consumed, above 1 is over budget. Republished after every billing debit and on every preflight that trips a limit, so it is the same consumed fraction `warn_at`/`downgrade_at` compare against. Headroom is `1 - sbproxy_ai_budget_utilization_ratio` in PromQL; there is deliberately no separate remaining family, because a family and its complement double the series without adding information. |
 | `sbproxy_target_health_state` | 100 000 | Labels: `origin` (configured origin id, budgeted at 200), `target` (configured target URL, budgeted at 500). The cap column states the product, as every row here does, but the real bound is much lower and is the sum rather than the product: a target belongs to exactly one origin, so the live series count is the total number of configured load-balancer targets. `target` is the URL when it is unique within its origin and the load balancer's own `url#index` identifier when an origin configures one URL more than once, which is what keeps two same-URL targets (a weighted pair, or blue and green behind one address) from collapsing onto a single series. Gauge on LiteLLM's 0/1/2 deployment-state scale: 0 healthy, 1 degraded (circuit breaker half-open), 2 excluded from selection (probe-unhealthy, outlier-ejected, or breaker open). Sampled at scrape time from the same pipeline walk that renders `GET /api/health/targets`, so the two surfaces cannot disagree; a target removed by a config reload leaves the scrape on the next render instead of freezing at its last value, and the refresh drops only what left rather than clearing the family, so a scrape racing another listener's scrape can never read it empty. |
 | `sbproxy_deprecated_requests_total` | 8 000 | Labels: `origin` (request `Host`, budgeted at 200 like every other `origin` label), `route` (forward-rule id or index, OpenAPI path template, or empty for a whole-origin block; budgeted at 2 000), `past_sunset` (true\|false), `outcome` (served\|gone). `route` deliberately does not reuse the `rule` label name: accepted-value sets are keyed on the label name alone, `rule` already carries the operator-named rule ids of the MCP and reversible-redaction families, and a large spec's operation list would have exhausted their budget. `outcome` is what separates a straggler still being served past sunset from a caller actually refused with 410, which `past_sunset` alone cannot do on a config running both postures. |
@@ -494,7 +538,7 @@ Three families cover all of them, dimensioned rather than duplicated, and two mo
 
 #### Cardinality budget
 
-Stated here rather than discovered on your Prometheus. The theoretical product is `event x engine x outcome x origin x tenant`, which is 18 x 8 x 7 = 1008 before tenancy. In practice it is sparse: one event is normally served by one engine per origin, and most origins use a handful of events.
+Stated here rather than discovered on your Prometheus. The theoretical product is `event x engine x outcome x origin x tenant`, which is 19 x 8 x 7 = 1064 before tenancy. In practice it is sparse: one event is normally served by one engine per origin, and most origins use a handful of events.
 
 At 50 origins and 500 tenants, expect roughly 50 x 500 x (events actually configured, typically 4 to 8) x 1 engine x (outcomes actually seen, typically 2 to 3), which lands in the low hundreds of thousands of series if every tenant uses every origin. That is the pathological reading. Tenants are normally partitioned across origins rather than crossed with them, which divides it by the number of origins and puts the realistic figure in the low thousands.
 
@@ -932,7 +976,7 @@ All three wired events carry detail. `cache.admit` reports `stored`, `ttl_secs`,
 
 `cache.key` reports a count rather than the dimension names on purpose. The names can carry header values an operator chose to key on, and this object is not scrubbed the way `reason` is, so a count answers "did the policy narrow this key" without carrying what it narrowed on.
 
-**What is not wired, and how you will know.** `transform`, `action`, and `log.custom_field` accept configuration and publish nothing. Enabling one is legal, because refusing it would block pre-configuring an event a later release wires. The proxy warns once at boot naming each event you enabled that has no emitter, so the gap is visible where the mistake is made rather than only as a metric reading flat zero. `rate_limit` and `waf` are a related but different case: they publish today, under `policy` rather than their own label, and the same boot warning tells you so rather than telling you to wait. `payment.lifecycle` never publishes here at all; see the settlement-store note above. Everything else on `DecisionEvent::ALL`, including `auth`, both AI guardrail events, `ai.tool_call`, `mcp.tool`, `ai.close`, and `ai.failure`, has a production emitter today. See [events.md](events.md) for the full taxonomy and how this channel relates to the typed proxy events the `events:` block delivers.
+**What is not wired, and how you will know.** `transform`, `action`, and `log.custom_field` accept configuration and publish nothing. Enabling one is legal, because refusing it would block pre-configuring an event a later release wires. The proxy warns once at boot naming each event you enabled that has no emitter, so the gap is visible where the mistake is made rather than only as a metric reading flat zero. `rate_limit` and `waf` are a related but different case: they publish today, under `policy` rather than their own label, and the same boot warning tells you so rather than telling you to wait. `payment.lifecycle` never publishes here at all; see the settlement-store note above. Everything else on `DecisionEvent::ALL`, including `auth`, both AI guardrail events, `ai.tool_call`, `mcp.tool`, `ai.close`, `ai.failure`, and `ai.admission`, has a production emitter today. See [events.md](events.md) for the full taxonomy and how this channel relates to the typed proxy events the `events:` block delivers.
 
 This is what makes filtering the SIEM's job rather than the proxy's. "Show me every routing decision that moved a request off the model it asked for" is `requested_model != selected_model`, and "show me the plans we had to degrade" is `dropped > 0`. `route.decide` fires on every AI request that reaches a routing policy and most of those decisions change nothing, so the volume is real; the answer is to publish the fields that let a rule drop the no-ops at ingest, not to have the proxy guess in config which decisions were interesting. A record left out at the proxy cannot be recovered later.
 
@@ -1357,6 +1401,22 @@ dashboards:
 ```
 
 Set `dashboards.enabled: false` to skip the ConfigMap when dashboards are managed out of band. Operators who run Grafana outside Helm can `kubectl create configmap` the JSON files from `deploy/dashboards/` directly with the `grafana_dashboard=1` label.
+
+The `dashboards/grafana/` tree ships the import-ready boards instead, listed
+with their uids in [`dashboards/README.md`](../dashboards/README.md). One of
+them covers a subsystem nothing in this directory reaches:
+`sbproxy-mesh-storage.json` charts mesh inbound connection admission and the
+storage backend the mesh persists into. Read its two header tiles before
+reading anything else on it. Both metric families are absent rather than zero
+on a deployment that does not run the mesh with its Redis backend, so an empty
+chart there is not the same claim as a flat zero, and the tiles are what tell
+the two apart.
+
+`sbproxy-ai-gateway.json` now carries the same device for its routing and
+reliability section. Named model groups, prompt-cache affinity, shadow
+evaluation and the per-request timeout override register their families on
+first use, so four `absent()` tiles head that section and every panel under it
+sets a `noValue` string naming which kind of emptiness it is showing.
 
 ## Alerts
 

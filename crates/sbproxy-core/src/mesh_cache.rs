@@ -120,21 +120,27 @@ impl MeshCacheTier {
         }
     }
 
-    async fn delete_raw(&self, key: &str) {
+    /// Delete one key, reporting whether the delete actually landed.
+    ///
+    /// The routed form can fail: the owning node may be unreachable. A
+    /// swallowed failure there is a revoked record still answering L2
+    /// lookups on whichever node owns its slot, so the result is returned
+    /// rather than dropped.
+    async fn delete_raw(&self, key: &str) -> anyhow::Result<()> {
         match &self.backing {
             Backing::Local(c) => {
                 c.delete_local(key);
+                Ok(())
             }
             Backing::Clustered {
                 cache,
                 pool,
                 peer_addr,
                 ..
-            } => {
-                let _ = cache
-                    .delete_routed(key, pool.as_ref(), peer_addr.as_ref())
-                    .await;
-            }
+            } => cache
+                .delete_routed(key, pool.as_ref(), peer_addr.as_ref())
+                .await
+                .map_err(|error| anyhow::anyhow!("mesh cache delete for '{key}' failed: {error}")),
         }
     }
 }
@@ -173,9 +179,15 @@ impl CacheTier for MeshCacheTier {
         }
     }
 
-    async fn invalidate(&self, id: &str) {
-        self.delete_raw(&format!("{KEY_PREFIX}{id}")).await;
-        self.delete_raw(&format!("{CRED_PREFIX}{id}")).await;
+    /// Drop both of this id's cached records.
+    ///
+    /// Both deletes are attempted even when the first fails, because they
+    /// are independent records and dropping one of them is better than
+    /// dropping neither. The first error is what the caller sees.
+    async fn invalidate(&self, id: &str) -> anyhow::Result<()> {
+        let key = self.delete_raw(&format!("{KEY_PREFIX}{id}")).await;
+        let cred = self.delete_raw(&format!("{CRED_PREFIX}{id}")).await;
+        key.and(cred)
     }
 
     /// Purge every key-plane record, cluster-wide.
@@ -188,9 +200,14 @@ impl CacheTier for MeshCacheTier {
     /// Purge is cluster-wide rather than consistent-hash-routed, because any
     /// node may hold a cached copy of any record. A peer that cannot be
     /// reached keeps its stale entries until they expire, which is why the
-    /// failure is logged rather than swallowed: the caller asked for a
-    /// cluster-wide purge and did not fully get one.
-    async fn invalidate_all(&self) {
+    /// failure is logged and returned rather than swallowed: the caller
+    /// asked for a cluster-wide purge and did not fully get one.
+    ///
+    /// The fan-out runs to completion before the first failure is returned.
+    /// Stopping at the first unreachable peer would leave the reachable ones
+    /// behind it holding records the operator asked to be gone.
+    async fn invalidate_all(&self) -> anyhow::Result<()> {
+        let mut unreached: Vec<String> = Vec::new();
         for prefix in [KEY_PREFIX, CRED_PREFIX] {
             match &self.backing {
                 Backing::Local(c) => {
@@ -210,10 +227,20 @@ impl CacheTier for MeshCacheTier {
                                 "mesh cache purge fan-out failed for a peer, which will serve \
                                  stale key-plane records until they expire"
                             );
+                            unreached.push(format!("{addr} ({prefix})"));
                         }
                     }
                 }
             }
+        }
+        if unreached.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "mesh cache purge did not reach {} peer prefixes: {}",
+                unreached.len(),
+                unreached.join(", ")
+            ))
         }
     }
 }
@@ -237,7 +264,9 @@ mod tests {
         tier.put_key(&rec, Duration::from_secs(60)).await;
         assert!(tier.get_key("k1").await.is_some(), "cached before purge");
 
-        tier.invalidate_all().await;
+        tier.invalidate_all()
+            .await
+            .expect("purge must report success");
 
         assert!(
             tier.get_key("k1").await.is_none(),
@@ -254,7 +283,9 @@ mod tests {
         let tier = MeshCacheTier::standalone("purge-b");
         let rec = KeyRecord::new("k2", "h2", Utc::now());
         tier.put_key(&rec, Duration::from_secs(60)).await;
-        tier.invalidate_all().await;
+        tier.invalidate_all()
+            .await
+            .expect("purge must report success");
         assert!(tier.get_key("k2").await.is_none());
     }
 
@@ -268,7 +299,9 @@ mod tests {
         let got = tier.get_key("k1").await.expect("present after put");
         assert_eq!(got.key_id, "k1");
 
-        tier.invalidate("k1").await;
+        tier.invalidate("k1")
+            .await
+            .expect("invalidate must report success");
         assert!(tier.get_key("k1").await.is_none(), "invalidate drops it");
     }
 
@@ -295,7 +328,9 @@ mod tests {
         tier.put_credential(&cred, Duration::from_secs(60)).await;
         assert!(tier.get_credential("c1").await.is_some());
 
-        tier.invalidate_all().await;
+        tier.invalidate_all()
+            .await
+            .expect("purge must report success");
         assert!(
             tier.get_credential("c1").await.is_none(),
             "purge_all clears it"
@@ -317,7 +352,9 @@ mod tests {
         let got = tier.get_key("k9").await.expect("present after routed put");
         assert_eq!(got.key_id, "k9");
 
-        tier.invalidate("k9").await;
+        tier.invalidate("k9")
+            .await
+            .expect("invalidate must report success");
         assert!(tier.get_key("k9").await.is_none(), "routed delete drops it");
     }
 }

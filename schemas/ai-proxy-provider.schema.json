@@ -166,11 +166,61 @@
         }
       ]
     },
+    "service_tier": {
+      "description": "Upstream service tier this destination requests: `flex`, `standard`, or `priority`. Unset sends no tier field at all and the vendor serves on its own default.\n\nThis is the operator's decision, not the caller's. A caller that sets a tier on the request body has it replaced by this value, or removed when this is unset, because raising the tier raises the bill and the operator pays it.\n\nThe tier is a property of this entry, not of a request. To run two tiers of one vendor, declare two `providers[]` entries with the same `provider_type` and different tiers; the router then treats them as two candidates with independent weights, health, and realized latency.\n\nA tier the provider catalog does not record for this vendor is refused at config load rather than dropped at request time, so an entry that can never serve the tier you asked for never boots.",
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ServiceTier"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "on_key_failure": {
+      "description": "What happens when this provider rejects the request's own credential with a `401` or `403`.\n\n`fallback` (the default) retries this same provider once with `fallback_credential_id`, if one is configured. `fail_closed` returns the provider's rejection to the caller untouched, which is what you want when the tenant's own key is the authorization boundary and serving them on a house credential would let a revoked tenant keep working.\n\nThis only ever applies to this entry's own `api_key`. A request carrying a caller-owned native credential never falls back to an operator credential: the caller presented their own key and the provider refused it, so spending yours would bill you for their authorization failure.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/KeyFailurePosture"
+        }
+      ]
+    },
+    "fallback_credential_id": {
+      "description": "Id of the operator-held credential to retry with when this entry's own `api_key` is rejected. Names a record under `key_management.seed.credentials[]` (or one minted through the admin key plane), never a secret written here.\n\nThe record is resolved per request through the key plane, so it picks up a rotation without a config reload, and it is refused if it belongs to a different tenant than the request. Unset means there is nothing to fall back to, and `on_key_failure: fallback` then behaves exactly like `fail_closed`.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "serve": {
       "description": "WOR-1652: optional local model-serving block. When set, the gateway itself hosts the models (pull weights, fit an engine to the GPU, supervise it) and registers them as local providers ahead of any cloud fallback, instead of proxying `base_url` to an already-running server. `None` keeps the proxy-only behavior. The lifecycle half (spawn/evict) ships in phases of the model-host epic; this field is the config surface it reads.",
       "anyOf": [
         {
           "$ref": "#/definitions/ModelHostConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "aws_sigv4": {
+      "description": "Sign this provider's requests with AWS Signature Version 4 instead of forwarding a static credential. Required by Bedrock and SageMaker, which do not accept a bearer token. Presence of this block is what selects the signer, so a provider entry either sets `api_key` or sets this, never both. `region` is required and is the credential scope; it is never inferred from `base_url`, matching the AWS SDKs, where an endpoint override leaves the signing region alone. When `base_url` is unset, `region` also fills the `{region}` placeholder in the provider catalog's default endpoint. See `sbproxy_ai::aws_sigv4`.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/AwsSigV4Config"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "bedrock_guardrail": {
+      "description": "Amazon Bedrock guardrail applied inline by the Converse call itself.\n\nSet this to have Bedrock evaluate the prompt and the completion inside the same request that generates them, rather than as a separate `ApplyGuardrail` call. An intervention comes back on a 200 response as `stopReason: guardrail_intervened`; SBproxy turns that into a 403 `guardrail_violation`, records it on the output guardrail decision feed under the name `bedrock_guardrail`, and never admits the response to any cache.\n\nValid only when this provider entry resolves to the Bedrock wire format. Configuring it on any other provider is refused at config load.\n\nThis is a different control from `guardrails.external[]` with `provider: bedrock`, which is an out-of-band `ApplyGuardrail` call against the same AWS guardrail object. Both may be configured; the account is then charged for two evaluations.\n\nThere is no failure posture for this block. The guardrail runs inside the generation call, so a rejected or unauthorized guardrail configuration fails the whole call before any tokens are produced and is handled by the ordinary provider-failure path.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/BedrockGuardrailPassthrough"
         },
         {
           "type": "null"
@@ -201,6 +251,33 @@
         }
       },
       "additionalProperties": false
+    },
+    "ServiceTier": {
+      "type": "string",
+      "enum": [
+        "flex",
+        "standard",
+        "priority"
+      ]
+    },
+    "KeyFailurePosture": {
+      "description": "What the gateway does when one provider entry's credential is rejected upstream.\n\nThe rejection this decides is a `401` or `403` from the provider, which is a statement about the credential rather than about the provider's health. A `429`, a `5xx`, or a timeout stays with the provider failover and `cooldown_policy`, because a different key against a rate-limited provider is still rate limited.",
+      "oneOf": [
+        {
+          "description": "Retry this provider once with `fallback_credential_id`. The default, and inert on an entry that names no fallback credential.",
+          "type": "string",
+          "enum": [
+            "fallback"
+          ]
+        },
+        {
+          "description": "Return the provider's rejection to the caller unchanged.",
+          "type": "string",
+          "enum": [
+            "fail_closed"
+          ]
+        }
+      ]
     },
     "ModelHostConfig": {
       "description": "The `serve:` block: the local models plus host-wide policy.",
@@ -926,6 +1003,178 @@
           ]
         }
       ]
+    },
+    "AwsSigV4Config": {
+      "description": "Sign this provider's requests with AWS Signature Version 4.\n\nPresence of this block is what selects the signer. Absent it, the provider's `api_key` is forwarded verbatim in the catalog's auth header, which is the pre-existing bearer-token behavior and never reaches this code at all. The two are mutually exclusive: a provider entry sets `api_key` or `aws_sigv4`, never both.",
+      "type": "object",
+      "required": [
+        "region"
+      ],
+      "properties": {
+        "region": {
+          "description": "AWS region used for the credential scope, for example `us-east-1`. Required, and independent of `base_url`: pointing `base_url` at a VPC endpoint or a private hostname does not change the region a signature is scoped to, exactly as an AWS SDK's `endpoint_url` override does not. When `base_url` is unset, this value also fills the `{region}` placeholder in the provider catalog's default endpoint.",
+          "type": "string"
+        },
+        "service": {
+          "description": "Signing service name in the credential scope. Defaults to `bedrock` for a `bedrock` provider and `sagemaker` for a `sagemaker` provider; set it explicitly for any other AWS service fronted through a provider entry.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "credentials": {
+          "description": "How to obtain the AWS credentials. Unset uses the standard AWS credential provider chain.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AwsCredentialsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "refresh_margin_secs": {
+          "description": "Seconds before expiry at which a short-lived credential is refreshed. Defaults to 900. A refresh that fails inside this window is retried on the next request and logged, and the cached credential keeps serving until 600 seconds remain, at which point a refresh failure fails the request.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "AwsCredentialsConfig": {
+      "description": "How one provider's AWS credentials are obtained.",
+      "type": "object",
+      "properties": {
+        "source": {
+          "description": "Which credential source backs this provider. Defaults to the standard AWS provider chain.",
+          "default": "default_chain",
+          "allOf": [
+            {
+              "$ref": "#/definitions/AwsCredentialSource"
+            }
+          ]
+        },
+        "access_key_id": {
+          "description": "AWS access key ID. Required by, and only read by, `static`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "secret_access_key": {
+          "description": "AWS secret access key. Required by, and only read by, `static`. Resolve it through `${VAR}`, `vault://`, or `awssm://` rather than writing it into the config file.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_token": {
+          "description": "Session token accompanying an already-issued short-lived key pair. Only read by `static`. A token supplied this way expires on AWS's schedule and SBproxy has no way to renew it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role_arn": {
+          "description": "Role ARN to assume. Required by, and only read by, `assume_role`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "external_id": {
+          "description": "External ID demanded by the role's trust policy. Only read by `assume_role`. Held as a credential, so no SBproxy code path formats it, but note that the process-wide log redactor keys off a fixed list of credential field names that does not include this one (`external_id` is also a non-secret payment identifier elsewhere in the product, so widening that list would mask reconciliation IDs). Supply it as a `${VAR}` or `vault://` reference so the literal never sits in the config file.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_name": {
+          "description": "Role session name recorded in CloudTrail. Only read by `assume_role`; defaults to `sbproxy`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_duration_secs": {
+          "description": "Requested role session length in seconds. Only read by `assume_role`; unset takes the role's own default (one hour on most roles).",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "profile": {
+          "description": "Named profile in the shared AWS config files. Read by `default_chain` and by the base identity `assume_role` starts from.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "AwsCredentialSource": {
+      "description": "Where a provider's AWS credentials come from.",
+      "oneOf": [
+        {
+          "description": "The standard AWS credential provider chain: environment variables, the shared config and credentials files, an OIDC web identity token (EKS IRSA), the ECS task role, and finally the EC2 instance profile. This is the default and the right answer for anything running inside AWS, because the chain refreshes short-lived credentials on its own.",
+          "type": "string",
+          "enum": [
+            "default_chain"
+          ]
+        },
+        {
+          "description": "A long-lived access key pair supplied by config. `session_token` may carry an already-issued short-lived credential, but SBproxy cannot renew one it was handed: use `assume_role` or `default_chain` for credentials that expire.",
+          "type": "string",
+          "enum": [
+            "static"
+          ]
+        },
+        {
+          "description": "STS `AssumeRole`, with the base identity coming from the default chain. The session is renewed before it expires, so a role session is the supported way to run on short-lived credentials.",
+          "type": "string",
+          "enum": [
+            "assume_role"
+          ]
+        }
+      ]
+    },
+    "BedrockGuardrailPassthrough": {
+      "description": "Inline Bedrock Converse guardrail settings.",
+      "type": "object",
+      "required": [
+        "identifier",
+        "version"
+      ],
+      "properties": {
+        "identifier": {
+          "description": "Bedrock guardrail identifier, sent as `guardrailIdentifier`.",
+          "type": "string"
+        },
+        "version": {
+          "description": "Bedrock guardrail version, sent as `guardrailVersion`. Use `DRAFT` for the working version.",
+          "type": "string"
+        },
+        "trace": {
+          "description": "Ask Bedrock for the guardrail assessment trace. The trace is used to name the policies that fired in the block reason and is never relayed to the caller. Defaults to `false`.",
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

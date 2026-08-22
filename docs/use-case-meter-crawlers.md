@@ -1,10 +1,10 @@
 # AI crawlers are reading your site for free
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 ![An unsigned crawler gets 401, a signed crawler gets a 402 price challenge, a payment token redeems once for a 200, and the replay is charged again](assets/use-case-meter-crawlers.gif)
 
-GPTBot, ClaudeBot, and PerplexityBot are in your access logs right now, pulling pages your team paid to produce. The usual response is a robots.txt entry or an outright block, which forfeits the one useful thing about this traffic: AI vendors will pay for licensed content when there is a machine-readable way to charge them. SBproxy's pitch is "Call any model. Serve your own. Govern both.", and this guide is the govern half pointed at inbound traffic. The same Apache-2.0 binary that routes chat completions to 72 providers, or serves weights on your own GPUs, stands in front of your site, checks each crawler's cryptographic identity, quotes a price per fetch, and answers with HTTP 402 until a payment token arrives.
+GPTBot, ClaudeBot, and PerplexityBot are in your access logs right now, pulling pages your team paid to produce. The usual response is a robots.txt entry or an outright block, which forfeits the one useful thing about this traffic: AI vendors will pay for licensed content when there is a machine-readable way to charge them. SBproxy's pitch is "Call any model. Serve your own. Govern both.", and this guide is the govern half pointed at inbound traffic. The same Apache-2.0 binary that routes chat completions to 70 providers, or serves weights on your own GPUs, stands in front of your site, checks each crawler's cryptographic identity, quotes a price per fetch, and answers with HTTP 402 until a payment token arrives.
 
 ## What you will build
 
@@ -126,7 +126,7 @@ content-type: application/json
 {"error":"bot_auth: signature required"}
 ```
 
-Now sign as GPTBot. Write the demo private key (a keypair RFC 8032 publishes as a test vector; its public half is already in the config) and let the bundled helper produce the two signature headers. Sign the components exactly as the proxy derives them: the path for `@target-uri` and the `Host` value for `@authority`:
+Now sign as GPTBot. Write the demo private key (a keypair RFC 8032 publishes as a test vector; its public half is already in the config) and let the bundled helper produce the two signature headers. The helper signs `@target-uri` as the path alone, which is the shape earlier releases derived; the proxy still accepts it for a deprecation window and logs once per process when it does. A production signer should use a conformant RFC 9421 library, which signs the absolute URI (`http://blog.local/anything/article` here). `@authority` is the `Host` value in both shapes:
 
 ```bash
 printf -- '-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIJ1hsZ3v/VpguoRK9JLsLMREScVpezJpGXA7rAMcrn9g\n-----END PRIVATE KEY-----\n' \

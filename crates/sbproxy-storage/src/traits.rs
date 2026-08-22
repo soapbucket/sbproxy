@@ -51,9 +51,25 @@ pub trait EphemeralKv: Send + Sync {
 
     /// Store `value` under `key` with the given TTL.
     ///
-    /// Implementations should treat `ttl == Duration::ZERO` as
-    /// "evict immediately"; backends without that primitive may
-    /// reject it with [`StorageError::InvalidConfig`].
+    /// Implementations MUST reject `ttl == Duration::ZERO` with
+    /// [`StorageError::InvalidConfig`]. A zero-lifetime write has no
+    /// meaning, and the two plausible readings of it, "store then evict
+    /// at once" and "do not store", are not distinguishable by the
+    /// caller from the result.
+    ///
+    /// Implementations MUST also reject, rather than round up, any TTL
+    /// finer than the granularity they can express: rounding up leaves
+    /// the entry readable past its TTL and breaks the eviction
+    /// guarantee above. Rounding *down* is allowed, since an entry that
+    /// goes early still honors it. `RedisStore` counts in whole seconds
+    /// and so refuses anything under one second; `MockEphemeralKv`
+    /// keeps the full `Duration` and refuses only zero.
+    ///
+    /// So the portable floor for a caller is one second. A sub-second
+    /// TTL that a test accepts against the in-memory double is refused
+    /// against Redis, and that refusal surfaces wherever the caller
+    /// runs rather than where it was written. Ask for whole seconds
+    /// unless the call site is pinned to one implementation.
     async fn put(&self, key: &str, value: Bytes, ttl: Duration) -> Result<(), StorageError>;
 
     /// Atomically read and delete `key` (Redis GETDEL semantics).

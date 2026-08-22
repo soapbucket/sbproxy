@@ -1,5 +1,5 @@
 # OpenAPI Emission
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-21*
 
 SBproxy documents and governs your API. It does not just proxy it.
 
@@ -67,13 +67,17 @@ The gateway derives every part of the document from its compiled config. Each ro
 | Forward rule `exact` matcher                  | `paths` key                                   |
 | Forward rule `prefix` matcher                 | `paths` key + `x-sbproxy-prefix-match: true`  |
 | Forward rule `regex` matcher                  | Synthetic key + `x-sbproxy-regex-path` extension |
-| `allowed_methods`                             | `Operation` per method                        |
+| `allowed_methods` entry OpenAPI 3.0 can name  | `Operation` per method                        |
+| `allowed_methods` entry it cannot             | `x-sbproxy-unrepresentable-methods` on the path item, one entry per method and host |
+| The origin's hostname, per operation          | `servers[]` on the operation                  |
+| Matcher `header` / `query` / `body` / `method` / `when` | `x-sbproxy-match` on the operation, field and comparison only |
 | Rule-level `parameters`                       | `parameters[]` per operation                  |
 | `auth_config`                                 | `securitySchemes` + `security`                |
 | `response_cache.cacheable_status`             | `responses` keys                              |
 | `error_pages` keys                            | `responses` keys                              |
 | `cors`                                        | `x-sbproxy-cors` extension                    |
 | `deprecation:` block (rule wins over origin)  | `deprecated: true` + `x-sbproxy-sunset` / `x-sbproxy-successor` extensions |
+| Two rules on one path and method              | First wins + `x-sbproxy-alternate-operations` + `x-sbproxy-collisions` |
 
 The deprecation extensions carry the exact wire values the response
 filter stamps (`x-sbproxy-sunset` is the RFC 8594 HTTP-date), so the
@@ -81,6 +85,160 @@ emitted spec and the response headers cannot disagree. See
 [api-gateway.md](api-gateway.md#deprecating-endpoints).
 
 Coverage is bounded by what the gateway config knows. Upstream request and response body schemas are not described unless you declare them explicitly (or feed in an upstream OpenAPI spec via the existing consumption path).
+
+### Methods OpenAPI cannot name
+
+A Path Item Object has exactly eight operation fields: `get`, `put`,
+`post`, `delete`, `options`, `head`, `patch`, and `trace`. Everything
+else is a verb OpenAPI 3.0 has nowhere to put, and `allowed_methods`
+accepts anything that is a valid HTTP method token:
+
+```yaml
+origins:
+  "files.example.com":
+    allowed_methods: ["GET", "PROPFIND"]
+    action: { type: proxy, url: http://upstream }
+```
+
+The gateway serves both of those and answers everything else with a
+`405`, so the document says both. `GET` becomes an operation; `PROPFIND`
+is listed on the path item instead:
+
+```json
+"/documents/{id}": {
+  "get": { "...": "..." },
+  "x-sbproxy-unrepresentable-methods": [
+    {
+      "method": "PROPFIND",
+      "servers": [{"url": "https://files.example.com"}]
+    }
+  ]
+}
+```
+
+Each entry names the host that serves the verb, for the same reason
+operations do. Two origins can share a path key while only one of them
+allows `PROPFIND`, and a bare list of verbs on the shared path item
+would have the all-hosts document claiming a verb against a host that
+answers it with a `405`.
+
+An origin whose whole allowlist is unrepresentable emits its paths with
+that extension and no operations at all. That is deliberate: a path item
+carrying a verb the gateway would refuse is worse than one carrying
+none, because a generator will build a client against it. Read
+`x-sbproxy-unrepresentable-methods` before concluding a path only serves
+what its operations list, and read the `servers` on the entry before
+concluding which host serves it.
+
+An empty `allowed_methods` installs no method check at all. The document
+still names the seven common verbs rather than guessing at the extension
+ones, so it under-describes an unrestricted origin instead of
+over-describing it.
+
+### Two rules on one path and method
+
+Path keys are not unique across a config. Two origins can expose the
+same path, and one origin can route the same path two ways using a
+`header`, `query`, `body`, `method`, or `when` condition that OpenAPI
+has no field for. The document keeps whichever comes first in the
+config. Within one origin that is also how the gateway picks at
+request time, first matching forward rule wins, so the operation on
+the key is the one a request actually reaches. Across origins nothing
+competes at request time (the hosts differ); the shared key is an
+artifact of the all-hosts document flattening every origin into one
+`paths` map:
+
+```json
+"/users": {
+  "get": {
+    "operationId": "api_get_users",
+    "servers": [{"url": "https://api.example.com"}],
+    "x-sbproxy-match": {
+      "header": {"name": "x-beta", "compare": "exact"},
+      "variant": 1
+    }
+  },
+  "x-sbproxy-alternate-operations": [
+    {
+      "operationId": "web_get_users",
+      "servers": [{"url": "https://web.example.com"}]
+    }
+  ]
+}
+```
+
+Nothing is dropped. The operation that lost the key stays readable under
+`x-sbproxy-alternate-operations`, and the whole set is summarized once at
+the top level:
+
+```json
+"x-sbproxy-collisions": [
+  {
+    "path": "/users",
+    "method": "get",
+    "emitted": "api_get_users",
+    "alternate": "web_get_users"
+  }
+]
+```
+
+A byte-identical repeat is not a collision and is not reported. Neither
+extension appears on a document that has no conflicts.
+
+Two things make an operation self-describing enough for that to be
+useful. Each operation carries its own `servers` entry naming the origin
+that serves it, which also fixes the all-hosts document's older habit of
+implying every host served every path. And `x-sbproxy-match` describes
+the matcher conditions OpenAPI cannot express, so two rules on one path
+are distinguishable rather than looking like the same route written
+twice.
+
+### What `x-sbproxy-match` deliberately leaves out
+
+`/.well-known/openapi.json` needs no credential, so everything in the
+document is public. Matcher values are not. Operators route on
+shared-secret headers, internal query tokens, body fields carrying
+customer identifiers, and `when:` predicates that name internal
+infrastructure, and none of that is contract; it is config that happens
+to sit next to the routes.
+
+So the extension carries the field a rule looks at and the comparison it
+performs, never the value it compares against. One entry per matcher the
+rule sets, plus the `variant` number described below:
+
+| Config | Emitted |
+| --- | --- |
+| `header: {name: x-partner-token, value: sk-live-9f3}` | `{"header": {"name": "x-partner-token", "compare": "exact"}}` |
+| `header: {name: authorization, prefix: "Bearer sk-"}` | `{"header": {"name": "authorization", "compare": "prefix"}}` |
+| `query: {name: access}` | `{"query": {"name": "access", "compare": "present"}}` |
+| `body: {pointer: /account, prefix: acct-9}` | `{"body": {"pointer": "/account", "compare": "prefix"}}` |
+| `when: "request.headers['x-src'] == 'vault.internal'"` | `{"when": "cel"}` |
+| `method: [POST, PUT]` | `{"method": ["POST", "PUT"]}` |
+
+Methods are the one thing carried verbatim. Config load refuses a
+`method:` entry that is not a valid HTTP method token, so the field
+cannot hold operator text, and the verbs are the document's own
+vocabulary already.
+
+That leaves a gap the `variant` number fills. Two rules that differ only
+in a header value have the same shape, so without it they would emit as
+one operation and the second route would vanish from the document.
+`variant` counts the distinct condition sets seen under one shape, in
+the order they first appear. Equal variants mean equal conditions;
+different variants mean different ones. It says the two rules match on
+different values and nothing at all about what those values are.
+
+The count is per document. A rule can carry `variant: 1` in its own
+host's document and `variant: 2` in the admin document for every host,
+where an earlier origin claimed the first number for a different value.
+Compare variants inside one document, never across two.
+
+A short hash of the value would number them just as well and stay stable
+when a rule is inserted ahead of them, which a counter does not. It is
+still the wrong trade: a hash lets anyone holding the document confirm a
+guessed token offline, at whatever rate their hardware allows, with no
+request to rate-limit and no log line to notice. That is the disclosure
+this extension exists to prevent, only slower.
 
 ## Where to read it
 
@@ -188,6 +346,10 @@ Custom auth types can register their own mappers via the `AuthSchemeMapper` regi
 - Path templates and regex matchers describe routing surface, not upstream contract. Request and response body schemas are not emitted unless an upstream OpenAPI spec was fed in via the existing consumption path (`crates/sbproxy-extension/src/mcp/openapi_convert.rs`); merging that spec into emitted operations is on the roadmap.
 - CORS is surfaced as an `x-sbproxy-cors` extension because OpenAPI 3.0 has no native CORS vocabulary.
 - The `info.version` field defaults to `1.0.0`; callers who want the live config revision should override it after `build()` returns.
+- A verb outside OpenAPI 3.0's eight cannot become an operation. It is named on the path item under `x-sbproxy-unrepresentable-methods` instead, and standard tooling will not see it as a route.
+- When two rules resolve to one path and method, one operation holds the key and the rest sit under `x-sbproxy-alternate-operations`. A generator that reads only the path item builds a client for the first, so check `x-sbproxy-collisions` if you expected more routes than you got.
+- Matcher conditions ride along in `x-sbproxy-match` rather than in anything OpenAPI defines, so a generator will not enforce them. A client built from this document can call an operation whose header, query, body, or `when` condition it never satisfies, and the gateway will route it somewhere else.
+- `x-sbproxy-match` names the field and the comparison, never the value. There is no way to read a routing secret, an internal token, or the text of a `when:` predicate out of this document, and no way to reconstruct one from the `variant` number either. If you want the values, read the config through the authenticated admin surface, which redacts secrets on its way out.
 
 ## Programmatic access
 
@@ -206,7 +368,9 @@ If you have a custom auth provider plugged in via the public plugin API, registe
 
 ## Why emission, not just proxying
 
-Most gateways ship an OpenAPI editor (you write the spec) or an OpenAPI importer (you feed in an upstream spec). SBproxy goes the other way: you configure routes, auth, caching, and rate limits on the gateway, and the gateway publishes a faithful OpenAPI document that always matches the running config. Reloads invalidate the cache; the next consumer fetch sees the new shape.
+Most gateways ship an OpenAPI editor (you write the spec) or an OpenAPI importer (you feed in an upstream spec). SBproxy goes the other way: you configure routes, auth, caching, and rate limits on the gateway, and the gateway publishes an OpenAPI document derived from the running config. Reloads invalidate the cache; the next consumer fetch sees the new shape.
+
+Where the config says something OpenAPI 3.0 cannot, the document says so in an extension rather than rounding it to the nearest thing the format allows. That is the whole bargain: everything the document states as an operation is a route the gateway serves, and the two `x-sbproxy-` lists above are where you look for the rest.
 
 That makes the gateway, not the upstream service, the source of truth for what your API looks like to the outside world. Buyers point their SDK generators, contract tests, and developer portals at SBproxy. When you change a route, the document changes. When you tighten an auth scheme, the document tightens.
 
@@ -286,9 +450,12 @@ rather than hoisted to the path item:
 
 `allowed_methods: ["GET", "POST"]` on the origin is why every path carries
 exactly those two operations, each with its own `operationId` built from the
-host, the method, and the rule's `id`. Responses are the generic `200` and
-`default` pair: the gateway describes the routes it exposes, not the bodies
-the upstream returns.
+host, the method, and the rule's `id`, and its own `servers` entry naming the
+origin it came from. Both verbs are ones OpenAPI can name, so no path in this
+example carries `x-sbproxy-unrepresentable-methods`, and no two rules share a
+path and method, so the document carries no `x-sbproxy-collisions` either.
+Responses are the generic `200` and `default` pair: the gateway describes the
+routes it exposes, not the bodies the upstream returns.
 
 The admin surface serves the same document for every host and requires basic
 auth. Without credentials it answers `401`:

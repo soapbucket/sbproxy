@@ -201,6 +201,50 @@ pub struct LlmUsageEvent {
     /// resolved a local engine, and nothing else can produce it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub served_model: Option<String>,
+    /// The terminal `finish_reason` the provider reported, when the
+    /// response carried one.
+    ///
+    /// Populated on shadow rows, where it is the cheapest signal that
+    /// two targets disagreed: a target that stopped on `length` where
+    /// another stopped on `stop` truncated its answer, and neither cost
+    /// nor latency says so. `None` on rows whose response shape carries
+    /// no finish reason and on rows the call never completed.
+    ///
+    /// Not populated on an ordinary completion. The primary's finish
+    /// reasons reach the request span as
+    /// `gen_ai.response.finish_reasons` instead, so a primary-versus-
+    /// target comparison joins the ledger to the trace or access log,
+    /// while a target-versus-target comparison is answerable from the
+    /// ledger alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+    /// The primary request this row shadow-evaluated, when this row is
+    /// a shadow row.
+    ///
+    /// The join key for the shadow comparison surface: it groups the
+    /// primary's row with the one row each shadow target produced, so
+    /// cost, latency, `finish_reason`, and model can be read side by
+    /// side per request. `None` on every ordinary completion.
+    ///
+    /// Carried as data and never as the dedup key. `request_id` on a
+    /// shadow row is freshly minted per target, because the correlation
+    /// id feature lets a caller choose the primary's request id with an
+    /// `X-Request-Id` header; deriving the shadow row's key from it
+    /// would let one caller suppress another caller's shadow rows on
+    /// replay of the verifiable ledger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_of: Option<String>,
+    /// Which secret the accepted upstream attempt presented
+    /// (WOR-2655): `provider_entry`, `native_caller`, or `fallback`.
+    ///
+    /// The outbound counterpart to the request row's inbound
+    /// `key_mode`, and it is on the spend record rather than only on
+    /// the log because it answers a billing question: an entry whose
+    /// `fallback` share climbs is one whose tenant key is dying and
+    /// whose spend is quietly moving onto the operator's account.
+    /// `None` on records the AI dispatch path did not produce.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_source: Option<String>,
 }
 
 /// A destination for completed-call usage events.
@@ -215,6 +259,9 @@ pub trait UsageSink: Send + Sync + std::fmt::Debug {
 }
 
 /// A sink that appends one JSON object per line to a file.
+///
+/// The file is owner-only (`0o600`), created and kept that way by
+/// [`sbproxy_util::secure_fs`].
 #[derive(Debug)]
 pub struct JsonlFileSink {
     path: std::path::PathBuf,
@@ -230,20 +277,31 @@ impl JsonlFileSink {
 impl UsageSink for JsonlFileSink {
     fn record(&self, event: &LlmUsageEvent) {
         use std::io::Write as _;
-        let line = match serde_json::to_string(event) {
+        let mut line = match serde_json::to_string(event) {
             Ok(l) => l,
             Err(e) => {
                 tracing::warn!(error = %e, "usage sink: failed to serialize event");
                 return;
             }
         };
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-        {
+        // The newline goes in the same buffer as the row. `writeln!`
+        // formats the body and the newline as two separate writes, and
+        // this sink holds no lock and reopens per event, so two
+        // concurrent recorders (the shadow targets of one request, or
+        // two requests completing together) interleave into
+        // `{a}{b}\n\n`: two rows written, zero rows parseable, and a
+        // reader that skips bad lines reports them as missing rather
+        // than as corrupt. One `write_all` of one buffer to an
+        // `O_APPEND` file is atomic against other appenders.
+        line.push('\n');
+        // Owner-only (`0o600`). A usage line carries the tenant, the
+        // model, and the token counts that price it, and this open
+        // runs once per event, so the tightening also re-asserts the
+        // mode if something loosened the file underneath a long-lived
+        // process.
+        match sbproxy_util::secure_fs::open_append_owner_only(&self.path) {
             Ok(mut f) => {
-                if let Err(e) = writeln!(f, "{line}") {
+                if let Err(e) = f.write_all(line.as_bytes()) {
                     tracing::warn!(error = %e, path = %self.path.display(), "usage sink: write failed");
                 }
             }
@@ -1399,6 +1457,9 @@ mod tests {
             workflow_id: None,
             logical_model: None,
             served_model: None,
+            finish_reason: None,
+            shadow_of: None,
+            credential_source: None,
         }
     }
 
@@ -1428,6 +1489,58 @@ mod tests {
         assert_eq!(parsed["total_tokens"], 15);
         // None fields are omitted, not serialized as null.
         assert!(parsed.get("user").is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn concurrent_recorders_do_not_interleave_a_row_with_its_newline() {
+        // The sink holds no lock and reopens the file per event, so two
+        // recorders running at once is the ordinary case: a request
+        // with two shadow targets produces two rows from two detached
+        // tasks, and two requests completing together produce two more.
+        // Emitting the body and the newline as separate writes let
+        // those interleave into `{a}{b}` on one line and two empty
+        // lines after it, which reads to any JSONL consumer as rows
+        // that were never written.
+        let path = std::env::temp_dir().join(format!(
+            "sb-usage-concurrent-{}-{:?}.jsonl",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let sink = std::sync::Arc::new(JsonlFileSink::new(&path));
+        let threads = 8;
+        let per_thread = 40;
+        let start = std::sync::Arc::new(std::sync::Barrier::new(threads));
+        let handles: Vec<_> = (0..threads)
+            .map(|index| {
+                let sink = std::sync::Arc::clone(&sink);
+                let start = std::sync::Arc::clone(&start);
+                std::thread::spawn(move || {
+                    let mut event = sample_event();
+                    event.provider = format!("provider-{index}");
+                    start.wait();
+                    for _ in 0..per_thread {
+                        sink.record(&event);
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("recorder thread");
+        }
+
+        let content = std::fs::read_to_string(&path).expect("usage file");
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(
+            lines.len(),
+            threads * per_thread,
+            "one line per recorded event"
+        );
+        for line in &lines {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|error| panic!("torn JSONL line {line:?}: {error}"));
+        }
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2239,5 +2352,47 @@ mod tests {
                     && e.host == synthetic_host),
             "record() must not recompute the synthetic default from a fresh environment scan"
         );
+    }
+
+    /// WOR-2626: a usage line carries the tenant, the model, and the
+    /// token counts that price it, so the JSONL feed must be
+    /// owner-only.
+    ///
+    /// This sink reopens its file on every event, so the test asserts
+    /// twice: once on the file this call created, and once after
+    /// something loosens it underneath a running process. The second
+    /// half is the one a create-time mode alone cannot satisfy.
+    #[cfg(unix)]
+    #[test]
+    fn the_jsonl_feed_is_owner_only_and_stays_that_way() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("usage.jsonl");
+        let sink = JsonlFileSink::new(&path);
+
+        sink.record(&sample_event());
+        let created = std::fs::metadata(&path)
+            .expect("stat the feed")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(created, 0o600, "new feed is {created:o}, not owner-only");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen the feed behind the sink's back");
+        sink.record(&sample_event());
+        let reopened = std::fs::metadata(&path)
+            .expect("stat the feed")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            reopened, 0o600,
+            "reopened feed is {reopened:o}; a loosened file must be tightened, not inherited"
+        );
+
+        let written = std::fs::read_to_string(&path).expect("read the feed");
+        assert_eq!(written.lines().count(), 2, "both events were appended");
     }
 }

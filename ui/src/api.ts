@@ -2059,6 +2059,10 @@ export interface RequestLog {
   api_key_id?: string;
   key_mode?: "none" | "minted" | "native" | string;
   key_provider?: string;
+  // Which secret the AI attempt presented upstream, the outbound
+  // counterpart to key_mode. Absent on rows the AI gateway did not
+  // dispatch.
+  credential_source?: "provider_entry" | "native_caller" | "fallback" | string;
   tenant_id?: string;
   user_id?: string;
   // WOR-2094 explainability columns.
@@ -2996,6 +3000,19 @@ export const api = {
   spendWindow: (window: string, groupBy: string) =>
     getJson<SpendWindowResponse>(
       `/api/usage/spend?window=${encodeURIComponent(window)}&group_by=${encodeURIComponent(groupBy)}`,
+    ),
+  /**
+   * The same rollup query over an explicit range, in Unix seconds.
+   *
+   * `window=` only ever means "ending now", so the prior equal-length
+   * period, which is what turns a total into a change, is unreachable
+   * through it. The server takes `from`/`to` on the same route and
+   * requires `from < to`; anything else is a 400.
+   */
+  spendRange: (fromSecs: number, toSecs: number, groupBy: string) =>
+    getJson<SpendWindowResponse>(
+      `/api/usage/spend?from=${Math.floor(fromSecs)}&to=${Math.floor(toSecs)}` +
+        `&group_by=${encodeURIComponent(groupBy)}`,
     ),
 
   // Prompts

@@ -171,7 +171,12 @@ mod tests {
             allow_private_base_url: false,
             no_prompt_training: false,
             data_posture: None,
+            service_tier: None,
+            on_key_failure: crate::provider::KeyFailurePosture::Fallback,
+            fallback_credential_id: None,
             serve: None,
+            aws_sigv4: None,
+            bedrock_guardrail: None,
         };
         p.serve = Some(serve);
         p

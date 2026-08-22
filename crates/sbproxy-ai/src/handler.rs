@@ -55,6 +55,34 @@ pub struct AiHandlerConfig {
     /// Strategy used to select a provider for each request.
     #[serde(default = "default_strategy", deserialize_with = "deserialize_routing")]
     pub routing: RoutingStrategy,
+    /// Route a caller's repeated requests back to the provider that already
+    /// holds their warm prompt cache.
+    ///
+    /// When a request carries a prompt cache key (`prompt_cache_key`, or
+    /// `user` when that is absent), the gateway remembers which provider
+    /// served it and prefers that provider for the caller's next request
+    /// with the same key. It is a preference, never a pin: an unhealthy,
+    /// ejected, or policy-ineligible provider is still skipped, and a
+    /// request whose resolved model changed starts a fresh lease.
+    ///
+    /// This composes with `routing.strategy` rather than replacing it. The
+    /// strategy still picks; affinity only moves a live lease holder to the
+    /// front of the order it produced. The four strategies that own their
+    /// ordering outright are the exception and are left alone:
+    /// `fallback_chain`, `cascade`, `cost_quality`, and a `routing_policy`
+    /// plan all express an order the operator wrote down, so a lease is
+    /// neither read nor recorded on those origins.
+    ///
+    /// The lease is scoped to the tenant, the credential, the origin, and
+    /// the API surface, so one caller's key can never steer another's
+    /// routing. Nothing writes the key; a request that does not send one is
+    /// routed by the configured strategy alone.
+    ///
+    /// State lives in this gateway process only. It does not survive a
+    /// restart and is not shared between replicas. Unset disables the
+    /// feature.
+    #[serde(default)]
+    pub cache_affinity: Option<crate::routing_state::CacheAffinityConfig>,
     /// Data-handling posture requirement gating provider eligibility.
     ///
     /// Evaluated as a hard candidate-set filter before any routing
@@ -105,6 +133,19 @@ pub struct AiHandlerConfig {
     /// already chosen that provider. See [`crate::model_alias`].
     #[serde(default)]
     pub model_aliases: Vec<crate::model_alias::ModelAlias>,
+    /// Named model groups for this origin.
+    ///
+    /// Each entry binds one public name callers send as `model` to a
+    /// list of members, each naming a provider on this action and the
+    /// upstream model id it serves. A group carries its own routing
+    /// strategy and per-member weights, so it load-balances
+    /// independently of this action's `routing:`, and its members may
+    /// serve different model ids. Groups resolve on the dispatch path
+    /// before every model gate and before provider selection, the same
+    /// point a `model_aliases` entry resolves, so every gate below
+    /// judges the member's real model id. See [`crate::model_group`].
+    #[serde(default)]
+    pub model_groups: Vec<crate::model_group::ModelGroup>,
     /// Maximum request body size in bytes accepted by the gateway.
     ///
     /// Checked while the body arrives rather than once it is all in
@@ -283,6 +324,58 @@ pub struct AiHandlerConfig {
     /// positive when set; `None` (the default) disables the gate.
     #[serde(default)]
     pub max_price_per_request: Option<f64>,
+    /// Allow a caller's `x-sbproxy-timeout-ms` header to replace the
+    /// selected provider's `timeout_ms` for one request.
+    ///
+    /// Defaults to `false`, and off means the header is ignored rather
+    /// than honored or refused. A caller who can raise a timeout holds a
+    /// downstream connection, a `quota_pool` slot, and an upstream
+    /// generation open for as long as the ceiling allows, which is a
+    /// capacity decision an operator makes. A caller who can lower one is
+    /// no safer: `timeout_ms` runs from connect through the end of the
+    /// response body, so a shortened budget cuts off a streaming
+    /// completion the operator is already billed for and burns a retry
+    /// attempt doing it.
+    ///
+    /// Turning this on requires `max_request_timeout_ms`. The flag alone
+    /// is refused at config load, because an unbounded caller timeout is
+    /// the failure this gate exists to prevent.
+    ///
+    /// Scope is the origin, so this enables the override for every caller
+    /// and every tenant routed to this `ai_proxy` action.
+    ///
+    /// The override reaches every dispatch that goes out over the
+    /// gateway's provider HTTP client: hosted providers, a confidence
+    /// cascade's tiers, each racing leg, every retry attempt, and a
+    /// `managed_model` this process serves locally, which is dialed over
+    /// that same client once the engine is up. It does not reach a
+    /// `managed_model` served by another node in a cluster, which is
+    /// dispatched over the model plane on its own deadlines, nor the
+    /// gateway's own routing work: semantic-cache and semantic-route
+    /// embeddings and shadow copies keep their configured budgets.
+    #[serde(default)]
+    pub allow_request_timeout_override: bool,
+    /// Hard ceiling in milliseconds on a caller's `x-sbproxy-timeout-ms`.
+    ///
+    /// A header above the ceiling is refused with 400 naming the accepted
+    /// range rather than silently clamped, so a caller does not build a
+    /// retry schedule on a budget it never got. Must be above zero when
+    /// set, and required whenever `allow_request_timeout_override` is
+    /// true.
+    ///
+    /// Independent of any provider's `timeout_ms`: this bounds what a
+    /// caller may ask for, `timeout_ms` is what they get when they ask
+    /// for nothing. It bounds one attempt rather than the whole request,
+    /// so with `max_retries: 3` a caller asking for the ceiling can hold
+    /// four attempts of it. Size it against the attempt, then multiply.
+    ///
+    /// An honored header replaces the gateway's 30-second HTTP client
+    /// default as well as the provider's `timeout_ms`, so a ceiling above
+    /// 30000 does buy a caller a longer attempt. That is the point of the
+    /// ceiling: it is the only thing bounding how long one caller can
+    /// hold a connection, a `quota_pool` slot, and an upstream generation.
+    #[serde(default)]
+    pub max_request_timeout_ms: Option<u64>,
     /// WOR-1880: optional fair-share quota pool across providers.
     /// When set, each provider attempt reserves against the pool before
     /// dispatch; a deny advances to the next candidate when alternatives
@@ -353,6 +446,10 @@ pub struct AiHandlerConfig {
     /// that carries aliases is fully resolved before it is published.
     #[serde(skip)]
     model_alias_index: OnceLock<crate::model_alias::ModelAliasRegistry>,
+    /// Group index built from `model_groups`. `from_config` warms it at
+    /// config load, for the same reason the alias index is warmed there.
+    #[serde(skip)]
+    model_group_index: OnceLock<crate::model_group::ModelGroupRegistry>,
 }
 
 fn default_usage_parser() -> String {
@@ -558,7 +655,22 @@ impl AiHandlerConfig {
         self.router
             .get_or_init(|| {
                 let mut router =
-                    crate::routing::Router::new(self.routing.clone(), self.providers.len());
+                    crate::routing::Router::new(self.routing.clone(), self.providers.len())
+                        // WOR-2657: one rotation cursor per named group,
+                        // sized here for the same reason the
+                        // per-provider vectors are sized in `new`.
+                        .with_model_groups(
+                            self.model_groups.iter().map(|group| group.name.as_str()),
+                        );
+                if let Some(cache_affinity) = self.cache_affinity {
+                    router = router.with_cache_affinity(cache_affinity);
+                    tracing::info!(
+                        providers = self.providers.len(),
+                        ttl_secs = cache_affinity.ttl_secs,
+                        max_keys_per_provider = cache_affinity.max_keys_per_provider,
+                        "ai prompt-cache affinity armed"
+                    );
+                }
                 if let Some(resilience) = self.resilience.as_ref() {
                     if let Some(breaker) = resilience.circuit_breaker.as_ref() {
                         let failure_threshold = breaker.failure_threshold.max(1);
@@ -775,6 +887,49 @@ pub struct AiResilienceConfig {
     /// more permissive model after a stricter one. Off by default.
     #[serde(default)]
     pub content_policy_fallback: bool,
+    /// Milliseconds a streaming request may wait for the provider's
+    /// response headers before the gateway gives up on that candidate and
+    /// tries the next one.
+    ///
+    /// This bounds connect through upstream response headers only. Once
+    /// the provider answers with a streaming content type the request is
+    /// committed to that provider: a stall after that point ends the
+    /// stream rather than failing over, because a later candidate cannot
+    /// replace output the caller is already receiving. Those stalls are
+    /// counted on `sbproxy_ai_stream_post_commit_failures_total`, and a
+    /// failover taken on this budget is labeled
+    /// `sbproxy_ai_failovers_total{reason="pre_header_timeout"}`.
+    ///
+    /// This is a different budget from `providers[].timeout_ms`, which is
+    /// measured from connect through the end of the response body and so
+    /// cuts a streaming completion off mid-stream. Set both: this one to
+    /// fail off a wedged provider quickly, that one to cap the whole
+    /// call.
+    ///
+    /// Applies to streaming requests only, and must be above zero when
+    /// set. Unset leaves streaming requests bounded solely by
+    /// `providers[].timeout_ms`, or by the gateway's 30-second HTTP
+    /// client default when that is unset too, during which no failover
+    /// happens.
+    ///
+    /// This budget only ever shortens an attempt, so a value above the
+    /// attempt's own transport budget never fires: set it below
+    /// `providers[].timeout_ms`, or below 30000 on a provider that sets
+    /// no `timeout_ms`.
+    ///
+    /// Worst case before the caller sees an error is
+    /// `(pre_header_timeout_ms + backoff) x candidate count`, since the
+    /// dispatch loop visits each configured provider at most once.
+    ///
+    /// What it also covers, which is easy to miss on a cluster: a
+    /// `managed_model` served by another node is dispatched over the
+    /// model plane from inside the same bounded attempt, so this budget
+    /// bounds that dispatch too, cold start included. A cold start is
+    /// legitimately slower than any hosted provider's headers. On an
+    /// origin that can route to a managed model, size this above the
+    /// cold-start budget or leave it unset.
+    #[serde(default)]
+    pub pre_header_timeout_ms: Option<u64>,
 }
 
 /// LLM-aware failover actions (WOR-1545).
@@ -945,12 +1100,37 @@ fn default_health_healthy() -> u32 {
 /// timeout that, when exceeded, drops the future and ticks a separate timeout
 /// counter. See `sbproxy_ai::client::AiClient` for the supervisor
 /// implementation.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone)]
 pub struct AiShadowConfig {
+    /// Providers to shadow this route against.
+    ///
+    /// Every target sees the same request, independently sampled, and
+    /// each produces its own usage-ledger row tagged `shadow` and
+    /// grouped with the primary by `shadow_of`. The list is keyed by
+    /// `provider`: two entries naming the same provider are refused at
+    /// config load, because the provider name is what labels the
+    /// metric and identifies the row.
+    ///
+    /// The single-target form is still accepted and means a one-entry
+    /// list:
+    ///
+    /// ```yaml
+    /// shadow:
+    ///   provider: anthropic
+    ///   sample_rate: 0.1
+    /// ```
+    pub targets: Vec<AiShadowTarget>,
+}
+
+/// One provider this route is shadowed against.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct AiShadowTarget {
     /// Provider name to shadow against. Must also appear in the
     /// `providers` list (so its API key, base URL, and rate limits
     /// resolve normally). Use a different model than the primary if
-    /// you want to A/B different model versions.
+    /// you want to A/B different model versions. No two targets may
+    /// name the same provider.
     pub provider: String,
     /// Optional model override for the shadow request. Defaults to
     /// the same model the client sent.
@@ -958,6 +1138,12 @@ pub struct AiShadowConfig {
     pub model: Option<String>,
     /// Sample rate in `[0.0, 1.0]`. Default `1.0` (mirror every
     /// request). Set lower to avoid doubling spend on every call.
+    ///
+    /// One draw is taken per request and every target is compared
+    /// against that same draw, so target populations nest rather than
+    /// diverge: everything a `0.1` target sees, a `0.5` target on the
+    /// same route also saw. That is what makes two targets comparable
+    /// on the smaller one's whole population.
     #[serde(default = "default_shadow_sample_rate")]
     pub sample_rate: f32,
     /// Per-shadow-request HTTP timeout in milliseconds. Default
@@ -972,6 +1158,61 @@ pub struct AiShadowConfig {
     /// providers that hang inside DNS, TLS, or pre-body read paths.
     #[serde(default = "default_shadow_task_timeout_ms")]
     pub task_timeout_ms: u64,
+}
+
+/// The `targets:` spelling, kept separate from the flat one so an
+/// unknown key inside it is still refused.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AiShadowTargetList {
+    targets: Vec<AiShadowTarget>,
+}
+
+impl<'de> Deserialize<'de> for AiShadowConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        // Branch on the presence of `targets` rather than with
+        // `#[serde(untagged)]`: untagged reports "data did not match any
+        // variant" for a typo anywhere in either arm, which for a block
+        // with five sibling keys is a worse error than the one
+        // `deny_unknown_fields` gives.
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let targets = if value.get("targets").is_some() {
+            serde_json::from_value::<AiShadowTargetList>(value)
+                .map_err(D::Error::custom)?
+                .targets
+        } else {
+            vec![serde_json::from_value::<AiShadowTarget>(value).map_err(D::Error::custom)?]
+        };
+
+        if targets.is_empty() {
+            return Err(D::Error::custom(
+                "ai shadow.targets must name at least one provider; remove the \
+                 shadow block to disable shadow evaluation",
+            ));
+        }
+        // The provider name labels the shadow metric families and
+        // identifies the target's ledger rows. Two entries sharing it
+        // would silently merge two evaluations into one series.
+        for (index, target) in targets.iter().enumerate() {
+            if let Some(earlier) = targets[..index]
+                .iter()
+                .position(|other| other.provider == target.provider)
+            {
+                return Err(D::Error::custom(format!(
+                    "ai shadow.targets[{index}] repeats provider {:?} from \
+                     targets[{earlier}]; each target is identified by its \
+                     provider name",
+                    target.provider
+                )));
+            }
+        }
+        Ok(Self { targets })
+    }
 }
 
 fn default_shadow_sample_rate() -> f32 {
@@ -992,7 +1233,7 @@ fn default_strategy() -> RoutingStrategy {
 /// - A flat string: `"round_robin"` (Rust format)
 /// - A nested object: `{strategy: "round_robin", ...}` (Go format)
 /// - A cascade object: `{strategy: "cascade", tiers: [...], max_total_cost: ...}`
-fn deserialize_routing<'de, D>(deserializer: D) -> Result<RoutingStrategy, D::Error>
+pub(crate) fn deserialize_routing<'de, D>(deserializer: D) -> Result<RoutingStrategy, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -1019,6 +1260,16 @@ where
     let obj = value.as_object().ok_or_else(|| {
         Error::custom("routing must be either a strategy name string or an object")
     })?;
+    // `cache_affinity` composes with every strategy, so it is a sibling of
+    // `routing:`, not a field inside it. Authored here it would otherwise
+    // deserialize as an unknown strategy variant and refuse with a message
+    // that names the wrong problem.
+    if obj.contains_key("cache_affinity") {
+        return Err(Error::custom(
+            "cache_affinity is not a routing field; move it up one level so it \
+             sits beside `routing:` on the ai action",
+        ));
+    }
     let strategy_raw = obj
         .get("strategy")
         .ok_or_else(|| Error::custom("routing object is missing the required `strategy` field"))?;
@@ -1201,6 +1452,19 @@ impl AiHandlerConfig {
                 );
             }
         }
+        // The same silent-swallow failure, one level out. `timeout_ms`
+        // lives on `providers[]`, so an operator reaching for a second
+        // timeout key reasonably guesses the action level; `resilience:`
+        // is where this one is read. `AiHandlerConfig` sets no
+        // `deny_unknown_fields` either, so without this the key is
+        // dropped in silence and every streaming request keeps waiting
+        // out the 30-second client default with no failover.
+        anyhow::ensure!(
+            value.get("pre_header_timeout_ms").is_none(),
+            "ai `pre_header_timeout_ms` is not read at the action level and would be \
+             silently ignored: it is `resilience.pre_header_timeout_ms`, a key inside \
+             the `resilience:` block rather than a sibling of it"
+        );
         let mut config: Self = serde_json::from_value(value)?;
         // WOR-2556: a typed fallback list is an aimed allowlist. A name
         // matching no provider would leave the trigger configured and
@@ -1232,6 +1496,46 @@ impl AiHandlerConfig {
                     "ai max_price_per_request must be a positive USD amount, got {ceiling}. \
                      A ceiling at or below zero refuses every request, since no priced \
                      candidate estimates below it. Remove the key to disable the ceiling."
+                );
+            }
+        }
+        // A zero ceiling admits no caller header at all, so the flag
+        // would be on and every request carrying the header would 400.
+        // Same reading as a zero price ceiling: a typo, not a policy.
+        if config.max_request_timeout_ms == Some(0) {
+            anyhow::bail!(
+                "ai max_request_timeout_ms must be above zero. A ceiling of zero refuses \
+                 every x-sbproxy-timeout-ms header, which is the flag being off with extra \
+                 steps. Remove the key, or set the largest per-attempt budget a caller may \
+                 ask for."
+            );
+        }
+        // The flag without a ceiling is the failure the gate exists to
+        // prevent: any caller could then hold a downstream connection, a
+        // quota_pool slot, and an upstream generation open for as long as
+        // it liked. Refusing at load is the only place an operator finds
+        // out before a caller does.
+        if config.allow_request_timeout_override && config.max_request_timeout_ms.is_none() {
+            anyhow::bail!(
+                "ai allow_request_timeout_override requires max_request_timeout_ms. Without \
+                 a ceiling the x-sbproxy-timeout-ms header is an unbounded per-attempt \
+                 budget any caller can set. Set max_request_timeout_ms to the largest \
+                 budget a caller may ask for, or remove allow_request_timeout_override."
+            );
+        }
+        // A zero pre-header budget elapses before any provider can
+        // answer, so every streaming request would burn the whole
+        // candidate list and return an error. That reads as an outage,
+        // not as a tuning mistake, so it fails at load the way a zero
+        // `prefix_affinity.ttl` does.
+        if let Some(resilience) = config.resilience.as_ref() {
+            if resilience.pre_header_timeout_ms == Some(0) {
+                anyhow::bail!(
+                    "ai resilience.pre_header_timeout_ms must be above zero. A zero budget \
+                     elapses before any provider can send response headers, so every \
+                     streaming request would fail over through the whole candidate list \
+                     and return an error. Remove the key to leave streaming requests \
+                     bounded only by providers[].timeout_ms."
                 );
             }
         }
@@ -1425,9 +1729,25 @@ impl AiHandlerConfig {
                         provider.name
                     )
                 })?;
+            provider.validate_key_failure_posture().map_err(|error| {
+                anyhow::anyhow!(
+                    "ai provider {:?} key failure posture: {error}",
+                    provider.name
+                )
+            })?;
             provider
                 .validate_base_url()
                 .map_err(|e| anyhow::anyhow!("ai provider {:?} base_url: {e}", provider.name))?;
+            // WOR-2652: an entry that names a tier its vendor does not sell
+            // would boot green and then serve every request on a tier the
+            // operator did not choose, which shows up on the invoice rather
+            // than in a log.
+            crate::service_tier::validate_provider_tier(provider).map_err(|error| {
+                anyhow::anyhow!("ai provider {:?} service tier: {error}", provider.name)
+            })?;
+            provider.validate_bedrock_guardrail().map_err(|error| {
+                anyhow::anyhow!("ai provider {:?} bedrock guardrail: {error}", provider.name)
+            })?;
             // WOR-1818: an unresolved `${VAR}` left by env interpolation
             // would reach the wire verbatim as a bearer token and read as
             // a provider auth outage at request time. Fail at config load
@@ -1465,6 +1785,35 @@ impl AiHandlerConfig {
                 }
             }
         }
+        // Both Bedrock guardrail controls on one origin is a legal and
+        // sometimes deliberate deployment (ApplyGuardrail screens the
+        // prompt out of band, the inline block screens the completion),
+        // so this warns rather than refuses. It is still worth saying
+        // once at load: AWS bills each evaluation, and an operator who
+        // meant to migrate from one to the other has just doubled the
+        // guardrail spend without changing any behavior they can see.
+        let inline_guardrail_providers: Vec<&str> = config
+            .providers
+            .iter()
+            .filter(|provider| provider.bedrock_guardrail.is_some())
+            .map(|provider| provider.name.as_str())
+            .collect();
+        if !inline_guardrail_providers.is_empty() {
+            let apply_guardrail = config.guardrails.as_ref().is_some_and(|guardrails| {
+                guardrails.external.iter().any(|external| {
+                    external.provider == crate::external_guardrail::GuardrailProvider::Bedrock
+                })
+            });
+            if apply_guardrail {
+                tracing::warn!(
+                    providers = %inline_guardrail_providers.join(","),
+                    "ai: providers[].bedrock_guardrail and guardrails.external[] with \
+                     provider: bedrock are both configured; AWS evaluates and bills the \
+                     guardrail twice per request"
+                );
+            }
+        }
+
         // WOR-1880: reject strong consistency / invalid pool shapes at load.
         if let Some(pool) = &config.quota_pool {
             crate::quota_pool::validate_quota_pool_config(pool)
@@ -1570,6 +1919,16 @@ impl AiHandlerConfig {
         // Warm the index here rather than on the first request, so the
         // whole alias plane is resolved at config load.
         let _ = config.model_alias_registry();
+        // WOR-2657: a group resolves at the same seam an alias does, so
+        // it is validated against the same filled-in `models:` lists and
+        // against the alias list itself: one name cannot be both.
+        crate::model_group::validate_model_groups(
+            &config.model_groups,
+            &config.providers,
+            &config.model_aliases,
+        )
+        .map_err(|error| anyhow::anyhow!("ai model_groups: {error}"))?;
+        let _ = config.model_group_registry();
         // WOR-2557: a `data_posture:` block whose own requirement
         // excludes every provider the origin configures is a blackholed
         // origin, not a strict one: it boots green and then refuses
@@ -1665,6 +2024,18 @@ impl AiHandlerConfig {
         })
     }
 
+    /// This origin's model-group registry, built on first call.
+    ///
+    /// [`Self::from_config`] warms it, so the request path only ever
+    /// hits the cached instance. The fallback build keeps a handler
+    /// assembled some other way (a struct literal in a test) resolving
+    /// the same groups as one that came through config load.
+    pub fn model_group_registry(&self) -> &crate::model_group::ModelGroupRegistry {
+        self.model_group_index.get_or_init(|| {
+            crate::model_group::ModelGroupRegistry::from_config(self.model_groups.clone())
+        })
+    }
+
     /// Check if a model is allowed by the allow/block lists.
     pub fn is_model_allowed(&self, model: &str) -> bool {
         // Block list takes precedence
@@ -1753,6 +2124,77 @@ impl AiSurface {
             AiSurface::Messages => "messages",
             AiSurface::Responses => "responses",
             AiSurface::Unknown => "unknown",
+        }
+    }
+
+    /// Every classified surface, in declaration order.
+    ///
+    /// The capability matrix in [`crate::api_routes`] and the model
+    /// listing both need to iterate the whole surface set: the matrix
+    /// tests to prove the documented contract holds for every cell, and
+    /// [`crate::api_routes::surface_capability_names`] to decide which
+    /// surfaces a listing may name. This array is the production copy
+    /// both use, so a surface the dispatch path classifies cannot be
+    /// invisible to the listing that describes it (WOR-2647).
+    ///
+    /// Writing the length into the type checks the literal only against
+    /// itself, so the array on its own cannot notice a twentieth
+    /// variant. The private `position` function below is the
+    /// enforcement: its match is exhaustive, so a new variant fails to
+    /// compile there, and the `const` block after this `impl` checks
+    /// the two lists against each other at compile time.
+    pub const ALL: [AiSurface; 19] = [
+        AiSurface::ChatCompletions,
+        AiSurface::Models,
+        AiSurface::Embeddings,
+        AiSurface::Assistants,
+        AiSurface::Threads,
+        AiSurface::Batches,
+        AiSurface::FineTuning,
+        AiSurface::Files,
+        AiSurface::Realtime,
+        AiSurface::ImageGeneration,
+        AiSurface::ImageEdits,
+        AiSurface::ImageVariations,
+        AiSurface::AudioTranscription,
+        AiSurface::AudioSpeech,
+        AiSurface::Moderations,
+        AiSurface::Reranking,
+        AiSurface::Messages,
+        AiSurface::Responses,
+        AiSurface::Unknown,
+    ];
+
+    /// Where `surface` sits in [`Self::ALL`].
+    ///
+    /// This is the compile-time tie between the enum and the array.
+    /// The match is exhaustive, so a new variant is an `E0004`
+    /// "non-exhaustive patterns" error here rather than a quietly
+    /// shorter sweep and a surface missing from every published
+    /// listing. The `const` block after this `impl` then checks that
+    /// the index each arm names is where the variant actually sits
+    /// (WOR-2647).
+    const fn position(surface: &AiSurface) -> usize {
+        match *surface {
+            AiSurface::ChatCompletions => 0,
+            AiSurface::Models => 1,
+            AiSurface::Embeddings => 2,
+            AiSurface::Assistants => 3,
+            AiSurface::Threads => 4,
+            AiSurface::Batches => 5,
+            AiSurface::FineTuning => 6,
+            AiSurface::Files => 7,
+            AiSurface::Realtime => 8,
+            AiSurface::ImageGeneration => 9,
+            AiSurface::ImageEdits => 10,
+            AiSurface::ImageVariations => 11,
+            AiSurface::AudioTranscription => 12,
+            AiSurface::AudioSpeech => 13,
+            AiSurface::Moderations => 14,
+            AiSurface::Reranking => 15,
+            AiSurface::Messages => 16,
+            AiSurface::Responses => 17,
+            AiSurface::Unknown => 18,
         }
     }
 
@@ -1845,7 +2287,46 @@ impl AiSurface {
             AiSurface::ChatCompletions | AiSurface::Messages | AiSurface::Responses
         )
     }
+
+    /// Whether an upstream service tier can be requested on this surface.
+    ///
+    /// The three conversational JSON surfaces, which are the ones the
+    /// vendors document a `service_tier` field on. A tier written into an
+    /// embeddings or image body would be a field the endpoint never asked
+    /// for, so the operator's tier is not applied there; a caller's is
+    /// still stripped everywhere. See [`crate::service_tier`].
+    pub fn supports_service_tier(&self) -> bool {
+        matches!(
+            self,
+            AiSurface::ChatCompletions | AiSurface::Messages | AiSurface::Responses
+        )
+    }
 }
+
+// [`AiSurface::ALL`] and `AiSurface::position` are one list written
+// twice, so they are checked against each other at compile time rather
+// than in a test somebody has to remember to run (WOR-2647).
+//
+// The loop rejects a reorder, a duplicate index, and a variant dropped
+// from the array. The discriminant check rejects a variant added
+// anywhere above `Unknown` without the array growing to match:
+// `Unknown` is the last variant, so its discriminant is one less than
+// the variant count, and a fieldless enum casts to that discriminant.
+// Adding a variant fails in `position` first, which is exhaustive.
+const _: () = {
+    let mut index = 0;
+    while index < AiSurface::ALL.len() {
+        assert!(
+            AiSurface::position(&AiSurface::ALL[index]) == index,
+            "AiSurface::ALL and AiSurface::position name different orders"
+        );
+        index += 1;
+    }
+    assert!(
+        AiSurface::Unknown as usize == AiSurface::ALL.len() - 1,
+        "an AiSurface variant is missing from AiSurface::ALL"
+    );
+};
 
 /// Extract the surface-specific input-text field from a parsed JSON
 /// body, suitable for running through input guardrails or PII
@@ -2588,6 +3069,7 @@ mod tests {
         let config = AiHandlerConfig {
             providers: Vec::new(),
             routing: RoutingStrategy::RoundRobin,
+            cache_affinity: None,
             data_posture: None,
             context_window_fallbacks: Vec::new(),
             content_policy_fallbacks: Vec::new(),
@@ -2620,6 +3102,8 @@ mod tests {
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
             max_price_per_request: None,
+            allow_request_timeout_override: false,
+            max_request_timeout_ms: None,
             quota_pool: None,
             rag: None,
             guardrails_pipeline: OnceLock::new(),
@@ -2629,6 +3113,8 @@ mod tests {
             quota_pool_store: OnceLock::new(),
             model_aliases: Vec::new(),
             model_alias_index: OnceLock::new(),
+            model_groups: Vec::new(),
+            model_group_index: OnceLock::new(),
         };
         assert!(config.is_model_allowed("gpt-4"));
         assert!(config.is_model_allowed("anything"));
@@ -2639,6 +3125,7 @@ mod tests {
         let config = AiHandlerConfig {
             providers: Vec::new(),
             routing: RoutingStrategy::RoundRobin,
+            cache_affinity: None,
             data_posture: None,
             context_window_fallbacks: Vec::new(),
             content_policy_fallbacks: Vec::new(),
@@ -2671,6 +3158,8 @@ mod tests {
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
             max_price_per_request: None,
+            allow_request_timeout_override: false,
+            max_request_timeout_ms: None,
             quota_pool: None,
             rag: None,
             guardrails_pipeline: OnceLock::new(),
@@ -2680,6 +3169,8 @@ mod tests {
             quota_pool_store: OnceLock::new(),
             model_aliases: Vec::new(),
             model_alias_index: OnceLock::new(),
+            model_groups: Vec::new(),
+            model_group_index: OnceLock::new(),
         };
         assert!(!config.is_model_allowed("gpt-4"));
         assert!(config.is_model_allowed("gpt-3.5-turbo"));
@@ -2690,6 +3181,7 @@ mod tests {
         let config = AiHandlerConfig {
             providers: Vec::new(),
             routing: RoutingStrategy::RoundRobin,
+            cache_affinity: None,
             data_posture: None,
             context_window_fallbacks: Vec::new(),
             content_policy_fallbacks: Vec::new(),
@@ -2722,6 +3214,8 @@ mod tests {
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
             max_price_per_request: None,
+            allow_request_timeout_override: false,
+            max_request_timeout_ms: None,
             quota_pool: None,
             rag: None,
             guardrails_pipeline: OnceLock::new(),
@@ -2731,6 +3225,8 @@ mod tests {
             quota_pool_store: OnceLock::new(),
             model_aliases: Vec::new(),
             model_alias_index: OnceLock::new(),
+            model_groups: Vec::new(),
+            model_group_index: OnceLock::new(),
         };
         assert!(config.is_model_allowed("gpt-4"));
         assert!(config.is_model_allowed("gpt-3.5-turbo"));
@@ -2742,6 +3238,7 @@ mod tests {
         let config = AiHandlerConfig {
             providers: Vec::new(),
             routing: RoutingStrategy::RoundRobin,
+            cache_affinity: None,
             data_posture: None,
             context_window_fallbacks: Vec::new(),
             content_policy_fallbacks: Vec::new(),
@@ -2774,6 +3271,8 @@ mod tests {
             model_prices: std::collections::HashMap::new(),
             rate_card: None,
             max_price_per_request: None,
+            allow_request_timeout_override: false,
+            max_request_timeout_ms: None,
             quota_pool: None,
             rag: None,
             guardrails_pipeline: OnceLock::new(),
@@ -2783,6 +3282,8 @@ mod tests {
             quota_pool_store: OnceLock::new(),
             model_aliases: Vec::new(),
             model_alias_index: OnceLock::new(),
+            model_groups: Vec::new(),
+            model_group_index: OnceLock::new(),
         };
         // Block list wins
         assert!(!config.is_model_allowed("gpt-4"));
@@ -2938,6 +3439,259 @@ mod tests {
         );
     }
 
+    fn shadow_config(block: serde_json::Value) -> anyhow::Result<AiHandlerConfig> {
+        AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {"name": "primary", "api_key": "k"},
+                {"name": "anthropic", "api_key": "k"},
+                {"name": "gemini", "api_key": "k"},
+            ],
+            "shadow": block,
+        }))
+    }
+
+    #[test]
+    fn flat_shadow_config_still_parses_as_one_target() {
+        // The compat promise. The flat form is five sibling keys, not a
+        // renamed field, so nothing in serde keeps it working for free.
+        let config = shadow_config(serde_json::json!({
+            "provider": "anthropic",
+            "model": "claude-sonnet-4",
+            "sample_rate": 0.25,
+            "timeout_ms": 1234,
+            "task_timeout_ms": 4321,
+        }))
+        .expect("the single-target form is still accepted");
+        let targets = &config.shadow.expect("shadow block").targets;
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].provider, "anthropic");
+        assert_eq!(targets[0].model.as_deref(), Some("claude-sonnet-4"));
+        assert!((targets[0].sample_rate - 0.25).abs() < f32::EPSILON);
+        assert_eq!(targets[0].timeout_ms, 1234);
+        assert_eq!(targets[0].task_timeout_ms, 4321);
+    }
+
+    #[test]
+    fn a_shadow_targets_list_parses_and_keeps_its_order() {
+        let config = shadow_config(serde_json::json!({
+            "targets": [
+                {"provider": "anthropic", "sample_rate": 0.1},
+                {"provider": "gemini"},
+            ],
+        }))
+        .expect("the targets form parses");
+        let targets = &config.shadow.expect("shadow block").targets;
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].provider, "anthropic");
+        assert_eq!(targets[1].provider, "gemini");
+        assert!(
+            (targets[1].sample_rate - 1.0).abs() < f32::EPSILON,
+            "an omitted rate still defaults to mirroring every request"
+        );
+    }
+
+    #[test]
+    fn empty_shadow_targets_is_refused() {
+        // An empty list is not "shadow disabled": it is a block the
+        // operator wrote expecting evaluation, that silently produces
+        // none. Removing the block is how you disable it.
+        let error = shadow_config(serde_json::json!({"targets": []}))
+            .expect_err("an empty target list must refuse the config")
+            .to_string();
+        assert!(error.contains("at least one provider"), "{error}");
+    }
+
+    #[test]
+    fn duplicate_shadow_target_provider_is_refused() {
+        // The provider name is the metric label and the ledger row's
+        // target identity. Two entries sharing it merge two evaluations
+        // into one series with no way to tell them apart.
+        let error = shadow_config(serde_json::json!({
+            "targets": [
+                {"provider": "anthropic", "sample_rate": 0.1},
+                {"provider": "anthropic", "model": "claude-opus-4"},
+            ],
+        }))
+        .expect_err("two targets on one provider must refuse the config")
+        .to_string();
+        assert!(error.contains("anthropic"), "{error}");
+        assert!(error.contains("targets[1]"), "{error}");
+    }
+
+    #[test]
+    fn an_unknown_shadow_target_key_is_refused() {
+        let error = shadow_config(serde_json::json!({
+            "targets": [{"provider": "anthropic", "sample_rare": 0.1}],
+        }))
+        .expect_err("a typo'd key must not be silently dropped")
+        .to_string();
+        assert!(error.contains("sample_rare"), "{error}");
+    }
+
+    #[test]
+    fn from_config_refuses_bedrock_guardrail_on_a_non_bedrock_provider() {
+        // Drives the whole action body through `from_config_inner`
+        // rather than calling `validate_bedrock_guardrail` directly. A
+        // validator with no caller is a guard that reports green while
+        // enforcing nothing, and that is the failure this asserts
+        // against, not the validator's own logic (which
+        // `provider::tests` covers).
+        let error = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "api_key": "sk-test",
+                "bedrock_guardrail": {"identifier": "gr-1", "version": "DRAFT"},
+            }],
+        }))
+        .expect_err("an inline Bedrock guardrail on an OpenAI provider must refuse the config")
+        .to_string();
+        assert!(error.contains("bedrock guardrail"), "{error}");
+        assert!(error.contains("openai"), "{error}");
+    }
+
+    #[test]
+    fn from_config_accepts_bedrock_guardrail_on_a_bedrock_provider() {
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "bedrock",
+                "aws_sigv4": {"region": "us-east-1"},
+                "bedrock_guardrail": {
+                    "identifier": "gr-abc123",
+                    "version": "DRAFT",
+                    "trace": true,
+                },
+            }],
+        }))
+        .expect("a Bedrock provider accepts the inline guardrail");
+        let guardrail = config.providers[0]
+            .bedrock_guardrail
+            .as_deref()
+            .expect("the block survives deserialization");
+        assert_eq!(guardrail.identifier, "gr-abc123");
+        assert!(guardrail.trace);
+    }
+
+    /// Collect `warn!` output produced while `body` runs.
+    ///
+    /// `fmt` with a shared buffer rather than a custom `Layer`: the
+    /// assertion is on the message text an operator reads, not on a
+    /// field set.
+    fn captured_warnings(body: impl FnOnce()) -> String {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("log capture buffer")
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
+            type Writer = Buffer;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buffer = Buffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, body);
+        let bytes = buffer.0.lock().expect("log capture buffer").clone();
+        String::from_utf8(bytes).expect("captured log output is UTF-8")
+    }
+
+    #[test]
+    fn both_bedrock_guardrail_controls_on_one_origin_warn_once_and_still_load() {
+        // Two AWS evaluations per request, both billed. Refusing would
+        // break a deployment that deliberately screens the prompt out
+        // of band and the completion inline, so this warns instead; the
+        // test exists because an untested warning is one a refactor
+        // drops silently.
+        let action = serde_json::json!({
+            "providers": [{
+                "name": "bedrock",
+                "aws_sigv4": {"region": "us-east-1"},
+                "bedrock_guardrail": {"identifier": "gr-abc123", "version": "DRAFT"},
+            }],
+            "guardrails": {
+                "external": [{
+                    "name": "aws",
+                    "provider": "bedrock",
+                    "mode": "pre_call",
+                    "api_key": "aws-test-key",
+                    "url": "https://bedrock-runtime.us-east-1.amazonaws.com",
+                    "guardrail_id": "gr-abc123",
+                    "guardrail_version": "DRAFT",
+                }],
+            },
+        });
+        let logs = captured_warnings(|| {
+            AiHandlerConfig::from_config(action)
+                .expect("both controls on one origin is legal, not refused");
+        });
+        assert_eq!(
+            logs.matches("bills the guardrail twice").count(),
+            1,
+            "expected exactly one double-billing warning, got: {logs}"
+        );
+        assert!(
+            logs.contains("providers=bedrock"),
+            "the warning names which provider entries carry the inline \
+             control, or an operator with ten entries cannot act on it: {logs}"
+        );
+
+        // The inline control alone is the ordinary deployment and must
+        // stay quiet, or the warning trains operators to ignore it.
+        let inline_only = serde_json::json!({
+            "providers": [{
+                "name": "bedrock",
+                "aws_sigv4": {"region": "us-east-1"},
+                "bedrock_guardrail": {"identifier": "gr-abc123", "version": "DRAFT"},
+            }],
+        });
+        let logs = captured_warnings(|| {
+            AiHandlerConfig::from_config(inline_only).expect("inline alone loads");
+        });
+        assert!(
+            !logs.contains("bills the guardrail twice"),
+            "one control is not a double bill: {logs}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_bedrock_guardrail_key_is_refused() {
+        // `deny_unknown_fields`: the block is new and small, so a
+        // typo'd key must not be silently dropped into a guardrail the
+        // operator believes is configured.
+        let error = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "bedrock",
+                "aws_sigv4": {"region": "us-east-1"},
+                "bedrock_guardrail": {
+                    "identifier": "gr-abc123",
+                    "version": "DRAFT",
+                    "guardrail_version": "1",
+                },
+            }],
+        }))
+        .expect_err("an unknown key inside the guardrail block must refuse the config")
+        .to_string();
+        assert!(error.contains("guardrail_version"), "{error}");
+    }
+
     #[test]
     fn from_config_rejects_a_price_ceiling_at_or_below_zero() {
         // A ceiling of zero or below admits nothing, so it turns the
@@ -2964,6 +3718,93 @@ mod tests {
         }))
         .expect("a positive ceiling is a valid config");
         assert_eq!(config.max_price_per_request, Some(0.05));
+    }
+
+    /// The seam is the validator's caller: `from_config_inner` has to
+    /// reach the key, not just own it.
+    #[test]
+    fn a_zero_pre_header_timeout_is_refused_at_load() {
+        let error = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "resilience": {"pre_header_timeout_ms": 0},
+        }))
+        .expect_err("a zero pre-header budget must refuse the config")
+        .to_string();
+        assert!(error.contains("pre_header_timeout_ms"), "{error}");
+    }
+
+    #[test]
+    fn a_positive_pre_header_timeout_is_accepted() {
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "resilience": {"pre_header_timeout_ms": 750},
+        }))
+        .expect("a positive pre-header budget is a valid config");
+        assert_eq!(
+            config
+                .resilience
+                .as_ref()
+                .and_then(|resilience| resilience.pre_header_timeout_ms),
+            Some(750)
+        );
+    }
+
+    /// The seam is the misplacement loop. `AiHandlerConfig` sets no
+    /// `deny_unknown_fields`, so before this an action-level
+    /// `pre_header_timeout_ms` was swallowed: `sbproxy validate` exited
+    /// 0 and every streaming request kept waiting out the client
+    /// default with no failover and nothing in the logs.
+    #[test]
+    fn a_pre_header_timeout_at_the_action_level_is_refused() {
+        let error = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "pre_header_timeout_ms": 750,
+        }))
+        .expect_err("the key is not read at the action level")
+        .to_string();
+        assert!(
+            error.contains("resilience.pre_header_timeout_ms"),
+            "{error}"
+        );
+    }
+
+    /// The flag without a ceiling hands every caller an unbounded
+    /// per-attempt budget, which is the failure the gate exists to
+    /// prevent, so it is refused at load rather than defaulted.
+    #[test]
+    fn the_override_flag_without_a_ceiling_is_refused_at_load() {
+        let error = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "allow_request_timeout_override": true,
+        }))
+        .expect_err("the flag alone must refuse the config")
+        .to_string();
+        assert!(error.contains("allow_request_timeout_override"), "{error}");
+        assert!(error.contains("max_request_timeout_ms"), "{error}");
+    }
+
+    #[test]
+    fn a_zero_request_timeout_ceiling_is_refused_at_load() {
+        let error = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "allow_request_timeout_override": true,
+            "max_request_timeout_ms": 0,
+        }))
+        .expect_err("a zero ceiling must refuse the config")
+        .to_string();
+        assert!(error.contains("max_request_timeout_ms"), "{error}");
+    }
+
+    #[test]
+    fn the_override_flag_with_a_ceiling_loads() {
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "allow_request_timeout_override": true,
+            "max_request_timeout_ms": 5000,
+        }))
+        .expect("the flag plus a ceiling is a valid config");
+        assert!(config.allow_request_timeout_override);
+        assert_eq!(config.max_request_timeout_ms, Some(5000));
     }
 
     #[test]
@@ -3433,6 +4274,61 @@ mod tests {
             }
         }));
         assert!(invalid.is_err(), "zero TTL must fail config loading");
+    }
+
+    /// WOR-2651: `cache_affinity` composes with every strategy, so it is a
+    /// sibling of `routing:`. Authored inside it, the block would otherwise
+    /// refuse with "unknown variant", which names the wrong problem.
+    #[test]
+    fn cache_affinity_is_a_sibling_of_routing_not_a_field_inside_it() {
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "routing": "round_robin",
+            "cache_affinity": {"ttl_secs": 60, "max_keys_per_provider": 32}
+        }))
+        .expect("cache affinity beside routing");
+        let affinity = config.cache_affinity.expect("cache affinity parsed");
+        assert_eq!(affinity.ttl_secs, 60);
+        assert_eq!(affinity.max_keys_per_provider, 32);
+        assert!(config.router().cache_affinity_enabled());
+
+        let misplaced = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "sk-test"}],
+            "routing": {"strategy": "round_robin", "cache_affinity": {}}
+        }))
+        .expect_err("cache_affinity under routing is refused");
+        assert!(
+            misplaced.to_string().contains("not a routing field"),
+            "{misplaced}"
+        );
+    }
+
+    /// WOR-2652: the load-time half. The unit tests in
+    /// `crate::service_tier` cover the check itself; this one proves it is
+    /// wired into config compilation, which is the part a covered-but-
+    /// unwired function would pass without.
+    #[test]
+    fn a_provider_tier_the_vendor_does_not_sell_is_refused_at_config_load() {
+        let error = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "claude",
+                "provider_type": "anthropic",
+                "api_key": "sk-test",
+                "service_tier": "flex"
+            }]
+        }))
+        .expect_err("anthropic declares no service-tier vocabulary");
+        assert!(error.to_string().contains("service tier"), "{error}");
+
+        AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai-flex",
+                "provider_type": "openai",
+                "api_key": "sk-test",
+                "service_tier": "flex"
+            }]
+        }))
+        .expect("openai sells a flex tier");
     }
 
     #[test]

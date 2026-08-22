@@ -1,0 +1,45 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Credential-free fixture for examples/tenant-key-fallback/: a stand-in
+# OpenAI that accepts exactly one bearer token and refuses every other
+# one with a 401.
+#
+# That is the whole scenario in one file. The gateway presents the
+# provider entry's own `api_key` first, gets the 401, and presents the
+# operator's seeded credential second. The token this fixture accepts is
+# the operator's, so the second attempt answers.
+#
+# Run:
+#   make run CONFIG=examples/tenant-key-fallback/upstream-provider.yml
+
+proxy:
+  http_bind_port: 8094
+
+origins:
+  "127.0.0.1":
+    # The AI gateway sends an OpenAI-shaped provider
+    # `Authorization: Bearer <api_key>`, so bearer auth here is a
+    # faithful stand-in for the vendor's own key check.
+    authentication:
+      type: bearer
+      tokens:
+        - sk-house-openai-not-a-real-key
+
+    action:
+      type: mock
+      status: 200
+      content_type: application/json
+      body:
+        id: chatcmpl-house
+        object: chat.completion
+        created: 1700000000
+        model: gpt-4o
+        choices:
+          - index: 0
+            message:
+              role: assistant
+              content: "Served on the operator's credential."
+            finish_reason: stop
+        usage:
+          prompt_tokens: 12
+          completion_tokens: 7
+          total_tokens: 19

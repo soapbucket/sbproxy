@@ -111,6 +111,37 @@ export function relativeTime(value: unknown): string {
   return `${days}d ${suffix}`;
 }
 
+/**
+ * A 0..1 fraction as a percentage, never rounding a real value away.
+ *
+ * Rounding is the quiet failure mode of a share. A fallback price share
+ * of 0.4% printed as "0%" tells the reader that no price was invented,
+ * and a coverage of 99.6% printed as "100%" tells them nothing is
+ * missing. Both are the opposite of what the number says, on the two
+ * panels whose whole job is to say how far to trust the bill. A nonzero
+ * share that rounds to zero reads "<1%", and a share below one that
+ * rounds to a hundred reads ">99%".
+ *
+ * `digits` is the precision used in the ordinary case; the guards apply
+ * at whatever precision that is.
+ */
+export function formatShare(
+  fraction: number | undefined | null,
+  digits = 0,
+): string {
+  if (fraction === undefined || fraction === null || !isFinite(fraction)) {
+    return "n/a";
+  }
+  const pct = fraction * 100;
+  const step = Math.pow(10, -digits);
+  const floorLabel = digits > 0 ? `<${step.toFixed(digits)}%` : "<1%";
+  const ceilLabel = digits > 0 ? `>${(100 - step).toFixed(digits)}%` : ">99%";
+  if (pct > 0 && Number(pct.toFixed(digits)) === 0) return floorLabel;
+  if (pct < 0 && Number(pct.toFixed(digits)) === 0) return `-${floorLabel}`;
+  if (pct < 100 && Number(pct.toFixed(digits)) === 100) return ceilLabel;
+  return `${pct.toFixed(digits)}%`;
+}
+
 /** Truncate a long identifier for display, keeping head and tail. */
 export function shortId(id: string | undefined, head = 10, tail = 4): string {
   if (!id) return "";

@@ -104,6 +104,28 @@ impl FailureCause {
         )
     }
 
+    /// Whether this cause says the *credential* was rejected, and so is
+    /// worth one retry against the same provider on a different key.
+    ///
+    /// `Auth` only. The other causes are statements about the provider,
+    /// not about the secret: a different key against a rate-limited or
+    /// erroring provider gets the same rate limit and the same error,
+    /// and those causes already own the availability failover and
+    /// [`crate::failure_cause::CooldownPolicy`]. `Auth` is also exactly
+    /// the cause [`Self::is_retryable_default`] excludes, so there is no
+    /// existing retry behavior to displace.
+    ///
+    /// Widening this set is not a one-line change. Every other cause
+    /// here is already claimed by the availability failover, so a
+    /// second claimant needs a precedence ruling between "retry this
+    /// provider on another key" and "route to a healthy different
+    /// provider", and it changes what
+    /// `sbproxy_ai_failovers_total` reports for operators who
+    /// configured neither.
+    pub fn triggers_key_fallback(self) -> bool {
+        matches!(self, FailureCause::Auth)
+    }
+
     /// The fallback list this cause should route to.
     pub fn fallback_trigger(self) -> FallbackTrigger {
         match self {
@@ -308,6 +330,37 @@ mod tests {
         assert!(!FailureCause::BadRequest.is_retryable_default());
         assert!(!FailureCause::ContextWindowExceeded.is_retryable_default());
         assert!(!FailureCause::ContentPolicy.is_retryable_default());
+    }
+
+    /// WOR-2655: the provider-key fallback owns `Auth` and nothing
+    /// else. Every other cause is asserted `false` explicitly rather
+    /// than by omission, so widening the set has to come here and
+    /// confront the precedence question against the availability
+    /// failover, which already claims all four transient causes.
+    #[test]
+    fn auth_is_the_only_key_fallback_trigger() {
+        assert!(FailureCause::Auth.triggers_key_fallback());
+        for cause in [
+            FailureCause::Timeout,
+            FailureCause::RateLimit,
+            FailureCause::ServerError,
+            FailureCause::BadRequest,
+            FailureCause::ContextWindowExceeded,
+            FailureCause::ContentPolicy,
+            FailureCause::Unknown,
+        ] {
+            assert!(
+                !cause.triggers_key_fallback(),
+                "{} must stay with the availability failover",
+                cause.as_str()
+            );
+        }
+        // The trigger is reached from a status, not from a cause, so
+        // pin the two statuses the classifier maps onto `Auth`.
+        assert!(FailureCause::classify(401, "").triggers_key_fallback());
+        assert!(FailureCause::classify(403, "").triggers_key_fallback());
+        assert!(!FailureCause::classify(429, "").triggers_key_fallback());
+        assert!(!FailureCause::classify(500, "").triggers_key_fallback());
     }
 
     #[test]

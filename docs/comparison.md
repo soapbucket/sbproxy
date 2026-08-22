@@ -1,6 +1,6 @@
 # How SBproxy compares
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-21*
 
 SBproxy is an AI gateway that governs traffic in both directions. Most AI gateways only handle the calls your apps make out to models; SBproxy also governs the AI agents and crawlers coming in to your APIs and content, and because it is a real reverse proxy it handles the rest of your API traffic on the same runtime. This page is honest about where SBproxy fits and where you should pick something else.
 
@@ -93,11 +93,11 @@ SBproxy fits when you need a production reverse proxy *and* an AI gateway in the
 ### vs LiteLLM
 
 LiteLLM is the most popular open-source AI gateway. It supports 100+ LLM providers.
-SBproxy reaches 200+ models through 72 native providers behind one OpenAI-compatible API, including a native Anthropic translator. You bring your own key per provider and the model name passes straight through, so any model a provider serves works without per-model config. Point any provider at a custom `base_url` for self-hosted or proprietary endpoints.
+SBproxy reaches 200+ models through 70 native providers behind one OpenAI-compatible API, including a native Anthropic translator. You bring your own key per provider and the model name passes straight through, so any model a provider serves works without per-model config. Point any provider at a custom `base_url` for self-hosted or proprietary endpoints.
 
 | | SBproxy | LiteLLM |
 |---|---------|---------|
-| LLM providers | 200+ models (72 native providers, bring your own keys) | 100+ native |
+| LLM providers | 200+ models (70 native providers, bring your own keys) | 100+ native |
 | General HTTP proxy | Yes | No |
 | Implementation | Compiled native binary | Python |
 | Min resources | 1 CPU, 256 MB ([a starting point](capacity-planning.md), not a measured floor) | 4 CPU, 8 GB |
@@ -200,7 +200,7 @@ Caddy is a Go reverse proxy known for automatic HTTPS.
 | Circuit breaker | Built-in (3-state) | Latency-based |
 | Health checks | Active + passive | Active + passive |
 | Retries | Configurable with backoff | Configurable |
-| PROXY protocol | Yes (v1) | Yes (v1/v2) |
+| PROXY protocol | No (v1 parser present, not wired to a listener) | Yes (v1/v2) |
 | Service discovery | Config-based + DNS (A/AAAA re-resolution) | SRV, A/AAAA |
 | Load balancing | 8 algorithms | 12+ algorithms |
 | WAF | Built-in baseline (12 CRS-derived rules, no SecLang engine) | Community module |

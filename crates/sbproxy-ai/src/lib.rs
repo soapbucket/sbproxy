@@ -9,6 +9,7 @@ pub mod ai_routing_policy;
 pub mod alerting;
 pub mod api_routes;
 pub mod attribution;
+pub mod aws_sigv4;
 pub mod budget;
 pub mod client;
 pub mod compression;
@@ -36,6 +37,7 @@ pub mod local_host;
 pub mod managed_replica;
 pub mod model_alias;
 pub mod model_directory;
+pub mod model_group;
 pub mod prompt_fingerprint;
 pub mod prompt_optimizer;
 pub mod prompts;
@@ -53,6 +55,7 @@ pub mod routing_base_data;
 pub mod routing_feedback;
 pub mod routing_state;
 pub mod semantic_cache;
+pub mod service_tier;
 pub mod session;
 pub mod token_estimate;
 pub mod tracing_spans;
@@ -64,11 +67,15 @@ pub mod usage_parser;
 pub mod usage_sink;
 pub mod value_ledger;
 
+pub use aws_sigv4::{
+    AwsCredentialSource, AwsCredentialsConfig, AwsSigV4Config, AwsSigV4Error, AwsSigV4Signer,
+    ConfigSecret,
+};
 pub use budget::{
     cheapest_model, estimate_cost, BudgetConfig, BudgetLimit, BudgetScope, BudgetTracker,
     OnExceedAction, UsageRecord,
 };
-pub use client::AiClient;
+pub use client::{AiClient, OutboundSigner};
 pub use concurrency::ConcurrencyLimiter;
 pub use context_window::model_context_window;
 pub use degradation::{should_degrade, DegradationConfig};
@@ -77,8 +84,9 @@ pub use identity::VirtualKeyConfig;
 pub use ids::{ModelId, ProviderName};
 pub use key_scoping::KeyPermissions;
 pub use model_alias::{ModelAlias, ModelAliasRegistry};
+pub use model_group::{GroupMember, ModelGroup, ModelGroupRegistry};
 pub use prompt_fingerprint::prompt_fingerprint;
-pub use provider::ProviderConfig;
+pub use provider::{KeyFailurePosture, ProviderConfig};
 pub use provider_ratelimit::{
     ProviderQuotaSnapshot, ProviderRateLimitTracker, ProviderRateState, QuotaSignalQuality,
     QuotaSignalSource,
@@ -106,8 +114,9 @@ pub use reasoning::{
 };
 pub use routing::{FilteredSelectionFallback, PeakEwmaConfig, Router, RoutingStrategy};
 pub use routing_state::{
-    normalize_prefix, PrefixAffinityConfig, PrefixAffinityConfigError, PrefixDigest,
-    ReplicaRoutingState,
+    normalize_prefix, CacheAffinityConfig, CacheAffinityConfigError, CacheAffinityKey,
+    CacheAffinityKeyInput, CacheAffinityLookup, PrefixAffinityConfig, PrefixAffinityConfigError,
+    PrefixDigest, ReplicaRoutingState,
 };
 pub use semantic_cache::{
     decode_entry, encode_entry, select_exact_hit, semantic_configuration_digest,
@@ -126,6 +135,7 @@ pub use semantic_cache::{
     MAX_SEMANTIC_HEADER_VALUE_BYTES, MAX_SEMANTIC_RESPONSE_BYTES, MAX_SEMANTIC_RESPONSE_HEADERS,
     MAX_SEMANTIC_TOTAL_HEADER_BYTES, SEMANTIC_CACHE_SCHEMA_VERSION,
 };
+pub use service_tier::{CatalogServiceTiers, ServiceTier};
 pub use session::{ConversationSession, SessionStore};
 pub use token_estimate::{
     estimate_json_message_tokens, estimate_tokens, estimate_tokens_for_reservation,

@@ -254,6 +254,7 @@ see that case, because the key is read.
 |---|---|---|
 | `audit.sink: tracing` | It never selected anything. Emission to the `config_audit`, `security_audit`, and `key_audit` targets has always been unconditional, so `tracing` and `memory` described the same proxy. | `memory` for the same behavior under an honest name, or `chain` with a `path` and a `sign_with` for a hash-chained, signed trail that survives a restart. |
 | `audit.path`, `audit.sign_with` under any sink but `chain` | Nothing would write to the file or sign anything. A path nothing writes to is the more dangerous of the two shapes, because it looks configured. | Set `sink: chain`, or remove the key. |
+| `attestation.role: claim` and `attestation.role: both`, proxy-wide or on an origin | Both promise the claim half of attestation and this build does not implement it. No claim is written before a call is served, nothing ever reads `proxy.attestation.queue`, and no ceiling is computed for `proxy.attestation.enforcement_mode` to act on, so a config declaring either role compiled clean and served traffic producing neither a claim nor a receipt. That is worse than not offering the role: the operator believes their spend is bounded. Both spellings stay in the vocabulary so the refusal can name the missing half instead of reporting an unknown value. | `receipt`, which is the half that works: a receipt is written after the call is served and carries the settled cost. Leave `off` if you want neither. |
 
 #### Rego base data that collides with a rule (upgrade-affecting)
 
@@ -366,6 +367,66 @@ no surface carries the URL.
 find the `webhook` row for your collector, and add that host (and its port, if
 it is not 80 or 443) to `egress.usage_sinks.hosts`.
 
+### The usage ledger now `fsync`s every entry
+
+**Who this reaches.** Any config with a metering role, which is what makes
+the proxy open `proxy.attestation.ledger.path`. A deployment with no metering role
+never writes the file and is unaffected.
+
+**What changes.** Each ledger append now forces its entry to stable storage
+before returning, where before it called `Write::flush`, which `std::fs::File`
+documents as a no-op. Nothing about the file format, the hash chain, or the
+signatures changes; a file written by the previous release replays and
+verifies exactly as it did. What changes is throughput: the ledger's append
+rate is now bounded by how fast the filesystem under `proxy.attestation.ledger.path`
+can `fsync`, and appends are serialized behind one mutex, so a ledger on a
+network filesystem or a spinning disk is a new ceiling on metered request
+rate.
+
+**What an operator sees when it bites.** `sbproxy_meter_append_duration_seconds`
+moves, because it measures the whole critical section including the sync.
+Metering never fails a request, so the symptom is queueing on the metering
+path rather than errors.
+
+**What to do before upgrading.** Put `proxy.attestation.ledger.path` on local
+storage. If the histogram's tail is unacceptable there, the honest answer is
+that this deployment wants an unsigned usage sink rather than a receipt chain,
+because a chain whose entries are not durable cannot answer the dispute it
+exists for: a truncated hash chain verifies clean, so the lost entries leave
+no marker anywhere.
+
+### `agent_classes.resolver.rdns_enabled` now runs under fixed lookup bounds
+
+**Who this reaches.** Any config that leaves `agent_classes.resolver.rdns_enabled`
+at its default `true` and whose crawlers publish more than four PTR names for a
+single address. A config that sets it to `false`, or whose crawler zones publish
+one PTR per address as vendors do, resolves exactly as before.
+
+**What changes.** Resolver step 2 queries a zone the client being identified
+controls, and it previously followed that zone wherever it led: every PTR name
+it returned got its own forward lookup, serially, with the host resolver's
+default timeout and no ceiling on the total. Five bounds now apply. At most four
+PTR names per address are forward-confirmed; each query is capped at two
+seconds; the forward-confirm loop stops issuing new lookups once two seconds of
+it have elapsed; at most 32 queries are in flight process-wide; and a DNS
+failure is cached for 30 seconds instead of being re-queried on the next
+request. Nothing about the config schema changes.
+
+**What an operator sees when it bites.** A crawler that used to resolve with an
+`rdns` agent-id source resolves from its `User-Agent` instead, which is the same
+degradation path an unreachable resolver has always taken. The agent is still
+classified; only the source stamp and the confidence change. A policy that keys
+on the rDNS source specifically stops matching for that vendor. The
+in-flight cap can produce the same demotion transiently, under a burst of
+traffic from addresses the verdict cache has never seen; the next request from
+that address, 30 seconds later, verifies normally.
+
+**What to do before upgrading.** If a crawler you verify by rDNS publishes more
+than four PTR names per address, verify it by Web Bot Auth `keyid` instead
+(resolver step 1, and higher confidence than rDNS), or accept the UA-based
+classification. There is no knob to raise the cap: it is a bound on what a
+remote party can spend of your request path.
+
 ### `egress.token_exchange` now gates the MCP run-as-user token exchange
 
 **Who this reaches.** Any config with `egress.token_exchange` set to
@@ -385,6 +446,514 @@ OpenAPI tool calls, never its token endpoint.
 
 **What to do before upgrading.** Add every MCP token endpoint host to
 `egress.token_exchange.hosts` alongside the non-MCP ones already there.
+
+### `mcp.rbac_policies[].tool_quotas[].rate.per` is now validated at load
+
+**Who this reaches.** Any config with an `mcp` action whose `rbac_policies`
+declare a `tool_quotas[]` rule with a `per:` value the duration parser cannot
+read. The accepted suffixes are `ms`, `s`, `m`, `h`, and `d`; `per: 1hour`,
+`per: 60`, and `per: 1 hour` are all outside them. A config whose windows all
+use a documented suffix is unaffected.
+
+**What changes.** Nothing validated the string. The value was read for the
+first time on the request path, where a parse failure was treated as "this
+tool has no quota" and every `tools/call` passed, with no log line and no
+counter, so the operator's dashboard showed the quota configured and zero
+rejections. The action now refuses the config with an error naming the policy
+label, the tool, and the string it could not read. The request-path branch
+survives as a backstop and now denies the call instead of allowing it.
+
+**What an operator sees when it bites.** Startup or reload fails with
+`mcp action: rbac_policies['<label>']: tool_quotas rule for tool '<tool>' has
+an unparseable rate.per '<value>'`, listing the accepted suffixes. A reload
+leaves the previous generation serving.
+
+**What to do before upgrading.** Grep your configs for `per:` under
+`tool_quotas` and confirm every value ends in one of the five suffixes. A
+quota that has never rejected anything is the one to check first: under the
+old behavior an unreadable window and an unreached limit looked identical.
+
+### `proxy.scripting.lua.sandbox.allow_patterns: false` now also gates `string.gsub`
+
+**Who this reaches.** Any config that sets `allow_patterns: false` and whose
+Lua scripts call `string.gsub`. A config leaving `allow_patterns` at its
+`true` default is unaffected, and so is one whose scripts never call `gsub`.
+
+**What changes.** The gate stubbed `string.find`, `string.match`, and
+`string.gmatch` and left `string.gsub` reachable, so the knob whose stated
+purpose is containing the pattern engine left the same C-level matcher open.
+`gsub` is stubbed now, alongside the other three, which is the whole set of
+`string` functions that take a pattern.
+
+**What an operator sees when it bites.** The script fails with
+`Lua pattern API disabled by sandbox
+(proxy.scripting.lua.sandbox.allow_patterns)`, the same error the other three
+already raised, and the request fails closed the way any Lua error on that
+surface does.
+
+**What to do before upgrading.** Grep your Lua for `gsub`. Rewrite the call
+with `string.sub` and plain-text search, or set `allow_patterns: true` and
+accept that the pattern engine is on. Note what the flag buys either way:
+`max_execution_ms` cannot preempt a backtracking pattern, because the matcher
+runs inside the C string library where the interrupt the timer relies on never
+fires. Refusing the call is the only containment there is.
+
+### Circuit breakers now admit one probe at a time in half-open
+
+**Who this reaches.** Any config with a `circuit_breaker:` block on a
+`load_balancer` action, an AI router with circuit breaking enabled, or the AI
+crawl-control HTTP ledger client. A config with no breaker configured is
+unaffected.
+
+**What changes.** Half-open admitted every request that arrived. At high
+concurrency that meant the full request rate was pointed back at the upstream
+the instant `open_duration_secs` lapsed, before any of those requests had
+returned a verdict, once per open duration for as long as the upstream stayed
+down. Half-open now hands out one probe slot at a time: the request that takes
+it goes through, everything else is refused as if the breaker were still open,
+and the slot returns when that probe reports success or failure. A probe whose
+caller never reports an outcome is written off after one more open duration, so
+the breaker cannot get stuck refusing.
+
+**What an operator sees when it bites.** Fewer requests reach a recovering
+upstream, and recovery takes `success_threshold` sequential probes rather than
+one concurrent burst. On a load balancer the breaker is one narrowing stage
+among several and stays advisory: when it filters out every target in the pool,
+the request is still routed rather than failed, so a single-target pool behaves
+as before.
+
+**What to do before upgrading.** Nothing, unless you were relying on a
+recovering upstream absorbing a burst. If your upstream needs more than one
+concurrent probe to warm up, raise `success_threshold` rather than expecting
+concurrency.
+
+### Outlier ejection restarts the endpoint's measurement window
+
+**Who this reaches.** Any config with an `outlier_detection:` block whose
+`window_secs` is longer than its `ejection_duration_secs`, which is the
+default shape (60 s window, 30 s ejection).
+
+**What changes.** The failures that caused an ejection kept counting against
+the endpoint after it was re-admitted, until `window_secs` expired from the
+original window start. A re-admitted endpoint was therefore graded on
+pre-ejection traffic and was usually re-ejected on its first later error, so a
+configured 30 s ejection behaved as a `window_secs`-long one. Ejection now
+zeroes the endpoint's counters and starts a fresh window, so the post-ejection
+probe is graded only on post-ejection traffic.
+
+**What an operator sees when it bites.** Endpoints come back into the pool at
+the cooldown you configured instead of at the end of the window, and a healthy
+endpoint that takes one unrelated 5xx after re-admission stays in the pool.
+Endpoints that are genuinely still broken are re-ejected after `min_requests`
+fresh requests rather than immediately.
+
+**What to do before upgrading.** If you were leaning on the old behavior to
+keep a bad endpoint out for the length of the window, set
+`ejection_duration_secs` to the duration you actually want.
+
+### There is no PROXY protocol configuration key
+
+**Who this reaches.** Anyone deploying behind an AWS NLB, HAProxy, or another
+load balancer configured to send a PROXY protocol preamble.
+
+**What changes.** Nothing in the product. What changes is the claim:
+`comparison.md` listed PROXY protocol v1 as supported. It is not. A v1 parser
+exists in the source tree, no listener calls it, and no configuration key
+enables it. The comparison table now says so.
+
+**What an operator sees when it bites.** Every connection fails. The
+`PROXY TCP4 ...\r\n` line is handed to the HTTP parser as the request line and
+returns 400, and the client address that reaches the access log, the WAF, and
+the IP-filter policy is the load balancer's rather than the client's.
+
+**What to do before upgrading.** Turn PROXY protocol off on the load balancer
+in front of SBproxy and pass the client address in a header
+(`X-Forwarded-For`) instead.
+
+### Redis-backed idempotency entries move to a new keyspace
+
+**Who this reaches.** Any origin with `idempotency.backend: redis`. The
+`memory` backend keeps its entries in process and is unaffected.
+
+**What changes.** The storage key was `sbproxy:idem::<Idempotency-Key>`
+for every origin in the cluster, because the workspace segment it was
+scoped by is a field nothing ever fills. It now carries the owning
+origin's `tenant_id` and origin id in length-delimited segments. That
+closes the cross-origin read, and it also means entries written by the
+old build are not readable by the new one. They are not deleted either:
+they sit in the store until their TTL (24 h by default) expires them.
+
+**What an operator sees when it bites.** For the first request under any
+given `Idempotency-Key` after the upgrade, the proxy reports a miss and
+contacts the upstream, even if the pre-upgrade build had already cached a
+response for that key. A client retrying across the restart therefore
+gets its request executed a second time. On a rolling upgrade the two
+builds do not share entries at all, so the window lasts until the last
+old node is drained.
+
+**What to do before upgrading.** Treat it as a cache flush on a path
+where a repeat is a real repeat. Drain in-flight idempotent retries
+before the restart on anything that settles money, or accept one
+re-execution per key. Nothing in the config changes.
+
+### `compression.algorithms` now selects in the order you wrote
+
+**Who this reaches.** Any origin with a `compression.algorithms` list of
+more than one codec, where a client accepts more than one of them. An
+origin with an empty list, or one codec, or one whose clients accept only
+one, sees no change.
+
+**What changes.** The list was documented as a priority order on three
+surfaces and read as a membership set by the negotiator, which then
+walked its own hardcoded `zstd` > `br` > `gzip` ladder. It is a priority
+order now: the list is walked as authored and the first entry the client
+accepts is the one served. `algorithms: [gzip, br]` sent Brotli to a
+browser that accepts both and sends gzip after the upgrade.
+
+**What an operator sees when it bites.** The `Content-Encoding` on
+responses changes to the codec listed first, and
+`sbproxy_compression_decisions_total` moves between codecs. Nothing
+fails.
+
+**What to do before upgrading.** Read your `algorithms` lists as the
+preference they now are. If a list was written to mean "these three are
+allowed, pick the best", reorder it to `[zstd, br, gzip]` or empty it,
+which selects the same way it always did.
+
+Two smaller refusals ride along, both load-time. An entry naming no codec
+(`algorithms: [deflate]`) fails config compile instead of silently
+disabling compression for the origin, and a client `Accept-Encoding`
+qvalue of zero is honored as the refusal RFC 9110 §12.5.3 says it is, so
+a client sending `identity;q=1, *;q=0` gets an uncompressed response
+where it used to get zstd it could not decode.
+
+### `cors.allowed_origins: ["*"]` with `allow_credentials: true` fails config load
+
+**Who this reaches.** Any origin whose `cors:` block sets both. Nothing
+else.
+
+**What changes.** Browsers reject that pair per the Fetch standard, and
+the CORS middleware has always refused to emit any header for it. The
+refusal was a runtime no-op plus one `warn` line per request, so
+`sbproxy validate` exited 0 on a config that served a broken browser app
+forever. It fails config compile now, and the runtime guard that remains
+logs once per process and counts every occurrence on
+`sbproxy_cors_refusals_total{reason="wildcard_with_credentials"}`, which the
+"CORS Refusals by Reason" panel on the `sbproxy-security` dashboard reads.
+
+**What an operator sees when it bites.** The proxy refuses to start (or
+refuses the reload) naming the origin and both keys.
+
+**What to do before upgrading.** Run `sbproxy validate` against your
+config. If it names this pair, list the origins you actually mean in
+`allowed_origins`, or drop `allow_credentials`.
+
+### A plain `OPTIONS` request now reaches the upstream
+
+**Who this reaches.** Any origin with a `cors:` block whose upstream
+implements `OPTIONS` itself: a discovery endpoint answering with
+`Allow:`, a capability document, anything WebDAV.
+
+**What changes.** The proxy treated every `OPTIONS` carrying an `Origin`
+header as a CORS preflight, answered 204 from the edge, and never
+contacted the upstream. `Origin` rides on every cross-origin request of
+every method, so adding a `cors:` block silently deleted that endpoint. A
+preflight is now what the Fetch standard defines it as: an `OPTIONS`
+request carrying `Access-Control-Request-Method`. Everything else is a
+normal request and is proxied.
+
+**What an operator sees when it bites.** `OPTIONS` requests that used to
+return an empty 204 now return whatever the upstream returns. A browser
+preflight is unaffected, because a browser always sends
+`Access-Control-Request-Method`.
+
+**What to do before upgrading.** Nothing, unless something depended on
+the proxy answering a non-preflight `OPTIONS` without the upstream.
+
+### RFC 9421 signature verification refuses a stale `created`
+
+**Who this reaches.** Any origin with `authentication: {type: bot_auth}`
+or a `message_signatures:` verifier. `hmac_auth` already enforced this
+by hand and is unchanged in behavior.
+
+**What changes.** The freshness check refused a `created` in the future
+and an `expires` in the past, and had no lower bound on `created` at all.
+A captured `Signature-Input` / `Signature` pair with no `expires` and no
+`nonce` therefore verified forever: an unexpiring bearer token for
+whatever identity it carried. The window is symmetric now, which is what
+`clock_skew_seconds` has always been documented as: `created` may be at
+most `clock_skew_seconds` old and at most `clock_skew_seconds` in the
+future. `expires` can only shorten that window, never extend it.
+
+**What an operator sees when it bites.** A signer whose clock is behind,
+or whose signatures are minted well before they are sent, gets a 401
+whose reason names the stale timestamp.
+
+**What to do before upgrading.** If your signers legitimately mint a
+signature more than 30 seconds before sending it, raise
+`clock_skew_seconds` on that origin to cover the real gap.
+
+### `@target-uri` is the absolute URI RFC 9421 defines
+
+**Who this reaches.** Any signer or verifier whose covered component set
+includes `@target-uri` or `@request-target`. The shipped Web Bot Auth
+wiring covers `@authority`, `@method`, and `@path`, so a config that took
+those defaults is unaffected.
+
+**What changes.** `@target-uri` emitted the origin-form request target
+(`/v1/orders`) where RFC 9421 §2.2.2 defines it as the full absolute URI
+(`https://api.example.com/v1/orders`), so no conformant peer could
+interoperate in either direction. `@request-target` emitted
+`GET /v1/orders`, which is draft-cavage's shape, where RFC 9421 §2.2.5 is
+the request target alone. Both are correct now. For a deprecation
+window, inbound verification retries the old derivation when the
+conformant base fails and the covered set names one of the two, so a
+signer built against the old shape keeps verifying and the proxy logs the
+deprecation once per process.
+
+**What an operator sees when it bites.** Nothing immediately: both bases
+verify. Every acceptance of the old derivation counts on
+`sbproxy_signature_legacy_derivation_total{component}` and logs one
+`warn` per process naming the verifier's key id. The old one stops being
+accepted in a future release.
+
+**What to do before upgrading.** Move signers onto a conformant RFC 9421
+library, and watch
+`sbproxy_signature_legacy_derivation_total` go to zero before the release
+that removes the fallback. The "Legacy Signature Derivations (24h)" panel on
+the `sbproxy-security` dashboard is the number to hold at zero across a full
+traffic cycle, weekly and monthly batch callers included. Outbound signatures the proxy produces are
+already on the new derivation.
+
+### `acme.storage_backend` on a shared store now refuses to start when it cannot be opened
+
+**Who this reaches.** Any config with `proxy.acme.enabled: true` and
+`storage_backend` set to `file`, `redis`, `s3`, `gcs`, or `azure`, where the
+value in `storage_path` does not actually open: a DSN the Redis parser
+rejects, a bucket URL the object store cannot parse, a shared directory that
+is not mounted in this container. A config whose backend opens is unaffected,
+and so is every pod-local backend (`redb`, `sqlite`, `memory`).
+
+**What changes.** Each of those open failures used to log one `warn` reading
+"certs will NOT persist (in-memory fallback)" and hand back an in-memory
+store. Persistence was the smaller half of what that cost. The in-memory
+store implements neither of `KVStore`'s lock methods, so it inherits the
+single-node defaults, which acquire unconditionally. Every replica therefore
+won its own issuance lease and its own fencing generation, opened its own
+ACME order for the same hostname, and published its HTTP-01 token where no
+peer could read it. The proxy now refuses to start instead, with an error
+naming the backend.
+
+**What an operator sees when it bites.** The process exits at startup rather
+than serving, and the error reads `acme.storage_backend '<backend>' is a
+shared certificate store and could not be opened`. No part of `storage_path`
+is in the message: a Redis DSN carries a password and an object-store URL can
+carry a query credential, so the message names the backend and the failure,
+never the value. Under Kubernetes this is a pod that does not become ready,
+which is visible immediately, rather than a fleet that looks healthy until
+the CA rate-limits the domain days later.
+
+**What to do before upgrading.** Grep the running proxies' startup logs for
+`certs will NOT persist (in-memory fallback)`. That warn line is the old
+build's only report of this condition, and a proxy that emitted it on a shared
+backend is a proxy that will not start on the new build. Fix the backend, or
+move to a pod-local `storage_backend` and a single replica. The new
+`sbproxy_cert_store_degraded{backend}` gauge covers the pod-local half from
+here on; the shared half no longer has a degraded state to report.
+
+### Durable sink files are created `0o600` and existing ones are tightened
+
+**Who this reaches.** Any config that names a path for a durable sink, and any
+process outside the proxy that reads one of those files. The paths are
+`meter.ledger.path` (and the audit chains built on it), `payments.state_path`,
+`session_ledger.path`, `request_events.path`, and the AI gateway's
+`usage.sink: jsonl_file` path. A deployment where only the proxy user ever
+opens these files is unaffected in practice, though the mode on disk still
+changes.
+
+**What changes.** Every one of those files used to be opened with a plain
+create-and-append, which asks the kernel for `0o666` and lets the process umask
+subtract from it. On a host with the near-universal `0o022` they were all
+`0o644`. They now carry `0o600`, requested in the open itself so the file never
+exists at a wider mode, and reasserted afterwards so a file left behind by an
+older build at `0o644` is tightened on the first open rather than inherited.
+Directories the proxy creates for its own state, today only the parent of
+`payments.state_path`, are created `0o700`.
+
+Two things are deliberately left alone. A directory that already exists keeps
+the mode it has, because a sink path may sit under a `/var/log` the operator
+shares on purpose, and narrowing that would be a much larger change than
+hardening one file. A path that resolves to something other than a regular file
+(`/dev/stdout`, a fifo drained by a shipper, a device) is written to exactly as
+before with no mode applied, since its permissions are the operator's and not
+the proxy's.
+
+**What an operator sees when it bites.** Nothing inside the proxy: it reads and
+writes its own files as before. What breaks is outside it. A log shipper, a
+backup job, or a metrics scraper running as a different user starts getting
+`EACCES` on the first open after the upgrade, and keeps getting it, because the
+tightening is applied every time the sink opens the file. If the proxy itself
+cannot tighten a file, because another account owns it, the sink refuses to
+start rather than appending to a file other accounts can read: the session
+ledger and request event sinks warn and fall back to the logging sink, and the
+usage ledger and settlement store fail startup with the path in the message.
+
+**What to do before upgrading.** List every process that reads a sink file and
+decide, per reader, which of these applies: run it as the proxy's user; give it
+access explicitly at deployment time rather than through world-readable modes;
+or point the sink at a fifo or `/dev/stdout` it already drains, which this
+change does not touch. On Windows there are no POSIX permission bits, so files
+and directories keep inheriting the containing directory's ACL and nothing
+about this changes.
+
+### Bedrock's catalog data posture is now `retains_data: true`
+
+**Who this reaches.** Any action carrying
+`data_posture: {allow_data_collection: false}` that can route to a
+`bedrock`-typed provider entry with no operator posture override on it. A
+config that leaves `allow_data_collection` at its default `true`, or that
+sets `data_posture.retains_data: false` on the provider entry, is unaffected.
+`require_zdr: true` is also unaffected: Bedrock still declares
+`zdr_available: true`, because eligible customers can arrange full zero data
+retention through their AWS account team.
+
+**What changes.** Nothing in the request path changed. The catalog's claim
+about the vendor did. AWS's platform default is still zero retention, but its
+abuse-detection page carves out named models: classifier-flagged traffic to
+the OpenAI GPT-5.x family on Bedrock is retained up to thirty days with no
+opt-in. The model name passes straight through from the caller, so a stock
+account reaches a retention window without ever asking for one. A catalog
+entry that says `retains_data: false` promises the whole surface is
+non-retaining, and for that account it is not, so the entry now says `true`
+and the control closes rather than reading as a guarantee it cannot make.
+
+**What an operator sees when it bites.** Bedrock drops out of the eligible
+set for that action. If it was the only eligible provider, the call is
+refused rather than routed to a retaining endpoint, which is the direction
+this control is supposed to fail in.
+
+**What to do before upgrading.** Check
+[`GET /admin/ai-data-posture`](admin-api-reference.md#get-adminai-data-posture)
+for your Bedrock entry's `effective.retains_data`, and its `excluded_providers`
+for whether the entry has already dropped out. If your account has a ZDR
+arrangement with AWS, or you route Bedrock only to models outside the
+carve-out, declare it on the entry with `data_posture: {retains_data: false}`
+and the previous behavior returns. That declaration is the operator saying
+something about their own account that the catalog cannot know.
+
+### A Bedrock `guardrail_intervened` response is now a 403
+
+**Who this reaches.** Any route with a `bedrock`-format provider entry whose
+AWS guardrail can intervene, whether that guardrail is attached through the
+new `providers[].bedrock_guardrail` key or through the model, inference
+profile, or agent configuration in your AWS account. A Bedrock route whose
+guardrails never intervene is unaffected, and no other provider format is
+read for this at all.
+
+**What changes.** Bedrock does not answer a guardrail block with an error
+status. `Converse` returns 200 with `stopReason: guardrail_intervened` and an
+empty completion. SBproxy read neither: `body_refinable_client_status`
+classifies only 400 and 422, and the failure-cause matcher has no `guardrail`
+substring, so the intervention relayed to the caller as a successful, empty
+completion, was admitted to the semantic cache and the idempotency store, and
+produced no decision record and no metric. That response is now a 403
+`guardrail_violation` under the guardrail name `bedrock_guardrail`, with an
+`ai.guardrail.output` deny record and a
+`sbproxy_ai_external_guardrail_verdicts_total{provider="bedrock_inline"}`
+increment. The detection is per response, not per config key, so it applies
+whether or not the route sets `bedrock_guardrail`.
+
+**What an operator sees when it bites.** A call that previously returned 200
+with empty content now returns 403 with `type: guardrail_violation` and a
+reason naming the policy types that fired. Client code that treated the empty
+completion as a valid answer sees an error instead, which is the direction a
+refusal is supposed to fail in. The consumed tokens are still billed by AWS
+and are now recorded as `validation_failed` waste rather than as served
+spend.
+
+**What to do before upgrading.** If you route to Bedrock, check whether any
+guardrail is attached to the models you serve, and confirm your clients
+handle a 403 `guardrail_violation`. There is no key that restores the
+previous relay-as-200 behavior, because that behavior served a refusal as an
+answer.
+
+
+### A transcoded gRPC error now sets the HTTP status, not just the body
+
+**Who this reaches.** Any origin with `action: {type: grpc, transcode: {...}}`
+whose upstream returns a non-OK `grpc-status` in the *response headers*, which
+is what tonic and grpc-go send for a unary handler that returns an error. An
+origin with no `transcode` block is unaffected, and so is `grpc_web: true`:
+gRPC-Web requires HTTP 200 with the outcome in the trailer frame, and that
+path is untouched.
+
+**What changes.** The transcoder already mapped the gRPC code to an HTTP
+status for the JSON error envelope it puts in the body, and then threw the
+mapped value away, so the response kept the upstream's 200. It is applied to
+the status line now, using the same `google.rpc.Code` table `grpc-gateway`
+uses: `NOT_FOUND` becomes 404, `PERMISSION_DENIED` 403, `FAILED_PRECONDITION`
+and `INVALID_ARGUMENT` 400, `UNAVAILABLE` 503, `UNIMPLEMENTED` 501,
+`RESOURCE_EXHAUSTED` 429, `CANCELLED` 499. A `status` response modifier on the
+same origin still wins; it is applied later in the same filter.
+
+**What an operator sees when it bites.** Calls that used to be logged and
+metered as 2xx move into the 4xx and 5xx classes, so error-rate alerts,
+the `status` label on `sbproxy_requests_total` and
+`sbproxy_origin_requests_total`, and any downstream client that retries on 5xx
+all see the change at once. Response caching for those
+origins also changes, since a 4xx or 5xx is not stored the way a 200 was.
+Three more surfaces read the status line at the same point and therefore
+also move: the RFC 9209 `Proxy-Status` header, which is stamped on non-2xx
+responses only, so a `proxy_status.enabled` origin starts emitting it on
+failed RPCs; response `assert` policies; and `on_response` callbacks.
+Nothing about the JSON body changed.
+
+One surface deliberately does not move, and it is a change in its own
+right. `fallback_origin.on_status` is no longer consulted at all on an
+origin with `transcode` or `grpc_web: true`. Both translated modes own
+the response body outright, so a fallback that fired there could commit
+the fallback's status and `content-length` while the body downstream
+stayed the translated one, and a body that does not match its declared
+length desynchronizes a keep-alive connection. `on_error` is unaffected:
+it fires before any upstream response exists, so there is no translated
+body to conflict with. If you need a status fallback on a gRPC upstream,
+put it on a plain-passthrough origin in front of it.
+
+**What to do before upgrading.** Re-baseline error-rate alerts on the affected
+origins, and check any client that treated a transcoded call as always-2xx and
+read the outcome out of the body. The one shape that did not change is a
+failure reported in real HTTP/2 trailers after the response headers, typically
+a server-streaming method that fails partway: the status line is already
+committed downstream when the trailers arrive, so that response stays 200 with
+the error in the body.
+
+### The translated gRPC paths now ask the upstream for `identity` framing
+
+**Who this reaches.** Any origin with `action: {type: grpc}` and either
+`transcode` or `grpc_web: true`. Plain gRPC passthrough is unaffected.
+
+**What changes.** Both translated paths read the length-prefixed message
+frames, and neither can read a compressed one. They now send
+`grpc-accept-encoding: identity` on the request to the upstream, replacing
+anything the client sent, so a compliant server stops compressing. Two
+consequences follow. A compressed response frame that arrives anyway is
+refused by the transcoder with a JSON error naming compression, where before
+its bytes were handed to the protobuf decoder as if they were a message. And
+the gRPC-Web bridge no longer strips a non-`identity` `grpc-encoding` response
+header, since the frames under it are forwarded byte for byte.
+
+**What an operator sees when it bites.** An upstream configured to compress
+responses stops doing so on these origins, which shows up as larger response
+bodies between the proxy and that upstream. An upstream that compresses
+unconditionally, ignoring the negotiation, surfaces as a JSON body of
+`{"error": "gRPC response transcoding failed", "detail": "...compressed..."}`
+instead of the previous protobuf decode error. That body arrives with the
+upstream's own status, normally 200, because the frame's compression flag is
+only readable once the status line has gone downstream.
+
+**What to do before upgrading.** If you rely on gRPC message compression
+between the proxy and a gRPC upstream, keep that origin on plain passthrough
+rather than `transcode` or `grpc_web`.
 
 ---
 
@@ -478,7 +1047,7 @@ them turns an `sbproxy plan` reload into a restart.
 | `allowed_headers` | `allow_headers` | array | `[]` | **stable** |
 | `expose_headers` | - | array | `[]` | **stable** |
 | `max_age` | - | integer | - | **stable** |
-| `allow_credentials` | - | boolean | false | **stable** |
+| `allow_credentials` | - | boolean | false | **stable**, **refused** with `allowed_origins: ["*"]` |
 | `enable` | `enabled` | boolean | - | **refused** at `false` |
 
 CORS is on for an origin exactly when that origin has a `cors:` block.
@@ -500,9 +1069,13 @@ checked together. Delete the block to turn CORS off.
 | Field | Alias | Type | Default | Stability |
 |---|---|---|---|---|
 | `enabled` | `enable` | boolean | true | **stable** |
-| `algorithms` | - | array | `[]` | **stable** |
+| `algorithms` | - | array | `[]` | **stable**, entries **refused** outside `zstd`/`br`/`gzip` |
 | `min_size` | - | integer | 0 | **stable** |
 | `level` | - | integer | - | **beta** |
+
+`algorithms` is a priority order. The list is walked as authored and the
+first entry the client's `Accept-Encoding` accepts is served; an empty
+list takes the built-in `zstd` > `br` > `gzip` order.
 
 `level` is applied to whichever encoder the client negotiates, clamped
 into that algorithm's native range (gzip 0-9, brotli 0-11, zstd 1-22).
@@ -594,6 +1167,65 @@ codings the caller accepts. Two consequences for an existing config:
 | `set` | - | object | `{}` | **stable** |
 | `add` | - | object | `{}` | **stable** |
 | `remove` | `delete` | array | `[]` | **stable** |
+
+### `providers[].aws_sigv4` - AWS SigV4 request signing
+
+| Field | Type | Default | Stability | Notes |
+|---|---|---|---|---|
+| `region` | string | required | **beta** | Credential scope. Independent of `base_url`; never inferred from the endpoint host. |
+| `service` | string | from `provider_type` | **beta** | Signing service name. Defaults to `bedrock` / `sagemaker`. |
+| `refresh_margin_secs` | integer | 900 | **beta** | Refresh window before a short-lived credential expires. Minimum 600. |
+| `credentials.source` | string | `default_chain` | **beta** | `default_chain`, `static`, or `assume_role`. |
+| `credentials.access_key_id` | string | - | **beta** | Read by `static` only. |
+| `credentials.secret_access_key` | string | - | **beta** | Read by `static` only. Secret-resolving. |
+| `credentials.session_token` | string | - | **beta** | Read by `static` only. Secret-resolving. Not renewable by SBproxy. |
+| `credentials.role_arn` | string | - | **beta** | Read by `assume_role` only. |
+| `credentials.external_id` | string | - | **beta** | Read by `assume_role` only. Secret-resolving. |
+| `credentials.session_name` | string | `sbproxy` | **beta** | Read by `assume_role` only. |
+| `credentials.session_duration_secs` | integer | role default | **beta** | Read by `assume_role` only. |
+| `credentials.profile` | string | - | **beta** | Read by `default_chain` and by the `assume_role` base identity. |
+
+The whole block is **beta** for its first release. The shape that is least
+likely to move is `region` plus a credential source, and the part most likely
+to gain fields is `credentials`, where AWS keeps adding provider kinds. Every
+field a source does not read is refused rather than ignored, so a rename would
+surface as a config error rather than as a silently unsigned request.
+`api_key` and `aws_sigv4` on one provider entry are refused together.
+
+### `providers[].bedrock_guardrail` - inline Converse guardrail
+
+| Field | Type | Default | Stability | Notes |
+|---|---|---|---|---|
+| `identifier` | string | required | **beta** | Sent as `guardrailIdentifier`. Refused when blank. |
+| `version` | string | required | **beta** | Sent as `guardrailVersion`. `DRAFT` selects the working version. Refused when blank. |
+| `trace` | bool | `false` | **beta** | Sent as `trace: enabled`/`disabled`. Enables the assessment SBproxy reads to name the policies in the block reason; the trace is never relayed to the caller. |
+
+The whole block is **beta** for its first release. Unknown keys inside it are
+refused rather than ignored, and the block itself is refused on any provider
+entry that does not resolve to the Bedrock wire format. There is deliberately
+no failure-posture key: the guardrail runs inside the generation call, so a
+bad reference fails the `Converse` request on the ordinary provider-failure
+path. See [guardrails.md](guardrails.md#bedrock-guardrails-inline-on-the-converse-call).
+
+### `providers[]` - provider-key failure fallback
+
+| Field | Type | Default | Stability | Notes |
+|---|---|---|---|---|
+| `on_key_failure` | enum | `fallback` | **beta** | `fallback` or `fail_closed`. Decides what a `401`/`403` from this provider does to the request. |
+| `fallback_credential_id` | string | - | **beta** | Names a `key_management.seed.credentials[]` record. Never a secret; resolved per request through the key plane. |
+
+Both are **beta** for their first release. The pair is inert on a config that
+sets neither, and the default's *name* says `fallback` while its *behavior*
+without a credential id is identical to `fail_closed`, which is what makes it
+safe on an existing config. The two are refused together when the posture is
+`fail_closed`, and `fallback_credential_id` is refused on a `serve:`,
+`managed_model`, or `aws_sigv4` entry, because none of those presents a static
+upstream key for it to replace.
+
+The trigger set is the part most likely to move, and it is deliberately the
+narrowest it can be: `401` and `403` only. Widening it would need a precedence
+ruling against the availability failover, which already owns every other
+failure class.
 
 ### Body Modifier (request)
 

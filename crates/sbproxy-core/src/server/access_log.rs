@@ -85,16 +85,20 @@ pub(super) fn agent_class_label(ctx: &RequestContext) -> &'static str {
 ///   overlay path. Falls back to defaults with the same warning.
 /// - Any other catalog string: warns and falls back to defaults.
 ///
-/// DNS resolver: the OSS build does not pull `hickory-resolver`, so we
-/// install [`sbproxy_security::agent_verify::SystemResolver`]. Its
-/// `reverse()` returns an error verdict; the resolver chain treats
-/// that as a transient miss and falls through to UA matching, matching
-/// the documented "no working PTR" degradation path. Operators who
-/// want forward-confirmed rDNS in production can flip
-/// `agent_classes.resolver.rdns_enabled: false` to skip the lookup
-/// entirely (saves a syscall) until a real resolver lands.
+/// DNS resolver: [`sbproxy_security::agent_verify::SystemResolver`],
+/// which is a real resolver. `hickory-resolver` is a non-optional
+/// dependency of `sbproxy-security`, so `reverse()` issues an actual
+/// PTR query against the host DNS configuration, and this function
+/// runs unconditionally in the default build. An operator who does not
+/// want PTR lookups on the request path sets
+/// `agent_classes.resolver.rdns_enabled: false`, which skips resolver
+/// step 2 entirely; otherwise the lookup happens, bounded by the caps
+/// documented on `sbproxy_security::agent_verify` and moved off the
+/// async worker by `agent_class::stamp_request_context_offloaded`. A
+/// client IP with no PTR record yields a `DnsError` verdict, which the
+/// resolver chain treats as a miss and falls through to UA matching.
 ///
-/// Cache size honours `agent_classes.resolver.cache_size`; the default
+/// Cache size honors `agent_classes.resolver.cache_size`; the default
 /// (10 000 entries) matches the OSS recommendation in the resolver
 /// docs.
 #[cfg(feature = "agent-class")]
@@ -134,7 +138,7 @@ pub(super) fn install_agent_class_resolver(block: Option<&sbproxy_config::AgentC
                 other => {
                     tracing::warn!(
                         catalog = %other,
-                        "agent_classes.catalog '{}' is not recognised; falling back to \
+                        "agent_classes.catalog '{}' is not recognized; falling back to \
                          the built-in defaults",
                         other,
                     );
@@ -255,7 +259,7 @@ pub(super) fn redact_pii_other_fields(
             Some(r) => RedactorRef::Scoped(r),
             // No matching rule names: no-op so the caller falls back
             // to the cheap `redact_secrets` pass alone, matching the
-            // header-scope behaviour in `capture_headers_for_log`.
+            // header-scope behavior in `capture_headers_for_log`.
             None => return,
         }
     };
@@ -610,6 +614,7 @@ pub(super) fn emit_access_log(
         api_key_id,
         key_provider: ctx.native_key_provider.clone(),
         key_mode: Some(ctx.inbound_key_mode.as_str().to_string()),
+        credential_source: ctx.ai_credential_source.map(str::to_string),
         served_from_cache: Some(ctx.served_from_cache),
         fallback_triggered: Some(ctx.fallback_triggered),
         retry_count: Some(ctx.retry_count),
@@ -838,6 +843,9 @@ pub(super) struct AccessLogContext {
     pub(super) key_provider: Option<String>,
     /// Inbound credential mode (`none`, `minted`, or `native`).
     pub(super) key_mode: Option<String>,
+    /// Which secret the AI attempt presented upstream (WOR-2655):
+    /// `provider_entry`, `native_caller`, or `fallback`.
+    pub(super) credential_source: Option<String>,
     pub(super) served_from_cache: Option<bool>,
     pub(super) fallback_triggered: Option<bool>,
     pub(super) retry_count: Option<u32>,
@@ -972,6 +980,7 @@ impl AccessLogContext {
             api_key_id: None,
             key_provider: None,
             key_mode: None,
+            credential_source: None,
             served_from_cache: None,
             fallback_triggered: None,
             retry_count: None,
@@ -1212,6 +1221,7 @@ pub(super) fn emit_access_log_entry(
         api_key_id: context.api_key_id,
         key_provider: context.key_provider,
         key_mode: context.key_mode,
+        credential_source: context.credential_source,
         served_from_cache: context.served_from_cache,
         fallback_triggered: context.fallback_triggered,
         retry_count: context.retry_count,

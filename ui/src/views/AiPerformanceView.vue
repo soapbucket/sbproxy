@@ -14,8 +14,10 @@ import {
   type MetricFamily,
 } from "../lib/metrics";
 import { formatNumber, formatUsd } from "../lib/format";
+import { AI_ADMISSION_FAMILY, admissionSummary } from "../lib/ai-admission";
 import PageHeader from "../components/PageHeader.vue";
 import StatCard from "../components/StatCard.vue";
+import StatusBadge from "../components/StatusBadge.vue";
 import MiniBars from "../components/MiniBars.vue";
 import ErrorState from "../components/ErrorState.vue";
 import EmptyState from "../components/EmptyState.vue";
@@ -125,11 +127,36 @@ const gatewayRejectionRate = computed(() =>
     : 0,
 );
 
+// --- Pre-provider admission refusals (WOR-2595) ---
+// A refusal at the inbound native-format shim or the stored-prompt
+// resolver happens before a provider is chosen, so it leaves no trace
+// on attempts, errors, or latency above. This is the only place the
+// console can see it.
+//
+// `admission` is `undefined` when the family is absent from the scrape,
+// which is not the same as zero: the counter registers on its first
+// increment, so a proxy that has never refused a request before
+// dispatch publishes nothing. The tile says "not reported" for that
+// case rather than drawing a reassuring zero.
+const admission = computed(() =>
+  admissionSummary(fam(AI_ADMISSION_FAMILY)),
+);
+const admissionDenials = computed(() => admission.value?.denials);
+const admissionTotal = computed(() => admission.value?.total);
+
 const hasAiTraffic = computed(
   () =>
     sumSamples(attributedRequests.value) > 0 ||
     gatewayDecisionTotal.value > 0 ||
-    providerHealth.value.length > 0,
+    providerHealth.value.length > 0 ||
+    // A deployment whose only AI activity so far is refusals still has
+    // something to show, and it is the thing an operator came to find.
+    // Gated on the family's whole total rather than on the denied slice:
+    // `outcome` exists so an admit-side series can share the family, and
+    // the panel below renders every row the family carries, so gating on
+    // `denials` would draw the empty state over a populated panel the
+    // day that series arrives.
+    (admissionTotal.value ?? 0) > 0,
 );
 
 function rateTone(rate: number): "ok" | "warn" | "err" {
@@ -168,14 +195,14 @@ const hasCompression = computed(() => compressionTotalRequests.value > 0);
 <template>
   <PageHeader
     title="AI performance"
-    subtitle="Serving latency (TTFT, TPOT, throughput) and provider health from the live counters. Values accumulate since process start."
+    subtitle="Requests refused before dispatch, serving latency (TTFT, TPOT, throughput), and provider health from the live counters. Values accumulate since process start."
   />
 
   <ErrorState v-if="req.error.value" :error="req.error.value" @retry="req.run" />
 
   <EmptyState
     v-else-if="!req.loading.value && !hasAiTraffic"
-    message="No AI traffic recorded since the proxy started. Panels light up after the first request flows through an ai_proxy origin; streaming latency panels need at least one streamed completion."
+    message="No AI traffic recorded since the proxy started, and no request refused before dispatch. Panels light up after the first request flows through an ai_proxy origin; streaming latency panels need at least one streamed completion."
   />
 
   <template v-else-if="hasAiTraffic">
@@ -206,7 +233,81 @@ const hasCompression = computed(() => compressionTotalRequests.value > 0);
         :sub="`${formatNumber(gatewayRejections)} rejected before provider dispatch`"
         :tone="gatewayRejectionRate >= 0.05 ? 'accent' : 'default'"
       />
+      <StatCard
+        label="Refused before dispatch"
+        :value="admissionDenials !== undefined ? formatNumber(admissionDenials) : 'not reported'"
+        :sub="
+          admissionDenials !== undefined
+            ? 'a named slice of the rejections beside this, not an addition'
+            : 'counted from the first refusal at an inbound AI surface'
+        "
+        :tone="(admissionDenials ?? 0) > 0 ? 'accent' : 'default'"
+      />
     </div>
+
+    <section class="panel">
+      <h2>Refused before dispatch</h2>
+      <p class="hint">
+        Requests the gateway refused at the inbound AI surface, before it chose a
+        provider. No provider was called, so nothing in provider health below and
+        nothing in a provider's own dashboard records them. Coverage is the two
+        native-format shims and the shared stored-prompt resolver; a refusal by a
+        model gate, guardrail, budget, or policy records under that plane instead.
+      </p>
+      <p class="hint">
+        These are not additive with the gateway rejection rate above. Every
+        refusal counted here is also one of those rejections, filed under
+        <span class="sb-mono">client_error</span>, which cannot say which
+        inbound surface it arrived on or which refusal it was. That is what this
+        panel adds.
+      </p>
+      <template v-if="admission">
+        <table v-if="admission.rows.length" class="detail">
+          <thead>
+            <tr>
+              <th>Inbound surface</th>
+              <th>Why it was refused</th>
+              <th>Outcome</th>
+              <th>Requests</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="row in admission.rows" :key="row.key">
+              <td>
+                {{ row.surfaceLabel }}
+                <div class="code sb-mono sb-faint">{{ row.surface }}</div>
+              </td>
+              <td>
+                {{ row.reasonLabel }}
+                <div class="code sb-mono sb-faint">{{ row.reason }}</div>
+              </td>
+              <td>
+                <StatusBadge
+                  :label="row.outcomeLabel"
+                  :tone="row.outcome === 'deny' ? 'err' : 'ok'"
+                />
+              </td>
+              <td>{{ formatNumber(row.count) }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <p v-else class="hint">
+          The counter is being scraped and has recorded no refusal.
+        </p>
+        <div class="subgrid" v-if="admission.bySurface.length > 1">
+          <div>
+            <h3>Refusals by inbound surface</h3>
+            <MiniBars :items="admission.bySurface" :format="formatNumber" />
+          </div>
+        </div>
+      </template>
+      <p v-else class="hint">
+        Not reported. The counter
+        <span class="sb-mono">{{ AI_ADMISSION_FAMILY }}</span> is
+        published on its first increment, so it is absent until one request is
+        refused at an inbound AI surface. This is not a zero.
+      </p>
+    </section>
 
     <section class="panel">
       <h2>Provider health</h2>
@@ -389,6 +490,10 @@ const hasCompression = computed(() => compressionTotalRequests.value > 0);
   padding: 6px 8px;
   border-bottom: 1px solid var(--sb-border);
   font-variant-numeric: tabular-nums;
+}
+.code {
+  font-size: 11px;
+  margin-top: 2px;
 }
 .rate {
   display: flex;
