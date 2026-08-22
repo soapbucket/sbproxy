@@ -638,7 +638,8 @@ refusal was a runtime no-op plus one `warn` line per request, so
 `sbproxy validate` exited 0 on a config that served a broken browser app
 forever. It fails config compile now, and the runtime guard that remains
 logs once per process and counts every occurrence on
-`sbproxy_cors_refusals_total{reason="wildcard_with_credentials"}`.
+`sbproxy_cors_refusals_total{reason="wildcard_with_credentials"}`, which the
+"CORS Refusals by Reason" panel on the `sbproxy-security` dashboard reads.
 
 **What an operator sees when it bites.** The proxy refuses to start (or
 refuses the reload) naming the origin and both keys.
@@ -719,7 +720,9 @@ accepted in a future release.
 **What to do before upgrading.** Move signers onto a conformant RFC 9421
 library, and watch
 `sbproxy_signature_legacy_derivation_total` go to zero before the release
-that removes the fallback. Outbound signatures the proxy produces are
+that removes the fallback. The "Legacy Signature Derivations (24h)" panel on
+the `sbproxy-security` dashboard is the number to hold at zero across a full
+traffic cycle, weekly and monthly batch callers included. Outbound signatures the proxy produces are
 already on the new derivation.
 
 ### `acme.storage_backend` on a shared store now refuses to start when it cannot be opened
