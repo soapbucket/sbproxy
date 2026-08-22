@@ -46,11 +46,18 @@
 //!       cedar_policies:
 //!         policies: |
 //!           permit(
-//!               principal in AgentClass::"trusted",
+//!               principal == Agent::"agent-123",
 //!               action == Action::"MCP::CallTool",
 //!               resource == ToolInvocation::"gh/search_repos"
 //!           );
 //! ```
+//!
+//! Match `principal` on a specific `Agent::"<id>"`, not on group
+//! membership (`principal in AgentClass::"..."`): the built-in
+//! `CedarMcpHook` evaluates every request against an empty Cedar
+//! entity store (see `sbproxy_extension::mcp::cedar_hook`'s "Entity
+//! construction" section), so no `Agent` ever has a recorded
+//! `AgentClass` ancestor and an `in`-based policy can never match.
 //!
 //! The `rbac:` field on each `federated_servers[]` references a key
 //! in the top-level `rbac_policies` map. The matching
@@ -74,17 +81,21 @@
 //! against the default MCP entity/action schema
 //! (`Agent`/`AgentClass`/`User`/`Group`/`Server`/`Tool`/
 //! `ToolInvocation`/`ArgumentBinding`, `MCP::CallTool` etc.; see
-//! `sbproxy_extension::cedar::schema::mcp`), and registers a
-//! `CedarMcpHook` as a built-in `McpPolicyHook`
-//! (`sbproxy_plugin::mcp::register_mcp_policy_hook`). This runs
-//! ALONGSIDE `rbac_policies`, not instead of it: RBAC stays the
-//! coarse, per-server, default-deny gate consulted directly below by
-//! `sbproxy-core`'s dispatcher; Cedar is the finer-grained ABAC layer
-//! evaluated afterward, on every federated `tools/call` in the
-//! process, regardless of which `mcp` action or origin declared it
-//! (the underlying `McpPolicyHook` registry is process-global, not
-//! scoped per action). `schema_override` appends workspace-authored
-//! Cedar source to the default schema; see
+//! `sbproxy_extension::cedar::schema::mcp`) into a `CedarMcpHook`. That
+//! hook is held on the compiled action (see
+//! [`McpAction::cedar_policy_hook`]) rather than registered here: only
+//! once the pipeline this action belongs to actually starts serving
+//! does `sbproxy_core::reload::load_pipeline` install it as a built-in
+//! `McpPolicyHook`, so a config-validation pass or a hot-reload
+//! candidate a lifecycle hook goes on to reject never touches live
+//! traffic. This runs ALONGSIDE `rbac_policies`, not instead of it:
+//! RBAC stays the coarse, per-server, default-deny gate consulted
+//! directly below by `sbproxy-core`'s dispatcher; Cedar is the
+//! finer-grained ABAC layer evaluated afterward, on every federated
+//! `tools/call` in the process, regardless of which `mcp` action or
+//! origin declared it (the underlying `McpPolicyHook` registry is
+//! process-global, not scoped per action). `schema_override` appends
+//! workspace-authored Cedar source to the default schema; see
 //! `sbproxy_extension::cedar::schema::mcp::merged_schema` for the
 //! conflict-detection rules an override must satisfy.
 //!
@@ -278,8 +289,10 @@ pub struct McpActionConfig {
 }
 
 /// `cedar_policies:` block (WOR-2587): a Cedar ABAC policy for MCP
-/// tool calls, compiled once at config-load time and registered as a
-/// built-in `McpPolicyHook` alongside `rbac_policies`.
+/// tool calls, compiled once at config-load time and installed as a
+/// built-in `McpPolicyHook` alongside `rbac_policies` once the
+/// pipeline it belongs to actually starts serving (see
+/// [`McpAction::cedar_policy_hook`]).
 ///
 /// ```yaml
 /// origins:
@@ -289,11 +302,19 @@ pub struct McpActionConfig {
 ///       cedar_policies:
 ///         policies: |
 ///           permit(
-///               principal in AgentClass::"trusted",
+///               principal == Agent::"agent-123",
 ///               action == Action::"MCP::CallTool",
 ///               resource == ToolInvocation::"gh/search_repos"
 ///           );
 /// ```
+///
+/// `principal` matches a specific `Agent::"<id>"` here, not group
+/// membership (`principal in AgentClass::"..."`): the built-in
+/// `CedarMcpHook` evaluates every request against an empty Cedar
+/// entity store, so no `Agent` ever has a recorded `AgentClass`
+/// ancestor and an `in`-based policy can never match. See
+/// `sbproxy_extension::mcp::cedar_hook`'s "Entity construction"
+/// section.
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpCedarPolicyConfig {
     /// Cedar policy source text: one or more `permit` / `forbid`
@@ -1574,6 +1595,29 @@ pub const MCP_RESULT_POLICY_REASON: &str = "result_policy";
 /// duplicating whichever rule_id fired instead of naming the gate.
 pub const MCP_FLOW_REASON: &str = "session_flow";
 
+/// `sbproxy.decision.reason` for a generic
+/// `sbproxy_plugin::mcp::McpPolicyHook` verdict of either polarity
+/// (WOR-2587 review): names the mechanism (any registered hook), not
+/// a specific implementation -- `CedarMcpHook` is the only in-tree
+/// producer today, but the registry is a generic extension point (see
+/// `sbproxy_extension::mcp::federation::McpCallOutcome`'s doc
+/// comment). `sbproxy.decision.rule_id` carries which polarity fired:
+/// [`MCP_POLICY_HOOK_DENY_RULE_ID`] or
+/// [`MCP_POLICY_HOOK_CONFIRM_RULE_ID`].
+pub const MCP_POLICY_HOOK_REASON: &str = "policy_hook";
+
+/// `sbproxy.decision.rule_id` for an outright `McpPolicyHook` `Deny`
+/// verdict (WOR-2587 review).
+pub const MCP_POLICY_HOOK_DENY_RULE_ID: &str = "policy_hook_deny";
+
+/// `sbproxy.decision.rule_id` for an `McpPolicyHook` `Confirm` verdict
+/// (WOR-2587 review). PR beta's dispatcher currently denies a Confirm
+/// rather than parking it for approval (no `PendingConfirmStore` in
+/// OSS yet); this rule id lets a SIEM rule distinguish "denied
+/// outright" from "would have been held for human approval" even
+/// while both answer the caller the same way.
+pub const MCP_POLICY_HOOK_CONFIRM_RULE_ID: &str = "policy_hook_confirm";
+
 /// One entry in the gateway-level guardrails list.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1932,6 +1976,18 @@ pub struct McpAction {
     /// under `gen_ai.tool.call.arguments`. Off by default. See
     /// [`McpAuditConfig::capture_arguments`].
     pub mcp_audit_capture_arguments: bool,
+    /// Compiled `cedar_policies:` hook (WOR-2587), or `None` when the
+    /// block is absent. Held here rather than installed into the
+    /// global `sbproxy_plugin::mcp` hook registry at compile time: a
+    /// compile happens for a validation-only pass and for a hot-reload
+    /// candidate a lifecycle hook may still reject, and this value is
+    /// simply dropped in both cases. Only
+    /// [`crate::compile::compile_action_for_origin_with_registry`]
+    /// building a `Runtime`-mode action that then actually reaches
+    /// `sbproxy_core::reload::load_pipeline` results in this hook ever
+    /// being registered; see [`Self::cedar_policy_hook`] and that
+    /// publisher's doc comment for the installation seam.
+    pub(crate) cedar_hook: Option<Arc<CedarMcpHook>>,
     /// Compiled `type: local` federated servers' tool catalogs
     /// (WOR-2489), one entry per local server, empty when none are
     /// configured. Validated and compiled at config-compile time by
@@ -4487,38 +4543,52 @@ impl McpAction {
             })?;
         }
 
-        // WOR-2587: compile the optional Cedar ABAC policy and
-        // register it as a built-in `McpPolicyHook`, ALONGSIDE the
-        // `rbac_policies` gate above rather than instead of it -- RBAC
-        // is still consulted directly by `action_dispatch.rs` before
-        // any registered `McpPolicyHook` ever runs (see
+        // WOR-2587: compile the optional Cedar ABAC policy into a
+        // `CedarMcpHook`, ALONGSIDE the `rbac_policies` gate above
+        // rather than instead of it -- RBAC is still consulted
+        // directly by `action_dispatch.rs` before any registered
+        // `McpPolicyHook` ever runs (see
         // `sbproxy_extension::mcp::cedar_hook`'s module docs for the
         // exact seam). A malformed policy or schema override is a
         // config-load error, exactly like every other Cedar / CEL /
         // Rego surface in this codebase: a caller that wants
         // deliberate allow-all writes a single `permit(principal,
         // action, resource);` policy rather than omitting the block.
-        if let Some(cedar_cfg) = &cfg.cedar_policies {
-            let schema_config = McpSchemaConfig {
-                mcp_primitives_enabled: true,
-                workspace_override: cedar_cfg.schema_override.clone(),
-            };
-            let (schema, _warnings) = merged_schema(&schema_config)
-                .map_err(|error| anyhow::anyhow!("mcp action: cedar_policies: {error}"))?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "mcp action: cedar_policies: default MCP schema unexpectedly disabled"
-                    )
-                })?;
-            let compiled =
-                compile_cedar_policies(&[("cedar_policies", cedar_cfg.policies.as_str())], None)
-                    .map_err(|error| anyhow::anyhow!("mcp action: cedar_policies: {error}"))?;
-            let evaluator = CedarEvaluator::new(compiled.policy_set, Some(schema))
+        //
+        // WOR-2587 review: this used to also register the hook into
+        // `sbproxy_plugin::mcp`'s global registry right here, which
+        // runs for every compile regardless of whether it is a
+        // validation-only pass or a hot-reload candidate a lifecycle
+        // hook later rejects, and never retired a previous
+        // generation's hook on a successful reload (the registry is
+        // append-only). The hook is held on `self` instead; see
+        // [`Self::cedar_policy_hook`] and
+        // `sbproxy_core::reload::load_pipeline` for where it actually
+        // goes live.
+        let cedar_hook: Option<Arc<CedarMcpHook>> = match &cfg.cedar_policies {
+            Some(cedar_cfg) => {
+                let schema_config = McpSchemaConfig {
+                    mcp_primitives_enabled: true,
+                    workspace_override: cedar_cfg.schema_override.clone(),
+                };
+                let (schema, _warnings) = merged_schema(&schema_config)
+                    .map_err(|error| anyhow::anyhow!("mcp action: cedar_policies: {error}"))?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "mcp action: cedar_policies: default MCP schema unexpectedly disabled"
+                        )
+                    })?;
+                let compiled = compile_cedar_policies(
+                    &[("cedar_policies", cedar_cfg.policies.as_str())],
+                    None,
+                )
                 .map_err(|error| anyhow::anyhow!("mcp action: cedar_policies: {error}"))?;
-            sbproxy_plugin::mcp::register_mcp_policy_hook(Arc::new(CedarMcpHook::new(Arc::new(
-                evaluator,
-            ))));
-        }
+                let evaluator = CedarEvaluator::new(compiled.policy_set, Some(schema))
+                    .map_err(|error| anyhow::anyhow!("mcp action: cedar_policies: {error}"))?;
+                Some(Arc::new(CedarMcpHook::new(Arc::new(evaluator))))
+            }
+            None => None,
+        };
 
         // WOR-2384 fix round 1, item 1 (critical): federation's
         // OUTBOUND leg speaks only `LEGACY_PROTOCOL_VERSION` today.
@@ -5028,8 +5098,29 @@ impl McpAction {
             content_filters,
             result_policies,
             mcp_audit_capture_arguments: cfg.mcp_audit.capture_arguments,
+            cedar_hook,
             local_servers,
         })
+    }
+
+    /// The compiled `cedar_policies:` hook, as a boxed
+    /// `sbproxy_plugin::mcp::McpPolicyHook` ready to install into that
+    /// crate's runtime hook registry, or `None` when the action
+    /// declared no `cedar_policies:` block.
+    ///
+    /// Deliberately does *not* register the hook itself. Compiling an
+    /// `McpAction` happens for a config-validation pass and for a
+    /// hot-reload candidate a lifecycle hook may still reject, neither
+    /// of which should ever touch process-global state; only a
+    /// publisher that knows this action's pipeline generation actually
+    /// went live should call
+    /// `sbproxy_plugin::mcp::set_pipeline_mcp_policy_hooks` with the
+    /// value returned here (`sbproxy_core::reload::load_pipeline` is
+    /// that publisher today).
+    pub fn cedar_policy_hook(&self) -> Option<Arc<dyn sbproxy_plugin::mcp::McpPolicyHook>> {
+        self.cedar_hook
+            .clone()
+            .map(|hook| hook as Arc<dyn sbproxy_plugin::mcp::McpPolicyHook>)
     }
 
     /// Evaluate `argument_policies[]` against one `tools/call` (WOR-2384,

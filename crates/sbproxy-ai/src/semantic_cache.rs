@@ -99,12 +99,29 @@ impl SemanticCache {
 
     /// Compute a deterministic hash for a list of messages.
     ///
-    /// Uses SHA-256 over the JSON-serialized messages to produce a
-    /// hex-encoded digest suitable as a cache key.
+    /// Uses SHA-256 over the RFC 8785 canonical JSON form of the
+    /// messages to produce a hex-encoded digest suitable as a cache
+    /// key.
+    ///
+    /// Canonicalizing (rather than `serde_json::to_string` directly)
+    /// matters because [`crate::types::Message::content`] is a raw
+    /// `serde_json::Value`: multimodal content is a client-supplied
+    /// array of objects, and this workspace's `serde_json/preserve_order`
+    /// feature (forced on transitively by `cedar-policy-core`; see
+    /// `sbproxy-extension/Cargo.toml`'s comment) means an object's keys
+    /// now serialize in whatever order the client's JSON happened to
+    /// use, not a normalized order. Two semantically identical
+    /// multimodal messages differing only in key order would otherwise
+    /// hash differently and silently miss this cache's exact-match
+    /// lookup instead of hitting it. `serde_json_canonicalizer` sorts
+    /// object keys before hashing, matching the same pattern
+    /// `sbproxy_config::cache_identity` already uses for exactly this
+    /// reason.
     pub fn compute_hash(messages: &[crate::types::Message]) -> String {
         use sha2::{Digest, Sha256};
-        let serialized = serde_json::to_string(messages).unwrap_or_default();
-        let hash = Sha256::digest(serialized.as_bytes());
+        let value = serde_json::to_value(messages).unwrap_or(serde_json::Value::Null);
+        let canonical = serde_json_canonicalizer::to_vec(&value).unwrap_or_default();
+        let hash = Sha256::digest(&canonical);
         hex::encode(hash)
     }
 
@@ -944,6 +961,31 @@ mod tests {
         let h2 = SemanticCache::compute_hash(&msgs);
         assert_eq!(h1, h2);
         assert_eq!(h1.len(), 64); // SHA-256 hex = 64 chars
+    }
+
+    /// WOR-2587 review: guards against the exact-match cache silently
+    /// degrading to an always-miss for multimodal content under the
+    /// workspace-wide `preserve_order` feature, which makes
+    /// `serde_json::Value` serialize in source key order rather than a
+    /// normalized order. Two messages carrying the same multimodal
+    /// content but different JSON key order must hash the same.
+    #[test]
+    fn compute_hash_is_key_order_independent_for_multimodal_content() {
+        let a = vec![Message {
+            role: "user".to_string(),
+            content: serde_json::json!([{"type": "text", "text": "hi"}]),
+        }];
+        let b = vec![Message {
+            role: "user".to_string(),
+            content: serde_json::json!([{"text": "hi", "type": "text"}]),
+        }];
+        assert_eq!(
+            SemanticCache::compute_hash(&a),
+            SemanticCache::compute_hash(&b),
+            "two semantically identical multimodal messages that differ only in JSON key \
+             order must hash the same, or the exact-match cache silently degrades to \
+             always-miss for them"
+        );
     }
 
     // --- WOR-796: embedding cache ---

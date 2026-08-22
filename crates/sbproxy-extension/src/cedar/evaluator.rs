@@ -171,18 +171,37 @@ impl CedarEvaluator {
             Decision::Deny => {
                 let matched_ids: Vec<_> = response.diagnostics().reason().collect();
 
-                // WOR-2587: a `forbid` annotated `@confirm("reason")`
-                // asks for human-in-the-loop approval rather than an
-                // outright refusal. The first matched id carrying the
-                // annotation wins; Cedar itself already resolved
-                // "which forbid(s) fired" via `Diagnostics::reason()`,
-                // so this only decides how sbproxy reports that
-                // outcome upstream, not whether the request was
-                // denied.
-                if let Some(reason) = matched_ids
-                    .iter()
-                    .find_map(|id| self.policy_set.annotation(id, "confirm"))
-                {
+                // WOR-2587 review: a `forbid` annotated
+                // `@confirm("reason")` asks for human-in-the-loop
+                // approval rather than an outright refusal, but only
+                // downgrades the verdict when EVERY matched forbid
+                // carries the annotation. Cedar's own decision is Deny
+                // either way once any forbid matches; the bug this
+                // guards against is a policy author writing one
+                // absolute, non-confirmable `forbid` and a separate,
+                // narrower `@confirm`-annotated `forbid` that also
+                // happens to match the same request -- `find_map`
+                // over the full matched-id list would soften the
+                // absolute forbid's intent the moment the narrower
+                // rule also fired, purely because it happened to be
+                // annotated. Requiring unanimity means a plain forbid
+                // anywhere in the matched set keeps the verdict a hard
+                // Deny, exactly as its author wrote it.
+                let all_confirm = !matched_ids.is_empty()
+                    && matched_ids
+                        .iter()
+                        .all(|id| self.policy_set.annotation(id, "confirm").is_some());
+                if all_confirm {
+                    // Every matched id carries the annotation, so any
+                    // one of their reason texts is a faithful summary;
+                    // the first is used because `Diagnostics::reason()`
+                    // has already decided which forbid(s) fired and
+                    // this only decides how sbproxy reports that
+                    // outcome upstream.
+                    let reason = matched_ids
+                        .iter()
+                        .find_map(|id| self.policy_set.annotation(id, "confirm"))
+                        .unwrap_or_default();
                     let reason = if reason.is_empty() {
                         "cedar policy requires confirmation".to_string()
                     } else {
@@ -386,6 +405,34 @@ mod tests {
                 assert_eq!(reason, "high-risk tool requires human approval");
             }
             other => panic!("expected Confirm, got {other:?}"),
+        }
+    }
+
+    /// WOR-2587 review: when two forbids match the same request and
+    /// only one carries `@confirm(...)`, the verdict must stay a plain
+    /// `Deny`, not downgrade to `Confirm`. An absolute, unannotated
+    /// forbid's intent must not be softened just because a separate,
+    /// narrower `@confirm`-annotated forbid also happened to fire.
+    #[test]
+    fn confirm_does_not_win_when_another_matched_forbid_is_unannotated() {
+        let src = r#"
+            permit(principal, action, resource);
+
+            forbid(principal == User::"banned", action, resource);
+
+            @confirm("needs review")
+            forbid(principal, action, resource);
+        "#;
+        let compiled = compile_all(&[("t", src)], None).expect("compile");
+        let evaluator = CedarEvaluator::new(compiled.policy_set, None).expect("new evaluator");
+
+        let req = CedarRequest::new(r#"User::"banned""#, r#"Action::"view""#, r#"Doc::"d""#);
+        match evaluator.evaluate(&req) {
+            PolicyDecision::Deny { status, .. } => assert_eq!(status, 403),
+            other => panic!(
+                "an absolute unannotated forbid must not be softened to Confirm just \
+                 because a separate annotated forbid also matched, got {other:?}"
+            ),
         }
     }
 

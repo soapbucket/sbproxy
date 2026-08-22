@@ -90,10 +90,15 @@ const ANONYMOUS_AGENT_ID: &str = "anonymous";
 /// set.
 ///
 /// Constructed once at config-load time from a workspace's
-/// `cedar_policies` config block and registered into the global
-/// `sbproxy_plugin::mcp` hook registry via
-/// `sbproxy_plugin::mcp::register_mcp_policy_hook`; see
-/// `sbproxy_modules::action::mcp::McpAction::from_parsed`.
+/// `cedar_policies` config block and held on the compiled
+/// `sbproxy_modules::action::mcp::McpAction` (see that type's
+/// `cedar_policy_hook` method). It only reaches
+/// `sbproxy_plugin::mcp`'s global hook registry once the pipeline it
+/// belongs to actually starts serving: `sbproxy_core::reload::load_pipeline`
+/// installs it via `sbproxy_plugin::mcp::set_pipeline_mcp_policy_hooks`
+/// at that publication boundary, not at compile time, so a
+/// config-validation pass or a hot-reload candidate a lifecycle hook
+/// goes on to reject never installs a hook that outlives it.
 pub struct CedarMcpHook {
     evaluator: Arc<CedarEvaluator>,
 }
@@ -266,6 +271,33 @@ mod tests {
         );
         let verdict = hook.evaluate(ctx(None, "srv", "tool_a")).await;
         assert!(matches!(verdict, PolicyDecision::Deny { .. }));
+    }
+
+    /// Rubric review (WOR-2587): this hook builds a bare
+    /// `Agent::"<id>"` principal with no ancestor entities (see this
+    /// module's "Entity construction" doc section), so a policy
+    /// written with Cedar's `in` ancestor operator against a group
+    /// entity -- the shape `sbproxy_modules::action::mcp`'s own
+    /// module docs used to show as the flagship `cedar_policies:`
+    /// example -- can never match, for any agent, ever. Pinning this
+    /// here so the doc-example fix stays honest and so materialising
+    /// real ancestor entities (tracked as follow-up work in this
+    /// module's doc comment) has a test that goes green, not one that
+    /// silently stops meaning anything.
+    #[tokio::test]
+    async fn group_membership_never_matches_without_ancestor_entities() {
+        let hook = hook_from_source(
+            r#"permit(
+                principal in AgentClass::"trusted",
+                action,
+                resource == ToolInvocation::"srv/tool_a"
+            );"#,
+        );
+        let verdict = hook.evaluate(ctx(Some("agent-1"), "srv", "tool_a")).await;
+        assert!(
+            matches!(verdict, PolicyDecision::Deny { .. }),
+            "an `in`-based policy must never match while entities are empty, got {verdict:?}"
+        );
     }
 
     /// A call that matches no rule at all falls through to Cedar's

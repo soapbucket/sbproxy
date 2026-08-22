@@ -41,9 +41,15 @@
 //!   backend is redb, not Postgres, so nothing here requires an
 //!   external database to run.
 //!
-//! This module compiles and is unit-tested standalone; wiring it into
-//! the MCP tool-call hot path as a built-in policy hook is separate,
-//! later work.
+//! This module is wired into the MCP tool-call hot path as a built-in
+//! `sbproxy_plugin::mcp::McpPolicyHook` (WOR-2587): see
+//! `crate::mcp::cedar_hook::CedarMcpHook`, which wraps [`CedarEvaluator`]
+//! and is installed into that registry at the pipeline-publication
+//! boundary (`sbproxy_core::reload::load_pipeline`) once a
+//! `cedar_policies:` config block compiles successfully. What remains
+//! separate, later work is [`storage`]'s dynamic-policy path (see that
+//! module's own doc comment) and the CEL-inline-condition bridge
+//! ([`cel_bridge`]).
 
 pub mod cel_bridge;
 pub mod compiler;

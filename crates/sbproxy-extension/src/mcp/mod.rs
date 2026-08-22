@@ -74,8 +74,9 @@ pub use cedar_hook::CedarMcpHook;
 pub use egress::{EgressDenied, EgressMode, EgressPolicy, SystemHostResolver};
 pub use federation::{
     FederatedPrompt, FederatedTool, FederationIoSettings, LocalBacking, McpCallOutcome,
-    McpFederation, McpServerConfig, NamespaceMode, OpenApiBacking, PromptCatalogSnapshot,
-    SerializedToolEntry, SerializedTools, ToolVersioningGate, VersioningMode,
+    McpFederation, McpPolicyDenialKind, McpPolicyDeniedError, McpServerConfig, NamespaceMode,
+    OpenApiBacking, PromptCatalogSnapshot, SerializedToolEntry, SerializedTools,
+    ToolVersioningGate, VersioningMode,
 };
 pub use openapi_convert::{openapi_to_mcp_tools, openapi_to_routes, OpenApiRoute};
 pub use peer_profile::{
