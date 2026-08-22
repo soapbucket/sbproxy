@@ -905,7 +905,7 @@ async fn a_settle_answering_five_hundred_lands_on_the_reconciliation_queue() {
     // settle that leaves no claimable row is unreconcilable forever.
     assert_eq!(
         fixture.reconciliation_queue().await,
-        [fixture.intent_id.clone()]
+        [fixture.intent_id.as_str()]
     );
     assert_eq!(
         *fixture.observer.events.lock().unwrap(),
