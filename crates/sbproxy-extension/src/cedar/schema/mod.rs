@@ -18,18 +18,13 @@ use serde::Serialize;
 
 /// Per-policy refusal report produced when a schema change would
 /// break pinned policies.
+///
+/// An empty `failed_policies` means the schema change is safe to
+/// apply; a hot-reload path should refuse the swap otherwise.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct SchemaRefusalReport {
     /// `(policy_id, list_of_broken_type_or_action_references)` for
     /// each pinned policy that fails validation against the proposed
     /// schema.
     pub failed_policies: Vec<(uuid::Uuid, Vec<String>)>,
-}
-
-impl SchemaRefusalReport {
-    /// `true` when no pinned policy failed validation, i.e. the
-    /// schema change is safe to apply.
-    pub fn is_clean(&self) -> bool {
-        self.failed_policies.is_empty()
-    }
 }

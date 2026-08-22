@@ -96,7 +96,7 @@ mod tests {
     fn empty_pinned_set_is_clean() {
         let (schema, _w) = default_schema().expect("schema");
         let report = validate_against_schema(&[], &schema);
-        assert!(report.is_clean());
+        assert!(report.failed_policies.is_empty());
     }
 
     #[test]
@@ -106,7 +106,7 @@ mod tests {
         let src = r#"permit(principal, action == Action::"MCP::Ping", resource);"#;
         let report = validate_against_schema(&[pin(id, src)], &schema);
         assert!(
-            report.is_clean(),
+            report.failed_policies.is_empty(),
             "expected clean, got: {:?}",
             report.failed_policies
         );
@@ -127,7 +127,10 @@ mod tests {
         let src =
             r#"permit(principal == Person::"a", action == Action::"view", resource == Tool::"x");"#;
         let report = validate_against_schema(&[pin(id, src)], &schema);
-        assert!(!report.is_clean(), "expected non-clean report");
+        assert!(
+            !report.failed_policies.is_empty(),
+            "expected non-clean report"
+        );
         assert_eq!(report.failed_policies.len(), 1);
         assert_eq!(report.failed_policies[0].0, id);
         assert!(!report.failed_policies[0].1.is_empty());
