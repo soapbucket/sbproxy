@@ -34,6 +34,7 @@ members = [
     "crates/sbproxy-agent-detect",
     "crates/sbproxy-model-host",
     "crates/sbproxy-capability",
+    "crates/sbproxy-mcp-gateway",
     "e2e",
 ]
 # The k8s operator and the Gateway API controller both pull kube +
@@ -71,6 +72,7 @@ default-members = [
     "crates/sbproxy-classifier-sidecar",
     "crates/sbproxy-classifier-client",
     "crates/sbproxy-agent-detect",
+    "crates/sbproxy-mcp-gateway",
     "e2e",
 ]
 
@@ -155,6 +157,7 @@ sbproxy-classifiers = { path = "crates/sbproxy-classifiers" }
 sbproxy-classifier-client = { path = "crates/sbproxy-classifier-client" }
 sbproxy-agent-detect = { path = "crates/sbproxy-agent-detect" }
 sbproxy-capability = { path = "crates/sbproxy-capability" }
+sbproxy-mcp-gateway = { path = "crates/sbproxy-mcp-gateway" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

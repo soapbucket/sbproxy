@@ -529,3 +529,31 @@
 2026-08-21 (batch-4 merge from main): 296 -> 295. The ground was gained by the
 lanes that landed in #1195, not by this branch; merging main into the batch is
 where the count first became visible to a gate.
+
+2026-08-22 (WOR-2662): unreferenced bucket 1424 -> 1452, tests-only bucket
+unchanged at 295. `sbproxy-mcp-gateway` is a whole-crate port of a
+previously-shipped, already-proven OAuth 2.1 broker (23 files, ~14.7k lines),
+landing as one complete unit rather than growing call-site-first the way
+OSS-native work does. The 28 items behind this bump are the crate's own
+intentional integration-extension points, each with an in-crate convenience
+wrapper that already has a real caller: `InMemoryCimdCache` has
+`EphemeralKvCimdCache` beside it for multi-replica CIMD sharing;
+`InMemorySessionStore` has `RedisSessionStore::with_storage` /
+`with_storage_arc` for injecting any `EphemeralKv` backend; `CimdToDcrCache`
+has `PersistentKvDcrCache` for durable DCR-registration caching; the PKCE
+primitives (`pkce::CodeChallenge::from_verifier_s256`, `VERIFIER_MIN_LEN`,
+`VERIFIER_MAX_LEN`) and the RFC 9068 claim helpers (`at_jwt::MAX_PURPOSE_CHARS`,
+`AtJwtClaims::with_agent_profile`) are the pieces a caller building a custom
+grant flow reaches for directly rather than through this crate's own HTTP
+handlers; `well_known::patch_par_endpoint`, `device_code`'s
+`normalize_user_code`/`format_user_code`/`resolve_user_code`, and
+`par::{from_form, is_well_formed_request_uri}` are the same shape, each a
+building block its own module's public handler already composes above it. The
+two `metrics.rs` statics (`DPOP_PROOFS_TOTAL`, `SESSIONS_ACTIVE`) are consumed
+by name only from this same file's `record_*` helpers and its own test, which
+is why they still show as file-local even though the counters they back are
+live (`docs/mcp-oauth-gateway.md` and the shipped Grafana dashboard both name
+them). None of this is scaffolding nothing calls: it is the exact shape
+`sbproxy-storage::RedisStore` and `sbproxy-plugin`'s traits already take
+elsewhere in this workspace, a wider surface than any single in-tree caller
+exercises because the caller is meant to live outside the tree.

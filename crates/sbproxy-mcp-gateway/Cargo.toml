@@ -1,0 +1,74 @@
+[package]
+name = "sbproxy-mcp-gateway"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "MCP OAuth 2.1 broker: PKCE, DPoP, mTLS-bound tokens, RFC 8707/8693/7591, plus the resource-server companion that verifies the tokens it issues."
+
+[lib]
+name = "sbproxy_mcp_gateway"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }
+async-trait = { workspace = true }
+# DPoP proof errors use thiserror so callers can match on
+# `DpopError::Replay` / `DpopError::NonceRequired` etc. without
+# string-comparing.
+thiserror = { workspace = true }
+# JWT decode/encode for client_secret_jwt + private_key_jwt, RFC 9068
+# access-token minting, and the resource-server's JWKS verification.
+jsonwebtoken = { workspace = true }
+prometheus = { workspace = true }
+bytes = { workspace = true }
+url = { workspace = true }
+
+# All flow state (PKCE-adjacent sessions, DPoP replay jtis, device
+# codes, PAR entries, the CIMD -> DCR cache) is written against
+# EphemeralKv / PersistentKv. Redis is this crate's optional
+# multi-replica backend, wired through sbproxy-storage's own `redis`
+# feature (its default); `LocalStore` in this crate is the in-process
+# default when no Redis URL is configured.
+sbproxy-storage = { workspace = true }
+# Hardened outbound clients (no redirects on token-bearing endpoints,
+# bounded timeout and idle pool). Every outbound reqwest::Client in
+# this crate is built through default_outbound() / token_bearing_outbound()
+# rather than reqwest::Client::new().
+sbproxy-httpkit = { workspace = true }
+# Shared URL redactor for log lines that name an outbound target this
+# crate dials (upstream AS metadata / JWKS / CIMD document URLs), so a
+# DSN-shaped credential or a CIMD bearer token in a query string cannot
+# reach a log line verbatim.
+sbproxy-security = { workspace = true }
+
+# Per-crate axum pin: axum is not a workspace dependency because this
+# is the only OSS crate that mounts an axum router directly (the rest
+# of the workspace's request path is Pingora-based). If a second crate
+# ever needs axum, promote this to workspace.dependencies so both pins
+# move together.
+axum = { version = "0.7", default-features = false, features = ["http1", "tokio", "query", "matched-path", "json", "form"] }
+
+[dev-dependencies]
+# Drives axum routers via tower's `ServiceExt::oneshot` in unit and
+# integration tests without spinning up a real listener.
+tower = { version = "0.4", features = ["util"] }
+http = { workspace = true }
+http-body-util = { workspace = true }
+serde_urlencoded = "0.7"
+# Pulls in the in-memory mock backend (`MockEphemeralKv`) so the
+# session-store, DPoP replay, and device-code unit tests do not need a
+# real Redis. Production builds never see the `mock` feature because
+# dev-dependencies are not propagated.
+sbproxy-storage = { workspace = true, features = ["mock"] }

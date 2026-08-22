@@ -1,6 +1,6 @@
 # MCP gateway
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-22*
 
 SBproxy ships an MCP (Model Context Protocol) gateway that speaks
 JSON-RPC 2.0 over HTTP POST. Configure the `mcp` action on an origin
@@ -559,6 +559,11 @@ Token validation itself stays in the generic auth layer; this block
 only drives discovery and the challenge. A request that already
 carries an `Authorization` header is never re-challenged. See
 [`examples/mcp-oauth-discovery`](../examples/mcp-oauth-discovery).
+
+For an MCP server that is not itself proxied through `sbproxy`, see
+[mcp-oauth-gateway.md](mcp-oauth-gateway.md): a standalone OAuth 2.1
+broker plus a resource-server companion, usable without running the
+rest of `sbproxy` at all.
 
 ## Discovery manifest
 

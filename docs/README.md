@@ -1,6 +1,6 @@
 # SBproxy documentation
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-22*
 
 SBproxy is an open source Enterprise AI Gateway for API, MCP and agent, and AI model traffic. Every feature in this repository ships under Apache-2.0.
 
@@ -103,6 +103,7 @@ Route AI, govern the AI that calls you, and run AI models yourself.
 
 - [mcp-and-agents.md](mcp-and-agents.md) - the map across MCP (tool calling) and A2A (agent-to-agent) traffic: which doc covers which layer.
 - [mcp.md](mcp.md) - the MCP gateway: wire shape, capabilities, and `experimental.agentSkillsUrl` advertising.
+- [mcp-oauth-gateway.md](mcp-oauth-gateway.md) - standalone OAuth 2.1 broker (PKCE, DPoP, mTLS-bound tokens, device-code, CIMD, token exchange) for an MCP server not fronted by `sbproxy`, plus the resource-server companion that verifies the tokens it issues.
 - [mcp-compose.md](mcp-compose.md) - `type: local` servers: config-declared tools (static, HTTP, or a step DAG), the interpolation vocabulary, DAG semantics, and template/JS/Lua response shaping.
 - [mcp-gateway-guardrails.md](mcp-gateway-guardrails.md) - MCP gateway guardrails: egress, session risk, quarantine, stdio, run-as-user, and compaction.
 - [mcp-security.md](mcp-security.md) - MCP and agent threat classes: tool poisoning, definition tampering, prompt injection in tool output, and tenant isolation.

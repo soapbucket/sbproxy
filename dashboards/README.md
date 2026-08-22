@@ -1,5 +1,5 @@
 # SBproxy Dashboards and Alerts
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-22*
 
 Grafana dashboards and Prometheus alert/recording rules for monitoring SBproxy.
 
@@ -31,6 +31,7 @@ scrape_configs:
 | AI Bot & Agent Traffic | `grafana/sbproxy-ai-bot-traffic.json` | `sbproxy-ai-bot-traffic` | Inbound AI bot / agent volume by class, vendor, and verification status (verified Web Bot Auth vs anonymous vs unknown); paid vs unpaid breakdown; AI crawl policy verdicts (allow / block / tarpit); bot-auth integrity (nonce replays, skill digest mismatches) |
 | Model Host | `grafana/sbproxy-model-host.json` | `sbproxy-model-host` | Local inference-engine lifecycle: resident models, cold-start (time-to-ready) latency, launch/eviction rates, load-queue depth, and per-device VRAM used/free and GPU utilization |
 | Mesh Admission & Storage | `grafana/sbproxy-mesh-storage.json` | `sbproxy-mesh-storage` | Mesh inbound connection admission by refusal reason and regrouped by operator fix, plus storage backend latency percentiles, error rate by error kind, operation throughput, and error ratio. Both halves report only where the mesh runs with its Redis backend, and the header tiles say so rather than leaving an empty chart to read as health. |
+| MCP OAuth Gateway | `grafana/sbproxy-mcp-oauth-gateway.json` | `sbproxy-mcp-oauth-gateway` | The standalone MCP OAuth 2.1 broker (`crates/sbproxy-mcp-gateway`, `docs/mcp-oauth-gateway.md`): `/authorize` and `/token` outcomes, DPoP proof verification, `/revoke` and `/introspect` outcomes, active sessions, and a token rejection-rate stat. Only populated on a deployment that mounts this crate's router and scrapes its own `/metrics` endpoint. |
 
 The routing and reliability section on `sbproxy-ai-gateway` follows the
 convention `sbproxy-mesh-storage` set: a strip of `absent()` tiles reading

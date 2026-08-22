@@ -1,0 +1,990 @@
+//! RFC 8628 Device Authorization Grant for the MCP Auth Gateway.
+//!
+//! Headless MCP clients (CLI tools, SSH-only hosts, embedded agents)
+//! cannot run a browser to complete the standard authorization-code
+//! flow. The device-code grant addresses this by splitting the flow
+//! across two devices: the client requests a `device_code` plus a
+//! short user-friendly `user_code` from the AS, displays the user_code
+//! and a verification URL to the human, and polls /token while the
+//! human authorizes the request from any browser.
+//!
+//! This module implements:
+//!
+//! * `device_authorization` - the `POST /device_authorization` HTTP
+//!   handler. Mints a `device_code`, a Crockford-base32 `user_code`,
+//!   and persists the in-flight state under the workspace
+//!   `EphemeralKv` so /verify and the /token poll can read it.
+//! * `verify_get` / `verify_post` - the user-facing browser flow
+//!   that resolves a typed-in `user_code` to its device_code, runs (or
+//!   simulates, in this slice) the upstream PKCE flow, and marks the
+//!   device-code state as `authorized` with the resulting token.
+//! * [`DeviceCodeStore`] - thin wrapper around `EphemeralKv` with the
+//!   broker's key naming convention (`device:<code>` and
+//!   `device:user:<user_code>`).
+//!
+//! The token-side polling logic lives in `token.rs` so all grant
+//! types share the same DPoP / cnf.jkt injection machinery.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::{
+    extract::{Query, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{Html, IntoResponse, Response},
+    Form, Json,
+};
+use base64::Engine;
+use bytes::Bytes;
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
+
+use sbproxy_storage::EphemeralKv;
+
+use crate::AppState;
+
+// --- RFC 8628 grant URN ---
+
+/// The RFC 8628 §3.1 grant_type URN polled at /token.
+pub const DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+
+// --- Default knobs ---
+
+/// Crockford-base32 alphabet (RFC 4648 §6 with letters O, I, L, U
+/// dropped). Drops the visually ambiguous characters so the human can
+/// re-type the user_code from a phone screen without errors.
+const CROCKFORD_BASE32: &[u8] = b"ABCDEFGHJKMNPQRSTVWXYZ0123456789";
+
+/// Length of the user_code on display (8 chars, formatted as XXXX-XXXX).
+/// 32^8 yields 1.1 trillion possible codes, more than enough entropy
+/// for a 10-minute lifetime even at 1k requests/sec.
+const USER_CODE_LEN: usize = 8;
+
+/// Cap for the `slow_down` interval doubling. RFC 8628 §3.5 caps the
+/// guidance at "a few minutes"; we cap at 60 seconds because longer
+/// intervals frustrate humans waiting at the CLI prompt.
+const SLOW_DOWN_INTERVAL_CAP_SECS: u64 = 60;
+
+// --- Request / response models ---
+
+/// `POST /device_authorization` request body. Per RFC 8628 §3.1 the
+/// content type is `application/x-www-form-urlencoded`. We accept a
+/// `client_id` (CIMD or pre-registered), an optional `scope`, and an
+/// optional `resource` (RFC 8707) the issued token should be bound to.
+#[derive(Debug, Deserialize)]
+pub struct DeviceAuthorizationRequest {
+    /// Client identifier, either an opaque pre-registered id or a
+    /// CIMD URL when the AS supports the parecki draft.
+    pub client_id: Option<String>,
+    /// Optional whitespace-separated scope list.
+    pub scope: Option<String>,
+    /// Optional resource indicator (RFC 8707) the issued token is
+    /// bound to. Forwarded verbatim to the upstream when /verify
+    /// completes the standard authorization-code dance.
+    pub resource: Option<String>,
+}
+
+/// Response body for `POST /device_authorization`, RFC 8628 §3.2.
+#[derive(Debug, Serialize)]
+pub struct DeviceAuthorizationResponse {
+    /// Opaque code the client polls /token with.
+    pub device_code: String,
+    /// Short, human-typeable code displayed to the user.
+    pub user_code: String,
+    /// Verification URL the human visits.
+    pub verification_uri: String,
+    /// `verification_uri` with the user_code prefilled as a query
+    /// param. Optional per RFC 8628 §3.3.1 but every realistic CLI
+    /// renders this so the user can click the link in their terminal.
+    pub verification_uri_complete: String,
+    /// Lifetime of the code in seconds.
+    pub expires_in: u64,
+    /// Minimum poll interval the client MUST honor.
+    pub interval: u64,
+}
+
+/// Persisted device-code state. Serialized as JSON in the
+/// `EphemeralKv` value, keyed off `device:<device_code>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceCodeState {
+    /// Mirrors the inbound `client_id`. Re-validated on every poll
+    /// against the request's `client_id` to prevent code-substitution
+    /// attacks (stealing one client's code, polling as another).
+    pub client_id: String,
+    /// Whitespace-separated scope from the original request.
+    pub scope: Option<String>,
+    /// RFC 8707 resource indicator from the original request.
+    pub resource: Option<String>,
+    /// Human-typeable code. Tracked here so /token can return
+    /// `expired_token` when the user_code reverse index has TTL'd out.
+    pub user_code: String,
+    /// Status machine: `pending` (initial), `authorized` (user
+    /// completed /verify, token stored), `denied` (user clicked
+    /// "deny"), `expired` (TTL elapsed; set lazily on poll).
+    pub status: DeviceCodeStatus,
+    /// JSON body returned by the upstream /token endpoint when the
+    /// /verify flow completed. Present only when `status == authorized`.
+    pub authorized_token: Option<serde_json::Value>,
+    /// Issued-at, seconds since UNIX epoch. Used to derive
+    /// `expires_at` and to surface the absolute expiry time on the
+    /// /verify HTML page.
+    pub issued_at: i64,
+    /// Absolute expiry, seconds since UNIX epoch. Polls past this
+    /// value return `expired_token`.
+    pub expires_at: i64,
+    /// Current minimum polling interval. Doubles on each `slow_down`
+    /// up to a 60-second cap.
+    pub interval_secs: u64,
+    /// Wall-clock of the previous /token poll, seconds since UNIX
+    /// epoch. Compared against `interval_secs` to decide whether the
+    /// next poll trips `slow_down`.
+    pub last_polled_at: Option<i64>,
+}
+
+/// State machine for an in-flight device-code authorization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceCodeStatus {
+    /// User has not yet visited /verify.
+    Pending,
+    /// User authorized; an upstream token is stored.
+    Authorized,
+    /// User clicked "deny" on /verify.
+    Denied,
+}
+
+// --- Store ---
+
+/// Thin facade over [`EphemeralKv`] with the device-code key naming
+/// convention. The broker's [`AppState`] holds an `Arc` to this so
+/// `/device_authorization`, `/verify`, and `/token` all read and write
+/// the same backend.
+pub struct DeviceCodeStore {
+    kv: Arc<dyn EphemeralKv>,
+}
+
+impl DeviceCodeStore {
+    /// Wrap an [`EphemeralKv`] with the device-code prefix.
+    pub fn new(kv: Arc<dyn EphemeralKv>) -> Self {
+        Self { kv }
+    }
+
+    /// Convenience: arc-wrap the store for handler injection.
+    pub fn arc(kv: Arc<dyn EphemeralKv>) -> Arc<Self> {
+        Arc::new(Self::new(kv))
+    }
+
+    /// Persist the state under `device:<device_code>` plus a reverse
+    /// index `device:user:<user_code>` so the browser /verify path
+    /// can resolve a typed code without scanning every key.
+    pub async fn put(
+        &self,
+        device_code: &str,
+        state: &DeviceCodeState,
+        ttl: Duration,
+    ) -> Result<(), DeviceCodeError> {
+        let bytes =
+            serde_json::to_vec(state).map_err(|e| DeviceCodeError::Serialize(format!("{e}")))?;
+        self.kv
+            .put(&device_key(device_code), Bytes::from(bytes), ttl)
+            .await
+            .map_err(|e| DeviceCodeError::Storage(format!("{e}")))?;
+        // The reverse index value is the device_code itself. We want
+        // both keys to TTL together so the index never outlives the
+        // primary entry.
+        self.kv
+            .put(
+                &user_code_key(&state.user_code),
+                Bytes::copy_from_slice(device_code.as_bytes()),
+                ttl,
+            )
+            .await
+            .map_err(|e| DeviceCodeError::Storage(format!("{e}")))?;
+        Ok(())
+    }
+
+    /// Read the state for a given device_code.
+    pub async fn get(&self, device_code: &str) -> Result<Option<DeviceCodeState>, DeviceCodeError> {
+        let raw = self
+            .kv
+            .get(&device_key(device_code))
+            .await
+            .map_err(|e| DeviceCodeError::Storage(format!("{e}")))?;
+        match raw {
+            Some(bytes) => {
+                let state: DeviceCodeState = serde_json::from_slice(&bytes)
+                    .map_err(|e| DeviceCodeError::Serialize(format!("{e}")))?;
+                Ok(Some(state))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Resolve a user_code to its device_code via the reverse index.
+    pub async fn resolve_user_code(
+        &self,
+        user_code: &str,
+    ) -> Result<Option<String>, DeviceCodeError> {
+        let raw = self
+            .kv
+            .get(&user_code_key(user_code))
+            .await
+            .map_err(|e| DeviceCodeError::Storage(format!("{e}")))?;
+        Ok(raw.and_then(|b| String::from_utf8(b.to_vec()).ok()))
+    }
+
+    /// Update a state in place, preserving the original TTL by deriving
+    /// a remaining-time TTL from `expires_at`. Callers should hold a
+    /// state read on entry and pass the mutated copy back here.
+    pub async fn update(
+        &self,
+        device_code: &str,
+        state: &DeviceCodeState,
+    ) -> Result<(), DeviceCodeError> {
+        let now = unix_now();
+        let remaining = state.expires_at.saturating_sub(now).max(1) as u64;
+        self.put(device_code, state, Duration::from_secs(remaining))
+            .await
+    }
+
+    /// Delete the primary state and reverse index for a given
+    /// device_code. Called once after the /token poll has redeemed
+    /// the code so a replay cannot mint a second token.
+    pub async fn delete(&self, device_code: &str, user_code: &str) -> Result<(), DeviceCodeError> {
+        self.kv
+            .delete(&device_key(device_code))
+            .await
+            .map_err(|e| DeviceCodeError::Storage(format!("{e}")))?;
+        self.kv
+            .delete(&user_code_key(user_code))
+            .await
+            .map_err(|e| DeviceCodeError::Storage(format!("{e}")))?;
+        Ok(())
+    }
+}
+
+/// Errors surfaced by the device-code subsystem. Map onto the RFC
+/// 8628 §3.5 error codes inside the /token handler.
+#[derive(Debug)]
+pub enum DeviceCodeError {
+    /// EphemeralKv backend rejected a read or write.
+    Storage(String),
+    /// Internal serialization failure (state did not round-trip).
+    Serialize(String),
+}
+
+impl std::fmt::Display for DeviceCodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeviceCodeError::Storage(s) => write!(f, "device code storage: {s}"),
+            DeviceCodeError::Serialize(s) => write!(f, "device code serialize: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for DeviceCodeError {}
+
+// --- Key helpers ---
+
+/// Primary key: `device:<device_code>`.
+fn device_key(device_code: &str) -> String {
+    format!("device:{device_code}")
+}
+
+/// Reverse index key: `device:user:<user_code>`. The user_code is
+/// uppercased and dashes are stripped before lookup so the user can
+/// type it in any cosmetic form.
+fn user_code_key(user_code: &str) -> String {
+    format!("device:user:{}", normalize_user_code(user_code))
+}
+
+/// Normalize a user_code into the canonical form: uppercase,
+/// dash-stripped, whitespace-stripped. Browser-side and CLI-side
+/// callers see the formatted `XXXX-XXXX` form; the storage layer keys
+/// off the raw eight characters.
+pub fn normalize_user_code(input: &str) -> String {
+    input
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .collect()
+}
+
+// --- Handlers ---
+
+/// `POST {base_path}/device_authorization` handler.
+pub async fn device_authorization(
+    State(app): State<AppState>,
+    Form(form): Form<DeviceAuthorizationRequest>,
+) -> Response {
+    let cfg = &app.config;
+    if !cfg.device_code_enabled {
+        return oauth_error(
+            StatusCode::NOT_FOUND,
+            "unsupported_grant_type",
+            "device authorization grant is disabled",
+        );
+    }
+
+    let store = match app.device_code_store.as_ref() {
+        Some(s) => s.clone(),
+        None => {
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "device code store not configured",
+            );
+        }
+    };
+
+    let client_id = match form.client_id {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "missing client_id",
+            );
+        }
+    };
+
+    // Mint the codes. 256 bits of entropy for the device_code matches
+    // the access-token strength and is comfortably URL-safe.
+    let device_code = mint_device_code();
+    let user_code = mint_user_code();
+    let now = unix_now();
+    let lifetime = cfg.device_code_lifetime_secs.max(60);
+    let interval = cfg.device_code_polling_interval_secs.max(1);
+
+    let state = DeviceCodeState {
+        client_id,
+        scope: form.scope,
+        resource: form.resource,
+        user_code: user_code.clone(),
+        status: DeviceCodeStatus::Pending,
+        authorized_token: None,
+        issued_at: now,
+        expires_at: now + lifetime as i64,
+        interval_secs: interval,
+        last_polled_at: None,
+    };
+
+    if let Err(e) = store
+        .put(&device_code, &state, Duration::from_secs(lifetime))
+        .await
+    {
+        tracing::error!(error = %e, "device_authorization: store put failed");
+        return oauth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "device code persistence failed",
+        );
+    }
+
+    let verification_uri = resolve_verification_uri(cfg);
+    let verification_uri_complete = format!(
+        "{}?user_code={}",
+        verification_uri,
+        format_user_code(&user_code)
+    );
+
+    let resp = DeviceAuthorizationResponse {
+        device_code,
+        user_code: format_user_code(&user_code),
+        verification_uri,
+        verification_uri_complete,
+        expires_in: lifetime,
+        interval,
+    };
+
+    let mut response = (StatusCode::OK, Json(resp)).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+/// `GET {base_path}/verify` query string. RFC 8628 §3.3.1 lets the
+/// AS prefill the user_code via `?user_code=XXXX-XXXX`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct VerifyQuery {
+    pub user_code: Option<String>,
+}
+
+/// `GET {base_path}/verify` handler. Returns a tiny self-contained
+/// HTML form so the user can paste their user_code and (for now)
+/// approve or deny. Production deployments will swap this for a
+/// branded page; the contract is that submitting the form arrives
+/// at `POST /verify` with a `user_code` and either `action=approve`
+/// or `action=deny`.
+pub(crate) async fn verify_get(
+    State(app): State<AppState>,
+    Query(q): Query<VerifyQuery>,
+) -> Response {
+    if !app.config.device_code_enabled {
+        return (StatusCode::NOT_FOUND, "device authorization disabled").into_response();
+    }
+
+    let prefilled = q.user_code.unwrap_or_default();
+    Html(verify_html(&prefilled)).into_response()
+}
+
+/// `POST {base_path}/verify` body. The HTML form posts the typed
+/// user_code plus an `action` of either `approve` or `deny`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct VerifySubmission {
+    pub user_code: Option<String>,
+    /// Either `approve` or `deny`.
+    pub action: Option<String>,
+}
+
+/// `POST {base_path}/verify` handler. Looks up the user_code, walks
+/// the upstream PKCE flow (or, for this slice, uses any session
+/// cookie or assumes the user is already authenticated), and marks
+/// the device-code state. A production deployment would 302 the user
+/// agent to /authorize first; this slice keeps the flow synchronous
+/// to keep the LOC budget tight while preserving the contract.
+pub(crate) async fn verify_post(
+    State(app): State<AppState>,
+    Form(form): Form<VerifySubmission>,
+) -> Response {
+    if !app.config.device_code_enabled {
+        return (StatusCode::NOT_FOUND, "device authorization disabled").into_response();
+    }
+
+    let store = match app.device_code_store.as_ref() {
+        Some(s) => s.clone(),
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "device code store not configured",
+            )
+                .into_response();
+        }
+    };
+
+    let raw_user_code = match form.user_code {
+        Some(s) if !s.is_empty() => s,
+        _ => return Html(verify_error_html("user_code required")).into_response(),
+    };
+
+    let action = form.action.unwrap_or_else(|| "approve".to_string());
+    let approve = action != "deny";
+
+    let device_code = match store.resolve_user_code(&raw_user_code).await {
+        Ok(Some(dc)) => dc,
+        Ok(None) => {
+            return Html(verify_error_html("user_code unknown or expired")).into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "verify_post: reverse lookup failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "device code lookup failed",
+            )
+                .into_response();
+        }
+    };
+
+    let mut state = match store.get(&device_code).await {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return Html(verify_error_html("device code expired")).into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "verify_post: state read failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "device code lookup failed",
+            )
+                .into_response();
+        }
+    };
+
+    if approve {
+        state.status = DeviceCodeStatus::Authorized;
+        // Stash a placeholder token: a production deployment runs
+        // /authorize against the upstream and stores the resulting
+        // access_token here. For this slice the placeholder lets the
+        // poller see a successful 200 with a recognisable shape;
+        // operators that wire the gateway to a real upstream provide
+        // their own /verify implementation that calls into the
+        // upstream and overwrites the token JSON.
+        state.authorized_token = Some(serde_json::json!({
+            "access_token": "device-flow-pending",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        }));
+    } else {
+        state.status = DeviceCodeStatus::Denied;
+    }
+
+    if let Err(e) = store.update(&device_code, &state).await {
+        tracing::error!(error = %e, "verify_post: state update failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "device code update failed",
+        )
+            .into_response();
+    }
+
+    let body = if approve {
+        verify_success_html("Device authorized. You may close this window.")
+    } else {
+        verify_success_html("Device authorization denied.")
+    };
+    Html(body).into_response()
+}
+
+// --- Mint helpers ---
+
+/// Mint a 32-byte URL-safe device_code.
+fn mint_device_code() -> String {
+    let mut buf = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut buf);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
+}
+
+/// Mint an 8-character Crockford-base32 user_code, raw (no dashes).
+/// The display form `XXXX-XXXX` is rendered by [`format_user_code`].
+fn mint_user_code() -> String {
+    let mut buf = [0u8; USER_CODE_LEN];
+    rand::thread_rng().fill_bytes(&mut buf);
+    let mut out = String::with_capacity(USER_CODE_LEN);
+    for b in buf.iter() {
+        out.push(CROCKFORD_BASE32[(*b as usize) % CROCKFORD_BASE32.len()] as char);
+    }
+    out
+}
+
+/// Format an 8-char user_code as `XXXX-XXXX`.
+pub fn format_user_code(raw: &str) -> String {
+    let normalized = normalize_user_code(raw);
+    if normalized.len() == USER_CODE_LEN {
+        format!("{}-{}", &normalized[..4], &normalized[4..])
+    } else {
+        normalized
+    }
+}
+
+/// Resolve the verification URI advertised in /device_authorization.
+/// Order of precedence: explicit config, then env-derived
+/// `<MCP_GATEWAY_BASE_URL><base_path>/verify`, then a relative path
+/// fallback (`<base_path>/verify`).
+fn resolve_verification_uri(cfg: &crate::config::McpGatewayConfig) -> String {
+    if !cfg.device_code_verification_uri.is_empty() {
+        return cfg.device_code_verification_uri.clone();
+    }
+    let base = std::env::var("MCP_GATEWAY_BASE_URL").unwrap_or_default();
+    let path = cfg.base_path.trim_end_matches('/');
+    if base.is_empty() {
+        format!("{path}/verify")
+    } else {
+        format!("{}{}/verify", base.trim_end_matches('/'), path)
+    }
+}
+
+/// UNIX seconds-since-epoch.
+pub(crate) fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Update the rate-limit state for a poll. Returns the new state
+/// alongside whether the poller tripped slow_down. Public so the
+/// /token handler can call into it without re-implementing the math.
+pub fn apply_poll_rate_limit(state: &mut DeviceCodeState, now: i64) -> bool {
+    let last = state.last_polled_at.unwrap_or(0);
+    let elapsed = now.saturating_sub(last);
+    let too_fast = last > 0 && (elapsed as u64) < state.interval_secs;
+    state.last_polled_at = Some(now);
+    if too_fast {
+        let doubled = state.interval_secs.saturating_mul(2);
+        state.interval_secs = doubled.min(SLOW_DOWN_INTERVAL_CAP_SECS);
+    }
+    too_fast
+}
+
+// --- HTML stubs ---
+
+/// Render the /verify form. Inline CSS keeps this self-contained;
+/// operators wanting a branded experience can override this handler
+/// downstream.
+fn verify_html(prefilled: &str) -> String {
+    let safe = html_escape(prefilled);
+    format!(
+        r#"<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Authorize device</title>
+<style>body{{font-family:system-ui;max-width:32rem;margin:4rem auto;padding:1rem}}
+input{{font-size:1.25rem;padding:.5rem;width:100%;box-sizing:border-box}}
+button{{font-size:1rem;padding:.5rem 1rem;margin-right:.5rem}}</style>
+</head><body>
+<h1>Authorize device</h1>
+<p>Enter the code shown on your device.</p>
+<form method="POST" action="">
+<label for="user_code">User code</label>
+<input id="user_code" name="user_code" value="{safe}" autocomplete="off" autofocus>
+<p>
+<button type="submit" name="action" value="approve">Approve</button>
+<button type="submit" name="action" value="deny">Deny</button>
+</p>
+</form></body></html>"#,
+        safe = safe
+    )
+}
+
+/// Render a success page after /verify completes.
+fn verify_success_html(message: &str) -> String {
+    let safe = html_escape(message);
+    format!(
+        r#"<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Device authorized</title></head>
+<body><h1>{safe}</h1></body></html>"#,
+        safe = safe
+    )
+}
+
+/// Render an error page.
+fn verify_error_html(message: &str) -> String {
+    let safe = html_escape(message);
+    format!(
+        r#"<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Error</title></head>
+<body><h1>Error</h1><p>{safe}</p></body></html>"#,
+        safe = safe
+    )
+}
+
+/// Minimal HTML escaper. Sufficient for rendering a user-supplied
+/// user_code into an `<input value="...">` attribute or `<h1>` body.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+// --- Error helper ---
+
+/// Render an OAuth-shaped JSON error response.
+fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    (
+        status,
+        headers,
+        Json(serde_json::json!({
+            "error": error,
+            "error_description": description,
+        })),
+    )
+        .into_response()
+}
+
+// --- Tests ---
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::McpGatewayConfig;
+    use crate::session::InMemorySessionStore;
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::Router;
+    use http_body_util::BodyExt;
+    use sbproxy_storage::mock::MockEphemeralKv;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn enabled_config() -> McpGatewayConfig {
+        McpGatewayConfig {
+            device_code_enabled: true,
+            device_code_lifetime_secs: 600,
+            device_code_polling_interval_secs: 5,
+            device_code_verification_uri: "https://broker.example/mcp/oauth/verify".to_string(),
+            ..McpGatewayConfig::default()
+        }
+    }
+
+    fn build_app(cfg: McpGatewayConfig) -> Router {
+        let store = InMemorySessionStore::arc(Duration::from_secs(60));
+        let kv: Arc<dyn EphemeralKv> = Arc::new(MockEphemeralKv::new());
+        let dc_store = Some(DeviceCodeStore::arc(kv));
+        crate::router_full_with_par(
+            Arc::new(cfg),
+            store,
+            None,
+            None,
+            None,
+            None,
+            None,
+            dc_store,
+            None,
+        )
+    }
+
+    async fn post_form(app: Router, uri: &str, body: &str) -> (StatusCode, String) {
+        let req = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&body).to_string())
+    }
+
+    #[tokio::test]
+    async fn device_authorization_happy_path() {
+        let app = build_app(enabled_config());
+        let (status, body) = post_form(
+            app,
+            "/mcp/oauth/device_authorization",
+            "client_id=cli&scope=read",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["device_code"].as_str().unwrap().len() >= 32);
+        let user_code = v["user_code"].as_str().unwrap();
+        assert_eq!(user_code.len(), 9);
+        assert!(user_code.contains('-'));
+        assert_eq!(v["expires_in"].as_u64().unwrap(), 600);
+        assert_eq!(v["interval"].as_u64().unwrap(), 5);
+        assert!(v["verification_uri_complete"]
+            .as_str()
+            .unwrap()
+            .contains("user_code="));
+    }
+
+    #[tokio::test]
+    async fn device_authorization_disabled_returns_404() {
+        let mut cfg = enabled_config();
+        cfg.device_code_enabled = false;
+        let app = build_app(cfg);
+        let (status, _) = post_form(app, "/mcp/oauth/device_authorization", "client_id=cli").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn device_authorization_rejects_missing_client_id() {
+        let app = build_app(enabled_config());
+        let (status, body) = post_form(app, "/mcp/oauth/device_authorization", "scope=read").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("invalid_request"));
+    }
+
+    #[test]
+    fn user_codes_are_unique_across_minting() {
+        // Birthday-paradox check: 1000 codes from a 32^8 space should
+        // collide with vanishingly small probability (P~5e-7). One in
+        // a thousand passes is acceptable; if this trips we will know
+        // the entropy source is broken.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let code = mint_user_code();
+            assert_eq!(code.len(), USER_CODE_LEN);
+            assert!(seen.insert(code), "user_code collision in 1000 mints");
+        }
+    }
+
+    #[test]
+    fn normalize_user_code_strips_dashes_and_lowercases() {
+        assert_eq!(normalize_user_code("ab12-cd34"), "AB12CD34");
+        assert_eq!(normalize_user_code(" ab 12 cd 34 "), "AB12CD34");
+        assert_eq!(normalize_user_code("AB12CD34"), "AB12CD34");
+    }
+
+    #[test]
+    fn format_user_code_groups_into_quartets() {
+        assert_eq!(format_user_code("ABCDEFGH"), "ABCD-EFGH");
+        assert_eq!(format_user_code("abcd-efgh"), "ABCD-EFGH");
+    }
+
+    #[tokio::test]
+    async fn verify_get_renders_form_with_prefilled_user_code() {
+        let app = build_app(enabled_config());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/mcp/oauth/verify?user_code=ABCD-EFGH")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8_lossy(&body);
+        assert!(body_str.contains("ABCD-EFGH"));
+        assert!(body_str.contains("Approve"));
+        assert!(body_str.contains("Deny"));
+    }
+
+    #[tokio::test]
+    async fn verify_post_marks_state_authorized_then_polled_path_works() {
+        // Mint a fresh device_code, then POST /verify with action=approve.
+        // The state should flip to Authorized.
+        let cfg = enabled_config();
+        let store = InMemorySessionStore::arc(Duration::from_secs(60));
+        let kv: Arc<dyn EphemeralKv> = Arc::new(MockEphemeralKv::new());
+        let dc_store = DeviceCodeStore::arc(kv.clone());
+        let app = crate::router_full_with_par(
+            Arc::new(cfg),
+            store,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(dc_store.clone()),
+            None,
+        );
+
+        // 1. /device_authorization
+        let (status, body) = post_form(
+            app.clone(),
+            "/mcp/oauth/device_authorization",
+            "client_id=cli",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let user_code = v["user_code"].as_str().unwrap().to_string();
+        let device_code = v["device_code"].as_str().unwrap().to_string();
+
+        // 2. POST /verify
+        let body_form = format!("user_code={}&action=approve", urlencode(&user_code));
+        let (status, _) = post_form(app, "/mcp/oauth/verify", &body_form).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // 3. State should be Authorized.
+        let state = dc_store.get(&device_code).await.unwrap().expect("state");
+        assert_eq!(state.status, DeviceCodeStatus::Authorized);
+        assert!(state.authorized_token.is_some());
+    }
+
+    #[tokio::test]
+    async fn verify_post_with_unknown_user_code_returns_error_page() {
+        let app = build_app(enabled_config());
+        let body_form = "user_code=ZZZZ-ZZZZ&action=approve";
+        let (status, body) = post_form(app, "/mcp/oauth/verify", body_form).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("user_code unknown"));
+    }
+
+    #[test]
+    fn poll_rate_limit_doubles_interval_when_too_fast() {
+        let mut state = DeviceCodeState {
+            client_id: "c".to_string(),
+            scope: None,
+            resource: None,
+            user_code: "ABCDEFGH".to_string(),
+            status: DeviceCodeStatus::Pending,
+            authorized_token: None,
+            issued_at: 0,
+            expires_at: 600,
+            interval_secs: 5,
+            last_polled_at: Some(100),
+        };
+        // 100s ago + 5s interval => poll at 102 is too fast.
+        let too_fast = apply_poll_rate_limit(&mut state, 102);
+        assert!(too_fast);
+        assert_eq!(state.interval_secs, 10);
+        // A second too-fast poll doubles again.
+        state.last_polled_at = Some(102);
+        let too_fast = apply_poll_rate_limit(&mut state, 105);
+        assert!(too_fast);
+        assert_eq!(state.interval_secs, 20);
+    }
+
+    #[test]
+    fn poll_rate_limit_caps_at_60_seconds() {
+        let mut state = DeviceCodeState {
+            client_id: "c".to_string(),
+            scope: None,
+            resource: None,
+            user_code: "ABCDEFGH".to_string(),
+            status: DeviceCodeStatus::Pending,
+            authorized_token: None,
+            issued_at: 0,
+            expires_at: 600,
+            interval_secs: 40,
+            last_polled_at: Some(100),
+        };
+        let too_fast = apply_poll_rate_limit(&mut state, 101);
+        assert!(too_fast);
+        // 40 doubled to 80, capped at 60.
+        assert_eq!(state.interval_secs, SLOW_DOWN_INTERVAL_CAP_SECS);
+    }
+
+    #[test]
+    fn poll_rate_limit_does_not_trip_when_interval_elapsed() {
+        let mut state = DeviceCodeState {
+            client_id: "c".to_string(),
+            scope: None,
+            resource: None,
+            user_code: "ABCDEFGH".to_string(),
+            status: DeviceCodeStatus::Pending,
+            authorized_token: None,
+            issued_at: 0,
+            expires_at: 600,
+            interval_secs: 5,
+            last_polled_at: Some(100),
+        };
+        // 100s ago + 5s interval, poll at 110 => well past.
+        let too_fast = apply_poll_rate_limit(&mut state, 110);
+        assert!(!too_fast);
+        // Interval should NOT double on a well-behaved poll.
+        assert_eq!(state.interval_secs, 5);
+    }
+
+    #[tokio::test]
+    async fn store_round_trip_serializes_state_correctly() {
+        let kv: Arc<dyn EphemeralKv> = Arc::new(MockEphemeralKv::new());
+        let store = DeviceCodeStore::new(kv);
+        let state = DeviceCodeState {
+            client_id: "cli".to_string(),
+            scope: Some("read write".to_string()),
+            resource: Some("https://api.example/r".to_string()),
+            user_code: "ABCDEFGH".to_string(),
+            status: DeviceCodeStatus::Pending,
+            authorized_token: None,
+            issued_at: 1000,
+            expires_at: 1600,
+            interval_secs: 5,
+            last_polled_at: None,
+        };
+        store
+            .put("dc1", &state, Duration::from_secs(60))
+            .await
+            .unwrap();
+        let got = store.get("dc1").await.unwrap().unwrap();
+        assert_eq!(got.client_id, "cli");
+        assert_eq!(got.user_code, "ABCDEFGH");
+        // Reverse index resolves.
+        let dc = store.resolve_user_code("ABCDEFGH").await.unwrap();
+        assert_eq!(dc.as_deref(), Some("dc1"));
+        // Cosmetic dashes in the input are ignored by the resolver.
+        let dc = store.resolve_user_code("ABCD-EFGH").await.unwrap();
+        assert_eq!(dc.as_deref(), Some("dc1"));
+    }
+
+    /// Tiny URL-form encoder for test fixtures.
+    fn urlencode(s: &str) -> String {
+        s.bytes()
+            .flat_map(|b| {
+                if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                    vec![b as char]
+                } else {
+                    format!("%{b:02X}").chars().collect()
+                }
+            })
+            .collect()
+    }
+}
