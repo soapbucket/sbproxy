@@ -31,6 +31,7 @@ what makes the label usable as a correlation key.
 | [`RB-AUDIT-WRITE`](#rb-audit-write) | `SBPROXY-AUDIT-WRITE-FAILURE` | page |
 | [`RB-AUDIT-LATENCY`](#rb-audit-latency) | `SBPROXY-AUDIT-LATENCY-P99` | ticket |
 | [`RB-AI-ADMISSION`](#rb-ai-admission) | `SBPROXY-AI-ADMISSION-REFUSAL-SHARE` | ticket |
+| [`RB-AI-STREAM-POST-COMMIT`](#rb-ai-stream-post-commit) | `SBPROXY-AI-STREAM-POST-COMMIT` | ticket |
 | [`RB-CERT-STORE-DEGRADED`](#rb-cert-store-degraded) | `SBPROXY-CERT-STORE-DEGRADED` | ticket |
 | [`RB-MESH-ADMISSION`](#rb-mesh-admission) | `SBPROXY-MESH-INBOUND-REJECTED` | ticket |
 | [`RB-STORAGE-BACKEND`](#rb-storage-backend) | `SBPROXY-STORAGE-BACKEND-ERRORS` | ticket |
@@ -396,6 +397,60 @@ those and this section is the wrong page.
 **Resolved when.** The share is back under 5%. That happens by fixing the
 caller, restoring the prompt, or accepting the traffic, not by changing this
 gateway's answer.
+
+### RB-AI-STREAM-POST-COMMIT
+
+`SBPROXY-AI-STREAM-POST-COMMIT` (ticket, more than 1% of one provider's
+accepted responses failing part way through the stream, sustained for 15
+minutes).
+
+The gateway committed to a provider, sent response headers with a 200 on them,
+and the stream then failed. Every caller in that share received a truncated
+body with nothing in the response saying it was truncated, and no failover was
+possible, because the attempt loop had already closed by the time the relay
+started.
+
+Nothing else on this page sees it. The status line was a success, so
+`SBPROXY-SUBSTRATE-AVAIL-*` stays quiet. Failover is impossible past the commit
+point, so `sbproxy_ai_failovers_total` cannot carry it.
+`sbproxy_ai_provider_errors_total` does move for the two upstream causes, but
+it counts pre-commit errors on the same series, and those ended in a retry or
+in a clean error status the caller could act on. The usual way this gets
+noticed without the alert is a user saying an answer stopped in the middle.
+
+**First check.** The cause breakdown. Open the AI Gateway dashboard
+([`sbproxy-ai-gateway`](../dashboards/grafana/sbproxy-ai-gateway.json)) and read
+"Post-commit Stream Failures by Cause". There are three causes and only two of
+them are in this alert:
+
+- `upstream_timeout`. A transport budget cut a generation that was still
+  running. This one is yours, and it is worth checking first: a `timeout_ms` on
+  the provider entry, or a `max_request_timeout_ms` ceiling, that is tighter
+  than the model needs for a long answer. Reasoning models and long-output
+  requests reach it first, so the alert often follows a model change rather
+  than a config change.
+- `upstream_error`. The provider reset or truncated its own stream. Check the
+  provider's status page, then decide whether to steer traffic off it. Read
+  "Post-commit Failure Share by Provider" to see whether one provider carries
+  all of it or the whole set is degraded.
+- `guardrail`. The gateway ended the stream itself on an output guardrail or a
+  stream-safety verdict. That is the configured answer rather than a fault, so
+  it is excluded from the rule, and it stays on the panel so a spike in it is
+  still visible. If that is the line that moved, this section is the wrong page
+  and the guardrail configuration is the right one.
+
+**What the alert cannot see.** A caller that disconnects mid-stream is not
+counted at all: the failed downstream write leaves the relay before the counter
+is reached, so a wave of client cancels neither shows up here nor inflates the
+share. The denominator is every provider response the gateway kept, streaming
+and non-streaming alike, so on a mixed workload the real per-stream failure
+rate is higher than the number on the alert. Treat it as a floor.
+
+**Resolved when.** The share is back under 1%. That happens by widening the
+transport budget that was cutting generations short, or by steering traffic off
+a provider whose streams keep breaking. It does not happen by changing what the
+gateway does at the commit point, because there is nothing to change there:
+once headers are on the wire, a truncated body is the only answer left.
 
 ### RB-CERT-STORE-DEGRADED
 

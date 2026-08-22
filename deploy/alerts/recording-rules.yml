@@ -202,6 +202,45 @@ groups:
           /
           clamp_min(sum by (surface) (rate(sbproxy_ai_surface_requests_total[5m])), 0.000001)
 
+  # --- AI gateway post-commit streaming failures (WOR-2650) ---
+  - name: sbproxy_ai_stream_post_commit
+    interval: 30s
+    rules:
+      # Share of the provider responses this gateway accepted that then
+      # failed part way through the stream.
+      #
+      # Past the commit point there is no honest way to tell the caller.
+      # Headers are already on the wire with a 200 on them, so
+      # sbproxy:slo:substrate:availability scores the request a success, and
+      # the attempt loop has closed by the time the relay runs, so
+      # sbproxy_ai_failovers_total cannot move either. The caller is handed a
+      # truncated body and nothing in the response says so.
+      #
+      # `cause!="guardrail"` drops the arm where the gateway ended the stream
+      # itself on an output guardrail or stream-safety verdict. That is the
+      # configured answer rather than a fault, and alerting on it would be
+      # alerting on a policy working. The negation is safe here for a reason
+      # worth writing down, because a negated matcher on a label a family
+      # does not carry selects every series: `cause` is declared on this
+      # family, all three write sites set it, and verify_references checks
+      # every selector label against the registry, so a matcher naming a
+      # label this family lacks fails the build.
+      #
+      # The denominator is every provider response the gateway kept, which
+      # includes non-streaming ones. That dilutes the ratio on a mixed
+      # workload, so this reads low rather than high and the alert on it is
+      # conservative by construction. The numerator is a strict subset of the
+      # denominator: a stream only reaches the relay after the attempt loop
+      # recorded its `success`, so clamp_min guards a zero denominator
+      # without ever masking a real failure. Both families sanitize
+      # `provider` through the same shared cardinality limiter, so the join
+      # holds on the same string.
+      - record: sbproxy:ai:stream_post_commit_failure_share:5m
+        expr: |
+          sum by (provider) (rate(sbproxy_ai_stream_post_commit_failures_total{cause!="guardrail"}[5m]))
+          /
+          clamp_min(sum by (provider) (rate(sbproxy_ai_provider_attempts_total{outcome="success"}[5m])), 0.000001)
+
   # --- Outbound + cardinality (informational) ---
   - name: sbproxy_slo_outbound
     interval: 30s

@@ -1,0 +1,138 @@
+# promtool unit test for AI gateway post-commit streaming failures
+# (WOR-2650).
+#
+# What this pins is the invisibility and the exclusion, in that order.
+#
+# A stream that fails after the gateway committed to a provider has already
+# put a 200 on the wire, so sbproxy:slo:substrate:availability scores it a
+# success, and the attempt loop has closed, so no failover counter can carry
+# it. The caller gets a truncated body and no signal. The firing case below
+# is exactly that shape: a provider whose accepted responses keep breaking
+# part way through, with every other series flat.
+#
+# The exclusion needs its own cases because getting it wrong is silent in
+# both directions. Including `cause="guardrail"` would alert an operator
+# every time their own output guardrail cut a stream, which is the policy
+# working. Writing the matcher against a label the family does not carry
+# would, in PromQL, select every series instead of none. So case one carries
+# a guardrail series large enough to change the answer and asserts it does
+# not, and case three carries nothing but guardrail terminations and asserts
+# the recorded share is absent rather than zero.
+
+rule_files:
+  - ../recording-rules.yml
+  - ../alerting-rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # A provider's streams start breaking after commit. 5 of every 100
+  # responses the gateway accepted fail part way through, which is five
+  # times the threshold. The guardrail series is three times larger than
+  # the upstream one and must not count: if it did, the recorded share
+  # would be 0.15 rather than 0.05.
+  - interval: 1m
+    input_series:
+      - series: 'sbproxy_ai_provider_attempts_total{provider="openai", outcome="success"}'
+        values: '0+100x180'
+      - series: 'sbproxy_ai_stream_post_commit_failures_total{provider="openai", cause="upstream_timeout"}'
+        values: '0+5x180'
+      - series: 'sbproxy_ai_stream_post_commit_failures_total{provider="openai", cause="guardrail"}'
+        values: '0+15x180'
+
+    promql_expr_test:
+      # `round(..., 0.001)` drops the recording rule's __name__ so the
+      # provider label alone matches, and absorbs float noise.
+      - expr: round(sbproxy:ai:stream_post_commit_failure_share:5m, 0.001)
+        eval_time: 30m
+        exp_samples:
+          - labels: '{provider="openai"}'
+            value: 0.05
+
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: SBPROXY-AI-STREAM-POST-COMMIT
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              slo_id: SLO-AI-STREAM-COMMIT
+              runbook_id: RB-AI-STREAM-POST-COMMIT
+              window: 5m
+              provider: openai
+            exp_annotations:
+              summary: "More than 1% of openai responses failed after the gateway committed to them"
+              description: |
+                More than 1% of the responses this gateway accepted from this
+                provider then failed part way through the stream, sustained for
+                15 minutes. Headers were already sent with a 200 on them, so
+                each of those callers received a truncated body with nothing in
+                the response saying so, and no failover was possible. Open the
+                AI Gateway dashboard and read the cause: upstream_timeout is a
+                transport budget cutting generations that are still running and
+                is yours to widen, and upstream_error is the provider resetting
+                its own stream. Guardrail terminations are excluded from this
+                rule.
+              runbook_url: "https://docs.sbproxy.dev/runbook#rb-ai-stream-post-commit"
+
+  # Control one: a real, nonzero background rate of provider stream resets,
+  # at half the threshold. The rule is demonstrably measuring something and
+  # still does not fire, so a rule pinned at zero by a broken join would
+  # fail here rather than passing quietly.
+  - interval: 1m
+    input_series:
+      - series: 'sbproxy_ai_provider_attempts_total{provider="anthropic", outcome="success"}'
+        values: '0+1000x180'
+      - series: 'sbproxy_ai_stream_post_commit_failures_total{provider="anthropic", cause="upstream_error"}'
+        values: '0+5x180'
+
+    promql_expr_test:
+      - expr: round(sbproxy:ai:stream_post_commit_failure_share:5m, 0.001)
+        eval_time: 90m
+        exp_samples:
+          - labels: '{provider="anthropic"}'
+            value: 0.005
+
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: SBPROXY-AI-STREAM-POST-COMMIT
+        exp_alerts: []
+
+  # Control two: the gateway's own output guardrail is cutting a fifth of
+  # this provider's streams. That is the configured answer, not a fault.
+  # The recorded share must be absent rather than zero, because the
+  # excluded arm is the only thing writing the family.
+  - interval: 1m
+    input_series:
+      - series: 'sbproxy_ai_provider_attempts_total{provider="gemini", outcome="success"}'
+        values: '0+100x180'
+      - series: 'sbproxy_ai_stream_post_commit_failures_total{provider="gemini", cause="guardrail"}'
+        values: '0+20x180'
+
+    promql_expr_test:
+      - expr: round(sbproxy:ai:stream_post_commit_failure_share:5m, 0.001)
+        eval_time: 90m
+        exp_samples: []
+
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: SBPROXY-AI-STREAM-POST-COMMIT
+        exp_alerts: []
+
+  # Control three: healthy traffic and no post-commit failure family at
+  # all, which is the state every deployment is in until the first one.
+  # The family is registered on first use, so the recorded share must be
+  # absent rather than a zero that reads as a measured health.
+  - interval: 1m
+    input_series:
+      - series: 'sbproxy_ai_provider_attempts_total{provider="openai", outcome="success"}'
+        values: '0+100x180'
+
+    promql_expr_test:
+      - expr: round(sbproxy:ai:stream_post_commit_failure_share:5m, 0.001)
+        eval_time: 90m
+        exp_samples: []
+
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: SBPROXY-AI-STREAM-POST-COMMIT
+        exp_alerts: []

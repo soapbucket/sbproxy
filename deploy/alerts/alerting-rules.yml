@@ -351,6 +351,47 @@ groups:
             bodies.
           runbook_url: "https://docs.sbproxy.dev/runbook#rb-ai-admission"
 
+  # --- AI gateway post-commit streaming failures (WOR-2650) ---
+  #
+  # Ticket, not page. The damage is per request and bounded: one caller gets
+  # one truncated answer. It is not a fleet outage, and both remedies, widening
+  # a transport budget and steering traffic off a provider, are config changes
+  # that hold until morning.
+  #
+  # What makes it worth an alert at all is that nothing else reports it.
+  # Response headers carried a 200 before the failure happened, so
+  # sbproxy:slo:substrate:availability scores every one of these a success.
+  # Failover is impossible past the commit point, so sbproxy_ai_failovers_total
+  # cannot carry them. sbproxy_ai_provider_errors_total does move for the two
+  # upstream causes, but it counts pre-commit errors on the same series, and
+  # those ended in a retry or a clean error status the caller could act on.
+  # This is the only family that separates "the provider failed" from "the
+  # caller was already being answered when the provider failed".
+  - name: sbproxy_alerts_ai_stream_post_commit
+    rules:
+      - alert: SBPROXY-AI-STREAM-POST-COMMIT
+        expr: sbproxy:ai:stream_post_commit_failure_share:5m > 0.01
+        for: 15m
+        labels:
+          severity: ticket
+          slo_id: SLO-AI-STREAM-COMMIT
+          runbook_id: RB-AI-STREAM-POST-COMMIT
+          window: 5m
+        annotations:
+          summary: "More than 1% of {{ $labels.provider }} responses failed after the gateway committed to them"
+          description: |
+            More than 1% of the responses this gateway accepted from this
+            provider then failed part way through the stream, sustained for
+            15 minutes. Headers were already sent with a 200 on them, so
+            each of those callers received a truncated body with nothing in
+            the response saying so, and no failover was possible. Open the
+            AI Gateway dashboard and read the cause: upstream_timeout is a
+            transport budget cutting generations that are still running and
+            is yours to widen, and upstream_error is the provider resetting
+            its own stream. Guardrail terminations are excluded from this
+            rule.
+          runbook_url: "https://docs.sbproxy.dev/runbook#rb-ai-stream-post-commit"
+
   # --- Certificate store ---
   #
   # The one TLS failure that looks like a working proxy. A pod whose

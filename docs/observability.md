@@ -304,6 +304,7 @@ The Wave 1 substrate adds five labels: `agent_id`, `agent_class`, `agent_vendor`
 | SLO-CERT-STORE | Certs | configured certificate-store backend open (not degraded to in-memory) | 100% | continuous | Ticket |
 | SLO-CARD-BUDGET | Substrate | per-metric series count under cap | 100% | continuous | Log-only (CI gate) |
 | SLO-AI-ADMISSION | AI Gateway | requests admitted past the inbound shim (1 - pre-provider refusal share, per surface) | 95% | 15 min sustained | Ticket |
+| SLO-AI-STREAM-COMMIT | AI Gateway | committed provider responses that stream to completion, per provider (guardrail terminations excluded) | 99% | 15 min sustained | Ticket |
 | SLO-MESH-ADMISSION | Mesh | inbound peer connections admitted (the idle reclaim is not a refusal and is excluded) | 100% | 10 min sustained | Ticket |
 | SLO-STORAGE-OPS | Storage | storage backend operations returning no error | 99.9% | 10 min sustained | Ticket |
 
@@ -1410,6 +1411,12 @@ reading anything else on it. Both metric families are absent rather than zero
 on a deployment that does not run the mesh with its Redis backend, so an empty
 chart there is not the same claim as a flat zero, and the tiles are what tell
 the two apart.
+
+`sbproxy-ai-gateway.json` now carries the same device for its routing and
+reliability section. Named model groups, prompt-cache affinity, shadow
+evaluation and the per-request timeout override register their families on
+first use, so four `absent()` tiles head that section and every panel under it
+sets a `noValue` string naming which kind of emptiness it is showing.
 
 ## Alerts
 

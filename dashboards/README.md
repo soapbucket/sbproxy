@@ -22,7 +22,7 @@ scrape_configs:
 | Dashboard | File | UID | Description |
 |-----------|------|-----|-------------|
 | SBProxy Overview | `grafana/sbproxy-overview.json` | `sbproxy-overview` | Request rate, latency percentiles, error rate, active connections, cache hit ratio, bandwidth |
-| AI Gateway | `grafana/sbproxy-ai-gateway.json` | `sbproxy-ai-gateway` | AI provider request rates, token usage, TTFT, guardrail triggers, fallbacks, context-compression savings, latency, failures, and state coordination, plus pre-provider admission refusals by reason and by share of each surface's arriving traffic, and an arrived / dispatched / refused reconciliation |
+| AI Gateway | `grafana/sbproxy-ai-gateway.json` | `sbproxy-ai-gateway` | AI provider request rates, token usage, TTFT, guardrail triggers, fallbacks, context-compression savings, latency, failures, and state coordination, plus pre-provider admission refusals by reason and by share of each surface's arriving traffic, and an arrived / dispatched / refused reconciliation. A routing and reliability section below that covers post-commit streaming failures by cause and by provider share, provider-key fallbacks, named model group member selection, prompt-cache affinity decisions against its lease evictions, service tier dispositions, per-request timeout override outcomes, and shadow evaluation call outcomes and latency. Four `absent()` tiles head that section, because five of those families are absent rather than zero until the feature behind them is configured |
 | AI Value | `grafana/sbproxy-ai-value.json` | `sbproxy-ai-value` | Per-credential, multi-tenant, multi-model value tracking: spend, token volume, p95 model latency, value-vs-waste by outcome, and success-only compression tokens and cost saved. Tokenizer precision stays visible. |
 | Judge Backend | `grafana/sbproxy-judge-backend.json` | `sbproxy-judge-backend` | LLM-as-judge call rate by verdict, cache hit ratio, latency, cost per decision, budget exhaustion |
 | Policy Verdicts | `grafana/sbproxy-policy-verdicts.json` | `sbproxy-policy-verdicts` | Verdict rate by tag, audit bus drops per tenant, plugin vs built-in surface ratio, decision latency percentiles, top policies |
@@ -31,6 +31,17 @@ scrape_configs:
 | AI Bot & Agent Traffic | `grafana/sbproxy-ai-bot-traffic.json` | `sbproxy-ai-bot-traffic` | Inbound AI bot / agent volume by class, vendor, and verification status (verified Web Bot Auth vs anonymous vs unknown); paid vs unpaid breakdown; AI crawl policy verdicts (allow / block / tarpit); bot-auth integrity (nonce replays, skill digest mismatches) |
 | Model Host | `grafana/sbproxy-model-host.json` | `sbproxy-model-host` | Local inference-engine lifecycle: resident models, cold-start (time-to-ready) latency, launch/eviction rates, load-queue depth, and per-device VRAM used/free and GPU utilization |
 | Mesh Admission & Storage | `grafana/sbproxy-mesh-storage.json` | `sbproxy-mesh-storage` | Mesh inbound connection admission by refusal reason and regrouped by operator fix, plus storage backend latency percentiles, error rate by error kind, operation throughput, and error ratio. Both halves report only where the mesh runs with its Redis backend, and the header tiles say so rather than leaving an empty chart to read as health. |
+
+The routing and reliability section on `sbproxy-ai-gateway` follows the
+convention `sbproxy-mesh-storage` set: a strip of `absent()` tiles reading
+`In use` or `Not in use`, then panels whose `noValue` string says which kind of
+emptiness you are looking at. Named model groups, prompt-cache affinity, shadow
+evaluation and the per-request timeout override each register their family on
+first use, so a deployment that has not configured one has no series at all
+rather than a series sitting at zero. Read the tile before reading the chart.
+Provider-key fallbacks and post-commit stream failures are the other kind: they
+are absent because nothing has gone wrong yet, and an empty chart there is the
+healthy state.
 
 One family cannot be charted at all and it is the obvious one to reach for on
 the mesh board: `mesh_peer_count`. The coverage scanner in

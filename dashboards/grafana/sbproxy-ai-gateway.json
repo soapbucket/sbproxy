@@ -1160,6 +1160,801 @@
         }
       ],
       "description": "Reconciles inbound AI traffic against provider traffic on one axis. Arrived counts every request classified onto an AI surface. Dispatched counts requests attributed to a provider. Refused counts requests denied before any provider was dialed. When Arrived holds steady and Dispatched drops, the missing requests should appear on Refused. If they do not, the loss is somewhere this funnel cannot see: the model allow and block gate, a virtual-key policy, a guardrail, a budget, a rate limiter, or a CEL or Rego policy each record on their own plane, and only five inbound refusal arms report here. Refused draws no line until the first refusal, because the family is registered on first use. Runbook: docs/operator-runbook.md#rb-ai-admission."
+    },
+    {
+      "id": 20,
+      "title": "Named Model Groups",
+      "type": "stat",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 88
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "Not in use",
+                  "color": "text",
+                  "index": 0
+                }
+              }
+            }
+          ],
+          "noValue": "In use"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "absent(sbproxy_ai_model_group_selections_total)",
+          "legendFormat": "absent",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Whether any request has ever been routed through a named model group. absent() returns 1 when no scraped process has recorded a single group selection, which is the normal state for a deployment that declares no model groups. When this reads Not in use, read the model group panel below as unconfigured rather than as a group that stopped serving. If you did declare a group and this still reads Not in use, no request has addressed it by name yet, so check that callers send the group name as the model."
+    },
+    {
+      "id": 21,
+      "title": "Prompt-cache Affinity",
+      "type": "stat",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 6,
+        "y": 88
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "Not in use",
+                  "color": "text",
+                  "index": 0
+                }
+              }
+            }
+          ],
+          "noValue": "In use"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "absent(sbproxy_ai_cache_affinity_decisions_total)",
+          "legendFormat": "absent",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Whether caller-keyed prompt-cache affinity has ever made a routing decision. absent() returns 1 when no scraped process has recorded one, which is the normal state for a deployment that has not enabled it. When this reads Not in use, the affinity panel below is unconfigured, not idle, and its empty chart is not a claim that the cache is missing."
+    },
+    {
+      "id": 22,
+      "title": "Shadow Evaluation",
+      "type": "stat",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 12,
+        "y": 88
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "Not in use",
+                  "color": "text",
+                  "index": 0
+                }
+              }
+            }
+          ],
+          "noValue": "In use"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "absent(sbproxy_ai_shadow_calls_total)",
+          "legendFormat": "absent",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Whether any shadow evaluation call has ever completed. absent() returns 1 when no scraped process has recorded one, which is the normal state for a deployment that configures no shadow targets. This tile is the one that separates a shadow eval nobody set up from a shadow eval that was set up and is now returning nothing, because both leave the two shadow panels below empty. If you expected shadow traffic and this reads Not in use, no call has completed since the process started: look at sbproxy_ai_shadow_dropped_total, which counts the calls this gateway declined to make before dispatch."
+    },
+    {
+      "id": 23,
+      "title": "Per-request Timeout Override",
+      "type": "stat",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 18,
+        "y": 88
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "Not in use",
+                  "color": "text",
+                  "index": 0
+                }
+              }
+            }
+          ],
+          "noValue": "In use"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "absent(sbproxy_ai_request_timeout_override_total)",
+          "legendFormat": "absent",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Whether any caller has ever sent an x-sbproxy-timeout-ms header. absent() returns 1 when no scraped process has seen one. This family counts refusals as well as honored headers, so Not in use means no caller is attempting a per-request timeout at all, not that the feature is switched off. Read the timeout override panel below only once this reads In use."
+    },
+    {
+      "id": 24,
+      "title": "Post-commit Stream Failures by Cause",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 93
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "bars",
+            "pointSize": 5,
+            "showPoints": "never"
+          },
+          "noValue": "No post-commit stream failure since start"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (cause) (rate(sbproxy_ai_stream_post_commit_failures_total[5m]))",
+          "legendFormat": "{{cause}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Streaming responses that failed after the gateway had already committed to a provider and sent response headers. The caller received a 200 and a truncated body, so it has no clean way to learn the answer is incomplete, and failover is impossible past this point. The cause names who fixes it. upstream_timeout means a transport budget cut a generation that was still running, so a timeout_ms or an x-sbproxy-timeout-ms ceiling is tighter than the model needs, and that is the one an operator changes directly. upstream_error means the provider reset or truncated its own stream, so the fix is provider selection or a support case. guardrail means the gateway ended the stream itself on an output guardrail or stream-safety verdict, which is configured behavior rather than a fault, and it is excluded from the alert for that reason. A caller that disconnects mid-stream is not counted here at all. This family is registered on first use, so an empty panel means no committed stream has failed since the process started, not a broken scrape. Runbook: docs/operator-runbook.md#rb-ai-stream-post-commit."
+    },
+    {
+      "id": 25,
+      "title": "Post-commit Failure Share by Provider",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 93
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto",
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "noValue": "No committed stream has failed on any provider in this window",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.005
+              },
+              {
+                "color": "red",
+                "value": 0.01
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (provider) (rate(sbproxy_ai_stream_post_commit_failures_total{cause!=\"guardrail\"}[5m])) / clamp_min(sum by (provider) (rate(sbproxy_ai_provider_attempts_total{outcome=\"success\"}[5m])), 0.000001)",
+          "legendFormat": "{{provider}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Share of the provider responses this gateway accepted that then failed mid-stream, with the guardrail cause excluded because that one is the gateway enforcing what it was told to enforce. Red is 1 percent, where SBPROXY-AI-STREAM-POST-COMMIT files a ticket. Read this rather than Provider Error Rate above when the question is whether callers are being handed broken answers: a pre-commit provider error turns into a failover or a clean error status, and this one turns into a truncated 200 that the inbound availability SLO scores as a success. When a provider climbs, read the cause breakdown to the left, then either widen the transport budget or route that traffic elsewhere. The denominator counts every provider response the gateway kept, streaming and non-streaming alike, so on a mixed workload the true per-stream rate is higher than this line and this is a floor rather than an overstatement. The axis is deliberately not capped at 100 percent: a value above 1 would mean the two families stopped agreeing on the provider label, and that is worth seeing rather than clipping. A provider draws no line at all until it has its first post-commit failure, because the ratio only produces a series where the numerator has one, so an empty panel here is good news rather than a missing denominator. Runbook: docs/operator-runbook.md#rb-ai-stream-post-commit."
+    },
+    {
+      "id": 26,
+      "title": "Provider Key Fallbacks by Provider and Outcome",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 101
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "bars",
+            "pointSize": 5,
+            "showPoints": "never"
+          },
+          "noValue": "No provider-key fallback since start"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (provider, outcome) (rate(sbproxy_ai_key_fallbacks_total[5m]))",
+          "legendFormat": "{{provider}} / {{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "How often a provider refused the credential its own entry carries, and whether the operator's fallback_credential_id then covered the request. engaged means the fallback resolved and the retry was queued, so the house credential is paying for that traffic now and the entry's own key needs rotating before the bill arrives. unavailable is the one to act on: the fallback did not resolve either, the provider's own 401 or 403 went back to the caller, and it reads as the tenant's fault when what is actually broken is the deployment's fallback secret. Check that fallback_credential_id still names a credential the secret backend can resolve. Nothing else carries this: the refusal is a 4xx, so the inbound availability SLO stays at 1.0 through it. Absent until the first refusal, so an empty panel is the healthy state rather than a missing scrape."
+    },
+    {
+      "id": 27,
+      "title": "Model Group Selections by Group and Member",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 101
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "noValue": "No named model group has been selected since start"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (group, provider) (rate(sbproxy_ai_model_group_selections_total[5m]))",
+          "legendFormat": "{{group}} -> {{provider}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Which named model group each request addressed and which member deployment served it. Both labels are operator-declared config names, so this is the panel that shows whether a group is spreading traffic the way it was written. A member whose line falls to zero while the group's other lines hold is a deployment that stopped being chosen: check its health, whether a cooldown is open on it, and whether a recent config edit dropped it from the group. Every line in a group disappearing at once means callers stopped addressing that group by name, which is a client change rather than a routing fault. Read the Named Model Groups tile above first, because this family is absent rather than zero on a deployment that declares no groups."
+    },
+    {
+      "id": 28,
+      "title": "Prompt-cache Affinity Decisions and Evictions",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 109
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "noValue": "Prompt-cache affinity has recorded nothing since start"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(sbproxy_ai_cache_affinity_decisions_total[5m]))",
+          "legendFormat": "decision: {{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (reason) (rate(sbproxy_ai_cache_affinity_evictions_total[5m]))",
+          "legendFormat": "eviction: {{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Caller-keyed prompt-cache affinity, with the lease table's evictions on the same axis because the evictions are what turn later requests into misses. decision: hit means an existing lease sent the request back to the deployment that already holds that caller's prompt prefix, which is the outcome that earns the provider-side cache discount. miss, ineligible and model_changed each mean the request routed without affinity. missing_signal is a client-side finding rather than a gateway one: the caller sent neither prompt_cache_key nor user, so nothing here can help until the client sends one. eviction: capacity is the one to act on, because it means the lease table is too small for the live caller set and leases are being dropped before their TTL, which shows up as falling hits on the same chart. eviction: ttl and eviction: model_changed are the table working as designed. Both families are absent rather than zero until affinity runs at all, so read the Prompt-cache Affinity tile above before reading an empty chart as a cache that is not hitting."
+    },
+    {
+      "id": 29,
+      "title": "Service Tier Decisions by Disposition",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 109
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "bars",
+            "pointSize": 5,
+            "showPoints": "never"
+          },
+          "noValue": "No service-tier decision since start"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (disposition) (rate(sbproxy_ai_service_tier_decisions_total[5m]))",
+          "legendFormat": "{{disposition}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "What the gateway did with the provider service tier on each upstream attempt. operator_tier_applied means the provider entry set the tier and no caller asked for a different one. caller_tier_replaced means a caller sent service_tier and the operator's entry overrode it, which is the governance working, and it is worth watching only for volume. caller_tier_stripped is the disposition that surprises people: a caller asked for a tier, no operator tier applies on that surface, and the field was dropped rather than forwarded, so that caller is silently getting the provider default at whatever it costs and whatever latency it carries. When that line is high, either declare a tier on the provider entry or tell the callers to stop sending one, because right now neither side is getting what it asked for. Absent until the first attempt whose tier anyone touched."
+    },
+    {
+      "id": 30,
+      "title": "Per-request Timeout Override Outcomes",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 117
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "bars",
+            "pointSize": 5,
+            "showPoints": "never"
+          },
+          "noValue": "No x-sbproxy-timeout-ms header seen since start"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(sbproxy_ai_request_timeout_override_total[5m]))",
+          "legendFormat": "{{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "What happened to each x-sbproxy-timeout-ms header a caller sent. applied means the header replaced the provider's timeout_ms for that request. over_ceiling and invalid_header are both refused with a 400, so the caller does learn about them: over_ceiling means max_request_timeout_ms is smaller than callers expect and is an operator decision to revisit, and invalid_header means a client library is sending something that is not a positive integer. ignored_override_disabled is the quiet one, because the origin has not opted in, the header was dropped, no error was returned, and the request is still running on the provider's configured budget. A steady ignored_override_disabled line means a set of callers believe they are setting a timeout this gateway is not honoring, and the fix is either to opt the origin in or to tell them. Absent until a caller sends the header at all."
+    },
+    {
+      "id": 31,
+      "title": "Shadow Evaluation Calls by Target and Status Class",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 117
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "noValue": "No shadow evaluation call completed since start"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (target, status_class) (rate(sbproxy_ai_shadow_calls_total[5m]))",
+          "legendFormat": "{{target}} / {{status_class}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (target) (rate(sbproxy_ai_shadow_calls_total{finish_reason=\"length\"}[5m]))",
+          "legendFormat": "{{target}} / truncated at length",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Completed shadow evaluation calls, by the target being evaluated and the status class it returned. Shadow traffic never reaches the caller, so a failing target degrades nothing on the request path and moves no other panel on this board, which is exactly why it can rot unnoticed. A target sitting on 4xx has a credential or a request-shape problem in its own entry. 5xx is the target failing, and error means no response arrived at all, which is the transport. The second series counts calls that finished on length. It is a subset of the calls above it rather than an extra failure, and it matters because a shadow answer truncated at the output limit is not comparable to the primary answer, so any eval built on it is wrong rather than merely noisy: raise the target's output limit or shorten the prompt. Shadow calls this gateway declined to make before dispatch are not counted here at all; they are on sbproxy_ai_shadow_dropped_total."
+    },
+    {
+      "id": 32,
+      "title": "Shadow Evaluation Latency P50 / P95 by Target",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 125
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "noValue": "No shadow evaluation latency recorded since start"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le, target) (rate(sbproxy_ai_shadow_latency_seconds_bucket[5m])))",
+          "legendFormat": "{{target}} P50",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le, target) (rate(sbproxy_ai_shadow_latency_seconds_bucket[5m])))",
+          "legendFormat": "{{target}} P95",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "How long each shadow target takes to answer. This is the cost side of running an evaluation in production. Shadow calls are dispatched off the request path under a bounded in-flight budget, so a slow target does not slow callers down; it occupies that budget and starves the evaluation instead, and the calls that no longer fit are dropped before dispatch and never appear on the panel to the left. A P95 that climbs while the completed-call rate falls is that starvation happening. Compare these lines with AI Latency P95 by Provider higher up the board to tell a target that is genuinely slower from a provider set that is slow for everyone. Absent until the first shadow call completes."
     }
   ],
   "templating": {
