@@ -23,7 +23,7 @@ scrape_configs:
 |-----------|------|-----|-------------|
 | SBProxy Overview | `grafana/sbproxy-overview.json` | `sbproxy-overview` | Request rate, latency percentiles, error rate, active connections, cache hit ratio, bandwidth |
 | AI Gateway | `grafana/sbproxy-ai-gateway.json` | `sbproxy-ai-gateway` | AI provider request rates, token usage, TTFT, guardrail triggers, fallbacks, context-compression savings, latency, failures, and state coordination, plus pre-provider admission refusals by reason and by share of each surface's arriving traffic, and an arrived / dispatched / refused reconciliation. A routing and reliability section below that covers post-commit streaming failures by cause and by provider share, provider-key fallbacks, named model group member selection, prompt-cache affinity decisions against its lease evictions, service tier dispositions, per-request timeout override outcomes, and shadow evaluation call outcomes and latency. Four `absent()` tiles head that section, because five of those families are absent rather than zero until the feature behind them is configured |
-| AI Value | `grafana/sbproxy-ai-value.json` | `sbproxy-ai-value` | Per-credential, multi-tenant, multi-model value tracking: spend, token volume, p95 model latency, value-vs-waste by outcome, and success-only compression tokens and cost saved. Tokenizer precision stays visible. |
+| AI Value | `grafana/sbproxy-ai-value.json` | `sbproxy-ai-value` | Per-credential, multi-tenant, multi-model value tracking: spend, token volume, p95 model latency, value-vs-waste by outcome, and success-only compression tokens and cost saved. Tokenizer precision stays visible. Ends with a trust row that says how much of the spend figure is measured: which price table produced each price, price-ceiling outcomes, token-estimate error p05 and p95 by model, and semantic-cache dollars saved. |
 | Judge Backend | `grafana/sbproxy-judge-backend.json` | `sbproxy-judge-backend` | LLM-as-judge call rate by verdict, cache hit ratio, latency, cost per decision, budget exhaustion |
 | Policy Verdicts | `grafana/sbproxy-policy-verdicts.json` | `sbproxy-policy-verdicts` | Verdict rate by tag, audit bus drops per tenant, plugin vs built-in surface ratio, decision latency percentiles, top policies |
 | Security | `grafana/sbproxy-security.json` | `sbproxy-security` | WAF blocks, rate limiting, auth failures, IP filter blocks, bot detections, key operations and credential resolution, audit write failures, CORS refusals by reason, RFC 9421 legacy signature derivation on its deprecation window, and certificate-store degradation |
@@ -53,6 +53,28 @@ build refuses the panel. It is the only one of the 331 declared families with
 that name shape. `sbproxy-mesh-storage.json` uses `mesh_node_isolated` as its
 mesh-is-running tile instead; mesh bootstrap publishes that gauge at 0 when it
 builds the isolation observer, so its presence carries the same signal.
+
+### Reading "not reported"
+
+Some families only exist once the feature that writes them is configured. On a
+Prometheus datasource a family that was never written and a family sitting at
+zero both render as a flat zero line, so a panel over an unconfigured feature
+reads as a healthy zero.
+
+Panels over an optional family therefore carry a second target,
+`absent(<family>)`, whose series is named `not reported` and pinned red by a
+`byName` field override. When that red line sits at 1 the family has never been
+written and the panel below it is not a measurement of anything. When the red
+line is missing and the other series read zero, that is a real zero. Each such
+panel's description says which of the two its absence means.
+
+The `absent()` target must carry the same label selector as the target it
+guards. A panel filtered to `{tenant=~"$tenant"}` whose guard reads the bare
+family goes quiet the moment any other tenant writes the family, which is the
+false healthy zero the convention exists to prevent.
+
+The trust row on `sbproxy-ai-value` is the current example, on all four of its
+panels.
 
 ### Importing via Grafana UI
 

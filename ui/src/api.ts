@@ -2992,6 +2992,19 @@ export const api = {
     getJson<SpendWindowResponse>(
       `/api/usage/spend?window=${encodeURIComponent(window)}&group_by=${encodeURIComponent(groupBy)}`,
     ),
+  /**
+   * The same rollup query over an explicit range, in Unix seconds.
+   *
+   * `window=` only ever means "ending now", so the prior equal-length
+   * period, which is what turns a total into a change, is unreachable
+   * through it. The server takes `from`/`to` on the same route and
+   * requires `from < to`; anything else is a 400.
+   */
+  spendRange: (fromSecs: number, toSecs: number, groupBy: string) =>
+    getJson<SpendWindowResponse>(
+      `/api/usage/spend?from=${Math.floor(fromSecs)}&to=${Math.floor(toSecs)}` +
+        `&group_by=${encodeURIComponent(groupBy)}`,
+    ),
 
   // Prompts
   prompts: () => getJson<unknown>("/admin/prompts"),

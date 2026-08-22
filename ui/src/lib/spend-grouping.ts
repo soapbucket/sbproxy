@@ -4,14 +4,24 @@ export interface SpendGroupOption {
   unavailable: boolean;
 }
 
+/**
+ * Every dimension `GroupBy::parse` accepts, in the order an operator
+ * narrows: the whole bill, then what it bought, then who bought it.
+ *
+ * `tenant` and `agent` were missing here while the server answered both,
+ * so "which agent spent this" was queryable by hand-editing the URL and
+ * not from the page.
+ */
 const BUILT_IN_GROUPS: readonly Omit<SpendGroupOption, "unavailable">[] = [
   { value: "total", label: "Total" },
   { value: "model", label: "Model" },
   { value: "provider", label: "Provider" },
+  { value: "tenant", label: "Tenant" },
   { value: "team", label: "Team" },
   { value: "project", label: "Project" },
   { value: "api_key", label: "API key" },
   { value: "origin", label: "Origin" },
+  { value: "agent", label: "Agent" },
 ];
 
 export function spendGroupOptions(
