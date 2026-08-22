@@ -396,6 +396,28 @@ impl SqliteSettlementStore {
     ///
     /// Returns [`BillingError::Storage`] or [`BillingError::UnsupportedSchema`].
     pub fn open_with_config(path: &Path, config: SqliteStoreConfig) -> Result<Self, BillingError> {
+        // Create the database file owner-only (`0o600`) before SQLite
+        // sees the path, and tighten it if a previous build left it at
+        // `0o644`. Two reasons the order matters. SQLite would create
+        // it at `0o666 & ~umask`, so on a default host the settlement
+        // ledger, its amounts, and its payer identifiers would be
+        // readable by every account on the box. And SQLite copies the
+        // main database's mode onto the `-wal` and `-shm` sidecars it
+        // opens under `journal_mode = WAL`, so getting the main file
+        // right is what gets the sidecars right; there is no other
+        // hook for them.
+        //
+        // `SQLITE_OPEN_URI` is set below, so a `file:` path is a URI
+        // that SQLite resolves itself and may not name a file at all
+        // (`mode=memory`). Pre-creating a literal `file:...` entry
+        // would leave a junk file next to the real database, so that
+        // form is handed straight through; every configured
+        // `payments.state_path` in the shipped examples is a plain
+        // path.
+        if !path.to_string_lossy().starts_with("file:") {
+            sbproxy_util::secure_fs::ensure_file_owner_only(path)
+                .map_err(|_| BillingError::Storage("create settlement database owner-only"))?;
+        }
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_URI

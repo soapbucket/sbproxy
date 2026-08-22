@@ -225,6 +225,12 @@ Each reconcile writes the rendered document to a temporary file in the same dire
 
 Two limits are worth knowing. The guarantee is the filesystem's: a rename is atomic within one filesystem, which is why the temporary is written beside `sb.yml` rather than in `/tmp`, and on an NFS-backed `PersistentVolume` both the rename and the `fsync` are the server's promise rather than the kernel's. And a mode you set on the published file is carried across each publish, so `chmod 640 sb.yml` on the shared volume survives the next reconcile.
 
+### A watch relist swaps in a complete set
+
+The API server ends watches routinely. An etcd compaction answers the next read with `410 Gone`, an apiserver rolls, and kube-rs reconnects and replays every object of that kind from the top. The controller collects the replay in a buffer beside the snapshot it is already serving and swaps the two when the replay finishes, so a reconcile that lands halfway through renders the set from before the disconnect rather than the three routes that have arrived so far. One relist produces one reconcile, at the swap. A route deleted while the watch was down is gone from the document at that same moment, because the replayed list is the whole answer.
+
+The first document a fresh controller publishes waits for all four kinds to finish their first list. A restarting pod finds a complete `sb.yml` on the shared volume already, and publishing as soon as the `GatewayClass` watcher had listed would replace it with a perfectly valid document carrying zero origins until the route watchers caught up. If some kind never lists at all, because its watch is failing, the resync timer publishes without it once it fires, and `sbproxy_gateway_watch_errors_total` names the kind that was missing.
+
 ### One process, one HTTP port
 
 sbproxy binds one HTTP port and one HTTPS port for the whole process. Gateway API lets you declare as many listeners on as many ports as you like. Listeners are visited in a stable order (Gateway namespace, then name, then declaration order); the first HTTP listener and the first HTTPS listener win, and any later listener asking for a *different* port reports `Programmed: False` with a message naming the port that beat it. Several listeners on the *same* port are all programmed, which is the usual pattern of one listener per hostname.
