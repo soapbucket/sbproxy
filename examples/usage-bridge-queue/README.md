@@ -75,7 +75,7 @@ sqlite3 /tmp/sbproxy-usage-bridge/payments.sqlite3 \
 {"attributes":{"claim_id":"019fc4332bc872f0bbfbb36cb735cc14","resource_name":"openai/gpt-4o-mini","resource_type":"ai_model","stripe_customer_id":"cus_demo_usage_bridge","unit":"total_tokens"},"event_name":"sbproxy_ai_tokens","occurred_at_ms":1785703115773,"origin_id":"billing.local","quantity":1020,"reporter":"stripe_meter","tenant_id":"tenant-a","usage_identifier":"sbu-019fc4332bc872f0bbfbb36cb735cc14-edba0b3d3dfd9c8ddd3718560501eb69"}
 ```
 
-Two counters describe the bridge, both labelled by tenant, because a billing number that merged every tenant into one series answers a question nobody asks:
+Two counters describe the bridge, both labeled by tenant, because a billing number that merged every tenant into one series answers a question nobody asks:
 
 ```bash
 curl -s http://127.0.0.1:8080/metrics | grep sbproxy_usage_bridge

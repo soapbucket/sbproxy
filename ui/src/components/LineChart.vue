@@ -16,6 +16,14 @@ const props = defineProps<{
   height?: number;
   /** Y-axis upper bound; defaults to the data maximum. */
   max?: number;
+  /**
+   * X-axis tick formatter, given the point's millisecond timestamp.
+   *
+   * Defaults to a wall clock, which is right for a live scrape sampled
+   * every few seconds. A chart whose points are days apart needs a date:
+   * three ticks all reading "00:00:00" is worse than no axis.
+   */
+  xFormat?: (t: number) => string;
 }>();
 
 const PALETTE = [
@@ -104,6 +112,7 @@ const yTicks = computed(() => {
 });
 
 function clock(t: number): string {
+  if (props.xFormat) return props.xFormat(t);
   const d = new Date(t);
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
 }

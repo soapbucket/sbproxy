@@ -578,33 +578,138 @@ page open does not inflate the values it displays.
 
 ## Spend (`/spend`)
 
-![Spend: the window grouped by a promoted custom property, with per-model, per-provider, and per-origin breakdowns below](assets/admin-spend.png)
+![Spend, showing the window control, the group-by selector, and the ranked breakdown](assets/admin-spend.png)
 
-Estimated AI cost: live totals since process start, plus durable
-windowed history.
+This shot predates the tiles, the two-series chart, and the trust panel.
+Every screenshot in this doc carries the sidebar, so they are recaptured
+together at release prep rather than one at a time.
 
-- **Shows:** `GET /metrics` for live totals and breakdowns (by model,
-  provider, origin, API key, team, project; attribution partitions
-  are omitted from a breakdown when the label is absent, not shown as
-  a zero row), `GET /api/usage/spend?window=...&group_by=...` for the
-  durable rollup history chart, which survives a restart unlike the
-  live counters. History groups by provider, model, tenant, team,
-  API key, project, or origin; rollup rows recorded by builds that
-  predate the origin dimension fold into the unattributed segment. The
-  response also advertises promoted property keys, which appear as
-  `Property: <key>` groupings and query as `group_by=property:<key>`.
-  Labels in the by-origin breakdown link through to Logs filtered to
-  that origin; the other breakdowns are deliberately not linked,
-  because landing on an unfiltered log is worse than no link. For
-  by-model, by-key, by-tenant, or by-user drill-down over the recent
-  ring, use [Reports](#reports-reports), which filters on exactly
-  those dimensions.
-- **Mutations:** none.
-- **Empty/error notes:** no AI traffic yet renders an empty state; a
-  `window`/`group_by` combination with no matching rollup data renders
-  an empty chart, not an error. If a selected property disappears in
-  another window, the selector preserves it with an unavailable hint
-  rather than changing the operator's query.
+What the gateway estimates you spent, what it saved you, and how much of
+the number is measured rather than guessed. Every figure above the fold
+comes from the durable usage rollups and follows the selected window.
+Savings, budget headroom, and the trust readouts come from the
+process-lifetime `/metrics` scrape, which resets on restart, and each of
+those blocks says so in its own header rather than leaving an operator to
+work out that two numbers on the page count different things.
+
+Where each number comes from:
+
+```mermaid
+flowchart TD
+    AI["AI dispatch\n(emit_ai_billing_event)"] --> ROLL["Usage rollup store\n(hourly buckets, durable,\nsurvives restart)"]
+    AI --> PROM["Prometheus registry\n(process-lifetime counters,\nreset on restart)"]
+    ROLL --> W["GET /api/usage/spend?window=&group_by=\nthe selected window"]
+    ROLL --> P["GET /api/usage/spend?from=&to=&group_by=\nthe equal-length window before it"]
+    PROM --> M["GET /metrics"]
+    LEDGER["Governance reserve/settle ledger"] --> KU["GET /admin/keys/{id}/usage\nper capped key, at most 20"]
+    W --> TILES["Tiles, chart, breakdown table"]
+    P --> TILES
+    W --> UNATTR["Unattributed tile\n(group key is empty)"]
+    M --> SAVED["What it saved"]
+    M --> TRUST["How much to trust this"]
+    M --> SCOPE["Utilization by scope"]
+    KU --> HEAD["Budget headroom"]
+```
+
+- **Shows:** `GET /api/usage/spend?window=&group_by=` for the selected
+  window and `?from=&to=&group_by=` for the equal-length window before
+  it, which is what turns a total into a change. Four tiles: window
+  spend against the prior period, a run rate in dollars per day with its
+  basis printed on the tile, unattributed spend for the selected
+  dimension, and blended cost per million tokens. A two-series line
+  chart of this window against the previous one, with a per-bucket and
+  cumulative toggle. A ranked breakdown of the top eight groups plus an
+  Other row carrying its own dollars, and a table with share of window,
+  dollar delta against the prior window, requests, tokens each way,
+  cost per million tokens, and requests blocked before dispatch.
+  `GET /metrics` supplies the savings panel
+  (`sbproxy_ai_cost_saved_micros_total`, `sbproxy_ai_tokens_saved_total`,
+  `sbproxy_semantic_cache_results_total`, the
+  `sbproxy_ai_compression_value_*` pair, and the `budget_exceeded` and
+  `price_ceiling_block` outcomes of
+  `sbproxy_ai_requests_attributed_total`), the scope gauge
+  (`sbproxy_ai_budget_utilization_ratio`), and the trust panel
+  (`sbproxy_ai_price_source_total`, `sbproxy_ai_price_ceiling_total`,
+  `sbproxy_ai_token_estimate_error_ratio`, and the
+  `surface="compression_summary"` slice of
+  `sbproxy_ai_cost_dollars_attributed_total`). `GET /admin/keys` plus
+  `GET /admin/keys/{id}/usage` fill Budget headroom, one request per
+  capped key and no more than twenty of them.
+- **Grouping:** provider, model, tenant, team, API key, project, origin,
+  agent, promoted properties as `property:<key>`, or a single total.
+  That is every dimension `GroupBy::parse` accepts.
+- **Drill-down:** group labels link where the destination both accepts
+  the filter and shows the operator that it applied it. Origin and API
+  key go to [Logs](#logs-logs); model and tenant go to
+  [Reports](#reports-reports), which filters the same ring on those
+  dimensions and prices each row; a promoted property goes to Logs with
+  both halves of the property pair seeded. Provider, team, project,
+  agent, and the total grouping have no filter on either page and stay
+  unlinked, because a label that looks clickable and lands on an
+  unfiltered list is worse than plain text.
+- **Mutations:** none on this page. The Resume control inside Workspace
+  budgets is the one exception and belongs to that component.
+- **Empty/error notes:** rollups switched off (`503`) reads as a
+  configuration hint naming `proxy.observability.usage_rollups`, not as
+  an error panel. A one hour window renders no chart and says why:
+  hourly is the finest bucket the store keeps, so the window is a single
+  point. A property that disappears from one window stays selected with
+  an unavailable hint rather than silently changing the query. The
+  prior-window request can fail on its own, most often as a `400` when
+  the selected promoted property carries no row in the earlier range;
+  the page then drops the comparison and says so instead of drawing the
+  previous period at zero.
+
+### Absent is not zero
+
+Nine of the families this page reads only start existing once a feature
+is configured, and summing an absent family returns 0. Every block here
+branches on whether the family was found before it reads a value, so an
+unconfigured semantic cache reads "not reported" and a configured one
+that has saved nothing reads `$0.00`. The same rule covers derived
+figures: a unit cost over zero tokens, a percentage change against a
+prior window of zero, and a run rate with fewer than three complete
+buckets all render `n/a` with the reason underneath. Percentages are
+guarded the same way: a real share that would round to `0%` reads `<1%`
+and one below the whole that would round to `100%` reads `>99%`, so a
+small fallback price share cannot render as no fallbacks at all.
+
+Two figures the page deliberately does not show. There is no dollar
+figure for what the refused requests avoided, because nothing
+accumulates the price of a request that never went out and multiplying
+the count by an average price would print a number a customer could
+disprove. There is no per-key savings total, because neither
+cache-savings family carries `api_key_id` and the compression families
+carry a different tenant label from the cache ones, so no attribution
+exists on which a per-key total would be true.
+
+### Reading a spend jump
+
+Someone in finance asks why last week cost more than the week before.
+
+1. Set the window to 7d and leave the grouping on Model. The Spend tile
+   reads `$412.90` against `$349.61` in the previous 7d, up 18%.
+2. The sentence above the breakdown splits that: `$52.10` of the rise
+   came from more tokens and `$11.19` from a shift toward more expensive
+   models. That is a price-volume variance computed from the rollup's
+   own cost and token counts, so the two parts always reconstruct the
+   whole change.
+3. The table's `vs prev` column names which model moved, and the column
+   reconstructs the whole change. A row marked `new` was not there last
+   week, so its delta is its whole spend; a row marked `gone` kept its
+   old dollars as a negative delta. If the previous window could not be
+   read at all, no row carries a delta and a line above the table says
+   so, because an unanswered comparison is not a comparison against
+   zero.
+4. Follow the model label into Reports, filtered to that model, to see
+   the requests behind it. Both pages read the same 1000-entry ring,
+   which clears on restart, so treat it as a recent sample rather than
+   the whole window. The rollup totals above are the durable figures.
+5. Before quoting the number, read the honesty line under the window
+   control. If the fallback share of price lookups is climbing, some of
+   those dollars were priced at the flat $5 per million rate rather than
+   from the catalog, and the trust panel at the foot of the page says
+   how much.
 
 ## Reports (`/reports`)
 

@@ -32,6 +32,10 @@ pub mod echo_pb {
 use echo_pb::echo_server::{Echo, EchoServer};
 use echo_pb::{EchoRequest, EchoResponse};
 
+/// Request message that makes the stub Echo upstream report the
+/// `grpc-accept-encoding` it was called with rather than echo.
+const ACCEPT_ENCODING_PROBE: &str = "__report_grpc_accept_encoding";
+
 #[derive(Default)]
 struct EchoSvc;
 
@@ -45,7 +49,24 @@ impl Echo for EchoSvc {
         &self,
         request: tonic::Request<EchoRequest>,
     ) -> Result<tonic::Response<EchoResponse>, tonic::Status> {
+        // A caller asking for this exact message gets the request's
+        // `grpc-accept-encoding` back instead of an echo. It is the only
+        // way a test on the REST side of the transcoder can see a header
+        // the proxy adds on the gRPC side, and that header is what stops
+        // the upstream from compressing a frame the transcoder cannot
+        // read. Any other message echoes as usual.
+        let accept_encoding = request
+            .metadata()
+            .get("grpc-accept-encoding")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("<absent>")
+            .to_string();
         let msg = request.into_inner().message;
+        if msg == ACCEPT_ENCODING_PROBE {
+            return Ok(tonic::Response::new(EchoResponse {
+                message: accept_encoding,
+            }));
+        }
         Ok(tonic::Response::new(EchoResponse { message: msg }))
     }
 
@@ -178,6 +199,10 @@ origins:
             path: /echo
             grpc_method: sbproxy_e2e.echo.Echo.Hello
             body: "*"
+          - method: POST
+            path: /echo-error
+            grpc_method: sbproxy_e2e.echo.Echo.HelloError
+            body: "*"
 "#
     )
 }
@@ -226,5 +251,80 @@ fn unmapped_path_is_not_transcoded() {
         resp.status >= 400,
         "an unmapped path must not transcode; got {}",
         resp.status
+    );
+}
+
+#[test]
+fn the_transcoded_request_advertises_identity_message_encoding() {
+    // The proxy decodes the response frame itself to build JSON, and it
+    // can decode exactly one message encoding. A gRPC server compresses
+    // only what its caller says it can read, so the caller has to say so;
+    // sending nothing leaves a server free to gzip a frame the transcoder
+    // then refuses. This asserts the header on the wire the upstream
+    // actually received, not the intent at the call site.
+    //
+    // The REST client deliberately sends its own `grpc-accept-encoding:
+    // gzip`. Overriding it is half the claim: on this hop the proxy is
+    // the gRPC client, not a forwarder, so what the caller can read says
+    // nothing about what the transcoder can read. A probe that sent no
+    // header would pass against an implementation that merely defaulted
+    // the value when absent and forwarded a client's `gzip` untouched,
+    // which is the bug wearing the fix's clothes.
+    let upstream = spawn_echo_grpc_server();
+    let harness = ProxyHarness::start_with_yaml(&transcode_config(&upstream)).expect("start");
+
+    let resp = harness
+        .post_json(
+            "/echo",
+            "transcode.localhost",
+            &json!({ "message": ACCEPT_ENCODING_PROBE }),
+            &[("grpc-accept-encoding", "gzip")],
+        )
+        .expect("post");
+
+    assert_eq!(resp.status, 200, "the probe call itself must succeed");
+    let v: serde_json::Value = serde_json::from_slice(&resp.body)
+        .unwrap_or_else(|e| panic!("response is JSON: {e}; body={:?}", resp.body));
+    assert_eq!(
+        v["message"], "identity",
+        "the synthesized gRPC request must advertise identity message encoding; \
+         upstream saw {}",
+        v["message"]
+    );
+}
+
+#[test]
+fn a_grpc_error_becomes_the_mapped_http_status() {
+    // A gRPC upstream answers a failed call with HTTP 200 and puts the
+    // outcome in `grpc-status`: the status line describes the transport,
+    // not the call. A REST client on the near side of the transcoder
+    // reads the status line, so forwarding the 200 tells it the call
+    // succeeded. `HelloError` always fails with FAILED_PRECONDITION,
+    // which google.rpc.Code maps to HTTP 400.
+    //
+    // This is the trailers-only shape: tonic answers a unary `Err` with
+    // a single HEADERS frame carrying `grpc-status`, and pingora skips
+    // the body and trailer filters for a HEADERS frame with END_STREAM.
+    // So the header filter is the only place the mapping can happen and
+    // the status line is the only thing this test can assert on. The
+    // headers-then-trailers shape (`HelloStreamError`) is committed
+    // downstream before the trailers arrive and keeps its 200; see
+    // docs/routing.md.
+    let upstream = spawn_echo_grpc_server();
+    let harness = ProxyHarness::start_with_yaml(&transcode_config(&upstream)).expect("start");
+
+    let resp = harness
+        .post_json(
+            "/echo-error",
+            "transcode.localhost",
+            &json!({ "message": "precondition" }),
+            &[],
+        )
+        .expect("post");
+
+    assert_eq!(
+        resp.status, 400,
+        "FAILED_PRECONDITION must reach the REST client as 400, not as a 200 \
+         whose failure is discoverable only by parsing the body"
     );
 }

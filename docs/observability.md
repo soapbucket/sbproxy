@@ -301,7 +301,11 @@ The Wave 1 substrate adds five labels: `agent_id`, `agent_class`, `agent_vendor`
 | SLO-DR-RESTORE | DR | restore drill | succeed monthly | calendar | Page on missed |
 | SLO-CONFIG-RELOAD | Config | hot-reload success | 100% | 24h | Page |
 | SLO-BOT-AUTH-DIR | Bot Auth | directory freshness (TTL not exceeded) | 99.9% | 7d | Ticket |
+| SLO-CERT-STORE | Certs | configured certificate-store backend open (not degraded to in-memory) | 100% | continuous | Ticket |
 | SLO-CARD-BUDGET | Substrate | per-metric series count under cap | 100% | continuous | Log-only (CI gate) |
+| SLO-AI-ADMISSION | AI Gateway | requests admitted past the inbound shim (1 - pre-provider refusal share, per surface) | 95% | 15 min sustained | Ticket |
+| SLO-MESH-ADMISSION | Mesh | inbound peer connections admitted (the idle reclaim is not a refusal and is excluded) | 100% | 10 min sustained | Ticket |
+| SLO-STORAGE-OPS | Storage | storage backend operations returning no error | 99.9% | 10 min sustained | Ticket |
 
 PromQL recording rules pre-compute each SLI at 1m, 5m, 1h, 6h, and 24h windows. Burn-rate alerts use the multi-window pattern from the SRE workbook (5m AND 1h at 14.4x for page tier, 30m AND 6h at 6x, 1h AND 24h at 3x for ticket). The full rule set lives in `deploy/alerts/`. These are the rules to page on. The proxy also evaluates one availability burn rate in process, covered under [Alerts](#alerts), and it is a fallback for deployments with no scrape target rather than a second copy of the set above.
 
@@ -393,7 +397,7 @@ Every family below is emitted by running code. That is worth stating because it 
 | `sbproxy_ai_shadow_inflight` | 1 | Gauge; live in-flight shadow-evaluation count. Pair with `sbproxy_ai_shadow_dropped_total` to alert when shadow runs back up. |
 | `sbproxy_ai_shadow_dropped_total` | 6 | Counter; labels: `reason` (`streaming`\|`provider_not_found`\|`provider_not_allowed`\|`prompt_training_disallowed`\|`egress_denied`\|`saturated`). Counts configured shadow evaluations skipped or dropped before dispatch. Sampling out is intentionally excluded. |
 | `sbproxy_ai_shadow_timeout_total` | 1 | Counter; shadow evaluations dropped because the per-eval timeout fired. |
-| `sbproxy_ai_token_estimate_error_ratio_bucket` | 200 | Labels: `model`; histogram buckets `(estimate - actual) / actual` between -1 and +1. Drives the pre-flight estimator's accuracy alert. |
+| `sbproxy_ai_token_estimate_error_ratio_bucket` | 200 | Labels: `model`; histogram buckets `(actual - estimated) / actual`, cut at +/- 0.10 and bounded at -1 and +1. Positive is an under-reservation (the request cost more than it debited); negative is an over-reservation. Read by the `Token estimate error by model (p05 and p95)` panel on the `sbproxy-ai-value` dashboard, which charts both tails because p95 alone cannot see a systematically high estimator. No alert fires on it. Recorded only on a reconciled rate-limit admission, so a model with no entry in `config.model_rate_limits` contributes no series while its estimate still drives budget debits and the price ceiling. |
 | `sbproxy_ai_budget_utilization_ratio` | 7 | Labels: `scope` (workspace\|api_key\|user\|model\|origin\|tag\|agent). Gauge; fraction of a scope's tightest configured cap consumed, above 1 is over budget. Republished after every billing debit and on every preflight that trips a limit, so it is the same consumed fraction `warn_at`/`downgrade_at` compare against. Headroom is `1 - sbproxy_ai_budget_utilization_ratio` in PromQL; there is deliberately no separate remaining family, because a family and its complement double the series without adding information. |
 | `sbproxy_target_health_state` | 100 000 | Labels: `origin` (configured origin id, budgeted at 200), `target` (configured target URL, budgeted at 500). The cap column states the product, as every row here does, but the real bound is much lower and is the sum rather than the product: a target belongs to exactly one origin, so the live series count is the total number of configured load-balancer targets. `target` is the URL when it is unique within its origin and the load balancer's own `url#index` identifier when an origin configures one URL more than once, which is what keeps two same-URL targets (a weighted pair, or blue and green behind one address) from collapsing onto a single series. Gauge on LiteLLM's 0/1/2 deployment-state scale: 0 healthy, 1 degraded (circuit breaker half-open), 2 excluded from selection (probe-unhealthy, outlier-ejected, or breaker open). Sampled at scrape time from the same pipeline walk that renders `GET /api/health/targets`, so the two surfaces cannot disagree; a target removed by a config reload leaves the scrape on the next render instead of freezing at its last value, and the refresh drops only what left rather than clearing the family, so a scrape racing another listener's scrape can never read it empty. |
 | `sbproxy_deprecated_requests_total` | 8 000 | Labels: `origin` (request `Host`, budgeted at 200 like every other `origin` label), `route` (forward-rule id or index, OpenAPI path template, or empty for a whole-origin block; budgeted at 2 000), `past_sunset` (true\|false), `outcome` (served\|gone). `route` deliberately does not reuse the `rule` label name: accepted-value sets are keyed on the label name alone, `rule` already carries the operator-named rule ids of the MCP and reversible-redaction families, and a large spec's operation list would have exhausted their budget. `outcome` is what separates a straggler still being served past sunset from a caller actually refused with 410, which `past_sunset` alone cannot do on a config running both postures. |
@@ -1393,6 +1397,16 @@ dashboards:
 ```
 
 Set `dashboards.enabled: false` to skip the ConfigMap when dashboards are managed out of band. Operators who run Grafana outside Helm can `kubectl create configmap` the JSON files from `deploy/dashboards/` directly with the `grafana_dashboard=1` label.
+
+The `dashboards/grafana/` tree ships the import-ready boards instead, listed
+with their uids in [`dashboards/README.md`](../dashboards/README.md). One of
+them covers a subsystem nothing in this directory reaches:
+`sbproxy-mesh-storage.json` charts mesh inbound connection admission and the
+storage backend the mesh persists into. Read its two header tiles before
+reading anything else on it. Both metric families are absent rather than zero
+on a deployment that does not run the mesh with its Redis backend, so an empty
+chart there is not the same claim as a flat zero, and the tiles are what tell
+the two apart.
 
 ## Alerts
 

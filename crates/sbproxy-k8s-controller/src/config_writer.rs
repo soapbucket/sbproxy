@@ -3,8 +3,9 @@
 
 //! Translate Gateway API resources into an sbproxy configuration document.
 //!
-//! This is a pure function. Nothing here touches the network or the
-//! clock, and only [`write_config`] touches the filesystem, so the whole
+//! Translation is a pure function. Nothing here touches the network,
+//! and only [`write_config`] touches the filesystem or the clock (it
+//! stamps the name of the temporary it publishes through), so the whole
 //! translation is exercised by unit tests that build resources from their
 //! JSON wire shape.
 //!
@@ -345,9 +346,19 @@ pub fn render(
 /// what makes the new contents durable rather than the rename merely
 /// pointing at unwritten pages, and the `fsync` of the directory
 /// afterwards is what makes the rename itself survive power loss. On
-/// crash-consistency terms: after this returns `Ok`, the new document is
-/// on stable storage; if it returns `Err`, the previous file is
+/// crash-consistency terms: after this returns `Ok`, the new document
+/// is the published one; if it returns `Err`, the previous file is
 /// untouched and no temporary is left behind.
+///
+/// The directory `fsync` is the single step that runs after the rename
+/// has already taken effect, so its failure is logged and not returned.
+/// Some network and FUSE-backed mounts refuse `fsync` on a directory
+/// handle outright, and answering `Err` there would fail every
+/// reconcile forever over a document that published correctly, while
+/// telling the caller the previous file was still in place when it was
+/// not. What is actually lost is narrower than a failed publish: the
+/// rename may not survive a power cut before the filesystem flushes the
+/// entry on its own.
 ///
 /// Two caveats worth stating rather than implying. The temporary is
 /// created in `path`'s own directory because a rename is atomic only
@@ -389,22 +400,34 @@ pub fn write_config(config: &GeneratedConfig, path: &Path) -> anyhow::Result<()>
         file.write_all(yaml.as_bytes())?;
         file.sync_all()?;
         std::fs::rename(&temporary, path)?;
-        // Durability of the directory entry itself. Windows has no
-        // handle to a directory to sync, and no controller image ships
-        // for it.
-        #[cfg(unix)]
-        {
-            std::fs::File::open(parent)?.sync_all()?;
-        }
         Ok(())
     })();
 
-    if result.is_err() {
+    if let Err(error) = result {
         // Best effort: the publish already failed, and a leftover
         // dotfile in the mount is the smaller problem.
         let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
     }
-    Ok(result?)
+
+    // Durability of the directory entry itself. This runs after the
+    // rename, so the new document is already the published one and no
+    // error return could walk that back; a refusal here is a warning,
+    // not a failed publish. Windows has no handle to a directory to
+    // sync, and no controller image ships for it.
+    #[cfg(unix)]
+    {
+        if let Err(error) = std::fs::File::open(parent).and_then(|dir| dir.sync_all()) {
+            tracing::warn!(
+                target: "k8s_audit",
+                path = %path.display(),
+                error = %error,
+                "published the document but could not fsync its directory"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 // --- Listener planning ------------------------------------------------
@@ -2520,6 +2543,43 @@ origins:
             .collect();
         entries.sort();
         assert_eq!(entries, vec!["sb.yml".to_string()]);
+    }
+
+    /// The cleanup branch nothing else reaches. Every other failure
+    /// injection in this file fails before the temporary exists, so
+    /// `remove_file` runs against a name that was never created and the
+    /// line could be deleted without a test noticing. Renaming a file
+    /// over a *directory* fails with `EISDIR` on every unix and fails
+    /// for root as well, so this one also cannot go vacuous on a
+    /// privileged runner the way the read-only-directory injection
+    /// above does.
+    #[test]
+    fn write_config_removes_its_temporary_when_the_rename_cannot_land() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("sb.yml");
+        std::fs::create_dir(&path).expect("stage a directory where the document belongs");
+        let rendered = render_default(&[simple_gateway()], &[], &[]);
+
+        let error = write_config(&rendered.config, &path)
+            .expect_err("renaming the temporary over a directory fails");
+        assert!(!format!("{error}").is_empty());
+
+        let mut entries: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read the directory")
+            .map(|entry| {
+                entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec!["sb.yml".to_string()],
+            "a publish whose rename failed left its temporary behind"
+        );
     }
 
     /// The publish swaps the inode, so without carrying the mode across
