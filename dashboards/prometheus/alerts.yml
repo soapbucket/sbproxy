@@ -41,6 +41,29 @@ groups:
           summary: "High guardrail block rate (> 10/min)"
           description: "Guardrail blocks are firing at a high rate. Current rate: {{ $value }}/sec."
 
+      # Pre-provider admission refusals (WOR-2595). The gateway turns these
+      # away at the inbound shim or the stored-prompt resolver, before it
+      # dials a provider, so they answer 4xx and SBProxyHighErrorRate never
+      # sees them, and no provider-side series moves at all. Without this
+      # rule a broken client integration is silent.
+      #
+      # Grouped by surface so the alert names where to look. clamp_min only
+      # guards a zero denominator: sbproxy_ai_surface_requests_total is
+      # incremented on arrival, before any refusal arm can run, so a refusal
+      # is always in the denominator too.
+      - alert: SBProxyAIAdmissionRefusalShare
+        expr: |
+          sum by (surface) (rate(sbproxy_ai_admission_decisions_total{outcome="deny"}[5m]))
+          /
+          clamp_min(sum by (surface) (rate(sbproxy_ai_surface_requests_total[5m])), 0.000001)
+          > 0.05
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 5% of {{ $labels.surface }} traffic refused before any provider was called"
+          description: "The AI gateway is refusing more than 5% of the requests arriving on this surface before it calls any provider. Open the AI Gateway dashboard and read Pre-provider Refusals by Reason: the bounded reason code says whether a caller is asking for a governed provider feature, a stored prompt is missing, or a client is sending unreadable bodies."
+
       - alert: SBProxyHighTokenUsage
         expr: increase(sbproxy_ai_tokens_attributed_total{direction="output"}[1h]) > 1000000
         for: 0m

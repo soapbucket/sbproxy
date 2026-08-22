@@ -1,0 +1,105 @@
+# promtool unit test for the AI gateway pre-provider admission share
+# (WOR-2595).
+#
+# What this pins is the invisibility, not the arithmetic. A request the
+# gateway refuses at the inbound shim answers 4xx and never dials a
+# provider, so sbproxy:slo:substrate:availability holds at 1.0 and every
+# provider-side series stays flat while a whole surface is being turned
+# away. The firing case below is exactly that: refusals climb, the share
+# crosses 5%, and this is the only rule in the file that notices.
+#
+# The control matters more than usual here. sbproxy_ai_admission_decisions_total
+# is registered on first use, so before any refusal the family is absent
+# and the recorded share produces no series at all. A rule that fired on
+# absence, or one that could not move off zero, would both pass a
+# firing-only test.
+
+rule_files:
+  - ../recording-rules.yml
+  - ../alerting-rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # A client integration breaks: one fifth of everything arriving on the
+  # responses surface is refused before dispatch. Nothing else moves.
+  - interval: 1m
+    input_series:
+      - series: 'sbproxy_ai_surface_requests_total{surface="responses", method="POST"}'
+        values: '0+100x180'
+      - series: 'sbproxy_ai_admission_decisions_total{surface="responses", reason="tools_mcp_unsupported", outcome="deny"}'
+        values: '0+20x180'
+
+    promql_expr_test:
+      # 20 refusals per 100 arrivals is 0.2. `round(..., 0.001)` drops the
+      # recording rule's __name__ so the surface label alone matches, and
+      # absorbs float noise.
+      - expr: round(sbproxy:ai:admission_refusal_share:5m, 0.001)
+        eval_time: 30m
+        exp_samples:
+          - labels: '{surface="responses"}'
+            value: 0.2
+
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: SBPROXY-AI-ADMISSION-REFUSAL-SHARE
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              slo_id: SLO-AI-ADMISSION
+              runbook_id: RB-AI-ADMISSION
+              window: 5m
+              surface: responses
+            exp_annotations:
+              summary: "More than 5% of responses traffic refused before any provider was called"
+              description: |
+                sbproxy_ai_admission_decisions_total is taking more than 5% of
+                the requests arriving on this AI surface, sustained for 15
+                minutes. These requests were refused at the inbound shim or the
+                stored-prompt resolver, so no provider saw them and no
+                provider-side panel shows the loss. Open the AI Gateway
+                dashboard and read the refusal reason: a bounded code names
+                whether a caller is asking for a governed provider feature, a
+                stored prompt is missing, or a client is sending unreadable
+                bodies.
+              runbook_url: "https://docs.sbproxy.dev/runbook#rb-ai-admission"
+
+  # Control one: a healthy surface with a trickle of bad client bodies.
+  # The share is real and nonzero, so the rule is demonstrably measuring
+  # something, and it stays under the threshold so nothing fires.
+  - interval: 1m
+    input_series:
+      - series: 'sbproxy_ai_surface_requests_total{surface="responses", method="POST"}'
+        values: '0+100x180'
+      - series: 'sbproxy_ai_admission_decisions_total{surface="responses", reason="malformed_json", outcome="deny"}'
+        values: '0+2x180'
+
+    promql_expr_test:
+      - expr: round(sbproxy:ai:admission_refusal_share:5m, 0.001)
+        eval_time: 90m
+        exp_samples:
+          - labels: '{surface="responses"}'
+            value: 0.02
+
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: SBPROXY-AI-ADMISSION-REFUSAL-SHARE
+        exp_alerts: []
+
+  # Control two: traffic on the surface and no refusal family at all, the
+  # state every deployment is in until the first refusal. The recorded
+  # share must be absent rather than zero, and must not fire.
+  - interval: 1m
+    input_series:
+      - series: 'sbproxy_ai_surface_requests_total{surface="chat_completions", method="POST"}'
+        values: '0+100x180'
+
+    promql_expr_test:
+      - expr: round(sbproxy:ai:admission_refusal_share:5m, 0.001)
+        eval_time: 90m
+        exp_samples: []
+
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: SBPROXY-AI-ADMISSION-REFUSAL-SHARE
+        exp_alerts: []

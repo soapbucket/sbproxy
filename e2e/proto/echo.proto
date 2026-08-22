@@ -20,10 +20,12 @@ service Echo {
   rpc HelloStream(EchoRequest) returns (stream EchoResponse);
 
   // Always fails with FAILED_PRECONDITION + the request message as
-  // the grpc-message. Reserved for future use; current proxy wiring
-  // cannot inject a body on trailers-only-in-headers responses
-  // (Pingora skips both body and trailer filters for HEADERS frames
-  // with END_STREAM), so this RPC has no corresponding e2e yet.
+  // the grpc-message. The proxy still cannot inject a body on a
+  // trailers-only-in-headers response (Pingora skips both body and
+  // trailer filters for HEADERS frames with END_STREAM), so nothing
+  // asserts on the response body here. The response *header* filter
+  // does run, which is what `grpc_transcode.rs` uses to pin the
+  // gRPC-status-to-HTTP-status mapping on the status line.
   rpc HelloError(EchoRequest) returns (EchoResponse);
 
   // Server-streaming variant of HelloError: emits ONE message, then
