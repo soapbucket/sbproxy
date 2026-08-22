@@ -1141,7 +1141,7 @@ const METRIC_CTORS: &[&str] = &[
 ///
 /// The scan walks constructors rather than prefixes, so an unsanctioned
 /// name is collected and then refused by [`verify_coverage`] instead of
-/// slipping past unseen. See [`SANCTIONED_PREFIXES`] for what that cost
+/// slipping past unseen. See `SANCTIONED_PREFIXES` for what that cost
 /// before. Test regions are already stripped from `SourceFile::text`, so a
 /// fixture metric inside a `#[cfg(test)]` module is not a declaration.
 pub fn declared_metrics(root: &Path) -> BTreeSet<String> {
