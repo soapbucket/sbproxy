@@ -42,7 +42,11 @@ function countedSignal(
   family: MetricFamily | undefined,
   label: string,
 ): CountedSignal | undefined {
-  if (!family) return undefined;
+  // A family with no samples is also "not reported". `parsePrometheus`
+  // creates a family entry from a bare `# HELP` or `# TYPE` line, so a
+  // scrape can name a counter it has never incremented. Summing that gives
+  // 0, which is the healthy-looking zero these derivations exist to avoid.
+  if (!family || !family.samples.length) return undefined;
   return {
     total: sumSamples(family),
     breakdown: groupByLabel(family, label).filter((b) => b.key !== "(none)"),
@@ -81,8 +85,18 @@ export function legacySignatureDerivations(
   );
 }
 
-/** What the certificate-store gauge says about this node. */
-export type CertStoreState = "not-reported" | "opened" | "degraded";
+/**
+ * What the certificate-store gauge says about this node.
+ *
+ * `ephemeral` is a gauge reading `0` on `acme.storage_backend: memory`. The
+ * store opened, so the gauge is honestly zero, but nothing is persisted and
+ * the node pays the same re-issuance cost as `degraded`.
+ */
+export type CertStoreState =
+  | "not-reported"
+  | "opened"
+  | "ephemeral"
+  | "degraded";
 
 export interface CertStoreStatus {
   state: CertStoreState;
@@ -97,7 +111,15 @@ export interface CertStoreStatus {
   summary: string;
   /** The full sentence an operator can act on. */
   detail: string;
+  /**
+   * Lead sentence for a warning block, set only for the states that need
+   * hoisting above the component list. Absent means the row is enough.
+   */
+  headline?: string;
 }
+
+/** The one backend that opens successfully and still persists nothing. */
+const NON_PERSISTENT_BACKEND = "memory";
 
 function backendList(names: string[]): string {
   return names.length ? names.join(", ") : "the configured backend";
@@ -117,6 +139,12 @@ function backendList(names: string[]): string {
  * backend that cannot be opened refuses to start rather than degrade,
  * because an in-memory fallback inherits the single-node locking defaults
  * and hands every replica its own ACME issuance lease.
+ *
+ * A fourth state sits inside the zero. `acme.storage_backend: memory` is a
+ * supported value, and it opens, so the gauge reads `0` on a node that
+ * persists nothing and asks the CA for a fresh certificate on every boot.
+ * Reporting that as `ok` would put a green badge on the exact failure the
+ * degraded branch below exists to warn about, so it gets its own state.
  */
 export function certStoreStatus(families: MetricFamily[]): CertStoreStatus {
   const family = findFamily(families, CERT_STORE_DEGRADED_FAMILY);
@@ -153,7 +181,22 @@ export function certStoreStatus(families: MetricFamily[]): CertStoreStatus {
       backends,
       degradedBackends,
       summary: "Fell back to an in-memory store.",
+      headline: "The certificate store fell back to memory.",
       detail: `The configured certificate store (${backendList(degradedBackends)}) could not be opened, so this node is serving from an in-memory store. Certificates do not survive a restart and are issued again on every boot, which spends the CA rate limit for the hostname. Repair the backend behind acme.storage_path and restart the node.`,
+    };
+  }
+
+  if (backends.includes(NON_PERSISTENT_BACKEND)) {
+    return {
+      state: "ephemeral",
+      label: "in memory",
+      tone: "warn",
+      backends,
+      degradedBackends: [],
+      summary: "Configured in memory. Certificates do not persist.",
+      headline: "This node stores certificates in memory by configuration.",
+      detail:
+        "acme.storage_backend is set to memory, so the store opened and the gauge reads zero, but nothing is written down. Certificates are lost on restart and the node asks the CA for a new one on every boot, which spends the rate limit for the hostname. Set acme.storage_backend to redb or sqlite for a single node, or to file, redis, s3, gcs, or azure for a fleet.",
     };
   }
 

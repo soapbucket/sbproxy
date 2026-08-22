@@ -20,11 +20,12 @@ describe("Overview certificate store visibility", () => {
     expect(overviewView).not.toContain("sumSamples");
   });
 
-  it("hoists the degraded state into a warning block, not a row to read past", () => {
-    expect(overviewView).toContain("certStore?.state === 'degraded'");
-    expect(overviewView).toContain(
-      "The certificate store fell back to memory.",
-    );
+  it("hoists every non-persisting state into a warning block, not a row to read past", () => {
+    // Gating on `headline` rather than on `state === 'degraded'` is what
+    // gets the memory backend into the block. It opens cleanly, so it is
+    // not degraded, and it still persists nothing.
+    expect(overviewView).toContain('v-if="certStore?.headline"');
+    expect(overviewView).not.toContain("certStore?.state === 'degraded'");
     expect(overviewView).toContain('class="cert-alert"');
     expect(overviewView).toContain("var(--sb-warn)");
   });
@@ -33,14 +34,21 @@ describe("Overview certificate store visibility", () => {
     // "not reported" is not in StatusBadge's inferred vocabulary and
     // would fall back to neutral by accident rather than on purpose.
     expect(overviewView).toContain(
-      '<StatusBadge :label="certStore.label" :tone="certStore.tone" />',
+      '<StatusBadge :label="certRow.label" :tone="certRow.tone" />',
     );
     expect(overviewView).toContain("certificate store");
   });
 
+  it("keeps the row when the scrape failed rather than dropping it", () => {
+    // A dropped row reads as "no certificate store on this node", which is
+    // a claim the console cannot make when the fetch never answered.
+    expect(overviewView).toContain("certMetrics.error.value");
+    expect(overviewView).toContain('label: "unavailable"');
+  });
+
   it("shows the row whenever the scrape answered, even with no health components", () => {
     expect(overviewView).toContain(
-      'v-if="healthComponents.length || certStore"',
+      'v-if="healthComponents.length || certRow"',
     );
   });
 });

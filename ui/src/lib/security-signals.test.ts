@@ -54,6 +54,20 @@ describe("corsRefusals", () => {
     });
   });
 
+  it("is undefined for a family the scrape names but never sampled", () => {
+    // parsePrometheus creates a family from a bare HELP or TYPE line.
+    // Summing that gives 0, which is the healthy-looking zero this whole
+    // module exists to avoid drawing.
+    expect(
+      corsRefusals(families("# TYPE sbproxy_cors_refusals_total counter")),
+    ).toBeUndefined();
+    expect(
+      legacySignatureDerivations(
+        families("# TYPE sbproxy_signature_legacy_derivation_total counter"),
+      ),
+    ).toBeUndefined();
+  });
+
   it("drops the synthetic (none) bucket rather than labeling it", () => {
     // groupByLabel invents "(none)" for a sample missing the label. A bar
     // named "(none)" reads as a refusal reason and is not one.
@@ -99,6 +113,7 @@ describe("certStoreStatus", () => {
     expect(status.label).toBe("not reported");
     expect(status.tone).toBe("neutral");
     expect(status.backends).toEqual([]);
+    expect(status.headline).toBeUndefined();
   });
 
   it("reports ok when the configured backend opened", () => {
@@ -113,6 +128,41 @@ describe("certStoreStatus", () => {
     expect(status.backends).toEqual(["redb"]);
     expect(status.degradedBackends).toEqual([]);
     expect(status.summary).toContain("redb");
+    // No warning block for a store that actually persists.
+    expect(status.headline).toBeUndefined();
+  });
+
+  it("does not call a memory backend healthy just because the gauge is zero", () => {
+    // `acme.storage_backend: memory` is a supported value and it opens, so
+    // the gauge honestly reads 0. Nothing is written down: certificates are
+    // lost on restart and re-issued on every boot, which is the same cost
+    // the degraded branch warns about. A green "ok" here would be the
+    // healthy-looking reading this module exists to prevent.
+    const status = certStoreStatus(
+      families(
+        "# TYPE sbproxy_cert_store_degraded gauge",
+        'sbproxy_cert_store_degraded{backend="memory"} 0',
+      ),
+    );
+    expect(status.state).toBe("ephemeral");
+    expect(status.tone).toBe("warn");
+    expect(status.label).toBe("in memory");
+    expect(status.summary).toContain("do not persist");
+    expect(status.headline).toBeDefined();
+    expect(status.detail).toContain("acme.storage_backend");
+  });
+
+  it("prefers degraded over ephemeral when a backend is at 1", () => {
+    const status = certStoreStatus(
+      families(
+        "# TYPE sbproxy_cert_store_degraded gauge",
+        'sbproxy_cert_store_degraded{backend="memory"} 1',
+      ),
+    );
+    expect(status.state).toBe("degraded");
+    expect(status.headline).toBe(
+      "The certificate store fell back to memory.",
+    );
   });
 
   it("reports degraded with the backend named and what it costs", () => {

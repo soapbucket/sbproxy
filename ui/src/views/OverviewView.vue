@@ -44,14 +44,46 @@ function refresh() {
 }
 onMounted(refresh);
 
-// Three states, and the third is why this reads the family rather than
-// summing it: absent means no certificate store was opened at all, which is
-// the normal state for a node with no ACME configuration and must not be
-// drawn as the healthy zero. See lib/security-signals.ts.
+// Four states, and the reason this reads the family rather than summing it:
+// an absent gauge means no certificate store was opened at all, which is the
+// normal state for a node with no ACME configuration and must not be drawn
+// as the healthy zero. See lib/security-signals.ts.
 const certStore = computed(() => {
   const text = certMetrics.data.value;
   if (text === null || text === undefined) return null;
   return certStoreStatus(parsePrometheus(text));
+});
+
+// A scrape that did not answer is its own state. Dropping the row on a
+// failed fetch would make an unreachable /metrics look exactly like a node
+// with no certificate store, which is the distinction this row exists to
+// draw. Every other panel on this page renders an ErrorState; one row
+// cannot, so it says so in place.
+const certRow = computed<{
+  label: string;
+  tone: "ok" | "warn" | "neutral";
+  summary: string;
+  title: string;
+} | null>(() => {
+  const store = certStore.value;
+  if (store) {
+    return {
+      label: store.label,
+      tone: store.tone,
+      summary: store.summary,
+      title: store.detail,
+    };
+  }
+  if (certMetrics.error.value) {
+    return {
+      label: "unavailable",
+      tone: "neutral",
+      summary: "The metrics scrape did not answer.",
+      title:
+        "This row reads sbproxy_cert_store_degraded from GET /metrics. That request failed, so whether this node opened the certificate store its config asked for is unknown. It is not a report that no store was opened.",
+    };
+  }
+  return null;
 });
 
 // Health components can arrive as an array or a map of name -> value.
@@ -144,22 +176,24 @@ function optionalNumber(v: unknown): number | undefined {
       <StatCard label="Components" :value="healthComponents.length || '0'" />
     </div>
     <!--
-      The certificate store degrading has no other symptom until the CA
-      rate-limits the hostname, and it is not a health component, so it is
-      hoisted to a warning block rather than left as a row an operator has to
-      read past.
+      A certificate store that is not persisting has no other symptom until
+      the CA rate-limits the hostname, and it is not a health component, so
+      it is hoisted to a warning block rather than left as a row an operator
+      has to read past. `headline` is set for both states that qualify: the
+      backend that could not be opened, and the backend configured in memory,
+      which opens cleanly and still persists nothing.
     -->
     <div
-      v-if="certStore?.state === 'degraded'"
+      v-if="certStore?.headline"
       class="cert-alert"
       role="status"
       aria-live="polite"
     >
-      <strong>The certificate store fell back to memory.</strong>
+      <strong>{{ certStore.headline }}</strong>
       {{ certStore.detail }}
     </div>
 
-    <div class="card-list" v-if="healthComponents.length || certStore">
+    <div class="card-list" v-if="healthComponents.length || certRow">
       <div class="check" v-for="(c, i) in healthComponents" :key="i">
         <span class="check__name sb-mono">{{ c.name ?? "component" }}</span>
         <span class="check__detail sb-muted" v-if="c.detail || c.message">
@@ -167,10 +201,10 @@ function optionalNumber(v: unknown): number | undefined {
         </span>
         <StatusBadge :label="String(c.status ?? 'unknown')" />
       </div>
-      <div class="check" v-if="certStore">
+      <div class="check" v-if="certRow" :title="certRow.title">
         <span class="check__name sb-mono">certificate store</span>
-        <span class="check__detail sb-muted">{{ certStore.summary }}</span>
-        <StatusBadge :label="certStore.label" :tone="certStore.tone" />
+        <span class="check__detail sb-muted">{{ certRow.summary }}</span>
+        <StatusBadge :label="certRow.label" :tone="certRow.tone" />
       </div>
     </div>
   </section>
