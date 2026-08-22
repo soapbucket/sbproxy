@@ -3232,24 +3232,45 @@ pub(super) async fn send_response_with_extra(
 ///
 /// `original` is the inbound native bytes (Anthropic Messages JSON
 /// today). `resolved_model` is the post-`map_model` model name the
-/// router chose. The helper rewrites `body["model"]` in the native
-/// JSON when it differs from the original, then reserialises. When no
-/// remap is needed (the common case for native-native traffic where
-/// operators do not configure a model_map), the original bytes are
-/// returned as-is so the request truly is a byte forward.
+/// router chose. `operator_tier` is the provider entry's resolved
+/// service tier as a `(wire field, wire value)` pair, or `None` when the
+/// entry declares none.
+///
+/// The helper rewrites `body["model"]` and the tier field in the native
+/// JSON when either differs from the original, then reserialises. When
+/// neither needs a rewrite (the common case for native-native traffic
+/// where operators configure no model_map and no tier), the original
+/// bytes are returned as-is so the request truly is a byte forward.
+///
+/// The tier arm exists because this path does not go through
+/// `attempt_body`: it reconstructs the request from the inbound bytes.
+/// A tier applied only at `attempt_body` would silently not apply here
+/// (WOR-2652).
 pub(super) fn make_native_bypass_body(
     original: &bytes::Bytes,
     resolved_model: &str,
+    operator_tier: Option<(&str, &str)>,
 ) -> Result<bytes::Bytes, serde_json::Error> {
-    if resolved_model.is_empty() {
+    let model_needs_rewrite = !resolved_model.is_empty();
+    if !model_needs_rewrite && operator_tier.is_none() {
         return Ok(original.clone());
     }
     let mut parsed: serde_json::Value = serde_json::from_slice(original)?;
-    let existing = parsed.get("model").and_then(|v| v.as_str()).unwrap_or("");
-    if existing == resolved_model {
+    let model_matches = !model_needs_rewrite
+        || parsed.get("model").and_then(|v| v.as_str()) == Some(resolved_model);
+    let tier_matches = match operator_tier {
+        Some((field, value)) => parsed.get(field).and_then(|v| v.as_str()) == Some(value),
+        None => true,
+    };
+    if model_matches && tier_matches {
         return Ok(original.clone());
     }
-    parsed["model"] = serde_json::Value::String(resolved_model.to_string());
+    if model_needs_rewrite {
+        parsed["model"] = serde_json::Value::String(resolved_model.to_string());
+    }
+    if let Some((field, value)) = operator_tier {
+        parsed[field] = serde_json::Value::String(value.to_string());
+    }
     let remapped = serde_json::to_vec(&parsed)?;
     Ok(bytes::Bytes::from(remapped))
 }

@@ -54,6 +54,7 @@ pub mod routing_base_data;
 pub mod routing_feedback;
 pub mod routing_state;
 pub mod semantic_cache;
+pub mod service_tier;
 pub mod session;
 pub mod token_estimate;
 pub mod tracing_spans;
@@ -132,6 +133,7 @@ pub use semantic_cache::{
     MAX_SEMANTIC_HEADER_VALUE_BYTES, MAX_SEMANTIC_RESPONSE_BYTES, MAX_SEMANTIC_RESPONSE_HEADERS,
     MAX_SEMANTIC_TOTAL_HEADER_BYTES, SEMANTIC_CACHE_SCHEMA_VERSION,
 };
+pub use service_tier::{CatalogServiceTiers, ServiceTier};
 pub use session::{ConversationSession, SessionStore};
 pub use token_estimate::{
     estimate_json_message_tokens, estimate_tokens, estimate_tokens_for_reservation,

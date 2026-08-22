@@ -662,6 +662,81 @@ score or a promptless request and at `warn` for an unavailable embedder.
 See [examples/semantic-routing](../examples/semantic-routing/) for a
 runnable two-pool config with a below-floor fallback walkthrough.
 
+## Service tier
+
+Several vendors sell the same model at more than one latency and price point,
+selected by a `service_tier` field on the request. That field is the operator's
+decision, not the caller's, because it sets the price and the operator pays the
+bill. Declare it on the provider entry:
+
+```yaml
+origins:
+  - match: { host: ai.internal }
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai-flex
+          provider_type: openai
+          api_key: ${OPENAI_API_KEY}
+          service_tier: flex
+        - name: openai-standard
+          provider_type: openai
+          api_key: ${OPENAI_API_KEY}
+          service_tier: standard
+      routing:
+        strategy: cost_optimized
+```
+
+The call, with a caller trying to buy themselves faster capacity:
+
+```bash
+curl https://ai.internal/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"gpt-5","service_tier":"priority",
+       "messages":[{"role":"user","content":"summarize this"}]}'
+```
+
+The outcome: whichever entry the router picks, the body that reaches OpenAI
+carries that entry's tier (`"service_tier": "flex"` or `"service_tier":
+"default"`), never `priority`. An entry that declares no tier sends no tier
+field at all, and the caller's is removed on the way through, so the vendor
+serves on its own default.
+
+Two tiers of one vendor are two `providers[]` entries, as above. The tier is a
+property of the destination, not of a request, so the router treats them as two
+candidates with independent weights, health, cooldowns, and observed latency,
+and every existing strategy works over them unchanged.
+
+```mermaid
+flowchart TD
+    A[request body] --> B[strip any caller service_tier]
+    B --> C{surface carries a tier?}
+    C -- "no (embeddings, images, audio)" --> Z[send no tier field]
+    C -- "yes (chat, messages, responses)" --> D{entry declares service_tier?}
+    D -- no --> Z
+    D -- yes --> E{catalog records this vendor's tier?}
+    E -- no --> F[refused at config load]
+    E -- yes --> G[write the vendor's wire value]
+```
+
+The canonical tiers are `flex`, `standard`, and `priority`. Each is translated
+to the vendor's own spelling by the provider catalog: OpenAI's entry maps
+`standard` to its wire value `default`, and keeps `flex` and `priority` as
+written. A vendor whose catalog entry declares no `service_tiers` block has no
+tier the gateway knows how to ask for, and an entry naming one is refused at
+config load rather than booted and served on a tier nobody chose:
+
+```
+ai provider "claude" service tier: `service_tier: flex` is not available: the
+provider catalog records no service-tier vocabulary for provider type
+"anthropic".
+```
+
+Only vendors whose tier vocabulary has been read off their own API reference
+are declared in the shipped catalog. To add one, override the catalog with
+`proxy.ai_providers_file` and give the vendor a `service_tiers` block naming
+the request field and its wire value for each tier you use.
+
 ## Routing policy
 
 The strategies above are a fixed menu. `ai_routing_policy` lets you write

@@ -4971,6 +4971,39 @@ fn apply_semantic_route_outcome(
     }
 }
 
+/// Make the request's service tier the operator's choice, not the caller's.
+///
+/// A caller's `service_tier` is removed first, unconditionally: raising the
+/// tier raises the bill and the operator pays it, and on the OpenAI-chat
+/// surface the field otherwise reaches the upstream verbatim because that
+/// surface never round-trips through the canonical hub request. The
+/// provider entry's own tier is then written in the vendor's wire spelling,
+/// on the surfaces that document the field.
+///
+/// Both halves are needed. Writing without stripping would leave a caller's
+/// tier in place on a provider that declares none; stripping without writing
+/// would make the config key inert.
+fn apply_operator_service_tier(
+    provider: &sbproxy_ai::provider::ProviderConfig,
+    surface: &sbproxy_ai::handler::AiSurface,
+    attempt_body: &mut serde_json::Value,
+) {
+    let Some(object) = attempt_body.as_object_mut() else {
+        return;
+    };
+    // The one field name every vendor with a tier axis uses today, and the
+    // one the catalog declares. Stripping it on every JSON surface rather
+    // than only the tier-capable ones is the fail-closed half: a vendor that
+    // honors it somewhere undocumented still cannot be steered by a caller.
+    object.remove("service_tier");
+    if !surface.supports_service_tier() {
+        return;
+    }
+    if let Some((field, value)) = sbproxy_ai::service_tier::resolved_wire_tier(provider) {
+        object.insert(field, serde_json::Value::String(value));
+    }
+}
+
 /// Derive one caller-scoped prompt-cache lease identity for a request.
 ///
 /// Reads the caller's own cache key: `prompt_cache_key` first, then `user`,
@@ -10663,6 +10696,7 @@ pub(super) async fn handle_ai_proxy(
             let mut provider = config.providers[idx].clone();
             apply_native_provider_credential(&mut provider, native_api_key.as_deref());
             let mut attempt_body = body.clone();
+            apply_operator_service_tier(&provider, &surface, &mut attempt_body);
             let resolved_model = if !model.is_empty() {
                 let mapped = provider.map_model(&model);
                 if mapped != model {
@@ -10948,6 +10982,7 @@ pub(super) async fn handle_ai_proxy(
 
         // Map model name for this provider.
         let mut attempt_body = body.clone();
+        apply_operator_service_tier(provider, &surface, &mut attempt_body);
         let resolved_model = if !model.is_empty() {
             let mapped = provider.map_model(&model);
             if mapped != model {
@@ -11045,7 +11080,17 @@ pub(super) async fn handle_ai_proxy(
                 // substituted in) to the upstream's `/v1/messages`
                 // path. The OpenAI Chat hub body that lives in
                 // `attempt_body` is discarded for this iteration.
-                match make_native_bypass_body(&native_request_bytes_for_bypass, &resolved_model) {
+                // The bypass rebuilds the request from the inbound bytes, so
+                // the operator tier written into `attempt_body` above never
+                // reaches it. Resolve it again for this provider entry.
+                let operator_tier = sbproxy_ai::service_tier::resolved_wire_tier(provider);
+                match make_native_bypass_body(
+                    &native_request_bytes_for_bypass,
+                    &resolved_model,
+                    operator_tier
+                        .as_ref()
+                        .map(|(field, value)| (field.as_str(), value.as_str())),
+                ) {
                     Ok(body) => {
                         sbproxy_ai::ai_metrics::record_native_bypass(
                             sbproxy_ai::format::NativeBypass::AnthropicMessages.inbound_label(),
@@ -18227,6 +18272,100 @@ origins:
             body["user"], "caller-42",
             "the caller's own field must reach the upstream unchanged"
         );
+    }
+
+    /// WOR-2652: the security regression test.
+    ///
+    /// Before this change a caller POSTing `{"service_tier": "priority"}`
+    /// to `/v1/chat/completions` reached the upstream verbatim, because
+    /// that surface never round-trips through the canonical hub request.
+    /// Raising the tier raises the bill, and the operator pays it.
+    #[tokio::test]
+    async fn a_caller_service_tier_is_replaced_by_the_operator_tier() {
+        let (upstream_url, hits, captured) = capturing_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        )
+        .await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai-flex",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key",
+                "service_tier": "flex"
+            }]
+        }))
+        .expect("service tier proxy config");
+
+        dispatch_chat_request(
+            &config,
+            serde_json::json!({
+                "model": "fixture-model",
+                "service_tier": "priority",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }),
+        )
+        .await;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let body = captured_upstream_json(captured).await;
+        assert_eq!(
+            body["service_tier"], "flex",
+            "the operator's tier must overwrite the caller's: {body}"
+        );
+    }
+
+    /// The other half of the same decision. An entry that declares no tier
+    /// must strip the caller's, or the config key would only work as an
+    /// upgrade and a caller could still escalate on every untiered entry.
+    #[tokio::test]
+    async fn a_caller_service_tier_is_stripped_when_the_entry_declares_none() {
+        let (upstream_url, hits, captured) = capturing_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        )
+        .await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai-default",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }]
+        }))
+        .expect("untiered proxy config");
+
+        dispatch_chat_request(
+            &config,
+            serde_json::json!({
+                "model": "fixture-model",
+                "service_tier": "priority",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            }),
+        )
+        .await;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let body = captured_upstream_json(captured).await;
+        assert!(
+            body.get("service_tier").is_none(),
+            "an entry with no tier must send no tier field: {body}"
+        );
+    }
+
+    async fn captured_upstream_json(
+        captured: tokio::task::JoinHandle<Vec<u8>>,
+    ) -> serde_json::Value {
+        let upstream_request = captured.await.expect("capturing upstream task");
+        let request_text = String::from_utf8(upstream_request).expect("upstream request UTF-8");
+        serde_json::from_str(
+            request_text
+                .split_once("\r\n\r\n")
+                .expect("upstream request body")
+                .1,
+        )
+        .expect("upstream JSON body")
     }
 
     /// WOR-2312: a global alias resolves before provider selection, which

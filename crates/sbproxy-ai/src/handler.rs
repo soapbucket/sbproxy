@@ -1475,6 +1475,13 @@ impl AiHandlerConfig {
             provider
                 .validate_base_url()
                 .map_err(|e| anyhow::anyhow!("ai provider {:?} base_url: {e}", provider.name))?;
+            // WOR-2652: an entry that names a tier its vendor does not sell
+            // would boot green and then serve every request on a tier the
+            // operator did not choose, which shows up on the invoice rather
+            // than in a log.
+            crate::service_tier::validate_provider_tier(provider).map_err(|error| {
+                anyhow::anyhow!("ai provider {:?} service tier: {error}", provider.name)
+            })?;
             // WOR-1818: an unresolved `${VAR}` left by env interpolation
             // would reach the wire verbatim as a bearer token and read as
             // a provider auth outage at request time. Fail at config load
@@ -1958,6 +1965,20 @@ impl AiSurface {
     /// Only prompt-completion surfaces carry the canonical message body and
     /// completion semantics required by provider reasoning controls.
     pub fn supports_reasoning_policy(&self) -> bool {
+        matches!(
+            self,
+            AiSurface::ChatCompletions | AiSurface::Messages | AiSurface::Responses
+        )
+    }
+
+    /// Whether an upstream service tier can be requested on this surface.
+    ///
+    /// The three conversational JSON surfaces, which are the ones the
+    /// vendors document a `service_tier` field on. A tier written into an
+    /// embeddings or image body would be a field the endpoint never asked
+    /// for, so the operator's tier is not applied there; a caller's is
+    /// still stripped everywhere. See [`crate::service_tier`].
+    pub fn supports_service_tier(&self) -> bool {
         matches!(
             self,
             AiSurface::ChatCompletions | AiSurface::Messages | AiSurface::Responses
@@ -3607,6 +3628,34 @@ mod tests {
             misplaced.to_string().contains("not a routing field"),
             "{misplaced}"
         );
+    }
+
+    /// WOR-2652: the load-time half. The unit tests in
+    /// `crate::service_tier` cover the check itself; this one proves it is
+    /// wired into config compilation, which is the part a covered-but-
+    /// unwired function would pass without.
+    #[test]
+    fn a_provider_tier_the_vendor_does_not_sell_is_refused_at_config_load() {
+        let error = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "claude",
+                "provider_type": "anthropic",
+                "api_key": "sk-test",
+                "service_tier": "flex"
+            }]
+        }))
+        .expect_err("anthropic declares no service-tier vocabulary");
+        assert!(error.to_string().contains("service tier"), "{error}");
+
+        AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai-flex",
+                "provider_type": "openai",
+                "api_key": "sk-test",
+                "service_tier": "flex"
+            }]
+        }))
+        .expect("openai sells a flex tier");
     }
 
     #[test]

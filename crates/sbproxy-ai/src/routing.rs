@@ -1806,6 +1806,7 @@ mod tests {
             allow_private_base_url: false,
             no_prompt_training: false,
             data_posture: None,
+            service_tier: None,
             serve: None,
             aws_sigv4: None,
         }
