@@ -49,9 +49,10 @@ done
 ```
 
 ```bash
-# Per-target counters. Both targets get their own series, so a slow or
+# Per-target counters, read off the loopback admin listener this
+# example enables. Both targets get their own series, so a slow or
 # truncating target is visible without reading a log line.
-curl -s http://127.0.0.1:9090/metrics | grep sbproxy_ai_shadow_calls_total
+curl -su admin:changeme http://127.0.0.1:9090/metrics | grep sbproxy_ai_shadow_calls_total
 ```
 
 ```

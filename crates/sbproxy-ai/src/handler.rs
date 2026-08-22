@@ -3284,6 +3284,106 @@ mod tests {
         assert!(guardrail.trace);
     }
 
+    /// Collect `warn!` output produced while `body` runs.
+    ///
+    /// `fmt` with a shared buffer rather than a custom `Layer`: the
+    /// assertion is on the message text an operator reads, not on a
+    /// field set.
+    fn captured_warnings(body: impl FnOnce()) -> String {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("log capture buffer")
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
+            type Writer = Buffer;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buffer = Buffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, body);
+        let bytes = buffer.0.lock().expect("log capture buffer").clone();
+        String::from_utf8(bytes).expect("captured log output is UTF-8")
+    }
+
+    #[test]
+    fn both_bedrock_guardrail_controls_on_one_origin_warn_once_and_still_load() {
+        // Two AWS evaluations per request, both billed. Refusing would
+        // break a deployment that deliberately screens the prompt out
+        // of band and the completion inline, so this warns instead; the
+        // test exists because an untested warning is one a refactor
+        // drops silently.
+        let action = serde_json::json!({
+            "providers": [{
+                "name": "bedrock",
+                "aws_sigv4": {"region": "us-east-1"},
+                "bedrock_guardrail": {"identifier": "gr-abc123", "version": "DRAFT"},
+            }],
+            "guardrails": {
+                "external": [{
+                    "name": "aws",
+                    "provider": "bedrock",
+                    "mode": "pre_call",
+                    "api_key": "aws-test-key",
+                    "url": "https://bedrock-runtime.us-east-1.amazonaws.com",
+                    "guardrail_id": "gr-abc123",
+                    "guardrail_version": "DRAFT",
+                }],
+            },
+        });
+        let logs = captured_warnings(|| {
+            AiHandlerConfig::from_config(action)
+                .expect("both controls on one origin is legal, not refused");
+        });
+        assert_eq!(
+            logs.matches("bills the guardrail twice").count(),
+            1,
+            "expected exactly one double-billing warning, got: {logs}"
+        );
+        assert!(
+            logs.contains("providers=bedrock"),
+            "the warning names which provider entries carry the inline \
+             control, or an operator with ten entries cannot act on it: {logs}"
+        );
+
+        // The inline control alone is the ordinary deployment and must
+        // stay quiet, or the warning trains operators to ignore it.
+        let inline_only = serde_json::json!({
+            "providers": [{
+                "name": "bedrock",
+                "aws_sigv4": {"region": "us-east-1"},
+                "bedrock_guardrail": {"identifier": "gr-abc123", "version": "DRAFT"},
+            }],
+        });
+        let logs = captured_warnings(|| {
+            AiHandlerConfig::from_config(inline_only).expect("inline alone loads");
+        });
+        assert!(
+            !logs.contains("bills the guardrail twice"),
+            "one control is not a double bill: {logs}"
+        );
+    }
+
     #[test]
     fn an_unknown_bedrock_guardrail_key_is_refused() {
         // `deny_unknown_fields`: the block is new and small, so a

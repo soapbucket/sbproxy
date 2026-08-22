@@ -190,6 +190,8 @@ origins:
 
 `identifier` and `version` are required and are sent as `guardrailIdentifier` and `guardrailVersion`. `version: DRAFT` selects the working version. `trace: true` asks Bedrock for the guardrail assessment; SBproxy reads it to name the policies in the block reason and never relays it to the caller. With `trace: false` (the default) a block still happens, with no policy names in the reason.
 
+SBproxy reads `stopReason: guardrail_intervened` off every Bedrock response, not only off routes that set this key, which is why the decision path above branches on the response rather than on the config. A guardrail attached to the model, the inference profile, or an agent in your AWS account produces the same stop reason, and relaying that to the caller as a successful empty completion was the bug. If you already run Bedrock, treat that as an upgrade-affecting change: see [config-stability.md](config-stability.md#a-bedrock-guardrail_intervened-response-is-now-a-403).
+
 There is no failure posture here, and that is not an omission. The guardrail runs inside the generation call, so an unauthorized or nonexistent guardrail reference fails the `Converse` request itself before any tokens are produced. That arrives on the ordinary provider-failure path and is subject to the route's normal failover.
 
 ### The call

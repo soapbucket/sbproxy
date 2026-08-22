@@ -992,7 +992,7 @@ Per target, from the usage ledger:
 | `provider` | which target produced this row |
 | `shadow_of` | the primary request this row evaluated, and the join key back to the primary's row |
 | `request_id` | this row's own id, freshly minted per target and ending in `:shadow` |
-| `finish_reason` | the target's terminal finish reason, which is the cheapest disagreement signal: `length` where the primary said `stop` means the target truncated |
+| `finish_reason` | the target's terminal finish reason, which is the cheapest disagreement signal: one target on `length` where another said `stop` truncated. Shadow rows only. The primary's finish reasons reach the request span as `gen_ai.response.finish_reasons`, not the ledger row, so a primary-versus-target comparison joins the ledger to the trace |
 | `cost_usd`, `latency_ms`, `prompt_tokens`, `completion_tokens` | the usual per-row figures |
 
 `shadow_of` is carried as data and is never the ledger's dedup key. The correlation-id feature lets a caller choose its own request id through `X-Request-Id`, so a shadow row whose key was derived from the primary's would let one caller suppress another caller's rows on ledger replay.

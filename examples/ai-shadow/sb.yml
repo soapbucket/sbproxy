@@ -42,7 +42,8 @@
 # Then watch the proxy logs for `shadow response` events, one per
 # target that fired, and the per-target counters:
 #
-#   curl -s http://127.0.0.1:9090/metrics | grep sbproxy_ai_shadow_calls_total
+#   curl -su admin:changeme http://127.0.0.1:9090/metrics \
+#     | grep sbproxy_ai_shadow_calls_total
 #
 #   sbproxy_ai_shadow_calls_total{target="anthropic",status_class="2xx",finish_reason="stop"} 1
 #   sbproxy_ai_shadow_calls_total{target="gemini",status_class="2xx",finish_reason="stop"} 4
@@ -55,6 +56,14 @@
 
 proxy:
   http_bind_port: 8080
+  # So the per-target shadow counters can be scraped locally. The admin
+  # server is off by default and `/metrics` is behind basic auth, so
+  # without this block the curl below reaches nothing. Loopback-only.
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: ${SBPROXY_ADMIN_PASSWORD:-changeme}
 
 origins:
   "ai.local":

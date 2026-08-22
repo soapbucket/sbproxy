@@ -10,7 +10,7 @@ Require curl
 Set Shell "bash"
 Set FontSize 16
 Set Width 1280
-Set Height 470
+Set Height 600
 Set Padding 24
 Set TypingSpeed 30ms
 Set Theme { "name": "sbproxy", "background": "#0d0d0f", "foreground": "#e6e6e6", "cursor": "#ffb454", "selection": "#2a2a33", "black": "#1a1a1f", "red": "#ff6b6b", "green": "#a8d96a", "yellow": "#ffb454", "blue": "#7aa2f7", "magenta": "#bb9af7", "cyan": "#7dcfff", "white": "#e6e6e6", "brightBlack": "#5c5c66", "brightRed": "#ff8888", "brightGreen": "#c3f088", "brightYellow": "#ffd194", "brightBlue": "#9bb8ff", "brightMagenta": "#d4b8ff", "brightCyan": "#a4e0ff", "brightWhite": "#ffffff" }
@@ -21,6 +21,10 @@ Enter
 Show
 
 Type `curl http://127.0.0.1:8080/v1/chat/completions -H 'Host: ai.local' -H 'Content-Type: application/json' -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"What is 2+2?"}]}'`
+Enter
+Sleep 3.5s
+
+Type `curl -su admin:changeme http://127.0.0.1:9090/metrics | grep sbproxy_ai_shadow_calls_total`
 Enter
 Sleep 3.5s
 

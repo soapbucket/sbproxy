@@ -260,18 +260,24 @@ fn mint_governed_token(admin_port: u16, policy: Value) -> String {
 fn wait_for_usage_rows(path: &std::path::Path, count: usize) -> Vec<Value> {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let rows = std::fs::read_to_string(path)
-            .unwrap_or_default()
+        let raw = std::fs::read_to_string(path).unwrap_or_default();
+        let rows = raw
             .lines()
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect::<Vec<_>>();
         if rows.len() >= count {
             return rows;
         }
+        // The raw text is in the message on purpose. A JSONL sink that
+        // interleaves two concurrent rows onto one line produces a file
+        // whose line count is right and whose parseable-row count is
+        // not, and a message that reported only the row count read as
+        // "the writer never ran".
         assert!(
             std::time::Instant::now() < deadline,
-            "expected {count} usage rows, found {}: {rows:?}",
-            rows.len()
+            "expected {count} usage rows, parsed {} of {} lines. Raw file:\n{raw}",
+            rows.len(),
+            raw.lines().count()
         );
         std::thread::sleep(Duration::from_millis(20));
     }

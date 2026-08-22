@@ -795,12 +795,18 @@ pub enum ShadowDropReason {
 
 /// Every [`ShadowDropReason`], in label order.
 ///
-/// The array length is written out, so a variant added to the enum and
-/// not added here fails to compile. Before this, the exhaustiveness
+/// A variant added to the enum and not added here fails to compile,
+/// enforced by [`ShadowDropReason::next_in_label_order`] and the const
+/// walk below rather than by the written-out array length, which on
+/// its own would happily stay at six. Before this, the exhaustiveness
 /// test held a hand-written copy of this list: a seventh variant would
 /// have compiled, shipped, and never been asserted on, and
 /// `docs/observability.md` states this family's cardinality as a
 /// number that would then have been wrong.
+///
+/// What it still cannot see: the two prose enumerations of the same
+/// vocabulary, `docs/observability.md` and `docs/ai-gateway.md`. A new
+/// variant has to be written into both by hand.
 pub const ALL_SHADOW_DROP_REASONS: [ShadowDropReason; 6] = [
     ShadowDropReason::Streaming,
     ShadowDropReason::ProviderNotFound,
@@ -809,6 +815,29 @@ pub const ALL_SHADOW_DROP_REASONS: [ShadowDropReason; 6] = [
     ShadowDropReason::EgressDenied,
     ShadowDropReason::Saturated,
 ];
+
+// Walks the variant chain against the array at compile time. A seventh
+// variant makes `next_in_label_order` non-exhaustive, and the arm its
+// author has to add puts a seventh link in the chain, which indexes one
+// slot past a six-element array and fails const evaluation. Written as
+// a walk rather than as a length assertion because a length written out
+// beside the array is a copy of the array, not a check on it.
+const _: () = {
+    let mut index = 0usize;
+    let mut current = Some(ShadowDropReason::Streaming);
+    while let Some(reason) = current {
+        assert!(
+            ALL_SHADOW_DROP_REASONS[index] as u8 == reason as u8,
+            "ALL_SHADOW_DROP_REASONS is out of order with the variant chain"
+        );
+        index += 1;
+        current = reason.next_in_label_order();
+    }
+    assert!(
+        index == ALL_SHADOW_DROP_REASONS.len(),
+        "ALL_SHADOW_DROP_REASONS has an entry no variant claims"
+    );
+};
 
 impl ShadowDropReason {
     /// Stable Prometheus label value.
@@ -820,6 +849,23 @@ impl ShadowDropReason {
             Self::PromptTrainingDisallowed => "prompt_training_disallowed",
             Self::EgressDenied => "egress_denied",
             Self::Saturated => "saturated",
+        }
+    }
+
+    /// The variant that follows this one in [`ALL_SHADOW_DROP_REASONS`],
+    /// or `None` for the last.
+    ///
+    /// This exists only so the array's contents are enforced rather
+    /// than asserted in prose. The match is exhaustive, so a new
+    /// variant cannot compile without joining the chain.
+    const fn next_in_label_order(self) -> Option<Self> {
+        match self {
+            Self::Streaming => Some(Self::ProviderNotFound),
+            Self::ProviderNotFound => Some(Self::ProviderNotAllowed),
+            Self::ProviderNotAllowed => Some(Self::PromptTrainingDisallowed),
+            Self::PromptTrainingDisallowed => Some(Self::EgressDenied),
+            Self::EgressDenied => Some(Self::Saturated),
+            Self::Saturated => None,
         }
     }
 }
@@ -879,9 +925,13 @@ static AI_SHADOW_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
 
 /// Record one completed shadow call against one target.
 ///
-/// `status` is the HTTP status the target answered, or 0 when the call
-/// never produced a response. `finish_reason` is whatever the target
-/// reported, normalized here.
+/// `status` is the HTTP status the target answered, 504 when the
+/// wall-clock supervisor timeout fired (the same status the ledger row
+/// records for that case, so the two surfaces agree), and 0 when the
+/// transport never produced a response at all, which lands in the
+/// `error` class. `sbproxy_ai_shadow_timeout_total` is what separates
+/// a supervisor timeout from an upstream 504. `finish_reason` is
+/// whatever the target reported, normalized here.
 pub fn record_shadow_call(target: &str, status: u16, finish_reason: Option<&str>, secs: f64) {
     let status_class = match status {
         200..=299 => "2xx",

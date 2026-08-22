@@ -10465,10 +10465,33 @@ pub(super) async fn handle_ai_proxy(
                             .as_ref()
                             .map(|guardrails| guardrails.external.as_slice())
                             .unwrap_or_default();
-                        if let Some(block) =
-                            external_output_guardrail_block(output_external, &o.body, &o.model)
-                                .await
-                        {
+                        // Through the same funnel the relay and the two
+                        // replay paths use, so this arm publishes an
+                        // `ai.guardrail.output` record like they do.
+                        // Cascade materializes its body outside the
+                        // relay, so it used to call the external
+                        // adapter directly and recorded nothing, which
+                        // left `docs/events.md`'s claim wider than the
+                        // code for every cascade route. `builtin` is
+                        // `None` because that is exactly the set of
+                        // guardrails this arm already ran; routing it
+                        // here adds the record and changes nothing
+                        // about what is evaluated.
+                        //
+                        // Boxed for the same reason the relay's call
+                        // is: this frame is on the Pingora worker's 2MB
+                        // stack.
+                        let cascade_block = Box::pin(ai_output_guardrail_block(
+                            Some(&*ctx),
+                            o.status,
+                            None,
+                            None,
+                            output_external,
+                            &o.body,
+                            &o.model,
+                        ))
+                        .await;
+                        if let Some(block) = cascade_block {
                             warn!(
                                 guardrail = %block.name,
                                 reason = %block.reason,
@@ -12624,6 +12647,11 @@ async fn external_output_guardrail_block(
 /// serves callers with no request context. Without one there is no
 /// origin or tenant to attribute the decision to, so the guardrails
 /// still run and still block but nothing is recorded.
+///
+/// Callers: the live relay, the cascade arm (which materializes its
+/// body outside the relay and passes `builtin: None`, the set it has
+/// always evaluated), the JSON and multipart idempotency replays, and
+/// the semantic-cache hit.
 ///
 /// **What this cannot see.** Streaming responses. An SSE relay never
 /// materializes a response body here, so neither the guardrails nor
@@ -21015,6 +21043,14 @@ origins:
 
     #[tokio::test]
     async fn cascade_external_output_guardrail_blocks_the_selected_tier_model() {
+        // Scoped to a tenant label no other test uses, because
+        // `sbproxy_decision_event_total` is process-global.
+        let deny = [
+            ("event", "ai.guardrail.output"),
+            ("outcome", "deny"),
+            ("tenant", "wor2649-cascade-block"),
+        ];
+        let before_deny = decision_event_total(&deny);
         let (guardrail_url, received) = blocking_guardrail().await;
         let (upstream_url, upstream_hits) = upstream_fixture(
             r#"{"confidence_score":1.0,"choices":[{"message":{"role":"assistant","content":"cascade provider text"}}]}"#,
@@ -21027,6 +21063,7 @@ origins:
         }))
         .await;
         let mut context = crate::context::RequestContext::new();
+        context.tenant_id = "wor2649-cascade-block".into();
         let (pipeline, recording_semantic, recording_idempotency) =
             pipeline_with_recording_caches().await;
 
@@ -21081,6 +21118,17 @@ origins:
                 "model": "cascade-selected-model",
                 "phase": "output"
             })
+        );
+        // Cascade materializes its response outside the relay, so it is
+        // a third live path into the output-guardrail funnel and has to
+        // publish the record the other two publish. `docs/events.md`
+        // names the two exceptions (streamed, live multipart); a
+        // cascade route is not one of them.
+        assert_eq!(
+            decision_event_total(&deny) - before_deny,
+            1.0,
+            "a cascade output-guardrail block must publish one \
+             ai.guardrail.output deny"
         );
     }
 

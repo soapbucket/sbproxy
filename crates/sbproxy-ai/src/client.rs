@@ -2999,6 +2999,17 @@ fn serialized_json_len(value: &serde_json::Value) -> usize {
 /// Best-effort extraction of token counts and finish_reason from an
 /// OpenAI-shaped response body. Returns `None`s when the upstream
 /// shape differs.
+/// Longest `finish_reason` a shadow row or log line will carry.
+///
+/// The value is copied out of a target's response body, and since it
+/// started reaching a durable usage-ledger row as well as a log line it
+/// needs a bound: a broken or hostile target can put a megabyte of text
+/// in that field, up to the response metadata cap, and every shadow row
+/// would carry it. The metric label is already closed to a vocabulary;
+/// this bounds the two surfaces that keep the raw string. The longest
+/// legitimate value, `content_filter`, is 14 bytes.
+const MAX_SHADOW_FINISH_REASON_BYTES: usize = 64;
+
 fn parse_shadow_metadata(body: &[u8]) -> (Option<u64>, Option<u64>, Option<String>) {
     let v: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -3017,7 +3028,13 @@ fn parse_shadow_metadata(body: &[u8]) -> (Option<u64>, Option<u64>, Option<Strin
         .and_then(|c| c.get(0))
         .and_then(|c| c.get("finish_reason"))
         .and_then(|s| s.as_str())
-        .map(str::to_string);
+        .map(|reason| {
+            let mut end = MAX_SHADOW_FINISH_REASON_BYTES.min(reason.len());
+            while end > 0 && !reason.is_char_boundary(end) {
+                end -= 1;
+            }
+            reason[..end].to_string()
+        });
     (prompt, completion, finish)
 }
 
@@ -4182,6 +4199,40 @@ mod tests {
     }
 
     #[test]
+    fn a_targets_finish_reason_is_bounded_before_it_reaches_a_row() {
+        // The string is copied out of the target's response body and
+        // now lands on a durable ledger row, so a target that answers
+        // with a very long finish reason must not be able to size that
+        // row. Multi-byte on purpose: truncating mid-character would
+        // panic on the slice.
+        let long = "\u{00e9}".repeat(4096);
+        let body = serde_json::json!({
+            "choices": [{"finish_reason": long}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        })
+        .to_string();
+        let (_, _, finish) = parse_shadow_metadata(body.as_bytes());
+        let finish = finish.expect("a finish reason was present");
+        assert!(
+            finish.len() <= MAX_SHADOW_FINISH_REASON_BYTES,
+            "finish reason kept {} bytes",
+            finish.len()
+        );
+        assert!(finish.chars().all(|c| c == '\u{00e9}'));
+
+        let (_, _, finish) = parse_shadow_metadata(
+            serde_json::json!({"choices": [{"finish_reason": "content_filter"}]})
+                .to_string()
+                .as_bytes(),
+        );
+        assert_eq!(
+            finish.as_deref(),
+            Some("content_filter"),
+            "the longest legitimate value must survive intact"
+        );
+    }
+
+    #[test]
     fn shadow_finish_reason_reaches_the_usage_row() {
         // Parsed by `parse_shadow_metadata` since the feature shipped
         // and then dropped on the floor. A target that stopped on
@@ -4427,6 +4478,14 @@ mod tests {
         // otherwise exhaust any finite supervisor partway through the
         // loop and turn a later `Spawned` into a `Saturated` that reads
         // exactly like "this target did not fire".
+        //
+        // The metric lock is held even though this test asserts on no
+        // metric: capacity zero means every sampled target is refused
+        // as `saturated`, so the loop bumps
+        // `sbproxy_ai_shadow_dropped_total{reason="saturated"}` a few
+        // hundred times, and two sibling tests assert an exact delta of
+        // one on that process-global series.
+        let _metric_guard = SHADOW_METRIC_TEST_LOCK.lock().await;
         let client = AiClient::with_shadow_supervisor(Arc::new(ShadowSupervisor::new(0)));
         let config = multi_target_handler_config(serde_json::json!([
             {"provider": "shadow-a", "sample_rate": 0.1, "timeout_ms": 50, "task_timeout_ms": 50},

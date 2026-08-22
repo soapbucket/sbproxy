@@ -406,11 +406,17 @@ pub fn response_to_openai(body: Value) -> Value {
 /// a decision record can tell which layer stopped the request.
 pub const INLINE_GUARDRAIL_NAME: &str = "bedrock_guardrail";
 
-/// Longest policy summary this module will put in a block reason.
-/// The reason reaches the caller's 403 envelope, `ctx.deny_reason`,
-/// and the decision audit record, so it is bounded even though every
+/// Most policies this module will name in a block reason. The reason
+/// reaches the caller's 403 envelope, `ctx.deny_reason`, and the
+/// decision audit record, so the count is bounded even though every
 /// component of it is already an enum value or an operator-authored
 /// name.
+///
+/// This caps the number of names, not the byte length. Each name is
+/// either a closed AWS enum value or a topic or regex name the
+/// operator wrote in their own AWS guardrail, so the length is bounded
+/// by the operator's own config rather than by anything a caller
+/// sends.
 const MAX_REASON_POLICIES: usize = 8;
 
 /// Detect an inline Converse guardrail intervention on a 2xx Bedrock
