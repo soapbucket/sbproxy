@@ -1,5 +1,5 @@
 # Headers reference
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 Every header SBproxy reads or stamps, with the config that triggers it.
 This is the single source of truth; `docs/manual.md` and the marketing

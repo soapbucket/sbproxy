@@ -4100,6 +4100,38 @@ impl TimeoutOverrideOutcome {
     }
 }
 
+/// A refused `x-sbproxy-timeout-ms`: the closed metric label this
+/// refusal belongs on, and the message the caller gets back.
+///
+/// Both travel together because the alternative was reading the label
+/// back out of the message at the call site, which quietly reclassifies
+/// a series the next time anyone rewords a sentence.
+#[derive(Debug, PartialEq, Eq)]
+struct TimeoutOverrideRefusal {
+    /// `over_ceiling` or `invalid_header`; the two 400 members of the
+    /// `sbproxy_ai_request_timeout_override_total` outcome set.
+    outcome: &'static str,
+    /// Caller-facing text. Safe to return in the response body; it never
+    /// carries anything but the caller's own parsed number.
+    message: String,
+}
+
+impl TimeoutOverrideRefusal {
+    fn invalid(message: String) -> Self {
+        Self {
+            outcome: "invalid_header",
+            message,
+        }
+    }
+
+    fn over_ceiling(message: String) -> Self {
+        Self {
+            outcome: "over_ceiling",
+            message,
+        }
+    }
+}
+
 /// Resolve a caller's `x-sbproxy-timeout-ms` against the origin's opt-in
 /// and ceiling.
 ///
@@ -4117,39 +4149,50 @@ impl TimeoutOverrideOutcome {
 /// is still visible, on
 /// `sbproxy_ai_request_timeout_override_total{outcome="ignored_override_disabled"}`.
 ///
-/// Err carries the operator-safe message; it never interpolates anything
-/// but the caller's own number, which is already bounded by the parse.
+/// Err carries the closed metric label alongside the operator-safe
+/// message, so the call site never has to read the message back to
+/// decide which series the refusal belongs on. The message never
+/// interpolates anything but the caller's own number, which is already
+/// bounded by the parse.
 fn effective_request_timeout(
     allow_override: bool,
     ceiling_ms: Option<u64>,
     header_value: Option<&str>,
-) -> Result<TimeoutOverrideOutcome, String> {
+) -> Result<TimeoutOverrideOutcome, TimeoutOverrideRefusal> {
     let Some(raw) = header_value else {
         return Ok(TimeoutOverrideOutcome::Absent);
     };
     if !allow_override {
         return Ok(TimeoutOverrideOutcome::IgnoredDisabled);
     }
-    let requested: u64 = raw.trim().parse().map_err(|_| {
-        format!("x-sbproxy-timeout-ms is not a whole number of milliseconds: {raw:?}")
-    })?;
+    let Ok(requested) = raw.trim().parse::<u64>() else {
+        return Err(TimeoutOverrideRefusal::invalid(format!(
+            "x-sbproxy-timeout-ms is not a whole number of milliseconds: {raw:?}"
+        )));
+    };
     if requested == 0 {
-        return Err("x-sbproxy-timeout-ms must be above zero milliseconds".to_string());
+        return Err(TimeoutOverrideRefusal::invalid(
+            "x-sbproxy-timeout-ms must be above zero milliseconds".to_string(),
+        ));
     }
     // The ceiling is required whenever the flag is on, refused at config
     // load otherwise, so this `None` is unreachable through a loaded
     // config. Treating it as a refusal rather than as "no ceiling" keeps
-    // the fail-closed direction if that validation is ever loosened.
+    // the fail-closed direction if that validation is ever loosened, and
+    // it counts as `over_ceiling` because that is what it is: no value a
+    // caller can send clears an absent ceiling.
     let Some(ceiling) = ceiling_ms else {
-        return Err(
-            "x-sbproxy-timeout-ms cannot be honored: this origin has no              max_request_timeout_ms ceiling configured"
+        return Err(TimeoutOverrideRefusal::over_ceiling(
+            "x-sbproxy-timeout-ms cannot be honored: this origin has no \
+             max_request_timeout_ms ceiling configured"
                 .to_string(),
-        );
+        ));
     };
     if requested > ceiling {
-        return Err(format!(
-            "x-sbproxy-timeout-ms of {requested} exceeds this origin's              max_request_timeout_ms of {ceiling}; ask for between 1 and {ceiling}"
-        ));
+        return Err(TimeoutOverrideRefusal::over_ceiling(format!(
+            "x-sbproxy-timeout-ms of {requested} exceeds this origin's \
+             max_request_timeout_ms of {ceiling}; ask for between 1 and {ceiling}"
+        )));
     }
     Ok(TimeoutOverrideOutcome::Applied(
         std::time::Duration::from_millis(requested),
@@ -5344,23 +5387,19 @@ pub(super) async fn handle_ai_proxy(
         timeout_override_header.as_deref(),
     ) {
         Ok(outcome) => outcome,
-        Err(reason) => {
+        Err(refusal) => {
             // Over the ceiling and malformed are both 400 and both the
             // caller's mistake, but they are separate series: one says
             // the client library is broken, the other says the ceiling
-            // is smaller than callers expect.
-            let outcome = if reason.contains("max_request_timeout_ms") {
-                "over_ceiling"
-            } else {
-                "invalid_header"
-            };
+            // is smaller than callers expect. The refusal carries which
+            // one it is, so the split cannot drift with the wording.
             record_request_timeout_refusal(
                 ctx,
                 &ai_span,
-                outcome,
-                request_timeout_refusal_reason(outcome),
+                refusal.outcome,
+                request_timeout_refusal_reason(refusal.outcome),
             );
-            let bytes = ErrorEnvelope::new("invalid_request_timeout", &reason)
+            let bytes = ErrorEnvelope::new("invalid_request_timeout", &refusal.message)
                 .request_id(ctx.request_id.as_str())
                 .to_bytes();
             send_response(session, 400, "application/json", &bytes).await?;
@@ -22840,12 +22879,25 @@ origins:
         sbproxy_ai::AiHandlerConfig::from_config(action).expect("pre-header timeout config")
     }
 
+    /// Serializes the two tests that read
+    /// `sbproxy_ai_failovers_total{reason="transport"}`.
+    ///
+    /// `prometheus::gather()` reads a process-global registry.
+    /// `a_pre_header_timeout_is_labeled_as_such` asserts that the
+    /// `transport` series did *not* move, and
+    /// `a_non_streaming_request_is_not_bounded_by_the_pre_header_budget`
+    /// moves it. nextest gives each test its own process and would hide
+    /// that, but `cargo test` runs both on threads in one process, where
+    /// the pair interleaves and the equality assertion fails for a
+    /// reason that has nothing to do with the code under test.
+    static FAILOVER_REASON_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// One `sbproxy_ai_failovers_total` series, or 0 when nothing has
     /// created it yet.
     ///
-    /// `prometheus::gather()` reads a process-global registry and the
-    /// sibling tests in this module can run in the same process, so
-    /// callers assert a strict increase rather than an exact value.
+    /// Callers assert a strict increase rather than an exact value
+    /// wherever a sibling could also move the series; the one place that
+    /// needs an exact value takes [`FAILOVER_REASON_LOCK`] instead.
     fn failovers_count(reason: &str) -> f64 {
         prometheus::gather()
             .into_iter()
@@ -22952,6 +23004,9 @@ origins:
     /// provider on the same series as a refused connection.
     #[tokio::test]
     async fn a_pre_header_timeout_is_labeled_as_such() {
+        // Held for the whole test: the `transport` assertion below is an
+        // equality on a process-global counter a sibling also writes.
+        let _serialized = FAILOVER_REASON_LOCK.lock().await;
         let (wedged_url, _wedged_hits) = wedged_upstream_fixture().await;
         let (stream_url, _stream_hits) =
             upstream_bytes_fixture(openai_tool_call_stream(), "text/event-stream").await;
@@ -23000,6 +23055,9 @@ origins:
     /// end it four times sooner.
     #[tokio::test]
     async fn a_non_streaming_request_is_not_bounded_by_the_pre_header_budget() {
+        // This failover writes `reason="transport"`, which the sibling
+        // above asserts did not move. Same lock, opposite side.
+        let _serialized = FAILOVER_REASON_LOCK.lock().await;
         let (wedged_url, wedged_hits) = wedged_upstream_fixture().await;
         let (json_url, json_hits) =
             upstream_bytes_fixture(canonical_chat_response("buffered"), "application/json").await;
@@ -23049,12 +23107,18 @@ origins:
     /// so a candidate switch is structurally impossible and this is a
     /// regression lock rather than evidence of new behavior. The counter
     /// half is what is new.
+    ///
+    /// The budget is deliberately generous. This test needs it set (so a
+    /// budget that leaked past the commit point would show up) but never
+    /// needs it to fire, and a 200ms budget would turn a loaded build
+    /// machine into a failover to the second provider and a red test
+    /// about nothing.
     #[tokio::test]
     async fn a_stall_after_upstream_headers_does_not_fail_over() {
         let (truncated_url, truncated_hits) = truncated_stream_upstream_fixture().await;
         let (stream_url, stream_hits) =
             upstream_bytes_fixture(openai_tool_call_stream(), "text/event-stream").await;
-        let config = pre_header_timeout_config(&truncated_url, &stream_url, Some(200), 5_000);
+        let config = pre_header_timeout_config(&truncated_url, &stream_url, Some(5_000), 30_000);
         let (mut session, client) = downstream_session(serde_json::json!({
             "model": "requested-model",
             "stream": true,
@@ -27252,9 +27316,11 @@ mod price_ceiling_tests {
     #[test]
     fn timeout_override_header_that_is_not_a_number_is_an_error() {
         for bad in ["soon", "", "3.5", "-100", "3000ms"] {
-            assert!(
-                super::effective_request_timeout(true, Some(5_000), Some(bad)).is_err(),
-                "{bad:?} is not a whole number of milliseconds"
+            let refusal = super::effective_request_timeout(true, Some(5_000), Some(bad))
+                .expect_err("not a whole number of milliseconds");
+            assert_eq!(
+                refusal.outcome, "invalid_header",
+                "{bad:?} is a malformed header, not a ceiling breach"
             );
         }
     }
@@ -27263,15 +27329,40 @@ mod price_ceiling_tests {
     fn timeout_override_header_of_zero_is_an_error() {
         // A zero budget refuses the request it was asked to bound, the
         // same reading as a zero price ceiling.
-        assert!(super::effective_request_timeout(true, Some(5_000), Some("0")).is_err());
+        let refusal = super::effective_request_timeout(true, Some(5_000), Some("0"))
+            .expect_err("a zero budget is refused");
+        assert_eq!(refusal.outcome, "invalid_header");
+    }
+
+    /// The label rides on the refusal rather than being recovered from
+    /// its wording. Reading it back out of the message put the
+    /// "origin has no ceiling" refusal, which names the same key, on the
+    /// caller-mistake series, and would have moved any of these the next
+    /// time a sentence was reworded.
+    #[test]
+    fn a_refused_timeout_override_carries_its_own_metric_label() {
+        let over = super::effective_request_timeout(true, Some(5_000), Some("60000"))
+            .expect_err("above the ceiling");
+        assert_eq!(over.outcome, "over_ceiling");
+        let no_ceiling = super::effective_request_timeout(true, None, Some("3000"))
+            .expect_err("the flag on with no ceiling refuses, fail-closed");
+        assert_eq!(no_ceiling.outcome, "over_ceiling");
     }
 
     #[test]
     fn timeout_override_above_the_ceiling_names_the_accepted_range() {
-        let error = super::effective_request_timeout(true, Some(5_000), Some("60000"))
+        let refusal = super::effective_request_timeout(true, Some(5_000), Some("60000"))
             .expect_err("a header above the ceiling is refused, not clamped");
-        assert!(error.contains("60000"), "{error}");
-        assert!(error.contains("5000"), "{error}");
+        let message = refusal.message;
+        assert!(message.contains("60000"), "{message}");
+        assert!(message.contains("5000"), "{message}");
+        // The message reaches the caller verbatim in the 400 body, and
+        // docs/ai-gateway.md quotes it, so a stray run of whitespace
+        // from a wrapped literal is a shipped defect.
+        assert!(
+            !message.contains("  "),
+            "the refusal is one clean sentence: {message:?}"
+        );
     }
 
     /// The seam that decides whether an operator who left the flag off

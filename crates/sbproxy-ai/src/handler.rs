@@ -303,12 +303,15 @@ pub struct AiHandlerConfig {
     /// Scope is the origin, so this enables the override for every caller
     /// and every tenant routed to this `ai_proxy` action.
     ///
-    /// The override reaches hosted provider dispatch, including a
-    /// confidence cascade's tiers and every retry attempt. It does not
-    /// reach a `managed_model` provider the gateway serves itself, which
-    /// runs on the model host's own deadlines, nor the gateway's own
-    /// routing work: semantic-cache and semantic-route embeddings and
-    /// shadow copies keep their configured budgets.
+    /// The override reaches every dispatch that goes out over the
+    /// gateway's provider HTTP client: hosted providers, a confidence
+    /// cascade's tiers, each racing leg, every retry attempt, and a
+    /// `managed_model` this process serves locally, which is dialed over
+    /// that same client once the engine is up. It does not reach a
+    /// `managed_model` served by another node in a cluster, which is
+    /// dispatched over the model plane on its own deadlines, nor the
+    /// gateway's own routing work: semantic-cache and semantic-route
+    /// embeddings and shadow copies keep their configured budgets.
     #[serde(default)]
     pub allow_request_timeout_override: bool,
     /// Hard ceiling in milliseconds on a caller's `x-sbproxy-timeout-ms`.
@@ -325,8 +328,11 @@ pub struct AiHandlerConfig {
     /// so with `max_retries: 3` a caller asking for the ceiling can hold
     /// four attempts of it. Size it against the attempt, then multiply.
     ///
-    /// The gateway's 30-second HTTP client default still applies, so a
-    /// ceiling above 30000 does not buy a caller a longer attempt.
+    /// An honored header replaces the gateway's 30-second HTTP client
+    /// default as well as the provider's `timeout_ms`, so a ceiling above
+    /// 30000 does buy a caller a longer attempt. That is the point of the
+    /// ceiling: it is the only thing bounding how long one caller can
+    /// hold a connection, a `quota_pool` slot, and an upstream generation.
     #[serde(default)]
     pub max_request_timeout_ms: Option<u64>,
     /// WOR-1880: optional fair-share quota pool across providers.
@@ -842,14 +848,26 @@ pub struct AiResilienceConfig {
     ///
     /// Applies to streaming requests only, and must be above zero when
     /// set. Unset leaves streaming requests bounded solely by
-    /// `providers[].timeout_ms` and the gateway's 30-second client
-    /// default, during which no failover happens.
+    /// `providers[].timeout_ms`, or by the gateway's 30-second HTTP
+    /// client default when that is unset too, during which no failover
+    /// happens.
+    ///
+    /// This budget only ever shortens an attempt, so a value above the
+    /// attempt's own transport budget never fires: set it below
+    /// `providers[].timeout_ms`, or below 30000 on a provider that sets
+    /// no `timeout_ms`.
     ///
     /// Worst case before the caller sees an error is
     /// `(pre_header_timeout_ms + backoff) x candidate count`, since the
-    /// dispatch loop visits each configured provider at most once. The
-    /// 30-second client default is a ceiling on each attempt: a value
-    /// above it does not extend one.
+    /// dispatch loop visits each configured provider at most once.
+    ///
+    /// What it also covers, which is easy to miss on a cluster: a
+    /// `managed_model` served by another node is dispatched over the
+    /// model plane from inside the same bounded attempt, so this budget
+    /// bounds that dispatch too, cold start included. A cold start is
+    /// legitimately slower than any hosted provider's headers. On an
+    /// origin that can route to a managed model, size this above the
+    /// cold-start budget or leave it unset.
     #[serde(default)]
     pub pre_header_timeout_ms: Option<u64>,
 }

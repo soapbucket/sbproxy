@@ -177,11 +177,17 @@ availability failover, `transport` for a connection-level failure,
 `managed_cold_fallback` for a managed local model that could not be
 brought up, and the typed reroute reasons the sections above cover.
 
-Two limits worth knowing before you size it. The key is ignored on
+Three limits worth knowing before you size it. The key is ignored on
 non-streaming requests, which have no partial output to protect and keep
-waiting out `timeout_ms`. And it cannot extend an attempt beyond the
-gateway's 30-second HTTP client default, so a value above 30000 buys
-nothing. A `0` is refused at config load, because a zero budget would
+waiting out `timeout_ms`. It only ever shortens an attempt, so a value
+above the attempt's own transport budget never fires: keep it under
+`timeout_ms`, or under 30000 on a provider that sets no `timeout_ms` and
+so runs on the gateway's HTTP client default. And on a cluster it also
+bounds a `managed_model` served by another node, cold start included,
+because that dispatch happens inside the same bounded attempt; a cold
+start is legitimately slower than any hosted provider's headers, so size
+the budget above your cold-start allowance on such an origin or leave it
+unset there. A `0` is refused at config load, because a zero budget would
 fail every streaming request over the whole candidate list.
 
 ### After the commit point
