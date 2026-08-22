@@ -5,7 +5,8 @@
 # rail adapter sit behind cargo features.
 #
 # This crate deliberately depends on no other sbproxy crate except the
-# shared HTTP client kit, and never on sbproxy-core, sbproxy-modules,
+# shared HTTP client kit and sbproxy-util, the std-only leaf with no
+# dependencies of its own, and never on sbproxy-core, sbproxy-modules,
 # sbproxy-ai, or sbproxy-config. Core translates its existing 402 policy
 # output into billing-owned settlement intents, which keeps the crate
 # graph acyclic.
@@ -22,7 +23,7 @@ publish = false
 
 [features]
 default = []
-runtime = ["dep:rusqlite", "dep:tokio", "dep:rand"]
+runtime = ["dep:rusqlite", "dep:tokio", "dep:rand", "dep:sbproxy-util"]
 # `dep:reqwest` is the client type the shared HTTP kit hands back. The kit
 # builds it and owns the outbound policy; this crate only needs to name the
 # type and drive a request, which is why reqwest is pulled in beside it rather
@@ -51,6 +52,11 @@ lightning-cln = ["runtime"]
 lightning-lnd = ["runtime"]
 
 [dependencies]
+# WOR-2626: the settlement database is created owner-only before SQLite
+# opens it, so the WAL and shm sidecars inherit `0o600` too. Gated with the
+# store it protects, and a std-only leaf with no dependencies of its own.
+sbproxy-util = { workspace = true, optional = true }
+
 rusqlite = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 sbproxy-httpkit = { workspace = true, optional = true }

@@ -407,12 +407,54 @@ A worked example covering all three scopes is in
 
 ## Redaction
 
-Every line is passed through the same secret redactor that protects
-metric labels and audit events. Bearer tokens, API keys with
-recognizable prefixes (`sk-`, `pk-`, `ghp_`, ...), and JWT-shaped
-strings are replaced with `[REDACTED]` before the line reaches stdout.
-Apply additional masking at your log shipper if your origin embeds
-custom secrets in URLs or other places the line carries verbatim.
+Every line goes through two passes before it reaches stdout, and the
+second one depends on the first.
+
+The **value pass** scans the rendered line for credential shapes and
+replaces the value with `[REDACTED]`. It is the same pass that protects
+metric labels, audit events, and the YAML that
+[`GET /admin/config`](admin-api-reference.md#get-put-adminconfig)
+returns. It knows Anthropic (`sk-ant-`), OpenAI (`sk-`), Stripe
+(`sk_live_`, `sk_test_`, `pk_live_`, `pk_test_`, `rk_live_`,
+`rk_test_`), GitHub (`ghp_`, `gho_`, `ghr_`, `ghs_`), AWS access key
+ids (`AKIA...`), a 40-character AWS secret key under a label containing
+"secret", `Authorization: Bearer` and `Basic` values, and any value
+written under a recognized name: `api_key`, `password`, `master_key`,
+`signing_key`, `shared_key`, `virtual_key`, `challenge_binding_key`,
+`signing_secret`, `client_secret`, `session_token`, or a bare `token`.
+
+The **field pass** then parses the line as JSON and masks whole values
+by field name. That is the layer covering `prompt`, `messages`,
+`cookie`, `authorization`, a captured `x-api-key` header, and
+everything else listed under
+[Redaction policy](observability.md#redaction-policy). It runs only if
+the line still parses, which is why the value pass never consumes the
+`":"` between a key and its value: a key and its separator come back
+byte for byte and only the value is replaced. A mask that broke the
+line would take the whole field pass down with it and ship the `prompt`
+in the clear.
+
+Three things the value pass does not catch:
+
+* **A bare JWT.** There is no JWT shape pattern. `eyJhbGciOi...` is
+  masked when it follows `Bearer ` or sits under one of the names
+  above, and is emitted as written otherwise.
+* **A credential under an unrecognized name.** `external_id` (the AWS
+  STS assume-role external id) and `secret_id` (the Vault AppRole
+  secret id) are both live examples, and both are left out on purpose:
+  the same two names are non-secret identifiers elsewhere in the
+  product, and masking them by name would hide settlement
+  reconciliation ids an operator needs to read. Write those fields as
+  `${VAR}` or `vault://` references, which the redactor preserves and
+  which never hold the value in the first place.
+* **The tail of a value containing `"`, `'`, `,` or `;`.** The value
+  run stops at those four characters because they are structure in
+  JSON, in YAML flow style, and in logfmt. `password: p@ss,word` comes
+  out as `password: [REDACTED],word`.
+
+For all three, add the field name under
+`proxy.observability.log.redact.fields:`, which matches on the name and
+never reads the value, or mask at your log shipper.
 
 The PII redactor described under [Header capture](#header-capture) runs
 before secret redaction, but only over captured header values. Other

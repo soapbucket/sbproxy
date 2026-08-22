@@ -387,6 +387,51 @@ OpenAPI tool calls, never its token endpoint.
 **What to do before upgrading.** Add every MCP token endpoint host to
 `egress.token_exchange.hosts` alongside the non-MCP ones already there.
 
+### Durable sink files are created `0o600` and existing ones are tightened
+
+**Who this reaches.** Any config that names a path for a durable sink, and any
+process outside the proxy that reads one of those files. The paths are
+`meter.ledger.path` (and the audit chains built on it), `payments.state_path`,
+`session_ledger.path`, `request_events.path`, and the AI gateway's
+`usage.sink: jsonl_file` path. A deployment where only the proxy user ever
+opens these files is unaffected in practice, though the mode on disk still
+changes.
+
+**What changes.** Every one of those files used to be opened with a plain
+create-and-append, which asks the kernel for `0o666` and lets the process umask
+subtract from it. On a host with the near-universal `0o022` they were all
+`0o644`. They now carry `0o600`, requested in the open itself so the file never
+exists at a wider mode, and reasserted afterwards so a file left behind by an
+older build at `0o644` is tightened on the first open rather than inherited.
+Directories the proxy creates for its own state, today only the parent of
+`payments.state_path`, are created `0o700`.
+
+Two things are deliberately left alone. A directory that already exists keeps
+the mode it has, because a sink path may sit under a `/var/log` the operator
+shares on purpose, and narrowing that would be a much larger change than
+hardening one file. A path that resolves to something other than a regular file
+(`/dev/stdout`, a fifo drained by a shipper, a device) is written to exactly as
+before with no mode applied, since its permissions are the operator's and not
+the proxy's.
+
+**What an operator sees when it bites.** Nothing inside the proxy: it reads and
+writes its own files as before. What breaks is outside it. A log shipper, a
+backup job, or a metrics scraper running as a different user starts getting
+`EACCES` on the first open after the upgrade, and keeps getting it, because the
+tightening is applied every time the sink opens the file. If the proxy itself
+cannot tighten a file, because another account owns it, the sink refuses to
+start rather than appending to a file other accounts can read: the session
+ledger and request event sinks warn and fall back to the logging sink, and the
+usage ledger and settlement store fail startup with the path in the message.
+
+**What to do before upgrading.** List every process that reads a sink file and
+decide, per reader, which of these applies: run it as the proxy's user; give it
+access explicitly at deployment time rather than through world-readable modes;
+or point the sink at a fifo or `/dev/stdout` it already drains, which this
+change does not touch. On Windows there are no POSIX permission bits, so files
+and directories keep inheriting the containing directory's ACL and nothing
+about this changes.
+
 ### Bedrock's catalog data posture is now `retains_data: true`
 
 **Who this reaches.** Any action carrying

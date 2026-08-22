@@ -5,9 +5,19 @@
 //!
 //! Four `kube::runtime::watcher` streams feed one in-memory snapshot per
 //! kind: `GatewayClass` (cluster scoped), plus `Gateway`, `HTTPRoute`,
-//! and `GRPCRoute`. Every event enqueues a kind label on a small channel;
-//! one worker drains it, coalescing a burst so `kubectl apply -f dir/`
-//! triggers one reconcile rather than one per file.
+//! and `GRPCRoute`. A steady-state event enqueues a kind label on a small
+//! channel; one worker drains it, coalescing a burst so `kubectl apply -f
+//! dir/` triggers one reconcile rather than one per file.
+//!
+//! A relist is the case worth spelling out. The API server ends watches
+//! routinely (etcd compaction returning `410 Gone`, an apiserver
+//! rollout), and kube-rs answers by replaying the whole set as `Init`,
+//! one `InitApply` per object, then `InitDone`. Those objects are staged
+//! in a buffer beside the live snapshot and swapped in at `InitDone`, so
+//! a reconcile that lands mid-replay renders the last complete set rather
+//! than however much of the new one has arrived. One reconcile is
+//! scheduled per relist, at the swap, and readers hold clones rather than
+//! references into the snapshot, so nobody can observe the swap halfway.
 //!
 //! A reconcile does two things: write the rendered document, then patch
 //! `Accepted`, `Programmed`, and `ResolvedRefs` back onto every resource
@@ -20,6 +30,7 @@
 //! Reconcile errors are caught and logged, never propagated. One
 //! malformed resource must not take the loop down.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -119,6 +130,13 @@ impl ControllerHandle {
     pub async fn reconcile_once(&self, kind: &'static str) -> anyhow::Result<ReconcileOutcome> {
         let started = Instant::now();
 
+        // Each snapshot is cloned out under its own lock and the guard is
+        // dropped before the render starts, so no part of this pass holds
+        // a reference into a store a watcher may be swapping. A relist
+        // that lands between two of these four lines gives the pass the
+        // new complete set for one kind and the old complete set for
+        // another, which is a slightly older view rather than a partial
+        // one.
         let classes = self.classes.lock().await.clone();
         let gateways = self.gateways.lock().await.clone();
         let http_routes = self.http_routes.lock().await.clone();
@@ -214,6 +232,20 @@ impl ControllerHandle {
     async fn replace_grpc_routes(&self, items: Vec<GRPCRoute>) {
         *self.grpc_routes.lock().await = items;
     }
+
+    /// Take every queued reconcile off the channel and count it.
+    ///
+    /// The worker coalesces a burst into one pass, so the count on the
+    /// channel is what says how many times the watchers asked.
+    #[cfg(test)]
+    async fn drain_scheduled(&self) -> usize {
+        let mut rx = self.schedule_rx.lock().await;
+        let mut count = 0;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        count
+    }
 }
 
 /// Start the watchers and the reconcile worker. Returns once the shutdown
@@ -232,11 +264,21 @@ pub async fn run(
     let http_api: Api<HTTPRoute> = namespaced_or_all(&client, namespace);
     let grpc_api: Api<GRPCRoute> = namespaced_or_all(&client, namespace);
 
+    // The first published document is assembled from all four kinds, so
+    // it waits for all four to have listed.
+    let sync = Arc::new(InitialSync::for_kinds(&[
+        KIND_GATEWAY_CLASS,
+        KIND_GATEWAY,
+        KIND_HTTP_ROUTE,
+        KIND_GRPC_ROUTE,
+    ]));
+
     let class_task = tokio::spawn(watch_kind(
         class_api,
         KIND_GATEWAY_CLASS,
         handle.classes.clone(),
         handle.schedule_tx.clone(),
+        sync.clone(),
         shutdown.clone(),
     ));
     let gateway_task = tokio::spawn(watch_kind(
@@ -244,6 +286,7 @@ pub async fn run(
         KIND_GATEWAY,
         handle.gateways.clone(),
         handle.schedule_tx.clone(),
+        sync.clone(),
         shutdown.clone(),
     ));
     let http_task = tokio::spawn(watch_kind(
@@ -251,6 +294,7 @@ pub async fn run(
         KIND_HTTP_ROUTE,
         handle.http_routes.clone(),
         handle.schedule_tx.clone(),
+        sync.clone(),
         shutdown.clone(),
     ));
     let grpc_task = tokio::spawn(watch_kind(
@@ -258,6 +302,7 @@ pub async fn run(
         KIND_GRPC_ROUTE,
         handle.grpc_routes.clone(),
         handle.schedule_tx.clone(),
+        sync.clone(),
         shutdown.clone(),
     ));
 
@@ -290,12 +335,146 @@ where
     }
 }
 
-/// Drive one watch stream into `store`, scheduling a reconcile per event.
+/// Which watch streams have finished their first list.
+///
+/// A restarting controller lands on a volume that already holds a
+/// complete `sb.yml`. If the first reconcile ran as soon as the fastest
+/// watcher had listed, that document would be replaced by one rendered
+/// from a snapshot holding the `GatewayClass` and no routes at all, and
+/// the data plane would 404 every route it serves until the slower
+/// watchers caught up. Each stream reports its first `InitDone` here, and
+/// the last one to report is what schedules the first pass.
+///
+/// A kind that never lists (RBAC missing `watch` on it, say) holds the
+/// first reconcile back rather than publishing a document missing that
+/// kind outright. The periodic full resync in `main` bounds that wait: it
+/// schedules a pass on its own timer whatever the watchers have done, so
+/// a broken watch delays the first publication rather than preventing it,
+/// and `sbproxy_gateway_watch_errors_total` says why.
+struct InitialSync {
+    pending: Mutex<BTreeSet<&'static str>>,
+}
+
+impl InitialSync {
+    fn for_kinds(kinds: &[&'static str]) -> Self {
+        Self {
+            pending: Mutex::new(kinds.iter().copied().collect()),
+        }
+    }
+
+    /// Record `kind` as listed. Idempotent, so a later relist of a kind
+    /// that already reported changes nothing.
+    async fn mark_listed(&self, kind: &'static str) {
+        self.pending.lock().await.remove(kind);
+    }
+
+    /// Kinds that have not listed yet, in a stable order for the log.
+    async fn pending(&self) -> Vec<&'static str> {
+        self.pending.lock().await.iter().copied().collect()
+    }
+}
+
+/// Enqueue a reconcile, unless some kind has yet to finish its first
+/// list.
+///
+/// Dropping the enqueue in that window is safe: whatever the event
+/// changed is already in the snapshot, and the last watcher to finish its
+/// first list schedules the pass that renders it.
+async fn schedule_reconcile(
+    kind: &'static str,
+    schedule: &mpsc::Sender<&'static str>,
+    sync: &InitialSync,
+) {
+    let pending = sync.pending().await;
+    if pending.is_empty() {
+        let _ = schedule.try_send(kind);
+    } else {
+        tracing::debug!(
+            target: "k8s_audit",
+            kind,
+            ?pending,
+            "holding the first reconcile until every watched kind has listed"
+        );
+    }
+}
+
+/// Fold one watch event into `store`, scheduling a reconcile only when
+/// what it leaves behind is a complete snapshot.
+///
+/// `staging` is this stream's relist buffer: `Some` between `Init` and
+/// `InitDone`, `None` outside one. The caller owns it because it has to
+/// survive from one event to the next.
+async fn apply_watch_event<K>(
+    event: Event<K>,
+    kind: &'static str,
+    store: &Mutex<Vec<K>>,
+    staging: &mut Option<Vec<K>>,
+    schedule: &mpsc::Sender<&'static str>,
+    sync: &InitialSync,
+) where
+    K: kube::Resource<DynamicType = ()>,
+{
+    match event {
+        Event::Init => {
+            // A relist has started. The live snapshot keeps serving the
+            // last complete set while the replay is collected beside it.
+            *staging = Some(Vec::new());
+        }
+        Event::InitApply(obj) => {
+            // Deliberately no reconcile here. One InitApply is one object
+            // out of a set that is still arriving, and a pass rendered
+            // from it publishes a document missing everything that has
+            // not replayed yet. kube-rs says the same thing in its own
+            // words on `Event::InitApply`: buffer these until `InitDone`
+            // if you need a complete set.
+            if staging.is_none() {
+                *staging = Some(Vec::new());
+            }
+            if let Some(buffer) = staging.as_mut() {
+                upsert_by_uid(buffer, obj);
+            }
+        }
+        Event::InitDone => {
+            // The swap. A reader either sees every object the previous
+            // list produced or every object this one did.
+            if let Some(listed) = staging.take() {
+                let staged = listed.len();
+                let previous = {
+                    let mut live = store.lock().await;
+                    std::mem::replace(&mut *live, listed).len()
+                };
+                tracing::debug!(
+                    target: "k8s_audit",
+                    kind,
+                    previous,
+                    staged,
+                    "relist complete; snapshot replaced"
+                );
+            }
+            sync.mark_listed(kind).await;
+            schedule_reconcile(kind, schedule, sync).await;
+        }
+        // kube-rs emits these only outside an init sequence, so they act
+        // on the live snapshot rather than on the staging buffer.
+        Event::Apply(obj) => {
+            upsert_by_uid(&mut *store.lock().await, obj);
+            schedule_reconcile(kind, schedule, sync).await;
+        }
+        Event::Delete(obj) => {
+            remove_by_uid(&mut *store.lock().await, &obj);
+            schedule_reconcile(kind, schedule, sync).await;
+        }
+    }
+}
+
+/// Drive one watch stream into `store`, scheduling a reconcile per
+/// steady-state event and one per completed relist.
 async fn watch_kind<K>(
     api: Api<K>,
     kind: &'static str,
     store: Arc<Mutex<Vec<K>>>,
     schedule: mpsc::Sender<&'static str>,
+    sync: Arc<InitialSync>,
     shutdown: ShutdownSignal,
 ) where
     K: kube::Resource<DynamicType = ()>
@@ -306,6 +485,8 @@ async fn watch_kind<K>(
         + 'static,
 {
     let mut stream = std::pin::pin!(watcher::watcher(api, watcher::Config::default()).boxed());
+    // Objects replayed by the relist in progress, if there is one.
+    let mut staging: Option<Vec<K>> = None;
     loop {
         tokio::select! {
             _ = shutdown.wait() => {
@@ -315,25 +496,20 @@ async fn watch_kind<K>(
             event = stream.next() => {
                 let Some(event) = event else { return };
                 match event {
-                    Ok(Event::Apply(obj)) | Ok(Event::InitApply(obj)) => {
-                        upsert_by_uid(&mut *store.lock().await, obj);
-                        let _ = schedule.try_send(kind);
-                    }
-                    Ok(Event::Delete(obj)) => {
-                        remove_by_uid(&mut *store.lock().await, &obj);
-                        let _ = schedule.try_send(kind);
-                    }
-                    Ok(Event::Init) => {
-                        // A fresh list-watch. Clear so the InitApply
-                        // events that follow rebuild a clean snapshot
-                        // rather than merging into a stale one.
-                        store.lock().await.clear();
-                    }
-                    Ok(Event::InitDone) => {
-                        let _ = schedule.try_send(kind);
+                    Ok(event) => {
+                        apply_watch_event(
+                            event, kind, &store, &mut staging, &schedule, &sync,
+                        )
+                        .await;
                     }
                     Err(e) => {
                         metrics::record_watch_error(kind);
+                        // Whatever the interrupted relist had replayed is
+                        // dropped rather than carried into the next one.
+                        // kube-rs re-lists from the top after an error, so
+                        // holding a half-replayed buffer would only pin
+                        // memory until the `Init` that resets it anyway.
+                        staging = None;
                         tracing::warn!(
                             target: "k8s_audit",
                             kind,
@@ -754,6 +930,213 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), worker).await;
 
         assert!(path.exists(), "the burst produced at least one document");
+    }
+
+    #[tokio::test]
+    async fn a_relist_never_exposes_a_partial_snapshot() {
+        // A `410 Gone` on the HTTPRoute watch is routine: etcd compacts,
+        // or the apiserver rolls. kube-rs answers by replaying the whole
+        // set as Init, one InitApply per object, then InitDone. Clearing
+        // the live snapshot on Init and scheduling a pass per InitApply
+        // published an sb.yml holding one route out of four, and the data
+        // plane 404s the other three until the replay finishes.
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("sb.yml");
+        let h = handle_for(path.clone());
+        h.replace_gateway_classes(vec![class()]).await;
+        h.replace_gateways(vec![gateway("u1", 8080)]).await;
+
+        let sync = InitialSync::for_kinds(&[KIND_HTTP_ROUTE]);
+        let store = h.http_routes.clone();
+        let tx = h.scheduler();
+        let mut staging = None;
+        let listed: Vec<HTTPRoute> = (1..=4)
+            .map(|i| http_route(&format!("r{i}"), &format!("r{i}.example.com"), "svc"))
+            .collect();
+
+        for event in std::iter::once(Event::Init)
+            .chain(listed.iter().cloned().map(Event::InitApply))
+            .chain(std::iter::once(Event::InitDone))
+        {
+            apply_watch_event(event, KIND_HTTP_ROUTE, &store, &mut staging, &tx, &sync).await;
+        }
+        assert_eq!(h.drain_scheduled().await, 1, "one list is one reconcile");
+        assert_eq!(
+            h.reconcile_once(KIND_HTTP_ROUTE)
+                .await
+                .expect("reconcile")
+                .origins,
+            4
+        );
+
+        // Now the relist. The cluster lost r4 and gained r5 while the
+        // watch was down, so the swap has to be observable afterwards.
+        let replayed = vec![
+            http_route("r1", "r1.example.com", "svc"),
+            http_route("r2", "r2.example.com", "svc"),
+            http_route("r3", "r3.example.com", "svc"),
+            http_route("r5", "r5.example.com", "svc"),
+        ];
+        apply_watch_event(
+            Event::Init,
+            KIND_HTTP_ROUTE,
+            &store,
+            &mut staging,
+            &tx,
+            &sync,
+        )
+        .await;
+        for route in &replayed {
+            apply_watch_event(
+                Event::InitApply(route.clone()),
+                KIND_HTTP_ROUTE,
+                &store,
+                &mut staging,
+                &tx,
+                &sync,
+            )
+            .await;
+            let outcome = h.reconcile_once(KIND_HTTP_ROUTE).await.expect("reconcile");
+            assert_eq!(
+                outcome.origins, 4,
+                "a reconcile landing mid-replay renders the last complete set, not the part \
+                 of the new one that has arrived"
+            );
+            let body = std::fs::read_to_string(&path).expect("read back");
+            for host in ["r1", "r2", "r3", "r4"] {
+                assert!(
+                    body.contains(&format!("{host}.example.com")),
+                    "{host} left the published document while the relist was in flight"
+                );
+            }
+        }
+        assert_eq!(
+            h.drain_scheduled().await,
+            0,
+            "no reconcile is scheduled from inside a relist"
+        );
+
+        apply_watch_event(
+            Event::InitDone,
+            KIND_HTTP_ROUTE,
+            &store,
+            &mut staging,
+            &tx,
+            &sync,
+        )
+        .await;
+        assert_eq!(
+            h.drain_scheduled().await,
+            1,
+            "exactly one reconcile per relist, scheduled at the swap"
+        );
+        let outcome = h.reconcile_once(KIND_HTTP_ROUTE).await.expect("reconcile");
+        assert_eq!(outcome.origins, 4);
+        let body = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            body.contains("r5.example.com"),
+            "the swap published the replayed set"
+        );
+        assert!(
+            !body.contains("r4.example.com"),
+            "a delete missed while the watch was down goes with it"
+        );
+
+        // Steady state is unchanged: one event, one reconcile.
+        for event in [
+            Event::Apply(http_route("r6", "r6.example.com", "svc")),
+            Event::Delete(http_route("r1", "r1.example.com", "svc")),
+        ] {
+            apply_watch_event(event, KIND_HTTP_ROUTE, &store, &mut staging, &tx, &sync).await;
+        }
+        assert_eq!(
+            h.drain_scheduled().await,
+            2,
+            "a post-init Apply and Delete each still schedule a pass"
+        );
+        let outcome = h.reconcile_once(KIND_HTTP_ROUTE).await.expect("reconcile");
+        assert_eq!(outcome.origins, 4, "r5 and r6 are in, r1 is out");
+    }
+
+    #[tokio::test]
+    async fn the_first_reconcile_waits_for_every_kind_to_list() {
+        // A controller restarting over a volume that already holds a
+        // complete document must not republish it from whichever kind
+        // listed first. The startup case of the same defect: a snapshot
+        // with the GatewayClass and no routes renders a valid document
+        // with zero origins.
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("sb.yml");
+        let h = handle_for(path);
+        let sync = InitialSync::for_kinds(&[KIND_GATEWAY_CLASS, KIND_HTTP_ROUTE]);
+        let tx = h.scheduler();
+        let mut class_staging = None;
+        let mut route_staging = None;
+
+        for event in [Event::Init, Event::InitApply(class()), Event::InitDone] {
+            apply_watch_event(
+                event,
+                KIND_GATEWAY_CLASS,
+                &h.classes,
+                &mut class_staging,
+                &tx,
+                &sync,
+            )
+            .await;
+        }
+        assert_eq!(
+            h.drain_scheduled().await,
+            0,
+            "the routes have not listed yet, so there is no complete snapshot to publish"
+        );
+        assert_eq!(
+            h.classes.lock().await.len(),
+            1,
+            "the class snapshot is populated all the same"
+        );
+
+        // An event on a kind that has listed is held back for the same
+        // reason: the document it would publish is still missing a kind.
+        apply_watch_event(
+            Event::Apply(class()),
+            KIND_GATEWAY_CLASS,
+            &h.classes,
+            &mut class_staging,
+            &tx,
+            &sync,
+        )
+        .await;
+        assert_eq!(h.drain_scheduled().await, 0);
+
+        for event in [
+            Event::Init,
+            Event::InitApply(http_route("r1", "r1.example.com", "svc")),
+        ] {
+            apply_watch_event(
+                event,
+                KIND_HTTP_ROUTE,
+                &h.http_routes,
+                &mut route_staging,
+                &tx,
+                &sync,
+            )
+            .await;
+        }
+        assert_eq!(h.drain_scheduled().await, 0);
+        apply_watch_event(
+            Event::InitDone,
+            KIND_HTTP_ROUTE,
+            &h.http_routes,
+            &mut route_staging,
+            &tx,
+            &sync,
+        )
+        .await;
+        assert_eq!(
+            h.drain_scheduled().await,
+            1,
+            "the last kind to list schedules the first pass, once"
+        );
     }
 
     #[test]

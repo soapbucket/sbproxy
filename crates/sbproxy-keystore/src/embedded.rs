@@ -65,8 +65,18 @@ pub struct EmbeddedKeyStore {
 
 impl EmbeddedKeyStore {
     /// Open (or create) the store at `path`, ensuring all tables exist.
+    ///
+    /// The file is pre-created owner-only before redb is handed the path.
+    /// redb calls `File::create` itself, which asks for `0o666` and lets the
+    /// umask decide, so the database holding every encrypted upstream
+    /// credential landed at `0o644` under the near-universal `0o022`. redb
+    /// opens an existing file rather than replacing it, so creating it at
+    /// `0o600` first is enough, and it is the same order the settlement
+    /// database uses for SQLite.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let path = path.as_ref();
+        sbproxy_util::secure_fs::ensure_file_owner_only(path)
+            .with_context(|| format!("create keystore database at {}", path.display()))?;
         let db = Database::create(path)
             .with_context(|| format!("open keystore database at {}", path.display()))?;
         let write_txn = db.begin_write().context("begin init transaction")?;

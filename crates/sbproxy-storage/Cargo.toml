@@ -36,8 +36,19 @@ prometheus = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
-redis = { workspace = true, optional = true }
+# `connection-manager` is what makes a dropped socket recoverable: the
+# bare multiplexed connection this crate used to cache never reconnects.
+redis = { workspace = true, optional = true, features = ["connection-manager"] }
 futures = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+# `net` and `io-util` are for the RESP stand-in server the reconnect
+# tests dial; the rest is what the crate already needs.
+tokio = { workspace = true, features = [
+  "macros",
+  "rt",
+  "rt-multi-thread",
+  "time",
+  "net",
+  "io-util",
+] }

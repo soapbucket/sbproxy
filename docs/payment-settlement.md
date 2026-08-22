@@ -1,6 +1,6 @@
 # Payment settlement
 
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-21*
 
 `proxy.payments` is how SBproxy charges for a request and proves it was
 paid. It is Apache-2.0, it is off unless you configure it, and it holds
@@ -87,7 +87,19 @@ the dispatch gate, not by the error text:
 | The deadline elapsed before anything was dispatched | `RetryWait` | 503 with `Retry-After` |
 | The deadline elapsed after dispatch | `NeedsReconciliation` | 503 with `Retry-After` |
 | The provider's success response could not be parsed | `NeedsReconciliation` | 503 with `Retry-After` |
+| The provider answered a dispatched write with a status its contract does not define as an answer | `NeedsReconciliation` | 503 with `Retry-After` |
 | The rail verified but did not settle | `NeedsReconciliation` | 503 with `Retry-After` |
+
+"The provider refused" means the provider answered in its own protocol
+that no funds moved, and each rail draws that line where its published
+contract does. On x402 only a 2xx settle body saying `success: false`
+counts, because x402 v2 defines no error response at all. Stripe counts
+a 4xx other than 409 and 429, because Stripe publishes a machine
+readable error object for those and documents 409 and 429 as
+retry-or-reconcile. Everything a rail's contract does not cover is
+unknown rather than refused, and unknown is a `NeedsReconciliation` row
+somebody can still resolve. Terminal is the one transition that asserts
+the money did not move; a status nobody defined is not evidence of that.
 
 A `NeedsReconciliation` intent is never retried by the request path. A
 second attempt is how a payer gets charged twice, so the client waits for

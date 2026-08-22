@@ -687,7 +687,16 @@ impl PaymentsRuntimeCandidate {
         let path = Path::new(&config.state_path);
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
+                // Owner-only (`0o700`) for every component this call
+                // creates. A `0o600` settlement database inside a
+                // `0o755` directory still tells any account on the
+                // host that this node settles payments, how large the
+                // ledger is, and when it last moved. A directory that
+                // already exists keeps the mode its operator gave it,
+                // because `state_path` is operator configuration and
+                // narrowing a shared parent is how a hardening change
+                // becomes an outage.
+                sbproxy_util::secure_fs::create_dir_all_owner_only(parent)
                     .map_err(|_| PaymentsRuntimeError::StatePath("create the parent directory"))?;
             }
         }
