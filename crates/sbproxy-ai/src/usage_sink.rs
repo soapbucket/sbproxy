@@ -256,6 +256,16 @@ pub trait UsageSink: Send + Sync + std::fmt::Debug {
     fn record(&self, event: &LlmUsageEvent);
     /// A short, stable label for logs and metrics.
     fn name(&self) -> &str;
+
+    /// Return the current chargeback view when this sink owns one.
+    ///
+    /// The default keeps non-chargeback sinks object-safe and avoids
+    /// downcasting erased trait objects. Configured chargeback sinks override
+    /// it so the live admin/export path can query the same instance requests
+    /// record into.
+    fn chargeback_snapshot(&self) -> Option<crate::billing::ChargebackSnapshot> {
+        None
+    }
 }
 
 /// A sink that appends one JSON object per line to a file.
@@ -1332,19 +1342,25 @@ pub enum UsageSinkConfig {
     },
     /// Emit events through the process OTel / OpenInference seam.
     Otel,
-    /// Accumulate in-memory per-workspace/team chargeback totals (WOR-2672).
+    /// Accumulate bounded in-memory per-workspace/team chargeback totals
+    /// (WOR-2672).
     ///
     /// See [`crate::billing::ChargebackTracker`] and `docs/ai-chargeback.md`.
-    /// In-memory only: the tracker built for this config entry is not
-    /// reachable outside the sink registration path, so an embedder that
-    /// needs to read `workspace_totals_snapshot()` / `entries_snapshot()`
-    /// back out (to drain it into durable storage, or to serve an admin
-    /// endpoint) should construct a `ChargebackTracker` directly and keep
-    /// a typed `Arc` to it instead of using this variant; this variant
-    /// exists for the common case of wanting chargeback recording turned
-    /// on from config alone, matching every other sink in this enum,
-    /// without needing a query path back into it.
-    Chargeback,
+    /// The live instance is queryable through [`UsageSink::chargeback_snapshot`]
+    /// and the authenticated admin JSON/CSV endpoints. Raw entries evict
+    /// oldest-first; workspace and team rollups fold excess cardinality into
+    /// `__other__` without dropping its spend.
+    Chargeback {
+        /// Number of recent raw usage entries retained for billing exports.
+        #[serde(default = "default_chargeback_max_entries")]
+        max_entries: usize,
+        /// Maximum workspace rollup rows, including the overflow row.
+        #[serde(default = "default_chargeback_max_dimensions")]
+        max_workspaces: usize,
+        /// Maximum team rollup rows, including the overflow row.
+        #[serde(default = "default_chargeback_max_dimensions")]
+        max_teams: usize,
+    },
     /// Write events as JSON objects to an S3 bucket.
     S3 {
         /// Destination bucket name.
@@ -1364,6 +1380,35 @@ pub enum UsageSinkConfig {
 }
 
 impl UsageSinkConfig {
+    /// Validate resource bounds for sinks whose shape is configurable.
+    pub fn validate(&self) -> Result<(), String> {
+        const MAX_ENTRIES: usize = 1_000_000;
+        const MAX_DIMENSIONS: usize = 100_000;
+        if let Self::Chargeback {
+            max_entries,
+            max_workspaces,
+            max_teams,
+        } = self
+        {
+            if !(1..=MAX_ENTRIES).contains(max_entries) {
+                return Err(format!(
+                    "chargeback max_entries must be in 1..={MAX_ENTRIES}, got {max_entries}"
+                ));
+            }
+            for (name, value) in [
+                ("max_workspaces", *max_workspaces),
+                ("max_teams", *max_teams),
+            ] {
+                if !(1..=MAX_DIMENSIONS).contains(&value) {
+                    return Err(format!(
+                        "chargeback {name} must be in 1..={MAX_DIMENSIONS}, got {value}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Build the runtime sink for this config entry. Returned as an `Arc` so a
     /// single instance is shared across every request for the origin.
     ///
@@ -1415,9 +1460,15 @@ impl UsageSinkConfig {
                 std::sync::Arc::new(sink)
             }
             UsageSinkConfig::Otel => std::sync::Arc::new(OtelSink::new()),
-            UsageSinkConfig::Chargeback => {
-                std::sync::Arc::new(crate::billing::ChargebackTracker::new())
-            }
+            UsageSinkConfig::Chargeback {
+                max_entries,
+                max_workspaces,
+                max_teams,
+            } => std::sync::Arc::new(crate::billing::ChargebackTracker::with_limits(
+                *max_entries,
+                *max_workspaces,
+                *max_teams,
+            )),
             UsageSinkConfig::S3 { bucket, prefix } => {
                 let mut sink = ObjectStoreSink::s3(bucket, prefix);
                 if let Some(authorizer) = &egress {
@@ -1434,6 +1485,14 @@ impl UsageSinkConfig {
             }
         }
     }
+}
+
+fn default_chargeback_max_entries() -> usize {
+    crate::billing::chargeback::DEFAULT_MAX_ENTRIES
+}
+
+fn default_chargeback_max_dimensions() -> usize {
+    crate::billing::chargeback::DEFAULT_MAX_DIMENSIONS
 }
 
 /// Build the runtime sinks for a list of configs.
@@ -1912,6 +1971,14 @@ mod tests {
         assert_eq!(sinks.len(), 1);
         assert_eq!(sinks[0].name(), "chargeback");
         sinks[0].record(&sample_event());
+        let snapshot = sinks[0]
+            .chargeback_snapshot()
+            .expect("configured chargeback sink remains queryable");
+        assert_eq!(snapshot.recorded_entries, 1);
+        assert_eq!(
+            snapshot.max_entries,
+            crate::billing::chargeback::DEFAULT_MAX_ENTRIES
+        );
     }
 
     #[test]

@@ -820,6 +820,28 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_ai_chargeback_entries_evicted_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_chargeback_entry_evicted"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &[],
+        description: "Raw chargeback entries evicted from bounded in-memory retention.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_ai_chargeback_rollups_collapsed_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_chargeback_rollup_collapsed"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["dimension"],
+        description: "Chargeback events folded into a bounded overflow rollup by workspace or team dimension.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_ai_context_poisoning_findings_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_context_poisoning_finding"),
@@ -988,6 +1010,28 @@ pub const METRICS: &[MetricCapability] = &[
     // writer symbols below live in that binary crate. Keeping them in this
     // workspace-wide capability table lets dashboard drift checks validate
     // the sidecar dashboard just like the main proxy dashboards.
+    MetricCapability {
+        name: "sbproxy_classifier_admission_queue",
+        kind: MetricKind::Gauge,
+        writer: Writer::Recorder("adjust_admission_queue"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["cmd"],
+        description: "Rich-sidecar requests currently waiting for a bounded inference slot, by command.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_classifier_admission_refusals_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_admission_refusal"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["cmd", "reason"],
+        description: "Rich-sidecar requests refused by bounded admission, by command and closed reason.",
+        dead_reason: None,
+    },
     MetricCapability {
         name: "sbproxy_classifier_errors_total",
         kind: MetricKind::Counter,

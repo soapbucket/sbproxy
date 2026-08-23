@@ -120,7 +120,8 @@ fn main() {
 
     println!("\nUnified bill for the period:");
     let entries = tracker.entries_snapshot();
-    let bill = generate_bill(&entries, "2026-08-01", "2026-08-31");
+    let bill = generate_bill(&entries, "2026-08-01", "2026-09-01")
+        .expect("example timestamps and the half-open August period are valid");
     for item in &bill.line_items {
         println!(
             "  {:<10} {:<20} {:>3} req  {:>6} tok  ${:.2}",

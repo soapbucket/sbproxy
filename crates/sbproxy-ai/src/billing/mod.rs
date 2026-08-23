@@ -27,8 +27,10 @@ pub mod chargeback;
 pub mod forecast;
 pub mod unified;
 
-pub use chargeback::{ChargebackEntry, ChargebackTracker, WorkspaceTotals, UNATTRIBUTED};
+pub use chargeback::{
+    ChargebackEntry, ChargebackSnapshot, ChargebackTracker, WorkspaceTotals, OVERFLOW, UNATTRIBUTED,
+};
 pub use forecast::{
     days_until_exhaustion, forecast_spend, remaining_budget, will_exceed_budget, UsageDataPoint,
 };
-pub use unified::{generate_bill, BillLineItem, UnifiedBill};
+pub use unified::{generate_bill, BillError, BillLineItem, UnifiedBill};

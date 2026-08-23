@@ -2423,6 +2423,59 @@ Read-only operators may call this; it has no write path.
 
 ---
 
+### `GET /admin/ai-chargeback` and `GET /admin/ai-chargeback.csv`
+
+Read the bounded chargeback sink instances attached to the live AI
+pipeline. The JSON form is an atomic snapshot of recent raw entries,
+workspace/team rollups, configured capacities, and retention counters.
+The CSV form exports one workspace or team rollup per row for finance
+tools. A hot reload replaces the view with the new pipeline's trackers.
+
+```json
+{
+  "schema_version": 1,
+  "origins": {
+    "ai.local": [{
+      "max_entries": 10000,
+      "max_workspaces": 1000,
+      "max_teams": 1000,
+      "entries": [],
+      "workspace_totals": {
+        "workspace-a": {"tokens": 150, "cost_usd": 0.25, "request_count": 1}
+      },
+      "team_totals": {
+        "team-a": {"tokens": 150, "cost_usd": 0.25, "request_count": 1}
+      },
+      "recorded_entries": 1,
+      "evicted_entries": 0,
+      "collapsed_workspace_events": 0,
+      "collapsed_team_events": 0
+    }]
+  }
+}
+```
+
+Origins without a configured `type: chargeback` sink are omitted. More
+than one configured chargeback sink produces more than one array entry in
+declaration order. The CSV header is
+`origin,tracker,dimension,name,request_count,tokens,cost_usd`; caller-derived
+names are quoted and spreadsheet-formula prefixes are neutralized.
+
+Both endpoints are process-local and read-only. They do not claim durable
+or cross-replica totals. Use the JSON retention counters and the
+`sbproxy_ai_chargeback_entries_evicted_total` /
+`sbproxy_ai_chargeback_rollups_collapsed_total{dimension}` metrics to tell
+when raw history or named rollup cardinality exceeded its configured
+window. See [ai-chargeback.md](ai-chargeback.md).
+
+| Status | When |
+|---|---|
+| `200` | Always, once authenticated. With no configured tracker, JSON returns an empty `origins` map and CSV returns only its header. |
+| `401` | Missing or invalid credentials. |
+| `405` | Any method other than `GET`. |
+
+---
+
 ### `GET /admin/config/schema`
 
 The JSON Schema for the config file, generated from the running

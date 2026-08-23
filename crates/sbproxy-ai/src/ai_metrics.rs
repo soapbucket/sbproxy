@@ -2791,6 +2791,40 @@ pub(crate) fn replica_selection_excluded_value(stage: &str) -> f64 {
         .get()
 }
 
+// --- Chargeback retention metrics ---
+
+/// Raw chargeback rows evicted from bounded in-memory retention.
+static AI_CHARGEBACK_ENTRIES_EVICTED: LazyLock<Counter> = LazyLock::new(|| {
+    register_counter!(
+        "sbproxy_ai_chargeback_entries_evicted_total",
+        "Raw chargeback entries evicted from bounded in-memory retention"
+    )
+    .unwrap()
+});
+
+/// Chargeback assignments folded into a bounded overflow rollup.
+static AI_CHARGEBACK_ROLLUPS_COLLAPSED: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_chargeback_rollups_collapsed_total",
+            "Chargeback events folded into an overflow rollup by dimension"
+        ),
+        &["dimension"]
+    )
+    .unwrap()
+});
+
+pub(crate) fn record_chargeback_entry_evicted() {
+    AI_CHARGEBACK_ENTRIES_EVICTED.inc();
+}
+
+pub(crate) fn record_chargeback_rollup_collapsed(dimension: &'static str) {
+    debug_assert!(matches!(dimension, "workspace" | "team"));
+    AI_CHARGEBACK_ROLLUPS_COLLAPSED
+        .with_label_values(&[dimension])
+        .inc();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

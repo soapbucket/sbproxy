@@ -1466,6 +1466,10 @@ impl AiHandlerConfig {
              the `resilience:` block rather than a sibling of it"
         );
         let mut config: Self = serde_json::from_value(value)?;
+        for (index, sink) in config.usage_sinks.iter().enumerate() {
+            sink.validate()
+                .map_err(|error| anyhow::anyhow!("ai usage_sinks[{index}]: {error}"))?;
+        }
         // WOR-2556: a typed fallback list is an aimed allowlist. A name
         // matching no provider would leave the trigger configured and
         // the reroute unreachable, so it fails the load instead.
@@ -3032,6 +3036,34 @@ mod tests {
         assert_eq!(sinks[1].name(), "webhook");
         // The lazy accessor returns the same built instances on repeat calls.
         assert_eq!(cfg.usage_sinks().len(), 2);
+    }
+
+    #[test]
+    fn chargeback_sink_is_queryable_and_its_limits_are_validated() {
+        let action = serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "k", "models": ["gpt-4o-mini"]}],
+            "usage_sinks": [{
+                "type": "chargeback",
+                "max_entries": 3,
+                "max_workspaces": 2,
+                "max_teams": 2
+            }]
+        });
+        let config = AiHandlerConfig::from_config(action.clone()).expect("valid chargeback sink");
+        let snapshot = config.usage_sinks()[0]
+            .chargeback_snapshot()
+            .expect("configured chargeback remains queryable after trait erasure");
+        assert_eq!(snapshot.max_entries, 3);
+        assert_eq!(snapshot.max_workspaces, 2);
+        assert_eq!(snapshot.max_teams, 2);
+
+        let mut invalid = action;
+        invalid["usage_sinks"][0]["max_entries"] = serde_json::json!(0);
+        let error = AiHandlerConfig::from_config(invalid)
+            .expect_err("zero retention must fail at config load")
+            .to_string();
+        assert!(error.contains("usage_sinks[0]"), "{error}");
+        assert!(error.contains("max_entries"), "{error}");
     }
 
     #[test]

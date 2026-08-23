@@ -1653,6 +1653,93 @@ fn handle_ai_data_posture() -> (u16, &'static str, String) {
     )
 }
 
+// --- AI chargeback export (WOR-2672) ---
+
+fn live_ai_chargeback_snapshots(
+) -> std::collections::BTreeMap<String, Vec<sbproxy_ai::billing::ChargebackSnapshot>> {
+    use sbproxy_modules::Action;
+
+    let pipeline = crate::reload::current_pipeline();
+    let mut origins = std::collections::BTreeMap::new();
+    for (index, action) in pipeline.actions.iter().enumerate() {
+        let Action::AiProxy(ai) = action else {
+            continue;
+        };
+        let Some(origin) = pipeline.config.origins.get(index) else {
+            continue;
+        };
+        let snapshots: Vec<_> = ai
+            .config
+            .usage_sinks()
+            .iter()
+            .filter_map(|sink| sink.chargeback_snapshot())
+            .collect();
+        if !snapshots.is_empty() {
+            origins.insert(origin.hostname.to_string(), snapshots);
+        }
+    }
+    origins
+}
+
+/// Return all configured live chargeback trackers as an atomic JSON export.
+fn handle_ai_chargeback() -> (u16, &'static str, String) {
+    (
+        200,
+        "application/json",
+        serde_json::json!({
+            "schema_version": 1,
+            "origins": live_ai_chargeback_snapshots(),
+        })
+        .to_string(),
+    )
+}
+
+/// Return bounded workspace/team rollups in spreadsheet-safe CSV.
+fn handle_ai_chargeback_csv() -> (u16, &'static str, String) {
+    let mut csv = "origin,tracker,dimension,name,request_count,tokens,cost_usd\n".to_string();
+    for (origin, snapshots) in live_ai_chargeback_snapshots() {
+        for (tracker, snapshot) in snapshots.iter().enumerate() {
+            for (dimension, totals) in [
+                ("workspace", &snapshot.workspace_totals),
+                ("team", &snapshot.team_totals),
+            ] {
+                for (name, total) in totals {
+                    use std::fmt::Write as _;
+                    let _ = writeln!(
+                        csv,
+                        "{},{tracker},{dimension},{},{},{},{}",
+                        chargeback_csv_field(&origin),
+                        chargeback_csv_field(name),
+                        total.request_count,
+                        total.tokens,
+                        total.cost_usd
+                    );
+                }
+            }
+        }
+    }
+    (200, "text/csv; charset=utf-8", csv)
+}
+
+fn chargeback_csv_field(value: &str) -> String {
+    let formula = value
+        .chars()
+        .next()
+        .is_some_and(|first| matches!(first, '=' | '+' | '-' | '@' | '\t' | '\r'));
+    let mut safe = if formula {
+        format!("'{value}")
+    } else {
+        value.to_string()
+    };
+    if safe
+        .chars()
+        .any(|character| matches!(character, ',' | '"' | '\n' | '\r'))
+    {
+        safe = format!("\"{}\"", safe.replace('"', "\"\""));
+    }
+    safe
+}
+
 // --- OpenAPI rendering ---
 
 /// Render the live pipeline's OpenAPI document as JSON or YAML.
@@ -4873,6 +4960,29 @@ pub fn handle_admin_request(
     if path_only == "/admin/ai-data-posture" {
         if method.eq_ignore_ascii_case("GET") {
             return handle_ai_data_posture();
+        }
+        return (
+            405,
+            "application/json",
+            r#"{"error":"method not allowed"}"#.to_string(),
+        );
+    }
+    // WOR-2672: bounded live chargeback results from the same sink
+    // instances the request path records into. Both forms are read-only
+    // and sit behind the common operator-auth gate above.
+    if path_only == "/admin/ai-chargeback" {
+        if method.eq_ignore_ascii_case("GET") {
+            return handle_ai_chargeback();
+        }
+        return (
+            405,
+            "application/json",
+            r#"{"error":"method not allowed"}"#.to_string(),
+        );
+    }
+    if path_only == "/admin/ai-chargeback.csv" {
+        if method.eq_ignore_ascii_case("GET") {
+            return handle_ai_chargeback_csv();
         }
         return (
             405,
@@ -12219,6 +12329,11 @@ origins:
       type: ai_proxy
       data_posture:
         require_zdr: true
+      usage_sinks:
+        - type: chargeback
+          max_entries: 3
+          max_workspaces: 4
+          max_teams: 4
       providers:
         - name: openai
           api_key: "k"
@@ -12295,6 +12410,68 @@ origins:
             openai["eligible"], true,
             "offering ZDR is not holding it; the operator declaration is what qualifies openai"
         );
+
+        let pipeline = crate::reload::current_pipeline();
+        let sbproxy_modules::Action::AiProxy(action) = &pipeline.actions[0] else {
+            panic!("first action is AI")
+        };
+        let event: sbproxy_ai::usage_sink::LlmUsageEvent =
+            serde_json::from_value(serde_json::json!({
+                "provider": "openai",
+                "model": "gpt-4o-mini",
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "cost_usd": 0.25,
+                "latency_ms": 25,
+                "status": 200,
+                "tenant_id": "workspace-a",
+                "team": "team-a"
+            }))
+            .expect("usage event");
+        action.config.usage_sinks()[0].record(&event);
+        drop(pipeline);
+
+        let (status, _, _) =
+            handle_admin_request("GET", "/admin/ai-chargeback", &state, None, None);
+        assert_eq!(status, 401);
+        let (status, _, _) = handle_admin_request(
+            "POST",
+            "/admin/ai-chargeback.csv",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 405);
+
+        let (status, _, body) =
+            handle_admin_request("GET", "/admin/ai-chargeback", &state, Some(&auth), None);
+        assert_eq!(status, 200, "got body: {body}");
+        let chargeback: serde_json::Value = serde_json::from_str(&body).expect("chargeback JSON");
+        assert_eq!(chargeback["schema_version"], 1);
+        let tracker = &chargeback["origins"]["ai.example.com"][0];
+        assert_eq!(tracker["recorded_entries"], 1);
+        assert_eq!(
+            tracker["workspace_totals"]["workspace-a"]["request_count"],
+            1
+        );
+        assert_eq!(tracker["team_totals"]["team-a"]["cost_usd"], 0.25);
+
+        let (status, content_type, csv) =
+            handle_admin_request("GET", "/admin/ai-chargeback.csv", &state, Some(&auth), None);
+        assert_eq!(status, 200, "got body: {csv}");
+        assert_eq!(content_type, "text/csv; charset=utf-8");
+        assert!(csv.starts_with("origin,tracker,dimension,name,request_count,tokens,cost_usd\n"));
+        assert!(csv.contains("ai.example.com,0,workspace,workspace-a,1,15,0.25"));
+        assert!(csv.contains("ai.example.com,0,team,team-a,1,15,0.25"));
+    }
+
+    #[test]
+    fn chargeback_csv_fields_quote_delimiters_and_neutralize_formulas() {
+        assert_eq!(chargeback_csv_field("plain"), "plain");
+        assert_eq!(chargeback_csv_field("team,west"), "\"team,west\"");
+        assert_eq!(chargeback_csv_field("=1+1"), "'=1+1");
+        assert_eq!(chargeback_csv_field("@SUM(A:A),x"), "\"'@SUM(A:A),x\"");
     }
 
     #[test]

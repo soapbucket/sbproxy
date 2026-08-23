@@ -20,10 +20,10 @@
 //! gateway call already flows through (`JsonlFileSink`, `WebhookSink`,
 //! `LangfuseSink`, `DatadogSink`, ... all implement it the same way).
 //! One [`crate::usage_sink::LlmUsageEvent`] carries the whole completed
-//! call, not a partial amount, so one `record()` call updates both the
-//! per-event log ([`ChargebackTracker::total_by_team`]) and the
-//! per-workspace totals ([`ChargebackTracker::workspace_totals_snapshot`])
-//! together, which is simpler than the enterprise source's
+//! call, not a partial amount, so one `record()` call updates the bounded
+//! recent-entry log and the team/workspace rollups under one lock. A
+//! [`ChargebackTracker::snapshot`] can therefore never observe half an
+//! event. This is simpler than the enterprise source's
 //! deliberately-isolated design: that isolation existed only to protect
 //! against three *partial* sink calls per request corrupting a
 //! per-event log built for *complete* entries, a problem that does not
@@ -39,13 +39,17 @@
 //!
 //! # Storage: none
 //!
-//! Per the port's disposition, this tracker is in-memory only. The
+//! Per the port's disposition, this tracker is in-memory only and every
+//! live structure is bounded. Raw entries evict oldest-first; excess
+//! workspace/team cardinality folds into [`OVERFLOW`] and increments both
+//! snapshot counters and Prometheus counters. The
 //! enterprise source's `ChargebackPersistence` (write-behind to a
 //! `HashKv`, cross-replica summing via `WorkspaceTotals::merge`) is not
-//! ported; an embedder that needs durability drains
-//! [`ChargebackTracker::workspace_totals_snapshot`] or
-//! [`ChargebackTracker::entries_count`] periodically into its own store,
-//! the same way any other [`crate::usage_sink::UsageSink`] would.
+//! ported; an embedder that needs durability exports
+//! [`ChargebackTracker::snapshot`] periodically into its own store. A
+//! configured sink is readable through
+//! [`crate::usage_sink::UsageSink::chargeback_snapshot`] and the
+//! authenticated JSON/CSV admin endpoints.
 //!
 //! # Employee-scoped chargeback: not ported
 //!
@@ -62,7 +66,7 @@
 //! [`super::unified`] against the same tracker.
 
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
@@ -74,8 +78,23 @@ use crate::usage_sink::{LlmUsageEvent, UsageSink};
 /// the record: the money was still spent.
 pub const UNATTRIBUTED: &str = "unattributed";
 
+/// Rollup bucket used once a tracker's configured dimension cardinality
+/// has been exhausted. This keeps caller-controlled workspace and team
+/// names from growing the live process without bound while retaining the
+/// associated usage and cost.
+pub const OVERFLOW: &str = "__other__";
+
+/// Default number of recent raw entries retained by a configured tracker.
+pub const DEFAULT_MAX_ENTRIES: usize = 10_000;
+
+/// Default maximum number of workspace or team rollup rows retained by a
+/// configured tracker. One row is reserved for [`OVERFLOW`].
+pub const DEFAULT_MAX_DIMENSIONS: usize = 1_000;
+
+const MAX_DIMENSION_BYTES: usize = 256;
+
 /// A single AI usage event with full attribution metadata.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChargebackEntry {
     /// Team that owns this usage. [`UNATTRIBUTED`] when the request
     /// carried no `SB-Attr-Team` / governed team tag.
@@ -106,12 +125,77 @@ pub struct WorkspaceTotals {
     pub request_count: u64,
 }
 
+impl WorkspaceTotals {
+    fn add(&mut self, tokens: u64, cost_usd: f64) {
+        self.tokens = self.tokens.saturating_add(tokens);
+        let next_cost = self.cost_usd + cost_usd;
+        self.cost_usd = if next_cost.is_finite() {
+            next_cost
+        } else {
+            f64::MAX
+        };
+        self.request_count = self.request_count.saturating_add(1);
+    }
+}
+
+/// One atomic, owned view of a chargeback tracker.
+///
+/// Raw entries and both rollup dimensions are copied while holding the
+/// tracker's single state lock. A caller therefore cannot observe an event
+/// in one surface before it appears in the other surfaces.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChargebackSnapshot {
+    /// Maximum recent raw entries retained by this tracker.
+    pub max_entries: usize,
+    /// Maximum workspace rollup rows, including [`OVERFLOW`].
+    pub max_workspaces: usize,
+    /// Maximum team rollup rows, including [`OVERFLOW`].
+    pub max_teams: usize,
+    /// Recent raw entries, oldest first.
+    pub entries: Vec<ChargebackEntry>,
+    /// All-time workspace totals, bounded by `max_workspaces`.
+    pub workspace_totals: BTreeMap<String, WorkspaceTotals>,
+    /// All-time team totals, bounded by `max_teams`.
+    pub team_totals: BTreeMap<String, WorkspaceTotals>,
+    /// Total events accepted since this tracker was created.
+    pub recorded_entries: u64,
+    /// Raw entries discarded from the front of the retention window.
+    pub evicted_entries: u64,
+    /// Events whose workspace attribution was folded into [`OVERFLOW`].
+    pub collapsed_workspace_events: u64,
+    /// Events whose team attribution was folded into [`OVERFLOW`].
+    pub collapsed_team_events: u64,
+}
+
+#[derive(Debug, Default)]
+struct ChargebackState {
+    entries: VecDeque<ChargebackEntry>,
+    workspace_totals: BTreeMap<String, WorkspaceTotals>,
+    team_totals: BTreeMap<String, WorkspaceTotals>,
+    recorded_entries: u64,
+    evicted_entries: u64,
+    collapsed_workspace_events: u64,
+    collapsed_team_events: u64,
+}
+
 /// Thread-safe store for accumulating [`ChargebackEntry`] records and
 /// per-workspace totals, fed by [`UsageSink::record`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ChargebackTracker {
-    entries: Mutex<Vec<ChargebackEntry>>,
-    workspace_totals: Mutex<HashMap<String, WorkspaceTotals>>,
+    max_entries: usize,
+    max_workspaces: usize,
+    max_teams: usize,
+    state: Mutex<ChargebackState>,
+}
+
+impl Default for ChargebackTracker {
+    fn default() -> Self {
+        Self::with_limits(
+            DEFAULT_MAX_ENTRIES,
+            DEFAULT_MAX_DIMENSIONS,
+            DEFAULT_MAX_DIMENSIONS,
+        )
+    }
 }
 
 impl ChargebackTracker {
@@ -120,39 +204,158 @@ impl ChargebackTracker {
         Self::default()
     }
 
+    /// Create an empty tracker with explicit retention and rollup limits.
+    ///
+    /// Each limit is clamped to at least one. Configuration parsing rejects
+    /// zero explicitly; the clamp keeps direct library construction safe and
+    /// bounded too.
+    pub fn with_limits(max_entries: usize, max_workspaces: usize, max_teams: usize) -> Self {
+        Self {
+            max_entries: max_entries.max(1),
+            max_workspaces: max_workspaces.max(1),
+            max_teams: max_teams.max(1),
+            state: Mutex::new(ChargebackState::default()),
+        }
+    }
+
     /// Append a chargeback entry directly, bypassing the [`UsageSink`]
     /// path. Used by tests and by callers that already have a
     /// [`ChargebackEntry`] in hand rather than an [`LlmUsageEvent`].
     pub fn record(&self, entry: ChargebackEntry) {
-        self.entries.lock().push(entry);
+        self.record_for_workspace(UNATTRIBUTED, entry);
     }
 
     /// Aggregate total cost per team across all recorded entries.
     pub fn total_by_team(&self) -> HashMap<String, f64> {
-        let entries = self.entries.lock();
-        let mut totals: HashMap<String, f64> = HashMap::new();
-        for e in entries.iter() {
-            *totals.entry(e.team.clone()).or_insert(0.0) += e.cost;
-        }
-        totals
+        self.state
+            .lock()
+            .team_totals
+            .iter()
+            .map(|(team, totals)| (team.clone(), totals.cost_usd))
+            .collect()
     }
 
-    /// Return the number of entries recorded so far.
+    /// Return the number of recent entries currently retained.
     pub fn entries_count(&self) -> usize {
-        self.entries.lock().len()
+        self.state.lock().entries.len()
     }
 
-    /// Snapshot every recorded entry, in record order. Used to feed
+    /// Snapshot the retained recent entries, in record order. Used to feed
     /// [`super::unified::generate_bill`] and [`super::forecast`].
     pub fn entries_snapshot(&self) -> Vec<ChargebackEntry> {
-        self.entries.lock().clone()
+        self.state.lock().entries.iter().cloned().collect()
     }
 
     /// Snapshot of the per-workspace totals. Returns a fresh `HashMap` so
     /// callers cannot accidentally hold the internal mutex.
     pub fn workspace_totals_snapshot(&self) -> HashMap<String, WorkspaceTotals> {
-        self.workspace_totals.lock().clone()
+        self.state
+            .lock()
+            .workspace_totals
+            .iter()
+            .map(|(workspace, totals)| (workspace.clone(), totals.clone()))
+            .collect()
     }
+
+    /// Return an atomic snapshot of retained entries and all bounded
+    /// rollups/counters.
+    pub fn snapshot(&self) -> ChargebackSnapshot {
+        let state = self.state.lock();
+        ChargebackSnapshot {
+            max_entries: self.max_entries,
+            max_workspaces: self.max_workspaces,
+            max_teams: self.max_teams,
+            entries: state.entries.iter().cloned().collect(),
+            workspace_totals: state.workspace_totals.clone(),
+            team_totals: state.team_totals.clone(),
+            recorded_entries: state.recorded_entries,
+            evicted_entries: state.evicted_entries,
+            collapsed_workspace_events: state.collapsed_workspace_events,
+            collapsed_team_events: state.collapsed_team_events,
+        }
+    }
+
+    fn record_for_workspace(&self, workspace: &str, mut entry: ChargebackEntry) {
+        entry.team = bounded_dimension(&entry.team, UNATTRIBUTED);
+        entry.project = bounded_dimension(&entry.project, "");
+        entry.provider = bounded_dimension(&entry.provider, UNATTRIBUTED);
+        entry.model = bounded_dimension(&entry.model, UNATTRIBUTED);
+        entry.timestamp = bounded_dimension(&entry.timestamp, "");
+        entry.cost = valid_cost(entry.cost);
+        let workspace = bounded_dimension(workspace, UNATTRIBUTED);
+
+        let mut state = self.state.lock();
+        state.recorded_entries = state.recorded_entries.saturating_add(1);
+        if state.entries.len() == self.max_entries {
+            state.entries.pop_front();
+            state.evicted_entries = state.evicted_entries.saturating_add(1);
+            crate::ai_metrics::record_chargeback_entry_evicted();
+        }
+        state.entries.push_back(entry.clone());
+
+        let workspace_collapsed = fold_rollup(
+            &mut state.workspace_totals,
+            &workspace,
+            self.max_workspaces,
+            entry.tokens,
+            entry.cost,
+        );
+        if workspace_collapsed {
+            state.collapsed_workspace_events = state.collapsed_workspace_events.saturating_add(1);
+            crate::ai_metrics::record_chargeback_rollup_collapsed("workspace");
+        }
+        let team_collapsed = fold_rollup(
+            &mut state.team_totals,
+            &entry.team,
+            self.max_teams,
+            entry.tokens,
+            entry.cost,
+        );
+        if team_collapsed {
+            state.collapsed_team_events = state.collapsed_team_events.saturating_add(1);
+            crate::ai_metrics::record_chargeback_rollup_collapsed("team");
+        }
+    }
+}
+
+fn valid_cost(cost: f64) -> f64 {
+    if cost.is_finite() && cost >= 0.0 {
+        cost
+    } else {
+        0.0
+    }
+}
+
+fn bounded_dimension(value: &str, fallback: &str) -> String {
+    let value = if value.is_empty() { fallback } else { value };
+    if value.len() <= MAX_DIMENSION_BYTES {
+        return value.to_string();
+    }
+    let mut end = MAX_DIMENSION_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+fn fold_rollup(
+    totals: &mut BTreeMap<String, WorkspaceTotals>,
+    requested_key: &str,
+    max_dimensions: usize,
+    tokens: u64,
+    cost_usd: f64,
+) -> bool {
+    let (key, collapsed) = if totals.contains_key(requested_key) {
+        (requested_key.to_string(), false)
+    } else if requested_key == OVERFLOW {
+        (OVERFLOW.to_string(), false)
+    } else if totals.len() < max_dimensions.saturating_sub(1) {
+        (requested_key.to_string(), false)
+    } else {
+        (OVERFLOW.to_string(), true)
+    };
+    totals.entry(key).or_default().add(tokens, cost_usd);
+    collapsed
 }
 
 impl UsageSink for ChargebackTracker {
@@ -179,31 +382,28 @@ impl UsageSink for ChargebackTracker {
             .clone()
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| UNATTRIBUTED.to_string());
-        let cost = if event.cost_usd.is_finite() && event.cost_usd >= 0.0 {
-            event.cost_usd
-        } else {
-            0.0
-        };
+        let cost = valid_cost(event.cost_usd);
 
-        self.entries.lock().push(ChargebackEntry {
-            team,
-            project,
-            provider: event.provider.clone(),
-            model: event.model.clone(),
-            tokens: event.total_tokens,
-            cost,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-        });
-
-        let mut totals = self.workspace_totals.lock();
-        let entry = totals.entry(workspace).or_default();
-        entry.tokens = entry.tokens.saturating_add(event.total_tokens);
-        entry.cost_usd += cost;
-        entry.request_count = entry.request_count.saturating_add(1);
+        self.record_for_workspace(
+            &workspace,
+            ChargebackEntry {
+                team,
+                project,
+                provider: event.provider.clone(),
+                model: event.model.clone(),
+                tokens: event.total_tokens,
+                cost,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            },
+        );
     }
 
     fn name(&self) -> &str {
         "chargeback"
+    }
+
+    fn chargeback_snapshot(&self) -> Option<ChargebackSnapshot> {
+        Some(self.snapshot())
     }
 }
 
@@ -418,5 +618,114 @@ mod tests {
     fn usage_sink_name_is_stable() {
         let t = ChargebackTracker::new();
         assert_eq!(UsageSink::name(&t), "chargeback");
+    }
+
+    #[test]
+    fn high_volume_retention_is_bounded_without_losing_rollups() {
+        let tracker = ChargebackTracker::with_limits(3, 4, 4);
+        for _ in 0..10 {
+            UsageSink::record(
+                &tracker,
+                &usage_event(Some("workspace-a"), Some("team-a"), 0.25),
+            );
+        }
+
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.max_entries, 3);
+        assert_eq!(snapshot.entries.len(), 3);
+        assert_eq!(snapshot.recorded_entries, 10);
+        assert_eq!(snapshot.evicted_entries, 7);
+        assert_eq!(snapshot.workspace_totals["workspace-a"].request_count, 10);
+        assert_eq!(snapshot.team_totals["team-a"].request_count, 10);
+    }
+
+    #[test]
+    fn dimension_cardinality_is_bounded_and_overflow_is_counted() {
+        let tracker = ChargebackTracker::with_limits(20, 2, 2);
+        for index in 0..10 {
+            UsageSink::record(
+                &tracker,
+                &usage_event(
+                    Some(&format!("workspace-{index}")),
+                    Some(&format!("team-{index}")),
+                    1.0,
+                ),
+            );
+        }
+
+        let snapshot = tracker.snapshot();
+        assert!(snapshot.workspace_totals.len() <= 2);
+        assert!(snapshot.team_totals.len() <= 2);
+        assert!(snapshot.workspace_totals.contains_key(OVERFLOW));
+        assert!(snapshot.team_totals.contains_key(OVERFLOW));
+        assert!(snapshot.collapsed_workspace_events > 0);
+        assert!(snapshot.collapsed_team_events > 0);
+        assert_eq!(
+            snapshot
+                .workspace_totals
+                .values()
+                .map(|totals| totals.request_count)
+                .sum::<u64>(),
+            snapshot.recorded_entries
+        );
+    }
+
+    #[test]
+    fn concurrent_snapshots_never_observe_half_recorded_events() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::sync::Arc;
+
+        let tracker = Arc::new(ChargebackTracker::with_limits(32, 8, 8));
+        let finished = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(0);
+        let writer_tracker = Arc::clone(&tracker);
+        let writer_finished = Arc::clone(&finished);
+        let writer = std::thread::spawn(move || {
+            UsageSink::record(
+                writer_tracker.as_ref(),
+                &usage_event(Some("workspace-a"), Some("team-a"), 0.01),
+            );
+            started_tx.send(()).expect("reader is waiting");
+            resume_rx.recv().expect("reader releases writer");
+            for _ in 1..2_000 {
+                UsageSink::record(
+                    writer_tracker.as_ref(),
+                    &usage_event(Some("workspace-a"), Some("team-a"), 0.01),
+                );
+                std::thread::yield_now();
+            }
+            writer_finished.store(true, Ordering::Release);
+        });
+
+        started_rx.recv().expect("writer recorded its first event");
+        let first = tracker.snapshot();
+        assert_eq!(first.recorded_entries, 1);
+        let mut snapshots_checked = 1;
+        resume_tx.send(()).expect("writer is waiting");
+        while !finished.load(Ordering::Acquire) {
+            let snapshot = tracker.snapshot();
+            snapshots_checked += 1;
+            let workspace_requests = snapshot
+                .workspace_totals
+                .values()
+                .map(|totals| totals.request_count)
+                .sum::<u64>();
+            let team_requests = snapshot
+                .team_totals
+                .values()
+                .map(|totals| totals.request_count)
+                .sum::<u64>();
+            assert_eq!(workspace_requests, snapshot.recorded_entries);
+            assert_eq!(team_requests, snapshot.recorded_entries);
+        }
+
+        writer.join().expect("writer joins");
+        assert!(
+            snapshots_checked > 0,
+            "reader observed the concurrent write"
+        );
+        assert_eq!(tracker.snapshot().recorded_entries, 2_000);
     }
 }

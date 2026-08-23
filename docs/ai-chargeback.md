@@ -19,14 +19,29 @@ Turn it on from config alone, the same way as the other sinks:
 ```yaml
 usage_sinks:
   - type: chargeback
+    max_entries: 10000
+    max_workspaces: 1000
+    max_teams: 1000
 ```
 
-This is the right choice when you only need chargeback recording to run;
-it builds a `ChargebackTracker` and registers it, and nothing else holds
-a reference to it. If your embedding needs to read the totals back out
-later (draining `workspace_totals_snapshot()` into your own store, or
-serving them from an admin endpoint), construct one directly instead so
-you keep a typed handle:
+All three limits are optional and the values above are the defaults. Raw
+entries retain the newest `max_entries` rows. Workspace and team maps
+reserve one of their configured rows for `"__other__"`; once a map is
+full, new caller-provided names fold into that row without losing their
+tokens, request count, or cost. Names and other raw string fields are
+capped at 256 bytes before retention.
+
+The configured instance remains queryable after the sink is registered.
+Use authenticated `GET /admin/ai-chargeback` for the atomic JSON view or
+`GET /admin/ai-chargeback.csv` for workspace/team rollups. The JSON export
+includes retained raw entries, all rollups, and `recorded_entries`,
+`evicted_entries`, `collapsed_workspace_events`, and
+`collapsed_team_events`. Prometheus exports the process totals as
+`sbproxy_ai_chargeback_entries_evicted_total` and
+`sbproxy_ai_chargeback_rollups_collapsed_total{dimension="workspace"|"team"}`.
+
+An embedding can also construct a tracker directly when it needs a typed
+handle:
 
 ```rust,ignore
 use sbproxy_ai::billing::ChargebackTracker;
@@ -50,10 +65,11 @@ for lacking a tag; the money was still spent.
 ### Storage: none
 
 The tracker is in-memory only, by design (WOR-2661 forbids a hard
-external-store dependency for this port). An embedder that needs
-durability drains `ChargebackTracker::workspace_totals_snapshot()` and
-`entries_snapshot()` periodically into its own store, the same way any
-other `UsageSink` implementation that wants persistence would.
+external-store dependency for this port). Rollups cover the lifetime of
+the process, while raw-entry retention is a bounded recent window. An
+embedder that needs durable or cross-replica totals periodically exports
+`ChargebackTracker::snapshot()` into its own store. The admin endpoints do
+not claim persistence across a restart.
 
 ### Employee-scoped chargeback: not ported
 
@@ -80,13 +96,21 @@ line item per (provider, model) pair:
 use sbproxy_ai::billing::generate_bill;
 
 let entries = tracker.entries_snapshot();
-let bill = generate_bill(&entries, "2026-08-01", "2026-08-31");
+// Half-open period: August 1 inclusive through September 1 exclusive.
+let bill = generate_bill(&entries, "2026-08-01", "2026-09-01")?;
 for item in &bill.line_items {
     println!("{} / {}: {} requests, {} tokens, ${:.2}",
         item.provider, item.model, item.requests, item.tokens, item.cost);
 }
 println!("total: ${:.2}", bill.total);
+# Ok::<(), sbproxy_ai::billing::BillError>(())
 ```
+
+Bounds accept RFC 3339 timestamps or `YYYY-MM-DD` at UTC midnight.
+Malformed bounds, empty/reversed periods, malformed entry timestamps,
+invalid costs, and arithmetic overflow return `BillError`; an
+August-labeled bill cannot silently include July or September usage or a
+wrapped monetary aggregate.
 
 ## Spend forecasting
 
