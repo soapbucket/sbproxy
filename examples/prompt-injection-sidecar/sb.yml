@@ -1,16 +1,14 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
 # prompt_injection_v2 with the out-of-process sidecar detector.
 #
-# Instead of loading an ONNX model inside the proxy, this routes
-# detection to a separate process over gRPC. The proxy
-# holds one client and sends the prompt to a sidecar that implements
-# the shared InferenceService contract; the sidecar runs the model and
-# returns a label and score. The model runtime is isolated from request
-# serving, so a malformed or oversized model takes down the sidecar
-# (which an orchestrator restarts), not the proxy.
+# The primary detector runs in a separate process over gRPC. The proxy
+# holds one client and sends the prompt to a sidecar that implements the
+# shared InferenceService contract. A verified in-process ONNX fallback
+# is mandatory: an unavailable, overloaded, or malformed sidecar can
+# never silently turn a protected request into an unscored allow.
 #
 # The same config works against the minimal OSS sidecar
-# (`sbproxy-classifier-sidecar`) and the richer enterprise sidecar;
+# (`sbproxy-classifier-sidecar`) and the richer OSS sidecar;
 # switching between them is a deployment change, not a config change.
 #
 # Run the OSS sidecar (supply your own ONNX model + tokenizer; OSS does
@@ -23,7 +21,10 @@
 # Run the proxy:
 #   make run CONFIG=examples/prompt-injection-sidecar/sb.yml
 #
-# See docs/prompt-injection-v2.md for the failure posture and a
+# Export the four SBPROXY_PROMPT_INJECTION_FALLBACK_* variables described
+# in this example's README before starting the proxy.
+#
+# See docs/prompt-injection-v2.md for the fallback contract and a
 # Kubernetes co-location manifest.
 
 proxy:
@@ -60,14 +61,18 @@ origins:
           # Per-call timeout in milliseconds. Covers the lazy connect
           # on the first request after the sidecar comes online.
           timeout_ms: 250
-          # If the sidecar is down or slow, treat the prompt as clean
-          # and let the request through. This is the default. The older
-          # `fail_closed: false` spelling still parses and means the
-          # same thing.
-          failure_posture: open
+          # Required verified local fallback for every transport,
+          # timeout, RPC, admission, or response-validation failure.
+          fallback:
+            model_path: "${SBPROXY_PROMPT_INJECTION_FALLBACK_MODEL_PATH}"
+            tokenizer_path: "${SBPROXY_PROMPT_INJECTION_FALLBACK_TOKENIZER_PATH}"
+            model_sha256: "${SBPROXY_PROMPT_INJECTION_FALLBACK_MODEL_SHA256}"
+            tokenizer_sha256: "${SBPROXY_PROMPT_INJECTION_FALLBACK_TOKENIZER_SHA256}"
+            labels: [safe, injection]
+            injection_label: injection
 
-  # block mode with fail-closed: requests are rejected on an injection
-  # verdict, and a missing verdict (sidecar down) is also a reject.
+  # Block mode rejects an injection verdict from either the sidecar or
+  # the mandatory verified local fallback.
   "block.local":
     action:
       type: proxy
@@ -86,8 +91,10 @@ origins:
           model: prompt-injection
           injection_label: injection
           timeout_ms: 250
-          # Closed: a missing verdict denies the request. Pair this
-          # with action: block only when you would rather drop traffic
-          # than let it through unscored, and budget for the sidecar's
-          # availability accordingly.
-          failure_posture: closed
+          fallback:
+            model_path: "${SBPROXY_PROMPT_INJECTION_FALLBACK_MODEL_PATH}"
+            tokenizer_path: "${SBPROXY_PROMPT_INJECTION_FALLBACK_TOKENIZER_PATH}"
+            model_sha256: "${SBPROXY_PROMPT_INJECTION_FALLBACK_MODEL_SHA256}"
+            tokenizer_sha256: "${SBPROXY_PROMPT_INJECTION_FALLBACK_TOKENIZER_SHA256}"
+            labels: [safe, injection]
+            injection_label: injection

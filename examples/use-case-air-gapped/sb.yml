@@ -74,8 +74,9 @@ origins:
     policies:
       # Second injection layer with its own threshold. heuristic-v1 is
       # the zero-dependency in-process detector; the on-box ONNX
-      # classifier (detector: sidecar) is the documented upgrade once a
-      # classifier sidecar runs on this host. See
+      # sidecar primary (detector: sidecar, with a mandatory pinned local
+      # ONNX fallback) is the documented upgrade once a classifier sidecar
+      # runs on this host. See
       # ../../docs/local-inference.md.
       - type: prompt_injection_v2
         threshold: 0.8

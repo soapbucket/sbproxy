@@ -7,9 +7,9 @@ SBproxy heavily invests in out-of-process AI safety via the `sbproxy-classifier-
 Two sidecar binaries exist, both built from this OSS tree, and a caller reaches either through the same `sbproxy-classifier-client`:
 
 - **`sbproxy-classifier-sidecar`** - minimal: `InferenceService` only (`Classify`, `Embed`, `Compress`, backed by ONNX), with hardened per-RPC admission control (request-byte budgets, running/queued semaphores, a bounded deadline). Sections 1-5 below cover it.
-- **`sbproxy-classifier`** - rich: the same `InferenceService` contract (ONNX-backed, without the admission-control hardening) plus multi-tenant heuristic classification, quality scoring, intent/content-type detection, and per-token streaming safety checks. Section 6 covers it, including the optional-degrade architecture every caller of either sidecar should use.
+- **`sbproxy-classifier`** - rich: the same ONNX-backed `InferenceService` contract with bounded admission and deadlines, plus multi-tenant heuristic classification, quality scoring, intent/content-type detection, and bounded per-token streaming safety checks. Section 6 covers it, including the optional-degrade architecture every caller of either sidecar should use.
 
-By running classifiers in a sidecar, you achieve strict process isolation: if a learned classifier or its ONNX engine crashes, it does not take down the main proxy serving traffic.
+Running the primary classifier in a sidecar isolates its process: if that model or ONNX engine crashes, it does not take down the main proxy serving traffic. A `prompt_injection_v2` sidecar policy also loads a small verified local ONNX fallback so loss of that isolated primary cannot silently bypass classification.
 
 ## 1. The `InferenceService` Contract
 
@@ -76,10 +76,9 @@ classification is CPU-bound work: one forward pass holds one thread until
 it returns, so how many a box can genuinely run at once is its core count,
 and any literal is wrong on every box but the one it was chosen on. Being
 wrong low is the expensive direction. A sidecar that sheds below what the
-hardware can serve does not show up as latency an operator can watch; the
-detector gives up after 250 ms and treats the refusal exactly like a
-sidecar that is down, so the shed lands as a `failure_posture` decision on
-live traffic.
+hardware can serve does not show up only as latency an operator can watch;
+the detector gives up after its configured timeout and routes the request
+through the policy's mandatory verified local ONNX fallback.
 
 Queue depth follows the running set for the same reason in reverse. What
 matters about a queue slot is how long its occupant waits, and a request
@@ -186,10 +185,11 @@ sampling is on purpose: a refusal storm is exactly the load these bounds
 exist to shed, and a line per refusal would turn it into a log flood.
 The counts stay exact regardless of what is logged.
 
-The sidecar has no `/metrics` endpoint of its own yet, so those counters
-are process-local today. On the proxy side, a refused call is a failed
-call: it takes the `failure_posture` path of whatever policy dialed the
-sidecar, the same as a sidecar that is down.
+The minimal sidecar has no `/metrics` endpoint of its own yet, so those
+counters are process-local today. On the proxy side, a refused call is a
+failed primary call: `prompt_injection_v2` classifies the prompt with its
+mandatory verified local ONNX fallback, the same as when the sidecar is
+down.
 
 ## 4. Configuring the Proxy
 
@@ -206,10 +206,16 @@ policies:
       model: prompt-injection
       injection_label: INJECTION
       timeout_ms: 250
-      failure_posture: open  # a sidecar outage degrades to "clean" (allow)
+      fallback:
+        model_path: /var/lib/sbproxy/models/injection/model.onnx
+        tokenizer_path: /var/lib/sbproxy/models/injection/tokenizer.json
+        model_sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+        tokenizer_sha256: abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
+        labels: ["SAFE", "INJECTION"]
+        injection_label: INJECTION
 ```
 
-`model` selects the loaded classifier by the id used on `--model` above (`prompt-injection` in the example). See [local-inference.md](local-inference.md#enable-first-class-onnx-prompt-injection) for the full field reference and auto-selection behavior.
+`model` selects the sidecar classifier by the id used on `--model` above (`prompt-injection` in the example). `fallback` is required and is verified and loaded at config construction, before traffic can be served. It handles transport, timeout, RPC, admission, and response-validation failures from the primary. See [local-inference.md](local-inference.md#enable-first-class-onnx-prompt-injection) for the full local artifact field reference.
 
 See [`examples/prompt-injection-sidecar/`](../examples/prompt-injection-sidecar/) for a complete working config, including both a `tag` and a `block` origin against the same sidecar.
 
@@ -223,7 +229,8 @@ When SBproxy encounters an AI request with a sidecar-backed guardrail, it automa
 1. Buffers and canonicalizes the request (e.g. assembling all messages into a unified prompt).
 2. Connects to your sidecar via the `sbproxy-classifier-client` (which handles lazy connection and, for the supervised co-located pattern, UDS dialing).
 3. Invokes `Classify` with the text payload.
-4. Compares the returned score against `threshold` and either allows the request or applies the policy's `action` (`tag` or `block`).
+4. On any sidecar failure, classifies the same text with the configured verified local ONNX fallback.
+5. Compares the resulting score against `threshold` and either allows the request or applies the policy's `action` (`tag` or `block`).
 
 See [guardrails.md](guardrails.md) and [prompt-injection-v2.md](prompt-injection-v2.md) for more details on wiring guardrails into your AI pipelines.
 
@@ -257,11 +264,13 @@ cargo run -p sbproxy-classifier -- \
 
 ### The optional-degrade architecture
 
-Per the epic's rule that a sidecar a deployment must run and keep running is the same category of hard dependency as an external database: **nothing in this OSS workspace may require either classifier sidecar to be up.** `sbproxy-classifier-client`'s `FallbackClassifier` is the reusable piece that guarantees this for any caller, not just `prompt_injection_v2`'s own hand-written fail-open/fail-closed logic:
+Per the epic's rule that a sidecar a deployment must run and keep running is the same category of hard dependency as an external database: **nothing in this OSS workspace may require either classifier sidecar to be up.** The shipping `prompt_injection_v2` compiler enforces this directly: selecting `detector: sidecar` requires a pinned real-ONNX fallback and constructs one composite detector. `sbproxy-classifier-client`'s `FallbackClassifier` offers the same primary/fallback control flow to custom callers, but those callers remain responsible for supplying and bounding a real fallback implementation.
 
 - No sidecar configured (the common OSS case: an operator who never deploys one) - every call goes straight to a caller-supplied in-process classifier. No connection is ever attempted.
 - A sidecar is configured but unreachable, times out, or returns a malformed response - the call degrades to the in-process classifier for that request, logging a warning.
 - A sidecar is configured and healthy - its verdict is used, and the in-process classifier is not invoked at all.
+
+For `prompt_injection_v2`, the fallback is not an arbitrary stub: config construction verifies the model and tokenizer paths, mandatory SHA-256 pins, size limits, and any configured detached signatures, then uses the same bounded admission/deadline mechanism as the explicit in-process detector.
 
 ```rust,ignore
 use sbproxy_classifier_client::{ClassifierClient, FallbackClassifier, InProcessClassifier, Verdict};
@@ -283,9 +292,9 @@ let verdict = classifier.classify(&prompt).await;
 
 Run `cargo run -p sbproxy-classifier-client --example fallback` for a live demonstration of all three cases.
 
-### Open product question (not resolved here)
+### Shipping deployment contract
 
-Should `sbproxy-classifier` eventually replace OSS's in-process ONNX classifier (`crates/sbproxy-classifiers`), or do the two coexist as a light tier (in-process, zero extra deployment) and a heavy tier (this sidecar, richer capability, its own process to run)? This is a product decision the WOR-2665 disposition explicitly carries unresolved; nothing in this port assumes either answer, and `FallbackClassifier` works identically either way.
+The two tiers coexist: local ONNX is the zero-extra-process baseline and verified fallback, while either sidecar is an optional isolated primary. Deploying a sidecar adds capability and isolation; losing it does not remove the configured prompt-injection classification policy.
 
 ### Metrics
 

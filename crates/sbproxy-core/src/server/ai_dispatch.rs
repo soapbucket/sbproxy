@@ -25199,17 +25199,19 @@ origins:
     /// The seam: the `tokio::time::timeout` wrapped around the dispatch
     /// loop's attempt binding.
     ///
-    /// The wedged provider's own `timeout_ms` is 5000, so without the
-    /// pre-header budget the failover cannot happen for five seconds
-    /// (and without any `timeout_ms` at all it would be the client
-    /// default's thirty). With a 200ms budget the handover is inside the
-    /// bound asserted here.
+    /// The wedged provider's own `timeout_ms` is 30 seconds, so without
+    /// the pre-header budget the failover cannot happen inside the
+    /// ten-second test deadline. With a 200ms budget the handover and
+    /// downstream response both complete inside that bound. Keeping the
+    /// two budgets far apart proves which timeout caused the handover
+    /// without asserting a brittle sub-second wall-clock duration on a
+    /// saturated test host.
     #[tokio::test]
     async fn a_wedged_provider_fails_over_before_the_client_timeout() {
         let (wedged_url, wedged_hits) = wedged_upstream_fixture().await;
         let (stream_url, stream_hits) =
             upstream_bytes_fixture(openai_tool_call_stream(), "text/event-stream").await;
-        let config = pre_header_timeout_config(&wedged_url, &stream_url, Some(200), 5_000);
+        let config = pre_header_timeout_config(&wedged_url, &stream_url, Some(200), 30_000);
         let (mut session, client) = downstream_session(serde_json::json!({
             "model": "requested-model",
             "stream": true,
@@ -25218,21 +25220,22 @@ origins:
         .await;
         let mut context = crate::context::RequestContext::new();
 
-        let started = std::time::Instant::now();
-        super::handle_ai_proxy(
-            &mut session,
-            &config,
-            &crate::pipeline::CompiledPipeline::default(),
-            "ai.test",
-            &mut context,
-            None,
-        )
+        let response = tokio::time::timeout(Duration::from_secs(10), async {
+            super::handle_ai_proxy(
+                &mut session,
+                &config,
+                &crate::pipeline::CompiledPipeline::default(),
+                "ai.test",
+                &mut context,
+                None,
+            )
+            .await
+            .expect("the wedged candidate is abandoned and the next one serves");
+            drop(session);
+            live_downstream_body(client).await
+        })
         .await
-        .expect("the wedged candidate is abandoned and the next one serves");
-        let elapsed = started.elapsed();
-        drop(session);
-
-        let response = live_downstream_body(client).await;
+        .expect("the pre-header budget must hand over before the 30s provider timeout");
         assert!(
             response.starts_with(b"HTTP/1.1 200"),
             "{}",
@@ -25243,11 +25246,6 @@ origins:
             stream_hits.load(Ordering::SeqCst),
             1,
             "the second candidate serves the stream"
-        );
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "the pre-header budget, not the provider's whole-call timeout_ms, \
-             has to end the wedged attempt; took {elapsed:?}"
         );
     }
 

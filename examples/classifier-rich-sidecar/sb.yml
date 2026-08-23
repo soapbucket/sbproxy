@@ -19,10 +19,14 @@
 #     --default-model prompt-injection \
 #     --model prompt-injection=/models/model.onnx:/models/tokenizer.json
 #
+# Export the four SBPROXY_PROMPT_INJECTION_FALLBACK_* variables described
+# in this example's README before starting the proxy. The pinned local
+# model is mandatory so a sidecar failure cannot silently admit a prompt.
+#
 # Run the proxy:
 #   make run CONFIG=examples/classifier-rich-sidecar/sb.yml
 #
-# See docs/prompt-injection-v2.md for the failure posture and
+# See docs/prompt-injection-v2.md for the fallback contract and
 # docs/classifier-sidecar.md for the rich sidecar's full capability list.
 
 proxy:
@@ -47,10 +51,12 @@ origins:
           model: prompt-injection
           injection_label: injection
           timeout_ms: 250
-          # A sidecar outage degrades to "clean" (allow). Pair with the
-          # client-side FallbackClassifier (see
-          # crates/sbproxy-classifier-client/examples/fallback.rs) when a
-          # caller wants the sidecar's verdict to be a genuine optional
-          # upgrade over an in-process classifier rather than a plain
-          # allow-on-outage.
-          failure_posture: open
+          # Every sidecar transport, timeout, RPC, admission, or response
+          # validation failure is classified by this verified local model.
+          fallback:
+            model_path: "${SBPROXY_PROMPT_INJECTION_FALLBACK_MODEL_PATH}"
+            tokenizer_path: "${SBPROXY_PROMPT_INJECTION_FALLBACK_TOKENIZER_PATH}"
+            model_sha256: "${SBPROXY_PROMPT_INJECTION_FALLBACK_MODEL_SHA256}"
+            tokenizer_sha256: "${SBPROXY_PROMPT_INJECTION_FALLBACK_TOKENIZER_SHA256}"
+            labels: [safe, injection]
+            injection_label: injection

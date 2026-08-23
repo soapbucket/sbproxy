@@ -262,12 +262,21 @@ origins:
           model: prompt-injection
           injection_label: INJECTION
           timeout_ms: 250
-          failure_posture: open  # a sidecar outage degrades to "clean" (allow)
+          fallback:
+            model_path: /var/lib/sbproxy/models/injection/model.onnx
+            tokenizer_path: /var/lib/sbproxy/models/injection/tokenizer.json
+            model_sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+            tokenizer_sha256: abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
+            labels: ["SAFE", "INJECTION"]
+            injection_label: INJECTION
 ```
 
-An explicit `detector: sidecar` always wins. If `detector` is omitted instead,
-SBproxy attempts verified in-process auto-selection and uses
-`heuristic-v1` only when both resolved local artifacts are absent.
+An explicit `detector: sidecar` makes the sidecar primary and requires the
+verified local ONNX `fallback`; every primary transport, timeout, RPC,
+admission, or response-validation failure runs that fallback instead of
+admitting an unscored request. If `detector` is omitted instead, SBproxy
+attempts verified in-process auto-selection and uses `heuristic-v1` only when
+both resolved local artifacts are absent.
 
 ## Verified in-process selection
 

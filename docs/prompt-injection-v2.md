@@ -1,5 +1,5 @@
 # prompt_injection_v2
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-22*
 
 ![Two requests carrying injection-style instructions: one tagged, one blocked](assets/prompt-injection-v2.gif)
 
@@ -9,7 +9,9 @@ returns a numeric score plus a categorical label, and the policy maps
 the score onto an action. The binary includes heuristic, in-process
 ONNX, and sidecar detectors. When `detector` is omitted, SBproxy uses a
 verified in-process model if a complete artifact pair is staged and
-otherwise logs one startup event and uses the heuristic.
+otherwise logs one startup event and uses the heuristic. An explicit
+`detector: sidecar` is a composite: its primary gRPC detector requires
+a pinned, verified in-process ONNX fallback at config load.
 
 ## Why a v2 policy
 
@@ -197,13 +199,14 @@ classifier lands.
 ## In-process vs out-of-process model inference
 
 SBproxy ships two ways to run a learned classifier alongside the
-heuristic detector. `detector: sidecar` runs the model out of process
-behind a gRPC contract and is the preferred choice: a malformed or
-oversized model can only take down the sidecar, not the proxy.
-`detector: inprocess` runs the same tract-based ONNX classifier inside
-the proxy address space; omission can also select it through the
-verified artifact rules above. The legacy `detector: onnx` name was
-removed and fails at config load with a pointer to supported choices.
+heuristic detector. `detector: sidecar` runs the primary model out of
+process behind a gRPC contract and requires a separately verified local
+ONNX fallback; faults in the richer primary runtime stay isolated while
+loss of that runtime does not bypass classification. `detector:
+inprocess` runs the same tract-based ONNX classifier directly inside the
+proxy address space; omission can also select it through the verified
+artifact rules above. The legacy `detector: onnx` name was removed and
+fails at config load with a pointer to supported choices.
 
 The trained model weights do not ship at all. The registry intentionally
 has no trusted `prompt-injection-v2` entry: the audited first-party
@@ -250,8 +253,14 @@ policies:
       injection_label: injection
       # Per-call timeout in milliseconds (covers the lazy connect).
       timeout_ms: 250
-      # Failure posture when the sidecar is unreachable or slow.
-      failure_posture: open
+      # Mandatory verified fallback for every sidecar failure.
+      fallback:
+        model_path: /var/lib/sbproxy/models/injection/model.onnx
+        tokenizer_path: /var/lib/sbproxy/models/injection/tokenizer.json
+        model_sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+        tokenizer_sha256: abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
+        labels: ["SAFE", "INJECTION"]
+        injection_label: INJECTION
 ```
 
 The client connects lazily, so the proxy starts even when the sidecar
@@ -259,47 +268,39 @@ is not up yet, and the first request after the sidecar comes online
 succeeds. The `detector_config` block is validated at config load and
 rejects an invalid `endpoint` URI, a `threshold` that is not a finite
 number in `[0.0, 1.0]`, a `timeout_ms` of zero, or an empty
-`injection_label`.
+`injection_label`. It also loads and verifies the fallback model and
+tokenizer before the proxy can serve: both paths and SHA-256 pins are
+mandatory, the configured size budgets are enforced, and optional
+Ed25519 signatures must be complete and valid when supplied.
 
-### Failure posture
+### Mandatory verified fallback
 
-A sidecar that is down, slower than `timeout_ms`, or returning an error
-is handled by `failure_posture`, in the shared vocabulary from
-[degradation.md](degradation.md):
+A sidecar that is down, slower than `timeout_ms`, returns an RPC error,
+sheds the request, or returns a malformed response does not produce a
+clean verdict. The proxy logs the primary failure and classifies the
+same prompt through the verified local ONNX fallback. This keeps the
+sidecar optional as a deployment component without making classification
+optional on its failure path.
 
-- `failure_posture: open` (default) returns a clean verdict and lets
-  the request through, so an inference outage never blocks traffic.
-- `failure_posture: closed` returns a high-confidence injection. Pair
-  this with `action: block` only when a missing verdict should deny the
-  request, and budget for the sidecar's availability accordingly.
-- `degraded` and `observe` are rejected at config load. The detector
-  has no channel yet to mark an admitted request's detection guarantee
-  as waived, and a sidecar that never answered produced no verdict to
-  shadow-record.
-
-A sidecar that sheds load is in the same bucket. The sidecar bounds the
-bytes, batch size, concurrency, and duration of every inference it runs,
-and a request past any of those bounds comes back as
-`RESOURCE_EXHAUSTED` or `DEADLINE_EXCEEDED` rather than a verdict. The
-detector cannot tell that apart from an outage and does not try to: both
-take the `failure_posture` path. See
+The sidecar bounds the bytes, batch size, concurrency, and duration of
+every inference it runs. A request past any of those bounds comes back
+as `RESOURCE_EXHAUSTED` or `DEADLINE_EXCEEDED` and takes the same local
+fallback path. See
 [classifier-sidecar.md](classifier-sidecar.md#3-request-limits-and-load-shedding)
 for the limits and their defaults.
 
-The older boolean `fail_closed` still parses and still means what it
-always meant: `true` resolves to `closed` and `false` (the default)
-resolves to `open`, so an existing config keeps its exact behavior.
-Setting both keys to values that disagree is a config-load error.
-
-Malformed responses follow the same posture. Every classification
-response is validated before the detector reads it: it must carry at
-least one label, every label needs a non-empty name that is unique
+Every sidecar response is validated before the detector reads it: it
+must carry at least one label, every label needs a non-empty name unique
 within the response (compared case-insensitively), and every score must
-be a finite number between 0.0 and 1.0. A response that fails any of
-these checks is a protocol error and is handled by `failure_posture`
-exactly like a sidecar that is down; it is never interpreted as a clean
-verdict. Labels are ordered highest score first after validation, so
-the verdict does not depend on the order the sidecar sent them in.
+be finite and in `[0.0, 1.0]`. Labels are ordered highest score first
+after validation, so the verdict does not depend on wire order. A
+response that fails those checks is a protocol failure and invokes the
+fallback; it is never interpreted as clean.
+
+The legacy `failure_posture` and `fail_closed` keys still parse for
+configuration compatibility, including their conflict validation, but
+they do not bypass the mandatory fallback on the policy's shipping
+`detector: sidecar` path. New configurations should omit both.
 
 ### Running the sidecar
 
@@ -330,7 +331,12 @@ spec:
   containers:
     - name: sbproxy
       image: REGISTRY/sbproxy:TAG
-      # proxy config selects detector: sidecar, endpoint http://127.0.0.1:9440
+      # Proxy config selects detector: sidecar, endpoint
+      # http://127.0.0.1:9440, and pins the pair under fallback.
+      volumeMounts:
+        - name: models
+          mountPath: /models
+          readOnly: true
     - name: classifier-sidecar
       image: REGISTRY/sbproxy-classifier-sidecar:TAG
       args:
@@ -343,8 +349,9 @@ spec:
           readOnly: true
   volumes:
     - name: models
-      # Stage model artifacts however you prefer: a baked image layer,
-      # an initContainer download, or a persistent volume.
+      # Stage immutable model artifacts however you prefer: a baked image
+      # layer, an initContainer download, or a persistent volume. Both
+      # containers read the pair; only the sidecar is the primary runtime.
       emptyDir: {}
 ```
 
