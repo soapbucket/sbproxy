@@ -648,10 +648,10 @@ pub fn inject_cnf_jkt(
     proof: &DpopProof,
     broker_signing_key: Option<&crate::config::JwkKey>,
 ) -> Result<bytes::Bytes, DpopError> {
-    if std::str::from_utf8(body)
+    let body_is_secret_reference = std::str::from_utf8(body)
         .ok()
-        .is_some_and(sbproxy_vault::looks_like_secret_reference_uri)
-    {
+        .is_some_and(|text| sbproxy_vault::looks_like_secret_reference_uri(text));
+    if body_is_secret_reference {
         return Err(DpopError::PayloadInvalid(
             "upstream token response is a secret reference".to_string(),
         ));

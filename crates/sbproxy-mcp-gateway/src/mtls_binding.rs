@@ -131,10 +131,10 @@ pub fn inject_cnf_x5t_s256(
     cert_der: &[u8],
     broker_signing_key: Option<&crate::config::JwkKey>,
 ) -> Result<bytes::Bytes, MtlsBindingError> {
-    if std::str::from_utf8(body)
+    let body_is_secret_reference = std::str::from_utf8(body)
         .ok()
-        .is_some_and(sbproxy_vault::looks_like_secret_reference_uri)
-    {
+        .is_some_and(|text| sbproxy_vault::looks_like_secret_reference_uri(text));
+    if body_is_secret_reference {
         return Err(MtlsBindingError::PayloadInvalid(
             "upstream token response is a secret reference".to_string(),
         ));
