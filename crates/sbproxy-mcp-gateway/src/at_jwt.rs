@@ -38,7 +38,9 @@
 
 use anyhow::{anyhow, Result};
 use base64::Engine;
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use jsonwebtoken::{
+    decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
+};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
@@ -89,6 +91,10 @@ pub struct AtJwtClaims {
     /// the RFC; we round-trip whatever the caller passes through.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub act: Option<serde_json::Value>,
+    /// Optional confirmation-method claims such as DPoP `jkt` or mTLS
+    /// `x5t#S256`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cnf: Option<serde_json::Value>,
 
     // --- draft-oauth-transaction-tokens-for-agents-04 (WOR-521) ---
     //
@@ -138,6 +144,45 @@ pub fn mint_at_jwt(claims: &AtJwtClaims, key: &JwkKey) -> Result<String> {
     header.typ = Some("at+jwt".to_string());
     header.kid = kid;
     encode(&header, claims, &encoding).map_err(|e| anyhow!("at+jwt sign failed: {e}"))
+}
+
+/// Verify an RFC 9068 access token minted by this broker and return its
+/// typed claims. This intentionally accepts only the configured broker key,
+/// issuer, and resource audience; it is used at credential-rebinding and
+/// local-revocation boundaries where merely decoding an untrusted JWT would
+/// let fabricated values allocate security state.
+pub fn verify_broker_at_jwt(
+    token: &str,
+    key: &JwkKey,
+    broker_issuer: &str,
+    resource_audience: &str,
+) -> Result<AtJwtClaims> {
+    let header = decode_header(token).map_err(|_| anyhow!("access token header is invalid"))?;
+    if !header.typ.as_deref().is_some_and(|value| {
+        value.eq_ignore_ascii_case("at+jwt") || value.eq_ignore_ascii_case("application/at+jwt")
+    }) {
+        return Err(anyhow!("access token typ is not at+jwt"));
+    }
+    let (decoding, expected_algorithm, expected_kid) = build_decoding_key(key)?;
+    if header.alg != expected_algorithm || header.kid != expected_kid {
+        return Err(anyhow!(
+            "access token header does not match the broker signing profile"
+        ));
+    }
+    let mut validation = Validation::new(expected_algorithm);
+    validation.set_issuer(&[broker_issuer]);
+    validation.set_audience(&[resource_audience]);
+    let claims = decode::<AtJwtClaims>(token, &decoding, &validation)
+        .map_err(|_| anyhow!("access token signature or registered claims are invalid"))?
+        .claims;
+    if claims.iss.is_empty()
+        || claims.sub.is_empty()
+        || claims.client_id.is_empty()
+        || claims.jti.is_empty()
+    {
+        return Err(anyhow!("access token has an empty required claim"));
+    }
+    Ok(claims)
 }
 
 /// Re-issue a JWT-shaped upstream access token as a broker-owned
@@ -258,7 +303,7 @@ impl AtJwtClaims {
 /// conversion path that jsonwebtoken offers via from_jwk.
 fn build_encoding_key(key: &JwkKey) -> Result<(EncodingKey, Algorithm, Option<String>)> {
     match key {
-        JwkKey::Pem { pem, alg, kid } => {
+        JwkKey::Pem { pem, alg, kid, .. } => {
             let algorithm = parse_alg(alg)?;
             let encoding = match algorithm {
                 Algorithm::RS256
@@ -291,6 +336,52 @@ fn build_encoding_key(key: &JwkKey) -> Result<(EncodingKey, Algorithm, Option<St
                 "broker_signing_key as JWK is not supported in the signer; \
                  use JwkKey::Pem and publish the matching JWK separately"
             ))
+        }
+    }
+}
+
+fn build_decoding_key(key: &JwkKey) -> Result<(DecodingKey, Algorithm, Option<String>)> {
+    match key {
+        JwkKey::Pem {
+            alg,
+            kid,
+            public_jwk,
+            ..
+        } => {
+            let algorithm = parse_alg(alg)?;
+            let public_jwk = public_jwk.as_ref().ok_or_else(|| {
+                anyhow!("broker PEM key requires matching public_jwk for verification")
+            })?;
+            let public_jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(public_jwk.clone())
+                .map_err(|error| anyhow!("broker public_jwk is invalid: {error}"))?;
+            if public_jwk
+                .common
+                .key_algorithm
+                .map(|value| value.to_string())
+                != Some(format!("{algorithm:?}"))
+                || public_jwk.common.key_id != *kid
+            {
+                return Err(anyhow!(
+                    "broker public_jwk does not match configured alg/kid"
+                ));
+            }
+            let decoding = DecodingKey::from_jwk(&public_jwk)
+                .map_err(|error| anyhow!("broker public_jwk decoding key failed: {error}"))?;
+            Ok((decoding, algorithm, kid.clone()))
+        }
+        JwkKey::Jwk { jwk } => {
+            let jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(jwk.clone())
+                .map_err(|error| anyhow!("broker JWK is invalid: {error}"))?;
+            let algorithm = jwk
+                .common
+                .key_algorithm
+                .ok_or_else(|| anyhow!("broker JWK requires alg"))?
+                .to_string();
+            let algorithm = parse_alg(&algorithm)?;
+            let kid = jwk.common.key_id.clone();
+            let decoding = DecodingKey::from_jwk(&jwk)
+                .map_err(|error| anyhow!("broker JWK decoding key failed: {error}"))?;
+            Ok((decoding, algorithm, kid))
         }
     }
 }
@@ -337,7 +428,13 @@ pub fn broker_jwks(key: Option<&JwkKey>) -> JwksDocument {
         return JwksDocument { keys: vec![] };
     };
     match key {
-        JwkKey::Pem { .. } => JwksDocument { keys: vec![] },
+        JwkKey::Pem { public_jwk, .. } => JwksDocument {
+            keys: public_jwk
+                .clone()
+                .map(strip_private_jwk_fields)
+                .into_iter()
+                .collect(),
+        },
         JwkKey::Jwk { jwk } => {
             let public = strip_private_jwk_fields(jwk.clone());
             JwksDocument { keys: vec![public] }
@@ -377,6 +474,15 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
             pem: PEM.to_string(),
             alg: "ES256".to_string(),
             kid: Some("test-key-1".to_string()),
+            public_jwk: Some(serde_json::json!({
+                "kty": "EC",
+                "crv": "P-256",
+                "x": "EVs_o5-uQbTjL3chynL4wXgUg2R9q9UU8I5mEovUf84",
+                "y": "kGe5DgSIycKp8w9aJmoHhB1sB3QTugfnRWm5nU_TzsY",
+                "kid": "test-key-1",
+                "use": "sig",
+                "alg": "ES256"
+            })),
         }
     }
 
@@ -394,6 +500,7 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
             acr: None,
             amr: Some(vec!["pwd".to_string()]),
             act: None,
+            cnf: None,
             actor: None,
             principal: None,
             tnx: None,
@@ -473,6 +580,34 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
     }
 
     #[test]
+    fn broker_token_verifier_accepts_only_the_matching_profile() {
+        let key = fixture_es256_pem();
+        let mut claims = fixture_claims();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        claims.iat = now;
+        claims.exp = now + 60;
+        let token = mint_at_jwt(&claims, &key).unwrap();
+        let verified = verify_broker_at_jwt(
+            &token,
+            &key,
+            "https://broker.example",
+            "https://api.example",
+        )
+        .expect("matching broker token must verify");
+        assert_eq!(verified.jti, claims.jti);
+        assert!(verify_broker_at_jwt(
+            &token,
+            &key,
+            "https://different.example",
+            "https://api.example",
+        )
+        .is_err());
+    }
+
+    #[test]
     fn resign_at_jwt_signs_mutated_claims_with_a_fresh_signature() {
         let key = fixture_es256_pem();
         let unsigned_shape = "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCJ9.eyJpc3MiOiJodHRwczovL3Vwc3RyZWFtLmV4YW1wbGUiLCJzdWIiOiJ1c2VyLTQyIiwiYXVkIjoiaHR0cHM6Ly9tY3AuZXhhbXBsZSIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwLCJqdGkiOiJvbGQtaWQiLCJjbGllbnRfaWQiOiJjbGllbnQtYWJjIn0.invalid-signature";
@@ -547,13 +682,11 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
     }
 
     #[test]
-    fn broker_jwks_empty_for_pem_key() {
-        // PEM keys cannot trivially round-trip to JWK without extra
-        // crypto work; we emit empty rather than half-render. The
-        // alternative would be to require operators to also publish
-        // a JWK-shaped key alongside the PEM private one.
+    fn broker_jwks_publishes_the_public_jwk_paired_with_a_pem_key() {
         let doc = broker_jwks(Some(&fixture_es256_pem()));
-        assert!(doc.keys.is_empty());
+        assert_eq!(doc.keys.len(), 1);
+        assert_eq!(doc.keys[0]["kid"], "test-key-1");
+        assert!(doc.keys[0].get("d").is_none());
     }
 
     #[test]

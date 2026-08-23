@@ -987,7 +987,7 @@ pub struct McpServerInfoConfig {
 pub struct McpFederatedServerConfig {
     /// Upstream MCP endpoint. Either a full URL
     /// (`https://example.com/mcp`) or a bare hostname; bare hostnames
-    /// are normalised to `https://<host>/mcp`.
+    /// are normalized to `https://<host>/mcp`.
     pub origin: String,
     /// Optional namespace label for this upstream. It sets the server name
     /// used to disambiguate name collisions, and, when `namespace: always`
@@ -4485,7 +4485,7 @@ impl McpAction {
         Self::from_parsed(cfg)
     }
 
-    /// Compile an `McpAction` from already-deserialised config. Split
+    /// Compile an `McpAction` from already-deserialized config. Split
     /// out from `from_config` so unit tests skip the JSON round-trip.
     pub fn from_parsed(cfg: McpActionConfig) -> anyhow::Result<Self> {
         if cfg.mode != "gateway" {
@@ -4508,6 +4508,7 @@ impl McpAction {
                 }
             }
         }
+        let oauth_security = sbproxy_mcp_gateway::McpSecurityContext::new();
         let resource_server = cfg
             .oauth
             .as_ref()
@@ -4524,7 +4525,10 @@ impl McpAction {
                     );
                 }
                 Ok(Arc::new(
-                    sbproxy_mcp_gateway::McpResourceServerProvider::new(resource)?,
+                    sbproxy_mcp_gateway::McpResourceServerProvider::new_with_security_context(
+                        resource,
+                        oauth_security.clone(),
+                    )?,
                 ))
             })
             .transpose()?;
@@ -4532,7 +4536,12 @@ impl McpAction {
             .oauth
             .as_ref()
             .and_then(|oauth| oauth.broker.clone())
-            .map(sbproxy_mcp_gateway::McpGatewayRuntime::new)
+            .map(|broker| {
+                sbproxy_mcp_gateway::McpGatewayRuntime::new_with_security_context(
+                    broker,
+                    oauth_security.clone(),
+                )
+            })
             .transpose()?
             .map(Arc::new);
         let modern_http = cfg
@@ -7366,7 +7375,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_hostname_normalises_to_https_mcp() {
+    fn bare_hostname_normalizes_to_https_mcp() {
         // Internal helper test: protects the wire-shape doc.
         assert_eq!(
             normalize_origin("github.example.com").unwrap(),
@@ -7565,7 +7574,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unrecognised_protocol_pin_is_rejected() {
+    fn an_unrecognized_protocol_pin_is_rejected() {
         let value = json!({
             "type": "mcp",
             "federated_servers": [
@@ -7580,7 +7589,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unrecognised_downgrade_mode_is_rejected_by_serde() {
+    fn an_unrecognized_downgrade_mode_is_rejected_by_serde() {
         let value = json!({
             "type": "mcp",
             "federated_servers": [

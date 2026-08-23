@@ -131,7 +131,6 @@ impl EphemeralKv for MockEphemeralKv {
         Ok(false)
     }
 
-
     async fn compare_exchange(
         &self,
         key: &str,

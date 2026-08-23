@@ -20,6 +20,9 @@ use sbproxy_security::url_redact::redacted_url;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+const MAX_AS_METADATA_BYTES: usize = 128 * 1024;
+const MAX_AS_JWKS_BYTES: usize = 256 * 1024;
+
 // --- Document model ---
 
 /// RFC 8414 Authorization-Server metadata. We deliberately model only
@@ -73,6 +76,7 @@ pub struct AsMetadataCache {
     /// Configured metadata document URL (typically
     /// `<issuer>/.well-known/oauth-authorization-server`).
     pub metadata_url: String,
+    allow_insecure_loopback: bool,
     /// Last-fetched metadata doc plus the wall-clock fetch time. The
     /// fetch time drives the refresh / staleness policy.
     current: Mutex<Option<(Arc<AuthorizationServerMetadata>, Instant)>>,
@@ -100,9 +104,21 @@ impl AsMetadataCache {
         Self {
             http,
             metadata_url: metadata_url.into(),
+            allow_insecure_loopback: false,
             current: Mutex::new(None),
             jwks: Mutex::new(None),
         }
+    }
+
+    /// Build a cache permitting plaintext loopback endpoints for an
+    /// explicitly enabled development runtime.
+    pub fn new_with_development_loopback(
+        http: reqwest::Client,
+        metadata_url: impl Into<String>,
+    ) -> Self {
+        let mut cache = Self::new(http, metadata_url);
+        cache.allow_insecure_loopback = true;
+        cache
     }
 
     /// Returns the cached metadata if it is younger than `refresh_secs`,
@@ -168,7 +184,9 @@ impl AsMetadataCache {
         };
 
         let jwks_origin = redacted_url(jwks_uri);
-        let mut req = self.http.get(jwks_uri);
+        let (_, http) =
+            crate::egress::endpoint_client(jwks_uri, self.allow_insecure_loopback).await?;
+        let mut req = http.get(jwks_uri);
         if let Some(etag) = cached_etag.as_deref() {
             req = req.header(reqwest::header::IF_NONE_MATCH, etag);
         }
@@ -196,14 +214,10 @@ impl AsMetadataCache {
             .get(reqwest::header::ETAG)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
-        let body = resp.text().await.map_err(|e| {
-            anyhow!(
-                "jwks read body failed: {}",
-                sbproxy_httpkit::request_error_summary(&e)
-            )
-        })?;
+        let body =
+            crate::remote_body::bounded_response_body(resp, MAX_AS_JWKS_BYTES, "AS JWKS").await?;
         let set: JwkSet =
-            serde_json::from_str(&body).map_err(|e| anyhow!("jwks parse failed: {e}"))?;
+            serde_json::from_slice(&body).map_err(|e| anyhow!("jwks parse failed: {e}"))?;
         let arc = Arc::new(set);
         let mut guard = self.jwks.lock().await;
         *guard = Some(JwksEntry {
@@ -217,28 +231,26 @@ impl AsMetadataCache {
 
     async fn fetch_metadata(&self) -> Result<AuthorizationServerMetadata> {
         tracing::info!(url = %redacted_url(&self.metadata_url), "fetching as metadata");
-        let resp = self
-            .http
-            .get(&self.metadata_url)
-            .send()
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "metadata fetch failed: {}",
-                    sbproxy_httpkit::request_error_summary(&e)
-                )
-            })?;
-        if !resp.status().is_success() {
-            return Err(anyhow!("metadata fetch returned status {}", resp.status()));
-        }
-        let body = resp.text().await.map_err(|e| {
+        let (_, http) =
+            crate::egress::endpoint_client(&self.metadata_url, self.allow_insecure_loopback)
+                .await?;
+        let resp = http.get(&self.metadata_url).send().await.map_err(|e| {
             anyhow!(
-                "metadata read body failed: {}",
+                "metadata fetch failed: {}",
                 sbproxy_httpkit::request_error_summary(&e)
             )
         })?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("metadata fetch returned status {}", resp.status()));
+        }
+        let body = crate::remote_body::bounded_response_body(
+            resp,
+            MAX_AS_METADATA_BYTES,
+            "authorization-server metadata",
+        )
+        .await?;
         let doc: AuthorizationServerMetadata =
-            serde_json::from_str(&body).map_err(|e| anyhow!("metadata parse failed: {e}"))?;
+            serde_json::from_slice(&body).map_err(|e| anyhow!("metadata parse failed: {e}"))?;
         Ok(doc)
     }
 
@@ -266,7 +278,7 @@ impl AsMetadataCache {
     }
 
     /// Returns the wall-clock time at which the JWKS was last fetched,
-    /// for tests that assert ETag round-trip behaviour.
+    /// for tests that assert ETag round-trip behavior.
     #[cfg(test)]
     pub async fn jwks_fetched_at(&self) -> Option<Instant> {
         self.jwks.lock().await.as_ref().map(|e| e.fetched_at)
@@ -283,7 +295,7 @@ mod tests {
     fn cache(url: &str) -> AsMetadataCache {
         // AS metadata fetch is not credential-bearing in this test, but
         // we still exercise the hardened client to mirror prod.
-        AsMetadataCache::new(sbproxy_httpkit::default_outbound(), url)
+        AsMetadataCache::new_with_development_loopback(sbproxy_httpkit::default_outbound(), url)
     }
 
     fn fixture_doc() -> AuthorizationServerMetadata {

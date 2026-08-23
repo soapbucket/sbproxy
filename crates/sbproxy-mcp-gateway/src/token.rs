@@ -32,6 +32,8 @@ use crate::AppState;
 const DPOP_HEADER: &str = "DPoP";
 /// Header name for the AS-issued DPoP nonce (RFC 9449 §8).
 pub(crate) const DPOP_NONCE_HEADER: &str = "DPoP-Nonce";
+const MAX_TOKEN_RESPONSE_BYTES: usize = 256 * 1024;
+const REFRESH_BINDING_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 // --- Error helpers ---
 
@@ -176,6 +178,16 @@ pub async fn token(
     if let Err(e) = ensure_method_accepted(method, &cfg.accepted_client_auth_methods) {
         return oauth_error(StatusCode::UNAUTHORIZED, "invalid_client", &e.to_string());
     }
+    let client_id = match cid.as_deref().filter(|value| !value.is_empty()) {
+        Some(client_id) => client_id,
+        None => {
+            return oauth_error(
+                StatusCode::UNAUTHORIZED,
+                "invalid_client",
+                "authenticated client identity is missing",
+            );
+        }
+    };
 
     // --- Sub-handlers for grants that do not forward upstream ---
     //
@@ -191,6 +203,8 @@ pub async fn token(
                 &app,
                 &form,
                 method,
+                client_id,
+                headers.get(axum::http::header::AUTHORIZATION),
                 dpop_proof.as_ref(),
                 verified_client_cert
                     .as_ref()
@@ -344,6 +358,24 @@ pub async fn token(
     }
     let original_refresh_token = forwarded.get("refresh_token").cloned();
 
+    if grant_type == "refresh_token" && method == ClientAuthMethod::None {
+        if let Some(refresh_token) = original_refresh_token.as_deref() {
+            match require_refresh_sender_binding(
+                app.security_store.as_ref(),
+                &app.security_namespace,
+                refresh_token,
+                dpop_proof.as_ref(),
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(description) => {
+                    return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", &description);
+                }
+            }
+        }
+    }
+
     // --- Forward to upstream ---
     if cfg.upstream_token_endpoint_url.is_empty() {
         return oauth_error(
@@ -355,7 +387,22 @@ pub async fn token(
 
     // WOR-170: token-bearing endpoint; refuse redirects so a malicious
     // upstream cannot 302 the Authorization header cross-origin.
-    let http = sbproxy_httpkit::token_bearing_outbound();
+    let (_, http) = match crate::egress::endpoint_client(
+        &cfg.upstream_token_endpoint_url,
+        cfg.allow_insecure_loopback,
+    )
+    .await
+    {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::warn!(%error, "upstream token endpoint rejected by egress policy");
+            return oauth_error(
+                StatusCode::BAD_GATEWAY,
+                "server_error",
+                "upstream token endpoint is not permitted",
+            );
+        }
+    };
     let mut req = http.post(&cfg.upstream_token_endpoint_url).form(&forwarded);
     // Replay the Authorization header for client_secret_basic so the
     // upstream sees the same credentials we accepted.
@@ -364,12 +411,15 @@ pub async fn token(
             req = req.header(axum::http::header::AUTHORIZATION, value.clone());
         }
     }
+    if let Some(proof) = dpop_proof.as_ref() {
+        req = req.header(DPOP_HEADER, &proof.raw_jwt);
+    }
 
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(
-                error = %sbproxy_httpkit::request_error_summary(&e),
+                error = %e,
                 "upstream /token call failed"
             );
             return oauth_error(
@@ -381,11 +431,17 @@ pub async fn token(
     };
 
     let status = resp.status();
-    let body_bytes = match resp.bytes().await {
+    let body_bytes = match crate::remote_body::bounded_response_body(
+        resp,
+        MAX_TOKEN_RESPONSE_BYTES,
+        "upstream token",
+    )
+    .await
+    {
         Ok(b) => b,
         Err(e) => {
             tracing::error!(
-                error = %sbproxy_httpkit::request_error_summary(&e),
+                error = %e,
                 "upstream /token body read failed"
             );
             return oauth_error(
@@ -413,7 +469,7 @@ pub async fn token(
             .get("refresh_token")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        match (original_refresh_token, new_refresh) {
+        match (original_refresh_token.as_ref(), new_refresh.as_ref()) {
             (Some(old), Some(new)) if old == new => {
                 return oauth_error(
                     StatusCode::BAD_REQUEST,
@@ -429,6 +485,41 @@ pub async fn token(
                 );
             }
             _ => {}
+        }
+    }
+
+    if status.is_success() && method == ClientAuthMethod::None {
+        if let Some(proof) = dpop_proof.as_ref() {
+            let new_refresh = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+                .ok()
+                .and_then(|body| {
+                    body.get("refresh_token")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                });
+            if let Some(new_refresh) = new_refresh {
+                if let Err(error) = store_refresh_sender_binding(
+                    app.security_store.as_ref(),
+                    &app.security_namespace,
+                    &new_refresh,
+                    proof,
+                )
+                .await
+                {
+                    tracing::error!(%error, "refresh-token sender binding persistence failed");
+                    return oauth_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "server_error",
+                        "refresh-token sender binding could not be persisted",
+                    );
+                }
+                if let Some(old_refresh) = original_refresh_token.as_deref() {
+                    let _ = app
+                        .security_store
+                        .delete(&refresh_binding_key(&app.security_namespace, old_refresh))
+                        .await;
+                }
+            }
         }
     }
 
@@ -528,6 +619,56 @@ pub async fn token(
         .headers_mut()
         .insert("Pragma", axum::http::HeaderValue::from_static("no-cache"));
     response
+}
+
+fn refresh_binding_key(namespace: &str, refresh_token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(refresh_token.as_bytes());
+    let digest: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("refresh-binding:{namespace}:{digest}")
+}
+
+async fn store_refresh_sender_binding(
+    store: &dyn sbproxy_storage::EphemeralKv,
+    namespace: &str,
+    refresh_token: &str,
+    proof: &DpopProof,
+) -> anyhow::Result<()> {
+    let jkt = jwk_thumbprint(&proof.jwk)?;
+    store
+        .put(
+            &refresh_binding_key(namespace, refresh_token),
+            bytes::Bytes::from(jkt),
+            REFRESH_BINDING_TTL,
+        )
+        .await?;
+    Ok(())
+}
+
+async fn require_refresh_sender_binding(
+    store: &dyn sbproxy_storage::EphemeralKv,
+    namespace: &str,
+    refresh_token: &str,
+    proof: Option<&DpopProof>,
+) -> Result<(), String> {
+    let expected = store
+        .get(&refresh_binding_key(namespace, refresh_token))
+        .await
+        .map_err(|_| "refresh-token sender binding is unavailable".to_string())?;
+    let Some(expected) = expected else {
+        return Err(
+            "public-client refresh token is unknown or its sender binding expired".to_string(),
+        );
+    };
+    let proof = proof.ok_or_else(|| {
+        "DPoP proof required for this sender-constrained refresh token".to_string()
+    })?;
+    let actual = jwk_thumbprint(&proof.jwk)
+        .map_err(|_| "DPoP key thumbprint could not be computed".to_string())?;
+    if expected.as_ref() != actual.as_bytes() {
+        return Err("DPoP key does not match this refresh token's original binding".to_string());
+    }
+    Ok(())
 }
 
 // --- DPoP helpers ---
@@ -806,7 +947,8 @@ async fn resolve_dcr_for_token(
     }
     // WOR-170: DCR translation forwards credentials to the upstream
     // registration endpoint; use the token-bearing client.
-    let http = sbproxy_httpkit::token_bearing_outbound();
+    let (_, http) =
+        crate::egress::endpoint_client(dcr_endpoint, app.config.allow_insecure_loopback).await?;
     let reg = crate::cimd_to_dcr::translate_cimd_to_dcr(doc, dcr_endpoint, &http).await?;
     cache.put(cimd_url, &fp, reg.clone()).await;
     Ok(reg.registered_client_id)
@@ -871,11 +1013,7 @@ async fn handle_device_code_grant(
     };
 
     let state = match store
-        .poll_and_consume(
-            &device_code,
-            req_client_id,
-            crate::device_code::unix_now(),
-        )
+        .poll_and_consume(&device_code, req_client_id, crate::device_code::unix_now())
         .await
     {
         Ok(crate::device_code::DevicePollOutcome::Authorized(state)) => state,
@@ -1280,13 +1418,59 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
         )]);
         let mut cfg = test_config();
         cfg.token_exchange_enabled = true;
-        cfg.subject_token_issuers = vec!["https://idp.example".to_string()];
+        cfg.external_base_url = "https://broker.example".to_string();
+        cfg.allow_insecure_loopback = true;
+        cfg.broker_signing_key = Some(crate::config::JwkKey::Pem {
+            pem: "-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgevZzL1gdAFr88hb2\n\
+OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
+1RTwjmYSi9R/zpBnuQ4EiMnCqfMPWiZqB4QdbAd0E7oH50VpuZ1P087G\n\
+-----END PRIVATE KEY-----"
+                .to_string(),
+            alg: "ES256".to_string(),
+            kid: Some("broker-key".to_string()),
+            public_jwk: Some(serde_json::json!({
+                "kty": "EC", "crv": "P-256",
+                "x": "EVs_o5-uQbTjL3chynL4wXgUg2R9q9UU8I5mEovUf84",
+                "y": "kGe5DgSIycKp8w9aJmoHhB1sB3QTugfnRWm5nU_TzsY",
+                "kid": "broker-key", "use": "sig", "alg": "ES256"
+            })),
+        });
+        let issuer = crate::well_known::broker_issuer(&cfg);
+        cfg.subject_token_issuers = vec![issuer.clone()];
+        let proof_jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(serde_json::json!({
+            "kty": "EC", "crv": "P-256",
+            "x": "EVs_o5-uQbTjL3chynL4wXgUg2R9q9UU8I5mEovUf84",
+            "y": "kGe5DgSIycKp8w9aJmoHhB1sB3QTugfnRWm5nU_TzsY"
+        }))
+        .unwrap();
+        let now = crate::device_code::unix_now();
+        let subject_token = crate::at_jwt::mint_at_jwt(
+            &crate::at_jwt::AtJwtClaims {
+                iss: issuer,
+                sub: "alice".to_string(),
+                aud: serde_json::Value::String(cfg.resource_uri.clone()),
+                exp: now + 300,
+                iat: now,
+                jti: "exchange-subject".to_string(),
+                client_id: "cli".to_string(),
+                scope: Some("tools:call".to_string()),
+                auth_time: None,
+                acr: None,
+                amr: None,
+                act: None,
+                cnf: Some(serde_json::json!({
+                    "jkt": crate::dpop::jwk_thumbprint(&proof_jwk).unwrap()
+                })),
+                actor: None,
+                principal: None,
+                tnx: None,
+                purpose: None,
+            },
+            cfg.broker_signing_key.as_ref().unwrap(),
+        )
+        .unwrap();
         let app = build_app(cfg);
-        let subject_payload = base64::Engine::encode(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            serde_json::json!({"iss": "https://idp.example", "sub": "alice"}).to_string(),
-        );
-        let subject_token = format!("e30.{subject_payload}.signature");
         let proof = token_endpoint_dpop_proof("token-exchange-no-ath", None);
         let request = Request::builder()
             .method("POST")
@@ -1307,6 +1491,75 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(String::from_utf8_lossy(&body).contains("missing required ath"));
+    }
+
+    fn sender_proof(jwk: serde_json::Value, jti: &str) -> DpopProof {
+        DpopProof {
+            jwk: serde_json::from_value(jwk).unwrap(),
+            jti: jti.to_string(),
+            htm: "POST".to_string(),
+            htu: "https://broker.example/mcp/oauth/token".to_string(),
+            iat: crate::device_code::unix_now(),
+            nonce: None,
+            ath: None,
+            raw_jwt: "[REDACTED TEST PROOF]".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn public_refresh_binding_rejects_missing_and_wrong_proof_keys() {
+        let store = crate::LocalStore::arc();
+        let original = sender_proof(
+            serde_json::json!({
+                "kty": "EC", "crv": "P-256",
+                "x": "EVs_o5-uQbTjL3chynL4wXgUg2R9q9UU8I5mEovUf84",
+                "y": "kGe5DgSIycKp8w9aJmoHhB1sB3QTugfnRWm5nU_TzsY"
+            }),
+            "original",
+        );
+        let attacker = sender_proof(
+            serde_json::json!({
+                "kty": "EC", "crv": "P-256",
+                "x": "DpZdjog3y9hgIyKgEPltBi5ptXKUeuRwVOAPSmoQAu4",
+                "y": "bfVVYV9slbMcg4dvtvYbeekYtpFXsYCWcIa9RCrBmTc"
+            }),
+            "attacker",
+        );
+
+        store_refresh_sender_binding(store.as_ref(), "tenant-a", "refresh-secret", &original)
+            .await
+            .unwrap();
+        assert!(
+            require_refresh_sender_binding(store.as_ref(), "tenant-a", "refresh-secret", None,)
+                .await
+                .is_err()
+        );
+        assert!(require_refresh_sender_binding(
+            store.as_ref(),
+            "tenant-a",
+            "refresh-secret",
+            Some(&attacker),
+        )
+        .await
+        .unwrap_err()
+        .contains("does not match"));
+        require_refresh_sender_binding(
+            store.as_ref(),
+            "tenant-a",
+            "refresh-secret",
+            Some(&original),
+        )
+        .await
+        .unwrap();
+        assert!(require_refresh_sender_binding(
+            store.as_ref(),
+            "tenant-b",
+            "refresh-secret",
+            Some(&original),
+        )
+        .await
+        .unwrap_err()
+        .contains("unknown"));
     }
 
     fn build_app_with_dpop(cfg: McpGatewayConfig) -> Router {
@@ -1508,6 +1761,7 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
             pem: include_str!("../../sbproxy-modules/src/auth/dpop_test_ec_p256.pem").to_string(),
             alg: "ES256".to_string(),
             kid: Some("broker-key".to_string()),
+            public_jwk: None,
         };
 
         let rewritten =

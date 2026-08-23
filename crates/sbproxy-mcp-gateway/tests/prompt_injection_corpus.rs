@@ -521,8 +521,15 @@ async fn op_inject_act_envelope_no_signing_key(e: &Entry, outcome: Outcome) {
         sub: Some("alice".into()),
         act: None,
     };
-    let result = inject_act_envelope(&body, &subject, None, None, "https://broker.example")
-        .expect("envelope ok");
+    let result = inject_act_envelope(
+        &body,
+        &subject,
+        "authenticated-client",
+        None,
+        None,
+        "https://broker.example",
+    )
+    .expect("envelope ok");
     let parsed: serde_json::Value = serde_json::from_slice(&result).expect("parse");
     assert!(matches!(outcome, Outcome::Sanitized));
     // access_token must pass through unchanged.

@@ -204,7 +204,18 @@ pub async fn register(
     // Forward to the upstream.
     // WOR-170: DCR call may carry an initial-access-token bearer; use
     // the token-bearing client so a 302 cannot leak it cross-host.
-    let http = sbproxy_httpkit::token_bearing_outbound();
+    let (_, http) =
+        match crate::egress::endpoint_client(upstream_url, cfg.allow_insecure_loopback).await {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!(%error, "registration endpoint rejected by egress policy");
+                return oauth_error(
+                    StatusCode::BAD_GATEWAY,
+                    "server_error",
+                    "upstream registration endpoint is not permitted",
+                );
+            }
+        };
     let resp = match http
         .post(upstream_url)
         .header(axum::http::header::CONTENT_TYPE, "application/json")
@@ -322,6 +333,7 @@ mod tests {
         // the full struct.
         let _ = default_accepted_client_auth_methods; // kept for symmetry with neighbors
         McpGatewayConfig {
+            allow_insecure_loopback: true,
             upstream_authorization_server_url: "https://idp.example.com/oauth/authorize"
                 .to_string(),
             resource_uri: "https://mcp.example/api".to_string(),

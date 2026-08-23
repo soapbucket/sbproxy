@@ -29,13 +29,14 @@
 //! * No raw token is persisted locally; the denylist key is SHA-256.
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use base64::Engine;
 use bytes::Bytes;
 use sbproxy_storage::EphemeralKv;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::Mutex;
 
 use axum::{
     extract::State,
@@ -46,73 +47,157 @@ use axum::{
 
 use crate::AppState;
 
-const LOCAL_REVOCATION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const REVOCATION_EXPIRY_GRACE_SECS: u64 = 60;
+const REVOCATION_CAS_RETRIES: usize = 32;
 
-/// Retain a JWT denylist entry for its remaining advertised lifetime.
-///
-/// The payload is used only to choose a retention period. Signature,
-/// issuer, and audience validation still happen in the resource
-/// provider before a non-revoked token is trusted. Opaque or malformed
-/// tokens use a conservative one-day fallback.
-fn revocation_ttl(token: &str) -> Duration {
-    let mut parts = token.split('.');
-    let (Some(_header), Some(payload), Some(_signature), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return LOCAL_REVOCATION_TTL;
-    };
-    let Ok(payload) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) else {
-        return LOCAL_REVOCATION_TTL;
-    };
-    let Ok(claims) = serde_json::from_slice::<serde_json::Value>(&payload) else {
-        return LOCAL_REVOCATION_TTL;
-    };
-    let Some(exp) = claims.get("exp").and_then(serde_json::Value::as_u64) else {
-        return LOCAL_REVOCATION_TTL;
-    };
+fn validated_revocation_ttl(exp: i64, maximum: Duration) -> Duration {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
     Duration::from_secs(
-        exp.saturating_sub(now)
+        (exp.max(0) as u64)
+            .saturating_sub(now)
             .saturating_add(REVOCATION_EXPIRY_GRACE_SECS)
-            .max(1),
+            .max(1)
+            .min(maximum.as_secs().max(1)),
     )
 }
 
-pub(crate) static REVOCATIONS: LazyLock<RevocationList> = LazyLock::new(|| {
-    let store: Arc<dyn EphemeralKv> = crate::LocalStore::arc();
-    RevocationList { store }
-});
-
 pub(crate) struct RevocationList {
     store: Arc<dyn EphemeralKv>,
+    index_key: String,
+    capacity: usize,
+    maximum_ttl: Duration,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct RevocationIndex {
+    /// Token digest to absolute expiry.
+    entries: HashMap<String, u64>,
 }
 
 impl RevocationList {
-    fn key(token: &str) -> String {
-        let digest = Sha256::digest(token.as_bytes());
-        format!(
-            "revoked:{}",
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
-        )
+    pub(crate) fn new(
+        store: Arc<dyn EphemeralKv>,
+        namespace: String,
+        capacity: usize,
+        maximum_ttl: Duration,
+    ) -> Self {
+        Self {
+            store,
+            index_key: format!("revoked:{namespace}:index"),
+            capacity: capacity.max(1),
+            maximum_ttl: maximum_ttl.max(Duration::from_secs(1)),
+        }
     }
 
-    pub(crate) async fn record(&self, token: &str) -> Result<(), sbproxy_storage::StorageError> {
-        self.store
-            .put(
-                &Self::key(token),
-                Bytes::from_static(b"1"),
-                revocation_ttl(token),
-            )
-            .await
+    fn digest(token: &str) -> String {
+        let digest = Sha256::digest(token.as_bytes());
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    pub(crate) async fn record_validated(
+        &self,
+        token: &str,
+        exp: i64,
+    ) -> Result<(), sbproxy_storage::StorageError> {
+        let digest = Self::digest(token);
+        let ttl = validated_revocation_ttl(exp, self.maximum_ttl);
+        let expires_at = unix_now().saturating_add(ttl.as_secs());
+        self.mutate(move |index| {
+            if !index.entries.contains_key(&digest) && index.entries.len() >= self.capacity {
+                if let Some(evicted) = index
+                    .entries
+                    .iter()
+                    .min_by(|(left_digest, left_exp), (right_digest, right_exp)| {
+                        (**left_exp, left_digest.as_str())
+                            .cmp(&(**right_exp, right_digest.as_str()))
+                    })
+                    .map(|(digest, _)| digest.clone())
+                {
+                    index.entries.remove(&evicted);
+                }
+            }
+            index.entries.insert(digest.clone(), expires_at);
+        })
+        .await
     }
 
     pub(crate) async fn contains(&self, token: &str) -> bool {
-        self.store.exists(&Self::key(token)).await.unwrap_or(true)
+        let digest = Self::digest(token);
+        self.mutate(move |index| index.entries.contains_key(&digest))
+            .await
+            .unwrap_or(true)
     }
+
+    async fn mutate<T>(
+        &self,
+        mut operation: impl FnMut(&mut RevocationIndex) -> T,
+    ) -> Result<T, sbproxy_storage::StorageError> {
+        for _ in 0..REVOCATION_CAS_RETRIES {
+            let current = self.store.get(&self.index_key).await?;
+            let mut index: RevocationIndex = current
+                .as_ref()
+                .and_then(|bytes| serde_json::from_slice(bytes).ok())
+                .unwrap_or_default();
+            let now = unix_now();
+            index.entries.retain(|_, expires_at| *expires_at > now);
+            let result = operation(&mut index);
+            let replacement = Bytes::from(serde_json::to_vec(&index).map_err(|error| {
+                sbproxy_storage::StorageError::Backend(format!(
+                    "revocation index serialization failed: {error}"
+                ))
+            })?);
+            if self
+                .store
+                .compare_exchange(
+                    &self.index_key,
+                    current,
+                    Some((replacement, self.maximum_ttl)),
+                )
+                .await?
+            {
+                return Ok(result);
+            }
+        }
+        Err(sbproxy_storage::StorageError::Backend(
+            "revocation index CAS contention limit reached".to_string(),
+        ))
+    }
+}
+
+pub(crate) struct RevocationRateLimiter {
+    limit: u64,
+    state: Mutex<(Instant, u64)>,
+}
+
+impl RevocationRateLimiter {
+    pub(crate) fn new(limit: u64) -> Self {
+        Self {
+            limit: limit.max(1),
+            state: Mutex::new((Instant::now(), 0)),
+        }
+    }
+
+    pub(crate) async fn allow(&self) -> bool {
+        let mut state = self.state.lock().await;
+        if state.0.elapsed() >= Duration::from_secs(60) {
+            *state = (Instant::now(), 0);
+        }
+        if state.1 >= self.limit {
+            return false;
+        }
+        state.1 += 1;
+        true
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 // --- Handler ---
@@ -135,6 +220,17 @@ pub async fn revoke(
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
     let cfg = &app.config;
+
+    if !app.revocation_rate_limiter.allow().await {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            axum::Json(serde_json::json!({
+                "error": "slow_down",
+                "error_description": "revocation request rate limit exceeded"
+            })),
+        )
+            .into_response();
+    }
 
     // RFC 7009 sec 2.1: missing `token` is a malformed request.
     let token = match form.get("token") {
@@ -183,9 +279,45 @@ pub async fn revoke(
     if let Some(client_secret) = form.get("client_secret") {
         form_body.push(("client_secret", client_secret.clone()));
     }
+    if let Some(assertion_type) = form.get("client_assertion_type") {
+        form_body.push(("client_assertion_type", assertion_type.clone()));
+    }
+    if let Some(assertion) = form.get("client_assertion") {
+        form_body.push(("client_assertion", assertion.clone()));
+    }
+
+    // Only a broker-signed, issuer/resource-bound RFC 9068 token may
+    // allocate local denylist state. RFC 7009 still forwards unknown values
+    // and returns upstream success, but fabricated JWT payloads cannot pin
+    // process memory or choose retention.
+    let validated_exp = cfg.broker_signing_key.as_ref().and_then(|key| {
+        crate::at_jwt::verify_broker_at_jwt(
+            &token,
+            key,
+            &crate::well_known::broker_issuer(cfg),
+            &cfg.resource_uri,
+        )
+        .ok()
+        .map(|claims| claims.exp)
+    });
     // WOR-170: revocation forwards the bearer token in the request
     // body; refuse redirects so the token cannot leak cross-host.
-    let mut request = sbproxy_httpkit::token_bearing_outbound().post(upstream);
+    let (_, http) =
+        match crate::egress::endpoint_client(upstream, cfg.allow_insecure_loopback).await {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!(%error, "revocation endpoint rejected by egress policy");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    axum::Json(serde_json::json!({
+                        "error": "upstream_error",
+                        "error_description": "upstream revocation endpoint is not permitted"
+                    })),
+                )
+                    .into_response();
+            }
+        };
+    let mut request = http.post(upstream);
     if let Some(authorization) = headers.get(axum::http::header::AUTHORIZATION) {
         request = request.header(reqwest::header::AUTHORIZATION, authorization.clone());
     }
@@ -196,16 +328,18 @@ pub async fn revoke(
                 upstream_status = %resp.status(),
                 "upstream revocation acknowledged"
             );
-            if let Err(e) = REVOCATIONS.record(&token).await {
-                tracing::error!(error = %e, "local revocation persistence failed");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    axum::Json(serde_json::json!({
-                        "error": "server_error",
-                        "error_description": "local revocation persistence failed"
-                    })),
-                )
-                    .into_response();
+            if let Some(exp) = validated_exp {
+                if let Err(e) = app.revocations.record_validated(&token, exp).await {
+                    tracing::error!(error = %e, "local revocation persistence failed");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(serde_json::json!({
+                            "error": "server_error",
+                            "error_description": "local revocation persistence failed"
+                        })),
+                    )
+                        .into_response();
+                }
             }
         }
         Ok(resp) => {
@@ -271,14 +405,70 @@ mod tests {
         (format!("http://{address}/revoke"), receiver)
     }
 
-    async fn call(url: String, token: &str) -> StatusCode {
+    const ES256_PRIVATE_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgevZzL1gdAFr88hb2\n\
+OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
+1RTwjmYSi9R/zpBnuQ4EiMnCqfMPWiZqB4QdbAd0E7oH50VpuZ1P087G\n\
+-----END PRIVATE KEY-----\n";
+
+    fn signing_key() -> crate::config::JwkKey {
+        crate::config::JwkKey::Pem {
+            pem: ES256_PRIVATE_PEM.to_string(),
+            alg: "ES256".to_string(),
+            kid: Some("revoke-key".to_string()),
+            public_jwk: Some(serde_json::json!({
+                "kty": "EC",
+                "crv": "P-256",
+                "x": "EVs_o5-uQbTjL3chynL4wXgUg2R9q9UU8I5mEovUf84",
+                "y": "kGe5DgSIycKp8w9aJmoHhB1sB3QTugfnRWm5nU_TzsY",
+                "kid": "revoke-key",
+                "use": "sig",
+                "alg": "ES256"
+            })),
+        }
+    }
+
+    fn signed_token() -> String {
+        let now = unix_now() as i64;
+        crate::at_jwt::mint_at_jwt(
+            &crate::at_jwt::AtJwtClaims {
+                iss: "https://broker.example/mcp/oauth".to_string(),
+                sub: "user".to_string(),
+                aud: serde_json::json!("https://resource.example"),
+                exp: now + 600,
+                iat: now,
+                jti: "revocation-jti".to_string(),
+                client_id: "client".to_string(),
+                scope: Some("mcp:read".to_string()),
+                auth_time: None,
+                acr: None,
+                amr: None,
+                act: None,
+                cnf: None,
+                actor: None,
+                principal: None,
+                tnx: None,
+                purpose: None,
+            },
+            &signing_key(),
+        )
+        .unwrap()
+    }
+
+    async fn call(url: String, token: &str) -> (StatusCode, crate::McpSecurityContext) {
         let cfg = crate::config::McpGatewayConfig {
             upstream_revocation_endpoint_url: Some(url),
+            allow_insecure_loopback: true,
+            external_base_url: "https://broker.example".to_string(),
+            resource_uri: "https://resource.example".to_string(),
+            broker_signing_key: Some(signing_key()),
             ..Default::default()
         };
-        let app = crate::router(
+        let security = crate::McpSecurityContext::for_test("revoke-handler");
+        let app = crate::router_with_security_context(
             Arc::new(cfg),
             crate::session::InMemorySessionStore::arc(Duration::from_secs(60)),
+            security.clone(),
         );
         let request = Request::builder()
             .method("POST")
@@ -289,42 +479,103 @@ mod tests {
             )
             .header(axum::http::header::AUTHORIZATION, "Basic Y2xpOnNlY3JldA==")
             .body(Body::from(format!(
-                "token={token}&client_id=cli&client_secret=form-secret"
+                "token={token}&client_id=cli&client_secret=form-secret&client_assertion_type=jwt-bearer&client_assertion=assertion-value"
             )))
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         let status = response.status();
         let _ = response.into_body().collect().await.unwrap();
-        status
+        (status, security)
     }
 
     #[tokio::test]
     async fn successful_revocation_forwards_auth_and_invalidates_local_token() {
-        let token = "locally-revoked-unique-token";
+        let token = signed_token();
         let (url, captured) = upstream("200 OK").await;
-        assert_eq!(call(url, token).await, StatusCode::OK);
+        let (status, security) = call(url, &token).await;
+        assert_eq!(status, StatusCode::OK);
         let request = captured.await.unwrap();
         assert!(request.contains("authorization: Basic Y2xpOnNlY3JldA=="));
         assert!(request.contains("client_secret=form-secret"));
-        assert!(REVOCATIONS.contains(token).await);
+        assert!(request.contains("client_assertion=assertion-value"));
+        let list = RevocationList::new(
+            security.store,
+            security.namespace,
+            4,
+            Duration::from_secs(3600),
+        );
+        assert!(list.contains(&token).await);
+    }
+
+    #[tokio::test]
+    async fn unknown_upstream_success_does_not_allocate_local_state() {
+        let token = "e30.eyJleHAiOjk5OTk5OTk5OTl9.fabricated";
+        let (url, _captured) = upstream("200 OK").await;
+        let (status, security) = call(url, token).await;
+        assert_eq!(status, StatusCode::OK);
+        let list = RevocationList::new(
+            security.store,
+            security.namespace,
+            4,
+            Duration::from_secs(3600),
+        );
+        assert!(!list.contains(token).await);
     }
 
     #[tokio::test]
     async fn failed_upstream_revocation_is_not_reported_as_success() {
-        let token = "failed-revocation-unique-token";
+        let token = signed_token();
         let (url, _captured) = upstream("500 Internal Server Error").await;
-        assert_eq!(call(url, token).await, StatusCode::BAD_GATEWAY);
-        assert!(!REVOCATIONS.contains(token).await);
+        let (status, security) = call(url, &token).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let list = RevocationList::new(
+            security.store,
+            security.namespace,
+            4,
+            Duration::from_secs(3600),
+        );
+        assert!(!list.contains(&token).await);
     }
 
     #[test]
-    fn revocation_retention_covers_the_signed_tokens_remaining_lifetime() {
-        let exp = crate::device_code::unix_now() as u64 + (3 * 24 * 60 * 60);
-        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(serde_json::json!({"exp": exp}).to_string());
-        let token = format!("e30.{claims}.signature");
+    fn validated_revocation_retention_is_capped() {
+        let exp = unix_now() as i64 + (30 * 24 * 60 * 60);
+        assert_eq!(
+            validated_revocation_ttl(exp, Duration::from_secs(600)),
+            Duration::from_secs(600)
+        );
+    }
 
-        assert!(revocation_ttl(&token) > LOCAL_REVOCATION_TTL);
+    #[tokio::test]
+    async fn revocation_capacity_evicts_deterministically_and_namespaces_are_isolated() {
+        let store: Arc<dyn EphemeralKv> = crate::LocalStore::arc();
+        let tenant_a = RevocationList::new(
+            store.clone(),
+            "tenant-a".to_string(),
+            2,
+            Duration::from_secs(600),
+        );
+        let tenant_b =
+            RevocationList::new(store, "tenant-b".to_string(), 2, Duration::from_secs(600));
+        let now = unix_now() as i64;
+        tenant_a.record_validated("old", now + 10).await.unwrap();
+        tenant_a.record_validated("new", now + 100).await.unwrap();
+        tenant_a
+            .record_validated("newest", now + 200)
+            .await
+            .unwrap();
+        assert!(!tenant_a.contains("old").await);
+        assert!(tenant_a.contains("new").await);
+        assert!(tenant_a.contains("newest").await);
+        assert!(!tenant_b.contains("new").await);
+    }
+
+    #[tokio::test]
+    async fn revocation_rate_limit_fails_closed_at_the_configured_budget() {
+        let limiter = RevocationRateLimiter::new(2);
+        assert!(limiter.allow().await);
+        assert!(limiter.allow().await);
+        assert!(!limiter.allow().await);
     }
 
     /// Pure construction-side test: confirms the form-body builder

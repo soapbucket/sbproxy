@@ -65,6 +65,8 @@ use axum::{
 
 use crate::AppState;
 
+const MAX_INTROSPECTION_RESPONSE_BYTES: usize = 128 * 1024;
+
 // --- Handler ---
 
 /// `POST {base_path}/introspect` handler.
@@ -163,7 +165,22 @@ pub async fn introspect(
     // WOR-170: introspection forwards the inbound Authorization header
     // upstream; refuse redirects so a malicious AS cannot bounce the
     // request cross-host and capture the credential.
-    let mut req = sbproxy_httpkit::token_bearing_outbound().post(upstream);
+    let (_, http) =
+        match crate::egress::endpoint_client(upstream, cfg.allow_insecure_loopback).await {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!(%error, "introspection endpoint rejected by egress policy");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "error": "upstream_error",
+                        "error_description": "upstream introspection endpoint is not permitted",
+                    })),
+                )
+                    .into_response();
+            }
+        };
+    let mut req = http.post(upstream);
     if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) {
         if let Ok(s) = auth.to_str() {
             req = req.header(reqwest::header::AUTHORIZATION, s);
@@ -176,7 +193,7 @@ pub async fn introspect(
         Err(e) => {
             tracing::warn!(
                 target: "mcp_gateway::introspect",
-                error = %sbproxy_httpkit::request_error_summary(&e),
+                error = %e,
                 "upstream introspection transport failed"
             );
             return (
@@ -210,12 +227,18 @@ pub async fn introspect(
     // Proxy the upstream JSON back. We do not parse / re-emit
     // because RFC 7662 §2.2 lets the AS include implementation
     // extensions; round-tripping bytes preserves them.
-    let body = match resp.bytes().await {
+    let body = match crate::remote_body::bounded_response_body(
+        resp,
+        MAX_INTROSPECTION_RESPONSE_BYTES,
+        "upstream introspection",
+    )
+    .await
+    {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(
                 target: "mcp_gateway::introspect",
-                error = %sbproxy_httpkit::request_error_summary(&e),
+                error = %e,
                 "upstream introspection body read failed"
             );
             return (

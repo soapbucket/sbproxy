@@ -67,15 +67,16 @@ pub fn detect_method(
     form: &HashMap<String, String>,
 ) -> Result<(ClientAuthMethod, Option<String>)> {
     // 1) HTTP Basic wins if present.
-    if headers.contains_key(axum::http::header::AUTHORIZATION) {
-        let value = headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| anyhow!("authorization header is not valid utf-8"))?;
-        if let Some(rest) = value.strip_prefix("Basic ") {
-            let (cid, _) = parse_basic(rest)?;
-            return Ok((ClientAuthMethod::ClientSecretBasic, Some(cid)));
+    if let Some((cid, _secret)) = parse_basic_authorization(headers)? {
+        if form
+            .get("client_id")
+            .is_some_and(|form_client_id| form_client_id != &cid)
+        {
+            return Err(anyhow!(
+                "form client_id does not match the HTTP Basic principal"
+            ));
         }
+        return Ok((ClientAuthMethod::ClientSecretBasic, Some(cid)));
     }
 
     // 2) JWT-based assertion.
@@ -129,14 +130,8 @@ pub fn detect_method(
 /// Verify a `client_secret_basic` credential against a known secret.
 /// Returns the validated `client_id` on success.
 pub fn verify_basic(headers: &HeaderMap, expected_secret: &str) -> Result<String> {
-    let value = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
+    let (cid, secret) = parse_basic_authorization(headers)?
         .ok_or_else(|| anyhow!("missing authorization header"))?;
-    let rest = value
-        .strip_prefix("Basic ")
-        .ok_or_else(|| anyhow!("not a basic auth header"))?;
-    let (cid, secret) = parse_basic(rest)?;
     if !constant_time_eq(secret.as_bytes(), expected_secret.as_bytes()) {
         return Err(anyhow!("client_secret mismatch"));
     }
@@ -261,6 +256,26 @@ fn parse_basic(b64: &str) -> Result<(String, String)> {
     Ok((cid, secret))
 }
 
+fn parse_basic_authorization(headers: &HeaderMap) -> Result<Option<(String, String)>> {
+    let mut values = headers.get_all(axum::http::header::AUTHORIZATION).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(anyhow!("duplicate authorization headers are ambiguous"));
+    }
+    let value = value
+        .to_str()
+        .map_err(|_| anyhow!("authorization header is not valid utf-8"))?;
+    let (scheme, credential) = value
+        .split_once(' ')
+        .ok_or_else(|| anyhow!("authorization header has no credential"))?;
+    if !scheme.eq_ignore_ascii_case("Basic") {
+        return Err(anyhow!("unsupported authorization scheme"));
+    }
+    parse_basic(credential.trim()).map(Some)
+}
+
 fn peek_unverified_claims(jwt: &str) -> Result<JwtBearerClaims> {
     // Manually decode the payload segment without verification. This
     // is only used to read the iss/sub for logging or detection. The
@@ -317,6 +332,46 @@ mod tests {
         let (method, cid) = detect_method(&headers, &empty_form()).unwrap();
         assert_eq!(method, ClientAuthMethod::ClientSecretBasic);
         assert_eq!(cid.as_deref(), Some("cli"));
+    }
+
+    #[test]
+    fn detect_basic_scheme_is_case_insensitive() {
+        let mut headers = basic_header("cli", "secret");
+        let value = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .replacen("Basic", "bAsIc", 1);
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_str(&value).unwrap(),
+        );
+        assert_eq!(
+            detect_method(&headers, &empty_form()).unwrap(),
+            (ClientAuthMethod::ClientSecretBasic, Some("cli".to_string()))
+        );
+    }
+
+    #[test]
+    fn duplicate_authorization_headers_are_rejected() {
+        let mut headers = basic_header("cli", "secret");
+        headers.append(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Basic YXR0YWNrZXI6c2VjcmV0"),
+        );
+        assert!(detect_method(&headers, &empty_form())
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate"));
+    }
+
+    #[test]
+    fn basic_principal_cannot_be_overridden_by_form_client_id() {
+        let headers = basic_header("cli", "secret");
+        let mut form = empty_form();
+        form.insert("client_id".to_string(), "spoofed".to_string());
+        assert!(detect_method(&headers, &form).is_err());
     }
 
     #[test]

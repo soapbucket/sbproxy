@@ -489,25 +489,16 @@ impl PersistentKvDcrCache {
             _ => return None,
         };
         let Ok(cached) = serde_json::from_slice::<PersistentCachedRegistration>(&legacy) else {
-            let _ = self
-                .store
-                .compare_exchange(&key, Some(legacy), None)
-                .await;
+            let _ = self.store.compare_exchange(&key, Some(legacy), None).await;
             return None;
         };
         if cached.expires_at_unix <= unix_now() {
-            let _ = self
-                .store
-                .compare_exchange(&key, Some(legacy), None)
-                .await;
+            let _ = self.store.compare_exchange(&key, Some(legacy), None).await;
             return None;
         }
         let registration = cached.registration.clone();
         self.put(cimd_url, fingerprint, cached.registration).await;
-        let _ = self
-            .store
-            .compare_exchange(&key, Some(legacy), None)
-            .await;
+        let _ = self.store.compare_exchange(&key, Some(legacy), None).await;
         Some(registration)
     }
 
@@ -671,7 +662,7 @@ pub fn fingerprint(etag: Option<&str>, doc: &ClientIdMetadataDocument) -> [u8; 3
     } else {
         // Deterministic by virtue of serde_json sorting object keys
         // alphabetically when we route through a BTreeMap. We do that
-        // by re-serialising via a Value first, then via to_string on
+        // by re-serializing via a Value first, then via to_string on
         // a sorted map. Practically this is `to_string` which is
         // stable for the same input within a serde_json version.
         let body = serde_json::to_vec(doc).unwrap_or_default();
@@ -977,7 +968,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl sbproxy_storage::PersistentKv for SynchronizedIndexReadStore {
-        async fn get(&self, key: &str) -> Result<Option<bytes::Bytes>, sbproxy_storage::StorageError> {
+        async fn get(
+            &self,
+            key: &str,
+        ) -> Result<Option<bytes::Bytes>, sbproxy_storage::StorageError> {
             let result = sbproxy_storage::PersistentKv::get(&self.inner, key).await;
             if key == PERSISTENT_DCR_INDEX_KEY
                 && self.first_index_reads.fetch_add(1, Ordering::SeqCst) < 2
@@ -1012,13 +1006,8 @@ mod tests {
             expected: Option<bytes::Bytes>,
             replacement: Option<bytes::Bytes>,
         ) -> Result<bool, sbproxy_storage::StorageError> {
-            sbproxy_storage::PersistentKv::compare_exchange(
-                &self.inner,
-                key,
-                expected,
-                replacement,
-            )
-            .await
+            sbproxy_storage::PersistentKv::compare_exchange(&self.inner, key, expected, replacement)
+                .await
         }
     }
 
@@ -1146,9 +1135,7 @@ mod tests {
             let gate = gate.clone();
             tasks.push(tokio::spawn(async move {
                 gate.wait().await;
-                cache
-                    .put(url, &[0x44; 32], fixture_registration(id))
-                    .await;
+                cache.put(url, &[0x44; 32], fixture_registration(id)).await;
             }));
         }
         gate.wait().await;

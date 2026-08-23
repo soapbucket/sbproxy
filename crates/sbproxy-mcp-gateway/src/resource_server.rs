@@ -56,13 +56,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use base64::Engine;
-use jsonwebtoken::jwk::JwkSet;
-use jsonwebtoken::{DecodingKey, Validation};
+use jsonwebtoken::jwk::{AlgorithmParameters, JwkSet, PublicKeyUse};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::dpop::{jwk_thumbprint, parse_and_verify, DpopError, DpopReplayCache};
+
+const MAX_RESOURCE_JWKS_BYTES: usize = 256 * 1024;
 
 // --- Audience ---
 
@@ -109,6 +111,10 @@ pub struct McpResourceServerConfig {
     /// JWKS endpoint URL the provider fetches signing keys from.
     pub jwks_url: String,
 
+    /// Development-only plaintext loopback override for JWKS retrieval.
+    #[serde(default)]
+    pub allow_insecure_loopback: bool,
+
     /// Accepted `aud` values. Must contain (or equal) `resource_uri`
     /// to bind tokens to this server.
     pub audience: AudienceConfig,
@@ -125,6 +131,12 @@ pub struct McpResourceServerConfig {
     /// Scopes advertised to clients in the metadata document.
     #[serde(default)]
     pub scopes_supported: Vec<String>,
+
+    /// Explicit asymmetric JWT algorithms accepted for RFC 9068 access
+    /// tokens. The verifier never selects an algorithm solely from an
+    /// attacker-controlled token header.
+    #[serde(default = "default_access_token_algorithms")]
+    pub access_token_algorithms: Vec<String>,
 
     /// Optional documentation URL (RFC 9728 `resource_documentation`).
     #[serde(default)]
@@ -158,6 +170,10 @@ fn default_dpop_skew_secs() -> u64 {
     30
 }
 
+fn default_access_token_algorithms() -> Vec<String> {
+    vec!["ES256".to_string(), "RS256".to_string()]
+}
+
 impl McpResourceServerConfig {
     /// Validate cross-field invariants.
     pub fn validate(&self) -> Result<()> {
@@ -171,6 +187,14 @@ impl McpResourceServerConfig {
             validate_absolute_http_url("authorization_servers entry", as_url)?;
         }
         validate_absolute_http_url("jwks_url", &self.jwks_url)?;
+        if self.access_token_algorithms.is_empty() {
+            return Err(anyhow!(
+                "mcp_resource_server access_token_algorithms must not be empty"
+            ));
+        }
+        for algorithm in &self.access_token_algorithms {
+            parse_access_token_algorithm(algorithm)?;
+        }
         if self.audience.as_list().is_empty()
             || self.audience.as_list().iter().any(|s| s.trim().is_empty())
         {
@@ -203,9 +227,12 @@ fn validate_absolute_http_url(field: &str, value: &str) -> Result<()> {
     if !matches!(parsed.scheme(), "http" | "https")
         || !parsed.has_host()
         || parsed.fragment().is_some()
+        || parsed.query().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
     {
         return Err(anyhow!(
-            "mcp_resource_server {field} must be an absolute HTTP(S) URL without a fragment"
+            "mcp_resource_server {field} must be an absolute HTTP(S) URL without credentials, query, or fragment"
         ));
     }
     Ok(())
@@ -247,6 +274,15 @@ impl ResourceServerAuthError {
             Self::JwksUnavailable(_) => "invalid_token",
         }
     }
+
+    fn public_description(&self) -> &'static str {
+        match self {
+            Self::MissingToken => "access token required",
+            Self::InvalidToken(_) | Self::NotBoundToResource(_) => "access token is invalid",
+            Self::DpopBindingFailed(_) => "sender-constrained access token is invalid",
+            Self::JwksUnavailable(_) => "access-token verification is temporarily unavailable",
+        }
+    }
 }
 
 /// The claims and resolved subject of a token that passed every check.
@@ -274,9 +310,10 @@ impl JwksCache {
 
     async fn fetch_or_cached(
         &self,
-        http: &reqwest::Client,
+        _http: &reqwest::Client,
         url: &str,
         ttl: Duration,
+        allow_insecure_loopback: bool,
     ) -> Result<Arc<JwkSet>> {
         {
             let guard = self.current.lock().await;
@@ -286,18 +323,30 @@ impl JwksCache {
                 }
             }
         }
-        let resp = http
-            .get(url)
-            .send()
+        let (_, pinned_http) = crate::egress::endpoint_client(url, allow_insecure_loopback)
             .await
-            .map_err(|e| anyhow!("jwks fetch failed: {e}"))?;
+            .map_err(|error| {
+                anyhow!("resource JWKS endpoint rejected by egress policy: {error}")
+            })?;
+        let resp = pinned_http.get(url).send().await.map_err(|error| {
+            tracing::warn!(
+                target: "mcp_gateway::resource_server",
+                error = %sbproxy_httpkit::request_error_summary(&error),
+                "resource JWKS fetch failed"
+            );
+            anyhow!("resource JWKS endpoint unavailable")
+        })?;
         if !resp.status().is_success() {
             return Err(anyhow!("jwks fetch returned status {}", resp.status()));
         }
-        let set: JwkSet = resp
-            .json()
-            .await
-            .map_err(|e| anyhow!("jwks parse failed: {e}"))?;
+        let body = crate::remote_body::bounded_response_body(
+            resp,
+            MAX_RESOURCE_JWKS_BYTES,
+            "resource JWKS",
+        )
+        .await?;
+        let set: JwkSet = serde_json::from_slice(&body)
+            .map_err(|e| anyhow!("resource JWKS response is invalid JSON: {e}"))?;
         let arc = Arc::new(set);
         let mut guard = self.current.lock().await;
         *guard = Some((arc.clone(), Instant::now()));
@@ -313,22 +362,39 @@ pub struct McpResourceServerProvider {
     http: reqwest::Client,
     jwks: JwksCache,
     dpop_replay: Arc<DpopReplayCache>,
+    revocations: Arc<crate::revoke::RevocationList>,
 }
 
 impl McpResourceServerProvider {
     /// Build a provider from validated config.
     pub fn new(config: McpResourceServerConfig) -> Result<Self> {
+        Self::new_with_security_context(config, crate::McpSecurityContext::new())
+    }
+
+    /// Build a provider sharing runtime-local replay and revocation state
+    /// with its colocated OAuth broker.
+    pub fn new_with_security_context(
+        config: McpResourceServerConfig,
+        security: crate::McpSecurityContext,
+    ) -> Result<Self> {
         config.validate()?;
         let replay_ttl_secs = 300_u64.max(config.dpop_max_clock_skew_secs.saturating_mul(2));
+        let revocations = Arc::new(crate::revoke::RevocationList::new(
+            security.store.clone(),
+            security.namespace,
+            crate::config::DEFAULT_REVOCATION_MAX_ENTRIES,
+            Duration::from_secs(crate::config::DEFAULT_REVOCATION_MAX_TTL_SECS),
+        ));
         Ok(Self {
             config,
             http: sbproxy_httpkit::default_outbound(),
             jwks: JwksCache::new(),
             dpop_replay: Arc::new(DpopReplayCache::with_prefix(
-                crate::LocalStore::arc(),
+                security.store,
                 Duration::from_secs(replay_ttl_secs),
                 "resource:dpop:jti",
             )),
+            revocations,
         })
     }
 
@@ -386,7 +452,7 @@ impl McpResourceServerProvider {
             realm = escape(&self.config.resource_uri),
             md = escape(&metadata_url),
             ec = err.rfc6750_error_code(),
-            desc = escape(&err.to_string()),
+            desc = escape(err.public_description()),
         )
     }
 
@@ -408,6 +474,41 @@ impl McpResourceServerProvider {
             .await
     }
 
+    /// Wire-level variant that rejects duplicate credential/proof headers
+    /// before choosing any value. Adjacent HTTP parsers must not disagree
+    /// about which replayable proof was authenticated.
+    pub async fn authenticate_header_values(
+        &self,
+        authorization_headers: &[&str],
+        dpop_headers: &[&str],
+        method: &str,
+        url: &url::Url,
+        verified_cert_x5t_s256: Option<&str>,
+    ) -> Result<VerifiedToken, ResourceServerAuthError> {
+        if authorization_headers.len() != 1 {
+            return Err(if authorization_headers.is_empty() {
+                ResourceServerAuthError::MissingToken
+            } else {
+                ResourceServerAuthError::InvalidToken(
+                    "multiple authorization headers are not allowed".to_string(),
+                )
+            });
+        }
+        if dpop_headers.len() > 1 {
+            return Err(ResourceServerAuthError::DpopBindingFailed(
+                "multiple DPoP proof headers are not allowed".to_string(),
+            ));
+        }
+        self.authenticate_with_certificate(
+            Some(authorization_headers[0]),
+            dpop_headers.first().copied(),
+            method,
+            url,
+            verified_cert_x5t_s256,
+        )
+        .await
+    }
+
     /// Authenticate with a certificate thumbprint obtained from the
     /// verified TLS connection. Forwarded certificate headers are not
     /// read here; the process integrating this provider owns the
@@ -420,16 +521,9 @@ impl McpResourceServerProvider {
         url: &url::Url,
         verified_cert_x5t_s256: Option<&str>,
     ) -> Result<VerifiedToken, ResourceServerAuthError> {
-        let token = authorization_header
-            .and_then(|v| {
-                v.strip_prefix("Bearer ")
-                    .or_else(|| v.strip_prefix("DPoP "))
-            })
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or(ResourceServerAuthError::MissingToken)?;
+        let (scheme, token) = parse_authorization(authorization_header)?;
 
-        if crate::revoke::REVOCATIONS.contains(token).await {
+        if self.revocations.contains(token).await {
             return Err(ResourceServerAuthError::InvalidToken(
                 "token has been revoked".to_string(),
             ));
@@ -437,7 +531,7 @@ impl McpResourceServerProvider {
 
         let claims = self.verify_signature_and_claims(token).await?;
         self.enforce_resource_binding(&claims)?;
-        self.enforce_dpop_binding(&claims, token, dpop_header, method, url)
+        self.enforce_dpop_binding(&claims, scheme, token, dpop_header, method, url)
             .await?;
         self.enforce_mtls_binding(&claims, verified_cert_x5t_s256)?;
 
@@ -455,12 +549,32 @@ impl McpResourceServerProvider {
     ) -> Result<serde_json::Value, ResourceServerAuthError> {
         let header = jsonwebtoken::decode_header(token)
             .map_err(|e| ResourceServerAuthError::InvalidToken(format!("header: {e}")))?;
+        if !header.typ.as_deref().is_some_and(|token_type| {
+            token_type.eq_ignore_ascii_case("at+jwt")
+                || token_type.eq_ignore_ascii_case("application/at+jwt")
+        }) {
+            return Err(ResourceServerAuthError::InvalidToken(
+                "JWT typ must identify an access token (at+jwt)".to_string(),
+            ));
+        }
+        let algorithm_name = format!("{:?}", header.alg);
+        if !self
+            .config
+            .access_token_algorithms
+            .iter()
+            .any(|configured| configured == &algorithm_name)
+        {
+            return Err(ResourceServerAuthError::InvalidToken(format!(
+                "JWT algorithm {algorithm_name} is not allowed"
+            )));
+        }
         let jwk_set = self
             .jwks
             .fetch_or_cached(
                 &self.http,
                 &self.config.jwks_url,
                 Duration::from_secs(self.config.jwks_cache_ttl_secs.max(1)),
+                self.config.allow_insecure_loopback,
             )
             .await
             .map_err(|e| ResourceServerAuthError::JwksUnavailable(e.to_string()))?;
@@ -474,6 +588,9 @@ impl McpResourceServerProvider {
 
         let mut last_error: Option<String> = None;
         for jwk in candidate_keys(&jwk_set, header.kid.as_deref()) {
+            if !jwk_matches_access_token_profile(jwk, header.alg) {
+                continue;
+            }
             let Ok(key) = DecodingKey::from_jwk(jwk) else {
                 continue;
             };
@@ -481,7 +598,10 @@ impl McpResourceServerProvider {
             validation.set_issuer(&[issuer.as_str()]);
             validation.set_audience(&audience);
             match jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation) {
-                Ok(data) => return Ok(data.claims),
+                Ok(data) => match validate_rfc9068_claim_types(&data.claims) {
+                    Ok(()) => return Ok(data.claims),
+                    Err(error) => last_error = Some(error),
+                },
                 Err(e) => last_error = Some(e.to_string()),
             }
         }
@@ -509,6 +629,7 @@ impl McpResourceServerProvider {
     async fn enforce_dpop_binding(
         &self,
         claims: &serde_json::Value,
+        authorization_scheme: AuthorizationScheme,
         access_token: &str,
         dpop_header: Option<&str>,
         method: &str,
@@ -523,6 +644,11 @@ impl McpResourceServerProvider {
             // token, not forced by the resource server.
             return Ok(());
         };
+        if authorization_scheme != AuthorizationScheme::Dpop {
+            return Err(ResourceServerAuthError::DpopBindingFailed(
+                "DPoP authorization scheme required for sender-constrained token".to_string(),
+            ));
+        }
         let proof_header = dpop_header.ok_or_else(|| {
             ResourceServerAuthError::DpopBindingFailed(
                 "DPoP proof required for sender-constrained token".to_string(),
@@ -596,6 +722,117 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthorizationScheme {
+    Bearer,
+    Dpop,
+}
+
+fn parse_authorization(
+    authorization_header: Option<&str>,
+) -> Result<(AuthorizationScheme, &str), ResourceServerAuthError> {
+    let value = authorization_header.ok_or(ResourceServerAuthError::MissingToken)?;
+    let (scheme, credential) = value
+        .split_once(char::is_whitespace)
+        .ok_or(ResourceServerAuthError::MissingToken)?;
+    let scheme = if scheme.eq_ignore_ascii_case("bearer") {
+        AuthorizationScheme::Bearer
+    } else if scheme.eq_ignore_ascii_case("dpop") {
+        AuthorizationScheme::Dpop
+    } else {
+        return Err(ResourceServerAuthError::MissingToken);
+    };
+    let credential = credential.trim();
+    if credential.is_empty() || credential.chars().any(char::is_whitespace) {
+        return Err(ResourceServerAuthError::MissingToken);
+    }
+    Ok((scheme, credential))
+}
+
+fn parse_access_token_algorithm(value: &str) -> Result<Algorithm> {
+    match value {
+        "ES256" => Ok(Algorithm::ES256),
+        "ES384" => Ok(Algorithm::ES384),
+        "RS256" => Ok(Algorithm::RS256),
+        "RS384" => Ok(Algorithm::RS384),
+        "RS512" => Ok(Algorithm::RS512),
+        "PS256" => Ok(Algorithm::PS256),
+        "PS384" => Ok(Algorithm::PS384),
+        "PS512" => Ok(Algorithm::PS512),
+        "EdDSA" => Ok(Algorithm::EdDSA),
+        other => Err(anyhow!(
+            "mcp_resource_server access_token_algorithms contains unsupported or symmetric algorithm {other:?}"
+        )),
+    }
+}
+
+fn jwk_matches_access_token_profile(jwk: &jsonwebtoken::jwk::Jwk, algorithm: Algorithm) -> bool {
+    if jwk.common.public_key_use != Some(PublicKeyUse::Signature) {
+        return false;
+    }
+    if jwk.common.key_algorithm.map(|value| value.to_string()) != Some(format!("{algorithm:?}")) {
+        return false;
+    }
+    matches!(
+        (&jwk.algorithm, algorithm),
+        (
+            AlgorithmParameters::EllipticCurve(_),
+            Algorithm::ES256 | Algorithm::ES384
+        ) | (
+            AlgorithmParameters::RSA(_),
+            Algorithm::RS256
+                | Algorithm::RS384
+                | Algorithm::RS512
+                | Algorithm::PS256
+                | Algorithm::PS384
+                | Algorithm::PS512
+        ) | (AlgorithmParameters::OctetKeyPair(_), Algorithm::EdDSA)
+    )
+}
+
+fn validate_rfc9068_claim_types(claims: &serde_json::Value) -> Result<(), String> {
+    let object = claims
+        .as_object()
+        .ok_or_else(|| "access-token claims must be a JSON object".to_string())?;
+    for claim in ["iss", "sub", "client_id", "jti"] {
+        if !object
+            .get(claim)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+        {
+            return Err(format!(
+                "access token requires non-empty string claim {claim}"
+            ));
+        }
+    }
+    for claim in ["exp", "iat"] {
+        if object
+            .get(claim)
+            .and_then(serde_json::Value::as_i64)
+            .is_none()
+        {
+            return Err(format!("access token requires integer claim {claim}"));
+        }
+    }
+    let audience_is_valid = match object.get("aud") {
+        Some(serde_json::Value::String(value)) => !value.is_empty(),
+        Some(serde_json::Value::Array(values)) => {
+            !values.is_empty()
+                && values
+                    .iter()
+                    .all(|value| value.as_str().is_some_and(|audience| !audience.is_empty()))
+        }
+        _ => false,
+    };
+    if !audience_is_valid {
+        return Err("access token requires string or non-empty string-array aud claim".to_string());
+    }
+    if object.get("scope").is_some_and(|scope| !scope.is_string()) {
+        return Err("access token scope claim must be a string".to_string());
+    }
+    Ok(())
+}
+
 /// Candidate JWKs to try, in preference order: an exact `kid` match
 /// first (when the token carries one and a key advertises it), then
 /// every remaining key. Trying every key rather than failing outright
@@ -606,11 +843,10 @@ fn candidate_keys<'a>(
     kid: Option<&str>,
 ) -> impl Iterator<Item = &'a jsonwebtoken::jwk::Jwk> {
     let kid = kid.map(str::to_string);
-    let (matching, rest): (Vec<_>, Vec<_>) = set.keys.iter().partition(|k| match &kid {
-        Some(k_id) => k.common.key_id.as_deref() == Some(k_id.as_str()),
-        None => false,
-    });
-    matching.into_iter().chain(rest)
+    set.keys.iter().filter(move |key| match &kid {
+        Some(kid) => key.common.key_id.as_deref() == Some(kid.as_str()),
+        None => true,
+    })
 }
 
 fn claim_contains(claim: Option<&serde_json::Value>, needle: &str) -> bool {
@@ -650,9 +886,32 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
         })
     }
 
+    fn complete_claims(mut overrides: serde_json::Value) -> serde_json::Value {
+        let mut claims = serde_json::json!({
+            "iss": "https://auth.example.com",
+            "sub": "user-1",
+            "aud": "https://mcp.example.com",
+            "resource": "https://mcp.example.com",
+            "exp": now() + 300,
+            "iat": now(),
+            "jti": "access-token-jti",
+            "client_id": "client-1",
+            "scope": "mcp:read"
+        });
+        if let (Some(base), Some(extra)) = (claims.as_object_mut(), overrides.as_object_mut()) {
+            base.append(extra);
+        }
+        claims
+    }
+
     fn issue_jwt(claims: serde_json::Value) -> String {
+        issue_jwt_with_type(complete_claims(claims), Some("at+jwt"))
+    }
+
+    fn issue_jwt_with_type(claims: serde_json::Value, token_type: Option<&str>) -> String {
         let mut header = Header::new(jsonwebtoken::Algorithm::ES256);
         header.kid = Some(TEST_KID.to_string());
+        header.typ = token_type.map(str::to_string);
         let key = EncodingKey::from_ec_pem(ES256_PRIVATE_PEM.as_bytes()).unwrap();
         encode(&header, &claims, &key).unwrap()
     }
@@ -691,10 +950,12 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
             resource_uri: "https://mcp.example.com".to_string(),
             authorization_servers: vec!["https://auth.example.com".to_string()],
             jwks_url,
+            allow_insecure_loopback: true,
             audience: AudienceConfig::Single("https://mcp.example.com".to_string()),
             issuer: Some("https://auth.example.com".to_string()),
             jwks_cache_ttl_secs: 300,
             scopes_supported: vec!["mcp:read".to_string()],
+            access_token_algorithms: vec!["ES256".to_string()],
             resource_documentation: Some("https://mcp.example.com/docs".to_string()),
             metadata_path: default_metadata_path(),
             dpop_enforce_binding: false,
@@ -790,8 +1051,22 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
     #[tokio::test]
     async fn locally_revoked_token_is_rejected_before_jwks_validation() {
         let token = "resource-provider-revoked-token";
-        crate::revoke::REVOCATIONS.record(token).await.unwrap();
-        let provider = McpResourceServerProvider::new(base_config("http://x".to_string())).unwrap();
+        let security = crate::McpSecurityContext::for_test("revoked-test");
+        let revocations = crate::revoke::RevocationList::new(
+            security.store.clone(),
+            security.namespace.clone(),
+            4,
+            Duration::from_secs(60),
+        );
+        revocations
+            .record_validated(token, now() + 60)
+            .await
+            .unwrap();
+        let provider = McpResourceServerProvider::new_with_security_context(
+            base_config("http://x".to_string()),
+            security,
+        )
+        .unwrap();
         let err = provider
             .authenticate(
                 Some(&format!("Bearer {token}")),
@@ -823,6 +1098,114 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
             .await
             .expect("token should verify");
         assert_eq!(verified.sub, "user-1");
+    }
+
+    #[tokio::test]
+    async fn authorization_scheme_is_case_insensitive() {
+        let addr = spawn_jwks_server().await;
+        let provider =
+            McpResourceServerProvider::new(base_config(format!("http://{addr}/jwks.json")))
+                .unwrap();
+        let token = issue_jwt(serde_json::json!({}));
+        let verified = provider
+            .authenticate(
+                Some(&format!("bEaReR {token}")),
+                None,
+                "POST",
+                &url::Url::parse("https://mcp.example.com/tools/call").unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(verified.sub, "user-1");
+    }
+
+    #[tokio::test]
+    async fn duplicate_dpop_proof_headers_are_rejected_before_crypto() {
+        let provider = McpResourceServerProvider::new(base_config("http://x".to_string())).unwrap();
+        let error = provider
+            .authenticate_header_values(
+                &["DPoP opaque"],
+                &["proof-one", "proof-two"],
+                "POST",
+                &url::Url::parse("https://mcp.example.com/tools/call").unwrap(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("multiple DPoP"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn id_token_type_is_rejected_even_when_signature_and_audience_match() {
+        let addr = spawn_jwks_server().await;
+        let provider =
+            McpResourceServerProvider::new(base_config(format!("http://{addr}/jwks.json")))
+                .unwrap();
+        let token = issue_jwt_with_type(complete_claims(serde_json::json!({})), Some("JWT"));
+        let error = provider
+            .authenticate(
+                Some(&format!("Bearer {token}")),
+                None,
+                "POST",
+                &url::Url::parse("https://mcp.example.com/tools/call").unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("typ"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn missing_rfc9068_claim_is_rejected() {
+        let addr = spawn_jwks_server().await;
+        let provider =
+            McpResourceServerProvider::new(base_config(format!("http://{addr}/jwks.json")))
+                .unwrap();
+        let mut claims = complete_claims(serde_json::json!({}));
+        claims.as_object_mut().unwrap().remove("client_id");
+        let token = issue_jwt_with_type(claims, Some("at+jwt"));
+        let error = provider
+            .authenticate(
+                Some(&format!("Bearer {token}")),
+                None,
+                "POST",
+                &url::Url::parse("https://mcp.example.com/tools/call").unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ResourceServerAuthError::InvalidToken(_)));
+    }
+
+    #[tokio::test]
+    async fn dpop_bound_token_is_rejected_under_bearer_scheme() {
+        let addr = spawn_jwks_server().await;
+        let provider =
+            McpResourceServerProvider::new(base_config(format!("http://{addr}/jwks.json")))
+                .unwrap();
+        let token = issue_jwt(serde_json::json!({"cnf":{"jkt":"some-key"}}));
+        let error = provider
+            .authenticate(
+                Some(&format!("Bearer {token}")),
+                Some("not-needed-before-scheme-check"),
+                "POST",
+                &url::Url::parse("https://mcp.example.com/tools/call").unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("DPoP authorization scheme"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn public_challenge_never_reflects_transport_detail() {
+        let provider = McpResourceServerProvider::new(base_config("http://x".to_string())).unwrap();
+        let challenge =
+            provider.www_authenticate_header(&ResourceServerAuthError::JwksUnavailable(
+                "https://internal.example/jwks?sig=CANARY-SECRET".to_string(),
+            ));
+        assert!(!challenge.contains("CANARY-SECRET"), "{challenge}");
+        assert!(!challenge.contains("internal.example"), "{challenge}");
     }
 
     #[tokio::test]

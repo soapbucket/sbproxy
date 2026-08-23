@@ -475,7 +475,8 @@ async fn resolve_dcr_translation(
         return Ok(reg.registered_client_id);
     }
     // WOR-170: DCR upstream is credential-bearing; refuse redirects.
-    let http = sbproxy_httpkit::token_bearing_outbound();
+    let (_, http) =
+        crate::egress::endpoint_client(dcr_endpoint, app.config.allow_insecure_loopback).await?;
     let reg = crate::cimd_to_dcr::translate_cimd_to_dcr(doc, dcr_endpoint, &http).await?;
     cache.put(cimd_url, &fp, reg.clone()).await;
     Ok(reg.registered_client_id)

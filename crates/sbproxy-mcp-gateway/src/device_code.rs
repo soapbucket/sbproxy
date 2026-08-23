@@ -257,11 +257,7 @@ impl DeviceCodeStore {
         let reverse_value = Bytes::copy_from_slice(device_code.as_bytes());
         let claimed_reverse = self
             .kv
-            .compare_exchange(
-                &reverse_key,
-                None,
-                Some((reverse_value.clone(), ttl)),
-            )
+            .compare_exchange(&reverse_key, None, Some((reverse_value.clone(), ttl)))
             .await
             .map_err(|e| DeviceCodeError::Storage(format!("{e}")))?;
         if !claimed_reverse {
@@ -433,7 +429,8 @@ impl DeviceCodeStore {
                     .await
                     .map_err(|e| DeviceCodeError::Storage(format!("{e}")))?
                 {
-                    self.remove_reverse_index(device_code, &state.user_code).await;
+                    self.remove_reverse_index(device_code, &state.user_code)
+                        .await;
                     return Ok(DevicePollOutcome::Expired);
                 }
                 continue;
@@ -449,7 +446,8 @@ impl DeviceCodeStore {
                     .await
                     .map_err(|e| DeviceCodeError::Storage(format!("{e}")))?
                 {
-                    self.remove_reverse_index(device_code, &state.user_code).await;
+                    self.remove_reverse_index(device_code, &state.user_code)
+                        .await;
                     return Ok(DevicePollOutcome::Authorized(state));
                 }
                 continue;
@@ -811,6 +809,7 @@ pub(crate) async fn verify_post(
             acr: None,
             amr: None,
             act: None,
+            cnf: None,
             actor: None,
             principal: None,
             tnx: None,
@@ -837,7 +836,9 @@ pub(crate) async fn verify_post(
         Ok(DeviceDecisionOutcome::AlreadyFinal(_)) => {
             return (
                 StatusCode::CONFLICT,
-                Html(verify_error_html("device authorization was already decided")),
+                Html(verify_error_html(
+                    "device authorization was already decided",
+                )),
             )
                 .into_response();
         }
@@ -1040,6 +1041,7 @@ mod tests {
                     .to_string(),
                 alg: "ES256".to_string(),
                 kid: Some("device-test-key".to_string()),
+                public_jwk: None,
             }),
             ..McpGatewayConfig::default()
         }
@@ -1443,7 +1445,9 @@ mod tests {
             let gate = gate.clone();
             tasks.push(tokio::spawn(async move {
                 gate.wait().await;
-                store.poll_and_consume("dc-redeem", "cli", unix_now() + 2).await
+                store
+                    .poll_and_consume("dc-redeem", "cli", unix_now() + 2)
+                    .await
             }));
         }
         gate.wait().await;

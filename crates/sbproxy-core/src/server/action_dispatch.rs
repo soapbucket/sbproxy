@@ -3934,20 +3934,24 @@ pub(super) async fn handle_mcp_action(
             request_url.set_query(session.req_header().uri.query());
             request_url.set_fragment(None);
             let authorization = request_headers
-                .get("authorization")
-                .and_then(|value| value.to_str().ok());
+                .get_all("authorization")
+                .iter()
+                .map(|value| value.to_str().unwrap_or(""))
+                .collect::<Vec<_>>();
             let dpop = request_headers
-                .get("dpop")
-                .and_then(|value| value.to_str().ok());
+                .get_all("dpop")
+                .iter()
+                .map(|value| value.to_str().unwrap_or(""))
+                .collect::<Vec<_>>();
             let verified_certificate = super::request_phase::client_cert_x5t_s256(
                 session
                     .digest()
                     .and_then(|digest| digest.ssl_digest.as_deref()),
             );
             match provider
-                .authenticate_with_certificate(
-                    authorization,
-                    dpop,
+                .authenticate_header_values(
+                    &authorization,
+                    &dpop,
                     method.as_str(),
                     &request_url,
                     verified_certificate.as_deref(),

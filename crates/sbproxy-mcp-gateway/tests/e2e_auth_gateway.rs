@@ -229,6 +229,7 @@ async fn start_pair() -> Pair {
     // the well-tested Default values.
     let cfg = McpGatewayConfig {
         base_path: "/mcp/oauth".to_string(),
+        allow_insecure_loopback: true,
         external_base_url: broker_url.clone(),
         upstream_redirect_uri: format!("{broker_url}/mcp/oauth/callback"),
         upstream_authorization_server_url: format!("{upstream_url}/authorize"),

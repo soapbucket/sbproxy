@@ -83,7 +83,7 @@ pub fn validate_startup(cfg: &McpGatewayConfig) -> Result<(), StartupConfigError
 /// 5 minutes balances freshness against load on the upstream.
 pub const DEFAULT_METADATA_REFRESH_SECS: u64 = 300;
 
-/// Maximum allowable staleness before fail-closed behaviour kicks in.
+/// Maximum allowable staleness before fail-closed behavior kicks in.
 /// 1 hour leaves headroom for short upstream outages without grounding
 /// the broker.
 pub const DEFAULT_METADATA_MAX_STALENESS_SECS: u64 = 3600;
@@ -123,6 +123,13 @@ pub const DEFAULT_DEVICE_CODE_LIFETIME_SECS: u64 = 600;
 /// /device_authorization response. Clients MUST wait at least this
 /// many seconds between /token polls.
 pub const DEFAULT_DEVICE_CODE_POLLING_INTERVAL_SECS: u64 = 5;
+
+/// Maximum local denylist retention for one validated broker token.
+pub const DEFAULT_REVOCATION_MAX_TTL_SECS: u64 = 24 * 60 * 60;
+/// Per-runtime bounded denylist capacity.
+pub const DEFAULT_REVOCATION_MAX_ENTRIES: usize = 4_096;
+/// Per-runtime revocation request budget in one minute.
+pub const DEFAULT_REVOCATION_REQUESTS_PER_MINUTE: u64 = 120;
 
 /// Default chain depth limit for nested `act` claims emitted by token
 /// exchange. Five hops covers every realistic delegation chain
@@ -180,6 +187,10 @@ pub enum JwkKey {
         /// Optional `kid` to publish in the JWS header.
         #[serde(default)]
         kid: Option<String>,
+        /// Public JWK matching the private PEM. Required when this process
+        /// must verify or publish its own broker-minted tokens.
+        #[serde(default)]
+        public_jwk: Option<serde_json::Value>,
     },
     /// Inline JWK JSON document. The raw value is kept as
     /// `serde_json::Value` so deployers can paste any JWK shape; the
@@ -227,6 +238,12 @@ pub struct McpGatewayConfig {
     /// Used for log context and (in 4B.3) the metadata document; the
     /// router itself receives the prefix at construction time.
     pub base_path: String,
+
+    /// Development-only override permitting plaintext HTTP to literal or
+    /// DNS-resolved loopback OAuth endpoints. It never permits private,
+    /// link-local, or public HTTP destinations.
+    #[serde(default)]
+    pub allow_insecure_loopback: bool,
 
     /// Externally visible absolute origin for this in-process broker.
     /// Used to publish metadata and validate DPoP `htu`; the legacy
@@ -308,6 +325,20 @@ pub struct McpGatewayConfig {
     #[serde(default)]
     pub upstream_introspection_endpoint_url: Option<String>,
 
+    /// Maximum number of validated local access tokens retained in this
+    /// runtime's revocation denylist.
+    #[serde(default = "McpGatewayConfig::default_revocation_max_entries")]
+    pub revocation_max_entries: usize,
+
+    /// Maximum denylist retention even when a token advertises a longer
+    /// lifetime.
+    #[serde(default = "McpGatewayConfig::default_revocation_max_ttl_secs")]
+    pub revocation_max_ttl_secs: u64,
+
+    /// Maximum revocation calls accepted by one runtime per minute.
+    #[serde(default = "McpGatewayConfig::default_revocation_requests_per_minute")]
+    pub revocation_requests_per_minute: u64,
+
     /// RFC 9068 broker-signed access token signing key. When set,
     /// the broker mints access tokens it issues itself (e.g. on
     /// token-exchange paths) as JWTs with typ="at+jwt" using this
@@ -348,7 +379,7 @@ pub struct McpGatewayConfig {
     pub dcr_upstream_shape: Option<String>,
 
     // --- 4C: Client ID Metadata Documents (CIMD) ---
-    /// Whether the broker recognises CIMD-shaped `client_id` values
+    /// Whether the broker recognizes CIMD-shaped `client_id` values
     /// (https URLs) at the /authorize and /token endpoints.
     /// Defaults to true; deployers locked to a server-side-registered
     /// client list can flip this off to fail closed on any URL-shaped
@@ -508,6 +539,18 @@ impl McpGatewayConfig {
         DEFAULT_DEVICE_CODE_POLLING_INTERVAL_SECS
     }
 
+    fn default_revocation_max_entries() -> usize {
+        DEFAULT_REVOCATION_MAX_ENTRIES
+    }
+
+    fn default_revocation_max_ttl_secs() -> u64 {
+        DEFAULT_REVOCATION_MAX_TTL_SECS
+    }
+
+    fn default_revocation_requests_per_minute() -> u64 {
+        DEFAULT_REVOCATION_REQUESTS_PER_MINUTE
+    }
+
     fn default_token_exchange_max_chain_depth() -> usize {
         DEFAULT_TOKEN_EXCHANGE_MAX_CHAIN_DEPTH
     }
@@ -517,6 +560,7 @@ impl Default for McpGatewayConfig {
     fn default() -> Self {
         Self {
             base_path: "/mcp/oauth".to_string(),
+            allow_insecure_loopback: false,
             external_base_url: String::new(),
             upstream_authorization_server_url: String::new(),
             upstream_redirect_uri: String::new(),
@@ -529,6 +573,9 @@ impl Default for McpGatewayConfig {
             upstream_registration_endpoint_url: None,
             upstream_revocation_endpoint_url: None,
             upstream_introspection_endpoint_url: None,
+            revocation_max_entries: DEFAULT_REVOCATION_MAX_ENTRIES,
+            revocation_max_ttl_secs: DEFAULT_REVOCATION_MAX_TTL_SECS,
+            revocation_requests_per_minute: DEFAULT_REVOCATION_REQUESTS_PER_MINUTE,
             metadata_refresh_secs: DEFAULT_METADATA_REFRESH_SECS,
             max_metadata_staleness_secs: DEFAULT_METADATA_MAX_STALENESS_SECS,
             accepted_client_auth_methods: default_accepted_client_auth_methods(),
@@ -581,6 +628,7 @@ mod tests {
             pem: "PRIVATE-PEM-SENTINEL".to_string(),
             alg: "ES256".to_string(),
             kid: Some("kid-1".to_string()),
+            public_jwk: None,
         };
         let rendered = format!("{key:?}");
         assert!(!rendered.contains("PRIVATE-PEM-SENTINEL"));

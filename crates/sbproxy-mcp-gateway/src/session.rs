@@ -105,7 +105,9 @@ impl InMemorySessionStore {
     /// room for an attacker-controlled request.
     pub fn with_capacity(ttl: Duration, capacity: usize) -> Result<Self> {
         if ttl.is_zero() || capacity == 0 {
-            return Err(anyhow!("session TTL and capacity must be greater than zero"));
+            return Err(anyhow!(
+                "session TTL and capacity must be greater than zero"
+            ));
         }
         Ok(Self {
             inner: Mutex::new(HashMap::new()),
@@ -266,7 +268,7 @@ impl SessionStore for RedisSessionStore {
         );
         // Trait `put` enforces TTL itself. `EphemeralKv` implementations
         // pin a 1s minimum (Redis SETEX rejects 0); duplicating that
-        // floor here would just hide the trait's behaviour from logs.
+        // floor here would just hide the trait's behavior from logs.
         self.kv
             .put(&key, payload, self.ttl)
             .await

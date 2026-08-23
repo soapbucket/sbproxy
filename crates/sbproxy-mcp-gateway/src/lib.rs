@@ -41,6 +41,47 @@ use bytes::Bytes;
 use std::sync::Arc;
 use tower::ServiceExt;
 
+/// Runtime-local security state shared by a colocated OAuth broker and MCP
+/// resource verifier. A fresh unguessable namespace prevents one action or
+/// tenant from consuming or observing another action's replay/revocation
+/// partitions even when both use the same process.
+#[derive(Clone)]
+pub struct McpSecurityContext {
+    pub(crate) store: Arc<dyn sbproxy_storage::EphemeralKv>,
+    pub(crate) namespace: String,
+}
+
+impl McpSecurityContext {
+    /// Create a bounded in-process context with a random runtime namespace.
+    pub fn new() -> Self {
+        use rand::RngCore;
+        let mut identifier = [0_u8; 16];
+        rand::thread_rng().fill_bytes(&mut identifier);
+        let namespace = identifier
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Self {
+            store: LocalStore::arc(),
+            namespace,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(namespace: &str) -> Self {
+        Self {
+            store: LocalStore::arc(),
+            namespace: namespace.to_string(),
+        }
+    }
+}
+
+impl Default for McpSecurityContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Operator-facing `/admin/status` JSON surface.
 pub mod admin;
 /// RFC 8414 Authorization-Server metadata cache (fetch, TTL, ETag).
@@ -68,6 +109,7 @@ pub mod config;
 pub mod device_code;
 /// RFC 9449 DPoP proof verification and replay protection.
 pub mod dpop;
+mod egress;
 /// OAuth 2.0 Token Introspection (RFC 7662, server side).
 pub mod introspect;
 /// In-process default backend for [`sbproxy_storage::EphemeralKv`] /
@@ -191,6 +233,15 @@ pub struct McpGatewayRuntime {
 impl McpGatewayRuntime {
     /// Build the broker and every enabled collaborator from one config.
     pub fn new(config: McpGatewayConfig) -> anyhow::Result<Self> {
+        Self::new_with_security_context(config, McpSecurityContext::new())
+    }
+
+    /// Build a broker using the same runtime-local security context as its
+    /// colocated resource verifier.
+    pub fn new_with_security_context(
+        config: McpGatewayConfig,
+        security: McpSecurityContext,
+    ) -> anyhow::Result<Self> {
         if !config.base_path.starts_with('/') || config.base_path.starts_with("//") {
             anyhow::bail!("MCP OAuth base_path must be an origin-relative path");
         }
@@ -233,7 +284,7 @@ impl McpGatewayRuntime {
         ));
         Ok(Self {
             base_path,
-            router: router(Arc::new(config), sessions),
+            router: router_with_security_context(Arc::new(config), sessions, security),
         })
     }
 
@@ -311,7 +362,7 @@ pub struct AppState {
     /// Optional Client ID Metadata Document (CIMD) cache. When
     /// `cimd_enabled` is true and a URL-shaped `client_id` arrives at
     /// /authorize, the broker resolves the document through this
-    /// cache. When None the broker falls back to fail-closed behaviour
+    /// cache. When None the broker falls back to fail-closed behavior
     /// for URL-shaped client_ids (rejecting them with `invalid_client`).
     pub cimd_cache: Option<Arc<dyn CimdCache>>,
     /// Optional CIMD → DCR translation cache. Only consulted when
@@ -339,6 +390,15 @@ pub struct AppState {
     /// and `/authorize` rejects any `request_uri` parameter as
     /// `invalid_request`.
     pub par_store: Option<Arc<dyn sbproxy_storage::EphemeralKv>>,
+    /// Runtime-scoped, bounded local access-token denylist.
+    pub(crate) revocations: Arc<revoke::RevocationList>,
+    /// Runtime-scoped fixed-window limiter for the revocation endpoint.
+    pub(crate) revocation_rate_limiter: Arc<revoke::RevocationRateLimiter>,
+    /// Shared runtime store for refresh-token sender bindings and other
+    /// namespaced credential state.
+    pub(crate) security_store: Arc<dyn sbproxy_storage::EphemeralKv>,
+    /// Opaque per-action namespace for credential-state keys.
+    pub(crate) security_namespace: String,
 }
 
 // --- Router ---
@@ -350,7 +410,15 @@ pub struct AppState {
 /// device-code collaborator. PAR remains available through
 /// [`router_full_with_par`] because it requires caller-owned storage.
 pub fn router(config: Arc<McpGatewayConfig>, session_store: Arc<dyn SessionStore>) -> Router {
-    let runtime_store = LocalStore::arc();
+    router_with_security_context(config, session_store, McpSecurityContext::new())
+}
+
+fn router_with_security_context(
+    config: Arc<McpGatewayConfig>,
+    session_store: Arc<dyn SessionStore>,
+    security: McpSecurityContext,
+) -> Router {
+    let runtime_store = security.store.clone();
     let replay_store: Arc<dyn sbproxy_storage::EphemeralKv> = runtime_store.clone();
     let dpop_replay = Arc::new(DpopReplayCache::new(
         replay_store,
@@ -374,12 +442,17 @@ pub fn router(config: Arc<McpGatewayConfig>, session_store: Arc<dyn SessionStore
         .as_deref()
         .filter(|url| !url.is_empty())
         .map(|url| {
-            Arc::new(AsMetadataCache::new(
-                sbproxy_httpkit::default_outbound(),
-                url,
-            ))
+            let cache = if config.allow_insecure_loopback {
+                AsMetadataCache::new_with_development_loopback(
+                    sbproxy_httpkit::default_outbound(),
+                    url,
+                )
+            } else {
+                AsMetadataCache::new(sbproxy_httpkit::default_outbound(), url)
+            };
+            Arc::new(cache)
         });
-    router_full_with_par(
+    router_full_with_par_and_security(
         config,
         session_store,
         as_metadata,
@@ -389,6 +462,7 @@ pub fn router(config: Arc<McpGatewayConfig>, session_store: Arc<dyn SessionStore
         Some(dpop_nonce),
         device_code_store,
         None,
+        security,
     )
 }
 
@@ -424,8 +498,44 @@ pub fn router_full_with_par(
     device_code_store: Option<Arc<DeviceCodeStore>>,
     par_store: Option<Arc<dyn sbproxy_storage::EphemeralKv>>,
 ) -> Router {
+    router_full_with_par_and_security(
+        config,
+        session_store,
+        as_metadata,
+        cimd_cache,
+        cimd_to_dcr,
+        dpop_replay,
+        dpop_nonce,
+        device_code_store,
+        par_store,
+        McpSecurityContext::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn router_full_with_par_and_security(
+    config: Arc<McpGatewayConfig>,
+    session_store: Arc<dyn SessionStore>,
+    as_metadata: Option<Arc<AsMetadataCache>>,
+    cimd_cache: Option<Arc<dyn CimdCache>>,
+    cimd_to_dcr: Option<Arc<CimdToDcrCache>>,
+    dpop_replay: Option<Arc<DpopReplayCache>>,
+    dpop_nonce: Option<Arc<DpopNonceIssuer>>,
+    device_code_store: Option<Arc<DeviceCodeStore>>,
+    par_store: Option<Arc<dyn sbproxy_storage::EphemeralKv>>,
+    security: McpSecurityContext,
+) -> Router {
     let base = config.base_path.trim_end_matches('/').to_string();
     let par_enabled = par_store.is_some();
+    let revocations = Arc::new(revoke::RevocationList::new(
+        security.store.clone(),
+        security.namespace.clone(),
+        config.revocation_max_entries,
+        std::time::Duration::from_secs(config.revocation_max_ttl_secs.max(1)),
+    ));
+    let revocation_rate_limiter = Arc::new(revoke::RevocationRateLimiter::new(
+        config.revocation_requests_per_minute.max(1),
+    ));
     let state = AppState {
         config,
         session_store,
@@ -436,6 +546,10 @@ pub fn router_full_with_par(
         dpop_nonce,
         device_code_store,
         par_store,
+        revocations,
+        revocation_rate_limiter,
+        security_store: security.store,
+        security_namespace: security.namespace,
     };
     let mut router = Router::new()
         .route(&format!("{base}/authorize"), get(authorize::authorize))

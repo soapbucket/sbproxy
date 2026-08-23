@@ -243,9 +243,10 @@ fn sweep_expired(state: &mut EphemeralState, now: Instant) {
         let Some(Reverse((expires_at, generation, key))) = state.expirations.pop() else {
             break;
         };
-        let expired = state.entries.get(&key).is_some_and(|entry| {
-            entry.generation == generation && entry.expires_at == expires_at
-        });
+        let expired = state
+            .entries
+            .get(&key)
+            .is_some_and(|entry| entry.generation == generation && entry.expires_at == expires_at);
         if expired {
             remove_ephemeral_entry(state, &key);
         }
@@ -445,9 +446,11 @@ impl PersistentKv for LocalStore {
             .get(key)
             .map_or(0, |old| key.len().saturating_add(old.len()));
         let new_bytes = key.len().saturating_add(value.len());
-        let next_bytes = guard.bytes.saturating_sub(old_bytes).saturating_add(new_bytes);
-        if !guard.entries.contains_key(key)
-            && guard.entries.len() >= self.limits.persistent_entries
+        let next_bytes = guard
+            .bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(new_bytes);
+        if !guard.entries.contains_key(key) && guard.entries.len() >= self.limits.persistent_entries
         {
             return Err(StorageError::InvalidConfig(format!(
                 "LocalStore persistent capacity {} reached",
@@ -469,7 +472,9 @@ impl PersistentKv for LocalStore {
         self.validate_key(key)?;
         let mut guard = self.persistent.lock().await;
         if let Some(value) = guard.entries.remove(key) {
-            guard.bytes = guard.bytes.saturating_sub(key.len().saturating_add(value.len()));
+            guard.bytes = guard
+                .bytes
+                .saturating_sub(key.len().saturating_add(value.len()));
         }
         Ok(())
     }

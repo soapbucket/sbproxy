@@ -52,14 +52,13 @@ pub const SUBJECT_TOKEN_TYPE_ACCESS: &str = "urn:ietf:params:oauth:token-type:ac
 /// RFC 8693 §3 token_type URN for a JWT-shaped issued token. Used as
 /// the default `issued_token_type` when the upstream omits it.
 const ISSUED_TOKEN_TYPE_JWT: &str = "urn:ietf:params:oauth:token-type:jwt";
+const MAX_TOKEN_EXCHANGE_RESPONSE_BYTES: usize = 256 * 1024;
 
 // --- Public claim envelope ---
 
-/// Minimal JWT claim envelope the broker reads from a `subject_token`.
-/// We deliberately ignore signature, expiry, and audience here: those
-/// checks are the upstream's job (we forward verbatim) and the broker
-/// only cares about `iss`, `sub`, and the nested `act` chain for its
-/// own policy enforcement.
+/// Minimal verified claim envelope the broker retains from a
+/// `subject_token`. The caller constructs this only after signature,
+/// expiry, issuer, audience, and sender-constraint validation.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SubjectClaims {
     /// Issuer claim (RFC 7519 §4.1.1). Required; matched against
@@ -167,7 +166,9 @@ pub fn chain_depth(claims: &SubjectClaims) -> usize {
 pub async fn handle_token_exchange(
     app: &AppState,
     form: &HashMap<String, String>,
-    _method: ClientAuthMethod,
+    method: ClientAuthMethod,
+    authenticated_client_id: &str,
+    authorization_header: Option<&axum::http::HeaderValue>,
     dpop_proof: Option<&DpopProof>,
     verified_client_certificate: Option<&crate::VerifiedClientCertificate>,
 ) -> Response {
@@ -226,15 +227,41 @@ pub async fn handle_token_exchange(
     }
 
     // --- 3. Parse the subject_token ---
-    let claims = match parse_subject_token(&subject_token) {
-        Some(c) => c,
+    let verified_subject = match cfg.broker_signing_key.as_ref().and_then(|key| {
+        crate::at_jwt::verify_broker_at_jwt(
+            &subject_token,
+            key,
+            &crate::well_known::broker_issuer(cfg),
+            &cfg.resource_uri,
+        )
+        .ok()
+    }) {
+        Some(claims) => claims,
         None => {
             return crate::token::oauth_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
-                "subject_token is not a parseable JWT",
+                "subject_token is not a verified broker access token",
             );
         }
+    };
+    let act = match verified_subject.act.clone() {
+        Some(value) => match serde_json::from_value(value) {
+            Ok(act) => Some(Box::new(act)),
+            Err(_) => {
+                return crate::token::oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "subject_token carries a malformed act chain",
+                );
+            }
+        },
+        None => None,
+    };
+    let claims = SubjectClaims {
+        iss: Some(verified_subject.iss.clone()),
+        sub: Some(verified_subject.sub.clone()),
+        act,
     };
 
     // --- 4. Issuer allowlist ---
@@ -295,7 +322,7 @@ pub async fn handle_token_exchange(
     let agent_profile = match form.get("requested_token_type").map(String::as_str) {
         Some(crate::at_jwt::REQUESTED_TOKEN_TYPE_AGENT) => match claims.sub.as_ref() {
             Some(principal) => Some(AgentProfileInputs {
-                actor: form.get("client_id").cloned().unwrap_or_default(),
+                actor: authenticated_client_id.to_string(),
                 principal: principal.clone(),
                 tnx: gen_transaction_id(),
                 purpose: form.get("purpose").cloned(),
@@ -324,6 +351,19 @@ pub async fn handle_token_exchange(
             &description,
         );
     }
+    let expected_jkt = verified_subject
+        .cnf
+        .as_ref()
+        .and_then(|cnf| cnf.get("jkt"))
+        .and_then(serde_json::Value::as_str);
+    let proof_jkt = dpop_proof.and_then(|proof| crate::dpop::jwk_thumbprint(&proof.jwk).ok());
+    if expected_jkt != proof_jkt.as_deref() {
+        return crate::token::oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_dpop_proof",
+            "DPoP key does not match the verified subject token binding",
+        );
+    }
 
     // --- 7. Forward to upstream /token ---
     if cfg.upstream_token_endpoint_url.is_empty() {
@@ -344,17 +384,36 @@ pub async fn handle_token_exchange(
 
     // WOR-170: token-exchange forwards the subject token to the
     // upstream token endpoint; refuse redirects.
-    let http = sbproxy_httpkit::token_bearing_outbound();
-    let resp = match http
-        .post(&cfg.upstream_token_endpoint_url)
-        .form(&forwarded)
-        .send()
-        .await
+    let (_, http) = match crate::egress::endpoint_client(
+        &cfg.upstream_token_endpoint_url,
+        cfg.allow_insecure_loopback,
+    )
+    .await
     {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::warn!(%error, "token-exchange endpoint rejected by egress policy");
+            return crate::token::oauth_error(
+                StatusCode::BAD_GATEWAY,
+                "server_error",
+                "upstream token endpoint is not permitted",
+            );
+        }
+    };
+    let mut request = http.post(&cfg.upstream_token_endpoint_url).form(&forwarded);
+    if method == ClientAuthMethod::ClientSecretBasic {
+        if let Some(authorization) = authorization_header {
+            request = request.header(reqwest::header::AUTHORIZATION, authorization.clone());
+        }
+    }
+    if let Some(proof) = dpop_proof {
+        request = request.header("DPoP", &proof.raw_jwt);
+    }
+    let resp = match request.send().await {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(
-                error = %sbproxy_httpkit::request_error_summary(&e),
+                error = %e,
                 "upstream token-exchange call failed"
             );
             return crate::token::oauth_error(
@@ -366,11 +425,17 @@ pub async fn handle_token_exchange(
     };
 
     let status = resp.status();
-    let body_bytes = match resp.bytes().await {
+    let body_bytes = match crate::remote_body::bounded_response_body(
+        resp,
+        MAX_TOKEN_EXCHANGE_RESPONSE_BYTES,
+        "upstream token exchange",
+    )
+    .await
+    {
         Ok(b) => b,
         Err(e) => {
             tracing::error!(
-                error = %sbproxy_httpkit::request_error_summary(&e),
+                error = %e,
                 "upstream token-exchange body read failed"
             );
             return crate::token::oauth_error(
@@ -395,6 +460,7 @@ pub async fn handle_token_exchange(
         match inject_act_envelope(
             &body_bytes,
             &claims,
+            authenticated_client_id,
             cfg.broker_signing_key.as_ref(),
             agent_profile.as_ref(),
             &crate::well_known::broker_issuer(cfg),
@@ -528,6 +594,7 @@ pub fn gen_transaction_id() -> String {
 pub fn inject_act_envelope(
     body: &bytes::Bytes,
     subject: &SubjectClaims,
+    current_actor: &str,
     broker_signing_key: Option<&crate::config::JwkKey>,
     agent_profile: Option<&AgentProfileInputs>,
     broker_issuer: &str,
@@ -555,7 +622,7 @@ pub fn inject_act_envelope(
         Some(s) => s.to_string(),
         None => return Err(anyhow::anyhow!("upstream response missing access_token")),
     };
-    let mutations = act_mutations(&access_token, subject, agent_profile)?;
+    let mutations = act_mutations(subject, current_actor, agent_profile)?;
     let rewritten =
         crate::at_jwt::resign_at_jwt(&access_token, signing_key, broker_issuer, &mutations)?;
     obj.insert(
@@ -567,38 +634,23 @@ pub fn inject_act_envelope(
 
 /// Build the claims a freshly signed broker token adds for RFC 8693.
 fn act_mutations(
-    jwt: &str,
     subject: &SubjectClaims,
+    current_actor: &str,
     agent_profile: Option<&AgentProfileInputs>,
 ) -> Result<serde_json::Map<String, serde_json::Value>, anyhow::Error> {
-    let mut parts = jwt.split('.');
-    let _header = parts
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("access token is not a JWT"))?;
-    let payload = parts
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("access token is not a JWT"))?;
-    let _signature = parts
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("access token is not a JWT"))?;
-    if parts.next().is_some() {
-        return Err(anyhow::anyhow!("access token is not a three-segment JWT"));
-    }
-    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .map_err(|e| anyhow::anyhow!("access token payload decode failed: {e}"))?;
-    let value: serde_json::Value = serde_json::from_slice(&raw)
-        .map_err(|e| anyhow::anyhow!("access token payload is not JSON: {e}"))?;
-    // Build the new act envelope. Existing `act` (if any) is preserved
-    // as the inner act for chain auditing.
-    let prior_act = value.get("act").cloned();
+    // The outer actor is the client whose authentication the upstream
+    // accepted for this exchange. Only the verified subject token supplies
+    // prior delegation history; unrelated response-token claims are ignored.
+    let prior_act = subject
+        .act
+        .as_ref()
+        .map(|act| serde_json::to_value(act.as_ref()))
+        .transpose()?;
     let mut new_act = serde_json::Map::new();
-    if let Some(sub) = subject.sub.as_ref() {
-        new_act.insert("sub".to_string(), serde_json::Value::String(sub.clone()));
-    }
-    if let Some(iss) = subject.iss.as_ref() {
-        new_act.insert("iss".to_string(), serde_json::Value::String(iss.clone()));
-    }
+    new_act.insert(
+        "sub".to_string(),
+        serde_json::Value::String(current_actor.to_string()),
+    );
     if let Some(prev) = prior_act {
         new_act.insert("act".to_string(), prev);
     }
@@ -645,11 +697,19 @@ mod tests {
     use http_body_util::BodyExt;
     use std::sync::Arc;
     use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
     use tower::ServiceExt;
 
-    /// Encode a JSON value as a JWS Compact Serialization fixture. The
-    /// signature segment is a fixed dummy value; the broker only
-    /// inspects the payload in 4D.2.
+    const BROKER_PRIVATE_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgevZzL1gdAFr88hb2\n\
+OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
+1RTwjmYSi9R/zpBnuQ4EiMnCqfMPWiZqB4QdbAd0E7oH50VpuZ1P087G\n\
+-----END PRIVATE KEY-----";
+
+    /// Encode an intentionally unsigned JWT-shaped fixture for tests that
+    /// exercise only response rewriting. Subject-token tests use
+    /// `signed_subject` below.
     fn fixture_jwt(payload: serde_json::Value) -> String {
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&serde_json::json!({"alg":"none","typ":"JWT"})).unwrap());
@@ -658,13 +718,63 @@ mod tests {
         format!("{header}.{p}.sig")
     }
 
+    fn broker_key() -> crate::config::JwkKey {
+        crate::config::JwkKey::Pem {
+            pem: BROKER_PRIVATE_PEM.to_string(),
+            alg: "ES256".to_string(),
+            kid: Some("broker-key".to_string()),
+            public_jwk: Some(serde_json::json!({
+                "kty": "EC", "crv": "P-256",
+                "x": "EVs_o5-uQbTjL3chynL4wXgUg2R9q9UU8I5mEovUf84",
+                "y": "kGe5DgSIycKp8w9aJmoHhB1sB3QTugfnRWm5nU_TzsY",
+                "kid": "broker-key", "use": "sig", "alg": "ES256"
+            })),
+        }
+    }
+
+    fn signed_subject(
+        cfg: &McpGatewayConfig,
+        issuer: &str,
+        act: Option<serde_json::Value>,
+        cnf: Option<serde_json::Value>,
+    ) -> String {
+        let now = crate::device_code::unix_now();
+        crate::at_jwt::mint_at_jwt(
+            &crate::at_jwt::AtJwtClaims {
+                iss: issuer.to_string(),
+                sub: "alice".to_string(),
+                aud: serde_json::Value::String(cfg.resource_uri.clone()),
+                exp: now + 300,
+                iat: now,
+                jti: "subject-jti".to_string(),
+                client_id: "original-client".to_string(),
+                scope: Some("tools:call".to_string()),
+                auth_time: None,
+                acr: None,
+                amr: None,
+                act,
+                cnf,
+                actor: None,
+                principal: None,
+                tnx: None,
+                purpose: None,
+            },
+            cfg.broker_signing_key.as_ref().expect("broker key"),
+        )
+        .expect("signed subject")
+    }
+
     fn enabled_config() -> McpGatewayConfig {
         McpGatewayConfig {
             token_exchange_enabled: true,
-            subject_token_issuers: vec!["https://idp.example".to_string()],
+            external_base_url: "https://broker.example".to_string(),
+            resource_uri: "https://mcp.example/api".to_string(),
+            subject_token_issuers: vec!["https://broker.example/mcp/oauth".to_string()],
             allowed_token_exchange_audiences: vec!["https://api.downstream".to_string()],
             // Closed port; upstream calls return BAD_GATEWAY.
             upstream_token_endpoint_url: "http://127.0.0.1:1/token".to_string(),
+            allow_insecure_loopback: true,
+            broker_signing_key: Some(broker_key()),
             ..McpGatewayConfig::default()
         }
     }
@@ -688,6 +798,57 @@ mod tests {
         let status = resp.status();
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         (status, String::from_utf8_lossy(&body).to_string())
+    }
+
+    fn dpop_proof_for_subject(
+        subject_token: &str,
+        private_pem: &str,
+        public_jwk: serde_json::Value,
+        jti: &str,
+    ) -> String {
+        use jsonwebtoken::{Algorithm, EncodingKey, Header};
+        use sha2::{Digest, Sha256};
+
+        let mut header = Header::new(Algorithm::ES256);
+        header.typ = Some("dpop+jwt".to_string());
+        header.jwk = Some(serde_json::from_value(public_jwk).unwrap());
+        let ath = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(Sha256::digest(subject_token.as_bytes()));
+        let claims = serde_json::json!({
+            "htm": "POST",
+            "htu": "https://broker.example/mcp/oauth/token",
+            "iat": crate::device_code::unix_now(),
+            "jti": jti,
+            "ath": ath,
+        });
+        jsonwebtoken::encode(
+            &header,
+            &claims,
+            &EncodingKey::from_ec_pem(private_pem.as_bytes()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    async fn token_upstream(
+        response_body: String,
+    ) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 16 * 1024];
+            let read = socket.read(&mut request).await.unwrap();
+            request.truncate(read);
+            let _ = sender.send(String::from_utf8_lossy(&request).to_string());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body,
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        (format!("http://{address}/token"), receiver)
     }
 
     #[tokio::test]
@@ -721,11 +882,9 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_issuer_rejected() {
-        let app = build_app(enabled_config());
-        let token = fixture_jwt(serde_json::json!({
-            "iss": "https://attacker.example",
-            "sub": "alice",
-        }));
+        let cfg = enabled_config();
+        let token = signed_subject(&cfg, "https://attacker.example", None, None);
+        let app = build_app(cfg);
         let body = format!(
             "grant_type={}&subject_token={}&subject_token_type={}&client_id=cli",
             urlencode(TOKEN_EXCHANGE_GRANT_TYPE),
@@ -735,16 +894,22 @@ mod tests {
         let (status, body) = post_form(app, "/mcp/oauth/token", &body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.contains("invalid_request"));
-        assert!(body.contains("not enrolled"));
+        assert!(body.contains("not a verified broker access token"));
     }
 
     #[tokio::test]
     async fn audience_not_allowed_returns_invalid_target() {
-        let app = build_app(enabled_config());
-        let token = fixture_jwt(serde_json::json!({
-            "iss": "https://idp.example",
-            "sub": "alice",
-        }));
+        let cfg = enabled_config();
+        let issuer = crate::well_known::broker_issuer(&cfg);
+        let token = signed_subject(&cfg, &issuer, None, None);
+        crate::at_jwt::verify_broker_at_jwt(
+            &token,
+            cfg.broker_signing_key.as_ref().unwrap(),
+            &issuer,
+            &cfg.resource_uri,
+        )
+        .expect("fixture must pass the production subject verifier");
+        let app = build_app(cfg);
         let body = format!(
             "grant_type={}&subject_token={}&subject_token_type={}&audience={}&client_id=cli",
             urlencode(TOKEN_EXCHANGE_GRANT_TYPE),
@@ -754,25 +919,27 @@ mod tests {
         );
         let (status, body) = post_form(app, "/mcp/oauth/token", &body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body.contains("invalid_target"));
+        assert!(body.contains("invalid_target"), "{body}");
     }
 
     #[tokio::test]
     async fn chain_too_deep_rejected() {
         let mut cfg = enabled_config();
         cfg.token_exchange_max_chain_depth = 2;
-        let app = build_app(cfg);
         // Build a 2-deep act chain so the next exchange would reach
         // depth 3 == limit. The handler rejects when current depth
         // is >= max, so depth=2 with limit=2 fails.
-        let token = fixture_jwt(serde_json::json!({
-            "iss": "https://idp.example",
-            "sub": "alice",
-            "act": {
-                "sub": "service-a",
-                "act": {"sub": "service-b"},
-            },
-        }));
+        let issuer = crate::well_known::broker_issuer(&cfg);
+        let token = signed_subject(
+            &cfg,
+            &issuer,
+            Some(serde_json::json!({
+                    "sub": "service-a",
+                    "act": {"sub": "service-b"},
+            })),
+            None,
+        );
+        let app = build_app(cfg);
         let body = format!(
             "grant_type={}&subject_token={}&subject_token_type={}&client_id=cli",
             urlencode(TOKEN_EXCHANGE_GRANT_TYPE),
@@ -782,7 +949,7 @@ mod tests {
         let (status, body) = post_form(app, "/mcp/oauth/token", &body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.contains("invalid_request"));
-        assert!(body.contains("chain too deep"));
+        assert!(body.contains("chain too deep"), "{body}");
     }
 
     #[tokio::test]
@@ -790,11 +957,10 @@ mod tests {
         // The subject is an access token, so reaching the upstream also
         // requires a DPoP proof whose ath covers it. A policy-valid
         // exchange with no proof must stop at the last pre-network gate.
-        let app = build_app(enabled_config());
-        let token = fixture_jwt(serde_json::json!({
-            "iss": "https://idp.example",
-            "sub": "alice",
-        }));
+        let cfg = enabled_config();
+        let issuer = crate::well_known::broker_issuer(&cfg);
+        let token = signed_subject(&cfg, &issuer, None, None);
+        let app = build_app(cfg);
         let body = format!(
             "grant_type={}&subject_token={}&subject_token_type={}&audience={}&client_id=cli",
             urlencode(TOKEN_EXCHANGE_GRANT_TYPE),
@@ -804,7 +970,141 @@ mod tests {
         );
         let (status, body) = post_form(app, "/mcp/oauth/token", &body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body.contains("invalid_dpop_proof"));
+        assert!(body.contains("invalid_dpop_proof"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn stolen_subject_token_with_wrong_dpop_key_is_rejected() {
+        let cfg = enabled_config();
+        let issuer = crate::well_known::broker_issuer(&cfg);
+        let original_public: jsonwebtoken::jwk::Jwk = serde_json::from_value(serde_json::json!({
+            "kty": "EC", "crv": "P-256",
+            "x": "EVs_o5-uQbTjL3chynL4wXgUg2R9q9UU8I5mEovUf84",
+            "y": "kGe5DgSIycKp8w9aJmoHhB1sB3QTugfnRWm5nU_TzsY"
+        }))
+        .unwrap();
+        let token = signed_subject(
+            &cfg,
+            &issuer,
+            None,
+            Some(serde_json::json!({
+                "jkt": crate::dpop::jwk_thumbprint(&original_public).unwrap()
+            })),
+        );
+        let attacker_public = serde_json::json!({
+            "kty": "EC", "crv": "P-256",
+            "x": "DpZdjog3y9hgIyKgEPltBi5ptXKUeuRwVOAPSmoQAu4",
+            "y": "bfVVYV9slbMcg4dvtvYbeekYtpFXsYCWcIa9RCrBmTc"
+        });
+        let proof = dpop_proof_for_subject(
+            &token,
+            include_str!("../../sbproxy-modules/src/auth/dpop_test_ec_p256.pem"),
+            attacker_public,
+            "stolen-subject-wrong-key",
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/mcp/oauth/token")
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .header("DPoP", proof)
+            .body(Body::from(format!(
+                "grant_type={}&subject_token={}&subject_token_type={}&client_id=attacker",
+                urlencode(TOKEN_EXCHANGE_GRANT_TYPE),
+                urlencode(&token),
+                urlencode(SUBJECT_TOKEN_TYPE_ACCESS),
+            )))
+            .unwrap();
+        let response = build_app(cfg).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains("does not match"));
+    }
+
+    #[tokio::test]
+    async fn basic_client_identity_is_forwarded_and_becomes_outer_actor() {
+        let upstream_access_token = fixture_jwt(serde_json::json!({
+            "iss": "https://upstream.example",
+            "sub": "alice",
+            "aud": "https://api.downstream",
+            "exp": crate::device_code::unix_now() + 300,
+            "iat": crate::device_code::unix_now(),
+            "jti": "upstream-jti",
+            "client_id": "upstream-client"
+        }));
+        let response_body = serde_json::json!({
+            "access_token": upstream_access_token,
+            "token_type": "Bearer",
+            "expires_in": 300
+        })
+        .to_string();
+        let (upstream_url, captured) = token_upstream(response_body).await;
+        let mut cfg = enabled_config();
+        cfg.upstream_token_endpoint_url = upstream_url;
+        let issuer = crate::well_known::broker_issuer(&cfg);
+        let proof_public_value = serde_json::json!({
+            "kty": "EC", "crv": "P-256",
+            "x": "EVs_o5-uQbTjL3chynL4wXgUg2R9q9UU8I5mEovUf84",
+            "y": "kGe5DgSIycKp8w9aJmoHhB1sB3QTugfnRWm5nU_TzsY"
+        });
+        let proof_public: jsonwebtoken::jwk::Jwk =
+            serde_json::from_value(proof_public_value.clone()).unwrap();
+        let subject = signed_subject(
+            &cfg,
+            &issuer,
+            Some(serde_json::json!({
+                "sub": "prior-client",
+                "act": {"sub": "first-client"}
+            })),
+            Some(serde_json::json!({
+                "jkt": crate::dpop::jwk_thumbprint(&proof_public).unwrap()
+            })),
+        );
+        let proof = dpop_proof_for_subject(
+            &subject,
+            BROKER_PRIVATE_PEM,
+            proof_public_value,
+            "basic-exchange-proof",
+        );
+        let basic = base64::engine::general_purpose::STANDARD.encode("basic-client:secret");
+        let request = Request::builder()
+            .method("POST")
+            .uri("/mcp/oauth/token")
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .header(axum::http::header::AUTHORIZATION, format!("Basic {basic}"))
+            .header("DPoP", proof)
+            .body(Body::from(format!(
+                "grant_type={}&subject_token={}&subject_token_type={}",
+                urlencode(TOKEN_EXCHANGE_GRANT_TYPE),
+                urlencode(&subject),
+                urlencode(SUBJECT_TOKEN_TYPE_ACCESS),
+            )))
+            .unwrap();
+        let response = build_app(cfg).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let upstream_request = captured.await.unwrap();
+        assert!(
+            upstream_request.to_ascii_lowercase().contains(&format!(
+                "authorization: basic {}",
+                basic.to_ascii_lowercase()
+            )),
+            "{upstream_request}"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let wrapper: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let token = wrapper["access_token"].as_str().unwrap();
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(token.split('.').nth(1).unwrap())
+            .unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(claims["act"]["sub"], "basic-client");
+        assert_eq!(claims["act"]["act"]["sub"], "prior-client");
+        assert_eq!(claims["act"]["act"]["act"]["sub"], "first-client");
     }
 
     /// WOR-40: token exchange with no client authentication material
@@ -943,8 +1243,15 @@ mod tests {
             act: None,
         };
         // No signing key: pass-through.
-        let rewritten =
-            inject_act_envelope(&body, &subject, None, None, "https://broker.example").unwrap();
+        let rewritten = inject_act_envelope(
+            &body,
+            &subject,
+            "client-1",
+            None,
+            None,
+            "https://broker.example",
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
         // access_token is unchanged.
         assert_eq!(parsed["access_token"].as_str().unwrap(), inner_jwt);
@@ -992,11 +1299,18 @@ mod tests {
             pem: include_str!("../../sbproxy-modules/src/auth/dpop_test_ec_p256.pem").to_string(),
             alg: "ES256".to_string(),
             kid: Some("broker-key".to_string()),
+            public_jwk: None,
         };
 
-        let rewritten =
-            inject_act_envelope(&body, &subject, Some(&key), None, "https://broker.example")
-                .unwrap();
+        let rewritten = inject_act_envelope(
+            &body,
+            &subject,
+            "client-1",
+            Some(&key),
+            None,
+            "https://broker.example",
+        )
+        .unwrap();
         let wrapper: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
         let token = wrapper["access_token"].as_str().unwrap();
         let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -1004,7 +1318,7 @@ mod tests {
             .unwrap();
         let claims: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         assert_eq!(claims["iss"], "https://broker.example");
-        assert_eq!(claims["act"]["sub"], "alice");
+        assert_eq!(claims["act"]["sub"], "client-1");
         assert_ne!(token.split('.').nth(2), Some("sig"));
     }
 
@@ -1048,6 +1362,7 @@ mod tests {
             pem: include_str!("../../sbproxy-modules/src/auth/dpop_test_ec_p256.pem").to_string(),
             alg: "ES256".to_string(),
             kid: Some("broker-key".to_string()),
+            public_jwk: None,
         });
         let certificate = crate::VerifiedClientCertificate {
             x5t_s256: "verified-certificate-thumbprint".to_string(),
@@ -1074,12 +1389,6 @@ mod tests {
     /// envelope when an `AgentProfileInputs` is supplied.
     #[test]
     fn rewrite_act_stamps_agent_profile_claims() {
-        use base64::Engine;
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-            serde_json::to_vec(&serde_json::json!({"sub": "agent-client", "iss": "https://idp"}))
-                .unwrap(),
-        );
-        let jwt = format!("hdr.{payload}.sig");
         let subject = SubjectClaims {
             iss: Some("https://idp".into()),
             sub: Some("alice".into()),
@@ -1091,30 +1400,26 @@ mod tests {
             tnx: "abc123".into(),
             purpose: Some("clean up staging".into()),
         };
-        let v = act_mutations(&jwt, &subject, Some(&ap)).expect("claims");
+        let v = act_mutations(&subject, "agent-client", Some(&ap)).expect("claims");
         assert_eq!(v["actor"], "agent-client");
         assert_eq!(v["principal"], "alice");
         assert_eq!(v["tnx"], "abc123");
         assert_eq!(v["purpose"], "clean up staging");
         // The act envelope (the human at the top of the chain) is still
         // built so the agent profile and the act chain coexist.
-        assert_eq!(v["act"]["sub"], "alice");
+        assert_eq!(v["act"]["sub"], "agent-client");
     }
 
     /// Without an agent profile, no agent-profile claims are added: a
     /// classic act-only rewrite stays clean.
     #[test]
     fn rewrite_act_without_agent_profile_adds_no_agent_claims() {
-        use base64::Engine;
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(serde_json::to_vec(&serde_json::json!({"sub": "svc"})).unwrap());
-        let jwt = format!("hdr.{payload}.sig");
         let subject = SubjectClaims {
             iss: None,
             sub: Some("alice".into()),
             act: None,
         };
-        let v = act_mutations(&jwt, &subject, None).expect("claims");
+        let v = act_mutations(&subject, "client-1", None).expect("claims");
         assert!(v.get("actor").is_none());
         assert!(v.get("principal").is_none());
         assert!(v.get("tnx").is_none());

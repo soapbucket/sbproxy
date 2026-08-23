@@ -603,6 +603,7 @@ mod tests {
             pem: include_str!("../../sbproxy-modules/src/auth/dpop_test_ec_p256.pem").to_string(),
             alg: "ES256".to_string(),
             kid: Some("broker-key".to_string()),
+            public_jwk: None,
         };
 
         let rewritten =
