@@ -125,6 +125,11 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_ai_inter_token_latency_seconds` | Histogram | `stable` | `beta` | `provider`, `model` | AI streaming average inter-token latency (TPOT). |
 | `sbproxy_ai_intent_detection_source_total` | Counter | `stable` | `beta` | `source` | Intent-detection dispatches by which path answered: a registered sidecar hook or the local keyword-heuristic fallback. |
 | `sbproxy_ai_quality_routing_decisions_total` | Counter | `stable` | `beta` | `outcome` | Quality-hook routing decisions by selected or fallback outcome. |
+| `sbproxy_classifier_errors_total` | Counter | `stable` | `beta` | `transport`, `cmd`, `reason` | Rich classifier sidecar requests that could not complete, by transport, command, and bounded reason. |
+| `sbproxy_classifier_quality_score` | Histogram | `stable` | `beta` | `transport` | Heuristic quality scores returned by the rich classifier sidecar, by transport. |
+| `sbproxy_classifier_requests_total` | Counter | `stable` | `beta` | `transport`, `cmd` | Requests handled by the rich classifier sidecar, by transport and command. |
+| `sbproxy_classifier_safety_verdicts_total` | Counter | `stable` | `beta` | `verdict` | Per-token streaming safety verdicts emitted by the rich classifier sidecar. |
+| `sbproxy_classifier_tenants` | Gauge | `stable` | `beta` | none | Tenants currently registered with the rich classifier sidecar. |
 | `sbproxy_ai_key_fallbacks_total` | Counter | `stable` | `beta` | `provider`, `outcome` | AI provider-key fallback decisions, by the provider entry whose own key was refused and the outcome (`engaged` when the operator's `fallback_credential_id` resolved and the retry was queued, `unavailable` when it did not and the provider's rejection stands). `unavailable` is the alertable one: it means the house credential is broken and the only other evidence is a `401` that reads like the tenant's fault. |
 | `sbproxy_ai_lb_decisions_total` | Counter | `stable` | `beta` | `strategy`, `provider` | AI router provider selections by strategy. |
 | `sbproxy_ai_model_group_selections_total` | Counter | `stable` | `alpha` | `group`, `provider` | Named model group member selections: which group a request addressed and which provider's deployment served it. Both labels are operator-declared config names. |
