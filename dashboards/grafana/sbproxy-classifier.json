@@ -215,6 +215,78 @@
         }
       ],
       "description": "Per-token/per-chunk streaming safety verdicts from ClassifierService.StreamSafety and the TCP streaming_safety command. A rising `blocked` rate against flat traffic is worth investigating before assuming it is the rule set."
+    },
+    {
+      "id": 6,
+      "title": "Admission queue by command",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max", "lastNotNull"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (cmd) (sbproxy_classifier_admission_queue)",
+          "legendFormat": "{{cmd}}",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+        }
+      ],
+      "description": "Requests waiting for one of the rich sidecar's bounded inference slots. Sustained queue depth means the configured concurrency limit is saturated."
+    },
+    {
+      "id": 7,
+      "title": "Admission refusals by command + reason",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max", "lastNotNull"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (cmd, reason) (rate(sbproxy_classifier_admission_refusals_total[5m]))",
+          "legendFormat": "{{cmd}}/{{reason}}",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+        }
+      ],
+      "description": "Requests refused before inference because the bounded queue was full, a deadline elapsed, or a resource limit was reached."
     }
   ],
   "refresh": "30s",

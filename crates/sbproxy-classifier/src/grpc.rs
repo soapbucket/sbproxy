@@ -582,7 +582,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_safety_blocks_once_a_rule_matches_and_stays_blocked() {
+    async fn stream_safety_emits_one_block_transition_and_stays_unsafe() {
         // Drives `run_stream_safety` directly with a plain `ReceiverStream`
         // rather than a real `tonic::Streaming`, which has no public test
         // constructor. This still exercises the exact loop the trait method
@@ -627,10 +627,11 @@ mod tests {
         assert!(!second.safe && second.blocked);
         assert!(second.reason.contains("forbidden"));
 
-        // Stays blocked on the message after the match, even though this
-        // chunk alone contains none of the rule text.
+        // The unsafe state persists on the message after the match, but
+        // `blocked` is the one-shot transition bit and does not fire again.
         let third = outbound.next().await.unwrap().unwrap();
         assert!(!third.safe);
+        assert!(!third.blocked);
         assert_eq!(third.reason, second.reason);
     }
 

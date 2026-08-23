@@ -239,7 +239,7 @@ See [guardrails.md](guardrails.md) and [prompt-injection-v2.md](prompt-injection
 | Quality scoring | gRPC `ClassifierService.Quality`, and TCP `quality_score` | Heuristic AI-response quality score: refusal-phrase detection, length, repetition, formatting, casing. Sub-100us, no model. |
 | Text normalization / PII redaction | TCP, applied to `classify` text before scoring | Unicode NFKC plus a regex substitution pipeline per tenant; an operator registers `email` / `phone` / `credit_card` rules (or its own) with a `<REDACTED>`-style replacement in `normalization.rules`. |
 | Intent / content-type detection | TCP `intent_detect` / `content_type_detect` | Coarse heuristic categories (coding / vision / analysis / summarization / general; image / audio / video / text). |
-| Per-token streaming safety | gRPC `ClassifierService.StreamSafety` (bidi), and TCP `streaming_safety` | Checks accumulated streamed tokens against a rule set as they arrive, so a caller can cut a response short instead of waiting for the full body. Once a rule matches, every later verdict on the stream reports blocked again. |
+| Per-token streaming safety | gRPC `ClassifierService.StreamSafety` (bidi), and TCP `streaming_safety` | Checks accumulated streamed tokens against a rule set as they arrive, so a caller can cut a response short instead of waiting for the full body. After the first match, `safe` remains false and carries the matching reason; `blocked` is true only on the message that first caused that transition. |
 
 `Compress` (token-classification pruning) is not ported and returns `UNIMPLEMENTED` on this binary; run the minimal sidecar for that RPC. See the crate's module docs (`crates/sbproxy-classifier/src/*.rs`) for the full scope note, including what was deliberately not ported from the enterprise source (LLM-judge backends, license-leak detection, the Wave 5 agent-classifier ML path, Ed25519 model-signing, OpenTelemetry).
 
@@ -289,7 +289,7 @@ Should `sbproxy-classifier` eventually replace OSS's in-process ONNX classifier 
 
 ### Metrics
 
-`sbproxy-classifier` exposes its own Prometheus families on `--metrics-addr`'s `/metrics` (see `crates/sbproxy-classifier/src/metrics.rs`): `sbproxy_classifier_requests_total{transport,cmd}`, `sbproxy_classifier_errors_total{transport,cmd,reason}`, `sbproxy_classifier_tenants`, `sbproxy_classifier_quality_score{transport}`, and `sbproxy_classifier_safety_verdicts_total{verdict}`. `dashboards/grafana/sbproxy-classifier.json` graphs all five; import it alongside the existing `sbproxy-model-host.json` and `sbproxy-mesh-storage.json` dashboards, which chart their own similarly out-of-process binaries the same way.
+`sbproxy-classifier` exposes seven Prometheus families on `--metrics-addr`'s `/metrics` (see `crates/sbproxy-classifier/src/metrics.rs`): `sbproxy_classifier_admission_queue{cmd}`, `sbproxy_classifier_admission_refusals_total{cmd,reason}`, `sbproxy_classifier_requests_total{transport,cmd}`, `sbproxy_classifier_errors_total{transport,cmd,reason}`, `sbproxy_classifier_tenants`, `sbproxy_classifier_quality_score{transport}`, and `sbproxy_classifier_safety_verdicts_total{verdict}`. All seven are in the central [metric stability catalog](metrics-stability.md), even though this standalone process serves them from its own scrape endpoint. `dashboards/grafana/sbproxy-classifier.json` graphs all seven; import it alongside the existing `sbproxy-model-host.json` and `sbproxy-mesh-storage.json` dashboards, which chart their own similarly out-of-process binaries the same way.
 
 ## See also
 
