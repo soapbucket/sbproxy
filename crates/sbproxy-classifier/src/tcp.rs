@@ -41,7 +41,7 @@ const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const TRANSPORT: &str = "tcp";
 const ADMIN_TRANSPORT: &str = "admin_tcp";
 pub const DEFAULT_MAX_CONNECTIONS: usize = 128;
-pub const DEFAULT_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const DEFAULT_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

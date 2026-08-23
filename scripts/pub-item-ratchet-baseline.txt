@@ -675,3 +675,22 @@ only production-tree textual occurrence that had hidden
 `select_by_quality_async` from both scans. The function remains public for
 its example and unit-test consumers; this records that lane-owned item
 explicitly instead of retaining a false comment to hold the baselines down.
+
+2026-08-22 (WOR-2661 review fix round 1): tests-only 321 -> 318 and
+unreferenced stays 1447 on the main-reconciled tree. Six former
+example-only items left both buckets: `FsmExecution::{current_state,
+is_completed}` and `WeightedPrompt{Store,Version}` plus
+`WeightedPromptStore::{add_version,select_by_weight}`. The stock CLI now
+names the first five on supported orchestration and prompt-rollout paths;
+the wall-clock `select_by_weight` API was replaced by cohort-stable
+selection. Three lane-owned items entered the tests-only slice:
+`ChargebackTracker::{entries_snapshot,workspace_totals_snapshot}` remain
+example-accessible export helpers, and `ClassifierIntentHook` remains named
+by its fallback example while stock configuration constructs it in its own
+module behind the trait seam. Eight lane-owned items initially entered the
+wider unreferenced slice, offset by the six removals. The two avoidable
+same-file-only constants (`DEFAULT_IO_TIMEOUT` and
+`SIDECAR_ONNX_DETECTOR_NAME`) were narrowed before recording the result.
+The remaining six additions are required typed errors/configuration or
+documented query surfaces: `PromptVersionError`, both classifier hook config
+types, `ClassifierIntentHook`, and the two chargeback snapshot helpers.

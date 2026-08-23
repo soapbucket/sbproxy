@@ -195,7 +195,7 @@ pub const DEFAULT_BLOCK_BODY: &str = "prompt injection detected";
 
 /// Runtime name for the shipping sidecar detector with its mandatory,
 /// verified in-process ONNX fallback.
-pub const SIDECAR_ONNX_DETECTOR_NAME: &str = "sidecar+inprocess";
+const SIDECAR_ONNX_DETECTOR_NAME: &str = "sidecar+inprocess";
 
 /// Composite used by production `detector: sidecar` configuration. A sidecar
 /// transport, timeout, RPC, or protocol failure is never silently admitted:
