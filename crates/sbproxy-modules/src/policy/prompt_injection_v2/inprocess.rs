@@ -13,14 +13,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context as _};
+use anyhow::{bail, Context as _};
 use sbproxy_classifiers::{
     default_model_cache_dir, lookup_known_model, parse_ed25519_pubkey, LoadOptions,
     LocalArtifactVerification, OnnxClassifier,
 };
 use serde::Deserialize;
 
-use super::detector::{DetectionLabel, DetectionResult, Detector};
+use super::detector::{
+    DetectionFailure, DetectionFailureKind, DetectionLabel, DetectionResult, Detector,
+    DetectorCacheNamespace,
+};
 
 /// Config name selecting this detector (`detector: "inprocess"`).
 pub const INPROCESS_DETECTOR_NAME: &str = "inprocess";
@@ -33,6 +36,13 @@ const DEFAULT_TOKENIZER_FILENAME: &str = "tokenizer.json";
 const DEFAULT_MAX_CONCURRENT: usize = 2;
 const DEFAULT_MAX_QUEUED: usize = 16;
 const DEFAULT_INFERENCE_TIMEOUT_MS: u64 = 500;
+
+/// Largest supported in-process inference concurrency.
+pub const INPROCESS_MAX_CONCURRENT: usize = 64;
+/// Largest supported in-process inference wait queue.
+pub const INPROCESS_MAX_QUEUED: usize = 1_024;
+/// Largest supported end-to-end in-process inference deadline.
+pub const INPROCESS_MAX_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Map a `[0,1]` injection score onto the v2 label vocabulary. Same
 /// cutoffs as the sidecar detector so the two report identically.
@@ -97,8 +107,9 @@ struct InprocessDetectorConfig {
     /// Maximum number of ONNX evaluations running for this detector.
     #[serde(default = "default_max_concurrent")]
     max_concurrent: usize,
-    /// Maximum number of evaluations waiting for a running slot. Zero
-    /// refuses immediately when every running slot is occupied.
+    /// Maximum number of evaluations waiting for a running slot. Must be in
+    /// `1..=1024`; once both the running and queued budgets are occupied,
+    /// later work is refused immediately.
     #[serde(default = "default_max_queued")]
     max_queued: usize,
     /// End-to-end admission and evaluation deadline.
@@ -132,13 +143,21 @@ struct InprocessAdmission {
 }
 
 impl InprocessAdmission {
+    fn validate(max_concurrent: usize, max_queued: usize, timeout: Duration) -> anyhow::Result<()> {
+        if !(1..=INPROCESS_MAX_CONCURRENT).contains(&max_concurrent) {
+            bail!("inprocess detector max_concurrent must be in 1..={INPROCESS_MAX_CONCURRENT}");
+        }
+        if !(1..=INPROCESS_MAX_QUEUED).contains(&max_queued) {
+            bail!("inprocess detector max_queued must be in 1..={INPROCESS_MAX_QUEUED}");
+        }
+        if timeout.is_zero() || timeout > INPROCESS_MAX_TIMEOUT {
+            bail!("inprocess detector inference_timeout_ms must be in 1..=30000");
+        }
+        Ok(())
+    }
+
     fn new(max_concurrent: usize, max_queued: usize, timeout: Duration) -> anyhow::Result<Self> {
-        if max_concurrent == 0 {
-            bail!("inprocess detector max_concurrent must be greater than zero");
-        }
-        if timeout.is_zero() {
-            bail!("inprocess detector inference_timeout_ms must be greater than zero");
-        }
+        Self::validate(max_concurrent, max_queued, timeout)?;
         Ok(Self {
             running: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
             queued: Arc::new(tokio::sync::Semaphore::new(max_queued)),
@@ -146,7 +165,7 @@ impl InprocessAdmission {
         })
     }
 
-    async fn run<F, T>(&self, work: F) -> anyhow::Result<T>
+    async fn run<F, T>(&self, work: F) -> Result<T, DetectionFailure>
     where
         F: FnOnce() -> anyhow::Result<T> + Send + 'static,
         T: Send + 'static,
@@ -157,24 +176,25 @@ impl InprocessAdmission {
                 Err(_) => {
                     let queued = Arc::clone(&self.queued)
                         .try_acquire_owned()
-                        .map_err(|_| anyhow!("inprocess detector inference queue is full"))?;
+                        .map_err(|_| DetectionFailure::direct(DetectionFailureKind::QueueFull))?;
                     let running = Arc::clone(&self.running)
                         .acquire_owned()
                         .await
-                        .map_err(|_| anyhow!("inprocess detector admission closed"))?;
+                        .map_err(|_| DetectionFailure::direct(DetectionFailureKind::Worker))?;
                     drop(queued);
                     running
                 }
             };
-            tokio::task::spawn_blocking(move || {
+            let result = tokio::task::spawn_blocking(move || {
                 let _running = running;
                 work()
             })
             .await
-            .map_err(|error| anyhow!("inprocess detector worker failed: {error}"))?
+            .map_err(|_| DetectionFailure::direct(DetectionFailureKind::Worker))?;
+            result.map_err(|_| DetectionFailure::direct(DetectionFailureKind::Inference))
         })
         .await
-        .map_err(|_| anyhow!("inprocess detector inference deadline exceeded"))?
+        .map_err(|_| DetectionFailure::direct(DetectionFailureKind::Deadline))?
     }
 }
 
@@ -185,6 +205,7 @@ pub struct InprocessDetector {
     injection_label: String,
     threshold: f64,
     name: &'static str,
+    cache_namespace: DetectorCacheNamespace,
 }
 
 pub(super) enum AutoInprocessSelection {
@@ -253,6 +274,11 @@ impl InprocessDetector {
                 cfg.threshold
             );
         }
+        InprocessAdmission::validate(
+            cfg.max_concurrent,
+            cfg.max_queued,
+            Duration::from_millis(cfg.inference_timeout_ms),
+        )?;
         let mut options = LoadOptions::default();
         if let Some(bytes) = cfg.max_model_bytes {
             options = options.with_max_model_bytes(bytes);
@@ -275,6 +301,7 @@ impl InprocessDetector {
         }
         let labels = cfg
             .labels
+            .clone()
             .unwrap_or_else(|| vec!["SAFE".to_string(), "INJECTION".to_string()]);
         if !labels
             .iter()
@@ -285,6 +312,7 @@ impl InprocessDetector {
                 cfg.injection_label
             );
         }
+        let cache_namespace = cache_namespace_for(&cfg, &labels)?;
         let classifier = OnnxClassifier::load_verified_local_with_options(
             model_path,
             tokenizer_path,
@@ -304,6 +332,7 @@ impl InprocessDetector {
             injection_label: cfg.injection_label,
             threshold: cfg.threshold,
             name: INPROCESS_DETECTOR_NAME,
+            cache_namespace,
         }))
     }
 }
@@ -345,19 +374,7 @@ fn auto_paths(
 }
 
 fn verification_for(cfg: &InprocessDetectorConfig) -> anyhow::Result<LocalArtifactVerification> {
-    let (model_sha256, tokenizer_sha256) = match (&cfg.model_sha256, &cfg.tokenizer_sha256) {
-        (Some(model), Some(tokenizer)) => (model.as_str(), tokenizer.as_str()),
-        (None, None) => lookup_known_model(&cfg.model)
-            .and_then(|model| model.pinned_pair())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "inprocess detector requires model_sha256 and tokenizer_sha256; \
-                         known model {:?} has no complete trusted pin pair",
-                    cfg.model
-                )
-            })?,
-        _ => bail!("inprocess detector requires model_sha256 and tokenizer_sha256 together"),
-    };
+    let (model_sha256, tokenizer_sha256) = resolved_pins(cfg)?;
 
     match (
         cfg.model_signature_path.as_ref(),
@@ -375,8 +392,60 @@ fn verification_for(cfg: &InprocessDetectorConfig) -> anyhow::Result<LocalArtifa
         .context("inprocess detector artifact pins")
 }
 
+fn resolved_pins(cfg: &InprocessDetectorConfig) -> anyhow::Result<(&str, &str)> {
+    let pins = match (&cfg.model_sha256, &cfg.tokenizer_sha256) {
+        (Some(model), Some(tokenizer)) => (model.as_str(), tokenizer.as_str()),
+        (None, None) => lookup_known_model(&cfg.model)
+            .and_then(|model| model.pinned_pair())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "inprocess detector requires model_sha256 and tokenizer_sha256; \
+                         known model {:?} has no complete trusted pin pair",
+                    cfg.model
+                )
+            })?,
+        _ => bail!("inprocess detector requires model_sha256 and tokenizer_sha256 together"),
+    };
+    Ok(pins)
+}
+
+fn cache_namespace_for(
+    cfg: &InprocessDetectorConfig,
+    labels: &[String],
+) -> anyhow::Result<DetectorCacheNamespace> {
+    let (model_sha256, tokenizer_sha256) = resolved_pins(cfg)?;
+    let model_sha256 = model_sha256.to_ascii_lowercase();
+    let tokenizer_sha256 = tokenizer_sha256.to_ascii_lowercase();
+    let injection_label = cfg.injection_label.to_ascii_lowercase();
+    let threshold = cfg.threshold.to_bits().to_be_bytes();
+    let mut parts: Vec<&[u8]> = vec![
+        INPROCESS_DETECTOR_NAME.as_bytes(),
+        b"semantic-version-1",
+        model_sha256.as_bytes(),
+        tokenizer_sha256.as_bytes(),
+        injection_label.as_bytes(),
+        &threshold,
+    ];
+    for label in labels {
+        parts.push(label.as_bytes());
+    }
+    Ok(DetectorCacheNamespace::derive(&parts))
+}
+
 impl Detector for InprocessDetector {
     fn detect(&self, prompt: &str) -> DetectionResult {
+        self.try_detect(prompt)
+            .unwrap_or_else(|failure| DetectionResult {
+                // Legacy direct callers cannot carry the typed error. Preserve a
+                // conservative non-clean result; production policy evaluation
+                // calls `try_detect` and handles the exact failure explicitly.
+                score: 1.0,
+                label: DetectionLabel::Injection,
+                reason: Some(failure.to_string()),
+            })
+    }
+
+    fn try_detect(&self, prompt: &str) -> Result<DetectionResult, DetectionFailure> {
         let outcome = match tokio::runtime::Handle::try_current() {
             Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
                 let classifier = Arc::clone(&self.classifier);
@@ -385,9 +454,7 @@ impl Detector for InprocessDetector {
                     handle.block_on(self.admission.run(move || classifier.classify(&prompt)))
                 })
             }
-            _ => Err(anyhow!(
-                "inprocess detector requires the proxy multi-thread Tokio runtime"
-            )),
+            _ => Err(DetectionFailure::direct(DetectionFailureKind::Runtime)),
         };
         match outcome {
             Ok(output) => {
@@ -400,27 +467,25 @@ impl Detector for InprocessDetector {
                 } else {
                     (1.0 - score, classify_score(1.0 - score, self.threshold))
                 };
-                DetectionResult {
+                Ok(DetectionResult {
                     score: score_for_policy,
                     label,
                     reason: Some(format!(
                         "inprocess label={} score={:.3}",
                         output.label, output.score
                     )),
-                }
+                })
             }
-            Err(e) => {
-                // Inference failure fails open (clean) so a model hiccup never
-                // wedges the request path; operators who want fail-closed use
-                // the sidecar detector's policy.
-                tracing::warn!(error = %e, "inprocess prompt-injection inference failed; failing open");
-                DetectionResult::clean()
-            }
+            Err(error) => Err(error),
         }
     }
 
     fn name(&self) -> &str {
         self.name
+    }
+
+    fn cache_namespace(&self) -> Option<DetectorCacheNamespace> {
+        Some(self.cache_namespace)
     }
 }
 
@@ -428,9 +493,53 @@ impl Detector for InprocessDetector {
 mod tests {
     use super::*;
 
+    /// A capacity or deadline accepted here reaches Tokio construction or
+    /// request-time arithmetic before the surrounding policy can render a
+    /// controlled refusal. Pin the public operational envelope at this
+    /// boundary so even direct library construction cannot panic on values
+    /// deserialized from operator config.
+    #[test]
+    fn admission_rejects_zero_and_values_above_operational_maxima_without_panicking() {
+        for (running, queued, timeout) in [
+            (0, 1, Duration::from_millis(1)),
+            (1, 0, Duration::from_millis(1)),
+            (65, 1, Duration::from_millis(1)),
+            (1, 1_025, Duration::from_millis(1)),
+            (1, 1, Duration::ZERO),
+            (1, 1, Duration::from_millis(30_001)),
+            (1, 1, Duration::from_millis(u64::MAX)),
+        ] {
+            assert!(
+                InprocessAdmission::new(running, queued, timeout).is_err(),
+                "running={running}, queued={queued}, timeout={timeout:?} must be rejected"
+            );
+        }
+
+        for (running, queued) in [(usize::MAX, 1), (1, usize::MAX)] {
+            let result = std::panic::catch_unwind(|| {
+                InprocessAdmission::new(running, queued, Duration::from_millis(1))
+            });
+            assert!(
+                result.is_ok(),
+                "operator capacity running={running}, queued={queued} must return an error, not panic"
+            );
+            assert!(result.expect("constructor did not panic").is_err());
+        }
+
+        assert!(
+            InprocessAdmission::new(
+                INPROCESS_MAX_CONCURRENT,
+                INPROCESS_MAX_QUEUED,
+                INPROCESS_MAX_TIMEOUT,
+            )
+            .is_ok(),
+            "the documented exact operational maxima must remain accepted"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn inference_admission_refuses_work_beyond_running_and_queue_budget() {
-        let admission = Arc::new(InprocessAdmission::new(1, 0, Duration::from_secs(1)).unwrap());
+        let admission = Arc::new(InprocessAdmission::new(1, 1, Duration::from_secs(1)).unwrap());
         let first = {
             let admission = Arc::clone(&admission);
             tokio::spawn(async move {
@@ -444,12 +553,43 @@ mod tests {
         };
         tokio::time::sleep(Duration::from_millis(20)).await;
 
+        let queued = {
+            let admission = Arc::clone(&admission);
+            tokio::spawn(async move { admission.run(|| Ok::<_, anyhow::Error>(())).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
         let error = admission
             .run(|| Ok::<_, anyhow::Error>(()))
             .await
             .expect_err("work beyond the configured queue budget must be refused");
-        assert!(error.to_string().contains("queue is full"));
+        assert_eq!(
+            error.terminal().kind,
+            DetectionFailureKind::QueueFull,
+            "work beyond the configured queue budget must retain its typed reason"
+        );
         first.await.unwrap().unwrap();
+        queued.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inference_admission_preserves_deadline_and_worker_failures() {
+        let deadline = InprocessAdmission::new(1, 1, Duration::from_millis(10)).unwrap();
+        let error = deadline
+            .run(|| {
+                std::thread::sleep(Duration::from_millis(50));
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .expect_err("slow work must reach the bounded deadline");
+        assert_eq!(error.terminal().kind, DetectionFailureKind::Deadline);
+
+        let worker = InprocessAdmission::new(1, 1, Duration::from_secs(1)).unwrap();
+        let error = worker
+            .run(|| -> anyhow::Result<()> { panic!("test worker panic") })
+            .await
+            .expect_err("a panicked blocking worker must remain typed");
+        assert_eq!(error.terminal().kind, DetectionFailureKind::Worker);
     }
 
     #[test]
@@ -460,6 +600,64 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("inprocess detector config"));
+    }
+
+    #[test]
+    fn configured_operational_limits_fail_before_artifact_loading() {
+        for (field, value, expected) in [
+            ("max_concurrent", serde_json::json!(0), "max_concurrent"),
+            ("max_concurrent", serde_json::json!(65), "max_concurrent"),
+            ("max_queued", serde_json::json!(0), "max_queued"),
+            ("max_queued", serde_json::json!(1_025), "max_queued"),
+            (
+                "inference_timeout_ms",
+                serde_json::json!(0),
+                "inference_timeout_ms",
+            ),
+            (
+                "inference_timeout_ms",
+                serde_json::json!(u64::MAX),
+                "inference_timeout_ms",
+            ),
+        ] {
+            let mut config = serde_json::json!({
+                "model_path": "/nonexistent/model.onnx",
+                "tokenizer_path": "/nonexistent/tokenizer.json",
+                "model_sha256": "0000000000000000000000000000000000000000000000000000000000000001",
+                "tokenizer_sha256": "0000000000000000000000000000000000000000000000000000000000000002"
+            });
+            config[field] = value;
+            let error = InprocessDetector::from_config(&config)
+                .err()
+                .expect("unsafe operational limit must fail config");
+            assert!(
+                error.to_string().contains(expected),
+                "{field} failed at the wrong boundary: {error}"
+            );
+            assert!(
+                !error.to_string().contains("artifact"),
+                "{field} must be rejected before artifact loading: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_exact_operational_maxima_pass_limit_validation() {
+        let error = InprocessDetector::from_config(&serde_json::json!({
+            "model_path": "/nonexistent/model.onnx",
+            "tokenizer_path": "/nonexistent/tokenizer.json",
+            "model_sha256": "0000000000000000000000000000000000000000000000000000000000000001",
+            "tokenizer_sha256": "0000000000000000000000000000000000000000000000000000000000000002",
+            "max_concurrent": INPROCESS_MAX_CONCURRENT,
+            "max_queued": INPROCESS_MAX_QUEUED,
+            "inference_timeout_ms": 30_000
+        }))
+        .err()
+        .expect("the nonexistent artifact still prevents construction");
+        assert!(
+            error.to_string().contains("stat local model artifact"),
+            "exact maxima must pass limit validation and reach artifact loading: {error}"
+        );
     }
 
     #[test]

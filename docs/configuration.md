@@ -3462,6 +3462,9 @@ policies:
 | `detector_config.signature_public_key` | string | none | Ed25519 key as 64 hex characters or a `PUBLIC KEY` PEM block. All three signature fields are required together. |
 | `detector_config.max_model_bytes` | integer | `209715200` | Model size budget checked before parsing. |
 | `detector_config.max_tokenizer_bytes` | integer | `209715200` | Tokenizer size budget checked before parsing. |
+| `detector_config.max_concurrent` | integer | `2` | Running in-process evaluations. Must be in `1..=64`. |
+| `detector_config.max_queued` | integer | `16` | Waiting in-process evaluations. Must be in `1..=1024`; later work is refused as `queue_full`. |
+| `detector_config.inference_timeout_ms` | integer | `500` | End-to-end local admission and inference deadline. Must be in `1..=30000`. |
 | `threshold` | float | `0.5` | Score threshold in `[0.0, 1.0]`; the policy fires when `score >= threshold`. |
 | `action` | string | `tag` | `tag` stamps the score / label headers on the upstream. `block` returns `403` with `block_body`. `log` writes a structured warn under `sbproxy::prompt_injection_v2`. |
 | `enforcement` | string | none | Optional override for the did-decide axis, shared vocabulary. `block` forces a hit to refuse whatever observe flavor `action` names. `observe` admits every hit: `action: block` downgrades to `log`, `tag` keeps tagging, and the `a2a` depth escalation is downgraded too, so this one key is the whole-policy rollout switch. An explicit `a2a.root_action: log` survives `enforcement: block`. Absent leaves `action` in charge. |
@@ -3474,6 +3477,16 @@ policies:
 | `a2a.block_above_delegation_depth` | integer or null | `0` | Delegation depth above which an agent-to-agent hit blocks regardless of `a2a.root_action`. Depth 0 is the chain root, so the default blocks any delegated hop. `null` disables the escalation. |
 
 The generic policy scans the request URI + non-auth headers (`Authorization`, `Cookie`, `Set-Cookie` are excluded so tokens carried by design don't self-flag) at request-filter time. Tag mode stamps the score / label headers via the existing trust-headers channel before `upstream_request_filter` builds the upstream request; block mode rejects with `403` immediately. Set `enable_body_aware: true` after measuring false positives to scan buffered request bodies as well; on a plain origin pair it with `block` or `log`, since a body hit arrives after the upstream request is assembled and cannot tag (`tag` + body-aware is refused at config compile there). A body-borne block honors `block_content_type`. See [prompt-injection-v2.md](prompt-injection-v2.md) for the phase table, auto-selection failure boundaries, the eval harness, and custom detector registration.
+
+An unavailable detector is never `clean` and is never cached. Effective
+`action: block` fails closed with a generic `503 service unavailable`, ignoring
+`block_body` so classifier internals cannot reach the client. `tag` and `log`
+continue with the typed `degraded` outcome; tag writes `degraded` to
+`label_header` without inventing a numeric score. Deterministic local cache
+entries are namespaced by complete model semantics. Remote and composite
+detectors bypass that cache. Operational state is available through the
+authenticated `GET /admin/prompt-injection-v2` route and
+`sbproxy_prompt_injection_classifier_failures_total`.
 
 The `a2a.*` keys apply only when an `a2a` policy is configured on the same origin and the request is detected as A2A 1.0. There is no `tag` in the agent-boundary vocabulary: the scan runs at the request-body phase, after the upstream request header has been built, so there is no header left to stamp. See [prompt-injection-v2.md](prompt-injection-v2.md#the-agent-boundary).
 

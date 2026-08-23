@@ -314,6 +314,9 @@ origins:
           injection_label: INJECTION
           max_model_bytes: 209715200   # 200 MB guard
           max_tokenizer_bytes: 209715200
+          max_concurrent: 2            # 1..=64
+          max_queued: 16               # 1..=1024
+          inference_timeout_ms: 500    # 1..=30000
 ```
 
 Configured paths take precedence. With no paths configured, auto-selection
@@ -323,6 +326,12 @@ checks `<user-cache-dir>/sbproxy/models/prompt-injection-v2/model.onnx` and
 heuristic with one startup log. A partial pair, unreadable or oversize file,
 missing/mismatched digest, incomplete signature group, or parse error stops
 startup. An explicit `detector: heuristic-v1` skips artifact inspection.
+
+The local prompt-injection runtime validates its concurrency, queue, and
+deadline limits before creating Tokio primitives. Request-time admission,
+deadline, worker, runtime, and inference failures remain typed unavailable.
+They fail closed with a generic `503` under `action: block`, or continue as
+explicitly degraded under `tag` and `log`; none is cached as a clean verdict.
 
 Optional detached Ed25519 verification adds
 `model_signature_path`, `tokenizer_signature_path`, and

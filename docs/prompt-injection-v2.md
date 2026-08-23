@@ -68,7 +68,7 @@ pre-loads state at startup, not in `detect` itself.
 | Name | Description |
 |------|-------------|
 | `heuristic-v1` | Case-insensitive substring matching against the OWASP LLM Top 10 2026 (LLM01) vocabulary plus a small "suspicious" cue list. Explicit choice and the no-artifact auto fallback. |
-| `sidecar` | Runs inference in a separate process over gRPC instead of in the proxy. The proxy holds one client; the sidecar implements the shared `InferenceService`. Isolates the model runtime so a bad model cannot exhaust the proxy. Fail-open by default. See [Running detection out of process](#running-detection-out-of-process-the-sidecar-detector). |
+| `sidecar` | Runs inference in a separate process over gRPC instead of in the proxy. The proxy holds one client; the sidecar implements the shared `InferenceService`. A pinned local ONNX fallback is mandatory, and a failure of both stages is preserved as unavailable rather than clean. See [Running detection out of process](#running-detection-out-of-process-the-sidecar-detector). |
 | `inprocess` | Runs the ONNX classifier inside the proxy via the pure-Rust tract engine. It can be selected explicitly or automatically when `detector` is omitted and a complete verified pair is staged. Prefer `sidecar` for process isolation. See [In-process detection](#in-process-detection-the-inprocess-detector). |
 
 ### In-process detection (the `inprocess` detector)
@@ -95,6 +95,9 @@ policies:
       labels: ["SAFE", "INJECTION"]
       max_model_bytes: 209715200
       max_tokenizer_bytes: 209715200
+      max_concurrent: 2       # accepted range: 1..=64
+      max_queued: 16          # accepted range: 1..=1024
+      inference_timeout_ms: 500 # accepted range: 1..=30000
       # Optional signatures are all-or-nothing:
       # model_signature_path: /var/lib/sbproxy/models/injection/model.onnx.sig
       # tokenizer_signature_path: /var/lib/sbproxy/models/injection/tokenizer.json.sig
@@ -117,9 +120,15 @@ and score onto the v2 vocabulary using the same cutoffs as the sidecar:
 at or above `threshold` is `injection`, `[0.3, threshold)` is
 `suspicious`, and below `0.3` is `clean`. A non-injection top label is
 read as confidence the prompt is benign, so its score is inverted.
-Request-time inference failures retain the established fail-open
-behavior; use the sidecar's fail-closed option if that availability
-policy is required.
+Request-time queue exhaustion, deadline, worker, runtime, tokenization, and
+ONNX failures are typed unavailable results. They are never converted to
+`clean`. A policy whose effective action is `block` returns a generic `503`
+before prompt bytes reach the provider. `tag` and `log` continue with an
+explicit `degraded` decision; tag mode writes `degraded` to the configured
+label header and never claims `clean`. The three admission settings above are
+validated before Tokio semaphores or deadlines are constructed. Zero,
+max-plus-one, platform-width extremes, and a deadline above 30 seconds stop
+config compilation.
 
 ## Registering a custom detector
 
@@ -277,10 +286,12 @@ Ed25519 signatures must be complete and valid when supplied.
 
 A sidecar that is down, slower than `timeout_ms`, returns an RPC error,
 sheds the request, or returns a malformed response does not produce a
-clean verdict. The proxy logs the primary failure and classifies the
-same prompt through the verified local ONNX fallback. This keeps the
-sidecar optional as a deployment component without making classification
-optional on its failure path.
+clean verdict. The proxy classifies the same prompt through the verified
+local ONNX fallback. This keeps the sidecar optional as a deployment
+component without making classification optional on its failure path. If the
+local admission, runtime, or inference then fails too, the request retains
+both closed stages (`primary_sidecar` and `local_fallback`) and follows the
+effective action's unavailable posture described above.
 
 The sidecar bounds the bytes, batch size, concurrency, and duration of
 every inference it runs. A request past any of those bounds comes back
@@ -510,18 +521,32 @@ content-length: 37
 {"error":"prompt injection detected"}
 ```
 
-The body is the configured `block_body` and the content type is the
-configured `block_content_type`. All four block paths (URI and headers,
-the buffered body, `ai_proxy`, and A2A) answer this way. Two settings on
-that origin make this exchange work: `block_content_type: application/json`
-shapes the response, and `enable_body_aware: true` is what makes the body
-scan run at all. Without it the payload above would stream to the upstream
-unscanned, because the policy reads only the URI and headers by default.
+For a classifier hit, the body is the configured `block_body` and the content
+type is the configured `block_content_type`. All four hit paths (URI and
+headers, the buffered body, `ai_proxy`, and A2A) answer this way. A classifier
+that cannot return a trustworthy verdict follows the separate unavailable
+contract below: `block` returns a generic `503 service unavailable`, never the
+configured hit body. Two settings on that origin make the hit exchange work:
+`block_content_type: application/json` shapes the response, and
+`enable_body_aware: true` is what makes the body scan run at all. Without it
+the payload above would stream to the upstream unscanned, because the policy
+reads only the URI and headers by default.
 
-Each block also increments `sbproxy_prompt_injection_blocks_total`, labeled
-with the `scan_path` that fired (`header_scan`, `body_scan`, `ai_body`, or
-`a2a`) and the tenant. The label is there so the four paths can be compared
-rather than merged into one number.
+Each classifier-hit block also increments
+`sbproxy_prompt_injection_blocks_total`, labeled with the `scan_path` that
+fired (`header_scan`, `body_scan`, `ai_body`, or `a2a`) and the tenant. The
+label is there so the four paths can be compared rather than merged into one
+number. Unavailable refusals use the failure metric below and do not inflate
+the injection-hit counter.
+
+Classifier-unavailable decisions use a separate operational contract. Each
+failed stage increments
+`sbproxy_prompt_injection_classifier_failures_total{scan_path,action,stage,reason,outcome,tenant}`.
+The `stage`, `reason`, and `outcome` values are closed vocabularies, so model
+paths, endpoints, credentials, and prompt text cannot become metric labels.
+The same fields are emitted in a typed `guardrail_triggered` event and retained
+in the bounded authenticated `GET /admin/prompt-injection-v2` snapshot. Warning
+logs are aggregated for 60 seconds by configured origin and closed reason.
 
 ### Which phase caught it
 
@@ -561,11 +586,12 @@ compile_config refuses `action: tag` together with `enable_body_aware`.
 If a future path skipped the compiler, the body-phase arm logs an error
 rather than looking like `log`.
 
-What the caller receives does not depend on which phase fired. Every
-`block`, whether it came from the URI and headers, the buffered body, the
-`ai_proxy` prompt segments, or an A2A message part, answers `403` with
-`block_body` as the raw response body and `block_content_type` as the
-`Content-Type`.
+What the caller receives for a classifier hit does not depend on which phase
+fired. Every hit handled by `block`, whether it came from the URI and headers,
+the buffered body, the `ai_proxy` prompt segments, or an A2A message part,
+answers `403` with `block_body` as the raw response body and
+`block_content_type` as the `Content-Type`. An unavailable classifier is not a
+hit and uses the generic `503` contract above.
 
 That was not always true. The URI and header phase used to return a
 generic policy denial rendered through the catch-all JSON path that every
@@ -641,8 +667,13 @@ cap fills up on the head of the envelope, so an injection late in a long
 thread never reaches the classifier at all.
 
 With `enable_body_aware: true` each text part is scored on its own,
-worst-of-N across parts, with per-part results cached by content hash so
-a replayed thread costs almost nothing after the first pass. Non-text
+worst-of-N across parts. A deterministic local detector can cache results only
+under an opaque namespace that commits to its implementation version,
+verified model and tokenizer pins, ordered label map, and classification
+settings. The truncated prompt is length-delimited into that key. Remote and
+sidecar-plus-local composite detectors bypass the process cache so a fallback
+result cannot hide primary recovery. Typed failures are never cached.
+Non-text
 parts (`FilePart`, `DataPart`) are skipped rather than fed in: a base64
 blob carries no language to score, and classifying it would spend a
 model pass on entropy and fill the cache with a key that never repeats.
@@ -700,11 +731,12 @@ the baseline as `log` there, the way the worked example does.
 
 ### Failure posture
 
-The body-aware evaluator is fail-open: any detector error logs and
-returns clean. Pointing it at the agent boundary imports that posture,
-so a classifier that is down or wedged means agent-to-agent messages
-pass unscanned rather than being refused. That is not configurable
-today. The push-notification check described in
+The body-aware evaluator preserves typed unavailable failures. At the agent
+boundary an effective `block` action returns the same generic `503` used by
+the other request paths, before the message body reaches the callee. An
+effective `log` action continues as an explicit degraded decision and emits
+the metric, event, admin state, and rate-limited warning described above. It
+never becomes `clean`. The push-notification check described in
 [a2a-gateway.md](a2a-gateway.md) is not affected; it is a deterministic
 URL validation with no external dependency.
 

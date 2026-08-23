@@ -9,6 +9,184 @@
 
 use std::fmt;
 
+use sha2::{Digest, Sha256};
+
+/// Closed reason vocabulary for a detector that could not classify a prompt.
+///
+/// These values cross metrics, events, and the authenticated admin surface, so
+/// they deliberately carry no model path, endpoint, prompt, or underlying
+/// error string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetectionFailureKind {
+    /// Every running slot and bounded queue slot was occupied.
+    QueueFull,
+    /// Admission plus inference exceeded the configured deadline.
+    Deadline,
+    /// The bounded blocking worker panicked or was cancelled.
+    Worker,
+    /// Detection was called from a runtime that cannot safely block in place.
+    Runtime,
+    /// Tokenization, ONNX execution, or output validation failed.
+    Inference,
+    /// The primary sidecar transport, RPC, deadline, or protocol failed.
+    Sidecar,
+}
+
+impl DetectionFailureKind {
+    /// Stable low-cardinality label used on operational surfaces.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::QueueFull => "queue_full",
+            Self::Deadline => "deadline",
+            Self::Worker => "worker",
+            Self::Runtime => "runtime",
+            Self::Inference => "inference",
+            Self::Sidecar => "sidecar",
+        }
+    }
+}
+
+impl fmt::Display for DetectionFailureKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Which classifier stage produced a closed failure reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetectionFailureOrigin {
+    /// A directly configured detector failed.
+    Detector,
+    /// The configured sidecar failed before the local fallback ran.
+    PrimarySidecar,
+    /// The mandatory verified local fallback also failed.
+    LocalFallback,
+}
+
+impl DetectionFailureOrigin {
+    /// Stable low-cardinality label used on operational surfaces.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Detector => "detector",
+            Self::PrimarySidecar => "primary_sidecar",
+            Self::LocalFallback => "local_fallback",
+        }
+    }
+}
+
+/// One closed, attributable detector failure stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+pub struct DetectionFailureStage {
+    /// Component that failed.
+    pub origin: DetectionFailureOrigin,
+    /// Closed reason for the failure.
+    pub kind: DetectionFailureKind,
+}
+
+/// Typed classification failure preserved through a composite detector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct DetectionFailure {
+    terminal: DetectionFailureStage,
+    primary: Option<DetectionFailureStage>,
+}
+
+impl DetectionFailure {
+    /// Construct a failure from a directly configured detector.
+    pub const fn direct(kind: DetectionFailureKind) -> Self {
+        Self {
+            terminal: DetectionFailureStage {
+                origin: DetectionFailureOrigin::Detector,
+                kind,
+            },
+            primary: None,
+        }
+    }
+
+    /// Preserve a primary sidecar failure beside this terminal local-fallback
+    /// failure. Composite adapters use this only after the primary sidecar
+    /// has failed; both stages remain in the closed public vocabulary.
+    pub const fn after_sidecar(mut self) -> Self {
+        self.terminal.origin = DetectionFailureOrigin::LocalFallback;
+        self.primary = Some(DetectionFailureStage {
+            origin: DetectionFailureOrigin::PrimarySidecar,
+            kind: DetectionFailureKind::Sidecar,
+        });
+        self
+    }
+
+    /// Terminal failure stage.
+    pub const fn terminal(self) -> DetectionFailureStage {
+        self.terminal
+    }
+
+    /// Earlier primary stage, present only when a sidecar and its mandatory
+    /// local fallback both failed.
+    pub const fn primary(self) -> Option<DetectionFailureStage> {
+        self.primary
+    }
+}
+
+impl fmt::Display for DetectionFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(primary) = self.primary {
+            write!(
+                f,
+                "classifier unavailable ({}:{}, {}:{})",
+                primary.origin.as_str(),
+                primary.kind,
+                self.terminal.origin.as_str(),
+                self.terminal.kind
+            )
+        } else {
+            write!(
+                f,
+                "classifier unavailable ({}:{})",
+                self.terminal.origin.as_str(),
+                self.terminal.kind
+            )
+        }
+    }
+}
+
+impl std::error::Error for DetectionFailure {}
+
+/// Opaque identity for deterministic classifier semantics in the global
+/// body-aware cache.
+///
+/// The digest must commit to every input that can change the raw score or
+/// label. It is never serialized or displayed. A detector that cannot supply
+/// a complete stable identity must return `None` from
+/// [`Detector::cache_namespace`], which bypasses the cache.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DetectorCacheNamespace([u8; 32]);
+
+impl DetectorCacheNamespace {
+    /// Derive an opaque namespace from ordered, length-delimited semantic
+    /// inputs. Callers should include a detector kind and explicit semantic
+    /// version before model pins and classifier settings.
+    pub fn derive(parts: &[&[u8]]) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"sbproxy.prompt-injection-v2.cache-namespace.v1");
+        for part in parts {
+            hasher.update((part.len() as u64).to_be_bytes());
+            hasher.update(part);
+        }
+        Self(hasher.finalize().into())
+    }
+
+    pub(crate) const fn digest(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for DetectorCacheNamespace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DetectorCacheNamespace([opaque])")
+    }
+}
+
 /// Categorical label assigned by a detector.
 ///
 /// The label and the score together describe how confident the
@@ -79,6 +257,22 @@ impl DetectionResult {
 pub trait Detector: Send + Sync + 'static {
     /// Inspect `prompt` and return a detection result.
     fn detect(&self, prompt: &str) -> DetectionResult;
+
+    /// Inspect `prompt` while preserving an unavailable classifier as a typed
+    /// failure. Existing deterministic in-process extensions remain source
+    /// compatible through this default implementation.
+    fn try_detect(&self, prompt: &str) -> Result<DetectionResult, DetectionFailure> {
+        Ok(self.detect(prompt))
+    }
+
+    /// Stable identity for deterministic cacheable classification semantics.
+    ///
+    /// The safe default is no cache. Remote detectors, composites with a
+    /// remote primary, and extensions without a complete versioned identity
+    /// must keep this default.
+    fn cache_namespace(&self) -> Option<DetectorCacheNamespace> {
+        None
+    }
 
     /// Stable detector name used in config (`detector: <name>`) and
     /// emitted in logs / metrics. Must be unique across registered

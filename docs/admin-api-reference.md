@@ -2361,6 +2361,48 @@ Read-only operators may call this; it has no write path.
 
 ---
 
+### `GET /admin/prompt-injection-v2`
+
+Returns the process-wide deterministic classification-cache counters and a
+bounded snapshot of unavailable prompt-injection classifier stages. The route
+uses the normal admin authentication gate and accepts only `GET`.
+
+```json
+{
+  "classification_cache": {
+    "size": 42,
+    "hits": 180,
+    "misses": 51,
+    "hit_ratio": 0.779
+  },
+  "classifier_failures": {
+    "max_entries": 256,
+    "evicted_keys": 0,
+    "entries": [
+      {
+        "origin_id": "chat-prod",
+        "stage": "local_fallback",
+        "reason": "deadline",
+        "failures_total": 3,
+        "blocked_total": 0,
+        "degraded_total": 3,
+        "warnings_emitted": 1,
+        "warnings_suppressed": 2,
+        "last_seen_unix_ms": 1787539200000,
+        "last_scan_path": "ai_body",
+        "last_action": "log",
+        "last_outcome": "degraded"
+      }
+    ]
+  }
+}
+```
+
+Rows are keyed only by the configured origin identifier and closed
+stage/reason values. Prompt text, classifier endpoints, model paths,
+credentials, and dependency error strings are not retained. At most 256 keys
+are retained; `evicted_keys` shows pressure on that bound.
+
 ### `GET /admin/ai-data-posture`
 
 Per AI origin, each provider's declared data-handling posture next to

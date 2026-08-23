@@ -215,6 +215,9 @@ pub mod policy_bus;
 /// in its own module so the helpers can be exercised by
 /// integration tests in `crates/sbproxy-core/tests/`.
 pub mod policy_dispatch;
+/// Bounded observability and fail-closed/degraded decision state for an
+/// unavailable `prompt_injection_v2` classifier.
+pub(crate) mod prompt_injection_runtime;
 mod proxy_wasm_http;
 /// WOR-2672: port of `sbproxy-enterprise-ai::quality_routing`. Provider
 /// selection by quality score via an optional

@@ -3611,6 +3611,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_prompt_injection_classifier_failures_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_prompt_injection_classifier_failure"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Alpha,
+        registry: Registry::Default,
+        labels: &["scan_path", "action", "stage", "reason", "outcome", "tenant"],
+        description: "Unavailable prompt-injection classifier stages, with closed failure and policy-outcome labels.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_prompt_injection_v2_results_total",
         kind: MetricKind::Counter,
         // `body_aware_counter`, not the `record_metric` that increments it.
@@ -4342,6 +4353,7 @@ pub const TENANT_SCOPED_METRICS: &[&str] = &[
     // blocked somewhere", which no operator of a multi-tenant deployment
     // can act on.
     "sbproxy_prompt_injection_blocks_total",
+    "sbproxy_prompt_injection_classifier_failures_total",
     "sbproxy_rate_limit_suspend_total",
     "sbproxy_rate_limit_total",
     // WOR-2526. Whether a browser hardening header actually reached clients

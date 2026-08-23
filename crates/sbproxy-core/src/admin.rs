@@ -4332,6 +4332,35 @@ pub fn handle_admin_request(
         return response;
     }
 
+    // Classifier cache and bounded unavailable-stage health. This is kept
+    // behind the operator-auth gate because configured origin identifiers and
+    // tenant-scoped failure state are operational metadata.
+    if path == "/admin/prompt-injection-v2" {
+        if !method.eq_ignore_ascii_case("GET") {
+            return (
+                405,
+                "application/json",
+                r#"{"error":"method not allowed"}"#.to_string(),
+            );
+        }
+        let cache = sbproxy_modules::classification_cache_stats();
+        let failures = crate::prompt_injection_runtime::snapshot();
+        return (
+            200,
+            "application/json",
+            serde_json::json!({
+                "classification_cache": {
+                    "size": cache.size,
+                    "hits": cache.hits,
+                    "misses": cache.misses,
+                    "hit_ratio": cache.hit_ratio(),
+                },
+                "classifier_failures": failures,
+            })
+            .to_string(),
+        );
+    }
+
     // --- Method-aware routes first ---
     if path == "/admin/reload" {
         if method.eq_ignore_ascii_case("POST") {
@@ -10749,6 +10778,57 @@ mod tests {
             handle_admin_request("GET", "/api/stats", &state, Some(&auth), None);
         assert_eq!(status, 200);
         assert!(body.contains("1"), "expected count 1 in: {body}");
+    }
+
+    #[test]
+    fn prompt_injection_classifier_health_is_authenticated_and_typed() {
+        crate::prompt_injection_runtime::record_unavailable(
+            Some("admin-test-origin"),
+            "tenant-a",
+            Some("request-a"),
+            "header_scan",
+            sbproxy_modules::PromptInjectionAction::Log,
+            crate::prompt_injection_runtime::UnavailableDecision::Degraded,
+            sbproxy_modules::DetectionFailure::direct(
+                sbproxy_modules::DetectionFailureKind::Inference,
+            ),
+        );
+        let state = make_state();
+
+        let (status, _, _) =
+            handle_admin_request("GET", "/admin/prompt-injection-v2", &state, None, None);
+        assert_eq!(status, 401);
+
+        let auth = basic_auth("admin", "secret");
+        let (status, content_type, body) = handle_admin_request(
+            "GET",
+            "/admin/prompt-injection-v2",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(content_type, "application/json");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid health JSON");
+        assert!(value.get("classification_cache").is_some());
+        let entries = value["classifier_failures"]["entries"]
+            .as_array()
+            .expect("failure entries array");
+        assert!(entries.iter().any(|entry| {
+            entry["origin_id"] == "admin-test-origin"
+                && entry["reason"] == "inference"
+                && entry["last_outcome"] == "degraded"
+        }));
+        assert!(!body.contains("request-a"));
+
+        let (status, _, _) = handle_admin_request(
+            "POST",
+            "/admin/prompt-injection-v2",
+            &state,
+            Some(&auth),
+            None,
+        );
+        assert_eq!(status, 405);
     }
 
     #[test]

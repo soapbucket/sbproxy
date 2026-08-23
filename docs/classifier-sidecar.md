@@ -230,7 +230,8 @@ When SBproxy encounters an AI request with a sidecar-backed guardrail, it automa
 2. Connects to your sidecar via the `sbproxy-classifier-client` (which handles lazy connection and, for the supervised co-located pattern, UDS dialing).
 3. Invokes `Classify` with the text payload.
 4. On any sidecar failure, classifies the same text with the configured verified local ONNX fallback.
-5. Compares the resulting score against `threshold` and either allows the request or applies the policy's `action` (`tag` or `block`).
+5. If the local fallback also fails, preserves both closed failure stages. `block` returns a generic `503`; `tag` or `log` continues as explicitly degraded. The failure is never cached or reported as clean.
+6. Otherwise, compares the resulting score against `threshold` and either allows the request or applies the policy's action.
 
 See [guardrails.md](guardrails.md) and [prompt-injection-v2.md](prompt-injection-v2.md) for more details on wiring guardrails into your AI pipelines.
 
@@ -267,10 +268,10 @@ cargo run -p sbproxy-classifier -- \
 Per the epic's rule that a sidecar a deployment must run and keep running is the same category of hard dependency as an external database: **nothing in this OSS workspace may require either classifier sidecar to be up.** The shipping `prompt_injection_v2` compiler enforces this directly: selecting `detector: sidecar` requires a pinned real-ONNX fallback and constructs one composite detector. `sbproxy-classifier-client`'s `FallbackClassifier` offers the same primary/fallback control flow to custom callers, but those callers remain responsible for supplying and bounding a real fallback implementation.
 
 - No sidecar configured (the common OSS case: an operator who never deploys one) - every call goes straight to a caller-supplied in-process classifier. No connection is ever attempted.
-- A sidecar is configured but unreachable, times out, or returns a malformed response - the call degrades to the in-process classifier for that request, logging a warning.
+- A sidecar is configured but unreachable, times out, or returns a malformed response - the call degrades to the in-process classifier for that request. Closed stage metrics and bounded health state record the outage; warnings are aggregated for 60 seconds by configured origin and reason.
 - A sidecar is configured and healthy - its verdict is used, and the in-process classifier is not invoked at all.
 
-For `prompt_injection_v2`, the fallback is not an arbitrary stub: config construction verifies the model and tokenizer paths, mandatory SHA-256 pins, size limits, and any configured detached signatures, then uses the same bounded admission/deadline mechanism as the explicit in-process detector.
+For `prompt_injection_v2`, the fallback is not an arbitrary stub: config construction verifies the model and tokenizer paths, mandatory SHA-256 pins, size limits, and any configured detached signatures, then uses the same bounded admission/deadline mechanism as the explicit in-process detector. A local queue, deadline, worker, runtime, or inference failure remains unavailable and follows the policy's blocked/degraded action; it never becomes a clean verdict.
 
 ```rust,ignore
 use sbproxy_classifier_client::{ClassifierClient, FallbackClassifier, InProcessClassifier, Verdict};

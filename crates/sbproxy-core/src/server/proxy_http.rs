@@ -6566,24 +6566,51 @@ impl ProxyHttp for SbProxy {
                                             virtual_key_id: None,
                                             policy_version: None,
                                         };
-                                        if let Some(rejection) =
-                                            crate::server::a2a_body_phase::scan_message_parts(
-                                                p, route, a2a, parsed, &collected, audit,
-                                            )
-                                        {
-                                            sbproxy_observe::metrics::record_prompt_injection_block(
-                                                "a2a",
-                                                ctx.tenant_id.as_ref(),
-                                            );
-                                            ctx.deny_policy_type = Some(rejection.deny_policy_type);
-                                            failed = Some((
-                                                rejection.status,
-                                                rejection.body,
-                                                rejection.content_type,
-                                            ));
-                                            break;
+                                        let configured_origin_id = ctx
+                                            .origin_idx
+                                            .and_then(|index| pipeline.config.origins.get(index))
+                                            .map(|origin| origin.origin_id.to_string());
+                                        match crate::server::a2a_body_phase::scan_message_parts(
+                                            p,
+                                            route,
+                                            a2a,
+                                            parsed,
+                                            &collected,
+                                            audit,
+                                            configured_origin_id.as_deref(),
+                                        ) {
+                                            crate::server::a2a_body_phase::A2ABodyScanOutcome::Pass => {
+                                                continue;
+                                            }
+                                            crate::server::a2a_body_phase::A2ABodyScanOutcome::Degraded => {
+                                                ctx.record_policy_decision(
+                                                    "prompt_injection_v2",
+                                                    "degraded",
+                                                );
+                                                continue;
+                                            }
+                                            crate::server::a2a_body_phase::A2ABodyScanOutcome::Reject(rejection) => {
+                                                if rejection.status == 403 {
+                                                    sbproxy_observe::metrics::record_prompt_injection_block(
+                                                        "a2a",
+                                                        ctx.tenant_id.as_ref(),
+                                                    );
+                                                } else {
+                                                    ctx.record_policy_decision(
+                                                        "prompt_injection_v2",
+                                                        "blocked_unavailable",
+                                                    );
+                                                }
+                                                ctx.deny_policy_type =
+                                                    Some(rejection.deny_policy_type);
+                                                failed = Some((
+                                                    rejection.status,
+                                                    rejection.body,
+                                                    rejection.content_type,
+                                                ));
+                                                break;
+                                            }
                                         }
-                                        continue;
                                     }
                                     // WOR-2137: the generic body scan is
                                     // opt-in. The enforcer only requests
@@ -6609,56 +6636,87 @@ impl ProxyHttp for SbProxy {
                                         PromptInjectionAction, PromptInjectionV2Outcome,
                                     };
                                     let body_text = String::from_utf8_lossy(&collected);
-                                    if let PromptInjectionV2Outcome::Hit { result } =
-                                        p.evaluate(&body_text)
-                                    {
-                                        match p.action() {
-                                            PromptInjectionAction::Block => {
-                                                sbproxy_observe::metrics::record_prompt_injection_block(
-                                                    "body_scan",
-                                                    ctx.tenant_id.as_ref(),
-                                                );
-                                                tracing::warn!(
-                                                    target: "sbproxy::prompt_injection_v2",
-                                                    score = %result.score,
-                                                    label = %result.label,
-                                                    scan_path = "body_scan",
-                                                    "blocked: detector matched request body"
-                                                );
-                                                // WOR-2159: honour the
-                                                // configured content type,
-                                                // as the ai_proxy and A2A
-                                                // block paths already do.
+                                    match p.evaluate(&body_text) {
+                                        PromptInjectionV2Outcome::Clean => {}
+                                        PromptInjectionV2Outcome::Unavailable { failure } => {
+                                            let action = p.action();
+                                            let outcome = if matches!(
+                                                action,
+                                                PromptInjectionAction::Block
+                                            ) {
+                                                crate::prompt_injection_runtime::UnavailableDecision::Blocked
+                                            } else {
+                                                crate::prompt_injection_runtime::UnavailableDecision::Degraded
+                                            };
+                                            crate::prompt_injection_runtime::record_for_request(
+                                                ctx,
+                                                "body_scan",
+                                                action,
+                                                outcome,
+                                                failure,
+                                            );
+                                            if matches!(action, PromptInjectionAction::Block) {
+                                                ctx.deny_policy_type =
+                                                    Some("prompt_injection_unavailable");
                                                 failed = Some((
-                                                    403,
-                                                    p.block_body().to_string(),
-                                                    p.block_content_type().to_string(),
+                                                    crate::prompt_injection_runtime::UNAVAILABLE_STATUS,
+                                                    crate::prompt_injection_runtime::UNAVAILABLE_BODY
+                                                        .to_string(),
+                                                    crate::prompt_injection_runtime::UNAVAILABLE_CONTENT_TYPE
+                                                        .to_string(),
                                                 ));
                                                 break;
                                             }
-                                            PromptInjectionAction::Log => {
-                                                tracing::warn!(
-                                                    target: "sbproxy::prompt_injection_v2",
-                                                    score = %result.score,
-                                                    label = %result.label,
-                                                    "prompt injection detected in request body \
-                                                     (advisory; upstream already dispatched)"
+                                        }
+                                        PromptInjectionV2Outcome::Hit { result } => {
+                                            match p.action() {
+                                                PromptInjectionAction::Block => {
+                                                    sbproxy_observe::metrics::record_prompt_injection_block(
+                                                    "body_scan",
+                                                    ctx.tenant_id.as_ref(),
                                                 );
-                                            }
-                                            PromptInjectionAction::Tag => {
-                                                // Unreachable on a compiled proxy origin:
-                                                // compile_config refuses action: tag with
-                                                // enable_body_aware (WOR-2136). Keep a distinct
-                                                // error so a future path that skips the compiler
-                                                // cannot silently look like log.
-                                                tracing::error!(
-                                                    target: "sbproxy::prompt_injection_v2",
-                                                    score = %result.score,
-                                                    label = %result.label,
-                                                    "prompt injection tag hit on the request body \
-                                                     after upstream headers were sent; this \
-                                                     combination is refused at config compile"
-                                                );
+                                                    tracing::warn!(
+                                                        target: "sbproxy::prompt_injection_v2",
+                                                        score = %result.score,
+                                                        label = %result.label,
+                                                        scan_path = "body_scan",
+                                                        "blocked: detector matched request body"
+                                                    );
+                                                    // WOR-2159: honour the
+                                                    // configured content type,
+                                                    // as the ai_proxy and A2A
+                                                    // block paths already do.
+                                                    failed = Some((
+                                                        403,
+                                                        p.block_body().to_string(),
+                                                        p.block_content_type().to_string(),
+                                                    ));
+                                                    break;
+                                                }
+                                                PromptInjectionAction::Log => {
+                                                    tracing::warn!(
+                                                        target: "sbproxy::prompt_injection_v2",
+                                                        score = %result.score,
+                                                        label = %result.label,
+                                                        "prompt injection detected in request body \
+                                                         (advisory; upstream already dispatched)"
+                                                    );
+                                                }
+                                                PromptInjectionAction::Tag => {
+                                                    // Unreachable on a compiled proxy origin:
+                                                    // compile_config refuses action: tag with
+                                                    // enable_body_aware (WOR-2136). Keep a distinct
+                                                    // error so a future path that skips the compiler
+                                                    // cannot silently look like log.
+                                                    tracing::error!(
+                                                        target: "sbproxy::prompt_injection_v2",
+                                                        score = %result.score,
+                                                        label = %result.label,
+                                                        "prompt injection tag hit on the request body \
+                                                         after upstream headers were sent; this \
+                                                         combination is refused at config compile"
+                                                    );
+                                                }
                                             }
                                         }
                                     }

@@ -28,8 +28,9 @@ pub use body_aware::{
     ClassificationCacheStats,
 };
 pub use detector::{
-    lookup_detector, registered_detector_names, DetectionLabel, DetectionResult, Detector,
-    DetectorFactory,
+    lookup_detector, registered_detector_names, DetectionFailure, DetectionFailureKind,
+    DetectionFailureOrigin, DetectionFailureStage, DetectionLabel, DetectionResult, Detector,
+    DetectorCacheNamespace, DetectorFactory,
 };
 pub use heuristic::{HeuristicDetector, HEURISTIC_DETECTOR_NAME};
 pub use inprocess::{InprocessDetector, INPROCESS_DETECTOR_NAME};
@@ -176,6 +177,14 @@ pub enum PromptInjectionV2Outcome {
         /// Detection result that triggered the hit.
         result: DetectionResult,
     },
+    /// The configured detector could not produce a trustworthy verdict.
+    /// Enforcement consumers must map this through the configured action;
+    /// it is never equivalent to [`Self::Clean`].
+    Unavailable {
+        /// Closed failure provenance. Contains no prompt, endpoint, model
+        /// path, credential, or dependency error string.
+        failure: DetectionFailure,
+    },
 }
 
 /// Heuristic detector used when auto-selection finds no local artifacts.
@@ -207,16 +216,24 @@ struct SidecarOnnxDetector {
 
 impl Detector for SidecarOnnxDetector {
     fn detect(&self, prompt: &str) -> DetectionResult {
+        self.try_detect(prompt)
+            .unwrap_or_else(|failure| DetectionResult {
+                // Production policy evaluation calls `try_detect` and preserves
+                // the exact unavailable outcome. This conservative result exists
+                // only for legacy direct trait callers that cannot carry errors.
+                score: 1.0,
+                label: DetectionLabel::Injection,
+                reason: Some(failure.to_string()),
+            })
+    }
+
+    fn try_detect(&self, prompt: &str) -> Result<DetectionResult, DetectionFailure> {
         match self.primary.try_detect(prompt) {
-            Ok(result) => result,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    fallback = INPROCESS_DETECTOR_NAME,
-                    "classifier sidecar unavailable; using verified in-process fallback"
-                );
-                self.fallback.detect(prompt)
-            }
+            Ok(result) => Ok(result),
+            Err(_primary_error) => self
+                .fallback
+                .try_detect(prompt)
+                .map_err(DetectionFailure::after_sidecar),
         }
     }
 
@@ -577,7 +594,10 @@ impl PromptInjectionV2Policy {
     /// detection from side-effects keeps this module trivially
     /// testable.
     pub fn evaluate(&self, prompt: &str) -> PromptInjectionV2Outcome {
-        let result = self.detector.detect(prompt);
+        let result = match self.detector.try_detect(prompt) {
+            Ok(result) => result,
+            Err(failure) => return PromptInjectionV2Outcome::Unavailable { failure },
+        };
         if result.score >= self.threshold && result.label != DetectionLabel::Clean {
             PromptInjectionV2Outcome::Hit { result }
         } else {
@@ -666,6 +686,63 @@ mod tests {
             PromptInjectionV2Outcome::Clean => {
                 panic!("a dead sidecar must use the real ONNX verdict, not admit as clean")
             }
+            PromptInjectionV2Outcome::Unavailable { failure } => {
+                panic!("verified local fallback unexpectedly failed: {failure}")
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sidecar_composite_preserves_every_typed_local_failure() {
+        struct FailingLocal(DetectionFailureKind);
+
+        impl Detector for FailingLocal {
+            fn detect(&self, _prompt: &str) -> DetectionResult {
+                panic!("the composite must use the typed fallible entry point")
+            }
+
+            fn try_detect(&self, _prompt: &str) -> Result<DetectionResult, DetectionFailure> {
+                Err(DetectionFailure::direct(self.0))
+            }
+
+            fn name(&self) -> &str {
+                INPROCESS_DETECTOR_NAME
+            }
+        }
+
+        for kind in [
+            DetectionFailureKind::QueueFull,
+            DetectionFailureKind::Deadline,
+            DetectionFailureKind::Worker,
+            DetectionFailureKind::Runtime,
+            DetectionFailureKind::Inference,
+        ] {
+            let composite = SidecarOnnxDetector {
+                primary: sidecar::SidecarDetector::parse(&serde_json::json!({
+                    "endpoint": "http://127.0.0.1:1",
+                    "timeout_ms": 100,
+                }))
+                .expect("dead local endpoint is a valid configured sidecar"),
+                fallback: Arc::new(FailingLocal(kind)),
+            };
+
+            let error = composite
+                .try_detect("must classify")
+                .expect_err("both configured stages fail");
+            assert_eq!(
+                error.primary(),
+                Some(DetectionFailureStage {
+                    origin: DetectionFailureOrigin::PrimarySidecar,
+                    kind: DetectionFailureKind::Sidecar,
+                })
+            );
+            assert_eq!(
+                error.terminal(),
+                DetectionFailureStage {
+                    origin: DetectionFailureOrigin::LocalFallback,
+                    kind,
+                }
+            );
         }
     }
 

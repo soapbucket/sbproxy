@@ -350,6 +350,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_policy_panic_total` | Counter | `stable` | `beta` | `policy` | Policy enforcer panics contained on the serving path, by policy type. |
 | `sbproxy_policy_triggers_total` | Counter | `stable` | `stable` | `origin`, `policy_type`, `action`, `agent_id`, `agent_class` | Policy enforcement results. |
 | `sbproxy_prompt_injection_blocks_total` | Counter | `stable` | `beta` | `scan_path`, `tenant` | Requests blocked by the prompt_injection_v2 policy, by scan path (header_scan, body_scan, ai_body, a2a). |
+| `sbproxy_prompt_injection_classifier_failures_total` | Counter | `stable` | `alpha` | `scan_path`, `action`, `stage`, `reason`, `outcome`, `tenant` | Unavailable prompt-injection classifier stages, with closed failure and policy-outcome labels. |
 | `sbproxy_prompt_injection_v2_results_total` | Counter | `stable` | `alpha` | `action`, `label`, `detector` | Body-aware prompt-injection detector results, by action taken, detection label, and detector name. |
 | `sbproxy_projection_render_failures_total` | Counter | `stable` | `alpha` | `projection` | Well-known projection render failures, by projection. |
 | `sbproxy_rate_limit_cluster_peer_denials_total` | Counter | `stable` | `alpha` | none | Mesh rate-limit denials that needed peer counts, so the approximation is observable. |

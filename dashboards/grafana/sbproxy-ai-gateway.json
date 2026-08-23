@@ -58,7 +58,7 @@
     "to": "now"
   },
   "refresh": "10s",
-  "version": 1,
+  "version": 2,
   "schemaVersion": 39,
   "panels": [
     {
@@ -2179,6 +2179,62 @@
         }
       ],
       "description": "Events folded into the bounded __other__ rollup after workspace or team cardinality reaches its configured limit. A sustained rate signals attribution cardinality pressure without losing tokens, request counts, or cost."
+    },
+    {
+      "id": 37,
+      "title": "Prompt-injection Classifier Failures",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 149
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "noValue": "No prompt-injection classifier failure since start"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (stage, reason, action, outcome) (rate(sbproxy_prompt_injection_classifier_failures_total[5m]))",
+          "legendFormat": "{{stage}} / {{reason}} / {{action}} / {{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Unavailable prompt-injection classifier stages. blocked means an effective block policy returned a generic 503 before prompt egress; degraded means tag or log admitted the request while explicitly recording that no trustworthy verdict was available. A double sidecar and local fallback failure contributes one primary_sidecar series and one local_fallback series, so both stages remain attributable. Labels are closed and never contain prompt text, endpoint addresses, model paths, or credentials."
     }
   ],
   "templating": {
