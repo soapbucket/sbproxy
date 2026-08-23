@@ -666,3 +666,12 @@ pre-rebase baseline. The net +1 is the Cedar change already explained
 above: `ValidationFinding` and `McpCedarPolicyConfig` enter the corrected
 unreferenced scan while a separate textual name overlap offsets one of
 the two. No AI item was added to either bucket during reconciliation.
+
+2026-08-22 (WOR-2672 review correction): tests-only 320 -> 321 and
+unreferenced 1446 -> 1447. The quality-routing production comment named
+`select_by_quality_async`, although the live request path actually calls
+`select_from_quality_hook_async`. Correcting the stale comment removed the
+only production-tree textual occurrence that had hidden
+`select_by_quality_async` from both scans. The function remains public for
+its example and unit-test consumers; this records that lane-owned item
+explicitly instead of retaining a false comment to hold the baselines down.
