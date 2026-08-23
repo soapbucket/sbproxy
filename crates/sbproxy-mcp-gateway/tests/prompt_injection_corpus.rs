@@ -414,7 +414,7 @@ async fn op_session_take_twice(e: &Entry, outcome: Outcome) {
         code_challenge: "abc".to_string(),
         code_challenge_method: "S256".to_string(),
     };
-    store.put("the-state", session).await;
+    store.put("the-state", session).await.unwrap();
     let first = store.take("the-state").await;
     assert!(first.is_some(), "[{}] first take must succeed", e.id);
     let second = store.take("the-state").await;

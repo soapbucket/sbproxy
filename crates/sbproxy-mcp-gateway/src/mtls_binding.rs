@@ -238,7 +238,7 @@ pub(crate) fn signed_cnf_from_token(
 ///   * `Err(MtlsBindingError::PayloadInvalid)` when the claim is
 ///     shaped unexpectedly (e.g. not a string).
 ///
-/// Mapping to RFC 8705 §3 wire behaviour: every `Err` here is an
+/// Mapping to RFC 8705 §3 wire behavior: every `Err` here is an
 /// `invalid_token` rejection at the HTTP layer.
 #[cfg(test)]
 fn verify_cnf_x5t_s256(

@@ -65,7 +65,7 @@
 //! that upstream, using the inbound `Principal` (tenant, virtual
 //! key, team, role, project, sub) to pick the matching ACL row.
 //! WOR-1065 + WOR-1066: the policy is default-deny; an operator who
-//! wants the legacy open-by-default behaviour sets
+//! wants the legacy open-by-default behavior sets
 //! `default_allow: true` on each policy. WOR-2314: once any
 //! `rbac_policies` are declared, every federated server must carry
 //! an `rbac:` label; an unlabeled server is a config compile error
@@ -900,7 +900,7 @@ pub enum McpVersioningModeConfig {
 /// MCP session management config (WOR-1642).
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpSessionConfig {
-    /// Master switch. `false` keeps the stateless behaviour even if
+    /// Master switch. `false` keeps the stateless behavior even if
     /// the block is present.
     #[serde(default)]
     pub enabled: bool,
@@ -957,7 +957,7 @@ pub struct McpDualLlmQuarantineConfig {
 pub struct McpOAuthConfig {
     /// Issuer URLs a client can obtain a token from.
     pub authorization_servers: Vec<String>,
-    /// Optional list of scopes the resource recognises.
+    /// Optional list of scopes the resource recognizes.
     #[serde(default)]
     pub scopes_supported: Vec<String>,
     /// Complementary resource-server verifier applied to protected MCP
@@ -5703,7 +5703,7 @@ impl McpAction {
 
     /// Per-server timeout for `tools/call`. `None` when not configured;
     /// the dispatcher uses an unbounded await in that case (matching
-    /// pre-WOR-186 behaviour for upstreams that don't opt in).
+    /// pre-WOR-186 behavior for upstreams that don't opt in).
     pub fn timeout_for_server(&self, server_name: &str) -> Option<Duration> {
         self.prefix_for(server_name)?.timeout
     }

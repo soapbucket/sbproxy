@@ -28,6 +28,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
+const DEFAULT_SESSION_CAPACITY: usize = 4_096;
+
 // --- Session row ---
 
 /// One pending authorization request, keyed by the broker's outbound
@@ -68,7 +70,7 @@ pub struct Session {
 pub trait SessionStore: Send + Sync + 'static {
     /// Insert a session under `state` with the configured TTL. The
     /// implementation is free to evict expired rows on insert.
-    async fn put(&self, state: &str, session: Session);
+    async fn put(&self, state: &str, session: Session) -> Result<()>;
 
     /// Atomically remove and return the session for `state` if it
     /// exists and has not expired.
@@ -88,15 +90,28 @@ struct Entry {
 pub struct InMemorySessionStore {
     inner: Mutex<HashMap<String, Entry>>,
     ttl: Duration,
+    capacity: usize,
 }
 
 impl InMemorySessionStore {
     /// Builds a new store with the given TTL applied to every entry.
     pub fn new(ttl: Duration) -> Self {
-        Self {
+        Self::with_capacity(ttl, DEFAULT_SESSION_CAPACITY)
+            .expect("non-zero default authorization-session capacity")
+    }
+
+    /// Build a store with a strict live-session capacity. A new state
+    /// fails closed at capacity; live sessions are never evicted to make
+    /// room for an attacker-controlled request.
+    pub fn with_capacity(ttl: Duration, capacity: usize) -> Result<Self> {
+        if ttl.is_zero() || capacity == 0 {
+            return Err(anyhow!("session TTL and capacity must be greater than zero"));
+        }
+        Ok(Self {
             inner: Mutex::new(HashMap::new()),
             ttl,
-        }
+            capacity,
+        })
     }
 
     /// Convenience constructor for callers that hold the store inside
@@ -121,12 +136,18 @@ impl InMemorySessionStore {
 
 #[async_trait]
 impl SessionStore for InMemorySessionStore {
-    async fn put(&self, state: &str, session: Session) {
+    async fn put(&self, state: &str, session: Session) -> Result<()> {
         let now = Instant::now();
         let mut guard = self.inner.lock().await;
         // Inline purge keeps the map bounded without spawning a
         // background sweeper task.
         guard.retain(|_, entry| entry.expires_at > now);
+        if !guard.contains_key(state) && guard.len() >= self.capacity {
+            return Err(anyhow!(
+                "authorization session capacity {} reached",
+                self.capacity
+            ));
+        }
         guard.insert(
             state.to_string(),
             Entry {
@@ -134,6 +155,7 @@ impl SessionStore for InMemorySessionStore {
                 expires_at: now + self.ttl,
             },
         );
+        Ok(())
     }
 
     async fn take(&self, state: &str) -> Option<Session> {
@@ -236,21 +258,19 @@ impl RedisSessionStore {
 
 #[async_trait]
 impl SessionStore for RedisSessionStore {
-    async fn put(&self, state: &str, session: Session) {
+    async fn put(&self, state: &str, session: Session) -> Result<()> {
         let key = self.key_for(state);
-        let payload = match serde_json::to_vec(&session) {
-            Ok(b) => Bytes::from(b),
-            Err(e) => {
-                tracing::error!(error = %e, "failed to serialize session to JSON");
-                return;
-            }
-        };
+        let payload = Bytes::from(
+            serde_json::to_vec(&session)
+                .map_err(|error| anyhow!("failed to serialize authorization session: {error}"))?,
+        );
         // Trait `put` enforces TTL itself. `EphemeralKv` implementations
         // pin a 1s minimum (Redis SETEX rejects 0); duplicating that
         // floor here would just hide the trait's behaviour from logs.
-        if let Err(e) = self.kv.put(&key, payload, self.ttl).await {
-            tracing::error!(error = %e, key = %key, "session put failed");
-        }
+        self.kv
+            .put(&key, payload, self.ttl)
+            .await
+            .map_err(|error| anyhow!("authorization session persistence failed: {error}"))
     }
 
     async fn take(&self, state: &str) -> Option<Session> {
@@ -296,7 +316,7 @@ mod tests {
     #[tokio::test]
     async fn put_then_take_returns_row() {
         let store = InMemorySessionStore::new(Duration::from_secs(60));
-        store.put("st-1", fixture("st-1")).await;
+        store.put("st-1", fixture("st-1")).await.unwrap();
         let got = store.take("st-1").await.expect("row missing");
         assert_eq!(got.client_state, "client-st-1");
     }
@@ -304,7 +324,7 @@ mod tests {
     #[tokio::test]
     async fn take_is_single_use() {
         let store = InMemorySessionStore::new(Duration::from_secs(60));
-        store.put("st-2", fixture("st-2")).await;
+        store.put("st-2", fixture("st-2")).await.unwrap();
         assert!(store.take("st-2").await.is_some());
         assert!(
             store.take("st-2").await.is_none(),
@@ -322,7 +342,7 @@ mod tests {
     async fn expired_session_is_not_returned() {
         // Zero TTL means every entry is expired the instant after insert.
         let store = InMemorySessionStore::new(Duration::from_nanos(1));
-        store.put("st-3", fixture("st-3")).await;
+        store.put("st-3", fixture("st-3")).await.unwrap();
         // Tiny sleep to make sure the clock has moved past the TTL.
         tokio::time::sleep(Duration::from_millis(5)).await;
         assert!(store.take("st-3").await.is_none());
@@ -331,12 +351,22 @@ mod tests {
     #[tokio::test]
     async fn put_purges_expired_entries() {
         let store = InMemorySessionStore::new(Duration::from_millis(10));
-        store.put("old-1", fixture("old-1")).await;
-        store.put("old-2", fixture("old-2")).await;
+        store.put("old-1", fixture("old-1")).await.unwrap();
+        store.put("old-2", fixture("old-2")).await.unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
         // Now insert a fresh row, which should sweep the two stale rows.
-        store.put("fresh", fixture("fresh")).await;
+        store.put("fresh", fixture("fresh")).await.unwrap();
         assert_eq!(store.len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn in_memory_session_capacity_fails_closed_without_evicting_live_state() {
+        let store = InMemorySessionStore::with_capacity(Duration::from_secs(60), 1).unwrap();
+        store.put("first", fixture("first")).await.unwrap();
+        let error = store.put("second", fixture("second")).await.unwrap_err();
+        assert!(error.to_string().contains("capacity"));
+        assert!(store.take("first").await.is_some());
+        assert!(store.take("second").await.is_none());
     }
 
     // --- Redis store tests ---
@@ -396,7 +426,7 @@ mod tests {
         let kv: Arc<dyn EphemeralKv> = Arc::new(MockEphemeralKv::new());
         let store = RedisSessionStore::with_storage(kv, "mcp:session", Duration::from_secs(60));
 
-        store.put("st-mock", fixture("st-mock")).await;
+        store.put("st-mock", fixture("st-mock")).await.unwrap();
         let got = store.take("st-mock").await.expect("row present after put");
         assert_eq!(got.client_state, "client-st-mock");
         // Single-use: the second take must miss because the trait
@@ -447,7 +477,7 @@ mod tests {
         let prefix = format!("mcp-test-{}", uuid_like());
         let store = RedisSessionStore::new(&url, &prefix, Duration::from_secs(60))
             .expect("redis client open");
-        store.put("st-redis", fixture("st-redis")).await;
+        store.put("st-redis", fixture("st-redis")).await.unwrap();
         let got = store.take("st-redis").await.expect("row present after put");
         assert_eq!(got.client_state, "client-st-redis");
         // Single-use: a second take must miss.

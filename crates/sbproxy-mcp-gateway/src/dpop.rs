@@ -117,7 +117,7 @@ pub enum DpopError {
 /// All fields are populated only after `parse_and_verify` succeeds.
 /// `raw_jwt` is retained so callers that want to forward the proof
 /// upstream (or log it for audit) can do so without re-serializing.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DpopProof {
     /// Public key the proof is signed under, taken from the JWS header.
     pub jwk: Jwk,
@@ -136,6 +136,22 @@ pub struct DpopProof {
     pub ath: Option<String>,
     /// Original JWT serialization, useful for forwarding or audit.
     pub raw_jwt: String,
+}
+
+impl std::fmt::Debug for DpopProof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DpopProof")
+            .field("jwk", &self.jwk)
+            .field("jti", &self.jti)
+            .field("htm", &self.htm)
+            .field("htu", &self.htu)
+            .field("iat", &self.iat)
+            .field("nonce", &self.nonce.as_ref().map(|_| "[REDACTED]"))
+            .field("ath", &self.ath.as_ref().map(|_| "[REDACTED]"))
+            .field("raw_jwt", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Internal claims model the JWT decoder hydrates. Public fields
@@ -638,6 +654,35 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
         assert_eq!(proof.jti, "jti-1");
         assert_eq!(proof.htm, "POST");
         assert_eq!(proof.htu, "https://broker.example.com/token");
+    }
+
+    #[test]
+    fn proof_debug_redacts_replayable_material() {
+        let (jwk_val, key) = es256_keypair();
+        let raw = build_proof_with(
+            &jwk_val,
+            &key,
+            Algorithm::ES256,
+            Some("dpop+jwt"),
+            "POST",
+            "https://broker.example.com/token",
+            0,
+            Some("debug-jti"),
+            Some("NONCE-CANARY-SECRET"),
+            Some("ATH-CANARY-SECRET"),
+        );
+        let proof = parse_and_verify(
+            &raw,
+            "POST",
+            &url("https://broker.example.com/token"),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let rendered = format!("{proof:?}");
+        assert!(!rendered.contains(&raw));
+        assert!(!rendered.contains("NONCE-CANARY-SECRET"));
+        assert!(!rendered.contains("ATH-CANARY-SECRET"));
+        assert!(rendered.contains("[REDACTED]"));
     }
 
     #[test]

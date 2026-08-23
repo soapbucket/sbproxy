@@ -368,24 +368,28 @@ impl CimdToDcrCache {
 /// fit: a fresh replica should not have to re-register every CIMD
 /// client just because it cold-booted.
 ///
-/// ## Key layout
-///
-/// `dcr:{url_hash_hex}:{fingerprint_hex}`. The URL is hashed (we
-/// never store it) and the fingerprint encodes the doc content, so
-/// a doc change naturally rotates the key without needing explicit
-/// invalidation. URL-level invalidation uses `PersistentKv::list_prefix`
-/// to enumerate every fingerprint under a given URL hash and delete
-/// each in turn.
+/// The complete bounded index is stored in one CAS-protected value.
+/// This makes expiry sweep, capacity eviction, insertion, and
+/// invalidation one atomic operation across replicas. Older per-entry
+/// `dcr:{url_hash}:{fingerprint}` values are migrated lazily.
 pub struct PersistentKvDcrCache {
     store: std::sync::Arc<dyn sbproxy_storage::PersistentKv>,
     ttl: Duration,
     capacity: usize,
 }
 
-#[derive(Serialize, Deserialize)]
+const PERSISTENT_DCR_INDEX_KEY: &str = "dcr:index:v1";
+const PERSISTENT_DCR_CAS_RETRIES: usize = 32;
+
+#[derive(Clone, Serialize, Deserialize)]
 struct PersistentCachedRegistration {
     registration: DcrRegisteredClient,
     expires_at_unix: u64,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct PersistentDcrIndex {
+    entries: HashMap<String, PersistentCachedRegistration>,
 }
 
 impl PersistentKvDcrCache {
@@ -453,30 +457,62 @@ impl PersistentKvDcrCache {
     /// stored bytes fail to deserialize (treat schema drift as miss).
     pub async fn get(&self, cimd_url: &str, fingerprint: &[u8; 32]) -> Option<DcrRegisteredClient> {
         let key = Self::cache_key(cimd_url, fingerprint);
-        if let Err(error) = self.reclaim_expired(None).await {
-            tracing::warn!(
-                target: "mcp_gateway::cimd_to_dcr",
-                %error,
-                "persistent DCR cache sweep failed"
-            );
-        }
-        match self.store.get(&key).await {
-            Ok(Some(bytes)) => {
-                let cached = serde_json::from_slice::<PersistentCachedRegistration>(&bytes).ok()?;
-                if cached.expires_at_unix <= unix_now() {
-                    let _ = self.store.delete(&key).await;
-                    None
-                } else {
-                    Some(cached.registration)
-                }
+        let lookup_key = key.clone();
+        let indexed = self
+            .mutate_index(move |index| {
+                let now = unix_now();
+                index
+                    .entries
+                    .retain(|_, cached| cached.expires_at_unix > now);
+                index
+                    .entries
+                    .get(&lookup_key)
+                    .map(|cached| cached.registration.clone())
+            })
+            .await;
+        match indexed {
+            Ok(Some(registration)) => return Some(registration),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    target: "mcp_gateway::cimd_to_dcr",
+                    %error,
+                    "persistent DCR cache atomic lookup failed"
+                );
+                return None;
             }
-            _ => None,
         }
+
+        // Upgrade path for the former one-key-per-registration layout.
+        let legacy = match self.store.get(&key).await {
+            Ok(Some(bytes)) => bytes,
+            _ => return None,
+        };
+        let Ok(cached) = serde_json::from_slice::<PersistentCachedRegistration>(&legacy) else {
+            let _ = self
+                .store
+                .compare_exchange(&key, Some(legacy), None)
+                .await;
+            return None;
+        };
+        if cached.expires_at_unix <= unix_now() {
+            let _ = self
+                .store
+                .compare_exchange(&key, Some(legacy), None)
+                .await;
+            return None;
+        }
+        let registration = cached.registration.clone();
+        self.put(cimd_url, fingerprint, cached.registration).await;
+        let _ = self
+            .store
+            .compare_exchange(&key, Some(legacy), None)
+            .await;
+        Some(registration)
     }
 
-    /// Store `registration` under `(cimd_url, fingerprint)`. A
-    /// serialization failure is logged but not propagated; the next
-    /// request will re-register and try again.
+    /// Store `registration` under `(cimd_url, fingerprint)` through a
+    /// single compare-and-swap of the bounded durable index.
     pub async fn put(
         &self,
         cimd_url: &str,
@@ -484,63 +520,98 @@ impl PersistentKvDcrCache {
         registration: DcrRegisteredClient,
     ) {
         let key = Self::cache_key(cimd_url, fingerprint);
-        if let Err(error) = self.reclaim_expired(Some(&key)).await {
+        let expires_at_unix = unix_now().saturating_add(self.ttl.as_secs());
+        let capacity = self.capacity;
+        if let Err(error) = self
+            .mutate_index(move |index| {
+                let now = unix_now();
+                index
+                    .entries
+                    .retain(|_, cached| cached.expires_at_unix > now);
+                if !index.entries.contains_key(&key) && index.entries.len() >= capacity {
+                    if let Some(oldest) = index
+                        .entries
+                        .iter()
+                        .min_by(|(left_key, left), (right_key, right)| {
+                            (left.expires_at_unix, left_key.as_str())
+                                .cmp(&(right.expires_at_unix, right_key.as_str()))
+                        })
+                        .map(|(oldest, _)| oldest.clone())
+                    {
+                        index.entries.remove(&oldest);
+                    }
+                }
+                index.entries.insert(
+                    key.clone(),
+                    PersistentCachedRegistration {
+                        registration: registration.clone(),
+                        expires_at_unix,
+                    },
+                );
+            })
+            .await
+        {
             tracing::warn!(
                 target: "mcp_gateway::cimd_to_dcr",
                 %error,
-                "persistent DCR cache capacity check failed; registration not cached"
+                "persistent DCR cache atomic update failed; registration not cached"
             );
             return;
         }
-        let cached = PersistentCachedRegistration {
-            registration,
-            expires_at_unix: unix_now().saturating_add(self.ttl.as_secs()),
+        self.reclaim_expired_legacy_entries().await;
+    }
+
+    /// Remove expired values left by the former one-key-per-registration
+    /// representation. Exact-value CAS prevents a concurrent refresh from
+    /// being deleted by this compatibility sweep.
+    async fn reclaim_expired_legacy_entries(&self) {
+        let Ok(keys) = self.store.list_prefix("dcr:").await else {
+            return;
         };
-        match serde_json::to_vec(&cached) {
-            Ok(bytes) => {
-                if let Err(e) = self.store.put(&key, bytes::Bytes::from(bytes)).await {
-                    tracing::warn!(
-                        target: "mcp_gateway::cimd_to_dcr",
-                        error = %e,
-                        "PersistentKv put failed; DCR registration not cached"
-                    );
-                }
+        let now = unix_now();
+        for key in keys {
+            if key == PERSISTENT_DCR_INDEX_KEY {
+                continue;
             }
-            Err(e) => {
-                tracing::warn!(
-                    target: "mcp_gateway::cimd_to_dcr",
-                    error = %e,
-                    "DCR registration serialize failed; not cached"
-                );
+            let Ok(Some(bytes)) = self.store.get(&key).await else {
+                continue;
+            };
+            let expired = serde_json::from_slice::<PersistentCachedRegistration>(&bytes)
+                .map(|cached| cached.expires_at_unix <= now)
+                .unwrap_or(true);
+            if expired {
+                let _ = self.store.compare_exchange(&key, Some(bytes), None).await;
             }
         }
     }
 
-    async fn reclaim_expired(
+    async fn mutate_index<T>(
         &self,
-        incoming_key: Option<&str>,
-    ) -> Result<(), sbproxy_storage::StorageError> {
-        let now = unix_now();
-        let mut live = Vec::new();
-        for key in self.store.list_prefix("dcr:").await? {
-            let Some(bytes) = self.store.get(&key).await? else {
-                continue;
+        mut mutation: impl FnMut(&mut PersistentDcrIndex) -> T,
+    ) -> Result<T, sbproxy_storage::StorageError> {
+        for _ in 0..PERSISTENT_DCR_CAS_RETRIES {
+            let current = self.store.get(PERSISTENT_DCR_INDEX_KEY).await?;
+            let mut index = match current.as_ref() {
+                Some(bytes) => serde_json::from_slice(bytes).unwrap_or_default(),
+                None => PersistentDcrIndex::default(),
             };
-            match serde_json::from_slice::<PersistentCachedRegistration>(&bytes) {
-                Ok(cached) if cached.expires_at_unix > now => {
-                    live.push((key, cached.expires_at_unix));
-                }
-                _ => self.store.delete(&key).await?,
+            let result = mutation(&mut index);
+            let replacement = bytes::Bytes::from(serde_json::to_vec(&index).map_err(|error| {
+                sbproxy_storage::StorageError::Backend(format!(
+                    "persistent DCR index serialization failed: {error}"
+                ))
+            })?);
+            if self
+                .store
+                .compare_exchange(PERSISTENT_DCR_INDEX_KEY, current, Some(replacement))
+                .await?
+            {
+                return Ok(result);
             }
         }
-        if incoming_key.is_some_and(|incoming_key| {
-            !live.iter().any(|(key, _)| key == incoming_key) && live.len() >= self.capacity
-        }) {
-            if let Some((oldest, _)) = live.into_iter().min_by_key(|(_, expires_at)| *expires_at) {
-                self.store.delete(&oldest).await?;
-            }
-        }
-        Ok(())
+        Err(sbproxy_storage::StorageError::Backend(
+            "persistent DCR index CAS contention limit reached".to_string(),
+        ))
     }
 
     /// Invalidate every cached registration for `cimd_url` regardless
@@ -549,26 +620,17 @@ impl PersistentKvDcrCache {
     /// revoked.
     pub async fn invalidate(&self, cimd_url: &str) {
         let prefix = Self::url_prefix(cimd_url);
-        let keys = match self.store.list_prefix(&prefix).await {
-            Ok(k) => k,
-            Err(e) => {
-                tracing::warn!(
-                    target: "mcp_gateway::cimd_to_dcr",
-                    error = %e,
-                    "PersistentKv list_prefix failed during DCR invalidate"
-                );
-                return;
-            }
-        };
-        for key in keys {
-            if let Err(e) = self.store.delete(&key).await {
-                tracing::warn!(
-                    target: "mcp_gateway::cimd_to_dcr",
-                    error = %e,
-                    key = %key,
-                    "PersistentKv delete failed during DCR invalidate"
-                );
-            }
+        if let Err(error) = self
+            .mutate_index(move |index| {
+                index.entries.retain(|key, _| !key.starts_with(&prefix));
+            })
+            .await
+        {
+            tracing::warn!(
+                target: "mcp_gateway::cimd_to_dcr",
+                %error,
+                "persistent DCR cache atomic invalidation failed"
+            );
         }
     }
 }
@@ -907,6 +969,59 @@ mod tests {
         std::sync::Arc::new(crate::local_store::LocalStore::new())
     }
 
+    struct SynchronizedIndexReadStore {
+        inner: crate::local_store::LocalStore,
+        first_index_reads: AtomicUsize,
+        barrier: tokio::sync::Barrier,
+    }
+
+    #[async_trait::async_trait]
+    impl sbproxy_storage::PersistentKv for SynchronizedIndexReadStore {
+        async fn get(&self, key: &str) -> Result<Option<bytes::Bytes>, sbproxy_storage::StorageError> {
+            let result = sbproxy_storage::PersistentKv::get(&self.inner, key).await;
+            if key == PERSISTENT_DCR_INDEX_KEY
+                && self.first_index_reads.fetch_add(1, Ordering::SeqCst) < 2
+            {
+                self.barrier.wait().await;
+            }
+            result
+        }
+
+        async fn put(
+            &self,
+            key: &str,
+            value: bytes::Bytes,
+        ) -> Result<(), sbproxy_storage::StorageError> {
+            sbproxy_storage::PersistentKv::put(&self.inner, key, value).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), sbproxy_storage::StorageError> {
+            sbproxy_storage::PersistentKv::delete(&self.inner, key).await
+        }
+
+        async fn list_prefix(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<String>, sbproxy_storage::StorageError> {
+            sbproxy_storage::PersistentKv::list_prefix(&self.inner, prefix).await
+        }
+
+        async fn compare_exchange(
+            &self,
+            key: &str,
+            expected: Option<bytes::Bytes>,
+            replacement: Option<bytes::Bytes>,
+        ) -> Result<bool, sbproxy_storage::StorageError> {
+            sbproxy_storage::PersistentKv::compare_exchange(
+                &self.inner,
+                key,
+                expected,
+                replacement,
+            )
+            .await
+        }
+    }
+
     fn fixture_registration(client_id: &str) -> DcrRegisteredClient {
         DcrRegisteredClient {
             registered_client_id: client_id.to_string(),
@@ -1009,6 +1124,53 @@ mod tests {
                 .registered_client_id,
             "second"
         );
+    }
+
+    #[tokio::test]
+    async fn persistent_capacity_is_atomic_across_concurrent_writers() {
+        let store = Arc::new(SynchronizedIndexReadStore {
+            inner: crate::local_store::LocalStore::new(),
+            first_index_reads: AtomicUsize::new(0),
+            barrier: tokio::sync::Barrier::new(2),
+        });
+        let cache = Arc::new(
+            PersistentKvDcrCache::with_limits(store.clone(), Duration::from_secs(60), 1).unwrap(),
+        );
+        let gate = Arc::new(tokio::sync::Barrier::new(3));
+        let mut tasks = Vec::new();
+        for (url, id) in [
+            ("https://one.example/cimd", "one"),
+            ("https://two.example/cimd", "two"),
+        ] {
+            let cache = cache.clone();
+            let gate = gate.clone();
+            tasks.push(tokio::spawn(async move {
+                gate.wait().await;
+                cache
+                    .put(url, &[0x44; 32], fixture_registration(id))
+                    .await;
+            }));
+        }
+        gate.wait().await;
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let raw_keys = sbproxy_storage::PersistentKv::list_prefix(store.as_ref(), "dcr:")
+            .await
+            .unwrap();
+        assert_eq!(
+            raw_keys.len(),
+            1,
+            "the durable cache must never exceed its declared capacity"
+        );
+        let present = [
+            cache.get("https://one.example/cimd", &[0x44; 32]).await,
+            cache.get("https://two.example/cimd", &[0x44; 32]).await,
+        ]
+        .into_iter()
+        .filter(Option::is_some)
+        .count();
+        assert_eq!(present, 1, "capacity must hold under synchronized writers");
     }
 
     #[tokio::test]

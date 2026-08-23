@@ -148,7 +148,7 @@ impl std::fmt::Debug for DeviceCodeState {
             .field("client_id", &self.client_id)
             .field("scope", &self.scope)
             .field("resource", &self.resource)
-            .field("user_code", &self.user_code)
+            .field("user_code", &"[REDACTED]")
             .field("status", &self.status)
             .field(
                 "authorized_token",
@@ -184,6 +184,44 @@ pub enum DeviceCodeStatus {
     Denied,
 }
 
+/// User decision applied to a pending device authorization.
+pub enum DeviceDecision {
+    /// Approve and persist the complete token response.
+    Approved(serde_json::Value),
+    /// Deny without storing token material.
+    Denied,
+}
+
+/// Result of an atomic pending-to-final transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceDecisionOutcome {
+    /// This caller won the transition.
+    Applied,
+    /// Another caller already finalized the decision.
+    AlreadyFinal(DeviceCodeStatus),
+    /// The code expired or was already consumed.
+    Missing,
+}
+
+/// Result of one atomic RFC 8628 token poll.
+#[derive(Debug)]
+pub enum DevicePollOutcome {
+    /// The device code is absent or was already consumed.
+    Missing,
+    /// The caller did not match the client that requested the code.
+    InvalidClient,
+    /// The user has not decided yet.
+    Pending,
+    /// The caller exceeded the polling interval.
+    SlowDown,
+    /// The code expired.
+    Expired,
+    /// The user denied consent.
+    Denied,
+    /// This caller atomically consumed the approved state.
+    Authorized(DeviceCodeState),
+}
+
 // --- Store ---
 
 /// Thin facade over [`EphemeralKv`] with the device-code key naming
@@ -214,23 +252,37 @@ impl DeviceCodeStore {
         state: &DeviceCodeState,
         ttl: Duration,
     ) -> Result<(), DeviceCodeError> {
-        let bytes =
-            serde_json::to_vec(state).map_err(|e| DeviceCodeError::Serialize(format!("{e}")))?;
-        self.kv
-            .put(&device_key(device_code), Bytes::from(bytes), ttl)
-            .await
-            .map_err(|e| DeviceCodeError::Storage(format!("{e}")))?;
-        // The reverse index value is the device_code itself. We want
-        // both keys to TTL together so the index never outlives the
-        // primary entry.
-        self.kv
-            .put(
-                &user_code_key(&state.user_code),
-                Bytes::copy_from_slice(device_code.as_bytes()),
-                ttl,
+        let bytes = serialize_state(state)?;
+        let reverse_key = user_code_key(&state.user_code);
+        let reverse_value = Bytes::copy_from_slice(device_code.as_bytes());
+        let claimed_reverse = self
+            .kv
+            .compare_exchange(
+                &reverse_key,
+                None,
+                Some((reverse_value.clone(), ttl)),
             )
             .await
             .map_err(|e| DeviceCodeError::Storage(format!("{e}")))?;
+        if !claimed_reverse {
+            return Err(DeviceCodeError::Contention(
+                "user code collision; mint a fresh code".to_string(),
+            ));
+        }
+        let claimed_primary = self
+            .kv
+            .compare_exchange(&device_key(device_code), None, Some((bytes, ttl)))
+            .await
+            .map_err(|e| DeviceCodeError::Storage(format!("{e}")))?;
+        if !claimed_primary {
+            let _ = self
+                .kv
+                .compare_exchange(&reverse_key, Some(reverse_value), None)
+                .await;
+            return Err(DeviceCodeError::Contention(
+                "device code collision; mint a fresh code".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -272,10 +324,167 @@ impl DeviceCodeStore {
         device_code: &str,
         state: &DeviceCodeState,
     ) -> Result<(), DeviceCodeError> {
-        let now = unix_now();
-        let remaining = state.expires_at.saturating_sub(now).max(1) as u64;
-        self.put(device_code, state, Duration::from_secs(remaining))
-            .await
+        let key = device_key(device_code);
+        for _ in 0..16 {
+            let Some(current) = self
+                .kv
+                .get(&key)
+                .await
+                .map_err(|e| DeviceCodeError::Storage(format!("{e}")))?
+            else {
+                return Err(DeviceCodeError::Contention(
+                    "device code disappeared during update".to_string(),
+                ));
+            };
+            if self
+                .kv
+                .compare_exchange(
+                    &key,
+                    Some(current),
+                    Some((serialize_state(state)?, remaining_ttl(state))),
+                )
+                .await
+                .map_err(|e| DeviceCodeError::Storage(format!("{e}")))?
+            {
+                return Ok(());
+            }
+        }
+        Err(DeviceCodeError::Contention(
+            "device code update contention limit reached".to_string(),
+        ))
+    }
+
+    /// Atomically finalize a pending code. A denial or approval that
+    /// already won is immutable.
+    pub async fn decide(
+        &self,
+        device_code: &str,
+        decision: DeviceDecision,
+    ) -> Result<DeviceDecisionOutcome, DeviceCodeError> {
+        let key = device_key(device_code);
+        for _ in 0..16 {
+            let Some(current) = self
+                .kv
+                .get(&key)
+                .await
+                .map_err(|e| DeviceCodeError::Storage(format!("{e}")))?
+            else {
+                return Ok(DeviceDecisionOutcome::Missing);
+            };
+            let mut state = deserialize_state(&current)?;
+            if state.status != DeviceCodeStatus::Pending {
+                return Ok(DeviceDecisionOutcome::AlreadyFinal(state.status));
+            }
+            match &decision {
+                DeviceDecision::Approved(token) => {
+                    state.status = DeviceCodeStatus::Authorized;
+                    state.authorized_token = Some(token.clone());
+                }
+                DeviceDecision::Denied => {
+                    state.status = DeviceCodeStatus::Denied;
+                    state.authorized_token = None;
+                }
+            }
+            if self
+                .kv
+                .compare_exchange(
+                    &key,
+                    Some(current),
+                    Some((serialize_state(&state)?, remaining_ttl(&state))),
+                )
+                .await
+                .map_err(|e| DeviceCodeError::Storage(format!("{e}")))?
+            {
+                return Ok(DeviceDecisionOutcome::Applied);
+            }
+        }
+        Err(DeviceCodeError::Contention(
+            "device decision contention limit reached".to_string(),
+        ))
+    }
+
+    /// Apply polling rate state and, when approved, atomically consume
+    /// the primary row. Exactly one concurrent poller can receive the
+    /// authorized token.
+    pub async fn poll_and_consume(
+        &self,
+        device_code: &str,
+        client_id: &str,
+        now: i64,
+    ) -> Result<DevicePollOutcome, DeviceCodeError> {
+        let key = device_key(device_code);
+        for _ in 0..16 {
+            let Some(current) = self
+                .kv
+                .get(&key)
+                .await
+                .map_err(|e| DeviceCodeError::Storage(format!("{e}")))?
+            else {
+                return Ok(DevicePollOutcome::Missing);
+            };
+            let mut state = deserialize_state(&current)?;
+            if state.client_id != client_id {
+                return Ok(DevicePollOutcome::InvalidClient);
+            }
+            if now >= state.expires_at {
+                if self
+                    .kv
+                    .compare_exchange(&key, Some(current), None)
+                    .await
+                    .map_err(|e| DeviceCodeError::Storage(format!("{e}")))?
+                {
+                    self.remove_reverse_index(device_code, &state.user_code).await;
+                    return Ok(DevicePollOutcome::Expired);
+                }
+                continue;
+            }
+            if state.status == DeviceCodeStatus::Denied {
+                return Ok(DevicePollOutcome::Denied);
+            }
+            let too_fast = apply_poll_rate_limit(&mut state, now);
+            if state.status == DeviceCodeStatus::Authorized && !too_fast {
+                if self
+                    .kv
+                    .compare_exchange(&key, Some(current), None)
+                    .await
+                    .map_err(|e| DeviceCodeError::Storage(format!("{e}")))?
+                {
+                    self.remove_reverse_index(device_code, &state.user_code).await;
+                    return Ok(DevicePollOutcome::Authorized(state));
+                }
+                continue;
+            }
+            if self
+                .kv
+                .compare_exchange(
+                    &key,
+                    Some(current),
+                    Some((serialize_state(&state)?, remaining_ttl(&state))),
+                )
+                .await
+                .map_err(|e| DeviceCodeError::Storage(format!("{e}")))?
+            {
+                return Ok(if too_fast {
+                    DevicePollOutcome::SlowDown
+                } else {
+                    DevicePollOutcome::Pending
+                });
+            }
+        }
+        Err(DeviceCodeError::Contention(
+            "device poll contention limit reached".to_string(),
+        ))
+    }
+
+    async fn remove_reverse_index(&self, device_code: &str, user_code: &str) {
+        let _ = self
+            .kv
+            .compare_exchange(
+                &user_code_key(user_code),
+                Some(Bytes::copy_from_slice(device_code.as_bytes())),
+                None,
+            )
+            .await;
     }
 
     /// Delete the primary state and reverse index for a given
@@ -302,6 +511,8 @@ pub enum DeviceCodeError {
     Storage(String),
     /// Internal serialization failure (state did not round-trip).
     Serialize(String),
+    /// A bounded CAS retry or unique-code claim could not make progress.
+    Contention(String),
 }
 
 impl std::fmt::Display for DeviceCodeError {
@@ -309,11 +520,26 @@ impl std::fmt::Display for DeviceCodeError {
         match self {
             DeviceCodeError::Storage(s) => write!(f, "device code storage: {s}"),
             DeviceCodeError::Serialize(s) => write!(f, "device code serialize: {s}"),
+            DeviceCodeError::Contention(s) => write!(f, "device code contention: {s}"),
         }
     }
 }
 
 impl std::error::Error for DeviceCodeError {}
+
+fn deserialize_state(bytes: &Bytes) -> Result<DeviceCodeState, DeviceCodeError> {
+    serde_json::from_slice(bytes).map_err(|e| DeviceCodeError::Serialize(format!("{e}")))
+}
+
+fn serialize_state(state: &DeviceCodeState) -> Result<Bytes, DeviceCodeError> {
+    serde_json::to_vec(state)
+        .map(Bytes::from)
+        .map_err(|e| DeviceCodeError::Serialize(format!("{e}")))
+}
+
+fn remaining_ttl(state: &DeviceCodeState) -> Duration {
+    Duration::from_secs(state.expires_at.saturating_sub(unix_now()).max(1) as u64)
+}
 
 // --- Key helpers ---
 
@@ -534,7 +760,7 @@ pub(crate) async fn verify_post(
         }
     };
 
-    let mut state = match store.get(&device_code).await {
+    let state = match store.get(&device_code).await {
         Ok(Some(s)) => s,
         Ok(None) => {
             return Html(verify_error_html("device code expired")).into_response();
@@ -549,7 +775,7 @@ pub(crate) async fn verify_post(
         }
     };
 
-    if approve {
+    let decision = if approve {
         let Some(signing_key) = app.config.broker_signing_key.as_ref() else {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -597,23 +823,35 @@ pub(crate) async fn verify_post(
                 return (StatusCode::INTERNAL_SERVER_ERROR, "token mint failed").into_response();
             }
         };
-        state.status = DeviceCodeStatus::Authorized;
-        state.authorized_token = Some(serde_json::json!({
+        DeviceDecision::Approved(serde_json::json!({
             "access_token": token,
             "token_type": "Bearer",
             "expires_in": state.expires_at.saturating_sub(unix_now()),
-        }));
+        }))
     } else {
-        state.status = DeviceCodeStatus::Denied;
-    }
+        DeviceDecision::Denied
+    };
 
-    if let Err(e) = store.update(&device_code, &state).await {
-        tracing::error!(error = %e, "verify_post: state update failed");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "device code update failed",
-        )
-            .into_response();
+    match store.decide(&device_code, decision).await {
+        Ok(DeviceDecisionOutcome::Applied) => {}
+        Ok(DeviceDecisionOutcome::AlreadyFinal(_)) => {
+            return (
+                StatusCode::CONFLICT,
+                Html(verify_error_html("device authorization was already decided")),
+            )
+                .into_response();
+        }
+        Ok(DeviceDecisionOutcome::Missing) => {
+            return Html(verify_error_html("device code expired")).into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "verify_post: atomic state transition failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "device code update failed",
+            )
+                .into_response();
+        }
     }
 
     let body = if approve {
@@ -1129,6 +1367,99 @@ mod tests {
         // Cosmetic dashes in the input are ignored by the resolver.
         let dc = store.resolve_user_code("ABCD-EFGH").await.unwrap();
         assert_eq!(dc.as_deref(), Some("dc1"));
+    }
+
+    #[test]
+    fn device_state_debug_redacts_user_code_and_token() {
+        let mut state = pending_state();
+        state.user_code = "USER-CODE-CANARY".to_string();
+        state.status = DeviceCodeStatus::Authorized;
+        state.authorized_token = Some(serde_json::json!({"access_token":"TOKEN-CANARY"}));
+        let rendered = format!("{state:?}");
+        assert!(!rendered.contains("USER-CODE-CANARY"), "{rendered}");
+        assert!(!rendered.contains("TOKEN-CANARY"), "{rendered}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+    }
+
+    fn pending_state() -> DeviceCodeState {
+        DeviceCodeState {
+            client_id: "cli".to_string(),
+            scope: Some("tools:call".to_string()),
+            resource: Some("https://api.example/r".to_string()),
+            user_code: "ABCDEFGH".to_string(),
+            status: DeviceCodeStatus::Pending,
+            authorized_token: None,
+            issued_at: unix_now(),
+            expires_at: unix_now() + 600,
+            interval_secs: 1,
+            last_polled_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn denial_is_immutable_and_cannot_be_overwritten_by_approval() {
+        let store = DeviceCodeStore::new(Arc::new(MockEphemeralKv::new()));
+        store
+            .put("dc-atomic", &pending_state(), Duration::from_secs(600))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .decide("dc-atomic", DeviceDecision::Denied)
+                .await
+                .unwrap(),
+            DeviceDecisionOutcome::Applied
+        );
+        let outcome = store
+            .decide(
+                "dc-atomic",
+                DeviceDecision::Approved(serde_json::json!({"access_token": "must-not-win"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            DeviceDecisionOutcome::AlreadyFinal(DeviceCodeStatus::Denied)
+        );
+        let state = store.get("dc-atomic").await.unwrap().unwrap();
+        assert_eq!(state.status, DeviceCodeStatus::Denied);
+        assert!(state.authorized_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn synchronized_concurrent_redemption_returns_one_token() {
+        let store = Arc::new(DeviceCodeStore::new(Arc::new(MockEphemeralKv::new())));
+        let mut approved = pending_state();
+        approved.status = DeviceCodeStatus::Authorized;
+        approved.authorized_token = Some(serde_json::json!({"access_token": "one-token"}));
+        store
+            .put("dc-redeem", &approved, Duration::from_secs(600))
+            .await
+            .unwrap();
+        let gate = Arc::new(tokio::sync::Barrier::new(3));
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let store = store.clone();
+            let gate = gate.clone();
+            tasks.push(tokio::spawn(async move {
+                gate.wait().await;
+                store.poll_and_consume("dc-redeem", "cli", unix_now() + 2).await
+            }));
+        }
+        gate.wait().await;
+        let mut authorized = 0;
+        let mut missing = 0;
+        for task in tasks {
+            match task.await.unwrap().unwrap() {
+                DevicePollOutcome::Authorized(state) => {
+                    authorized += 1;
+                    assert_eq!(state.authorized_token.unwrap()["access_token"], "one-token");
+                }
+                DevicePollOutcome::Missing => missing += 1,
+                other => panic!("unexpected poll outcome: {other:?}"),
+            }
+        }
+        assert_eq!((authorized, missing), (1, 1));
     }
 
     /// Tiny URL-form encoder for test fixtures.

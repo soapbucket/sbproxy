@@ -250,7 +250,10 @@ mod tests {
         upstream_state: &str,
     ) -> (axum::Router, Arc<InMemorySessionStore>) {
         let store = InMemorySessionStore::arc(Duration::from_secs(60));
-        store.put(upstream_state, fixture_session()).await;
+        store
+            .put(upstream_state, fixture_session())
+            .await
+            .unwrap();
         let cfg = test_config();
         let metadata = Arc::new(crate::as_metadata::AsMetadataCache::new(
             sbproxy_httpkit::default_outbound(),

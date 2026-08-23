@@ -130,6 +130,48 @@ impl EphemeralKv for MockEphemeralKv {
         }
         Ok(false)
     }
+
+
+    async fn compare_exchange(
+        &self,
+        key: &str,
+        expected: Option<Bytes>,
+        replacement: Option<(Bytes, Duration)>,
+    ) -> Result<bool, StorageError> {
+        check_key(key)?;
+        if let Some((value, ttl)) = replacement.as_ref() {
+            check_value(value)?;
+            if ttl.is_zero() {
+                return Err(StorageError::InvalidConfig(
+                    "ephemeral compare_exchange requires a non-zero ttl".into(),
+                ));
+            }
+        }
+        let now = Instant::now();
+        let mut guard = self.storage.lock().await;
+        if guard
+            .get(key)
+            .is_some_and(|(_, expires_at)| *expires_at <= now)
+        {
+            guard.remove(key);
+        }
+        let current = guard.get(key).map(|(value, _)| value.clone());
+        if current != expected {
+            return Ok(false);
+        }
+        match replacement {
+            Some((value, ttl)) => {
+                let expires_at = now
+                    .checked_add(ttl)
+                    .ok_or_else(|| StorageError::InvalidConfig("ttl overflow".into()))?;
+                guard.insert(key.to_string(), (value, expires_at));
+            }
+            None => {
+                guard.remove(key);
+            }
+        }
+        Ok(true)
+    }
 }
 
 // --- Persistent KV mock ---
@@ -176,6 +218,31 @@ impl PersistentKv for MockPersistentKv {
             .filter(|k| k.starts_with(prefix))
             .cloned()
             .collect())
+    }
+
+    async fn compare_exchange(
+        &self,
+        key: &str,
+        expected: Option<Bytes>,
+        replacement: Option<Bytes>,
+    ) -> Result<bool, StorageError> {
+        check_key(key)?;
+        if let Some(value) = replacement.as_ref() {
+            check_value(value)?;
+        }
+        let mut guard = self.storage.lock().await;
+        if guard.get(key).cloned() != expected {
+            return Ok(false);
+        }
+        match replacement {
+            Some(value) => {
+                guard.insert(key.to_string(), value);
+            }
+            None => {
+                guard.remove(key);
+            }
+        }
+        Ok(true)
     }
 }
 

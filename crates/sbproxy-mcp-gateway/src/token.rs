@@ -859,19 +859,70 @@ async fn handle_device_code_grant(
             );
         }
     };
-    let req_client_id = form.get("client_id").cloned();
+    let req_client_id = match form.get("client_id").filter(|value| !value.is_empty()) {
+        Some(client_id) => client_id,
+        None => {
+            return oauth_error(
+                StatusCode::UNAUTHORIZED,
+                "invalid_client",
+                "client_id is required for device-code redemption",
+            );
+        }
+    };
 
-    let mut state = match store.get(&device_code).await {
-        Ok(Some(s)) => s,
-        Ok(None) => {
+    let state = match store
+        .poll_and_consume(
+            &device_code,
+            req_client_id,
+            crate::device_code::unix_now(),
+        )
+        .await
+    {
+        Ok(crate::device_code::DevicePollOutcome::Authorized(state)) => state,
+        Ok(crate::device_code::DevicePollOutcome::Missing) => {
             return oauth_error(
                 StatusCode::BAD_REQUEST,
                 "expired_token",
-                "device_code is unknown or expired",
+                "device_code is unknown, expired, or already consumed",
+            );
+        }
+        Ok(crate::device_code::DevicePollOutcome::InvalidClient) => {
+            return oauth_error(
+                StatusCode::UNAUTHORIZED,
+                "invalid_client",
+                "client_id does not match the original request",
+            );
+        }
+        Ok(crate::device_code::DevicePollOutcome::Pending) => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "authorization_pending",
+                "user has not yet authorized this request",
+            );
+        }
+        Ok(crate::device_code::DevicePollOutcome::SlowDown) => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "slow_down",
+                "polling interval exceeded; double your delay",
+            );
+        }
+        Ok(crate::device_code::DevicePollOutcome::Expired) => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "expired_token",
+                "device_code expired",
+            );
+        }
+        Ok(crate::device_code::DevicePollOutcome::Denied) => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "access_denied",
+                "user denied the authorization request",
             );
         }
         Err(e) => {
-            tracing::error!(error = %e, "device_code: store get failed");
+            tracing::error!(error = %e, "device_code: atomic poll failed");
             return oauth_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "server_error",
@@ -879,69 +930,6 @@ async fn handle_device_code_grant(
             );
         }
     };
-
-    // --- client_id binding check ---
-    //
-    // RFC 8628 §3.4: the client_id on the poll MUST match the one
-    // supplied at /device_authorization. Without this check an
-    // attacker who learned a device_code could redeem it under a
-    // different client identity.
-    if let Some(rcid) = req_client_id.as_deref() {
-        if rcid != state.client_id {
-            return oauth_error(
-                StatusCode::UNAUTHORIZED,
-                "invalid_client",
-                "client_id does not match the original request",
-            );
-        }
-    }
-
-    // --- Expiry ---
-    let now = crate::device_code::unix_now();
-    if now >= state.expires_at {
-        return oauth_error(
-            StatusCode::BAD_REQUEST,
-            "expired_token",
-            "device_code expired",
-        );
-    }
-
-    // --- Rate limiting ---
-    let too_fast = crate::device_code::apply_poll_rate_limit(&mut state, now);
-    if too_fast {
-        // Persist the doubled interval so the next poll sees it.
-        if let Err(e) = store.update(&device_code, &state).await {
-            tracing::warn!(error = %e, "device_code: rate-limit state persist failed");
-        }
-        return oauth_error(
-            StatusCode::BAD_REQUEST,
-            "slow_down",
-            "polling interval exceeded; double your delay",
-        );
-    }
-
-    // --- Status checks ---
-    match state.status {
-        crate::device_code::DeviceCodeStatus::Pending => {
-            // Persist the new last_polled_at without changing status.
-            if let Err(e) = store.update(&device_code, &state).await {
-                tracing::warn!(error = %e, "device_code: poll-time persist failed");
-            }
-            return oauth_error(
-                StatusCode::BAD_REQUEST,
-                "authorization_pending",
-                "user has not yet authorized this request",
-            );
-        }
-        crate::device_code::DeviceCodeStatus::Denied => {
-            return oauth_error(
-                StatusCode::BAD_REQUEST,
-                "access_denied",
-                "user denied the authorization request",
-            );
-        }
-        crate::device_code::DeviceCodeStatus::Authorized => {}
-    }
 
     // --- Issue the stored token ---
     let token_value = match state.authorized_token.as_ref() {
@@ -1014,11 +1002,6 @@ async fn handle_device_code_grant(
         .headers_mut()
         .insert("Pragma", axum::http::HeaderValue::from_static("no-cache"));
 
-    // Drop the device_code state once it has been redeemed so a
-    // replayed poll cannot mint a second token.
-    if let Err(e) = store.delete(&device_code, &state.user_code).await {
-        tracing::warn!(error = %e, "device_code: post-issue cleanup failed");
-    }
     response
 }
 

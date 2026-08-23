@@ -356,7 +356,14 @@ pub async fn authorize(State(app): State<AppState>, Query(q): Query<AuthorizeQue
         code_challenge: code_challenge.to_string(),
         code_challenge_method: method.to_string(),
     };
-    app.session_store.put(&upstream_state, session).await;
+    if let Err(error) = app.session_store.put(&upstream_state, session).await {
+        tracing::warn!(%error, "authorization session store refused request");
+        return oauth_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporarily_unavailable",
+            "authorization session capacity unavailable",
+        );
+    }
 
     // --- Build upstream redirect URL ---
 

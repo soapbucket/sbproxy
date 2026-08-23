@@ -690,6 +690,7 @@ mod tests {
 
     #[test]
     fn validate_startup_rejects_a_non_origin_or_credentialed_public_base_url() {
+        let _env = crate::test_env::EnvVarGuard::set(&[("MCP_GATEWAY_BASE_URL", None)]);
         for external_base_url in [
             "https://broker.example/path",
             "https://broker.example?tenant=one",
