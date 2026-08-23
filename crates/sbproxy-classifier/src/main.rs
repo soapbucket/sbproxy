@@ -36,6 +36,8 @@
 //! `crates/sbproxy-classifier-client/src/fallback.rs` and
 //! `crates/sbproxy-classifier-client/examples/fallback.rs`.
 
+mod admission;
+mod auth;
 mod config;
 mod grpc;
 mod health;
@@ -53,8 +55,9 @@ use sbproxy_classifier_proto::{ClassifierServiceServer, InferenceServiceServer};
 use sbproxy_classifiers::{OnnxClassifier, OnnxEmbedder};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tonic::transport::Server;
 
 /// CLI for the rich classifier sidecar.
@@ -71,6 +74,14 @@ struct Cli {
     /// quality scoring, intent / content-type detection, tenant admin.
     #[arg(long = "listen-tcp", default_value = "127.0.0.1:9400")]
     listen_tcp: String,
+    /// Optional, separate TCP + MessagePack listener for tenant administration.
+    /// This listener is loopback-only and requires `--admin-token-file`.
+    #[arg(long = "listen-admin")]
+    listen_admin: Option<String>,
+    /// Mode-0600 JSON file containing scoped admin bearer-token grants.
+    /// Also protects `GET /tenants` on the HTTP listener.
+    #[arg(long = "admin-token-file")]
+    admin_token_file: Option<PathBuf>,
     /// HTTP listen address for `/healthz`, `/readyz`, `/metrics`, `/tenants`.
     #[arg(long = "metrics-addr", default_value = "127.0.0.1:9402")]
     metrics_addr: String,
@@ -93,6 +104,76 @@ struct Cli {
     /// configured.
     #[arg(long)]
     default_embed_model: Option<String>,
+    /// Maximum CPU-bound gRPC requests running concurrently.
+    #[arg(long, default_value_t = grpc::DEFAULT_MAX_RUNNING)]
+    inference_max_running: usize,
+    /// Maximum CPU-bound gRPC requests queued behind running work.
+    #[arg(long, default_value_t = grpc::DEFAULT_MAX_QUEUED)]
+    inference_max_queued: usize,
+    /// End-to-end gRPC admission/execution deadline in milliseconds.
+    #[arg(long, default_value_t = grpc::DEFAULT_DEADLINE_MS)]
+    inference_deadline_ms: u64,
+    /// Maximum simultaneous connections on each TCP listener.
+    #[arg(long, default_value_t = tcp::DEFAULT_MAX_CONNECTIONS)]
+    tcp_max_connections: usize,
+    /// Per-frame TCP read/write deadline in milliseconds.
+    #[arg(long, default_value_t = 5_000)]
+    tcp_io_timeout_ms: u64,
+}
+
+struct BoundListeners {
+    grpc: tokio::net::TcpListener,
+    tcp: tokio::net::TcpListener,
+    metrics: tokio::net::TcpListener,
+    admin: Option<tokio::net::TcpListener>,
+}
+
+async fn bind_required_listeners(
+    grpc: SocketAddr,
+    tcp: SocketAddr,
+    metrics: SocketAddr,
+    admin: Option<SocketAddr>,
+    ready: &health::ReadyState,
+) -> Result<BoundListeners> {
+    let grpc = tokio::net::TcpListener::bind(grpc)
+        .await
+        .context("binding gRPC listener")?;
+    let tcp = tokio::net::TcpListener::bind(tcp)
+        .await
+        .context("binding public TCP listener")?;
+    let metrics = tokio::net::TcpListener::bind(metrics)
+        .await
+        .context("binding HTTP listener")?;
+    let admin = match admin {
+        Some(address) => Some(
+            tokio::net::TcpListener::bind(address)
+                .await
+                .context("binding admin TCP listener")?,
+        ),
+        None => None,
+    };
+    ready.mark_ready();
+    Ok(BoundListeners {
+        grpc,
+        tcp,
+        metrics,
+        admin,
+    })
+}
+
+fn loopback_admin_address(value: Option<&str>) -> Result<Option<SocketAddr>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let address: SocketAddr = value
+        .parse()
+        .with_context(|| format!("invalid --listen-admin address {value:?}"))?;
+    if !address.ip().is_loopback() {
+        anyhow::bail!(
+            "--listen-admin must use a loopback address; remote administration requires a secure transport not provided by this binary"
+        );
+    }
+    Ok(Some(address))
 }
 
 fn load_model_spec(spec: &str) -> Result<(String, Arc<OnnxClassifier>)> {
@@ -126,6 +207,15 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let admin_auth = cli
+        .admin_token_file
+        .as_deref()
+        .map(auth::AdminAuth::from_file)
+        .transpose()?;
+    let admin_addr = loopback_admin_address(cli.listen_admin.as_deref())?;
+    if admin_addr.is_some() && admin_auth.is_none() {
+        anyhow::bail!("--listen-admin requires --admin-token-file");
+    }
 
     let mut models = HashMap::new();
     for spec in &cli.models {
@@ -158,12 +248,31 @@ async fn main() -> Result<()> {
         default_model,
         default_embed_model,
         version: format!("sbproxy-classifier {}", env!("CARGO_PKG_VERSION")),
+        admission: admission::Admission::new(
+            cli.inference_max_running,
+            cli.inference_max_queued,
+            Duration::from_millis(cli.inference_deadline_ms),
+        )?,
     });
 
     let grpc_addr: SocketAddr = cli
         .listen
         .parse()
         .with_context(|| format!("invalid --listen address {:?}", cli.listen))?;
+    let tcp_addr: SocketAddr = cli
+        .listen_tcp
+        .parse()
+        .with_context(|| format!("invalid --listen-tcp address {:?}", cli.listen_tcp))?;
+    let metrics_addr: SocketAddr = cli
+        .metrics_addr
+        .parse()
+        .with_context(|| format!("invalid --metrics-addr address {:?}", cli.metrics_addr))?;
+    let tcp_limits = tcp::TcpLimits {
+        max_connections: cli.tcp_max_connections,
+        io_timeout: Duration::from_millis(cli.tcp_io_timeout_ms),
+    };
+    let listeners =
+        bind_required_listeners(grpc_addr, tcp_addr, metrics_addr, admin_addr, &ready).await?;
 
     tracing::info!(
         grpc_addr = %grpc_addr,
@@ -188,28 +297,55 @@ async fn main() -> Result<()> {
                     Arc::clone(&state),
                 )))
                 .add_service(ClassifierServiceServer::new(grpc::ClassifierHandler(state)))
-                .serve(grpc_addr)
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+                    listeners.grpc,
+                ))
                 .await
         })
     };
 
     let tcp_task = {
         let registry = Arc::clone(&registry);
-        let addr = cli.listen_tcp.clone();
-        tokio::spawn(async move { tcp::serve(&addr, registry).await })
+        tokio::spawn(async move {
+            tcp::serve_on(
+                listeners.tcp,
+                registry,
+                tcp::TransportMode::Public,
+                None,
+                tcp_limits,
+            )
+            .await
+        })
+    };
+
+    let admin_task = {
+        let registry = Arc::clone(&registry);
+        let auth = admin_auth.clone();
+        tokio::spawn(async move {
+            match (listeners.admin, auth) {
+                (Some(listener), Some(auth)) => {
+                    tcp::serve_on(
+                        listener,
+                        registry,
+                        tcp::TransportMode::Admin,
+                        Some(Arc::new(auth)),
+                        tcp_limits,
+                    )
+                    .await
+                }
+                _ => std::future::pending().await,
+            }
+        })
     };
 
     let health_task = {
         let registry = Arc::clone(&registry);
-        let addr = cli.metrics_addr.clone();
         let ready = ready.clone();
-        tokio::spawn(async move { health::serve(&addr, registry, ready).await })
+        let auth = admin_auth.map(Arc::new);
+        tokio::spawn(
+            async move { health::serve_on(listeners.metrics, registry, ready, auth).await },
+        )
     };
-
-    // All three listeners are bound by the time the spawned tasks are
-    // running; mark ready immediately rather than probing bind state, since
-    // an early bind failure surfaces below via `select!` regardless.
-    ready.mark_ready();
 
     tokio::select! {
         res = grpc_task => {
@@ -224,7 +360,39 @@ async fn main() -> Result<()> {
             res.context("health server task panicked")?
                 .map_err(|e| anyhow::anyhow!("health server failed: {e}"))?;
         }
+        res = admin_task => {
+            res.context("admin TCP server task panicked")?
+                .map_err(|e| anyhow::anyhow!("admin TCP server failed: {e}"))?;
+        }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_bind_conflict_cannot_publish_readiness() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ready = health::ReadyState::new();
+        let result = bind_required_listeners(
+            occupied.local_addr().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            &ready,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(!ready.is_ready());
+    }
+
+    #[test]
+    fn remote_admin_bind_is_rejected_even_with_a_bearer_transport() {
+        let error = loopback_admin_address(Some("0.0.0.0:9401")).unwrap_err();
+        assert!(error.to_string().contains("loopback"));
+    }
 }

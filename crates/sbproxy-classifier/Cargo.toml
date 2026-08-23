@@ -37,6 +37,7 @@ clap = { version = "4", features = ["derive"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+subtle = { workspace = true }
 
 # Sidecar-local Prometheus exposition. Matches the `prometheus` crate the
 # rest of the workspace (`sbproxy-observe`) standardizes on, rather than

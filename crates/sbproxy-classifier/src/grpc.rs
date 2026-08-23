@@ -13,15 +13,10 @@
 //! OnnxEmbedder}`, the same tract-ONNX engine `sbproxy-classifier-sidecar`
 //! (the minimal OSS sidecar) uses, loaded from the same `--model` /
 //! `--embed-model` CLI flags. This is intentionally the thin half: the
-//! minimal sidecar already carries a hardened, per-RPC admission-controlled
-//! implementation of this exact contract (request-byte budgets, running/
-//! queued semaphores, a bounded deadline covering both). Reimplementing that
-//! bound-for-bound here would not add capability, only a second copy to keep
-//! in sync, so an operator whose traffic needs that hardening runs the
-//! minimal sidecar for ONNX classify/embed and this binary alongside it for
-//! the genuinely new surface (`Classify` here still enforces a flat
-//! `MAX_TEXT_BYTES` request-size guard; it just does not admission-control
-//! concurrency the way the minimal sidecar does). `Compress` is not ported
+//! minimal sidecar already carries hardened per-RPC admission controls. The
+//! rich sidecar applies the same defense here: shared running/queued budgets
+//! and one deadline cover classify, embed, quality, model-info probes, and
+//! streaming safety. `Compress` is not ported
 //! (token-classification pruning is out of WOR-2665's named scope) and
 //! returns `UNIMPLEMENTED`.
 //!
@@ -34,6 +29,7 @@
 //! TCP MessagePack transport today; see `crate::tcp` and
 //! `docs/classifier-sidecar.md` for why.
 
+use crate::admission::Admission;
 use crate::heuristic;
 use crate::quality;
 use sbproxy_classifier_proto::{
@@ -54,6 +50,16 @@ use tonic::{Request, Response, Status, Streaming};
 /// in `sbproxy-classifier-sidecar`), so the two report the same ceiling to an
 /// operator sizing traffic against either one.
 const MAX_TEXT_BYTES: usize = 1024 * 1024;
+const MAX_EMBED_ITEMS: usize = 64;
+const MAX_EMBED_TOTAL_BYTES: usize = MAX_TEXT_BYTES;
+const MAX_STREAM_BYTES: usize = MAX_TEXT_BYTES;
+const MAX_STREAM_CHUNKS: usize = 4096;
+const MAX_STREAM_RULES: usize = 64;
+const MAX_STREAM_RULE_BYTES: usize = 64 * 1024;
+
+pub const DEFAULT_MAX_RUNNING: usize = 4;
+pub const DEFAULT_MAX_QUEUED: usize = 32;
+pub const DEFAULT_DEADLINE_MS: u64 = 5_000;
 
 /// Shared state for both gRPC services. Constructed once in `main.rs` and
 /// wrapped in the tonic server handles for each service.
@@ -63,6 +69,7 @@ pub struct GrpcState {
     pub default_model: Option<String>,
     pub default_embed_model: Option<String>,
     pub version: String,
+    pub admission: Admission,
 }
 
 impl GrpcState {
@@ -135,12 +142,12 @@ impl InferenceService for InferenceHandler {
             .ok_or_else(|| Status::not_found("unknown or unconfigured classifier model"))?;
         let text = req.text;
         let started = std::time::Instant::now();
-        let output = tokio::task::spawn_blocking(move || classifier.classify(&text))
+        let output = self
+            .admission
+            .run_blocking("classify", move || classifier.classify(&text))
             .await
-            .map_err(|e| Status::internal(format!("classify task panicked: {e}")))?
-            .map_err(|e| {
+            .inspect_err(|_status| {
                 crate::metrics::record_error("grpc", "classify", "inference_failed");
-                Status::internal(format!("classify failed: {e}"))
             })?;
         Ok(Response::new(ClassifyResponse {
             labels: vec![Label {
@@ -157,28 +164,45 @@ impl InferenceService for InferenceHandler {
     ) -> Result<Response<EmbedResponse>, Status> {
         let req = request.into_inner();
         crate::metrics::record_request("grpc", "embed");
+        if req.texts.len() > MAX_EMBED_ITEMS {
+            crate::metrics::record_error("grpc", "embed", "resource_limit");
+            return Err(Status::resource_exhausted(format!(
+                "embed request exceeds the {MAX_EMBED_ITEMS}-item budget"
+            )));
+        }
+        let total_bytes = req
+            .texts
+            .iter()
+            .try_fold(0usize, |total, text| total.checked_add(text.len()))
+            .ok_or_else(|| Status::resource_exhausted("embed request byte count overflow"))?;
+        if total_bytes > MAX_EMBED_TOTAL_BYTES {
+            crate::metrics::record_error("grpc", "embed", "resource_limit");
+            return Err(Status::resource_exhausted(format!(
+                "embed request exceeds the {MAX_EMBED_TOTAL_BYTES}-byte aggregate budget"
+            )));
+        }
+        for text in &req.texts {
+            check_text_bytes(text)?;
+        }
         let embedder = self.resolve_embedder(&req.model).ok_or_else(|| {
             Status::failed_precondition(
                 "no matching embedding model is loaded; start with --embed-model",
             )
         })?;
-        for text in &req.texts {
-            check_text_bytes(text)?;
-        }
         let texts = req.texts;
         let started = std::time::Instant::now();
-        let vectors = tokio::task::spawn_blocking(move || {
-            texts
-                .iter()
-                .map(|t| embedder.embed(t))
-                .collect::<anyhow::Result<Vec<_>>>()
-        })
-        .await
-        .map_err(|e| Status::internal(format!("embed task panicked: {e}")))?
-        .map_err(|e| {
-            crate::metrics::record_error("grpc", "embed", "inference_failed");
-            Status::internal(format!("embed failed: {e}"))
-        })?;
+        let vectors = self
+            .admission
+            .run_blocking("embed", move || {
+                texts
+                    .iter()
+                    .map(|text| embedder.embed(text))
+                    .collect::<anyhow::Result<Vec<_>>>()
+            })
+            .await
+            .inspect_err(|_status| {
+                crate::metrics::record_error("grpc", "embed", "inference_failed");
+            })?;
         Ok(Response::new(EmbedResponse {
             embeddings: vectors
                 .into_iter()
@@ -215,10 +239,14 @@ impl InferenceService for InferenceHandler {
                 embedding_dim: 0,
             }
         } else if let Some(embedder) = self.resolve_embedder(&req.model) {
-            let dim = embedder
-                .embed("dimension probe")
-                .map(|o| o.values.len() as u32)
-                .unwrap_or(0);
+            let dim = self
+                .admission
+                .run_blocking("model_info", move || {
+                    embedder
+                        .embed("dimension probe")
+                        .map(|output| output.values.len() as u32)
+                })
+                .await?;
             ModelInfoResponse {
                 model: if req.model.is_empty() {
                     self.default_embed_model.clone().unwrap_or_default()
@@ -279,7 +307,11 @@ impl ClassifierService for ClassifierHandler {
         let req = request.into_inner();
         check_text_bytes(&req.text)?;
         crate::metrics::record_request("grpc", "quality");
-        let result = quality::quality_score(&req.text);
+        let text = req.text;
+        let result = self
+            .admission
+            .run_blocking("quality", move || Ok(quality::quality_score(&text)))
+            .await?;
         crate::metrics::record_quality_score("grpc", result.score);
         Ok(Response::new(QualityResponse {
             score: result.score,
@@ -293,20 +325,30 @@ impl ClassifierService for ClassifierHandler {
     ///
     /// `rules` is read from the first message on the stream and reused for
     /// every message after it, per the proto doc: a caller sends its rule
-    /// set once, then streams tokens. Once a rule matches, every subsequent
-    /// verdict on the stream reports `blocked` again with the same reason
-    /// and `safe: false`, rather than silently going back to evaluating
-    /// only the latest token: the caller is expected to have stopped
-    /// forwarding output at the first block, so this is a safety net for a
-    /// caller that keeps streaming anyway, not new information.
+    /// set once, then streams tokens. Once a rule matches, `safe` remains
+    /// false for the stream while `blocked` is true only on the message that
+    /// first caused the transition.
     async fn stream_safety(
         &self,
         request: Request<Streaming<SafetyToken>>,
     ) -> Result<Response<Self::StreamSafetyStream>, Status> {
         crate::metrics::record_request("grpc", "stream_safety");
+        let lease = self.admission.acquire("stream_safety").await?;
         let inbound = request.into_inner();
         let (tx, rx) = tokio::sync::mpsc::channel(16);
-        tokio::spawn(run_stream_safety(inbound, tx));
+        let admission = self.admission.clone();
+        let error_tx = tx.clone();
+        tokio::spawn(async move {
+            let result = admission
+                .run_with_lease("stream_safety", lease, async move {
+                    run_stream_safety(inbound, tx).await;
+                    Ok(())
+                })
+                .await;
+            if let Err(status) = result {
+                let _ = error_tx.send(Err(status)).await;
+            }
+        });
         let stream: SafetyStream = Box::pin(ReceiverStream::new(rx));
         Ok(Response::new(stream))
     }
@@ -318,12 +360,9 @@ impl ClassifierService for ClassifierHandler {
 ///
 /// `rules` is read from the first message on the stream and reused for
 /// every message after it, per the proto doc: a caller sends its rule set
-/// once, then streams tokens. Once a rule matches, every subsequent verdict
-/// reports `blocked` again with the same reason and `safe: false`, rather
-/// than silently going back to evaluating only the latest token: the caller
-/// is expected to have stopped forwarding output at the first block, so
-/// this is a safety net for a caller that keeps streaming anyway, not new
-/// information.
+/// once, then streams tokens. Matching retains only the bounded suffix needed
+/// to detect a rule split across two chunks. After a match, `safe` remains
+/// false and `blocked` becomes a one-shot transition signal.
 async fn run_stream_safety<S>(
     mut inbound: S,
     tx: tokio::sync::mpsc::Sender<Result<SafetyVerdict, Status>>,
@@ -331,9 +370,12 @@ async fn run_stream_safety<S>(
     S: Stream<Item = Result<SafetyToken, Status>> + Unpin,
 {
     let mut rules: Vec<String> = Vec::new();
-    let mut accumulated = String::new();
+    let mut tail = String::new();
     let mut already_blocked: Option<String> = None;
     let mut first = true;
+    let mut total_bytes = 0usize;
+    let mut chunks = 0usize;
+    let mut max_rule_bytes = 0usize;
 
     while let Some(next) = inbound.next().await {
         let token = match next {
@@ -343,11 +385,39 @@ async fn run_stream_safety<S>(
                 return;
             }
         };
+        chunks += 1;
+        total_bytes = total_bytes.saturating_add(token.token.len());
+        if chunks > MAX_STREAM_CHUNKS || total_bytes > MAX_STREAM_BYTES {
+            crate::metrics::record_error("grpc", "stream_safety", "resource_limit");
+            let _ = tx
+                .send(Err(Status::resource_exhausted(
+                    "stream_safety cumulative chunk or byte budget exceeded",
+                )))
+                .await;
+            return;
+        }
         if first {
             rules = token.rules;
+            let rule_bytes = rules.iter().map(String::len).sum::<usize>();
+            if rules.len() > MAX_STREAM_RULES || rule_bytes > MAX_STREAM_RULE_BYTES {
+                crate::metrics::record_error("grpc", "stream_safety", "resource_limit");
+                let _ = tx
+                    .send(Err(Status::resource_exhausted(
+                        "stream_safety rule budget exceeded",
+                    )))
+                    .await;
+                return;
+            }
+            max_rule_bytes = rules.iter().map(String::len).max().unwrap_or(0);
             first = false;
+        } else if !token.rules.is_empty() {
+            let _ = tx
+                .send(Err(Status::invalid_argument(
+                    "stream_safety rules are allowed only on the first message",
+                )))
+                .await;
+            return;
         }
-        accumulated.push_str(&token.token);
 
         let verdict = if let Some(reason) = &already_blocked {
             SafetyVerdict {
@@ -356,10 +426,15 @@ async fn run_stream_safety<S>(
                 reason: reason.clone(),
             }
         } else {
-            let (safe, blocked, reason) = heuristic::check_streaming_safety(&accumulated, &rules);
+            let mut window = tail;
+            window.push_str(&token.token);
+            let (safe, blocked, reason) = heuristic::check_streaming_safety(&window, &rules);
             crate::metrics::record_safety_verdict(if safe { "safe" } else { "blocked" });
             if blocked {
                 already_blocked = Some(reason.clone());
+                tail = String::new();
+            } else {
+                tail = bounded_suffix(&window, max_rule_bytes.saturating_sub(1));
             }
             SafetyVerdict {
                 safe,
@@ -375,6 +450,17 @@ async fn run_stream_safety<S>(
     }
 }
 
+fn bounded_suffix(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut start = value.len().saturating_sub(max_bytes);
+    while start < value.len() && !value.is_char_boundary(start) {
+        start += 1;
+    }
+    value[start..].to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +472,8 @@ mod tests {
             default_model: None,
             default_embed_model: None,
             version: "sbproxy-classifier test".to_string(),
+            admission: Admission::new(2, 4, std::time::Duration::from_millis(DEFAULT_DEADLINE_MS))
+                .unwrap(),
         })
     }
 
@@ -437,6 +525,19 @@ mod tests {
             .await
             .expect_err("no embedder configured");
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn embed_rejects_total_request_work_before_model_resolution() {
+        let state = inference_state();
+        let err = state
+            .embed(Request::new(EmbedRequest {
+                model: String::new(),
+                texts: vec!["x".repeat(17 * 1024); 64],
+            }))
+            .await
+            .expect_err("aggregate embed work must be bounded");
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
     }
 
     #[tokio::test]
@@ -531,5 +632,67 @@ mod tests {
         let third = outbound.next().await.unwrap().unwrap();
         assert!(!third.safe);
         assert_eq!(third.reason, second.reason);
+    }
+
+    #[tokio::test]
+    async fn stream_safety_rejects_a_stream_over_the_cumulative_byte_budget() {
+        let (in_tx, in_rx) = tokio::sync::mpsc::channel(2);
+        let inbound = ReceiverStream::new(in_rx);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(2);
+        in_tx
+            .send(Ok(SafetyToken {
+                tenant: String::new(),
+                rules: vec!["forbidden".to_string()],
+                token: "a".repeat(600 * 1024),
+            }))
+            .await
+            .unwrap();
+        in_tx
+            .send(Ok(SafetyToken {
+                tenant: String::new(),
+                rules: Vec::new(),
+                token: "b".repeat(600 * 1024),
+            }))
+            .await
+            .unwrap();
+        drop(in_tx);
+
+        run_stream_safety(inbound, out_tx).await;
+        assert!(out_rx.recv().await.unwrap().is_ok());
+        let error = out_rx
+            .recv()
+            .await
+            .unwrap()
+            .expect_err("the cumulative stream limit must terminate the stream");
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn bounded_stream_window_matches_a_rule_split_across_chunks() {
+        let (in_tx, in_rx) = tokio::sync::mpsc::channel(2);
+        let inbound = ReceiverStream::new(in_rx);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(2);
+        in_tx
+            .send(Ok(SafetyToken {
+                tenant: String::new(),
+                rules: vec!["forbidden".to_string()],
+                token: "safe then for".to_string(),
+            }))
+            .await
+            .unwrap();
+        in_tx
+            .send(Ok(SafetyToken {
+                tenant: String::new(),
+                rules: Vec::new(),
+                token: "bidden".to_string(),
+            }))
+            .await
+            .unwrap();
+        drop(in_tx);
+
+        run_stream_safety(inbound, out_tx).await;
+        assert!(out_rx.recv().await.unwrap().unwrap().safe);
+        let matched = out_rx.recv().await.unwrap().unwrap();
+        assert!(!matched.safe && matched.blocked);
     }
 }

@@ -57,6 +57,10 @@ pub struct Message {
     /// Inline tenant config (only used when cmd = "register").
     #[serde(default)]
     pub config: Option<TenantConfig>,
+    /// Bearer credential for commands sent to the separate admin TCP
+    /// listener. Ignored on the public inference listener.
+    #[serde(default)]
+    pub admin_token: Option<String>,
 
     // --- intent_detect fields ---
     /// Prompt text to classify into a coarse intent bucket

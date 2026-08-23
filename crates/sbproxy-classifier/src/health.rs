@@ -12,6 +12,7 @@
 //! - `GET /tenants` - JSON array of registered tenant ids, for a quick
 //!   operator check without reaching for the TCP `list` command.
 
+use crate::auth::AdminAuth;
 use crate::registry::Registry;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -43,22 +44,23 @@ impl ReadyState {
     }
 }
 
-/// Serve `/healthz`, `/readyz`, `/metrics`, and `/tenants` on `addr` until
+/// Serve `/healthz`, `/readyz`, `/metrics`, and authenticated `/tenants` on a
+/// pre-bound listener until
 /// the process exits or the listener errors.
-pub async fn serve(
-    addr: &str,
+pub async fn serve_on(
+    listener: TcpListener,
     registry: Arc<Registry>,
     ready: ReadyState,
+    auth: Option<Arc<AdminAuth>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let listener = TcpListener::bind(addr).await?;
-
     loop {
         let (stream, _) = listener.accept().await?;
         let registry = Arc::clone(&registry);
         let ready = ready.clone();
+        let auth = auth.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_health(stream, &registry, &ready).await {
+            if let Err(e) = handle_health(stream, &registry, &ready, auth.as_deref()).await {
                 debug!(error = %e, "health connection ended");
             }
         });
@@ -69,6 +71,7 @@ async fn handle_health(
     mut stream: tokio::net::TcpStream,
     registry: &Registry,
     ready: &ReadyState,
+    auth: Option<&AdminAuth>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (reader, mut writer) = stream.split();
     let mut reader = BufReader::new(reader);
@@ -83,11 +86,17 @@ async fn handle_health(
 
     // Drain the rest of the request headers; nothing here reads a body.
     let mut header = String::new();
+    let mut bearer = None;
     loop {
         header.clear();
         reader.read_line(&mut header).await?;
         if header.trim().is_empty() {
             break;
+        }
+        if let Some((name, value)) = header.split_once(':') {
+            if name.eq_ignore_ascii_case("authorization") {
+                bearer = value.trim().strip_prefix("Bearer ").map(str::to_string);
+            }
         }
     }
 
@@ -113,9 +122,21 @@ async fn handle_health(
             }
         }
         "/tenants" => {
-            let tenants: Vec<String> = registry.list().into_iter().map(|t| t.id).collect();
-            let body = serde_json::to_string(&tenants).unwrap_or_else(|_| "[]".to_string());
-            (200, "application/json".to_string(), body)
+            let tenants = registry.list().into_iter().map(|tenant| tenant.id);
+            match auth.and_then(|auth| auth.visible_tenants(bearer.as_deref(), tenants)) {
+                Some(tenants) => {
+                    let body = serde_json::to_string(&tenants).unwrap_or_else(|_| "[]".to_string());
+                    (200, "application/json".to_string(), body)
+                }
+                None => {
+                    crate::metrics::record_error("http", "tenants", "unauthorized");
+                    (
+                        401,
+                        "application/json".to_string(),
+                        r#"{"error":"unauthorized"}"#.to_string(),
+                    )
+                }
+            }
         }
         "/metrics" => {
             use prometheus::Encoder;
@@ -148,6 +169,7 @@ async fn handle_health(
 fn status_reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        401 => "Unauthorized",
         404 => "Not Found",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
@@ -158,6 +180,7 @@ fn status_reason(status: u16) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt as _;
 
     #[test]
     fn ready_state_starts_false_and_flips_once() {
@@ -185,7 +208,7 @@ mod tests {
                 let registry = Arc::clone(&registry_task);
                 let ready = ready_task.clone();
                 tokio::spawn(async move {
-                    let _ = handle_health(stream, &registry, &ready).await;
+                    let _ = handle_health(stream, &registry, &ready, None).await;
                 });
             }
         });
@@ -198,8 +221,53 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 503"));
     }
 
+    #[tokio::test]
+    async fn tenants_requires_a_valid_bearer_token() {
+        let registry = Registry::new_empty();
+        let ready = ReadyState::new();
+        let auth =
+            AdminAuth::from_json(br#"{"tokens":[{"token":"secret","tenants":["tenant-a"]}]}"#)
+                .unwrap();
+
+        let unauthorized = health_round_trip(&registry, &ready, Some(&auth), None).await;
+        assert!(unauthorized.starts_with("HTTP/1.1 401"));
+
+        let authorized = health_round_trip(&registry, &ready, Some(&auth), Some("secret")).await;
+        assert!(authorized.starts_with("HTTP/1.1 200"));
+        assert!(authorized.ends_with("[]"));
+    }
+
+    async fn health_round_trip(
+        registry: &Registry,
+        ready: &ReadyState,
+        auth: Option<&AdminAuth>,
+        token: Option<&str>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let token = token.map(str::to_string);
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            let authorization = token
+                .map(|token| format!("Authorization: Bearer {token}\r\n"))
+                .unwrap_or_default();
+            stream
+                .write_all(
+                    format!("GET /tenants HTTP/1.1\r\nHost: localhost\r\n{authorization}\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            response
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        handle_health(stream, registry, ready, auth).await.unwrap();
+        client.await.unwrap()
+    }
+
     async fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         stream
             .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())

@@ -22,6 +22,7 @@
 //! (see `crate::grpc`), which is where the minimal sidecar already serves
 //! it, so a caller wanting embeddings from either sidecar uses one RPC.
 
+use crate::auth::AdminAuth;
 use crate::heuristic;
 use crate::protocol::{
     AdminResponse, ClassifyResponse, ContentTypeDetectResponse, IntentDetectResponse, Label,
@@ -38,28 +39,130 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
 const TRANSPORT: &str = "tcp";
+const ADMIN_TRANSPORT: &str = "admin_tcp";
+pub const DEFAULT_MAX_CONNECTIONS: usize = 128;
+pub const DEFAULT_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, warn};
 
-/// Bind `addr` and serve the MessagePack protocol until the listener errors.
-pub async fn serve(
-    addr: &str,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransportMode {
+    Public,
+    Admin,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TcpLimits {
+    pub max_connections: usize,
+    pub io_timeout: Duration,
+}
+
+impl Default for TcpLimits {
+    fn default() -> Self {
+        Self {
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            io_timeout: DEFAULT_IO_TIMEOUT,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Command {
+    Classify,
+    QualityScore,
+    Register,
+    Delete,
+    List,
+    Version,
+    IntentDetect,
+    StreamingSafety,
+    ContentTypeDetect,
+    Unknown,
+}
+
+impl Command {
+    fn parse(raw: &str) -> Self {
+        match raw {
+            "" | "classify" => Self::Classify,
+            "quality_score" => Self::QualityScore,
+            "register" => Self::Register,
+            "delete" => Self::Delete,
+            "list" => Self::List,
+            "version" => Self::Version,
+            "intent_detect" => Self::IntentDetect,
+            "streaming_safety" => Self::StreamingSafety,
+            "content_type_detect" => Self::ContentTypeDetect,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Classify => "classify",
+            Self::QualityScore => "quality_score",
+            Self::Register => "register",
+            Self::Delete => "delete",
+            Self::List => "list",
+            Self::Version => "version",
+            Self::IntentDetect => "intent_detect",
+            Self::StreamingSafety => "streaming_safety",
+            Self::ContentTypeDetect => "content_type_detect",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn is_admin(self) -> bool {
+        matches!(self, Self::Register | Self::Delete | Self::List)
+    }
+}
+
+/// Serve a pre-bound MessagePack listener until it errors.
+pub async fn serve_on(
+    listener: TcpListener,
     registry: Arc<Registry>,
+    mode: TransportMode,
+    auth: Option<Arc<AdminAuth>>,
+    limits: TcpLimits,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let listener = TcpListener::bind(addr).await?;
+    if limits.max_connections == 0 || limits.io_timeout.is_zero() {
+        return Err("TCP limits must be greater than zero".into());
+    }
+    if mode == TransportMode::Admin && auth.is_none() {
+        return Err("admin TCP listener requires authentication".into());
+    }
+    let slots = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
 
     loop {
         let (stream, peer) = listener.accept().await?;
+        let permit = match Arc::clone(&slots).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                crate::metrics::record_error(
+                    if mode == TransportMode::Admin {
+                        ADMIN_TRANSPORT
+                    } else {
+                        TRANSPORT
+                    },
+                    "unknown",
+                    "resource_limit",
+                );
+                continue;
+            }
+        };
         stream.set_nodelay(true).ok();
         debug!(peer = %peer, "TCP connection");
 
         let registry = Arc::clone(&registry);
+        let auth = auth.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, &registry).await {
+            let _permit = permit;
+            if let Err(e) =
+                handle_connection(stream, &registry, mode, auth.as_deref(), limits).await
+            {
                 debug!(error = %e, "connection ended");
             }
         });
@@ -69,11 +172,17 @@ pub async fn serve(
 async fn handle_connection(
     mut stream: TcpStream,
     registry: &Registry,
+    mode: TransportMode,
+    auth: Option<&AdminAuth>,
+    limits: TcpLimits,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut len_buf = [0u8; 4];
 
     loop {
-        if let Err(e) = stream.read_exact(&mut len_buf).await {
+        let read_len = tokio::time::timeout(limits.io_timeout, stream.read_exact(&mut len_buf))
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "TCP read timeout"))?;
+        if let Err(e) = read_len {
             if e.kind() == std::io::ErrorKind::UnexpectedEof {
                 return Ok(());
             }
@@ -87,7 +196,9 @@ async fn handle_connection(
         }
 
         let mut payload = vec![0u8; msg_len];
-        stream.read_exact(&mut payload).await?;
+        tokio::time::timeout(limits.io_timeout, stream.read_exact(&mut payload))
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "TCP read timeout"))??;
 
         let msg: Message = match rmp_serde::from_slice(&payload) {
             Ok(m) => m,
@@ -98,35 +209,93 @@ async fn handle_connection(
             }
         };
 
-        let cmd = msg.cmd.clone();
-        let resp_bytes = match cmd.as_str() {
-            "classify" | "" => handle_classify(registry, &msg)?,
-            "quality_score" => handle_quality_score(&msg)?,
-            "register" => handle_register(registry, &msg)?,
-            "delete" => handle_delete(registry, &msg)?,
-            "list" => handle_list(registry)?,
-            "version" => handle_version()?,
-            "intent_detect" => handle_intent_detect(&msg)?,
-            "streaming_safety" => handle_streaming_safety(&msg)?,
-            "content_type_detect" => handle_content_type_detect(&msg)?,
-            other => {
-                warn!(cmd = %other, "unknown command");
-                crate::metrics::record_error(TRANSPORT, other, "unknown_command");
-                rmp_serde::to_vec_named(&AdminResponse {
-                    ok: false,
-                    cmd: other.to_string(),
-                    tenant: None,
-                    error: Some(format!("unknown command: {other}")),
-                    tenants: None,
-                })?
+        let command = Command::parse(&msg.cmd);
+        let transport = if mode == TransportMode::Admin {
+            ADMIN_TRANSPORT
+        } else {
+            TRANSPORT
+        };
+        let resp_bytes = if command.is_admin() && mode == TransportMode::Public {
+            crate::metrics::record_error(transport, command.label(), "unauthorized");
+            admin_error(
+                command,
+                msg.tenant.clone(),
+                "admin command unavailable on public transport",
+            )?
+        } else if mode == TransportMode::Admin && !command.is_admin() {
+            crate::metrics::record_error(transport, command.label(), "forbidden");
+            admin_error(
+                command,
+                msg.tenant.clone(),
+                "inference command unavailable on admin transport",
+            )?
+        } else {
+            match command {
+                Command::Classify => handle_classify(registry, &msg)?,
+                Command::QualityScore => handle_quality_score(&msg)?,
+                Command::Register | Command::Delete | Command::List => {
+                    handle_admin(registry, auth.expect("admin mode validated"), command, &msg)?
+                }
+                Command::Version => handle_version()?,
+                Command::IntentDetect => handle_intent_detect(&msg)?,
+                Command::StreamingSafety => handle_streaming_safety(&msg)?,
+                Command::ContentTypeDetect => handle_content_type_detect(&msg)?,
+                Command::Unknown => {
+                    warn!(cmd_len = msg.cmd.len(), "unknown command");
+                    crate::metrics::record_error(transport, "unknown", "unknown_command");
+                    admin_error(Command::Unknown, None, "unknown command")?
+                }
             }
         };
-        crate::metrics::record_request(TRANSPORT, if cmd.is_empty() { "classify" } else { &cmd });
+        crate::metrics::record_request(transport, command.label());
 
         let resp_len = (resp_bytes.len() as u32).to_be_bytes();
-        stream.write_all(&resp_len).await?;
-        stream.write_all(&resp_bytes).await?;
-        stream.flush().await?;
+        tokio::time::timeout(limits.io_timeout, async {
+            stream.write_all(&resp_len).await?;
+            stream.write_all(&resp_bytes).await?;
+            stream.flush().await
+        })
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "TCP write timeout"))??;
+    }
+}
+
+fn admin_error(
+    command: Command,
+    tenant: Option<String>,
+    error: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(rmp_serde::to_vec_named(&AdminResponse {
+        ok: false,
+        cmd: command.label().to_string(),
+        tenant,
+        error: Some(error.to_string()),
+        tenants: None,
+    })?)
+}
+
+fn handle_admin(
+    registry: &Registry,
+    auth: &AdminAuth,
+    command: Command,
+    msg: &Message,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let token = msg.admin_token.as_deref();
+    if !auth.authenticated(token) {
+        crate::metrics::record_error(ADMIN_TRANSPORT, command.label(), "unauthorized");
+        return admin_error(command, msg.tenant.clone(), "unauthorized");
+    }
+    if matches!(command, Command::Register | Command::Delete)
+        && !auth.authorize(token, msg.tenant.as_deref())
+    {
+        crate::metrics::record_error(ADMIN_TRANSPORT, command.label(), "forbidden");
+        return admin_error(command, msg.tenant.clone(), "tenant scope forbidden");
+    }
+    match command {
+        Command::Register => handle_register(registry, msg),
+        Command::Delete => handle_delete(registry, msg),
+        Command::List => handle_list(registry, auth, token),
+        _ => unreachable!("only admin commands reach handle_admin"),
     }
 }
 
@@ -274,8 +443,19 @@ fn handle_delete(
     })?)
 }
 
-fn handle_list(registry: &Registry) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let tenants = registry.list();
+fn handle_list(
+    registry: &Registry,
+    auth: &AdminAuth,
+    token: Option<&str>,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let visible = auth
+        .visible_tenants(token, registry.list().into_iter().map(|tenant| tenant.id))
+        .unwrap_or_default();
+    let tenants = registry
+        .list()
+        .into_iter()
+        .filter(|tenant| visible.iter().any(|id| id == &tenant.id))
+        .collect();
     Ok(rmp_serde::to_vec_named(&AdminResponse {
         ok: true,
         cmd: "list".to_string(),
@@ -363,11 +543,27 @@ mod tests {
     /// decoded response bytes. Exercises `handle_connection` end to end
     /// rather than calling a handler function directly.
     async fn round_trip(registry: Arc<Registry>, msg: &Message) -> Vec<u8> {
+        round_trip_with(registry, msg, TransportMode::Public, None).await
+    }
+
+    async fn round_trip_with(
+        registry: Arc<Registry>,
+        msg: &Message,
+        mode: TransportMode,
+        auth: Option<Arc<AdminAuth>>,
+    ) -> Vec<u8> {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let _ = handle_connection(stream, &registry).await;
+            let _ = handle_connection(
+                stream,
+                &registry,
+                mode,
+                auth.as_deref(),
+                TcpLimits::default(),
+            )
+            .await;
         });
 
         let mut stream = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(addr))
@@ -398,6 +594,7 @@ mod tests {
             top_k: 3,
             tenant: None,
             config: None,
+            admin_token: None,
             intent_text: None,
             streaming_tokens: None,
             safety_rules: None,
@@ -408,11 +605,24 @@ mod tests {
     #[tokio::test]
     async fn register_then_classify_round_trips_over_the_wire() {
         let registry = Arc::new(Registry::new_empty());
+        let auth = Arc::new(
+            AdminAuth::from_json(
+                br#"{"tokens":[{"token":"secret","tenants":["tenant.example"]}]}"#,
+            )
+            .unwrap(),
+        );
 
         let mut register_msg = msg("register");
         register_msg.tenant = Some("tenant.example".to_string());
         register_msg.config = Some(sample_tenant_config());
-        let resp = round_trip(Arc::clone(&registry), &register_msg).await;
+        register_msg.admin_token = Some("secret".to_string());
+        let resp = round_trip_with(
+            Arc::clone(&registry),
+            &register_msg,
+            TransportMode::Admin,
+            Some(auth),
+        )
+        .await;
         let admin: AdminResponse = rmp_serde::from_slice(&resp).unwrap();
         assert!(admin.ok, "{admin:?}");
 
@@ -452,6 +662,66 @@ mod tests {
         let resp = round_trip(registry, &msg("not-a-real-command")).await;
         let admin: AdminResponse = rmp_serde::from_slice(&resp).unwrap();
         assert!(!admin.ok);
-        assert!(admin.error.unwrap().contains("unknown command"));
+        assert_eq!(admin.cmd, "unknown");
+        assert_eq!(admin.error.as_deref(), Some("unknown command"));
+    }
+
+    #[tokio::test]
+    async fn public_transport_rejects_admin_and_scopes_block_cross_tenant_changes() {
+        let registry = Arc::new(Registry::new_empty());
+        let auth = Arc::new(
+            AdminAuth::from_json(br#"{"tokens":[{"token":"secret-a","tenants":["tenant-a"]}]}"#)
+                .unwrap(),
+        );
+        let mut register = msg("register");
+        register.tenant = Some("tenant-b".to_string());
+        register.config = Some(sample_tenant_config());
+        register.admin_token = Some("secret-a".to_string());
+
+        let public = round_trip(Arc::clone(&registry), &register).await;
+        let public: AdminResponse = rmp_serde::from_slice(&public).unwrap();
+        assert!(!public.ok);
+        assert!(public.error.unwrap().contains("public transport"));
+
+        let admin = round_trip_with(
+            Arc::clone(&registry),
+            &register,
+            TransportMode::Admin,
+            Some(auth),
+        )
+        .await;
+        let admin: AdminResponse = rmp_serde::from_slice(&admin).unwrap();
+        assert!(!admin.ok);
+        assert_eq!(admin.error.as_deref(), Some("tenant scope forbidden"));
+        assert_eq!(registry.tenant_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stalled_tcp_frame_is_closed_by_the_io_deadline() {
+        let registry = Arc::new(Registry::new_empty());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection(
+                stream,
+                &registry,
+                TransportMode::Public,
+                None,
+                TcpLimits {
+                    max_connections: 1,
+                    io_timeout: Duration::from_millis(20),
+                },
+            )
+            .await
+        });
+        let _client = TcpStream::connect(address).await.unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("connection task must not remain stuck")
+            .unwrap();
+        let error = result.expect_err("idle connection must hit its read deadline");
+        assert!(error.to_string().contains("timeout"));
     }
 }

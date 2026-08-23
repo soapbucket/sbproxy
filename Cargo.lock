@@ -7873,6 +7873,7 @@ dependencies = [
  "sbproxy-classifiers",
  "serde",
  "serde_json",
+ "subtle",
  "tempfile",
  "tokio",
  "tokio-stream",
