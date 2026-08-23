@@ -997,7 +997,7 @@ fn fetch_with_gix(request: &FetchRequest<'_>) -> Result<ResolvedRevision, Config
             });
         } else {
             prepare = prepare.with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
-                std::num::NonZeroU32::new(1).expect("depth 1 is non-zero"),
+                std::num::NonZeroU32::MIN,
             ));
         }
 
