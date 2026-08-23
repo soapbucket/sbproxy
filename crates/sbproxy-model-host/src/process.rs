@@ -2246,7 +2246,40 @@ unsafe fn linux_engine_child_after_fork(
         libc::_exit(125);
     }
     libc::execvpe(executable, arguments, environment);
+    // `/bin/sh -c exec` used to print the missing path on this
+    // failure. Keep that diagnostic on the captured stderr pipe so
+    // callers can tell exec failed, then exit 127 like a shell.
+    linux_write_all(libc::STDERR_FILENO, b"exec: ");
+    linux_write_cstr(libc::STDERR_FILENO, executable);
+    linux_write_all(libc::STDERR_FILENO, b": not found\n");
     libc::_exit(127);
+}
+
+/// Async-signal-safe write of a whole buffer. Best-effort: a short
+/// write still lets the child exit.
+#[cfg(target_os = "linux")]
+unsafe fn linux_write_all(fd: libc::c_int, bytes: &[u8]) {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let wrote = libc::write(fd, bytes.as_ptr().add(offset).cast(), bytes.len() - offset);
+        if wrote <= 0 {
+            return;
+        }
+        offset += wrote as usize;
+    }
+}
+
+/// Async-signal-safe write of a NUL-terminated path. `strlen` is not
+/// on the async-signal-safe list, so the length is counted here.
+#[cfg(target_os = "linux")]
+unsafe fn linux_write_cstr(fd: libc::c_int, value: *const libc::c_char) {
+    let mut len = 0;
+    while *value.add(len) != 0 {
+        len += 1;
+    }
+    if len > 0 {
+        let _ = libc::write(fd, value.cast(), len);
+    }
 }
 
 #[cfg(target_os = "macos")]
