@@ -292,6 +292,32 @@ pub fn record_intent_detection_source(source: &str) {
         .inc();
 }
 
+/// Quality-hook routing outcomes from the live AI request path (WOR-2672).
+static AI_QUALITY_ROUTING_DECISIONS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_quality_routing_decisions_total",
+            "Quality-hook routing decisions by selected or fallback outcome"
+        ),
+        &["outcome"]
+    )
+    .expect("sbproxy_ai_quality_routing_decisions_total is a fixed, unique metric family")
+});
+
+/// Record one live quality-hook routing outcome.
+///
+/// The closed label set prevents a hook or provider name from creating an
+/// unbounded metric series.
+pub fn record_quality_routing_decision(outcome: &str) {
+    let outcome = match outcome {
+        "selected" | "hook_unavailable" | "target_ineligible" => outcome,
+        _ => "unknown",
+    };
+    AI_QUALITY_ROUTING_DECISIONS
+        .with_label_values(&[outcome])
+        .inc();
+}
+
 /// AI routing decisions that intentionally use a fallback path.
 ///
 /// `strategy` comes from the closed routing enum. `reason` is normalized by

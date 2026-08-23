@@ -14,14 +14,29 @@ the same trait `JsonlFileSink`, `WebhookSink`, `LangfuseSink`, and
 gateway call's `LlmUsageEvent` reaches it automatically, the same way it
 already reaches whichever other sinks are configured.
 
+Turn it on from config alone, the same way as the other sinks:
+
+```yaml
+usage_sinks:
+  - type: chargeback
+```
+
+This is the right choice when you only need chargeback recording to run;
+it builds a `ChargebackTracker` and registers it, and nothing else holds
+a reference to it. If your embedding needs to read the totals back out
+later (draining `workspace_totals_snapshot()` into your own store, or
+serving them from an admin endpoint), construct one directly instead so
+you keep a typed handle:
+
 ```rust,ignore
 use sbproxy_ai::billing::ChargebackTracker;
 use sbproxy_ai::usage_sink::UsageSink;
 use std::sync::Arc;
 
-let tracker: Arc<dyn UsageSink> = Arc::new(ChargebackTracker::new());
-// Hand `tracker` to wherever your embedding registers usage sinks,
-// alongside any of the built-in ones.
+let tracker = Arc::new(ChargebackTracker::new());
+// Keep `tracker` (the concrete type) for later queries, and hand a
+// clone to wherever your embedding registers usage sinks:
+let sink: Arc<dyn UsageSink> = tracker.clone();
 ```
 
 Workspace attribution keys on the event's `tenant_id` (this crate's

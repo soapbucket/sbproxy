@@ -1332,6 +1332,19 @@ pub enum UsageSinkConfig {
     },
     /// Emit events through the process OTel / OpenInference seam.
     Otel,
+    /// Accumulate in-memory per-workspace/team chargeback totals (WOR-2672).
+    ///
+    /// See [`crate::billing::ChargebackTracker`] and `docs/ai-chargeback.md`.
+    /// In-memory only: the tracker built for this config entry is not
+    /// reachable outside the sink registration path, so an embedder that
+    /// needs to read `workspace_totals_snapshot()` / `entries_snapshot()`
+    /// back out (to drain it into durable storage, or to serve an admin
+    /// endpoint) should construct a `ChargebackTracker` directly and keep
+    /// a typed `Arc` to it instead of using this variant; this variant
+    /// exists for the common case of wanting chargeback recording turned
+    /// on from config alone, matching every other sink in this enum,
+    /// without needing a query path back into it.
+    Chargeback,
     /// Write events as JSON objects to an S3 bucket.
     S3 {
         /// Destination bucket name.
@@ -1402,6 +1415,9 @@ impl UsageSinkConfig {
                 std::sync::Arc::new(sink)
             }
             UsageSinkConfig::Otel => std::sync::Arc::new(OtelSink::new()),
+            UsageSinkConfig::Chargeback => {
+                std::sync::Arc::new(crate::billing::ChargebackTracker::new())
+            }
             UsageSinkConfig::S3 { bucket, prefix } => {
                 let mut sink = ObjectStoreSink::s3(bucket, prefix);
                 if let Some(authorizer) = &egress {
@@ -1881,6 +1897,21 @@ mod tests {
         assert_eq!(sinks[0].name(), "otel");
         assert_eq!(sinks[1].name(), "s3");
         assert_eq!(sinks[2].name(), "gcs");
+    }
+
+    #[test]
+    fn chargeback_config_builds_the_recording_sink() {
+        // Seam: serde-tagged config through `UsageSinkConfig::build`.
+        // Returning an arbitrary local sink from the new match arm would
+        // still compile and accept the YAML, but it would silently drop the
+        // workspace/team aggregation this option promises.
+        let configs: Vec<UsageSinkConfig> =
+            serde_json::from_str(r#"[{"type":"chargeback"}]"#).unwrap();
+        assert_eq!(configs.len(), 1);
+        let sinks = build_sinks(&configs);
+        assert_eq!(sinks.len(), 1);
+        assert_eq!(sinks[0].name(), "chargeback");
+        sinks[0].record(&sample_event());
     }
 
     #[test]

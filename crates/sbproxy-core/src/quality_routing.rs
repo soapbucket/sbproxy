@@ -6,30 +6,40 @@
 //!
 //! Two selection entrypoints are exposed:
 //!
-//! - [`select_by_quality`] is a pure synchronous helper over a slice of
-//!   pre-computed [`QualityScore`] values. It is used by unit tests and
-//!   any caller that already has scores in hand.
-//! - [`select_by_quality_async`] is the entrypoint a provider-selection
-//!   call site plugs in. It accepts an optional
+//! - [`crate::quality_routing::select_by_quality`] is a pure synchronous
+//!   helper over a slice of pre-computed
+//!   [`crate::quality_routing::QualityScore`] values. It is used by unit
+//!   tests and any caller that already has scores in hand.
+//! - [`crate::quality_routing::select_by_quality_async`] is the entrypoint
+//!   a provider-selection call site plugs in. It accepts an optional
 //!   [`crate::hooks::QualityScoringHook`] and, when present, asks it to
 //!   score each candidate provider (typically via a classifier sidecar).
 //!   On any failure it falls back to the first candidate so routing never
 //!   hard-fails.
 //!
-//! # This hook has a slot but no caller yet
+//! # Live call site
 //!
-//! [`crate::hooks::Hooks::quality_scoring`] is a real slot on the
-//! pipeline's hook bundle, but as of this port nothing in
-//! [`crate::server::ai_dispatch`] or elsewhere calls
-//! `QualityScoringHook::score_providers` (confirmed by grepping the
-//! request path: only the trait definition and two `is_none()` tests
-//! reference it). That is unlike [`crate::intent_detection`], whose hook
-//! is dispatched live. This module is therefore shipped as the reusable
-//! routing-decision library the epic asked for; wiring
-//! `select_by_quality_async` into an actual provider-candidate call site
-//! in [`crate::server::ai_dispatch`] is follow-up work, not assumed by
-//! this port. A future caller reaches this exactly the way
-//! [`crate::intent_detection::detect_intent_async`] is reached today.
+//! `crate::server::ai_dispatch::handle_ai_proxy` calls
+//! [`crate::quality_routing::select_by_quality_async`] on the POST request
+//! path, right after the
+//! semantic-route narrowing step and before the failover/prefix-affinity
+//! strategies apply: when [`crate::hooks::Hooks::quality_scoring`] holds a
+//! registered hook and the request carries a non-empty prompt, the current
+//! candidate provider order is handed to the hook, and the winning
+//! provider (if any, and still eligible) is pinned to the front, the same
+//! "collapse to one decided target" shape the pre-existing `cost_quality`
+//! strategy uses. Skipped whenever a cascade, `cost_quality`, or failover
+//! strategy already owns the order, so the two mechanisms never fight over
+//! the same request.
+//!
+//! No extension in this OSS tree registers a `QualityScoringHook` today
+//! (see `crates/sbproxy-core/src/classifier_hooks.rs` for why a
+//! classifier-sidecar-backed one is not shipped for this trait
+//! specifically), so `quality_scoring` is `None` in every default build
+//! and the call site above is a no-op there; an operator's own extension
+//! plugs in by registering one through
+//! [`crate::hooks::PipelineLifecycleHook`], the same seam
+//! [`crate::intent_detection`]'s hook is dispatched through.
 
 use std::sync::Arc;
 
@@ -92,6 +102,26 @@ pub fn top_providers(scores: &[QualityScore], min_threshold: f64, n: usize) -> V
 
 // --- Async hook-driven selection ---
 
+/// Ask a configured hook for one provider selection without inventing a
+/// fallback. The live dispatcher uses this form because it already has a
+/// configured routing strategy to preserve when the hook declines.
+pub(crate) async fn select_from_quality_hook_async(
+    hook: &Arc<dyn QualityScoringHook>,
+    req: &QualityRequest,
+    min_threshold: f64,
+) -> Option<String> {
+    let scores = hook.score_providers(req).await?;
+    scores
+        .into_iter()
+        .filter(|score| score.score >= min_threshold)
+        .max_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|score| score.provider)
+}
+
 /// Request-path entrypoint for quality-based routing.
 ///
 /// When `hook` is `Some`, we ask it to score every provider in
@@ -115,23 +145,9 @@ pub async fn select_by_quality_async(
     // Ask the hook for per-provider scores. `Some(vec)` means success;
     // `None` signals a classifier-side failure and we fall through to
     // the default selection below.
-    if let Some(h) = hook {
-        if let Some(scores) = h.score_providers(&req).await {
-            // Pick the highest score at or above the threshold. Ties are
-            // broken by input order (max_by is stable for equal keys).
-            let picked = scores
-                .into_iter()
-                .filter(|s| s.score >= min_threshold)
-                .max_by(|a, b| {
-                    a.score
-                        .partial_cmp(&b.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-            if let Some(s) = picked {
-                return Some(s.provider);
-            }
-            // Hook succeeded but nothing cleared the threshold: drop
-            // through to the fallback so the request still routes.
+    if let Some(hook) = hook {
+        if let Some(provider) = select_from_quality_hook_async(hook, &req, min_threshold).await {
+            return Some(provider);
         }
     }
 

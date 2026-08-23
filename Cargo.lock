@@ -7782,6 +7782,7 @@ dependencies = [
  "serde_json_canonicalizer",
  "sha2 0.11.0",
  "smallvec",
+ "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "tiktoken-rs",
@@ -7887,6 +7888,7 @@ version = "0.1.0"
 dependencies = [
  "hyper-util",
  "sbproxy-classifier-proto",
+ "sbproxy-classifiers",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -8032,6 +8034,7 @@ dependencies = [
  "sbproxy-ai",
  "sbproxy-billing",
  "sbproxy-cache",
+ "sbproxy-classifier-client",
  "sbproxy-classifiers",
  "sbproxy-config",
  "sbproxy-extension",

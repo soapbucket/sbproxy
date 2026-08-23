@@ -3,18 +3,20 @@
 //! Port of `sbproxy-enterprise-ai::intent_detection` (WOR-2672). The
 //! request path calls out to an external classifier sidecar via
 //! [`crate::hooks::IntentDetectionHook`], dispatched from
-//! [`crate::server::ai_dispatch`]. When no hook is registered (the
+//! `crate::server::ai_dispatch`. When no hook is registered (the
 //! common OSS case) or the hook declines to decide (fail-open path on
 //! RPC error, timeout, or an unreachable sidecar), callers fall back to
 //! the local keyword heuristic in this module so intent detection never
 //! goes silent.
 //!
-//! No sidecar-backed [`crate::hooks::IntentDetectionHook`] implementation
-//! ships in this OSS tree today: wiring one to the classifier sidecar
-//! (WOR-2665's `sbproxy-classifier-client`) is a separate, not yet
-//! scheduled piece of work, tracked by the `classifier` line item in
-//! WOR-2661's sequencing rather than this ticket. See
-//! [`detect_intent_async`] for exactly where a future hook implementation
+//! [`crate::classifier_hooks::ClassifierIntentHook`] is a sidecar-backed
+//! [`crate::hooks::IntentDetectionHook`] implementation built on WOR-2665's
+//! `sbproxy-classifier-client`; nothing in this OSS binary registers it by
+//! default (hook population is an extension's job, via
+//! [`crate::hooks::PipelineLifecycleHook`]), but an embedder that wants
+//! sidecar-backed intent detection constructs one and registers it rather
+//! than writing a hook from scratch. See
+//! [`crate::intent_detection::detect_intent_async`] for exactly where it
 //! plugs in, and `docs/ai-gateway.md`'s intent-detection section for the
 //! operator-facing picture.
 //!
@@ -22,7 +24,8 @@
 //!
 //! This crate's own [`crate::hooks::IntentCategory`] is the wire type the
 //! hook trait uses. This module historically (in the enterprise source)
-//! carried its own [`IntentCategory`] (with a `Display` impl, non-`Copy`).
+//! carried its own [`crate::intent_detection::IntentCategory`] (with a
+//! `Display` impl, non-`Copy`).
 //! Both are retained here, and `From` conversions are provided in both
 //! directions, so callers can pick whichever shape fits best with the
 //! lowest churn.

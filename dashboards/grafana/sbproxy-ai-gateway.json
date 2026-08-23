@@ -2011,6 +2011,62 @@
         }
       ],
       "description": "Which path answered intent detection: a registered classifier-sidecar IntentDetectionHook (`hook`), or the local keyword heuristic (`heuristic`, WOR-2672) used when no hook is registered or the registered one fails open. A deployment with no sidecar hook configured is 100% `heuristic` by design, which is not a problem; a deployment that configured a hook and shows a rising `heuristic` share is one whose sidecar has stopped answering, which is."
+    },
+    {
+      "id": 34,
+      "title": "Quality Hook Routing Outcomes",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 133
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "noValue": "No request has used a quality hook since start"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(sbproxy_ai_quality_routing_decisions_total[5m]))",
+          "legendFormat": "{{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Live provider-selection outcomes for a registered QualityScoringHook. `selected` means the hook pinned an eligible provider. `hook_unavailable` and `target_ineligible` preserve the configured router, so a rising fallback rate is visible without turning a hook outage into a request outage."
     }
   ],
   "templating": {

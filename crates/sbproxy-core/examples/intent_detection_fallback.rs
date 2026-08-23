@@ -38,10 +38,11 @@ const PROMPTS: &[&str] = &[
 ];
 
 /// Stand-in for a sidecar-backed hook: answers `Coding` for anything that
-/// contains "code", declines everything else. A real implementation would
-/// call out to the classifier sidecar via `sbproxy-classifier-client`'s
-/// `FallbackClassifier` (see `docs/classifier-sidecar.md`) rather than
-/// hardcoding a rule.
+/// contains "code", declines everything else. `sbproxy_core::classifier_hooks::ClassifierIntentHook`
+/// is the real implementation, backed by `sbproxy-classifier-client`'s
+/// `FallbackClassifier` (see `docs/classifier-sidecar.md`); this stub
+/// stays deliberately simple so the walkthrough below does not need a
+/// running sidecar.
 struct PartialHook;
 
 #[async_trait]

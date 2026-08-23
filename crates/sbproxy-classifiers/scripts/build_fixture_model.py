@@ -10,7 +10,7 @@ The fixture is deliberately microscopic - the goal is to exercise the
 load + classify paths in the runtime, not to produce useful output.
 
 Run with:
-  uv run --with torch --with onnx --with tokenizers crates/sbproxy-classifiers/scripts/build_fixture_model.py
+  uv run --with torch --with onnx --with onnxscript --with tokenizers crates/sbproxy-classifiers/scripts/build_fixture_model.py
 
 Outputs go under tests/fixtures/ relative to this script.
 """
@@ -47,6 +47,8 @@ class TinyClassifier(nn.Module):
 
 
 def build_model() -> Path:
+    # Keep the committed fixture byte-stable across regenerations.
+    torch.manual_seed(0)
     model = TinyClassifier()
     model.eval()
     dummy_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
@@ -63,7 +65,7 @@ def build_model() -> Path:
             "attention_mask": {0: "batch", 1: "seq"},
             "logits": {0: "batch"},
         },
-        opset_version=14,
+        opset_version=18,
     )
     return out_path
 

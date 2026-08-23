@@ -24,8 +24,19 @@ pub fn generate_agent_token(agent_id: &str, secret: &str) -> String {
 }
 
 /// Return `true` if `token` is the correct token for `agent_id` and `secret`.
+///
+/// Compares in constant time: `generate_agent_token`'s output is a
+/// long-lived bearer credential (unsalted, non-expiring), so a
+/// length-and-short-circuit `==` here would let a network attacker who
+/// can measure response timing recover it byte by byte. Branches on
+/// length only, which leaks nothing beyond what the fixed 64-hex-char
+/// digest length already reveals.
 pub fn verify_agent_token(agent_id: &str, token: &str, secret: &str) -> bool {
-    generate_agent_token(agent_id, secret) == token
+    use subtle::ConstantTimeEq as _;
+    let expected = generate_agent_token(agent_id, secret);
+    let expected = expected.as_bytes();
+    let actual = token.as_bytes();
+    expected.len() == actual.len() && bool::from(expected.ct_eq(actual))
 }
 
 #[cfg(test)]
@@ -41,6 +52,20 @@ mod tests {
     #[test]
     fn wrong_token_fails_verification() {
         assert!(!verify_agent_token("agent-1", "wrong_token", "my_secret"));
+    }
+
+    #[test]
+    fn same_length_wrong_token_fails_verification() {
+        // Same length as a real digest (64 hex chars) but wrong content,
+        // so this exercises the `ct_eq` byte comparison rather than the
+        // length short-circuit `wrong_token_fails_verification` above
+        // exercises.
+        let real = generate_agent_token("agent-1", "my_secret");
+        let mut tampered: Vec<u8> = real.into_bytes();
+        let last = tampered.len() - 1;
+        tampered[last] = if tampered[last] == b'0' { b'1' } else { b'0' };
+        let tampered = String::from_utf8(tampered).expect("hex digest is valid UTF-8");
+        assert!(!verify_agent_token("agent-1", &tampered, "my_secret"));
     }
 
     #[test]

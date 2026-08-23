@@ -183,6 +183,13 @@ sbproxy-agent-detect.workspace = true
 # request context references `sbproxy_classifiers::AgentId` etc., and
 # the scripting bridges read those types to expose `request.agent_id`.
 sbproxy-classifiers = { workspace = true, optional = true }
+# WOR-2672 follow-up: `classifier_hooks` builds an `IntentDetectionHook`
+# on `FallbackClassifier` (WOR-2665's optional-degrade sidecar client).
+# Acyclic: `sbproxy-classifier-client` depends only on
+# `sbproxy-classifier-proto`, not on this crate or `sbproxy-ai`, and
+# `sbproxy-ai` already pulls it in unconditionally, so this is not a new
+# edge in the build graph, only a direct one.
+sbproxy-classifier-client.workspace = true
 
 # Pingora
 pingora-core.workspace = true

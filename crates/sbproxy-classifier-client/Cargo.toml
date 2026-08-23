@@ -25,6 +25,7 @@ tower = "0.5"
 hyper-util = { version = "0.1", features = ["tokio"] }
 
 [dev-dependencies]
+sbproxy-classifiers = { path = "../sbproxy-classifiers" }
 tokio = { workspace = true, features = ["full", "macros"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 # UDS test: bind in a tempdir so parallel test runs do not collide.

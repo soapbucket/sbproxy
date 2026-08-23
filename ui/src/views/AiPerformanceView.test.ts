@@ -17,6 +17,24 @@ describe("AI performance gateway rejection visibility", () => {
   });
 });
 
+describe("AI classifier and quality-routing visibility (WOR-2672)", () => {
+  it("shows intent fallback and quality-hook outcomes from live counters", () => {
+    expect(aiPerformanceView).toContain(
+      "sbproxy_ai_intent_detection_source_total",
+    );
+    expect(aiPerformanceView).toContain(
+      "sbproxy_ai_quality_routing_decisions_total",
+    );
+    expect(aiPerformanceView).toContain("Intent detection source");
+    expect(aiPerformanceView).toContain("Quality-hook routing outcomes");
+  });
+
+  it("explains that hook fallback preserves configured routing", () => {
+    expect(aiPerformanceView).toContain("hook_unavailable");
+    expect(aiPerformanceView).toContain("preserves the configured router");
+  });
+});
+
 describe("AI performance pre-provider admission refusals (WOR-2595)", () => {
   it("names the admission counter through the shared module", () => {
     // The console curates families by name, so the name has to be

@@ -973,6 +973,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_ai_quality_routing_decisions_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_quality_routing_decision"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["outcome"],
+        description: "Quality-hook routing decisions by selected or fallback outcome.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_ai_key_fallbacks_total",
         kind: MetricKind::Counter,
         writer: Writer::Recorder("record_key_fallback"),

@@ -20,7 +20,7 @@
 //!
 //! The capability gap this module fills that `crate::prompts` does not:
 //! `crate::prompts`'s pin is deterministic (one version is live at a
-//! time); this module's [`WeightedPromptStore::select_by_weight`] instead
+//! time); this module's [`crate::prompt_versioning::WeightedPromptStore::select_by_weight`] instead
 //! answers "which version should THIS caller get" from a weighted random
 //! draw, which is what a gradual percentage rollout needs. It is shipped
 //! today as a standalone toolkit; integrating its weights as a

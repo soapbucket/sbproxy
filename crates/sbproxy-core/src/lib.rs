@@ -80,6 +80,11 @@ pub mod billing_runtime;
 pub mod builtin_enforcers;
 /// P0 edge capture wired into the request pipeline.
 pub mod capture_envelope;
+/// WOR-2672 follow-up: a real [`hooks::IntentDetectionHook`] implementation
+/// backed by [`sbproxy_classifier_client::FallbackClassifier`] (WOR-2665),
+/// degrading to [`intent_detection::detect_intent_heuristic`] when no
+/// sidecar is configured or the configured one is unreachable.
+pub mod classifier_hooks;
 /// Process owner for the shared local or distributed cluster handle.
 pub mod cluster;
 /// WOR-1721: fleet-wide metric aggregation over the mesh.
@@ -140,7 +145,7 @@ pub mod identity;
 pub mod inbound_key;
 /// WOR-2672: port of `sbproxy-enterprise-ai::intent_detection`. Coarse
 /// keyword-heuristic prompt classification, dispatched from
-/// [`server::ai_dispatch`] as the fallback when no
+/// `server::ai_dispatch` as the fallback when no
 /// [`hooks::IntentDetectionHook`] is registered or the registered one
 /// declines to decide.
 pub mod intent_detection;
@@ -216,9 +221,8 @@ mod proxy_wasm_http;
 /// WOR-2672: port of `sbproxy-enterprise-ai::quality_routing`. Provider
 /// selection by quality score via an optional
 /// [`hooks::QualityScoringHook`], falling back to the first candidate on
-/// any failure. No call site in [`server::ai_dispatch`] invokes this yet
-/// (see the module docs); it is shipped as the reusable routing-decision
-/// library the port asks for.
+/// any failure. Dispatched live from `server::ai_dispatch` (see the
+/// module docs for exactly where).
 pub mod quality_routing;
 pub(crate) mod request_body_plan;
 /// WOR-1130: module-owned workspace rate-limit budget state machine.

@@ -12,7 +12,7 @@
 //! `sbproxy_ai::judge` is the live policy-authoring host function
 //! (`judge::semantic`, cached, budget-capped) an operator's CEL or Lua
 //! policy calls mid-request to get an LLM's opinion on a decision, per
-//! `docs/adr-judge-trait.md`. [`judge`] here is a different, offline
+//! `docs/adr-judge-trait.md`. [`crate::evaluation::judge`] here is a different, offline
 //! concern: building a structured judge PROMPT and parsing a judge
 //! model's scored JSON response for an evaluation run, with no cache, no
 //! budget, and no policy integration. Neither depends on the other; both
@@ -20,11 +20,14 @@
 //!
 //! ## Modules
 //!
-//! - [`judge`] - LLM-as-Judge prompt building and response parsing.
-//! - [`experiments`] - Experiment tracking across model and prompt variants.
-//! - [`datasets`] - Versioned evaluation dataset management.
-//! - [`prompt_scoring`] - Per-prompt quality score aggregation and ranking.
-//! - [`custom_metrics`] - Composable pass/fail metrics (regex, JSON, length, keywords).
+//! - [`crate::evaluation::judge`] - LLM-as-Judge prompt building and response parsing.
+//! - [`crate::evaluation::experiments`] - Experiment tracking across model and prompt
+//!   variants.
+//! - [`crate::evaluation::datasets`] - Versioned evaluation dataset management.
+//! - [`crate::evaluation::prompt_scoring`] - Per-prompt quality score aggregation and
+//!   ranking.
+//! - [`crate::evaluation::custom_metrics`] - Composable pass/fail metrics (regex, JSON,
+//!   length, keywords).
 //!
 //! Self-contained: entirely in-memory, no dependency on the classifier
 //! sidecar or any other WOR-2661 port. See `docs/ai-evaluation-harness.md`

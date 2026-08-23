@@ -10772,6 +10772,91 @@ pub(super) async fn handle_ai_proxy(
         )
         .record();
     }
+    // WOR-2672: quality-based provider routing
+    // (`sbproxy_core::quality_routing`). Optional and hook-driven, unlike
+    // the config-driven strategies above: no extension in this OSS tree
+    // registers a `QualityScoringHook` today (see that module's doc
+    // comment), so `pipeline.hooks.quality_scoring` is `None` in every
+    // existing build and test, and this block is a no-op there. When a
+    // hook IS registered, ask `select_by_quality_async` to rank the
+    // providers `provider_order` is about to try and pin the winner to
+    // the front, the same "collapse to the one decided target" shape
+    // `cost_quality` uses above; a target that fell out of the eligible
+    // set logs and leaves `provider_order` untouched rather than routing
+    // to a provider resilience or policy already excluded. Skipped
+    // whenever a config-driven strategy already owns the order, so an
+    // operator who runs both a hook and one of cascade/cost_quality/
+    // failover never gets a silent tug-of-war between the two.
+    if !is_failover
+        && routing_policy_cascade.is_none()
+        && router.cascade_config().is_none()
+        && router.cost_quality_config().is_none()
+    {
+        if let Some(hook) = pipeline.hooks.quality_scoring.clone() {
+            if !extracted_prompt.is_empty() && !provider_order.is_empty() {
+                let candidate_providers: Vec<String> = provider_order
+                    .iter()
+                    .map(|&i| config.providers[i].name.to_string())
+                    .collect();
+                let quality_req = crate::hooks::QualityRequest {
+                    origin: hostname.to_string(),
+                    model_id: (!model.is_empty()).then(|| model.clone()),
+                    prompt: extracted_prompt.clone(),
+                    candidate_providers,
+                };
+                match crate::quality_routing::select_from_quality_hook_async(
+                    &hook,
+                    &quality_req,
+                    0.0,
+                )
+                .await
+                {
+                    Some(picked) => match provider_order
+                        .iter()
+                        .copied()
+                        .find(|&i| config.providers[i].name == picked)
+                    {
+                        Some(idx) => {
+                            sbproxy_ai::ai_metrics::record_quality_routing_decision("selected");
+                            tracing::info!(
+                                event = "ai.quality_routing.route",
+                                provider = %picked,
+                                "quality-based routing selected provider"
+                            );
+                            append_ai_route_reason(ctx, format!("quality_hook: selected {picked}"));
+                            provider_order = vec![idx];
+                        }
+                        None => {
+                            sbproxy_ai::ai_metrics::record_quality_routing_decision(
+                                "target_ineligible",
+                            );
+                            tracing::warn!(
+                                event = "ai.quality_routing.route_miss",
+                                provider = %picked,
+                                "quality routing target provider not eligible; using default order"
+                            );
+                            append_ai_route_reason(
+                                ctx,
+                                "quality_hook: target ineligible, preserved configured routing"
+                                    .to_owned(),
+                            );
+                        }
+                    },
+                    None => {
+                        sbproxy_ai::ai_metrics::record_quality_routing_decision("hook_unavailable");
+                        tracing::warn!(
+                            event = "ai.quality_routing.hook_unavailable",
+                            "quality routing hook returned no eligible score; using configured routing"
+                        );
+                        append_ai_route_reason(
+                            ctx,
+                            "quality_hook: unavailable, preserved configured routing".to_owned(),
+                        );
+                    }
+                }
+            }
+        }
+    }
     if is_failover {
         provider_order.sort_by_key(|&i| config.providers[i].priority.unwrap_or(u32::MAX));
     }
@@ -18835,6 +18920,201 @@ mod external_guardrail_context_tests {
                 .expect("write upstream response body");
         });
         (format!("http://{address}/v1"), hits)
+    }
+
+    struct QualityVerdictHook {
+        scores: Option<Vec<crate::hooks::QualityScore>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::hooks::QualityScoringHook for QualityVerdictHook {
+        async fn score_providers(
+            &self,
+            _req: &crate::hooks::QualityRequest,
+        ) -> Option<Vec<crate::hooks::QualityScore>> {
+            self.scores.clone()
+        }
+    }
+
+    fn quality_hook_pipeline(
+        scores: Option<Vec<crate::hooks::QualityScore>>,
+    ) -> crate::pipeline::CompiledPipeline {
+        let mut pipeline = crate::pipeline::CompiledPipeline::default();
+        pipeline.hooks.quality_scoring = Some(Arc::new(QualityVerdictHook { scores }));
+        pipeline
+    }
+
+    fn two_provider_quality_config(
+        first_url: &str,
+        second_url: &str,
+    ) -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [
+                {
+                    "name": "first",
+                    "provider_type": "openai",
+                    "base_url": first_url,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key"
+                },
+                {
+                    "name": "second",
+                    "provider_type": "openai",
+                    "base_url": second_url,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key"
+                }
+            ],
+            "routing": {"strategy": "round_robin"}
+        }))
+        .expect("quality-routing fixture config")
+    }
+
+    fn quality_routing_decisions_count(outcome: &str) -> f64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "sbproxy_ai_quality_routing_decisions_total")
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        metric
+                            .get_label()
+                            .iter()
+                            .any(|label| label.name() == "outcome" && label.value() == outcome)
+                    })
+                    .map(|metric| metric.get_counter().value())
+                    .sum()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Seam: the registered `QualityScoringHook` inside the live POST
+    /// dispatcher. A unit test of `select_by_quality_async` cannot prove the
+    /// selected provider reaches the network.
+    #[tokio::test]
+    async fn quality_hook_selection_reaches_the_selected_post_upstream() {
+        let (first_url, first_hits) =
+            upstream_fixture(r#"{"choices":[{"message":{"content":"first"}}]}"#).await;
+        let (second_url, second_hits) =
+            upstream_fixture(r#"{"choices":[{"message":{"content":"second"}}]}"#).await;
+        let config = two_provider_quality_config(&first_url, &second_url);
+        let pipeline = quality_hook_pipeline(Some(vec![
+            crate::hooks::QualityScore {
+                provider: "first".into(),
+                score: 0.1,
+            },
+            crate::hooks::QualityScore {
+                provider: "second".into(),
+                score: 0.9,
+            },
+        ]));
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        let selected_before = quality_routing_decisions_count("selected");
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("quality-selected request is dispatched");
+        drop(session);
+        let response = live_downstream_body(client).await;
+
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        assert_eq!(first_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(second_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            context.admin_load_balancer_target.as_deref(),
+            Some("second")
+        );
+        assert_eq!(
+            context.ai_route_reason.as_deref(),
+            Some("quality_hook: selected second")
+        );
+        assert!(
+            quality_routing_decisions_count("selected") > selected_before,
+            "a live hook choice must be visible to operators"
+        );
+    }
+
+    /// Seam: a registered quality hook that declines to score. The request
+    /// must retain the configured router's decision rather than collapsing
+    /// the eligible order to its first entry.
+    #[tokio::test]
+    async fn unavailable_quality_hook_preserves_round_robin_selection() {
+        let (first_url, first_hits) =
+            upstream_fixture(r#"{"choices":[{"message":{"content":"first"}}]}"#).await;
+        let (second_url, second_hits) =
+            upstream_fixture(r#"{"choices":[{"message":{"content":"second"}}]}"#).await;
+        let config = two_provider_quality_config(&first_url, &second_url);
+        let request = || {
+            serde_json::json!({
+                "model": "requested-model",
+                "messages": [{"role": "user", "content": "fixture prompt"}]
+            })
+        };
+
+        // Advance the shared round-robin cursor once without a hook. The
+        // second request should therefore select the second provider.
+        let (mut baseline_session, baseline_client) = downstream_session(request()).await;
+        let mut baseline_context = crate::context::RequestContext::new();
+        super::handle_ai_proxy(
+            &mut baseline_session,
+            &config,
+            &crate::pipeline::CompiledPipeline::default(),
+            "ai.test",
+            &mut baseline_context,
+            None,
+        )
+        .await
+        .expect("baseline request is dispatched");
+        drop(baseline_session);
+        let baseline_response = live_downstream_body(baseline_client).await;
+        assert!(baseline_response.starts_with(b"HTTP/1.1 200"));
+
+        let pipeline = quality_hook_pipeline(None);
+        let (mut session, client) = downstream_session(request()).await;
+        let mut context = crate::context::RequestContext::new();
+        let fallback_before = quality_routing_decisions_count("hook_unavailable");
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("hook failure preserves the configured routing decision");
+        drop(session);
+        let response = live_downstream_body(client).await;
+
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        assert_eq!(first_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(second_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            context.admin_load_balancer_target.as_deref(),
+            Some("second")
+        );
+        assert_eq!(
+            context.ai_route_reason.as_deref(),
+            Some("quality_hook: unavailable, preserved configured routing")
+        );
+        assert!(
+            quality_routing_decisions_count("hook_unavailable") > fallback_before,
+            "a configured hook outage must be visible to operators"
+        );
     }
 
     /// An upstream that answers one request and hands the caller the exact

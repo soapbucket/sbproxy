@@ -85,6 +85,11 @@ tracing.workspace = true
 chrono.workspace = true
 sha2.workspace = true
 hex.workspace = true
+# Constant-time comparison for the A2A bearer token in
+# `agent_orchestration::auth`, the same crate `sbproxy-config`,
+# `sbproxy-middleware`, and `sbproxy-modules` already use for
+# secret-equivalent comparisons.
+subtle.workspace = true
 # WOR-1540: Ed25519-signed entries for the verifiable usage ledger. The
 # signing itself moved to sbproxy-meter in WOR-2125; what is left here is the
 # key type in the `ledger verify` surface. Same major as the RFC 9421 verifier

@@ -1,8 +1,9 @@
 //! In-process multi-agent workflow orchestration (WOR-2672 port of
 //! `sbproxy-enterprise-ai::a2a`).
 //!
-//! Capability discovery ([`discovery`]), an FSM-based workflow orchestrator
-//! ([`fsm`]), and a shared-secret agent authentication scheme ([`auth`]) for
+//! Capability discovery ([`crate::agent_orchestration::discovery`]), an FSM-based workflow
+//! orchestrator ([`crate::agent_orchestration::fsm`]), and a shared-secret agent authentication
+//! scheme ([`crate::agent_orchestration::auth`]) for
 //! an embedder building a multi-agent pipeline on top of the AI gateway: a
 //! router that calls agent A, feeds its output to agent B, and branches on
 //! the result, with each hop authenticated and each capability discoverable

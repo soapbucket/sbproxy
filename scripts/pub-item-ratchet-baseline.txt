@@ -612,3 +612,49 @@ block (`AgentRegistry::list_agents`, `ChargebackTracker::entries_count`,
 `IntentSource`, `select_by_quality`, `top_providers`, and
 `select_by_quality_async` all needed an explicit example call site
 before this dropped). Lower this baseline too.
+
+2026-08-22 (WOR-2672 review follow-up): 293 -> 320 (tests-only),
+1418 -> 1445 (unreferenced), and both moves are corrections, not new
+debt. `scripts/scan-pub-item-usage.py`'s `is_test_path` treated
+`crates/<name>/examples/*.rs` as ordinary production source, so the
+2026-08-22 entry two paragraphs up was wrong about what it measured: a
+`cargo run --example` demo compiles as its own binary and links against
+the crate's public API exactly like an integration test under `tests/`
+does, and it is exercised the same way (a human runs it; nothing in CI
+does), but the scanner counted a name appearing in one as a real
+production caller. That is the exact "guard narrower than its claim"
+failure this ratchet exists to catch, and it is now closed:
+`is_test_path` treats `examples/` the same as `tests/` and `benches/`.
+
+Recomputing against the corrected scanner puts 24 of the moved items
+back where they belong: `AgentRegistry::{find_by_capability,
+list_agents}`, `AgentState::{current_state, is_completed}`,
+`ChargebackTracker::{total_by_team, entries_count}`,
+`Dataset::with_expected`, `ExperimentStore::{list_by_name, list_all,
+get_by_id}`, `JudgeResult::compute_composite`,
+`PromptScorer::{average_score, rank_prompts, observation_count}`,
+`WeightedPromptVersion`, `WeightedPromptStore`, `WeightedPromptStore::{
+add_version, get_latest, select_by_weight, list_versions, list_names}`,
+`IntentSource`, `select_by_quality`, and `top_providers`. Every one of
+those is still named only by its module's example, not by any
+production call site; nothing about the underlying code changed, only
+whether the scanner tells the truth about it.
+
+The other +3 / +27 respectively (296 vs the prior 293 "everything
+else" baseline; the wider delta on the unreferenced side) are
+pre-existing instances of the same pattern elsewhere in the tree that
+this correction also now catches for the first time, not anything this
+branch introduced; they are exactly the kind of finding the corrected
+detector is supposed to surface, and are left for a separate cleanup
+pass rather than triaged here.
+
+Two items partly offset the rise: this same follow-up gave
+`select_by_quality_async` (`crates/sbproxy-core/src/quality_routing.rs`)
+a real caller in `crates/sbproxy-core/src/server/ai_dispatch.rs`
+(quality-based provider routing is now dispatched from the POST
+request path, guarded on a registered `QualityScoringHook`), and gave
+`sbproxy-classifier-client`'s `FallbackClassifier` a real caller via
+the new `crate::classifier_hooks::ClassifierIntentHook`, an
+`IntentDetectionHook` implementation. Both are referenced from outside
+their own files by genuine library/call-site code, not by an example,
+so neither recurs in the corrected count.

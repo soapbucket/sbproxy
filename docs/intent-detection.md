@@ -2,9 +2,8 @@
 *Last modified: 2026-08-22*
 
 Two optional AI gateway hooks, ported from the enterprise value-feature
-survey (WOR-2672): coarse intent detection, which is live on the request
-path, and quality-based provider selection, which ships as a
-reusable routing-decision library. Both follow the same shape: an
+survey (WOR-2672): coarse intent detection and quality-based provider
+selection, both live on the request path. Both follow the same shape: an
 optional hook an extension can register, a closed-vocabulary answer, and
 a fallback that never blocks a request.
 
@@ -36,14 +35,12 @@ flowchart TD
     F --> G
 ```
 
-No sidecar-backed `IntentDetectionHook` implementation ships in this OSS
-tree today: wiring one to the classifier sidecar
-([classifier-sidecar.md](classifier-sidecar.md), WOR-2665) through
-`sbproxy-classifier-client`'s `FallbackClassifier` is a distinct,
-not-yet-scheduled piece of work. Until it lands, every OSS deployment runs
-the keyword heuristic on 100% of requests, which is the intended default
-behavior, not a degraded state: `source="heuristic"` at 100% on a
-deployment that never configured a hook is normal.
+`ClassifierIntentHook` is the shipped sidecar-backed implementation. It
+uses `sbproxy-classifier-client`'s `FallbackClassifier`, so a missing,
+unreachable, or failing sidecar degrades to the keyword heuristic for that
+request. Nothing registers the hook by default. An extension or embedder
+opts in through the pipeline lifecycle hook, while an ordinary OSS
+deployment remains 100% heuristic by design.
 
 ### What changed in this port
 
@@ -87,8 +84,8 @@ assert_eq!(source, IntentSource::Heuristic); // when no hook is registered
 
 `sbproxy_core::quality_routing` selects the AI provider with the highest
 quality score above a configurable minimum threshold, via an optional
-`QualityScoringHook`. On any failure, it falls back to the first
-candidate provider, so quality-based routing never hard-fails a request:
+`QualityScoringHook`. The reusable helper below falls back to the first
+candidate provider on failure:
 
 ```rust,ignore
 use sbproxy_core::quality_routing::select_by_quality_async;
@@ -106,16 +103,21 @@ let picked = select_by_quality_async(hook.as_ref(), req, 0.75).await;
 // 0.75, or the hook itself declined.
 ```
 
-**This is a library, not (yet) a live routing strategy.** Unlike intent
-detection, nothing in the request path calls `score_providers` on the
-`quality_scoring` hook slot today; the slot exists on
-`CompiledPipeline`'s `Hooks` bundle (confirmed empty by
-`hooks.quality_scoring.is_none()` in `sbproxy-core`'s own test suite) and
-is ready for a routing-strategy call site, but wiring one in is a
-separate, unscheduled follow-up. `select_by_quality_async` is shipped
-today as the reusable decision function that call site will use, mirroring
-exactly how `detect_intent_with_source` is reached from
-[`ai_dispatch`](../crates/sbproxy-core/src/server/ai_dispatch.rs) above.
+The live POST dispatcher invokes the same hook after eligibility filters
+and semantic routing, but before the configured load-balancer strategy.
+It stands down when fallback, cascade, or cost-quality routing already
+owns the order. A valid hook result pins the selected eligible provider.
+A declining hook, a below-threshold result, or an ineligible provider
+preserves the configured router's order instead of replacing it with a
+guess.
+
+Live outcomes are visible in three places:
+
+- `sbproxy_ai_quality_routing_decisions_total{outcome="selected"|"hook_unavailable"|"target_ineligible"}`.
+- The "Quality Hook Routing Outcomes" Grafana panel and the AI performance
+  admin view.
+- Structured `ai.quality_routing.*` log events and the routing decision's
+  `quality_hook:` reason in the admin routing row.
 
 ## Runnable example
 
@@ -130,9 +132,8 @@ cargo run -p sbproxy-core --example intent_detection_fallback
 
 ## See also
 
-- [classifier-sidecar.md](classifier-sidecar.md) - the sidecar a future
-  `IntentDetectionHook` / `QualityScoringHook` implementation would call,
-  and the `FallbackClassifier` optional-degrade wrapper such an
-  implementation should be built on rather than a raw client call.
+- [classifier-sidecar.md](classifier-sidecar.md) - the sidecar used by
+  `ClassifierIntentHook` and the `FallbackClassifier` optional-degrade
+  wrapper it is built on.
 - [ai-gateway.md](ai-gateway.md) - routing strategies these hooks feed
   into.
