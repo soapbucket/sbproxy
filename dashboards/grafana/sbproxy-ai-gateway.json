@@ -2067,6 +2067,118 @@
         }
       ],
       "description": "Live provider-selection outcomes for a registered QualityScoringHook. `selected` means the hook pinned an eligible provider. `hook_unavailable` and `target_ineligible` preserve the configured router, so a rising fallback rate is visible without turning a hook outage into a request outage."
+    },
+    {
+      "id": 35,
+      "title": "Chargeback Entry Evictions",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 141
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "noValue": "No retained chargeback entry has been evicted"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(sbproxy_ai_chargeback_entries_evicted_total[5m]))",
+          "legendFormat": "evicted entries",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Rate at which bounded chargeback trackers discard the oldest raw event after reaching max_entries. Rollups remain all-time and bounded separately. Absent until a configured tracker first reaches its retention limit."
+    },
+    {
+      "id": 36,
+      "title": "Chargeback Rollup Collapses",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 141
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "noValue": "No chargeback dimension has exceeded its rollup limit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (dimension) (rate(sbproxy_ai_chargeback_rollups_collapsed_total[5m]))",
+          "legendFormat": "{{dimension}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Events folded into the bounded __other__ rollup after workspace or team cardinality reaches its configured limit. A sustained rate signals attribution cardinality pressure without losing tokens, request counts, or cost."
     }
   ],
   "templating": {
