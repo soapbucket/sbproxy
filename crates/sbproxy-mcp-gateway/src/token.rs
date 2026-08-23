@@ -648,6 +648,14 @@ pub fn inject_cnf_jkt(
     proof: &DpopProof,
     broker_signing_key: Option<&crate::config::JwkKey>,
 ) -> Result<bytes::Bytes, DpopError> {
+    if std::str::from_utf8(body)
+        .ok()
+        .is_some_and(sbproxy_vault::looks_like_secret_reference_uri)
+    {
+        return Err(DpopError::PayloadInvalid(
+            "upstream token response is a secret reference".to_string(),
+        ));
+    }
     let mut value: serde_json::Value = serde_json::from_slice(body)
         .map_err(|e| DpopError::PayloadInvalid(format!("upstream body: {e}")))?;
     let obj = match value.as_object_mut() {

@@ -8719,6 +8719,7 @@ dependencies = [
  "sbproxy-httpkit",
  "sbproxy-security",
  "sbproxy-storage",
+ "sbproxy-vault",
  "serde",
  "serde_json",
  "serde_urlencoded",

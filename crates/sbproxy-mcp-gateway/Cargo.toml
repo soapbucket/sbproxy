@@ -52,6 +52,9 @@ sbproxy-httpkit = { workspace = true }
 # DSN-shaped credential or a CIMD bearer token in a query string cannot
 # reach a log line verbatim.
 sbproxy-security = { workspace = true }
+# Reject accidental vault-style secret references before token-response
+# passthrough paths can treat them as literal response material.
+sbproxy-vault = { workspace = true }
 
 # Per-crate axum pin: axum is not a workspace dependency because this
 # is the only OSS crate that mounts an axum router directly (the rest
