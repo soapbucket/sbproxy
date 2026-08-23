@@ -11,8 +11,9 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::{bail, Context as _};
+use anyhow::{anyhow, bail, Context as _};
 use sbproxy_classifiers::{
     default_model_cache_dir, lookup_known_model, parse_ed25519_pubkey, LoadOptions,
     LocalArtifactVerification, OnnxClassifier,
@@ -29,6 +30,9 @@ const DEFAULT_THRESHOLD: f64 = 0.5;
 const DEFAULT_MODEL_NAME: &str = "prompt-injection-v2";
 const DEFAULT_MODEL_FILENAME: &str = "model.onnx";
 const DEFAULT_TOKENIZER_FILENAME: &str = "tokenizer.json";
+const DEFAULT_MAX_CONCURRENT: usize = 2;
+const DEFAULT_MAX_QUEUED: usize = 16;
+const DEFAULT_INFERENCE_TIMEOUT_MS: u64 = 500;
 
 /// Map a `[0,1]` injection score onto the v2 label vocabulary. Same
 /// cutoffs as the sidecar detector so the two report identically.
@@ -90,6 +94,16 @@ struct InprocessDetectorConfig {
     /// default.
     #[serde(default)]
     max_tokenizer_bytes: Option<u64>,
+    /// Maximum number of ONNX evaluations running for this detector.
+    #[serde(default = "default_max_concurrent")]
+    max_concurrent: usize,
+    /// Maximum number of evaluations waiting for a running slot. Zero
+    /// refuses immediately when every running slot is occupied.
+    #[serde(default = "default_max_queued")]
+    max_queued: usize,
+    /// End-to-end admission and evaluation deadline.
+    #[serde(default = "default_inference_timeout_ms")]
+    inference_timeout_ms: u64,
 }
 
 fn default_model_name() -> String {
@@ -101,10 +115,73 @@ fn default_injection_label() -> String {
 fn default_threshold() -> f64 {
     DEFAULT_THRESHOLD
 }
+fn default_max_concurrent() -> usize {
+    DEFAULT_MAX_CONCURRENT
+}
+fn default_max_queued() -> usize {
+    DEFAULT_MAX_QUEUED
+}
+fn default_inference_timeout_ms() -> u64 {
+    DEFAULT_INFERENCE_TIMEOUT_MS
+}
+
+struct InprocessAdmission {
+    running: Arc<tokio::sync::Semaphore>,
+    queued: Arc<tokio::sync::Semaphore>,
+    timeout: Duration,
+}
+
+impl InprocessAdmission {
+    fn new(max_concurrent: usize, max_queued: usize, timeout: Duration) -> anyhow::Result<Self> {
+        if max_concurrent == 0 {
+            bail!("inprocess detector max_concurrent must be greater than zero");
+        }
+        if timeout.is_zero() {
+            bail!("inprocess detector inference_timeout_ms must be greater than zero");
+        }
+        Ok(Self {
+            running: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
+            queued: Arc::new(tokio::sync::Semaphore::new(max_queued)),
+            timeout,
+        })
+    }
+
+    async fn run<F, T>(&self, work: F) -> anyhow::Result<T>
+    where
+        F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        tokio::time::timeout(self.timeout, async {
+            let running = match Arc::clone(&self.running).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    let queued = Arc::clone(&self.queued)
+                        .try_acquire_owned()
+                        .map_err(|_| anyhow!("inprocess detector inference queue is full"))?;
+                    let running = Arc::clone(&self.running)
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| anyhow!("inprocess detector admission closed"))?;
+                    drop(queued);
+                    running
+                }
+            };
+            tokio::task::spawn_blocking(move || {
+                let _running = running;
+                work()
+            })
+            .await
+            .map_err(|error| anyhow!("inprocess detector worker failed: {error}"))?
+        })
+        .await
+        .map_err(|_| anyhow!("inprocess detector inference deadline exceeded"))?
+    }
+}
 
 /// Detector that runs ONNX classification in-process via tract.
 pub struct InprocessDetector {
-    classifier: OnnxClassifier,
+    classifier: Arc<OnnxClassifier>,
+    admission: InprocessAdmission,
     injection_label: String,
     threshold: f64,
     name: &'static str,
@@ -216,8 +293,14 @@ impl InprocessDetector {
             &options,
         )
         .map_err(|e| anyhow::anyhow!("inprocess detector: {e}"))?;
+        let admission = InprocessAdmission::new(
+            cfg.max_concurrent,
+            cfg.max_queued,
+            Duration::from_millis(cfg.inference_timeout_ms),
+        )?;
         Ok(Arc::new(Self {
-            classifier,
+            classifier: Arc::new(classifier),
+            admission,
             injection_label: cfg.injection_label,
             threshold: cfg.threshold,
             name: INPROCESS_DETECTOR_NAME,
@@ -294,7 +377,19 @@ fn verification_for(cfg: &InprocessDetectorConfig) -> anyhow::Result<LocalArtifa
 
 impl Detector for InprocessDetector {
     fn detect(&self, prompt: &str) -> DetectionResult {
-        match self.classifier.classify(prompt) {
+        let outcome = match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                let classifier = Arc::clone(&self.classifier);
+                let prompt = prompt.to_string();
+                tokio::task::block_in_place(|| {
+                    handle.block_on(self.admission.run(move || classifier.classify(&prompt)))
+                })
+            }
+            _ => Err(anyhow!(
+                "inprocess detector requires the proxy multi-thread Tokio runtime"
+            )),
+        };
+        match outcome {
             Ok(output) => {
                 let score = output.score as f64;
                 let is_injection_label = output.label.eq_ignore_ascii_case(&self.injection_label);
@@ -332,6 +427,30 @@ impl Detector for InprocessDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inference_admission_refuses_work_beyond_running_and_queue_budget() {
+        let admission = Arc::new(InprocessAdmission::new(1, 0, Duration::from_secs(1)).unwrap());
+        let first = {
+            let admission = Arc::clone(&admission);
+            tokio::spawn(async move {
+                admission
+                    .run(|| {
+                        std::thread::sleep(Duration::from_millis(100));
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let error = admission
+            .run(|| Ok::<_, anyhow::Error>(()))
+            .await
+            .expect_err("work beyond the configured queue budget must be refused");
+        assert!(error.to_string().contains("queue is full"));
+        first.await.unwrap().unwrap();
+    }
 
     #[test]
     fn from_config_requires_model_and_tokenizer_paths() {

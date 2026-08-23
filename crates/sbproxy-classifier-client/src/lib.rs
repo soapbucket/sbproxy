@@ -408,10 +408,7 @@ impl ClassifierClient {
             .map_err(|_| ClassifierClientError::Timeout(self.timeout))?
             .map_err(rpc_error)?;
         Ok(SafetyStream {
-            tx,
-            tenant: tenant.to_string(),
-            rules,
-            first_sent: false,
+            outbound: SafetyOutbound::new(tx, tenant.to_string(), rules),
             inbound: response.into_inner(),
         })
     }
@@ -423,18 +420,37 @@ impl ClassifierClient {
 /// Drop this to close the outbound half of the stream; the sidecar then
 /// ends the inbound half once it has drained any verdicts still in flight.
 pub struct SafetyStream {
+    outbound: SafetyOutbound,
+    inbound: tonic::Streaming<SafetyVerdict>,
+}
+
+/// Cancellation-safe outbound state for a streaming safety RPC.
+struct SafetyOutbound {
     tx: tokio::sync::mpsc::Sender<SafetyToken>,
     tenant: String,
     rules: Vec<String>,
     first_sent: bool,
-    inbound: tonic::Streaming<SafetyVerdict>,
 }
 
-impl SafetyStream {
-    /// Send the next token (or chunk) of streaming output to check.
-    /// `rules` (and `tenant`) are attached to the first call only, per the
-    /// proto contract; later calls carry the token alone.
+impl SafetyOutbound {
+    fn new(tx: tokio::sync::mpsc::Sender<SafetyToken>, tenant: String, rules: Vec<String>) -> Self {
+        Self {
+            tx,
+            tenant,
+            rules,
+            first_sent: false,
+        }
+    }
+
     pub async fn send(&mut self, token: impl Into<String>) -> Result<(), ClassifierClientError> {
+        let token = token.into();
+        // Reserving capacity is the only cancellation point. The one-shot
+        // tenant/rule state remains untouched until this succeeds, and a
+        // permit send cannot fail after the state is committed.
+        let permit =
+            self.tx.reserve().await.map_err(|_| {
+                ClassifierClientError::Connect("stream_safety sender closed".into())
+            })?;
         let msg = SafetyToken {
             tenant: if self.first_sent {
                 String::new()
@@ -446,13 +462,21 @@ impl SafetyStream {
             } else {
                 std::mem::take(&mut self.rules)
             },
-            token: token.into(),
+            token,
         };
         self.first_sent = true;
-        self.tx
-            .send(msg)
-            .await
-            .map_err(|_| ClassifierClientError::Connect("stream_safety sender closed".into()))
+        permit.send(msg);
+        Ok(())
+    }
+}
+
+impl SafetyStream {
+    /// Send the next token (or chunk) of streaming output to check.
+    /// `rules` (and `tenant`) are attached to the first call only, per the
+    /// proto contract; later calls carry the token alone. Cancellation while
+    /// backpressured leaves that one-shot state intact for a retry.
+    pub async fn send(&mut self, token: impl Into<String>) -> Result<(), ClassifierClientError> {
+        self.outbound.send(token).await
     }
 
     /// Receive the verdict for the next sent token, in order. Returns
@@ -566,6 +590,38 @@ mod tests {
     };
     use tokio_stream::StreamExt as _;
     use tonic::{Request, Response, Status, Streaming};
+
+    #[tokio::test]
+    async fn cancelled_first_safety_send_preserves_tenant_and_rules_for_retry() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.send(SafetyToken {
+            tenant: "occupied".to_string(),
+            rules: Vec::new(),
+            token: "occupied".to_string(),
+        })
+        .await
+        .expect("fill the bounded channel");
+        let mut outbound =
+            SafetyOutbound::new(tx, "tenant-a".to_string(), vec!["forbidden".to_string()]);
+
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(10), outbound.send("first attempt")).await;
+        assert!(
+            cancelled.is_err(),
+            "the full channel must backpressure send"
+        );
+
+        let occupied = rx.recv().await.expect("occupied message remains queued");
+        assert_eq!(occupied.tenant, "occupied");
+        outbound
+            .send("retry")
+            .await
+            .expect("retry reserves the released slot");
+        let retry = rx.recv().await.expect("retry was queued");
+        assert_eq!(retry.tenant, "tenant-a");
+        assert_eq!(retry.rules, vec!["forbidden".to_string()]);
+        assert_eq!(retry.token, "retry");
+    }
 
     // Minimal stub sidecar: Classify echoes a fixed label, Version reports one
     // model. Lets us exercise the client end to end without a real ONNX model.

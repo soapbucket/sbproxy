@@ -226,7 +226,7 @@ impl SidecarDetector {
 
     /// Deserialize and validate the config block (see
     /// [`from_config`](Self::from_config) for what is rejected).
-    fn parse(value: &serde_json::Value) -> anyhow::Result<Self> {
+    pub(super) fn parse(value: &serde_json::Value) -> anyhow::Result<Self> {
         let cfg: SidecarDetectorConfig = serde_json::from_value(value.clone())
             .map_err(|e| anyhow::anyhow!("sidecar detector config: {e}"))?;
         ClassifierClient::validate_endpoint(&cfg.endpoint)
@@ -308,6 +308,47 @@ impl SidecarDetector {
         }
     }
 
+    /// Ask the sidecar for a verdict without applying its terminal failure
+    /// posture. The shipping policy uses this entry point so a transport or
+    /// protocol failure can be handed to its verified local ONNX fallback.
+    pub(super) fn try_detect(
+        &self,
+        prompt: &str,
+    ) -> Result<DetectionResult, ClassifierClientError> {
+        // Build the channel on first use, once a Tokio runtime is available.
+        let client = match self.client.get() {
+            Some(client) => client,
+            None => {
+                let client = ClassifierClient::connect_lazy(&self.endpoint, self.timeout)?;
+                let _ = self.client.set(client);
+                self.client.get().expect("client just set")
+            }
+        };
+        let response = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(client.classify(&self.model, prompt))
+        })?;
+
+        let Some(Label { name, score }) = response.labels.into_iter().next() else {
+            return Err(ClassifierClientError::Protocol(
+                "classification response contains no labels".to_string(),
+            ));
+        };
+        let is_injection_label = name.eq_ignore_ascii_case(&self.injection_label);
+        let (score_for_policy, label) = if is_injection_label {
+            (score, classify_score(score, self.threshold))
+        } else {
+            (1.0 - score, classify_score(1.0 - score, self.threshold))
+        };
+        Ok(DetectionResult {
+            score: score_for_policy,
+            label,
+            reason: Some(format!(
+                "sidecar model={} label={} score={:.3}",
+                self.model, name, score
+            )),
+        })
+    }
+
     /// Map a transport/rpc/protocol error onto the configured failure
     /// posture.
     fn on_error(&self, err: &ClassifierClientError) -> DetectionResult {
@@ -351,25 +392,8 @@ impl SidecarDetector {
 
 impl Detector for SidecarDetector {
     fn detect(&self, prompt: &str) -> DetectionResult {
-        // The trait is sync; bridge to the async client on the multi-thread
-        // runtime worker we are already on. block_in_place keeps the other
-        // workers free while this one drives the RPC to completion.
-        // Build the channel on first use: we are on a runtime worker
-        // here, which construction requires (WOR-1783).
-        let client = match self.client.get() {
-            Some(c) => c,
-            None => match ClassifierClient::connect_lazy(&self.endpoint, self.timeout) {
-                Ok(c) => {
-                    let _ = self.client.set(c);
-                    self.client.get().expect("client just set")
-                }
-                Err(e) => return self.on_error(&e),
-            },
-        };
-        let outcome = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(client.classify(&self.model, prompt))
-        });
-        self.map_outcome(outcome)
+        self.try_detect(prompt)
+            .unwrap_or_else(|error| self.on_error(&error))
     }
 
     fn name(&self) -> &str {
