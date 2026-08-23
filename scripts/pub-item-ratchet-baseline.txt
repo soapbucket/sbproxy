@@ -658,3 +658,11 @@ the new `crate::classifier_hooks::ClassifierIntentHook`, an
 `IntentDetectionHook` implementation. Both are referenced from outside
 their own files by genuine library/call-site code, not by an example,
 so neither recurs in the corrected count.
+
+2026-08-22 (WOR-2661 main reconciliation): tests-only stays 320 and
+unreferenced moves 1445 -> 1446 after rebasing onto Cedar commit
+708ff4a8. This is the merged tree's measured count, not either side's
+pre-rebase baseline. The net +1 is the Cedar change already explained
+above: `ValidationFinding` and `McpCedarPolicyConfig` enter the corrected
+unreferenced scan while a separate textual name overlap offsets one of
+the two. No AI item was added to either bucket during reconciliation.
