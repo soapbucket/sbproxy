@@ -10778,7 +10778,7 @@ pub(super) async fn handle_ai_proxy(
     // registers a `QualityScoringHook` today (see that module's doc
     // comment), so `pipeline.hooks.quality_scoring` is `None` in every
     // existing build and test, and this block is a no-op there. When a
-    // hook IS registered, ask `select_by_quality_async` to rank the
+    // hook IS registered, ask `select_from_quality_hook_async` to rank the
     // providers `provider_order` is about to try and pin the winner to
     // the front, the same "collapse to the one decided target" shape
     // `cost_quality` uses above; a target that fell out of the eligible
@@ -10818,7 +10818,7 @@ pub(super) async fn handle_ai_proxy(
                     {
                         Some(idx) => {
                             sbproxy_ai::ai_metrics::record_quality_routing_decision("selected");
-                            tracing::info!(
+                            tracing::debug!(
                                 event = "ai.quality_routing.route",
                                 provider = %picked,
                                 "quality-based routing selected provider"
