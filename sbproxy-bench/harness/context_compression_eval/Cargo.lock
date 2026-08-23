@@ -5645,6 +5645,7 @@ dependencies = [
  "serde_json_canonicalizer",
  "sha2 0.11.0",
  "smallvec",
+ "subtle",
  "thiserror 2.0.19",
  "tiktoken-rs",
  "tokio",
@@ -5695,6 +5696,7 @@ dependencies = [
  "sbproxy-classifier-proto",
  "thiserror 2.0.19",
  "tokio",
+ "tokio-stream",
  "tonic 0.12.3",
  "tower 0.5.3",
  "tracing",
@@ -7180,6 +7182,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
