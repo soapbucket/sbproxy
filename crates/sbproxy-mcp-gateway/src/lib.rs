@@ -30,13 +30,16 @@
 //! `examples/standalone_broker.rs` for a runnable deployment.
 
 use axum::{
+    body::Body,
     extract::Request,
     middleware::{self, Next},
     response::Response,
     routing::{get, post},
     Router,
 };
+use bytes::Bytes;
 use std::sync::Arc;
+use tower::ServiceExt;
 
 /// Operator-facing `/admin/status` JSON surface.
 pub mod admin;
@@ -81,6 +84,7 @@ pub mod pkce;
 /// `POST /register`: RFC 7591 dynamic client registration, proxied to
 /// the upstream Authorization Server.
 pub mod register;
+mod remote_body;
 /// MCP resource-server companion: validates the tokens this broker
 /// issues, on the origin that serves MCP traffic.
 pub mod resource_server;
@@ -121,8 +125,8 @@ pub use config::{
     DEFAULT_TOKEN_EXCHANGE_MAX_CHAIN_DEPTH,
 };
 pub use device_code::{
-    DeviceAuthorizationRequest, DeviceAuthorizationResponse, DeviceCodeError, DeviceCodeState,
-    DeviceCodeStatus, DeviceCodeStore, DEVICE_CODE_GRANT_TYPE,
+    AuthenticatedDeviceUser, DeviceAuthorizationRequest, DeviceAuthorizationResponse,
+    DeviceCodeError, DeviceCodeState, DeviceCodeStatus, DeviceCodeStore, DEVICE_CODE_GRANT_TYPE,
 };
 pub use dpop::{
     jwk_thumbprint, parse_and_verify as parse_and_verify_dpop, DpopError, DpopNonceIssuer,
@@ -130,14 +134,17 @@ pub use dpop::{
 };
 pub use local_store::LocalStore;
 pub use mtls_binding::{
-    client_cert_thumbprint, extract_client_cert_der, inject_cnf_x5t_s256, verify_cnf_x5t_s256,
-    MtlsBindingError, CLIENT_CERT_HEADER,
+    client_cert_thumbprint, inject_cnf_x5t_s256, MtlsBindingError, VerifiedClientCertificate,
 };
 pub use par::{
     consume as consume_par, mint_request_uri, PushedAuthorizationParams,
     PushedAuthorizationResponse, PAR_TTL_SECS, REQUEST_URI_PREFIX,
 };
 pub use pkce::{CodeChallenge, CodeChallengeMethod, CodeVerifier, PkceError};
+pub use resource_server::{
+    AudienceConfig, McpResourceServerConfig, McpResourceServerProvider, ResourceServerAuthError,
+    VerifiedToken,
+};
 pub use session::{InMemorySessionStore, RedisSessionStore, Session, SessionStore};
 pub use token::inject_cnf_jkt;
 pub use token_exchange::{
@@ -145,6 +152,144 @@ pub use token_exchange::{
     SubjectClaims, SUBJECT_TOKEN_TYPE_ACCESS, TOKEN_EXCHANGE_GRANT_TYPE,
 };
 pub use well_known::{build_metadata, BrokerMetadata};
+
+/// Host-neutral request passed from sbproxy's Pingora action path to
+/// the in-process OAuth broker. Identity fields are typed and can only
+/// be populated from the host's verified auth/TLS state.
+pub struct GatewayHttpRequest {
+    /// HTTP method.
+    pub method: String,
+    /// Origin-form URI (path plus optional query).
+    pub uri: String,
+    /// Raw header names and values.
+    pub headers: Vec<(String, Vec<u8>)>,
+    /// Bounded request body.
+    pub body: Bytes,
+    /// Verified TLS client certificate thumbprint, if present.
+    pub verified_client_certificate: Option<VerifiedClientCertificate>,
+    /// Authenticated browser user for RFC 8628 consent, if present.
+    pub authenticated_device_user: Option<AuthenticatedDeviceUser>,
+}
+
+/// Host-neutral response returned by the in-process OAuth broker.
+pub struct GatewayHttpResponse {
+    /// HTTP status code.
+    pub status: u16,
+    /// Raw response headers.
+    pub headers: Vec<(String, Vec<u8>)>,
+    /// Bounded response body.
+    pub body: Bytes,
+}
+
+/// Cloneable in-process broker adapter used by `action: mcp`.
+#[derive(Clone)]
+pub struct McpGatewayRuntime {
+    base_path: String,
+    router: Router,
+}
+
+impl McpGatewayRuntime {
+    /// Build the broker and every enabled collaborator from one config.
+    pub fn new(config: McpGatewayConfig) -> anyhow::Result<Self> {
+        if !config.base_path.starts_with('/') || config.base_path.starts_with("//") {
+            anyhow::bail!("MCP OAuth base_path must be an origin-relative path");
+        }
+        for (field, value) in [
+            ("external_base_url", config.external_base_url.as_str()),
+            (
+                "upstream_redirect_uri",
+                config.upstream_redirect_uri.as_str(),
+            ),
+            ("resource_uri", config.resource_uri.as_str()),
+        ] {
+            let valid = url::Url::parse(value).ok().is_some_and(|url| {
+                matches!(url.scheme(), "http" | "https")
+                    && url.has_host()
+                    && url.fragment().is_none()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+            });
+            if !valid {
+                anyhow::bail!(
+                    "MCP OAuth {field} must be an absolute HTTP(S) URL without a fragment"
+                );
+            }
+        }
+        let external = url::Url::parse(&config.external_base_url)?;
+        if external.path() != "/" || external.query().is_some() {
+            anyhow::bail!("MCP OAuth external_base_url must be an origin without path or query");
+        }
+        let callback = url::Url::parse(&config.upstream_redirect_uri)?;
+        let expected_callback_path = format!("{}/callback", config.base_path.trim_end_matches('/'));
+        if callback.origin() != external.origin() || callback.path() != expected_callback_path {
+            anyhow::bail!(
+                "MCP OAuth upstream_redirect_uri must target this broker's configured callback"
+            );
+        }
+        validate_startup(&config)?;
+        let base_path = config.base_path.trim_end_matches('/').to_string();
+        let sessions = InMemorySessionStore::arc(std::time::Duration::from_secs(
+            config.session_ttl_secs.max(1),
+        ));
+        Ok(Self {
+            base_path,
+            router: router(Arc::new(config), sessions),
+        })
+    }
+
+    /// True when `path` belongs to this broker's configured route tree.
+    pub fn matches_path(&self, path: &str) -> bool {
+        path == self.base_path
+            || path
+                .strip_prefix(&self.base_path)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    }
+
+    /// Dispatch one request through the same Axum routes used by the
+    /// standalone harness, while carrying only host-verified identity.
+    pub async fn dispatch(
+        &self,
+        request: GatewayHttpRequest,
+    ) -> anyhow::Result<GatewayHttpResponse> {
+        let GatewayHttpRequest {
+            method,
+            uri,
+            headers,
+            body,
+            verified_client_certificate,
+            authenticated_device_user,
+        } = request;
+        let mut builder = axum::http::Request::builder()
+            .method(method.as_str())
+            .uri(uri.as_str());
+        for (name, value) in headers {
+            let name = axum::http::HeaderName::from_bytes(name.as_bytes())?;
+            let value = axum::http::HeaderValue::from_bytes(&value)?;
+            builder = builder.header(name, value);
+        }
+        let request = builder.body(Body::from(body))?;
+        let mut service = self.router.clone();
+        if let Some(certificate) = verified_client_certificate {
+            service = service.layer(axum::extract::Extension(certificate));
+        }
+        if let Some(user) = authenticated_device_user {
+            service = service.layer(axum::extract::Extension(user));
+        }
+        let response = service.oneshot(request).await?;
+        let status = response.status().as_u16();
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.as_str().to_string(), value.as_bytes().to_vec()))
+            .collect();
+        let body = axum::body::to_bytes(response.into_body(), 2 * 1024 * 1024).await?;
+        Ok(GatewayHttpResponse {
+            status,
+            headers,
+            body,
+        })
+    }
+}
 
 // --- Application state ---
 
@@ -200,30 +345,49 @@ pub struct AppState {
 
 /// Build an axum router with `/authorize`, `/callback`, `/token`,
 /// `/register`, `/admin/status`, and the two well-known metadata routes
-/// mounted under the configured base path, with every optional
-/// collaborator (AS metadata cache, CIMD caches, DPoP replay cache and
-/// nonce issuer, device-code store, PAR store) disabled. The router
-/// consumes its own state, so callers wanting to merge it into a wider
-/// router should call `Router::nest` or `Router::merge` after this
-/// returns.
-///
-/// This is the common case: an operator who wants every optional
-/// collaborator turned on calls [`router_full_with_par`] directly
-/// instead, since Rust has no default arguments and a constructor
-/// between these two extremes would only cover a specific subset of
-/// features nobody but its own test happened to name (which is exactly
-/// how the ratchet in `scripts/check-pub-item-ratchet.sh` catches
-/// exactly this shape of API sprawl).
+/// mounted under the configured base path. It wires bounded in-process
+/// DPoP replay/nonce storage and every enabled CIMD, DCR, metadata, and
+/// device-code collaborator. PAR remains available through
+/// [`router_full_with_par`] because it requires caller-owned storage.
 pub fn router(config: Arc<McpGatewayConfig>, session_store: Arc<dyn SessionStore>) -> Router {
+    let runtime_store = LocalStore::arc();
+    let replay_store: Arc<dyn sbproxy_storage::EphemeralKv> = runtime_store.clone();
+    let dpop_replay = Arc::new(DpopReplayCache::new(
+        replay_store,
+        std::time::Duration::from_secs(config.dpop_jti_ttl_secs),
+    ));
+    let nonce_store: Arc<dyn sbproxy_storage::EphemeralKv> = runtime_store.clone();
+    let dpop_nonce = Arc::new(DpopNonceIssuer::new(
+        nonce_store,
+        std::time::Duration::from_secs(config.dpop_nonce_ttl_secs),
+    ));
+    let device_code_store = config.device_code_enabled.then(|| {
+        let store: Arc<dyn sbproxy_storage::EphemeralKv> = runtime_store.clone();
+        DeviceCodeStore::arc(store)
+    });
+    let cimd_cache = config.cimd_enabled.then(|| {
+        InMemoryCimdCache::arc(std::time::Duration::from_secs(config.cimd_cache_ttl_secs))
+    });
+    let cimd_to_dcr = config.dcr_translate_cimd_clients.then(CimdToDcrCache::arc);
+    let as_metadata = config
+        .upstream_metadata_url
+        .as_deref()
+        .filter(|url| !url.is_empty())
+        .map(|url| {
+            Arc::new(AsMetadataCache::new(
+                sbproxy_httpkit::default_outbound(),
+                url,
+            ))
+        });
     router_full_with_par(
         config,
         session_store,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
+        as_metadata,
+        cimd_cache,
+        cimd_to_dcr,
+        Some(dpop_replay),
+        Some(dpop_nonce),
+        device_code_store,
         None,
     )
 }

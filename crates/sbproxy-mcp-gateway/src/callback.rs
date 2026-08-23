@@ -116,14 +116,37 @@ pub(crate) async fn callback(
 
     // --- RFC 9207 issuer check ---
     //
-    // If the upstream AS supplied `iss`, it MUST equal the
-    // configured upstream URL's origin. We only require an exact
-    // match against the configured upstream URL string for now;
-    // 4B.3 will swap this for the metadata document's `issuer` claim.
+    // If the upstream AS supplied `iss`, it MUST equal the issuer in
+    // its RFC 8414 metadata. The authorization endpoint is not an
+    // issuer identifier and may legitimately live at a different URL.
     if let Some(iss) = q.iss.as_deref() {
-        if iss != app.config.upstream_authorization_server_url {
+        let Some(metadata) = app.as_metadata.as_ref() else {
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "AS metadata is required to validate callback issuer",
+            );
+        };
+        let expected = match metadata
+            .fetch_or_cached(
+                app.config.metadata_refresh_secs,
+                app.config.max_metadata_staleness_secs,
+            )
+            .await
+        {
+            Ok(document) => document.issuer.clone(),
+            Err(e) => {
+                tracing::warn!(error = %e, "AS metadata unavailable for callback issuer check");
+                return oauth_error(
+                    StatusCode::BAD_GATEWAY,
+                    "server_error",
+                    "AS metadata unavailable for callback issuer validation",
+                );
+            }
+        };
+        if iss != expected {
             tracing::warn!(
-                expected = %app.config.upstream_authorization_server_url,
+                expected = %expected,
                 actual = %iss,
                 "RFC 9207 iss mismatch on /callback"
             );
@@ -203,6 +226,9 @@ mod tests {
             base_path: "/mcp/oauth".to_string(),
             upstream_authorization_server_url: "https://idp.example.com/oauth/authorize"
                 .to_string(),
+            upstream_metadata_url: Some(
+                "https://idp.example.com/.well-known/oauth-authorization-server".to_string(),
+            ),
             resource_uri: "https://mcp.example/api".to_string(),
             allowed_redirect_uris: vec!["https://client.example/cb".to_string()],
             session_ttl_secs: 600,
@@ -225,7 +251,31 @@ mod tests {
     ) -> (axum::Router, Arc<InMemorySessionStore>) {
         let store = InMemorySessionStore::arc(Duration::from_secs(60));
         store.put(upstream_state, fixture_session()).await;
-        let app = crate::router(Arc::new(test_config()), store.clone());
+        let cfg = test_config();
+        let metadata = Arc::new(crate::as_metadata::AsMetadataCache::new(
+            sbproxy_httpkit::default_outbound(),
+            cfg.upstream_metadata_url.clone().unwrap(),
+        ));
+        metadata
+            .seed_metadata(
+                crate::as_metadata::AuthorizationServerMetadata {
+                    issuer: "https://idp.example.com".to_string(),
+                    ..Default::default()
+                },
+                std::time::Instant::now(),
+            )
+            .await;
+        let app = crate::router_full_with_par(
+            Arc::new(cfg),
+            store.clone(),
+            Some(metadata),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         (app, store)
     }
 
@@ -271,7 +321,7 @@ mod tests {
         let (status, headers) = send(
             app,
             "/mcp/oauth/callback?state=known&code=auth-code-123\
-             &iss=https%3A%2F%2Fidp.example.com%2Foauth%2Fauthorize",
+             &iss=https%3A%2F%2Fidp.example.com",
         )
         .await;
         assert_eq!(status, StatusCode::FOUND);

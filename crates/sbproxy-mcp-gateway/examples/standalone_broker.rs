@@ -23,9 +23,9 @@
 //! ```
 //!
 //! Export `MCP_GATEWAY_BASE_URL=http://127.0.0.1:8089` (or your own
-//! bind address) before running: the well-known route and the DPoP
-//! `htu` check both read that variable at request time, and this
-//! example does not set it for you (this workspace's
+//! bind address) before running. The example copies it into the
+//! broker's canonical public-origin config. It does not mutate the
+//! environment itself (this workspace's
 //! `scripts/check-env-mutation.sh` refuses production code that calls
 //! `std::env::set_var`, on purpose, since it is process-global mutable
 //! state; see that script's header). `UPSTREAM_AUTHORIZATION_SERVER_URL`
@@ -78,6 +78,8 @@ async fn main() {
 
     let config = Arc::new(McpGatewayConfig {
         base_path: "/mcp/oauth".to_string(),
+        external_base_url: base_url.clone(),
+        upstream_redirect_uri: format!("{base_url}/mcp/oauth/callback"),
         upstream_authorization_server_url: std::env::var("UPSTREAM_AUTHORIZATION_SERVER_URL")
             .unwrap_or_else(|_| "https://idp.example.com/oauth/authorize".to_string()),
         upstream_token_endpoint_url: std::env::var("UPSTREAM_TOKEN_ENDPOINT_URL")

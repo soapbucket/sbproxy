@@ -83,6 +83,7 @@ fn base_config() -> McpGatewayConfig {
         base_path: "/mcp/oauth".to_string(),
         upstream_authorization_server_url: "https://idp.example/oauth/authorize".to_string(),
         upstream_token_endpoint_url: "http://127.0.0.1:1/token".to_string(),
+        upstream_redirect_uri: "https://broker.example/mcp/oauth/callback".to_string(),
         resource_uri: "https://mcp.example/api".to_string(),
         allowed_redirect_uris: vec!["https://client.example/cb".to_string()],
         session_ttl_secs: 600,
@@ -480,18 +481,12 @@ async fn op_inject_cnf_jkt_jwt_no_signing_key(e: &Entry, outcome: Outcome) {
     let upstream = Bytes::from(
         r#"{"access_token":"hdr.payload.sig","token_type":"Bearer","expires_in":3600}"#,
     );
-    let result = inject_cnf_jkt(&upstream, &proof, None).expect("inject ok");
-    let parsed: serde_json::Value = serde_json::from_slice(&result).expect("parse");
-    // WOR-47: token_type MUST stay Bearer; cnf MUST NOT be added.
+    let result = inject_cnf_jkt(&upstream, &proof, None, "https://broker.example");
+    // No signing key means the broker must refuse to claim a binding.
     assert!(matches!(outcome, Outcome::Blocked));
-    assert_eq!(
-        parsed["token_type"], "Bearer",
-        "[{}] JWT relabeled DPoP without broker signing key",
-        e.id,
-    );
     assert!(
-        parsed.get("cnf").is_none(),
-        "[{}] cnf injected into wrapper of JWT-shaped token",
+        result.is_err(),
+        "[{}] JWT accepted without broker signing key",
         e.id,
     );
 }
@@ -499,7 +494,7 @@ async fn op_inject_cnf_jkt_jwt_no_signing_key(e: &Entry, outcome: Outcome) {
 async fn op_inject_cnf_jkt_non_json(e: &Entry, outcome: Outcome) {
     let proof = fixture_proof("jti-nonjson");
     let upstream = Bytes::from_static(b"not-a-json-body");
-    let result = inject_cnf_jkt(&upstream, &proof, None);
+    let result = inject_cnf_jkt(&upstream, &proof, None, "https://broker.example");
     assert!(matches!(outcome, Outcome::Blocked));
     assert!(
         result.is_err(),
@@ -526,7 +521,8 @@ async fn op_inject_act_envelope_no_signing_key(e: &Entry, outcome: Outcome) {
         sub: Some("alice".into()),
         act: None,
     };
-    let result = inject_act_envelope(&body, &subject, None, None).expect("envelope ok");
+    let result = inject_act_envelope(&body, &subject, None, None, "https://broker.example")
+        .expect("envelope ok");
     let parsed: serde_json::Value = serde_json::from_slice(&result).expect("parse");
     assert!(matches!(outcome, Outcome::Sanitized));
     // access_token must pass through unchanged.

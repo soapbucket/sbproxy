@@ -196,6 +196,10 @@ async fn spawn_router(router: Router) -> (String, oneshot::Sender<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind 127.0.0.1:0");
+    spawn_router_on(listener, router)
+}
+
+fn spawn_router_on(listener: TcpListener, router: Router) -> (String, oneshot::Sender<()>) {
     let addr: SocketAddr = listener.local_addr().expect("local_addr");
     let (tx, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
@@ -211,6 +215,13 @@ async fn spawn_router(router: Router) -> (String, oneshot::Sender<()>) {
 
 async fn start_pair() -> Pair {
     let (upstream_url, upstream_shutdown) = spawn_router(build_mock_upstream_router()).await;
+    let broker_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind broker listener");
+    let broker_url = format!(
+        "http://{}",
+        broker_listener.local_addr().expect("broker local_addr")
+    );
 
     // Use struct update syntax so test fixtures don't break when new
     // optional fields are added to McpGatewayConfig. Only override the
@@ -218,6 +229,8 @@ async fn start_pair() -> Pair {
     // the well-tested Default values.
     let cfg = McpGatewayConfig {
         base_path: "/mcp/oauth".to_string(),
+        external_base_url: broker_url.clone(),
+        upstream_redirect_uri: format!("{broker_url}/mcp/oauth/callback"),
         upstream_authorization_server_url: format!("{upstream_url}/authorize"),
         resource_uri: "https://mcp.example/api".to_string(),
         allowed_redirect_uris: vec!["https://client.example/cb".to_string()],
@@ -237,7 +250,8 @@ async fn start_pair() -> Pair {
     };
     let store = InMemorySessionStore::arc(Duration::from_secs(60));
     let router = broker_router(Arc::new(cfg), store);
-    let (broker_url, broker_shutdown) = spawn_router(router).await;
+    let (bound_broker_url, broker_shutdown) = spawn_router_on(broker_listener, router);
+    assert_eq!(bound_broker_url, broker_url);
 
     Pair {
         broker_url,

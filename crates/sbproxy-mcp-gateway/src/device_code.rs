@@ -105,7 +105,7 @@ pub struct DeviceAuthorizationResponse {
 
 /// Persisted device-code state. Serialized as JSON in the
 /// `EphemeralKv` value, keyed off `device:<device_code>`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DeviceCodeState {
     /// Mirrors the inbound `client_id`. Re-validated on every poll
     /// against the request's `client_id` to prevent code-substitution
@@ -139,6 +139,37 @@ pub struct DeviceCodeState {
     /// epoch. Compared against `interval_secs` to decide whether the
     /// next poll trips `slow_down`.
     pub last_polled_at: Option<i64>,
+}
+
+impl std::fmt::Debug for DeviceCodeState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeviceCodeState")
+            .field("client_id", &self.client_id)
+            .field("scope", &self.scope)
+            .field("resource", &self.resource)
+            .field("user_code", &self.user_code)
+            .field("status", &self.status)
+            .field(
+                "authorized_token",
+                &self.authorized_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
+            .field("interval_secs", &self.interval_secs)
+            .field("last_polled_at", &self.last_polled_at)
+            .finish()
+    }
+}
+
+/// Identity inserted by the host only after its normal authentication
+/// chain has established the browser user's subject. The standalone
+/// broker does not synthesize this value, so device consent fails
+/// closed unless hosted behind an authenticated sbproxy path.
+#[derive(Clone, Debug)]
+pub struct AuthenticatedDeviceUser {
+    /// Stable subject to place in the broker-minted access token.
+    pub subject: String,
 }
 
 /// State machine for an in-flight device-code authorization.
@@ -347,6 +378,14 @@ pub async fn device_authorization(
             );
         }
     };
+    let resource = form.resource.unwrap_or_else(|| cfg.resource_uri.clone());
+    if !crate::authorize::is_resource_bound(&resource, cfg) {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_target",
+            "requested resource is not enrolled for this broker",
+        );
+    }
 
     // Mint the codes. 256 bits of entropy for the device_code matches
     // the access-token strength and is comfortably URL-safe.
@@ -359,7 +398,7 @@ pub async fn device_authorization(
     let state = DeviceCodeState {
         client_id,
         scope: form.scope,
-        resource: form.resource,
+        resource: Some(resource),
         user_code: user_code.clone(),
         status: DeviceCodeStatus::Pending,
         authorized_token: None,
@@ -438,18 +477,24 @@ pub(crate) struct VerifySubmission {
     pub action: Option<String>,
 }
 
-/// `POST {base_path}/verify` handler. Looks up the user_code, walks
-/// the upstream PKCE flow (or, for this slice, uses any session
-/// cookie or assumes the user is already authenticated), and marks
-/// the device-code state. A production deployment would 302 the user
-/// agent to /authorize first; this slice keeps the flow synchronous
-/// to keep the LOC budget tight while preserving the contract.
+/// `POST {base_path}/verify` handler. Requires host-established user
+/// identity, resolves the user code, applies an exact approve/deny
+/// decision, and stores a freshly signed broker access token on
+/// approval.
 pub(crate) async fn verify_post(
     State(app): State<AppState>,
+    authenticated_user: Option<axum::extract::Extension<AuthenticatedDeviceUser>>,
     Form(form): Form<VerifySubmission>,
 ) -> Response {
     if !app.config.device_code_enabled {
         return (StatusCode::NOT_FOUND, "device authorization disabled").into_response();
+    }
+
+    let Some(axum::extract::Extension(authenticated_user)) = authenticated_user else {
+        return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
+    };
+    if authenticated_user.subject.trim().is_empty() {
+        return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
     }
 
     let store = match app.device_code_store.as_ref() {
@@ -468,8 +513,11 @@ pub(crate) async fn verify_post(
         _ => return Html(verify_error_html("user_code required")).into_response(),
     };
 
-    let action = form.action.unwrap_or_else(|| "approve".to_string());
-    let approve = action != "deny";
+    let approve = match form.action.as_deref() {
+        Some("approve") => true,
+        Some("deny") => false,
+        _ => return Html(verify_error_html("action must be approve or deny")).into_response(),
+    };
 
     let device_code = match store.resolve_user_code(&raw_user_code).await {
         Ok(Some(dc)) => dc,
@@ -502,18 +550,58 @@ pub(crate) async fn verify_post(
     };
 
     if approve {
+        let Some(signing_key) = app.config.broker_signing_key.as_ref() else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "broker signing key required for device authorization",
+            )
+                .into_response();
+        };
+        let issuer = crate::well_known::broker_issuer(&app.config);
+        if issuer.is_empty() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "broker issuer required for device authorization",
+            )
+                .into_response();
+        }
+        let mut jti_bytes = [0_u8; 16];
+        rand::thread_rng().fill_bytes(&mut jti_bytes);
+        let claims = crate::at_jwt::AtJwtClaims {
+            iss: issuer,
+            sub: authenticated_user.subject,
+            aud: serde_json::Value::String(
+                state
+                    .resource
+                    .clone()
+                    .unwrap_or_else(|| app.config.resource_uri.clone()),
+            ),
+            exp: state.expires_at,
+            iat: unix_now(),
+            jti: jti_bytes.iter().map(|b| format!("{b:02x}")).collect(),
+            client_id: state.client_id.clone(),
+            scope: state.scope.clone(),
+            auth_time: Some(unix_now()),
+            acr: None,
+            amr: None,
+            act: None,
+            actor: None,
+            principal: None,
+            tnx: None,
+            purpose: None,
+        };
+        let token = match crate::at_jwt::mint_at_jwt(&claims, signing_key) {
+            Ok(token) => token,
+            Err(e) => {
+                tracing::error!(error = %e, "device token mint failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "token mint failed").into_response();
+            }
+        };
         state.status = DeviceCodeStatus::Authorized;
-        // Stash a placeholder token: a production deployment runs
-        // /authorize against the upstream and stores the resulting
-        // access_token here. For this slice the placeholder lets the
-        // poller see a successful 200 with a recognisable shape;
-        // operators that wire the gateway to a real upstream provide
-        // their own /verify implementation that calls into the
-        // upstream and overwrites the token JSON.
         state.authorized_token = Some(serde_json::json!({
-            "access_token": "device-flow-pending",
+            "access_token": token,
             "token_type": "Bearer",
-            "expires_in": 3600,
+            "expires_in": state.expires_at.saturating_sub(unix_now()),
         }));
     } else {
         state.status = DeviceCodeStatus::Denied;
@@ -568,14 +656,17 @@ pub fn format_user_code(raw: &str) -> String {
 }
 
 /// Resolve the verification URI advertised in /device_authorization.
-/// Order of precedence: explicit config, then env-derived
-/// `<MCP_GATEWAY_BASE_URL><base_path>/verify`, then a relative path
-/// fallback (`<base_path>/verify`).
+/// Order of precedence: explicit verification URI, then the legacy
+/// environment override or configured external base URL, then a
+/// relative-path fallback.
 fn resolve_verification_uri(cfg: &crate::config::McpGatewayConfig) -> String {
     if !cfg.device_code_verification_uri.is_empty() {
         return cfg.device_code_verification_uri.clone();
     }
-    let base = std::env::var("MCP_GATEWAY_BASE_URL").unwrap_or_default();
+    let base = std::env::var("MCP_GATEWAY_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| cfg.external_base_url.clone());
     let path = cfg.base_path.trim_end_matches('/');
     if base.is_empty() {
         format!("{path}/verify")
@@ -705,8 +796,21 @@ mod tests {
             device_code_lifetime_secs: 600,
             device_code_polling_interval_secs: 5,
             device_code_verification_uri: "https://broker.example/mcp/oauth/verify".to_string(),
+            resource_uri: "https://mcp.example".to_string(),
+            broker_signing_key: Some(crate::config::JwkKey::Pem {
+                pem: include_str!("../../sbproxy-modules/src/auth/dpop_test_ec_p256.pem")
+                    .to_string(),
+                alg: "ES256".to_string(),
+                kid: Some("device-test-key".to_string()),
+            }),
             ..McpGatewayConfig::default()
         }
+    }
+
+    fn authenticated(app: Router) -> Router {
+        app.layer(axum::extract::Extension(AuthenticatedDeviceUser {
+            subject: "user-123".to_string(),
+        }))
     }
 
     fn build_app(cfg: McpGatewayConfig) -> Router {
@@ -782,6 +886,19 @@ mod tests {
         assert!(body.contains("invalid_request"));
     }
 
+    #[tokio::test]
+    async fn device_authorization_rejects_an_unenrolled_resource() {
+        let app = build_app(enabled_config());
+        let (status, body) = post_form(
+            app,
+            "/mcp/oauth/device_authorization",
+            "client_id=cli&resource=https%3A%2F%2Fevil.example",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("invalid_target"), "{body}");
+    }
+
     #[test]
     fn user_codes_are_unique_across_minting() {
         // Birthday-paradox check: 1000 codes from a 32^8 space should
@@ -830,6 +947,10 @@ mod tests {
     async fn verify_post_marks_state_authorized_then_polled_path_works() {
         // Mint a fresh device_code, then POST /verify with action=approve.
         // The state should flip to Authorized.
+        let _env = crate::test_env::EnvVarGuard::set(&[(
+            "MCP_GATEWAY_BASE_URL",
+            Some("https://broker.example"),
+        )]);
         let cfg = enabled_config();
         let store = InMemorySessionStore::arc(Duration::from_secs(60));
         let kv: Arc<dyn EphemeralKv> = Arc::new(MockEphemeralKv::new());
@@ -860,18 +981,53 @@ mod tests {
 
         // 2. POST /verify
         let body_form = format!("user_code={}&action=approve", urlencode(&user_code));
-        let (status, _) = post_form(app, "/mcp/oauth/verify", &body_form).await;
+        let (status, _) = post_form(authenticated(app), "/mcp/oauth/verify", &body_form).await;
         assert_eq!(status, StatusCode::OK);
 
         // 3. State should be Authorized.
         let state = dc_store.get(&device_code).await.unwrap().expect("state");
         assert_eq!(state.status, DeviceCodeStatus::Authorized);
-        assert!(state.authorized_token.is_some());
+        let token = state.authorized_token.unwrap();
+        let access_token = token["access_token"].as_str().unwrap();
+        assert_ne!(access_token, "device-flow-pending");
+        assert_eq!(access_token.split('.').count(), 3);
+    }
+
+    #[tokio::test]
+    async fn verify_post_requires_an_authenticated_user() {
+        let app = build_app(enabled_config());
+        let (status, _) = post_form(
+            app,
+            "/mcp/oauth/verify",
+            "user_code=ABCD-EFGH&action=approve",
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn missing_or_unknown_action_never_approves() {
+        for action in ["", "&action=unexpected"] {
+            let app = build_app(enabled_config());
+            let (status, body) = post_form(
+                app.clone(),
+                "/mcp/oauth/device_authorization",
+                "client_id=cli",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let issued: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let user_code = issued["user_code"].as_str().unwrap();
+            let form = format!("user_code={}{}", urlencode(user_code), action);
+            let (status, body) = post_form(authenticated(app), "/mcp/oauth/verify", &form).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.contains("action must be approve or deny"));
+        }
     }
 
     #[tokio::test]
     async fn verify_post_with_unknown_user_code_returns_error_page() {
-        let app = build_app(enabled_config());
+        let app = authenticated(build_app(enabled_config()));
         let body_form = "user_code=ZZZZ-ZZZZ&action=approve";
         let (status, body) = post_form(app, "/mcp/oauth/verify", body_form).await;
         assert_eq!(status, StatusCode::OK);

@@ -252,10 +252,9 @@ fn derive_issuer(_cfg: &McpGatewayConfig, base: &str, path: &str) -> String {
 
 /// The broker's RFC 9207 issuer string, suitable for emitting as the
 /// `iss` parameter on authorization responses or as the `iss` claim
-/// on JWTs the broker mints itself. Reads `MCP_GATEWAY_BASE_URL` +
-/// the configured base path; returns an empty string when no base URL
-/// is configured (callers should treat that as "issuer unknown" and
-/// skip the iss parameter rather than emit an empty value).
+/// on JWTs the broker mints itself. Uses the legacy
+/// `MCP_GATEWAY_BASE_URL` override or the configured external base
+/// URL, plus the configured base path.
 pub fn broker_issuer(cfg: &McpGatewayConfig) -> String {
     let base_url = base_url_from_env_or_config(cfg);
     let base = base_url.trim_end_matches('/').to_string();
@@ -267,14 +266,9 @@ pub fn broker_issuer(cfg: &McpGatewayConfig) -> String {
 
 /// `GET {base_path}/.well-known/oauth-authorization-server` handler.
 pub async fn well_known(State(app): State<AppState>) -> Response {
-    // The `Host` header would let us derive `base_url` per request,
-    // but axum's State machinery does not include the request URI
-    // here; operators must supply the canonical base URL via config.
-    // For Wave 4B.3 we read it from an env-overrideable default that
-    // the integration layer (sb.yml -> config) populates; the field is
-    // tracked through the broker's own derived `base_url`. To keep
-    // this module side-effect-free we read from the
-    // `MCP_GATEWAY_BASE_URL` env at call time.
+    // Never derive public endpoints from the request Host header.
+    // Operators configure one canonical origin; the environment
+    // variable remains a backwards-compatible standalone override.
     let base_url = base_url_from_env_or_config(&app.config);
 
     let upstream = match app.as_metadata.as_ref() {
@@ -351,11 +345,13 @@ pub async fn jwks(State(app): State<AppState>) -> Response {
     (StatusCode::OK, headers, body).into_response()
 }
 
-/// Derive the broker's externally-visible base URL. Config does not
-/// yet carry this explicitly; the env override gives operators a
-/// single knob and tests a deterministic path.
-fn base_url_from_env_or_config(_cfg: &McpGatewayConfig) -> String {
-    std::env::var("MCP_GATEWAY_BASE_URL").unwrap_or_else(|_| String::new())
+/// Derive the broker's externally-visible base URL. The environment
+/// override is retained for older standalone deployments.
+fn base_url_from_env_or_config(cfg: &McpGatewayConfig) -> String {
+    std::env::var("MCP_GATEWAY_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| cfg.external_base_url.clone())
 }
 
 // --- Tests ---

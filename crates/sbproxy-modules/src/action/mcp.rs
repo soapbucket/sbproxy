@@ -960,6 +960,15 @@ pub struct McpOAuthConfig {
     /// Optional list of scopes the resource recognises.
     #[serde(default)]
     pub scopes_supported: Vec<String>,
+    /// Complementary resource-server verifier applied to protected MCP
+    /// requests on this same action path. Its authorization_servers and
+    /// scopes must match the discovery values above.
+    #[serde(default)]
+    pub resource_server: Option<sbproxy_mcp_gateway::McpResourceServerConfig>,
+    /// Optional OAuth broker mounted in-process under its configured
+    /// base_path. No second listener or sidecar is required.
+    #[serde(default)]
+    pub broker: Option<sbproxy_mcp_gateway::McpGatewayConfig>,
 }
 
 /// Server identity advertised by the gateway during MCP initialization.
@@ -1904,6 +1913,10 @@ pub struct McpAction {
     /// OAuth Protected Resource Metadata (RFC 9728) for auth discovery,
     /// or `None` when the gateway advertises no OAuth surface (WOR-806).
     pub oauth: Option<McpOAuthConfig>,
+    /// Compiled bearer/DPoP/mTLS verifier for protected MCP requests.
+    pub resource_server: Option<Arc<sbproxy_mcp_gateway::McpResourceServerProvider>>,
+    /// In-process OAuth broker for this MCP action.
+    pub oauth_broker: Option<Arc<sbproxy_mcp_gateway::McpGatewayRuntime>>,
     modern_http: Option<CompiledModernHttpSecurity>,
     /// Process-wide sliding-window quota store for per-tool quotas
     /// declared on `rbac_policies[].tool_quotas[]` (WOR-1065). One
@@ -4484,6 +4497,44 @@ impl McpAction {
         if cfg.federated_servers.is_empty() {
             anyhow::bail!("mcp action: federated_servers must not be empty");
         }
+        if let Some(oauth) = cfg.oauth.as_ref() {
+            if let (Some(resource), Some(broker)) =
+                (oauth.resource_server.as_ref(), oauth.broker.as_ref())
+            {
+                if resource.resource_uri != broker.resource_uri {
+                    anyhow::bail!(
+                        "mcp action: oauth broker and resource_server resource_uri must match"
+                    );
+                }
+            }
+        }
+        let resource_server = cfg
+            .oauth
+            .as_ref()
+            .and_then(|oauth| oauth.resource_server.clone().map(|resource| (oauth, resource)))
+            .map(|(oauth, resource)| {
+                if resource.authorization_servers != oauth.authorization_servers {
+                    anyhow::bail!(
+                        "mcp action: oauth.resource_server.authorization_servers must match oauth.authorization_servers"
+                    );
+                }
+                if resource.scopes_supported != oauth.scopes_supported {
+                    anyhow::bail!(
+                        "mcp action: oauth.resource_server.scopes_supported must match oauth.scopes_supported"
+                    );
+                }
+                Ok(Arc::new(
+                    sbproxy_mcp_gateway::McpResourceServerProvider::new(resource)?,
+                ))
+            })
+            .transpose()?;
+        let oauth_broker = cfg
+            .oauth
+            .as_ref()
+            .and_then(|oauth| oauth.broker.clone())
+            .map(sbproxy_mcp_gateway::McpGatewayRuntime::new)
+            .transpose()?
+            .map(Arc::new);
         let modern_http = cfg
             .modern_http
             .as_ref()
@@ -5098,6 +5149,8 @@ impl McpAction {
             lethal_trifecta,
             progressive_discovery: cfg.progressive_discovery,
             oauth: cfg.oauth,
+            resource_server,
+            oauth_broker,
             modern_http,
             quota_store: Arc::new(ToolQuotaStore::new()),
             refresh_interval: cfg.refresh_interval.unwrap_or(Duration::from_secs(60)),
@@ -6982,6 +7035,35 @@ mod tests {
         assert_eq!(action.server_version, "0.1.0");
         assert_eq!(action.prefixes.len(), 1);
         assert!(action.tool_allowlist.is_none());
+    }
+
+    #[test]
+    fn oauth_broker_and_resource_server_must_share_the_rfc8707_resource() {
+        let value = json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "federated_servers": [{"origin": "github.example.com"}],
+            "oauth": {
+                "authorization_servers": ["https://issuer.example"],
+                "resource_server": {
+                    "resource_uri": "https://mcp.example/resource-a",
+                    "authorization_servers": ["https://issuer.example"],
+                    "jwks_url": "https://issuer.example/jwks",
+                    "audience": "https://mcp.example/resource-a"
+                },
+                "broker": {
+                    "base_path": "/mcp/oauth",
+                    "external_base_url": "https://mcp.example",
+                    "upstream_authorization_server_url": "https://issuer.example/authorize",
+                    "upstream_redirect_uri": "https://mcp.example/mcp/oauth/callback",
+                    "resource_uri": "https://mcp.example/resource-b",
+                    "allowed_redirect_uris": ["https://client.example/callback"],
+                    "session_ttl_secs": 600
+                }
+            }
+        });
+        let error = McpAction::from_config(value).unwrap_err().to_string();
+        assert!(error.contains("resource_uri must match"), "{error}");
     }
 
     #[test]

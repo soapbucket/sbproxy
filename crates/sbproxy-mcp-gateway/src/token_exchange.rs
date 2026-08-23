@@ -154,18 +154,22 @@ pub fn chain_depth(claims: &SubjectClaims) -> usize {
 ///      rewrite is gated on broker re-signing capability (WOR-47):
 ///      without a `broker_signing_key`, the broker passes the
 ///      upstream JWT through unchanged.
+///  10. Re-sign the exchanged JWT with any DPoP and verified mTLS
+///      confirmation claims established by the shared endpoint seam.
 ///
 /// `_method` is the inbound client-auth method detected by the
 /// caller in `token::token`; the token-endpoint preflight already
 /// rejected an unaccepted method, so this handler trusts the gate
 /// and only consumes the value for audit logging in future slices.
-/// `_dpop_proof` is the verified RFC 9449 proof, also consumed by
-/// later slices when the broker mints `cnf.jkt`-bound tokens.
+/// `dpop_proof` and `verified_client_certificate` are verified identity
+/// supplied by the shared token-endpoint preflight and the host TLS seam;
+/// successful exchanged tokens are freshly re-signed with both bindings.
 pub async fn handle_token_exchange(
     app: &AppState,
     form: &HashMap<String, String>,
     _method: ClientAuthMethod,
-    _dpop_proof: Option<&DpopProof>,
+    dpop_proof: Option<&DpopProof>,
+    verified_client_certificate: Option<&crate::VerifiedClientCertificate>,
 ) -> Response {
     let cfg = &app.config;
 
@@ -308,6 +312,19 @@ pub async fn handle_token_exchange(
         _ => None,
     };
 
+    // The subject is an access token being presented to this token
+    // endpoint, so RFC 9449 binds the proof to its hash. Run this after
+    // structural/policy validation so malformed exchanges retain their
+    // precise OAuth errors, but before any token is forwarded upstream.
+    if let Err(description) = crate::token::require_access_token_ath(dpop_proof, &subject_token) {
+        crate::metrics::record_dpop("rejected");
+        return crate::token::oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_dpop_proof",
+            &description,
+        );
+    }
+
     // --- 7. Forward to upstream /token ---
     if cfg.upstream_token_endpoint_url.is_empty() {
         return crate::token::oauth_error(
@@ -374,25 +391,42 @@ pub async fn handle_token_exchange(
     // the upstream JWT passes through unchanged and the broker still
     // adds the missing `issued_token_type` to the wrapper for RFC
     // 8693 §2.2.1 compliance.
-    let body_bytes = if status.is_success() {
+    let mut body_bytes = if status.is_success() {
         match inject_act_envelope(
             &body_bytes,
             &claims,
             cfg.broker_signing_key.as_ref(),
             agent_profile.as_ref(),
+            &crate::well_known::broker_issuer(cfg),
         ) {
             Ok(b) => b,
             Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "act-envelope injection skipped; passing upstream body through"
+                tracing::warn!(error = %e, "act-envelope issuance failed closed");
+                return crate::token::oauth_error(
+                    StatusCode::BAD_GATEWAY,
+                    "server_error",
+                    "broker could not issue a delegated access token",
                 );
-                body_bytes
             }
         }
     } else {
         body_bytes
     };
+
+    if status.is_success() {
+        body_bytes =
+            match apply_sender_bindings(cfg, body_bytes, dpop_proof, verified_client_certificate) {
+                Ok(body) => body,
+                Err(error) => {
+                    tracing::warn!(%error, "token-exchange sender binding failed closed");
+                    return crate::token::oauth_error(
+                        StatusCode::BAD_GATEWAY,
+                        "server_error",
+                        "broker could not sender-constrain exchanged token",
+                    );
+                }
+            };
+    }
 
     // --- Pass-through response ---
     let mut response = Response::builder()
@@ -421,6 +455,34 @@ pub async fn handle_token_exchange(
         .headers_mut()
         .insert("Pragma", axum::http::HeaderValue::from_static("no-cache"));
     response
+}
+
+fn apply_sender_bindings(
+    cfg: &crate::config::McpGatewayConfig,
+    mut body: bytes::Bytes,
+    dpop_proof: Option<&DpopProof>,
+    verified_client_certificate: Option<&crate::VerifiedClientCertificate>,
+) -> Result<bytes::Bytes, anyhow::Error> {
+    let broker_issuer = crate::well_known::broker_issuer(cfg);
+    if let Some(proof) = dpop_proof {
+        body = crate::token::inject_cnf_jkt(
+            &body,
+            proof,
+            cfg.broker_signing_key.as_ref(),
+            &broker_issuer,
+        )
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    }
+    if let Some(certificate) = verified_client_certificate {
+        body = crate::mtls_binding::inject_cnf_x5t_s256_thumbprint(
+            &body,
+            &certificate.x5t_s256,
+            cfg.broker_signing_key.as_ref(),
+            &broker_issuer,
+        )
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    }
+    Ok(body)
 }
 
 // --- act-envelope injection ---
@@ -459,12 +521,8 @@ pub fn gen_transaction_id() -> String {
 ///   Rewriting the JWT payload while preserving the upstream
 ///   signature would yield a token that fails verification at every
 ///   downstream resource server.
-/// * **Broker has a signing key (follow-up):** the broker re-mints
-///   the access token via [`crate::at_jwt::mint_at_jwt`] with the new
-///   `act` envelope. That re-issuance pipeline is outside the WOR-47
-///   blast radius and lands in a focused follow-up; today the
-///   function falls back to pass-through and emits a debug log so
-///   integrators know the rewrite was skipped.
+/// * **Broker has a signing key:** the broker re-mints the access token
+///   with the new `act` envelope and a fresh signature/issuer/jti.
 ///
 /// Bodies that are not JSON-shaped pass through untouched.
 pub fn inject_act_envelope(
@@ -472,6 +530,7 @@ pub fn inject_act_envelope(
     subject: &SubjectClaims,
     broker_signing_key: Option<&crate::config::JwkKey>,
     agent_profile: Option<&AgentProfileInputs>,
+    broker_issuer: &str,
 ) -> Result<bytes::Bytes, anyhow::Error> {
     let mut value: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("upstream body not JSON: {e}"))?;
@@ -489,25 +548,16 @@ pub fn inject_act_envelope(
             serde_json::Value::String(ISSUED_TOKEN_TYPE_JWT.to_string()),
         );
     }
-    if broker_signing_key.is_none() {
-        // FOLLOW-UP: when the broker can re-sign, decode the upstream
-        // claim set, swap the act envelope, and mint a fresh JWT via
-        // `at_jwt::mint_at_jwt`. Until then, refuse to mutate the
-        // payload behind a preserved signature.
-        tracing::debug!(
-            "act-envelope rewrite skipped: broker has no signing key, JWT passes through unchanged"
-        );
+    let Some(signing_key) = broker_signing_key else {
         return Ok(serialize_value(&value));
-    }
-    // Pull the existing access_token and try to rewrite its payload.
+    };
     let access_token = match obj.get("access_token").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
-        None => return Ok(serialize_value(&value)),
+        None => return Err(anyhow::anyhow!("upstream response missing access_token")),
     };
-    let rewritten = match rewrite_act(&access_token, subject, agent_profile) {
-        Some(t) => t,
-        None => return Ok(serialize_value(&value)),
-    };
+    let mutations = act_mutations(&access_token, subject, agent_profile)?;
+    let rewritten =
+        crate::at_jwt::resign_at_jwt(&access_token, signing_key, broker_issuer, &mutations)?;
     obj.insert(
         "access_token".to_string(),
         serde_json::Value::String(rewritten),
@@ -515,30 +565,33 @@ pub fn inject_act_envelope(
     Ok(serialize_value(&value))
 }
 
-/// Decode the JWT payload, mutate the `act` claim, and re-encode. The
-/// signature segment is preserved verbatim (the broker has no signing
-/// key in 4D.2; Wave 5 will optionally re-sign with a broker key).
-/// Returns `None` if the input is not a JWS Compact Serialization.
-fn rewrite_act(
+/// Build the claims a freshly signed broker token adds for RFC 8693.
+fn act_mutations(
     jwt: &str,
     subject: &SubjectClaims,
     agent_profile: Option<&AgentProfileInputs>,
-) -> Option<String> {
+) -> Result<serde_json::Map<String, serde_json::Value>, anyhow::Error> {
     let mut parts = jwt.split('.');
-    let header = parts.next()?;
-    let payload = parts.next()?;
-    let signature = parts.next()?;
+    let _header = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("access token is not a JWT"))?;
+    let payload = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("access token is not a JWT"))?;
+    let _signature = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("access token is not a JWT"))?;
     if parts.next().is_some() {
-        return None;
+        return Err(anyhow::anyhow!("access token is not a three-segment JWT"));
     }
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload)
-        .ok()?;
-    let mut value: serde_json::Value = serde_json::from_slice(&raw).ok()?;
-    let map = value.as_object_mut()?;
+        .map_err(|e| anyhow::anyhow!("access token payload decode failed: {e}"))?;
+    let value: serde_json::Value = serde_json::from_slice(&raw)
+        .map_err(|e| anyhow::anyhow!("access token payload is not JSON: {e}"))?;
     // Build the new act envelope. Existing `act` (if any) is preserved
     // as the inner act for chain auditing.
-    let prior_act = map.remove("act");
+    let prior_act = value.get("act").cloned();
     let mut new_act = serde_json::Map::new();
     if let Some(sub) = subject.sub.as_ref() {
         new_act.insert("sub".to_string(), serde_json::Value::String(sub.clone()));
@@ -549,30 +602,29 @@ fn rewrite_act(
     if let Some(prev) = prior_act {
         new_act.insert("act".to_string(), prev);
     }
-    map.insert("act".to_string(), serde_json::Value::Object(new_act));
+    let mut mutations = serde_json::Map::new();
+    mutations.insert("act".to_string(), serde_json::Value::Object(new_act));
 
     // WOR-521: stamp the draft-oauth-transaction-tokens-for-agents
     // claim set when the exchange requested the agent profile.
     if let Some(ap) = agent_profile {
-        map.insert(
+        mutations.insert(
             "actor".to_string(),
             serde_json::Value::String(ap.actor.clone()),
         );
-        map.insert(
+        mutations.insert(
             "principal".to_string(),
             serde_json::Value::String(ap.principal.clone()),
         );
-        map.insert("tnx".to_string(), serde_json::Value::String(ap.tnx.clone()));
+        mutations.insert("tnx".to_string(), serde_json::Value::String(ap.tnx.clone()));
         if let Some(purpose) = ap.purpose.as_deref() {
-            map.insert(
+            mutations.insert(
                 "purpose".to_string(),
                 serde_json::Value::String(crate::at_jwt::truncate_purpose(purpose)),
             );
         }
     }
-    let encoded =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&value).ok()?);
-    Some(format!("{header}.{encoded}.{signature}"))
+    Ok(mutations)
 }
 
 /// Serialize a JSON value into bytes::Bytes for response assembly.
@@ -734,11 +786,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn happy_path_to_upstream_502() {
-        // The upstream URL points at a closed port; the broker returns
-        // 502 with a server_error body once it gets past the policy
-        // checks. This exercises the full happy path right up to the
-        // network call.
+    async fn policy_valid_exchange_without_dpop_is_rejected_before_upstream() {
+        // The subject is an access token, so reaching the upstream also
+        // requires a DPoP proof whose ath covers it. A policy-valid
+        // exchange with no proof must stop at the last pre-network gate.
         let app = build_app(enabled_config());
         let token = fixture_jwt(serde_json::json!({
             "iss": "https://idp.example",
@@ -752,8 +803,8 @@ mod tests {
             urlencode("https://api.downstream"),
         );
         let (status, body) = post_form(app, "/mcp/oauth/token", &body).await;
-        assert_eq!(status, StatusCode::BAD_GATEWAY);
-        assert!(body.contains("server_error"));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("invalid_dpop_proof"));
     }
 
     /// WOR-40: token exchange with no client authentication material
@@ -892,7 +943,8 @@ mod tests {
             act: None,
         };
         // No signing key: pass-through.
-        let rewritten = inject_act_envelope(&body, &subject, None, None).unwrap();
+        let rewritten =
+            inject_act_envelope(&body, &subject, None, None, "https://broker.example").unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
         // access_token is unchanged.
         assert_eq!(parsed["access_token"].as_str().unwrap(), inner_jwt);
@@ -910,6 +962,111 @@ mod tests {
         let claims: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         assert_eq!(claims["act"]["sub"], "service-a");
         assert!(claims["act"].get("act").is_none());
+    }
+
+    #[test]
+    fn envelope_with_broker_key_is_resigned_after_act_mutation() {
+        let inner_jwt = fixture_jwt(serde_json::json!({
+            "iss": "https://idp.example",
+            "sub": "alice",
+            "aud": "https://api.downstream",
+            "exp": 4102444800_i64,
+            "iat": 1700000000_i64,
+            "jti": "old-jti",
+            "client_id": "client-1"
+        }));
+        let body = bytes::Bytes::from(
+            serde_json::json!({
+                "access_token": inner_jwt,
+                "token_type": "Bearer",
+                "issued_token_type": ISSUED_TOKEN_TYPE_JWT
+            })
+            .to_string(),
+        );
+        let subject = SubjectClaims {
+            iss: Some("https://idp.example".into()),
+            sub: Some("alice".into()),
+            act: None,
+        };
+        let key = crate::config::JwkKey::Pem {
+            pem: include_str!("../../sbproxy-modules/src/auth/dpop_test_ec_p256.pem").to_string(),
+            alg: "ES256".to_string(),
+            kid: Some("broker-key".to_string()),
+        };
+
+        let rewritten =
+            inject_act_envelope(&body, &subject, Some(&key), None, "https://broker.example")
+                .unwrap();
+        let wrapper: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+        let token = wrapper["access_token"].as_str().unwrap();
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(token.split('.').nth(1).unwrap())
+            .unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(claims["iss"], "https://broker.example");
+        assert_eq!(claims["act"]["sub"], "alice");
+        assert_ne!(token.split('.').nth(2), Some("sig"));
+    }
+
+    #[test]
+    fn exchanged_token_preserves_act_while_signing_dpop_and_mtls_bindings() {
+        let _env = crate::test_env::EnvVarGuard::set(&[(
+            "MCP_GATEWAY_BASE_URL",
+            Some("https://broker.example"),
+        )]);
+        let access_token = fixture_jwt(serde_json::json!({
+            "iss": "https://idp.example",
+            "sub": "alice",
+            "aud": "https://api.downstream",
+            "exp": 4102444800_i64,
+            "iat": 1700000000_i64,
+            "jti": "old-jti",
+            "client_id": "client-1",
+            "act": {"sub": "delegating-service"}
+        }));
+        let body = bytes::Bytes::from(
+            serde_json::json!({"access_token": access_token, "token_type": "Bearer"}).to_string(),
+        );
+        let jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(serde_json::json!({
+            "kty": "EC", "crv": "P-256",
+            "x": "EVs_o5-uQbTjL3chynL4wXgUg2R9q9UU8I5mEovUf84",
+            "y": "kGe5DgSIycKp8w9aJmoHhB1sB3QTugfnRWm5nU_TzsY"
+        }))
+        .unwrap();
+        let proof = DpopProof {
+            jwk,
+            jti: "exchange-jti".to_string(),
+            htm: "POST".to_string(),
+            htu: "https://broker.example/mcp/oauth/token".to_string(),
+            iat: 0,
+            nonce: None,
+            ath: Some("subject-token-hash".to_string()),
+            raw_jwt: "header.payload.proof-signature".to_string(),
+        };
+        let mut cfg = enabled_config();
+        cfg.broker_signing_key = Some(crate::config::JwkKey::Pem {
+            pem: include_str!("../../sbproxy-modules/src/auth/dpop_test_ec_p256.pem").to_string(),
+            alg: "ES256".to_string(),
+            kid: Some("broker-key".to_string()),
+        });
+        let certificate = crate::VerifiedClientCertificate {
+            x5t_s256: "verified-certificate-thumbprint".to_string(),
+        };
+
+        let bound = apply_sender_bindings(&cfg, body, Some(&proof), Some(&certificate)).unwrap();
+        let wrapper: serde_json::Value = serde_json::from_slice(&bound).unwrap();
+        let token = wrapper["access_token"].as_str().unwrap();
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(token.split('.').nth(1).unwrap())
+            .unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(claims["act"]["sub"], "delegating-service");
+        assert_eq!(
+            claims["cnf"]["jkt"],
+            crate::dpop::jwk_thumbprint(&proof.jwk).unwrap()
+        );
+        assert_eq!(claims["cnf"]["x5t#S256"], "verified-certificate-thumbprint");
+        assert_ne!(token.split('.').nth(2), Some("sig"));
     }
 
     /// WOR-521: the agent-profile claim set (actor / principal / tnx /
@@ -934,11 +1091,7 @@ mod tests {
             tnx: "abc123".into(),
             purpose: Some("clean up staging".into()),
         };
-        let out = rewrite_act(&jwt, &subject, Some(&ap)).expect("rewrite");
-        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(out.split('.').nth(1).unwrap())
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        let v = act_mutations(&jwt, &subject, Some(&ap)).expect("claims");
         assert_eq!(v["actor"], "agent-client");
         assert_eq!(v["principal"], "alice");
         assert_eq!(v["tnx"], "abc123");
@@ -961,11 +1114,7 @@ mod tests {
             sub: Some("alice".into()),
             act: None,
         };
-        let out = rewrite_act(&jwt, &subject, None).expect("rewrite");
-        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(out.split('.').nth(1).unwrap())
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        let v = act_mutations(&jwt, &subject, None).expect("claims");
         assert!(v.get("actor").is_none());
         assert!(v.get("principal").is_none());
         assert!(v.get("tnx").is_none());

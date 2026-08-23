@@ -3771,9 +3771,96 @@ pub(super) async fn handle_mcp_action(
     // from untrusted peers, so an external client cannot forge it.
     let listener_is_tls = ctx.tls_terminated;
     let connection_scheme = if listener_is_tls { "https" } else { "http" };
+    let req_path = session.req_header().uri.path().to_string();
 
-    // Transport trust runs before anything else this function can do,
-    // whatever the method. The well-known routes below read the tool
+    // The OAuth broker is part of this compiled MCP action and shares
+    // the same listener. Dispatch its route tree before MCP transport
+    // classification; OAuth requests intentionally carry no MCP protocol
+    // markers. Only identity established by sbproxy's normal auth/TLS
+    // phases crosses the adapter boundary.
+    if let Some(broker) = mcp
+        .oauth_broker
+        .as_ref()
+        .filter(|b| b.matches_path(&req_path))
+    {
+        const MAX_BROKER_REQUEST_BYTES: usize = 1024 * 1024;
+        if session
+            .req_header()
+            .headers
+            .get("content-length")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .is_some_and(|length| length > MAX_BROKER_REQUEST_BYTES)
+        {
+            send_error(session, 413, "OAuth broker request body too large").await?;
+            return Ok(());
+        }
+        let mut body = bytes::BytesMut::new();
+        while let Some(chunk) = session.read_request_body().await? {
+            if body.len().saturating_add(chunk.len()) > MAX_BROKER_REQUEST_BYTES {
+                send_error(session, 413, "OAuth broker request body too large").await?;
+                return Ok(());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let headers = request_headers
+            .iter()
+            .map(|(name, value)| (name.as_str().to_string(), value.as_bytes().to_vec()))
+            .collect();
+        let verified_client_certificate = super::request_phase::client_cert_x5t_s256(
+            session
+                .digest()
+                .and_then(|digest| digest.ssl_digest.as_deref()),
+        )
+        .map(|x5t_s256| sbproxy_mcp_gateway::VerifiedClientCertificate { x5t_s256 });
+        let authenticated_device_user = (ctx.auth_result.is_some()
+            && !ctx.principal.sub.trim().is_empty())
+        .then(|| sbproxy_mcp_gateway::AuthenticatedDeviceUser {
+            subject: ctx.principal.sub.clone(),
+        });
+        let response = broker
+            .dispatch(sbproxy_mcp_gateway::GatewayHttpRequest {
+                method: method.to_string(),
+                uri: session.req_header().uri.to_string(),
+                headers,
+                body: body.freeze(),
+                verified_client_certificate,
+                authenticated_device_user,
+            })
+            .await
+            .map_err(|error| {
+                Error::because(
+                    ErrorType::InternalError,
+                    "in-process MCP OAuth broker dispatch failed",
+                    error,
+                )
+            })?;
+        let mut header =
+            pingora_http::ResponseHeader::build(response.status, Some(response.headers.len() + 1))?;
+        for (name, value) in response.headers {
+            if !name.eq_ignore_ascii_case("content-length")
+                && !name.eq_ignore_ascii_case("transfer-encoding")
+                && !name.eq_ignore_ascii_case("connection")
+            {
+                let _ = header.insert_header(name, value);
+            }
+        }
+        let _ = header.insert_header("content-length", response.body.len().to_string());
+        session
+            .write_response_header(Box::new(header), response.body.is_empty())
+            .await?;
+        if !response.body.is_empty() {
+            session
+                .write_response_body(Some(response.body), true)
+                .await?;
+        }
+        return Ok(());
+    }
+
+    // Transport trust runs before any MCP-protocol route below. The
+    // OAuth broker above is a separate browser/token protocol surface;
+    // it has already gone through sbproxy's normal request phases.
+    // The well-known routes below read the tool
     // catalogue and start the federation, and a POST reaches authentication
     // before its body is ever scanned, so refusing later would mean a
     // disallowed Origin had already learned the catalogue, caused upstream
@@ -3820,7 +3907,68 @@ pub(super) async fn handle_mcp_action(
         }
     }
 
-    let req_path = session.req_header().uri.path();
+    let resource_metadata_path = mcp.resource_server.as_ref().map_or(
+        req_path == sbproxy_extension::mcp::discovery::OAUTH_PROTECTED_RESOURCE_PATH,
+        |provider| provider.matches_metadata_path(&req_path),
+    );
+    let resource_metadata_request = method == http::Method::GET && resource_metadata_path;
+
+    // Complementary resource-server authorization is enforced on the
+    // actual MCP action after transport trust but before catalogue reads,
+    // body parsing, or upstream dispatch. RFC 9728 metadata itself remains
+    // public for discovery.
+    if !resource_metadata_request {
+        if let Some(provider) = mcp.resource_server.as_ref() {
+            // DPoP htu validation is anchored to the configured resource
+            // origin, never the caller-controlled Host header. The path
+            // and query still come from the actual request target.
+            let mut request_url =
+                url::Url::parse(&provider.config().resource_uri).map_err(|error| {
+                    Error::because(
+                        ErrorType::InternalError,
+                        "invalid configured MCP resource URI",
+                        error,
+                    )
+                })?;
+            request_url.set_path(session.req_header().uri.path());
+            request_url.set_query(session.req_header().uri.query());
+            request_url.set_fragment(None);
+            let authorization = request_headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok());
+            let dpop = request_headers
+                .get("dpop")
+                .and_then(|value| value.to_str().ok());
+            let verified_certificate = super::request_phase::client_cert_x5t_s256(
+                session
+                    .digest()
+                    .and_then(|digest| digest.ssl_digest.as_deref()),
+            );
+            match provider
+                .authenticate_with_certificate(
+                    authorization,
+                    dpop,
+                    method.as_str(),
+                    &request_url,
+                    verified_certificate.as_deref(),
+                )
+                .await
+            {
+                Ok(token) => ctx.principal.sub = token.sub,
+                Err(error) => {
+                    let challenge = provider.www_authenticate_header(&error);
+                    let mut header = pingora_http::ResponseHeader::build(401, Some(3))?;
+                    let _ = header.insert_header("www-authenticate", challenge);
+                    let _ = header.insert_header("cache-control", "no-store");
+                    let _ = header.insert_header("content-length", "0");
+                    session
+                        .write_response_header(Box::new(header), true)
+                        .await?;
+                    return Ok(());
+                }
+            }
+        }
+    }
 
     // WOR-483: serve the federated tool catalogue as a typed
     // Cloudflare-Code-Mode TypeScript module at
@@ -3963,30 +4111,31 @@ pub(super) async fn handle_mcp_action(
     // WOR-806: RFC 9728 OAuth Protected Resource Metadata. Served only
     // when the gateway declares `oauth:`, so an agent can discover the
     // authorization server. Not configured -> not intercepted.
-    if method == http::Method::GET
-        && req_path == sbproxy_extension::mcp::discovery::OAUTH_PROTECTED_RESOURCE_PATH
-    {
+    if resource_metadata_request {
         if let Some(oauth) = mcp.oauth.as_ref() {
-            // Trust-bounded: `tls_terminated` is true for a TLS listener or a
-            // `X-Forwarded-Proto: https` stamped by a peer inside
-            // `proxy.trusted_proxies`. The request phase strips that header
-            // from untrusted peers, so an external client cannot forge it.
-            let listener_is_tls = ctx.tls_terminated;
-            let scheme = if listener_is_tls { "https" } else { "http" };
-            let resource = match session
-                .req_header()
-                .headers
-                .get("host")
-                .and_then(|v| v.to_str().ok())
-            {
-                Some(authority) => format!("{scheme}://{authority}/"),
-                None => "/".to_string(),
+            let doc = match mcp.resource_server.as_ref() {
+                Some(provider) => provider.metadata_document(),
+                None => {
+                    // Legacy discovery-only configuration retains its
+                    // request-derived resource. A compiled verifier always
+                    // publishes its trusted RFC 8707 resource URI instead.
+                    let scheme = if ctx.tls_terminated { "https" } else { "http" };
+                    let resource = match session
+                        .req_header()
+                        .headers
+                        .get("host")
+                        .and_then(|v| v.to_str().ok())
+                    {
+                        Some(authority) => format!("{scheme}://{authority}/"),
+                        None => "/".to_string(),
+                    };
+                    sbproxy_extension::mcp::discovery::build_oauth_protected_resource(
+                        &resource,
+                        &oauth.authorization_servers,
+                        &oauth.scopes_supported,
+                    )
+                }
             };
-            let doc = sbproxy_extension::mcp::discovery::build_oauth_protected_resource(
-                &resource,
-                &oauth.authorization_servers,
-                &oauth.scopes_supported,
-            );
             let body = serde_json::to_vec(&doc).unwrap_or_default();
             let mut header = pingora_http::ResponseHeader::build(200, Some(2)).map_err(|e| {
                 Error::because(
@@ -4014,7 +4163,7 @@ pub(super) async fn handle_mcp_action(
     // transport, and tool catalogue without first opening a JSON-RPC
     // session. Served for any origin whose action is the MCP gateway.
     if method == http::Method::GET
-        && sbproxy_extension::mcp::discovery::SERVER_MANIFEST_PATHS.contains(&req_path)
+        && sbproxy_extension::mcp::discovery::SERVER_MANIFEST_PATHS.contains(&req_path.as_str())
     {
         mcp.federation.ensure_ready(mcp.refresh_interval).await;
         // Own the path now so its borrow of `session` ends before the
@@ -11965,6 +12114,209 @@ mod mcp_catalog_snapshot_tests {
             "inputSchema": {"type": "object", "properties": {}},
             "_meta": {"sbproxy.dev/version": "1.0.0"}
         })
+    }
+
+    async fn mcp_http_exchange(
+        action: &McpAction,
+        method: &str,
+        path: &str,
+        extra_headers: &str,
+        body: &[u8],
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind MCP downstream fixture");
+        let address = listener.local_addr().expect("MCP downstream address");
+        let request_head = format!(
+            "{method} {path} HTTP/1.1\r\nHost: mcp.test\r\ncontent-length: {}\r\n{extra_headers}connection: close\r\n\r\n",
+            body.len()
+        );
+        let body = body.to_vec();
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream.write_all(request_head.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            response
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut session = Session::new_h1(Box::new(Stream::from(stream)));
+        session.as_downstream_mut().read_request().await.unwrap();
+        let mut context = RequestContext::new();
+        handle_mcp_action(&mut session, action, &mut context, false)
+            .await
+            .unwrap();
+        drop(session);
+        String::from_utf8(
+            tokio::time::timeout(Duration::from_secs(2), client)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn action_mcp_mounts_the_oauth_broker_in_the_same_process() {
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "federated_servers": [{"origin": "https://upstream.example/mcp"}],
+            "oauth": {
+                "authorization_servers": ["https://issuer.example"],
+                "broker": {
+                    "base_path": "/mcp/oauth",
+                    "external_base_url": "https://mcp.test",
+                    "upstream_authorization_server_url": "https://issuer.example/authorize",
+                    "upstream_redirect_uri": "https://mcp.test/mcp/oauth/callback",
+                    "resource_uri": "http://mcp.test/",
+                    "allowed_redirect_uris": ["https://client.example/callback"],
+                    "session_ttl_secs": 600
+                }
+            }
+        }))
+        .expect("integrated broker config compiles");
+
+        let response = mcp_http_exchange(&action, "GET", "/mcp/oauth/admin/status", "", b"").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn action_mcp_resource_provider_rejects_missing_token_before_dispatch() {
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "federated_servers": [{"origin": "https://upstream.example/mcp"}],
+            "oauth": {
+                "authorization_servers": ["https://issuer.example"],
+                "scopes_supported": ["tools:call"],
+                "resource_server": {
+                    "resource_uri": "http://mcp.test/",
+                    "authorization_servers": ["https://issuer.example"],
+                    "jwks_url": "http://127.0.0.1:1/jwks",
+                    "audience": "http://mcp.test/",
+                    "issuer": "https://issuer.example",
+                    "scopes_supported": ["tools:call"]
+                }
+            }
+        }))
+        .expect("integrated resource-server config compiles");
+
+        let response = mcp_http_exchange(
+            &action,
+            "POST",
+            "/",
+            "content-type: application/json\r\n",
+            br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+        assert!(response.to_ascii_lowercase().contains("www-authenticate"));
+    }
+
+    #[tokio::test]
+    async fn action_mcp_metadata_uses_the_verified_resource_configuration_not_host() {
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "federated_servers": [{"origin": "https://upstream.example/mcp"}],
+            "oauth": {
+                "authorization_servers": ["https://issuer.example"],
+                "scopes_supported": ["tools:call"],
+                "resource_server": {
+                    "resource_uri": "http://canonical-resource.example/mcp",
+                    "authorization_servers": ["https://issuer.example"],
+                    "jwks_url": "http://127.0.0.1:1/jwks",
+                    "audience": "http://canonical-resource.example/mcp",
+                    "issuer": "https://issuer.example",
+                    "scopes_supported": ["tools:call"]
+                }
+            }
+        }))
+        .expect("integrated resource-server config compiles");
+
+        let response = mcp_http_exchange(
+            &action,
+            "GET",
+            sbproxy_extension::mcp::discovery::OAUTH_PROTECTED_RESOURCE_PATH,
+            "",
+            b"",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(
+            response.contains("\"resource\":\"http://canonical-resource.example/mcp\""),
+            "{response}"
+        );
+        assert!(!response.contains("\"resource\":\"http://mcp.test/\""));
+    }
+
+    #[tokio::test]
+    async fn action_mcp_serves_the_resource_providers_configured_metadata_path() {
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "federated_servers": [{"origin": "https://upstream.example/mcp"}],
+            "oauth": {
+                "authorization_servers": ["https://issuer.example"],
+                "resource_server": {
+                    "resource_uri": "http://canonical-resource.example/mcp",
+                    "authorization_servers": ["https://issuer.example"],
+                    "jwks_url": "http://127.0.0.1:1/jwks",
+                    "audience": "http://canonical-resource.example/mcp",
+                    "issuer": "https://issuer.example",
+                    "metadata_path": "/oauth/resource-metadata"
+                }
+            }
+        }))
+        .expect("integrated resource-server config compiles");
+
+        let response = mcp_http_exchange(&action, "GET", "/oauth/resource-metadata", "", b"").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(
+            response.contains("\"resource\":\"http://canonical-resource.example/mcp\""),
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn action_mcp_does_not_exempt_non_get_requests_to_the_metadata_path() {
+        let action = McpAction::from_config(json!({
+            "type": "mcp",
+            "mode": "gateway",
+            "federated_servers": [{"origin": "https://upstream.example/mcp"}],
+            "oauth": {
+                "authorization_servers": ["https://issuer.example"],
+                "resource_server": {
+                    "resource_uri": "http://canonical-resource.example/mcp",
+                    "authorization_servers": ["https://issuer.example"],
+                    "jwks_url": "http://127.0.0.1:1/jwks",
+                    "audience": "http://canonical-resource.example/mcp",
+                    "issuer": "https://issuer.example",
+                    "metadata_path": "/oauth/resource-metadata"
+                }
+            }
+        }))
+        .expect("integrated resource-server config compiles");
+
+        let response = mcp_http_exchange(
+            &action,
+            "POST",
+            "/oauth/resource-metadata",
+            "authorization: Bearer attacker\r\ncontent-type: application/json\r\n",
+            br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+        assert!(
+            response.contains(
+                "resource_metadata=\"http://canonical-resource.example/oauth/resource-metadata\""
+            ),
+            "{response}"
+        );
+        assert!(!response.contains("canonical-resource.example/mcp/oauth"));
     }
 
     async fn mcp_handler_exchange(

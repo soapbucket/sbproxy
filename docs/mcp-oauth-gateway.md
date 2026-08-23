@@ -1,19 +1,11 @@
 # MCP OAuth gateway
 *Last modified: 2026-08-22*
 
-`sbproxy-mcp-gateway` is a standalone OAuth 2.1 broker for MCP servers
-that are **not** already fronted by an `sbproxy` proxy. It is a
-separate crate (and, if you build the example, a separate binary) from
-the main `sbproxy` request pipeline: point an existing MCP server at it
-for the token-issuance side of the flow, and optionally use its
-[resource-server companion](#resource-server-companion-not-fronted-by-sbproxy)
-to verify the tokens it issues.
-
-If your MCP server already runs behind `sbproxy` with `action: {type:
-mcp}`, you do not need this crate. [mcp.md](mcp.md)'s "OAuth auth
-discovery (RFC 9728)" section and `require_dpop` on the `jwt` auth
-provider already cover that path, wired into the live request
-pipeline. See [When to use which](#when-to-use-which) below.
+`sbproxy-mcp-gateway` provides the OAuth 2.1 broker and protected-resource
+authentication used by the live `action: {type: mcp}` request path. The
+same crate also exposes an axum router and resource-server provider for
+standalone MCP deployments. See [mcp.md](mcp.md)'s "OAuth auth discovery
+(RFC 9728)" section for the integrated configuration.
 
 ## What it implements
 
@@ -50,11 +42,14 @@ Every piece of state this crate holds (PKCE-adjacent session rows,
 DPoP replay jtis, device codes, PAR entries, the CIMD → DCR translation
 cache) is written against `sbproxy_storage::EphemeralKv` /
 `PersistentKv`. A single-replica deployment needs nothing external:
-`LocalStore` (this crate) is the in-process default, a plain
-`Mutex`-guarded map with lazy TTL eviction. Point multiple replicas at
-the same session state by constructing `sbproxy_storage::RedisStore`
-instead and passing it to the same constructors; nothing else in the
-broker's wiring changes.
+`LocalStore` (this crate) is the bounded in-process default and expires
+unrelated stale entries during normal reads and writes. Point multiple
+replicas at the same session state by constructing
+`sbproxy_storage::RedisStore` instead and passing it to the same
+constructors; nothing else in the broker's wiring changes. DPoP replay
+protection is atomic for callers sharing one in-process cache. A
+multi-replica store must provide an atomic consume-or-insert operation
+before it can give the same cross-replica guarantee.
 
 ## Quickstart
 
@@ -83,14 +78,17 @@ let app = router_full_with_par(
 );
 ```
 
-Every optional collaborator defaults to `None` via the plain
-`router(config, session_store)` constructor; reach for
-`router_full_with_par` once you know which of the optional RFCs your
-deployment needs. A minimal config only requires:
+The plain `router(config, session_store)` constructor wires bounded
+in-process collaborators for the features enabled by the config.
+`router_full_with_par` remains available when a deployment supplies
+shared or custom stores. A minimal config includes the broker's public
+origin and its registered upstream callback:
 
 ```rust
 McpGatewayConfig {
     base_path: "/mcp/oauth".to_string(),
+    external_base_url: "https://mcp.example.com".to_string(),
+    upstream_redirect_uri: "https://mcp.example.com/mcp/oauth/callback".to_string(),
     upstream_authorization_server_url: "https://idp.example.com/oauth/authorize".to_string(),
     upstream_token_endpoint_url: "https://idp.example.com/oauth/token".to_string(),
     resource_uri: "https://mcp.example.com".to_string(),
@@ -100,16 +98,17 @@ McpGatewayConfig {
 ```
 
 Run `sbproxy_mcp_gateway::config::validate_startup(&config)` before
-binding a listener: it fails fast when DPoP is turned on but
-`MCP_GATEWAY_BASE_URL` is unset, which would otherwise let the broker
-accept a proof it has no canonical URL to validate against.
+binding a listener. It rejects a missing canonical public origin when
+DPoP is enabled and rejects replay retention shorter than twice the
+allowed clock skew. `MCP_GATEWAY_BASE_URL` remains a legacy override
+for standalone deployments.
 
-## Resource-server companion, not fronted by sbproxy
+## Resource-server provider
 
 [`resource_server`](../crates/sbproxy-mcp-gateway/src/resource_server.rs)
-verifies the Bearer/DPoP tokens this broker issues, for an MCP server
-that runs entirely outside the `sbproxy` proxy (a bespoke server in any
-language, fronted by nothing sbproxy-related). It shares the exact
+verifies the Bearer/DPoP tokens this broker issues. The live MCP action
+uses it before catalog lookup or upstream dispatch, and a standalone
+server can call it from its own request handling. It shares the exact
 DPoP-verification code the broker uses to mint `cnf.jkt`-bound tokens
 (`dpop::parse_and_verify`, `dpop::jwk_thumbprint`), so a proof accepted
 on the issuance side and one accepted on the verification side can
@@ -118,8 +117,11 @@ never drift from each other.
 It covers JWKS-mode verification: signature, issuer, and audience via
 `jsonwebtoken`, plus RFC 8707 resource binding (the token's `resource`
 claim, or failing that its `aud` claim, must contain the configured
-`resource_uri`) and, when `dpop_enforce_binding` is set, RFC 9449 proof
-matching. RFC 7662 introspection-mode verification is **not** ported:
+`resource_uri`). A signed `cnf.jkt` token always requires a matching
+RFC 9449 proof, including `ath`, and a signed `cnf.x5t#S256` token
+always requires a directly verified TLS certificate identity. The
+provider also checks the process-local revocation denylist before JWKS
+verification. RFC 7662 introspection-mode verification is **not** ported:
 it would depend on an introspection auth provider that is itself a
 separate, not-yet-ported piece of the same disposition plan this crate
 came from (`oauth_introspection`, tracked as an independent ticket).
@@ -153,17 +155,9 @@ protected-resource document; mount it, unauthenticated, at
 
 | Your MCP server is... | Use |
 |---|---|
-| Proxied through `sbproxy` with `action: {type: mcp}` | The `oauth:` block on that action ([mcp.md](mcp.md)) for RFC 9728 discovery and the 401 challenge, plus the `jwt` auth provider's `audience` and `require_dpop` fields for token and DPoP validation. Already wired into the live request pipeline. |
+| Proxied through `sbproxy` with `action: {type: mcp}` | The action's nested `oauth.broker` and `oauth.resource_server` blocks ([mcp.md](mcp.md)). Broker routes, RFC 9728 metadata, RFC 8707 resource binding, DPoP, mTLS certificate binding, and revocation checks run in the live request pipeline. |
 | Not proxied through `sbproxy` at all | This crate's `resource_server` module, called directly from your server's own request handling. |
 | The token issuer (any MCP server needing PKCE/DPoP/CIMD/DCR in front of an upstream AS) | This crate's broker (`router`, `router_full_with_par`). Both halves work together regardless of which resource-server option the caller picked. |
-
-The `oauth:` block does not perform RFC 8707 resource-claim fallback
-binding today (it checks `aud` via the generic `jwt` provider's
-`Validation::set_audience`, not `resource`); that is a real, narrow gap
-worth closing there directly rather than by asking every non-proxied
-deployment to duplicate this crate's broker. Filed for a future pass
-rather than fixed here, since closing it means touching the shared
-`jwt` auth provider rather than this independent crate.
 
 ## Metrics
 
@@ -246,13 +240,9 @@ unconditionally) returns which optional collaborators are wired up:
 }
 ```
 
-This crate ships as an independent axum router rather than a module
-inside the main `sbproxy` binary, so it has no page in `ui/`, which is
-the admin console for that binary's own request pipeline. This
-endpoint is this crate's equivalent: a small JSON surface an operator
-(or a script, or a future `ui/` integration once a deployment wires
-this broker behind the main proxy) can poll without a Prometheus query
-client.
+The same endpoint is available from the integrated MCP action and the
+standalone axum router. It is a small JSON surface an operator or
+script can poll without a Prometheus query client.
 
 ## Adversarial coverage
 

@@ -360,7 +360,22 @@ pub async fn authorize(State(app): State<AppState>, Query(q): Query<AuthorizeQue
 
     // --- Build upstream redirect URL ---
 
-    let callback_url = format!("{}/callback", cfg.base_path.trim_end_matches('/'));
+    let callback_url = match url::Url::parse(&cfg.upstream_redirect_uri) {
+        Ok(url)
+            if matches!(url.scheme(), "https" | "http")
+                && url.has_host()
+                && url.fragment().is_none() =>
+        {
+            cfg.upstream_redirect_uri.clone()
+        }
+        _ => {
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "upstream_redirect_uri must be an absolute registered HTTP(S) URI",
+            );
+        }
+    };
     let upstream = match build_upstream_url(
         &cfg.upstream_authorization_server_url,
         &outbound_client_id,
@@ -523,6 +538,7 @@ mod tests {
             base_path: "/mcp/oauth".to_string(),
             upstream_authorization_server_url: "https://idp.example.com/oauth/authorize"
                 .to_string(),
+            upstream_redirect_uri: "https://broker.example/mcp/oauth/callback".to_string(),
             resource_uri: "https://mcp.example/api".to_string(),
             allowed_redirect_uris: vec!["https://client.example/cb".to_string()],
             session_ttl_secs: 600,
@@ -576,6 +592,7 @@ mod tests {
         assert!(loc.contains("code_challenge=abc"));
         assert!(loc.contains("code_challenge_method=S256"));
         assert!(loc.contains("resource=https%3A%2F%2Fmcp.example%2Fapi"));
+        assert!(loc.contains("redirect_uri=https%3A%2F%2Fbroker.example%2Fmcp%2Foauth%2Fcallback"));
         // Broker minted its own state and stored a row under it.
         let parsed = url::Url::parse(loc).unwrap();
         let upstream_state = parsed

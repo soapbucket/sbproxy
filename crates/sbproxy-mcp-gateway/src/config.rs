@@ -19,12 +19,21 @@ pub enum StartupConfigError {
     /// against the canonical /token URL.
     #[error(
         "DPoP is enabled (dpop_supported or dpop_require_nonce) but \
-         MCP_GATEWAY_BASE_URL is not set; refusing to boot. Set \
-         MCP_GATEWAY_BASE_URL to the broker's externally visible \
-         origin (e.g. https://broker.example) so DPoP htu validation \
+         neither external_base_url nor MCP_GATEWAY_BASE_URL is a canonical HTTP(S) origin; \
+         refusing to boot. Set external_base_url to the broker's externally visible \
+         origin without credentials, path, query, or fragment (e.g. https://broker.example) so DPoP htu validation \
          can compose the canonical token endpoint URL."
     )]
     DpopRequiresBaseUrl,
+    /// Replay entries would expire while an otherwise fresh proof can
+    /// still be accepted.
+    #[error("dpop_jti_ttl_secs ({ttl}) is shorter than the required replay window ({minimum})")]
+    DpopReplayWindowTooShort {
+        /// Configured replay TTL.
+        ttl: u64,
+        /// Minimum safe replay TTL.
+        minimum: u64,
+    },
 }
 
 /// Run startup-time validation against the broker config and process
@@ -36,13 +45,32 @@ pub enum StartupConfigError {
 /// Today the only enforced rule is the DPoP base-URL requirement
 /// (WOR-47): when DPoP is advertised or required, the broker must
 /// know its own canonical /token URL to validate the proof's `htu`
-/// claim. The URL is read from the `MCP_GATEWAY_BASE_URL`
-/// environment variable, mirroring the well-known doc and the
-/// device-code verification URI.
+/// claim. The URL comes from `external_base_url`; the
+/// `MCP_GATEWAY_BASE_URL` environment variable remains a backwards-
+/// compatible override.
 pub fn validate_startup(cfg: &McpGatewayConfig) -> Result<(), StartupConfigError> {
     if cfg.dpop_supported || cfg.dpop_require_nonce {
-        let base = std::env::var("MCP_GATEWAY_BASE_URL").unwrap_or_default();
-        if base.is_empty() {
+        let minimum = cfg.dpop_max_clock_skew_secs.saturating_mul(2);
+        if cfg.dpop_jti_ttl_secs < minimum {
+            return Err(StartupConfigError::DpopReplayWindowTooShort {
+                ttl: cfg.dpop_jti_ttl_secs,
+                minimum,
+            });
+        }
+        let base = std::env::var("MCP_GATEWAY_BASE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| cfg.external_base_url.clone());
+        let valid = url::Url::parse(&base).ok().is_some_and(|url| {
+            matches!(url.scheme(), "http" | "https")
+                && url.has_host()
+                && url.path() == "/"
+                && url.query().is_none()
+                && url.fragment().is_none()
+                && url.username().is_empty()
+                && url.password().is_none()
+        });
+        if !valid {
             return Err(StartupConfigError::DpopRequiresBaseUrl);
         }
     }
@@ -139,7 +167,7 @@ pub fn default_accepted_client_auth_methods() -> Vec<String> {
 /// private side. The variants are kept structural rather than tagged
 /// so deployers can paste either a PEM string or a JWK JSON document
 /// straight from their AS console.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum JwkKey {
     /// PEM-encoded private key (RSA or EC).
@@ -163,6 +191,30 @@ pub enum JwkKey {
     },
 }
 
+impl std::fmt::Debug for JwkKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pem { alg, kid, .. } => f
+                .debug_struct("Pem")
+                .field("pem", &"[REDACTED]")
+                .field("alg", alg)
+                .field("kid", kid)
+                .finish(),
+            Self::Jwk { jwk } => {
+                let kty = jwk.get("kty").and_then(serde_json::Value::as_str);
+                let alg = jwk.get("alg").and_then(serde_json::Value::as_str);
+                let kid = jwk.get("kid").and_then(serde_json::Value::as_str);
+                f.debug_struct("Jwk")
+                    .field("private_material", &"[REDACTED]")
+                    .field("kty", &kty)
+                    .field("alg", &alg)
+                    .field("kid", &kid)
+                    .finish()
+            }
+        }
+    }
+}
+
 // --- Config ---
 
 /// Broker-side configuration loaded from sb.yml or constructed in
@@ -176,11 +228,31 @@ pub struct McpGatewayConfig {
     /// router itself receives the prefix at construction time.
     pub base_path: String,
 
+    /// Externally visible absolute origin for this in-process broker.
+    /// Used to publish metadata and validate DPoP `htu`; the legacy
+    /// `MCP_GATEWAY_BASE_URL` environment variable remains an override.
+    #[serde(default)]
+    pub external_base_url: String,
+
     /// Upstream Authorization Server URL. The broker redirects the
     /// user agent here after validating the inbound /authorize
     /// request. Stored as a string and parsed at request time so
     /// config loading does not depend on the URL crate's Result type.
     pub upstream_authorization_server_url: String,
+
+    /// Absolute redirect URI registered with the upstream AS for the
+    /// broker callback. This same value is sent on both authorization
+    /// and authorization-code token requests; relative paths are
+    /// rejected rather than relying on an AS-specific base URL.
+    #[serde(default)]
+    pub upstream_redirect_uri: String,
+
+    /// RFC 8414 metadata document URL for the upstream AS. When set,
+    /// the ordinary in-process router builds its metadata cache from
+    /// this URL and RFC 9207 callback `iss` checks use the document's
+    /// declared issuer.
+    #[serde(default)]
+    pub upstream_metadata_url: Option<String>,
 
     /// Resource indicator (RFC 8707) the broker requires every
     /// inbound /authorize request to carry. The broker forwards the
@@ -242,8 +314,8 @@ pub struct McpGatewayConfig {
     /// key, and exposes the public half at `/.well-known/jwks.json`.
     /// When None the broker forwards upstream tokens unchanged.
     /// Re-signing of upstream-issued tokens is opt-in per the
-    /// integration site (Wave 4D.3d ships the helper; the
-    /// token_exchange wire-up lands in a focused follow-up).
+    /// integration site. DPoP, mTLS, and token-exchange mutations
+    /// require this key so the resulting claims are integrity bound.
     #[serde(default)]
     pub broker_signing_key: Option<JwkKey>,
 
@@ -445,7 +517,10 @@ impl Default for McpGatewayConfig {
     fn default() -> Self {
         Self {
             base_path: "/mcp/oauth".to_string(),
+            external_base_url: String::new(),
             upstream_authorization_server_url: String::new(),
+            upstream_redirect_uri: String::new(),
+            upstream_metadata_url: None,
             resource_uri: String::new(),
             resource_uri_allowlist: Vec::new(),
             allowed_redirect_uris: Vec::new(),
@@ -498,6 +573,24 @@ mod tests {
         assert_eq!(cfg.accepted_client_auth_methods.len(), 5);
         assert!(cfg.client_jwt_signing_key.is_none());
         assert!(cfg.dcr_upstream_shape.is_none());
+    }
+
+    #[test]
+    fn private_signing_material_is_redacted_from_debug() {
+        let key = JwkKey::Pem {
+            pem: "PRIVATE-PEM-SENTINEL".to_string(),
+            alg: "ES256".to_string(),
+            kid: Some("kid-1".to_string()),
+        };
+        let rendered = format!("{key:?}");
+        assert!(!rendered.contains("PRIVATE-PEM-SENTINEL"));
+        assert!(rendered.contains("[REDACTED]"));
+
+        let cfg = McpGatewayConfig {
+            broker_signing_key: Some(key),
+            ..McpGatewayConfig::default()
+        };
+        assert!(!format!("{cfg:?}").contains("PRIVATE-PEM-SENTINEL"));
     }
 
     #[test]
@@ -582,6 +675,52 @@ mod tests {
             ..Default::default()
         };
         validate_startup(&cfg).expect("base url present, validation should succeed");
+    }
+
+    #[test]
+    fn validate_startup_accepts_the_single_process_config_base_url() {
+        let _env = crate::test_env::EnvVarGuard::set(&[("MCP_GATEWAY_BASE_URL", None)]);
+        let cfg = McpGatewayConfig {
+            external_base_url: "https://broker.example".to_string(),
+            dpop_supported: true,
+            ..Default::default()
+        };
+        validate_startup(&cfg).expect("configured external base URL should be sufficient");
+    }
+
+    #[test]
+    fn validate_startup_rejects_a_non_origin_or_credentialed_public_base_url() {
+        for external_base_url in [
+            "https://broker.example/path",
+            "https://broker.example?tenant=one",
+            "https://user:secret@broker.example",
+        ] {
+            let cfg = McpGatewayConfig {
+                external_base_url: external_base_url.to_string(),
+                dpop_supported: true,
+                ..Default::default()
+            };
+            assert!(validate_startup(&cfg).is_err(), "{external_base_url}");
+        }
+    }
+
+    #[test]
+    fn validate_startup_rejects_a_replay_ttl_shorter_than_the_proof_window() {
+        let cfg = McpGatewayConfig {
+            external_base_url: "https://broker.example".to_string(),
+            dpop_supported: true,
+            dpop_max_clock_skew_secs: 30,
+            dpop_jti_ttl_secs: 59,
+            ..Default::default()
+        };
+        let error = validate_startup(&cfg).unwrap_err();
+        assert!(matches!(
+            error,
+            StartupConfigError::DpopReplayWindowTooShort {
+                ttl: 59,
+                minimum: 60
+            }
+        ));
     }
 
     /// WOR-47: when DPoP is fully disabled in config, the missing env

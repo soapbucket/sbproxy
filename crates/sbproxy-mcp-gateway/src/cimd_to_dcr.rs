@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 use reqwest::Client;
@@ -30,6 +30,8 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::cimd::ClientIdMetadataDocument;
+
+const MAX_DCR_RESPONSE_BYTES: usize = 64 * 1024;
 
 // --- Translated registration ---
 
@@ -40,7 +42,7 @@ use crate::cimd::ClientIdMetadataDocument;
 /// /authorize and /token requests in place of the original CIMD URL.
 /// `client_secret` is preserved when the upstream issues one (some
 /// flows still require a secret even for "public" clients).
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DcrRegisteredClient {
     /// Opaque identifier the upstream assigned to this client.
     pub registered_client_id: String,
@@ -51,6 +53,20 @@ pub struct DcrRegisteredClient {
     /// upstream-specific extensions.
     #[serde(default)]
     pub raw: Option<serde_json::Value>,
+}
+
+impl std::fmt::Debug for DcrRegisteredClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DcrRegisteredClient")
+            .field("registered_client_id", &self.registered_client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("raw", &self.raw.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 // --- Translator ---
@@ -80,16 +96,11 @@ pub async fn translate_cimd_to_dcr(
         .map_err(|e| anyhow!("upstream DCR call failed: {e}"))?;
 
     let status = resp.status();
-    let body_bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| anyhow!("upstream DCR body read failed: {e}"))?;
+    let body_bytes =
+        crate::remote_body::bounded_response_body(resp, MAX_DCR_RESPONSE_BYTES, "upstream DCR")
+            .await?;
     if !status.is_success() {
-        bail!(
-            "upstream DCR returned status {} body {}",
-            status,
-            String::from_utf8_lossy(&body_bytes)
-        );
+        bail!("upstream DCR returned status {status}");
     }
     let parsed: serde_json::Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| anyhow!("upstream DCR returned non-JSON: {e}"))?;
@@ -239,7 +250,12 @@ fn build_dcr_payload(doc: &ClientIdMetadataDocument) -> serde_json::Value {
 /// extension that supports content-addressed entries will replace it.
 pub struct CimdToDcrCache {
     entries: Mutex<HashMap<CacheKey, CachedRegistration>>,
+    ttl: Duration,
+    capacity: usize,
 }
+
+const DEFAULT_DCR_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const DEFAULT_DCR_CACHE_CAPACITY: usize = 1_024;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct CacheKey {
@@ -250,10 +266,8 @@ struct CacheKey {
 #[derive(Clone, Debug)]
 struct CachedRegistration {
     registration: DcrRegisteredClient,
-    /// When the entry was written. Held for log context and for a
-    /// future TTL extension; the cache currently relies on fingerprint
-    /// invalidation rather than wall-clock TTL.
-    #[allow(dead_code)]
+    /// When the entry was written, used for expiry and oldest-entry
+    /// eviction when capacity is reached.
     cached_at: Instant,
 }
 
@@ -266,9 +280,22 @@ impl Default for CimdToDcrCache {
 impl CimdToDcrCache {
     /// Build a fresh, empty cache.
     pub fn new() -> Self {
-        Self {
-            entries: Mutex::new(HashMap::new()),
+        Self::with_limits(DEFAULT_DCR_CACHE_TTL, DEFAULT_DCR_CACHE_CAPACITY)
+            .expect("non-zero default DCR cache limits")
+    }
+
+    /// Build a cache with explicit TTL and entry capacity. Expired
+    /// registrations are swept on every access; insertion at capacity
+    /// evicts the oldest remaining registration.
+    pub fn with_limits(ttl: Duration, capacity: usize) -> Result<Self> {
+        if ttl.is_zero() || capacity == 0 {
+            bail!("DCR cache TTL and capacity must be greater than zero");
         }
+        Ok(Self {
+            entries: Mutex::new(HashMap::new()),
+            ttl,
+            capacity,
+        })
     }
 
     /// Wrap in an `Arc` for handler injection.
@@ -284,7 +311,9 @@ impl CimdToDcrCache {
             url_hash: hash_url(cimd_url),
             fingerprint: *fingerprint,
         };
-        let guard = self.entries.lock().await;
+        let now = Instant::now();
+        let mut guard = self.entries.lock().await;
+        guard.retain(|_, cached| now.duration_since(cached.cached_at) < self.ttl);
         guard.get(&key).map(|c| c.registration.clone())
     }
 
@@ -300,11 +329,22 @@ impl CimdToDcrCache {
             fingerprint: *fingerprint,
         };
         let mut guard = self.entries.lock().await;
+        let now = Instant::now();
+        guard.retain(|_, cached| now.duration_since(cached.cached_at) < self.ttl);
+        if !guard.contains_key(&key) && guard.len() >= self.capacity {
+            if let Some(oldest) = guard
+                .iter()
+                .min_by_key(|(_, cached)| cached.cached_at)
+                .map(|(key, _)| key.clone())
+            {
+                guard.remove(&oldest);
+            }
+        }
         guard.insert(
             key,
             CachedRegistration {
                 registration,
-                cached_at: Instant::now(),
+                cached_at: now,
             },
         );
     }
@@ -338,13 +378,58 @@ impl CimdToDcrCache {
 /// each in turn.
 pub struct PersistentKvDcrCache {
     store: std::sync::Arc<dyn sbproxy_storage::PersistentKv>,
+    ttl: Duration,
+    capacity: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistentCachedRegistration {
+    registration: DcrRegisteredClient,
+    expires_at_unix: u64,
 }
 
 impl PersistentKvDcrCache {
     /// Build a cache backed by `store`. The store is held by `Arc`
     /// so the cache is cheap to clone for handler injection.
     pub fn new(store: std::sync::Arc<dyn sbproxy_storage::PersistentKv>) -> Self {
-        Self { store }
+        Self {
+            store,
+            ttl: DEFAULT_DCR_CACHE_TTL,
+            capacity: DEFAULT_DCR_CACHE_CAPACITY,
+        }
+    }
+
+    /// Build a persistent cache with an explicit registration TTL.
+    /// Expired entries are deleted on lookup so durable backends do
+    /// not retain stale unique fingerprint keys indefinitely.
+    pub fn with_ttl(
+        store: std::sync::Arc<dyn sbproxy_storage::PersistentKv>,
+        ttl: Duration,
+    ) -> Result<Self> {
+        if ttl.as_secs() == 0 {
+            bail!("persistent DCR cache TTL must be at least one second");
+        }
+        Ok(Self {
+            store,
+            ttl,
+            capacity: DEFAULT_DCR_CACHE_CAPACITY,
+        })
+    }
+
+    /// Build a persistent cache with explicit TTL and capacity.
+    pub fn with_limits(
+        store: std::sync::Arc<dyn sbproxy_storage::PersistentKv>,
+        ttl: Duration,
+        capacity: usize,
+    ) -> Result<Self> {
+        if ttl.as_secs() == 0 || capacity == 0 {
+            bail!("persistent DCR cache TTL must be at least one second and capacity must be non-zero");
+        }
+        Ok(Self {
+            store,
+            ttl,
+            capacity,
+        })
     }
 
     /// Construct and return as `Arc<Self>`.
@@ -368,8 +453,23 @@ impl PersistentKvDcrCache {
     /// stored bytes fail to deserialize (treat schema drift as miss).
     pub async fn get(&self, cimd_url: &str, fingerprint: &[u8; 32]) -> Option<DcrRegisteredClient> {
         let key = Self::cache_key(cimd_url, fingerprint);
+        if let Err(error) = self.reclaim_expired(None).await {
+            tracing::warn!(
+                target: "mcp_gateway::cimd_to_dcr",
+                %error,
+                "persistent DCR cache sweep failed"
+            );
+        }
         match self.store.get(&key).await {
-            Ok(Some(bytes)) => serde_json::from_slice::<DcrRegisteredClient>(&bytes).ok(),
+            Ok(Some(bytes)) => {
+                let cached = serde_json::from_slice::<PersistentCachedRegistration>(&bytes).ok()?;
+                if cached.expires_at_unix <= unix_now() {
+                    let _ = self.store.delete(&key).await;
+                    None
+                } else {
+                    Some(cached.registration)
+                }
+            }
             _ => None,
         }
     }
@@ -384,7 +484,19 @@ impl PersistentKvDcrCache {
         registration: DcrRegisteredClient,
     ) {
         let key = Self::cache_key(cimd_url, fingerprint);
-        match serde_json::to_vec(&registration) {
+        if let Err(error) = self.reclaim_expired(Some(&key)).await {
+            tracing::warn!(
+                target: "mcp_gateway::cimd_to_dcr",
+                %error,
+                "persistent DCR cache capacity check failed; registration not cached"
+            );
+            return;
+        }
+        let cached = PersistentCachedRegistration {
+            registration,
+            expires_at_unix: unix_now().saturating_add(self.ttl.as_secs()),
+        };
+        match serde_json::to_vec(&cached) {
             Ok(bytes) => {
                 if let Err(e) = self.store.put(&key, bytes::Bytes::from(bytes)).await {
                     tracing::warn!(
@@ -402,6 +514,33 @@ impl PersistentKvDcrCache {
                 );
             }
         }
+    }
+
+    async fn reclaim_expired(
+        &self,
+        incoming_key: Option<&str>,
+    ) -> Result<(), sbproxy_storage::StorageError> {
+        let now = unix_now();
+        let mut live = Vec::new();
+        for key in self.store.list_prefix("dcr:").await? {
+            let Some(bytes) = self.store.get(&key).await? else {
+                continue;
+            };
+            match serde_json::from_slice::<PersistentCachedRegistration>(&bytes) {
+                Ok(cached) if cached.expires_at_unix > now => {
+                    live.push((key, cached.expires_at_unix));
+                }
+                _ => self.store.delete(&key).await?,
+            }
+        }
+        if incoming_key.is_some_and(|incoming_key| {
+            !live.iter().any(|(key, _)| key == incoming_key) && live.len() >= self.capacity
+        }) {
+            if let Some((oldest, _)) = live.into_iter().min_by_key(|(_, expires_at)| *expires_at) {
+                self.store.delete(&oldest).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Invalidate every cached registration for `cimd_url` regardless
@@ -432,6 +571,13 @@ impl PersistentKvDcrCache {
             }
         }
     }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Lowercase hex encoding of a 32-byte hash. Used to render cache
@@ -497,6 +643,66 @@ mod tests {
     }
 
     // --- Fingerprint + cache unit tests ---
+
+    #[test]
+    fn registered_client_debug_redacts_secret_and_raw_response() {
+        let registration = DcrRegisteredClient {
+            registered_client_id: "client-id".to_string(),
+            client_secret: Some("super-secret".to_string()),
+            raw: Some(serde_json::json!({"client_secret":"raw-secret"})),
+        };
+        let rendered = format!("{registration:?}");
+        assert!(!rendered.contains("super-secret"), "{rendered}");
+        assert!(!rendered.contains("raw-secret"), "{rendered}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn in_memory_dcr_cache_expires_and_bounds_unique_keys() {
+        let cache = CimdToDcrCache::with_limits(Duration::from_millis(15), 1).unwrap();
+        let first_fp = [1_u8; 32];
+        cache
+            .put(
+                "https://first.example/cimd",
+                &first_fp,
+                fixture_registration("one"),
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let second_fp = [2_u8; 32];
+        cache
+            .put(
+                "https://second.example/cimd",
+                &second_fp,
+                fixture_registration("two"),
+            )
+            .await;
+        assert!(cache
+            .get("https://first.example/cimd", &first_fp)
+            .await
+            .is_none());
+        assert_eq!(
+            cache
+                .get("https://second.example/cimd", &second_fp)
+                .await
+                .unwrap()
+                .registered_client_id,
+            "two"
+        );
+
+        let third_fp = [3_u8; 32];
+        cache
+            .put(
+                "https://third.example/cimd",
+                &third_fp,
+                fixture_registration("three"),
+            )
+            .await;
+        assert!(cache
+            .get("https://second.example/cimd", &second_fp)
+            .await
+            .is_none());
+    }
 
     #[test]
     fn fingerprint_changes_with_etag() {
@@ -640,8 +846,11 @@ mod tests {
 
     #[tokio::test]
     async fn translate_propagates_upstream_failure() {
-        let server =
-            MockDcrServer::spawn(r#"{"error":"invalid_redirect_uri"}"#.to_string(), 400).await;
+        let server = MockDcrServer::spawn(
+            "{\"client_secret\":\"DCR-SECRET-SENTINEL\"}\nInjected-Log-Line".to_string(),
+            400,
+        )
+        .await;
         // Our toy HTTP responder always sets the literal " OK" reason
         // text; reqwest cares about the numeric status only.
         let http = Client::new();
@@ -650,6 +859,18 @@ mod tests {
             .await
             .expect_err("must fail on 400");
         assert!(err.to_string().contains("400"), "got: {err}");
+        assert!(!err.to_string().contains("DCR-SECRET-SENTINEL"));
+        assert!(!err.to_string().contains("Injected-Log-Line"));
+        assert!(!err.to_string().contains('\n'));
+    }
+
+    #[tokio::test]
+    async fn translate_rejects_an_oversized_dcr_response() {
+        let server = MockDcrServer::spawn("x".repeat(MAX_DCR_RESPONSE_BYTES + 1), 200).await;
+        let err = translate_cimd_to_dcr(&fixture_doc(), &server.url(), &Client::new())
+            .await
+            .expect_err("oversized response must be rejected while streaming");
+        assert!(err.to_string().contains("exceeds"), "{err}");
     }
 
     #[tokio::test]
@@ -706,6 +927,88 @@ mod tests {
         assert_eq!(got.registered_client_id, reg.registered_client_id);
         assert_eq!(got.client_secret, reg.client_secret);
         assert_eq!(got.raw, reg.raw);
+    }
+
+    #[tokio::test]
+    async fn persistent_kv_cache_reclaims_expired_unique_key() {
+        let kv = persistent_kv();
+        let cache = PersistentKvDcrCache::new(kv.clone());
+        let url = "https://expired.example/.well-known/cimd";
+        let fingerprint = [0x55_u8; 32];
+        let key = PersistentKvDcrCache::cache_key(url, &fingerprint);
+        let expired = PersistentCachedRegistration {
+            registration: fixture_registration("expired"),
+            expires_at_unix: 0,
+        };
+        kv.put(
+            &key,
+            bytes::Bytes::from(serde_json::to_vec(&expired).unwrap()),
+        )
+        .await
+        .unwrap();
+
+        assert!(cache.get(url, &fingerprint).await.is_none());
+        assert!(kv.get(&key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn persistent_kv_cache_reclaims_an_unrelated_expired_unique_key() {
+        let kv = persistent_kv();
+        let cache = PersistentKvDcrCache::new(kv.clone());
+        let expired_url = "https://unrelated-expired.example/.well-known/cimd";
+        let expired_fingerprint = [0x56_u8; 32];
+        let expired_key = PersistentKvDcrCache::cache_key(expired_url, &expired_fingerprint);
+        let expired = PersistentCachedRegistration {
+            registration: fixture_registration("expired"),
+            expires_at_unix: 0,
+        };
+        kv.put(
+            &expired_key,
+            bytes::Bytes::from(serde_json::to_vec(&expired).unwrap()),
+        )
+        .await
+        .unwrap();
+
+        cache
+            .put(
+                "https://live.example/.well-known/cimd",
+                &[0x57_u8; 32],
+                fixture_registration("live"),
+            )
+            .await;
+
+        assert!(kv.get(&expired_key).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn persistent_kv_cache_rejects_subsecond_ttl_it_cannot_encode() {
+        let result = PersistentKvDcrCache::with_ttl(persistent_kv(), Duration::from_millis(999));
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn persistent_kv_cache_evicts_at_its_explicit_capacity() {
+        let cache =
+            PersistentKvDcrCache::with_limits(persistent_kv(), Duration::from_secs(60), 1).unwrap();
+        let first_url = "https://first-capacity.example/.well-known/cimd";
+        let second_url = "https://second-capacity.example/.well-known/cimd";
+        let fingerprint = [0x58_u8; 32];
+        cache
+            .put(first_url, &fingerprint, fixture_registration("first"))
+            .await;
+        cache
+            .put(second_url, &fingerprint, fixture_registration("second"))
+            .await;
+
+        assert!(cache.get(first_url, &fingerprint).await.is_none());
+        assert_eq!(
+            cache
+                .get(second_url, &fingerprint)
+                .await
+                .unwrap()
+                .registered_client_id,
+            "second"
+        );
     }
 
     #[tokio::test]

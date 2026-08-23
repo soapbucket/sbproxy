@@ -24,6 +24,7 @@ use crate::AppState;
 /// Implicit grant is forbidden by OAuth 2.1; we drop it from any
 /// inbound `grant_types` list.
 const FORBIDDEN_GRANTS: &[&str] = &["password", "implicit"];
+const MAX_DCR_RESPONSE_BYTES: usize = 64 * 1024;
 
 // --- Helpers ---
 
@@ -226,11 +227,17 @@ pub async fn register(
     };
 
     let status = resp.status();
-    let body_bytes = match resp.bytes().await {
+    let body_bytes = match crate::remote_body::bounded_response_body(
+        resp,
+        MAX_DCR_RESPONSE_BYTES,
+        "upstream registration",
+    )
+    .await
+    {
         Ok(b) => b,
         Err(e) => {
             tracing::error!(
-                error = %sbproxy_httpkit::request_error_summary(&e),
+                error = %e,
                 "upstream /register body read failed"
             );
             return oauth_error(
@@ -240,6 +247,18 @@ pub async fn register(
             );
         }
     };
+
+    if !status.is_success() {
+        tracing::warn!(
+            upstream_status = %status,
+            "upstream /register rejected request; response body suppressed"
+        );
+        return oauth_error(
+            axum::http::StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            "invalid_client_metadata",
+            "upstream registration rejected request",
+        );
+    }
 
     Response::builder()
         .status(
@@ -274,7 +293,27 @@ mod tests {
     use http_body_util::BodyExt;
     use std::sync::Arc;
     use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
     use tower::ServiceExt;
+
+    async fn response_server(status: &str, body: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = status.to_string();
+        let body = body.to_string();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        format!("http://{address}/register")
+    }
 
     fn cfg_with_upstream(url: Option<&str>, shape: Option<&str>) -> McpGatewayConfig {
         // Default-driven fixture so newly-added McpGatewayConfig
@@ -392,6 +431,27 @@ mod tests {
         // Validation succeeds; the upstream call fails closed at the
         // network layer, mapped to 502.
         assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn upstream_registration_error_body_is_not_reflected_to_the_client() {
+        let upstream = response_server(
+            "400 Bad Request",
+            "{\"client_secret\":\"REGISTER-SECRET-SENTINEL\"}\nInjected-Header: yes",
+        )
+        .await;
+        let app = build_app(cfg_with_upstream(Some(&upstream), None));
+        let (status, body) = post_json(
+            app,
+            "/mcp/oauth/register",
+            serde_json::json!({
+                "redirect_uris": ["https://client.example/cb"],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!body.contains("REGISTER-SECRET-SENTINEL"), "{body}");
+        assert!(!body.contains("Injected-Header"), "{body}");
     }
 
     #[test]

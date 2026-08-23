@@ -17,11 +17,12 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use axum::{
-    extract::State,
+    extract::{Extension, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Form, Json,
 };
+use base64::Engine;
 
 use crate::client_auth::{detect_method, ensure_method_accepted, ClientAuthMethod};
 use crate::dpop::{jwk_thumbprint, parse_and_verify, DpopError, DpopProof};
@@ -66,9 +67,15 @@ pub(crate) fn dpop_nonce_challenge(error: &str, description: &str, nonce: &str) 
 
 /// Build the canonical /token URL from broker config. Tests use a
 /// loopback URL at port 1; production deployments derive the host from
-/// `MCP_GATEWAY_BASE_URL` (the same env hook the well-known doc reads).
+/// config, with the legacy environment hook taking precedence.
 fn token_endpoint_url_for_proof(cfg: &crate::config::McpGatewayConfig) -> Option<url::Url> {
-    let base = std::env::var("MCP_GATEWAY_BASE_URL").ok()?;
+    let base = std::env::var("MCP_GATEWAY_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| cfg.external_base_url.clone());
+    if base.is_empty() {
+        return None;
+    }
     let path = cfg.base_path.trim_end_matches('/');
     let full = format!("{}{}/token", base.trim_end_matches('/'), path);
     url::Url::parse(&full).ok()
@@ -79,6 +86,7 @@ fn token_endpoint_url_for_proof(cfg: &crate::config::McpGatewayConfig) -> Option
 /// `POST {base_path}/token` handler.
 pub async fn token(
     State(app): State<AppState>,
+    verified_client_cert: Option<Extension<crate::mtls_binding::VerifiedClientCertificate>>,
     headers: HeaderMap,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
@@ -154,7 +162,6 @@ pub async fn token(
             return oauth_error(StatusCode::BAD_REQUEST, "invalid_dpop_proof", &desc);
         }
     };
-
     // --- Client authentication detection ---
     let (method, cid) = match detect_method(&headers, &form) {
         Ok(m) => m,
@@ -185,6 +192,9 @@ pub async fn token(
                 &form,
                 method,
                 dpop_proof.as_ref(),
+                verified_client_cert
+                    .as_ref()
+                    .map(|Extension(certificate)| certificate),
             )
             .await;
         }
@@ -293,6 +303,23 @@ pub async fn token(
 
     // --- Build forwarded form ---
     let mut forwarded = form.clone();
+    if grant_type == "authorization_code" {
+        if url::Url::parse(&cfg.upstream_redirect_uri)
+            .ok()
+            .filter(|url| matches!(url.scheme(), "https" | "http") && url.has_host())
+            .is_none()
+        {
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "upstream_redirect_uri must be an absolute registered HTTP(S) URI",
+            );
+        }
+        forwarded.insert(
+            "redirect_uri".to_string(),
+            cfg.upstream_redirect_uri.clone(),
+        );
+    }
     if !forwarded.contains_key("resource") && !cfg.resource_uri.is_empty() {
         // RFC 8707: bind the issued token to a specific resource.
         forwarded.insert("resource".to_string(), cfg.resource_uri.clone());
@@ -408,15 +435,9 @@ pub async fn token(
     // --- DPoP cnf.jkt injection (RFC 9449 §6) ---
     //
     // When the request carried a valid DPoP proof and the upstream
-    // returned a 2xx, the broker either:
-    //   * passes the upstream body through unchanged (when the broker
-    //     has no signing key), preserving the upstream's `token_type`
-    //     so resource servers cannot be tricked into accepting a
-    //     bearer-replayable token labeled "DPoP"; or
-    //   * rewrites the wrapper for opaque tokens (no JWT payload to
-    //     bind), or re-issues a fresh broker-signed JWT carrying
-    //     `cnf.jkt` inside the JWT payload (broker re-issuance is a
-    //     follow-up, see at_jwt::mint_at_jwt).
+    // returned a 2xx, the broker re-issues a fresh broker-signed JWT
+    // carrying `cnf.jkt`. Opaque tokens and missing signing keys fail
+    // closed rather than advertising a wrapper-only binding.
     //
     // Pre-WOR-47 the broker rewrote the wrapper to claim `token_type:
     // DPoP` and inject a top-level `cnf.jkt` even though the inner JWT
@@ -424,11 +445,21 @@ pub async fn token(
     // `cnf.jkt` only inside the JWT payload, so the rewrite produced
     // bearer-replayable tokens dressed up as sender-constrained ones.
     let body_bytes = if let (Some(proof), true) = (dpop_proof.as_ref(), status.is_success()) {
-        match inject_cnf_jkt(&body_bytes, proof, cfg.broker_signing_key.as_ref()) {
+        let broker_issuer = crate::well_known::broker_issuer(cfg);
+        match inject_cnf_jkt(
+            &body_bytes,
+            proof,
+            cfg.broker_signing_key.as_ref(),
+            &broker_issuer,
+        ) {
             Ok(b) => b,
             Err(e) => {
-                tracing::warn!(error = %e, "DPoP cnf.jkt injection failed; passing upstream body through");
-                body_bytes
+                tracing::warn!(error = %e, "DPoP cnf.jkt issuance failed closed");
+                return oauth_error(
+                    StatusCode::BAD_GATEWAY,
+                    "server_error",
+                    "broker could not issue a sender-constrained access token",
+                );
             }
         }
     } else {
@@ -437,27 +468,29 @@ pub async fn token(
 
     // --- RFC 8705 cnf.x5t#S256 injection (WOR-517) ---
     //
-    // When the inbound request rode an mTLS channel (cert handed over
-    // via the XFCC header), and the upstream issuance succeeded, bind
-    // the access token to the client cert via the SHA-256 thumbprint
-    // RFC 8705 §3.1 specifies. JWT-shaped tokens are passed through
-    // when the broker cannot re-sign (same WOR-47 fail-safe the DPoP
-    // path uses); opaque tokens get the wrapper-level cnf so resource
-    // servers see the binding via introspection.
+    // When the host established a verified client certificate and the
+    // upstream issuance succeeded, bind a freshly signed JWT to its
+    // SHA-256 thumbprint. Raw forwarded certificate headers are never
+    // read by this handler.
     let body_bytes = if status.is_success() {
-        if let Some(cert_der) = crate::mtls_binding::extract_client_cert_der(&headers) {
-            match crate::mtls_binding::inject_cnf_x5t_s256(
+        if let Some(Extension(cert)) = verified_client_cert {
+            match crate::mtls_binding::inject_cnf_x5t_s256_thumbprint(
                 &body_bytes,
-                &cert_der,
+                &cert.x5t_s256,
                 cfg.broker_signing_key.as_ref(),
+                &crate::well_known::broker_issuer(cfg),
             ) {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        "mTLS cnf.x5t#S256 injection failed; passing body through"
+                        "mTLS cnf.x5t#S256 issuance failed closed"
                     );
-                    body_bytes
+                    return oauth_error(
+                        StatusCode::BAD_GATEWAY,
+                        "server_error",
+                        "broker could not issue an mTLS-bound access token",
+                    );
                 }
             }
         } else {
@@ -549,7 +582,7 @@ pub(crate) async fn process_dpop(
     let token_url = match token_endpoint_url_for_proof(cfg) {
         Some(u) => u,
         None => {
-            // Without MCP_GATEWAY_BASE_URL we cannot construct the
+            // Without a configured canonical base URL we cannot construct the
             // canonical URL the proof's `htu` is matched against. Fail
             // closed whenever DPoP is advertised so a misconfigured
             // deployment cannot silently downgrade a sender-constrained
@@ -559,10 +592,12 @@ pub(crate) async fn process_dpop(
             // defense for hot-reloaded configs.
             if cfg.dpop_supported || cfg.dpop_require_nonce {
                 return Err(DpopProcessError::ProofInvalid(
-                    "MCP_GATEWAY_BASE_URL not set; refusing to validate DPoP htu".to_string(),
+                    "external broker base URL not set; refusing to validate DPoP htu".to_string(),
                 ));
             }
-            tracing::debug!("MCP_GATEWAY_BASE_URL not set; DPoP not advertised; ignoring proof");
+            tracing::debug!(
+                "external broker base URL not set; DPoP not advertised; ignoring proof"
+            );
             return Ok(None);
         }
     };
@@ -608,13 +643,47 @@ pub(crate) async fn process_dpop(
     }
 
     // --- Replay check ---
-    if let Some(replay) = &app.dpop_replay {
-        if let Err(e) = replay.record_jti(&proof).await {
-            return Err(DpopProcessError::ProofInvalid(format!("{e}")));
-        }
+    let replay = app.dpop_replay.as_ref().ok_or_else(|| {
+        DpopProcessError::ProofInvalid(
+            "DPoP replay protection is unavailable; refusing proof".to_string(),
+        )
+    })?;
+    if let Err(e) = replay.record_jti(&proof).await {
+        return Err(DpopProcessError::ProofInvalid(format!("{e}")));
     }
 
     Ok(Some(proof))
+}
+
+pub(crate) fn require_access_token_ath(
+    proof: Option<&DpopProof>,
+    access_token: &str,
+) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+
+    let proof = proof.ok_or_else(|| {
+        "a DPoP proof is required when an access token is used at the token endpoint".to_string()
+    })?;
+    let actual = proof
+        .ath
+        .as_deref()
+        .ok_or_else(|| "DPoP proof is missing required ath claim".to_string())?;
+    let expected = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(Sha256::digest(access_token.as_bytes()));
+    if !constant_time_eq(actual.as_bytes(), expected.as_bytes()) {
+        return Err("DPoP ath does not match the access token".to_string());
+    }
+    Ok(())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right.iter())
+        .fold(0_u8, |diff, (a, b)| diff | (a ^ b))
+        == 0
 }
 
 /// Inject `cnf.jkt` into the upstream's JSON token response.
@@ -622,22 +691,12 @@ pub(crate) async fn process_dpop(
 /// Behavior is chosen to avoid the WOR-47 trap (bearer-replayable
 /// token labeled DPoP):
 ///
-/// * **JWT access_token + no broker signing key:** the broker cannot
-///   produce a JWT with `cnf.jkt` in the payload and the resource
-///   server only honours the JWT-internal claim, so the wrapper is
-///   passed through unchanged. The upstream's `token_type` is
-///   preserved (Bearer stays Bearer); claiming DPoP here would be a
-///   security bug.
-/// * **JWT access_token + broker signing key:** broker re-issuance
-///   is a follow-up. For now the broker logs and passes through.
-/// * **Opaque access_token (not a JWS Compact Serialization) + valid
-///   proof:** the wrapper is decorated with the top-level
-///   `cnf.jkt` so resource servers that consult opaque-token
-///   introspection (which surfaces wrapper-level cnf) still get the
-///   binding, and `token_type` is rewritten to `DPoP`. RFC 9449 §6
-///   permits the binding to live next to the access_token; only the
-///   JWT path requires it inside the payload.
-/// * **Body not JSON-shaped:** passed through.
+/// * **JWT access_token + no broker signing key:** fail closed. The
+///   broker cannot produce a JWT with `cnf.jkt` in its signed payload.
+/// * **JWT access_token + broker signing key:** re-issue the token
+///   with a signed `cnf.jkt` claim and fresh broker timestamps.
+/// * **Opaque access_token or malformed/non-object body:** fail closed
+///   because this provider verifies signed JWT claims.
 ///
 /// Visibility note: this is `pub` rather than module-private so the
 /// integration test in `tests/prompt_injection_corpus.rs` can drive
@@ -647,10 +706,11 @@ pub fn inject_cnf_jkt(
     body: &bytes::Bytes,
     proof: &DpopProof,
     broker_signing_key: Option<&crate::config::JwkKey>,
+    broker_issuer: &str,
 ) -> Result<bytes::Bytes, DpopError> {
     let body_is_secret_reference = std::str::from_utf8(body)
         .ok()
-        .is_some_and(|text| sbproxy_vault::looks_like_secret_reference_uri(text));
+        .is_some_and(sbproxy_vault::looks_like_secret_reference_uri);
     if body_is_secret_reference {
         return Err(DpopError::PayloadInvalid(
             "upstream token response is a secret reference".to_string(),
@@ -658,10 +718,9 @@ pub fn inject_cnf_jkt(
     }
     let mut value: serde_json::Value = serde_json::from_slice(body)
         .map_err(|e| DpopError::PayloadInvalid(format!("upstream body: {e}")))?;
-    let obj = match value.as_object_mut() {
-        Some(o) => o,
-        None => return Ok(body.clone()),
-    };
+    let obj = value.as_object_mut().ok_or_else(|| {
+        DpopError::PayloadInvalid("upstream token response must be a JSON object".to_string())
+    })?;
     // Inspect the access_token shape. JWS Compact Serialization is
     // three base64url segments separated by dots; everything else is
     // treated as opaque (introspection-style) tokens.
@@ -673,22 +732,33 @@ pub fn inject_cnf_jkt(
         .as_deref()
         .map(|t| t.split('.').count() == 3)
         .unwrap_or(false);
-    if token_is_jwt && broker_signing_key.is_none() {
-        // FOLLOW-UP: when broker_signing_key is configured, re-mint
-        // the access_token with `cnf.jkt` in the JWT payload via
-        // crate::at_jwt::mint_at_jwt. That requires copying the
-        // upstream claim set and signing it as the broker, a
-        // behavior change that warrants its own design slice. Until
-        // then, refuse to claim DPoP on a token we cannot bind.
-        tracing::warn!(
-            "DPoP proof present but broker has no signing key; preserving upstream Bearer token"
-        );
-        return Ok(body.clone());
+    if !token_is_jwt {
+        return Err(DpopError::PayloadInvalid(
+            "DPoP binding requires a JWT access token".to_string(),
+        ));
     }
+    let signing_key = broker_signing_key.ok_or_else(|| {
+        DpopError::PayloadInvalid(
+            "DPoP binding requires a configured broker signing key".to_string(),
+        )
+    })?;
+    let access_token = access_token.ok_or_else(|| {
+        DpopError::PayloadInvalid("upstream response missing access_token".to_string())
+    })?;
     let jkt = jwk_thumbprint(&proof.jwk)?;
-    let mut cnf = serde_json::Map::new();
+    let mut cnf = crate::mtls_binding::signed_cnf_from_token(&access_token)
+        .map_err(|error| DpopError::PayloadInvalid(error.to_string()))?;
     cnf.insert("jkt".to_string(), serde_json::Value::String(jkt));
-    obj.insert("cnf".to_string(), serde_json::Value::Object(cnf));
+    let mut mutations = serde_json::Map::new();
+    mutations.insert("cnf".to_string(), serde_json::Value::Object(cnf));
+    let resigned =
+        crate::at_jwt::resign_at_jwt(&access_token, signing_key, broker_issuer, &mutations)
+            .map_err(|e| DpopError::PayloadInvalid(e.to_string()))?;
+    obj.insert(
+        "access_token".to_string(),
+        serde_json::Value::String(resigned),
+    );
+    obj.remove("cnf");
     obj.insert(
         "token_type".to_string(),
         serde_json::Value::String("DPoP".to_string()),
@@ -900,11 +970,21 @@ async fn handle_device_code_grant(
         }
     };
     let body_bytes = if let Some(proof) = dpop_proof {
-        match inject_cnf_jkt(&body_bytes, proof, cfg.broker_signing_key.as_ref()) {
+        let broker_issuer = crate::well_known::broker_issuer(cfg);
+        match inject_cnf_jkt(
+            &body_bytes,
+            proof,
+            cfg.broker_signing_key.as_ref(),
+            &broker_issuer,
+        ) {
             Ok(b) => b,
             Err(e) => {
-                tracing::warn!(error = %e, "device_code: cnf.jkt injection failed");
-                body_bytes
+                tracing::warn!(error = %e, "device_code: cnf.jkt issuance failed closed");
+                return oauth_error(
+                    StatusCode::BAD_GATEWAY,
+                    "server_error",
+                    "broker could not issue a sender-constrained access token",
+                );
             }
         }
     } else {
@@ -967,6 +1047,7 @@ mod tests {
             upstream_token_endpoint_url: "http://127.0.0.1:1/token".to_string(),
             upstream_authorization_server_url: "https://idp.example.com/oauth/authorize"
                 .to_string(),
+            upstream_redirect_uri: "https://broker.example/mcp/oauth/callback".to_string(),
             resource_uri: "https://mcp.example/api".to_string(),
             allowed_redirect_uris: vec!["https://client.example/cb".to_string()],
             ..McpGatewayConfig::default()
@@ -1120,6 +1201,131 @@ mod tests {
 
     // --- DPoP integration tests ---
 
+    fn token_endpoint_dpop_proof(jti: &str, ath: Option<&str>) -> String {
+        use jsonwebtoken::{Algorithm, EncodingKey, Header};
+        const PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgevZzL1gdAFr88hb2\n\
+OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
+1RTwjmYSi9R/zpBnuQ4EiMnCqfMPWiZqB4QdbAd0E7oH50VpuZ1P087G\n\
+-----END PRIVATE KEY-----\n";
+        let public_jwk = serde_json::json!({
+            "kty": "EC", "crv": "P-256",
+            "x": "EVs_o5-uQbTjL3chynL4wXgUg2R9q9UU8I5mEovUf84",
+            "y": "kGe5DgSIycKp8w9aJmoHhB1sB3QTugfnRWm5nU_TzsY"
+        });
+        let mut header = Header::new(Algorithm::ES256);
+        header.typ = Some("dpop+jwt".to_string());
+        header.jwk = Some(serde_json::from_value(public_jwk).unwrap());
+        let key = EncodingKey::from_ec_pem(PRIVATE_KEY.as_bytes()).unwrap();
+        let mut claims = serde_json::json!({
+            "htm": "POST",
+            "htu": "https://broker.example/mcp/oauth/token",
+            "iat": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
+            "jti": jti
+        });
+        if let Some(ath) = ath {
+            claims["ath"] = serde_json::Value::String(ath.to_string());
+        }
+        jsonwebtoken::encode(&header, &claims, &key).unwrap()
+    }
+
+    async fn post_with_dpop(app: Router, proof: &str) -> StatusCode {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp/oauth/token")
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .header("DPoP", proof)
+            .body(Body::from(
+                "grant_type=authorization_code&code=c1\
+                 &redirect_uri=https%3A%2F%2Fclient.example%2Fcb\
+                 &code_verifier=v&client_id=cli",
+            ))
+            .unwrap();
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn ordinary_router_rejects_replayed_token_endpoint_dpop_jti() {
+        let _env = crate::test_env::EnvVarGuard::set(&[(
+            "MCP_GATEWAY_BASE_URL",
+            Some("https://broker.example"),
+        )]);
+        let app = build_app(test_config());
+        let proof = token_endpoint_dpop_proof("single-use-token-jti", None);
+        assert_eq!(
+            post_with_dpop(app.clone(), &proof).await,
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(post_with_dpop(app, &proof).await, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_rejects_dpop_when_replay_cache_is_unavailable() {
+        let _env = crate::test_env::EnvVarGuard::set(&[(
+            "MCP_GATEWAY_BASE_URL",
+            Some("https://broker.example"),
+        )]);
+        let cfg = test_config();
+        let store = InMemorySessionStore::arc(Duration::from_secs(60));
+        let app = crate::router_full_with_par(
+            Arc::new(cfg),
+            store,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let proof = token_endpoint_dpop_proof("unprotected-jti", None);
+
+        assert_eq!(post_with_dpop(app, &proof).await, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn token_exchange_requires_ath_for_its_access_token_subject() {
+        let _env = crate::test_env::EnvVarGuard::set(&[(
+            "MCP_GATEWAY_BASE_URL",
+            Some("https://broker.example"),
+        )]);
+        let mut cfg = test_config();
+        cfg.token_exchange_enabled = true;
+        cfg.subject_token_issuers = vec!["https://idp.example".to_string()];
+        let app = build_app(cfg);
+        let subject_payload = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            serde_json::json!({"iss": "https://idp.example", "sub": "alice"}).to_string(),
+        );
+        let subject_token = format!("e30.{subject_payload}.signature");
+        let proof = token_endpoint_dpop_proof("token-exchange-no-ath", None);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/mcp/oauth/token")
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .header("DPoP", proof)
+            .body(Body::from(format!(
+                "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange\
+                 &subject_token={subject_token}\
+                 &subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token\
+                 &client_id=cli"
+            )))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains("missing required ath"));
+    }
+
     fn build_app_with_dpop(cfg: McpGatewayConfig) -> Router {
         use crate::dpop::{DpopNonceIssuer, DpopReplayCache};
         use sbproxy_storage::mock::MockEphemeralKv;
@@ -1182,7 +1388,7 @@ mod tests {
     }
 
     #[test]
-    fn inject_cnf_jkt_adds_cnf_and_rewrites_token_type_for_opaque_token() {
+    fn inject_cnf_jkt_refuses_opaque_token_that_cannot_carry_signed_binding() {
         use crate::dpop::DpopProof;
         use jsonwebtoken::jwk::Jwk;
         let jwk_value = serde_json::json!({
@@ -1202,16 +1408,38 @@ mod tests {
             ath: None,
             raw_jwt: "header.payload.sig".to_string(),
         };
-        // "abc" is opaque (not a 3-segment JWS), so the wrapper-level
-        // cnf injection is safe; the resource server reads cnf via
-        // introspection rather than the JWT payload.
         let upstream_body =
             bytes::Bytes::from(r#"{"access_token":"abc","token_type":"Bearer","expires_in":3600}"#);
-        let rewritten = super::inject_cnf_jkt(&upstream_body, &proof, None).unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
-        assert_eq!(parsed["token_type"], "DPoP");
-        assert!(parsed["cnf"]["jkt"].is_string());
-        assert_eq!(parsed["access_token"], "abc");
+        let err = super::inject_cnf_jkt(&upstream_body, &proof, None, "https://broker.example")
+            .unwrap_err();
+        assert!(err.to_string().contains("JWT"));
+    }
+
+    #[test]
+    fn inject_cnf_jkt_rejects_non_object_success_body() {
+        use crate::dpop::DpopProof;
+        use jsonwebtoken::jwk::Jwk;
+        let jwk: Jwk = serde_json::from_value(serde_json::json!({
+            "kty": "EC", "crv": "P-256",
+            "x": "EVs_o5-uQbTjL3chynL4wXgUg2R9q9UU8I5mEovUf84",
+            "y": "kGe5DgSIycKp8w9aJmoHhB1sB3QTugfnRWm5nU_TzsY"
+        }))
+        .unwrap();
+        let proof = DpopProof {
+            jwk,
+            jti: "non-object".to_string(),
+            htm: "POST".to_string(),
+            htu: "https://broker.example/mcp/oauth/token".to_string(),
+            iat: 0,
+            nonce: None,
+            ath: None,
+            raw_jwt: "header.payload.sig".to_string(),
+        };
+        let body = bytes::Bytes::from_static(br#"["not","an","object"]"#);
+
+        let error = inject_cnf_jkt(&body, &proof, None, "https://broker.example")
+            .expect_err("a bound token response must be an object");
+        assert!(error.to_string().contains("JSON object"));
     }
 
     /// WOR-47: a JWT-shaped access_token MUST NOT be relabeled "DPoP"
@@ -1221,7 +1449,7 @@ mod tests {
     /// payload, not the wrapper, so a wrapper-only rewrite produces
     /// bearer-replayable tokens dressed up as sender-constrained.
     #[test]
-    fn inject_cnf_jkt_passes_through_jwt_when_broker_cannot_resign() {
+    fn inject_cnf_jkt_refuses_jwt_when_broker_cannot_resign() {
         use crate::dpop::DpopProof;
         use jsonwebtoken::jwk::Jwk;
         let jwk_value = serde_json::json!({
@@ -1246,10 +1474,76 @@ mod tests {
         let upstream_body = bytes::Bytes::from(
             r#"{"access_token":"hdr.payload.sig","token_type":"Bearer","expires_in":3600}"#,
         );
-        let result = super::inject_cnf_jkt(&upstream_body, &proof, None).unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&result).unwrap();
-        assert_eq!(parsed["token_type"], "Bearer");
-        assert!(parsed.get("cnf").is_none());
+        let err = super::inject_cnf_jkt(&upstream_body, &proof, None, "https://broker.example")
+            .unwrap_err();
+        assert!(err.to_string().contains("signing key"));
+    }
+
+    #[test]
+    fn inject_cnf_jkt_resigns_jwt_with_binding_inside_signed_payload() {
+        use crate::dpop::DpopProof;
+        use jsonwebtoken::jwk::Jwk;
+        let jwk: Jwk = serde_json::from_value(serde_json::json!({
+            "kty": "EC", "crv": "P-256",
+            "x": "EVs_o5-uQbTjL3chynL4wXgUg2R9q9UU8I5mEovUf84",
+            "y": "kGe5DgSIycKp8w9aJmoHhB1sB3QTugfnRWm5nU_TzsY"
+        }))
+        .unwrap();
+        let proof = DpopProof {
+            jwk,
+            jti: "j3".to_string(),
+            htm: "POST".to_string(),
+            htu: "https://broker.example/mcp/oauth/token".to_string(),
+            iat: 0,
+            nonce: None,
+            ath: None,
+            raw_jwt: "header.payload.sig".to_string(),
+        };
+        let claims = serde_json::json!({
+            "iss": "https://upstream.example",
+            "sub": "user-1",
+            "aud": "https://mcp.example",
+            "exp": 4102444800_i64,
+            "iat": 1700000000_i64,
+            "jti": "old-jti",
+            "client_id": "client-1",
+            "cnf": {"x5t#S256": "existing-certificate-binding"}
+        });
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&claims).unwrap());
+        let upstream_body = bytes::Bytes::from(
+            serde_json::json!({
+                "access_token": format!("{header}.{payload}.upstream-signature"),
+                "token_type": "Bearer",
+                "expires_in": 3600
+            })
+            .to_string(),
+        );
+        let key = crate::config::JwkKey::Pem {
+            pem: include_str!("../../sbproxy-modules/src/auth/dpop_test_ec_p256.pem").to_string(),
+            alg: "ES256".to_string(),
+            kid: Some("broker-key".to_string()),
+        };
+
+        let rewritten =
+            super::inject_cnf_jkt(&upstream_body, &proof, Some(&key), "https://broker.example")
+                .unwrap();
+        let wrapper: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+        let token = wrapper["access_token"].as_str().unwrap();
+        assert_eq!(wrapper["token_type"], "DPoP");
+        assert_ne!(token.split('.').nth(2), Some("upstream-signature"));
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(token.split('.').nth(1).unwrap())
+            .unwrap();
+        let signed_claims: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(signed_claims["iss"], "https://broker.example");
+        assert!(signed_claims["cnf"]["jkt"].is_string());
+        assert_eq!(
+            signed_claims["cnf"]["x5t#S256"],
+            "existing-certificate-binding"
+        );
     }
 
     #[tokio::test]

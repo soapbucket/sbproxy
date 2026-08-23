@@ -407,6 +407,9 @@ pub fn jwk_thumbprint(jwk: &Jwk) -> Result<String, DpopError> {
 pub struct DpopReplayCache {
     kv: Arc<dyn EphemeralKv>,
     ttl: Duration,
+    /// Serializes the backend's separate read-delete and write calls so
+    /// concurrent proofs cannot both observe the same jti as absent.
+    gate: tokio::sync::Mutex<()>,
     /// Optional key prefix so DPoP replay state can coexist with the
     /// gateway's other ephemeral state (sessions, nonces) in the same
     /// backend without colliding.
@@ -421,6 +424,7 @@ impl DpopReplayCache {
         Self {
             kv,
             ttl,
+            gate: tokio::sync::Mutex::new(()),
             prefix: "dpop:jti".to_string(),
         }
     }
@@ -432,6 +436,7 @@ impl DpopReplayCache {
         Self {
             kv,
             ttl,
+            gate: tokio::sync::Mutex::new(()),
             prefix: prefix.into(),
         }
     }
@@ -439,11 +444,11 @@ impl DpopReplayCache {
     /// Record this proof's jti. Returns Err if the jti was already
     /// observed within the cache TTL.
     pub async fn record_jti(&self, proof: &DpopProof) -> Result<(), DpopError> {
+        let _guard = self.gate.lock().await;
         let key = format!("{}:{}", self.prefix, proof.jti);
-        // `take` returns the previous value if present and removes it,
-        // which we only use to atomically detect whether the jti has
-        // been observed. We then re-insert with a fresh TTL so a
-        // racing third request also sees the replay.
+        // The trait does not expose an atomic set-if-absent operation,
+        // so the process-local gate makes this read-delete/write pair
+        // atomic for all callers sharing this cache instance.
         match self.kv.take(&key).await {
             Ok(Some(_)) => {
                 // Re-insert so subsequent racing replays still trip.
@@ -522,8 +527,10 @@ impl DpopNonceIssuer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use jsonwebtoken::{encode, EncodingKey, Header};
     use sbproxy_storage::mock::MockEphemeralKv;
+    use sbproxy_storage::StorageError;
     use serde_json::{json, Value};
     use std::sync::Arc;
 
@@ -1045,6 +1052,81 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
     }
 
     // --- Replay cache ---
+
+    #[derive(Clone, Default)]
+    struct YieldAfterTakeKv {
+        inner: MockEphemeralKv,
+    }
+
+    #[async_trait]
+    impl EphemeralKv for YieldAfterTakeKv {
+        async fn get(&self, key: &str) -> Result<Option<Bytes>, StorageError> {
+            self.inner.get(key).await
+        }
+
+        async fn put(&self, key: &str, value: Bytes, ttl: Duration) -> Result<(), StorageError> {
+            self.inner.put(key, value, ttl).await
+        }
+
+        async fn take(&self, key: &str) -> Result<Option<Bytes>, StorageError> {
+            let value = self.inner.take(key).await?;
+            tokio::task::yield_now().await;
+            Ok(value)
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StorageError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_cache_allows_only_one_concurrent_first_use() {
+        let kv: Arc<dyn EphemeralKv> = Arc::new(YieldAfterTakeKv::default());
+        let cache = Arc::new(DpopReplayCache::new(kv, Duration::from_secs(60)));
+        let (jwk_val, key) = es256_keypair();
+        let token = build_proof_with(
+            &jwk_val,
+            &key,
+            Algorithm::ES256,
+            Some("dpop+jwt"),
+            "POST",
+            "https://broker.example.com/token",
+            0,
+            Some("jti-concurrent"),
+            None,
+            None,
+        );
+        let proof = Arc::new(
+            parse_and_verify(
+                &token,
+                "POST",
+                &url("https://broker.example.com/token"),
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+        );
+
+        let first = {
+            let cache = cache.clone();
+            let proof = proof.clone();
+            tokio::spawn(async move { cache.record_jti(&proof).await })
+        };
+        let second = {
+            let cache = cache.clone();
+            let proof = proof.clone();
+            tokio::spawn(async move { cache.record_jti(&proof).await })
+        };
+
+        let results = [first.await.unwrap(), second.await.unwrap()];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(DpopError::Replay)))
+                .count(),
+            1
+        );
+    }
 
     #[tokio::test]
     async fn replay_cache_first_use_ok_second_use_replay() {

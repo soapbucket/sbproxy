@@ -647,3 +647,8 @@ the unreferenced bucket independently at 1458 and 1425. The merged tree is
 1459, one above the infra branch alone because Cedar's public types remain
 present. The tests-only bucket remains 296. The baselines record the merged
 tree rather than either parent so both ratchets continue to reject regressions.
+
+2026-08-22 (WOR-2661 MCP security repair): unreferenced bucket 1459 ->
+1457. The live MCP action now consumes the gateway runtime, resource-server
+provider, and verified certificate identity across crate boundaries. Lowering
+the ratchet keeps those integration gains.

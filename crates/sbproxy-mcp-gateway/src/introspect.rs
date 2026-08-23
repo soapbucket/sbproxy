@@ -84,6 +84,7 @@ use crate::AppState;
 ///   `upstream_introspection_endpoint_url` configured.
 pub async fn introspect(
     State(app): State<AppState>,
+    verified_client_cert: Option<axum::extract::Extension<crate::VerifiedClientCertificate>>,
     headers: HeaderMap,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
@@ -238,7 +239,12 @@ pub async fn introspect(
     // ergonomic mismatch on a separate `x5t_s256_binding` field so
     // operators can debug without parsing the suppressed claim set.
     let body = match serde_json::from_slice::<serde_json::Value>(&body) {
-        Ok(claims) => match crate::mtls_binding::verify_cnf_x5t_s256(&claims, &headers) {
+        Ok(claims) => match crate::mtls_binding::verify_cnf_x5t_s256_thumbprint(
+            &claims,
+            verified_client_cert
+                .as_ref()
+                .map(|axum::extract::Extension(cert)| cert.x5t_s256.as_str()),
+        ) {
             Ok(_) => body,
             Err(e) => {
                 tracing::warn!(

@@ -45,6 +45,9 @@ use bytes::Bytes;
 use sbproxy_storage::{EphemeralKv, PersistentKv, StorageError};
 use tokio::sync::Mutex;
 
+const DEFAULT_EPHEMERAL_CAPACITY: usize = 16_384;
+const DEFAULT_PERSISTENT_CAPACITY: usize = 4_096;
+
 struct EphemeralEntry {
     value: Bytes,
     expires_at: Instant,
@@ -57,13 +60,14 @@ struct EphemeralEntry {
 /// write can never accidentally outlive (or be evicted alongside) a
 /// durable one; "durable" here means "survives for the life of this
 /// process", which is the only persistence a single-process broker can
-/// promise without an external store. Both maps are swept lazily
-/// (checked on the next `get`/`put`/`exists` for the touched key)
-/// rather than by a background task, so an idle broker pays no
-/// scanning cost.
+/// promise without an external store. Ephemeral operations sweep every
+/// expired entry before access/capacity checks rather than waiting for
+/// the exact key to be touched; no background task is required.
 pub struct LocalStore {
     ephemeral: Mutex<HashMap<String, EphemeralEntry>>,
     persistent: Mutex<HashMap<String, Bytes>>,
+    ephemeral_capacity: usize,
+    persistent_capacity: usize,
 }
 
 impl Default for LocalStore {
@@ -75,10 +79,30 @@ impl Default for LocalStore {
 impl LocalStore {
     /// Build an empty store.
     pub fn new() -> Self {
-        Self {
+        Self::with_capacity(DEFAULT_EPHEMERAL_CAPACITY, DEFAULT_PERSISTENT_CAPACITY)
+            .expect("non-zero default LocalStore capacities")
+    }
+
+    /// Build an empty store with explicit upper bounds for ephemeral
+    /// and process-lifetime entries. New unique keys fail closed once
+    /// the corresponding capacity is full; replacing an existing key
+    /// remains possible. Expired ephemeral entries are swept before
+    /// the capacity check.
+    pub fn with_capacity(
+        ephemeral_capacity: usize,
+        persistent_capacity: usize,
+    ) -> Result<Self, StorageError> {
+        if ephemeral_capacity == 0 || persistent_capacity == 0 {
+            return Err(StorageError::InvalidConfig(
+                "LocalStore capacities must be greater than zero".to_string(),
+            ));
+        }
+        Ok(Self {
             ephemeral: Mutex::new(HashMap::new()),
             persistent: Mutex::new(HashMap::new()),
-        }
+            ephemeral_capacity,
+            persistent_capacity,
+        })
     }
 
     /// `Arc`-wrapped convenience constructor for the common case of
@@ -93,6 +117,7 @@ impl EphemeralKv for LocalStore {
     async fn get(&self, key: &str) -> Result<Option<Bytes>, StorageError> {
         let now = Instant::now();
         let mut guard = self.ephemeral.lock().await;
+        guard.retain(|_, entry| entry.expires_at > now);
         match guard.get(key) {
             Some(entry) if entry.expires_at > now => Ok(Some(entry.value.clone())),
             Some(_) => {
@@ -110,13 +135,18 @@ impl EphemeralKv for LocalStore {
             ));
         }
         let mut guard = self.ephemeral.lock().await;
-        guard.insert(
-            key.to_string(),
-            EphemeralEntry {
-                value,
-                expires_at: Instant::now() + ttl,
-            },
-        );
+        let now = Instant::now();
+        let expires_at = now.checked_add(ttl).ok_or_else(|| {
+            StorageError::InvalidConfig("LocalStore ephemeral TTL overflow".to_string())
+        })?;
+        guard.retain(|_, entry| entry.expires_at > now);
+        if !guard.contains_key(key) && guard.len() >= self.ephemeral_capacity {
+            return Err(StorageError::InvalidConfig(format!(
+                "LocalStore ephemeral capacity {} reached",
+                self.ephemeral_capacity
+            )));
+        }
+        guard.insert(key.to_string(), EphemeralEntry { value, expires_at });
         Ok(())
     }
 
@@ -136,7 +166,8 @@ impl EphemeralKv for LocalStore {
 
     async fn exists(&self, key: &str) -> Result<bool, StorageError> {
         let now = Instant::now();
-        let guard = self.ephemeral.lock().await;
+        let mut guard = self.ephemeral.lock().await;
+        guard.retain(|_, entry| entry.expires_at > now);
         Ok(matches!(guard.get(key), Some(entry) if entry.expires_at > now))
     }
 }
@@ -148,7 +179,14 @@ impl PersistentKv for LocalStore {
     }
 
     async fn put(&self, key: &str, value: Bytes) -> Result<(), StorageError> {
-        self.persistent.lock().await.insert(key.to_string(), value);
+        let mut guard = self.persistent.lock().await;
+        if !guard.contains_key(key) && guard.len() >= self.persistent_capacity {
+            return Err(StorageError::InvalidConfig(format!(
+                "LocalStore persistent capacity {} reached",
+                self.persistent_capacity
+            )));
+        }
+        guard.insert(key.to_string(), value);
         Ok(())
     }
 
@@ -172,6 +210,83 @@ impl PersistentKv for LocalStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn expired_ephemeral_keys_are_reclaimed_before_an_unrelated_put() {
+        let store = LocalStore::with_capacity(1, 1).unwrap();
+        EphemeralKv::put(
+            &store,
+            "expired",
+            Bytes::from_static(b"v"),
+            Duration::from_millis(5),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        EphemeralKv::put(
+            &store,
+            "replacement",
+            Bytes::from_static(b"v2"),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("unrelated put must sweep expired unique keys");
+        assert_eq!(
+            EphemeralKv::get(&store, "replacement").await.unwrap(),
+            Some(Bytes::from_static(b"v2"))
+        );
+    }
+
+    #[tokio::test]
+    async fn full_stores_reject_new_unique_keys_but_allow_replacement() {
+        let store = LocalStore::with_capacity(1, 1).unwrap();
+        EphemeralKv::put(
+            &store,
+            "one",
+            Bytes::from_static(b"v1"),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        let err = EphemeralKv::put(
+            &store,
+            "two",
+            Bytes::from_static(b"v2"),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, StorageError::InvalidConfig(_)));
+        EphemeralKv::put(
+            &store,
+            "one",
+            Bytes::from_static(b"new"),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+
+        PersistentKv::put(&store, "one", Bytes::from_static(b"v1"))
+            .await
+            .unwrap();
+        let err = PersistentKv::put(&store, "two", Bytes::from_static(b"v2"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::InvalidConfig(_)));
+        PersistentKv::put(&store, "one", Bytes::from_static(b"new"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ephemeral_put_rejects_a_ttl_that_overflows_instant() {
+        let store = LocalStore::new();
+        let error = EphemeralKv::put(&store, "overflow", Bytes::from_static(b"v"), Duration::MAX)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StorageError::InvalidConfig(_)));
+    }
 
     #[tokio::test]
     async fn ephemeral_put_then_get_round_trips() {

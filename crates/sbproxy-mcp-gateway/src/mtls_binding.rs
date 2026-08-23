@@ -19,31 +19,20 @@
 //!   * [`client_cert_thumbprint`] - base64url-no-pad SHA-256 of the
 //!     DER-encoded client certificate. The exact `x5t#S256` value
 //!     RFC 8705 §3.1 demands.
-//!   * [`extract_client_cert_der`] - reads the de-facto Envoy / Istio
-//!     `x-forwarded-client-cert` header (XFCC) so a TLS-terminating
-//!     proxy can hand the cert off to the broker without standing up
-//!     a separate sidecar protocol.
 //!   * [`inject_cnf_x5t_s256`] - mirror of `token::inject_cnf_jkt`
 //!     for the mTLS path. Decorates the upstream's wrapper response
-//!     with `cnf.x5t#S256` so resource servers performing
-//!     introspection see the binding. JWT-shaped access tokens are
-//!     passed through unchanged when the broker has no signing key,
-//!     same WOR-47 fail-safe DPoP uses.
-//!   * [`verify_cnf_x5t_s256`] - inbound-side check used by the
-//!     introspection handler: when the resolved claim set advertises
-//!     `cnf.x5t#S256`, the broker compares it against the live
-//!     request's client cert thumbprint and refuses the token if
-//!     they disagree (or if no client cert is present).
+//!     by freshly re-signing a JWT with `cnf.x5t#S256`; opaque tokens
+//!     and missing broker signing keys fail closed.
 //!
-//! The TLS-termination posture is intentionally permissive about who
-//! presents the cert: the broker itself can sit behind an Envoy /
-//! Istio / NGINX mTLS terminator that forwards the cert via XFCC, or
-//! it can hold the TLS connection itself (in which case the operator
-//! is expected to write the DER into the same header before handing
-//! the request to axum).
+//! Production request handling accepts only [`VerifiedClientCertificate`]
+//! inserted by the host from its verified TLS connection. Raw XFCC
+//! parsing exists under `cfg(test)` solely as parser regression coverage;
+//! an arbitrary inbound forwarded header is never an identity signal.
 
+#[cfg(test)]
 use std::collections::HashMap;
 
+#[cfg(test)]
 use axum::http::HeaderMap;
 use base64::Engine;
 use sha2::{Digest, Sha256};
@@ -55,7 +44,16 @@ use sha2::{Digest, Sha256};
 /// off; the IETF has documented the same XFCC shape in
 /// `draft-ietf-httpapi-client-cert-field` so it is the safest
 /// portable choice.
-pub const CLIENT_CERT_HEADER: &str = "x-forwarded-client-cert";
+#[cfg(test)]
+const CLIENT_CERT_HEADER: &str = "x-forwarded-client-cert";
+
+/// Certificate identity established by the TLS stack or by a caller
+/// that already enforced its configured trusted-proxy boundary.
+#[derive(Clone, Debug)]
+pub struct VerifiedClientCertificate {
+    /// RFC 8705 `x5t#S256` of the verified leaf certificate.
+    pub x5t_s256: String,
+}
 
 /// Compute the RFC 8705 §3.1 `x5t#S256` thumbprint over a DER-encoded
 /// X.509 certificate: base64url-no-pad of SHA-256(DER).
@@ -89,7 +87,8 @@ pub fn client_cert_thumbprint(der: &[u8]) -> String {
 /// time verification absence on a `cnf.x5t#S256`-carrying token is
 /// fatal, but a token with no `cnf.x5t#S256` (typical bearer client)
 /// does not need a cert at all.
-pub fn extract_client_cert_der(headers: &HeaderMap) -> Option<Vec<u8>> {
+#[cfg(test)]
+fn extract_client_cert_der(headers: &HeaderMap) -> Option<Vec<u8>> {
     let raw = headers
         .get(CLIENT_CERT_HEADER)
         .and_then(|v| v.to_str().ok())
@@ -112,28 +111,38 @@ pub fn extract_client_cert_der(headers: &HeaderMap) -> Option<Vec<u8>> {
 ///
 /// Mirrors [`crate::token::inject_cnf_jkt`] for the mTLS path:
 ///
-///   * **JWT access_token + no broker signing key:** pass through
-///     unchanged. Resource servers verifying RFC 9068 access tokens
-///     consult the in-payload `cnf` claim, and the broker cannot
-///     produce a fresh JWT without a signing key. Decorating the
-///     wrapper alone would expose the same WOR-47 trap the DPoP
-///     path already documents.
-///   * **JWT access_token + broker signing key:** the broker has a
-///     signing key but full re-issuance is a follow-up. Today we
-///     also pass through and log a warning.
-///   * **Opaque access_token (anything not shaped like a 3-segment
-///     JWS):** safe to decorate the wrapper, since the resource
-///     server has to call /introspect anyway to learn the claims and
-///     introspection surfaces wrapper-level cnf.
-///   * **Body not JSON:** pass through unchanged.
+///   * **JWT access_token + no broker signing key:** fail closed.
+///     Resource servers consult the signed `cnf` claim, and the broker
+///     cannot create one without a signing key.
+///   * **JWT access_token + broker signing key:** re-issue the token
+///     with a signed `cnf.x5t#S256` claim and fresh broker timestamps.
+///   * **Opaque access_token or malformed/non-object body:** fail
+///     closed because this provider verifies signed JWT claims.
 pub fn inject_cnf_x5t_s256(
     body: &bytes::Bytes,
     cert_der: &[u8],
     broker_signing_key: Option<&crate::config::JwkKey>,
+    broker_issuer: &str,
+) -> Result<bytes::Bytes, MtlsBindingError> {
+    inject_cnf_x5t_s256_thumbprint(
+        body,
+        &client_cert_thumbprint(cert_der),
+        broker_signing_key,
+        broker_issuer,
+    )
+}
+
+/// Re-issue a JWT access token with a signed RFC 8705 certificate
+/// thumbprint derived from verified connection identity.
+pub fn inject_cnf_x5t_s256_thumbprint(
+    body: &bytes::Bytes,
+    thumbprint: &str,
+    broker_signing_key: Option<&crate::config::JwkKey>,
+    broker_issuer: &str,
 ) -> Result<bytes::Bytes, MtlsBindingError> {
     let body_is_secret_reference = std::str::from_utf8(body)
         .ok()
-        .is_some_and(|text| sbproxy_vault::looks_like_secret_reference_uri(text));
+        .is_some_and(sbproxy_vault::looks_like_secret_reference_uri);
     if body_is_secret_reference {
         return Err(MtlsBindingError::PayloadInvalid(
             "upstream token response is a secret reference".to_string(),
@@ -141,10 +150,11 @@ pub fn inject_cnf_x5t_s256(
     }
     let mut value: serde_json::Value = serde_json::from_slice(body)
         .map_err(|e| MtlsBindingError::PayloadInvalid(format!("upstream body: {e}")))?;
-    let obj = match value.as_object_mut() {
-        Some(o) => o,
-        None => return Ok(body.clone()),
-    };
+    let obj = value.as_object_mut().ok_or_else(|| {
+        MtlsBindingError::PayloadInvalid(
+            "upstream token response must be a JSON object".to_string(),
+        )
+    })?;
     let access_token = obj
         .get("access_token")
         .and_then(|v| v.as_str())
@@ -153,40 +163,58 @@ pub fn inject_cnf_x5t_s256(
         .as_deref()
         .map(|t| t.split('.').count() == 3)
         .unwrap_or(false);
-    if token_is_jwt && broker_signing_key.is_none() {
-        // Same WOR-47 fail-safe the DPoP path uses: do not relabel a
-        // bearer-shaped JWT as sender-constrained when we cannot put
-        // the binding inside the signed payload.
-        tracing::warn!(
-            "mTLS client cert present but broker has no signing key; preserving upstream JWT unchanged"
-        );
-        return Ok(body.clone());
+    if !token_is_jwt {
+        return Err(MtlsBindingError::PayloadInvalid(
+            "mTLS binding requires a JWT access token".to_string(),
+        ));
     }
-    let thumbprint = client_cert_thumbprint(cert_der);
-
-    // Merge into any existing cnf object so DPoP-bound tokens that
-    // also happen to ride an mTLS channel keep both bindings.
-    let cnf_entry = obj
-        .entry("cnf".to_string())
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-    let cnf_map = match cnf_entry.as_object_mut() {
-        Some(m) => m,
-        None => {
-            // Upstream returned a cnf that is not an object; refuse
-            // to clobber it silently.
-            return Err(MtlsBindingError::PayloadInvalid(
-                "upstream cnf claim is not a JSON object".to_string(),
-            ));
-        }
-    };
+    let signing_key = broker_signing_key.ok_or_else(|| {
+        MtlsBindingError::PayloadInvalid(
+            "mTLS binding requires a configured broker signing key".to_string(),
+        )
+    })?;
+    let access_token = access_token.ok_or_else(|| {
+        MtlsBindingError::PayloadInvalid("upstream response missing access_token".to_string())
+    })?;
+    let mut cnf_map = signed_cnf_from_token(&access_token)?;
     cnf_map.insert(
         "x5t#S256".to_string(),
-        serde_json::Value::String(thumbprint),
+        serde_json::Value::String(thumbprint.to_string()),
     );
-
+    let mut mutations = serde_json::Map::new();
+    mutations.insert("cnf".to_string(), serde_json::Value::Object(cnf_map));
+    let resigned =
+        crate::at_jwt::resign_at_jwt(&access_token, signing_key, broker_issuer, &mutations)
+            .map_err(|e| MtlsBindingError::PayloadInvalid(e.to_string()))?;
+    obj.insert(
+        "access_token".to_string(),
+        serde_json::Value::String(resigned),
+    );
+    obj.remove("cnf");
     let serialized = serde_json::to_vec(&value)
         .map_err(|e| MtlsBindingError::PayloadInvalid(format!("serialize body: {e}")))?;
     Ok(bytes::Bytes::from(serialized))
+}
+
+pub(crate) fn signed_cnf_from_token(
+    token: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, MtlsBindingError> {
+    let payload = token
+        .split('.')
+        .nth(1)
+        .ok_or_else(|| MtlsBindingError::PayloadInvalid("access token is not a JWT".to_string()))?;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|e| MtlsBindingError::PayloadInvalid(format!("JWT payload decode failed: {e}")))?;
+    let claims: serde_json::Value = serde_json::from_slice(&raw)
+        .map_err(|e| MtlsBindingError::PayloadInvalid(format!("JWT payload invalid: {e}")))?;
+    match claims.get("cnf") {
+        None => Ok(serde_json::Map::new()),
+        Some(serde_json::Value::Object(map)) => Ok(map.clone()),
+        Some(_) => Err(MtlsBindingError::PayloadInvalid(
+            "upstream cnf claim is not a JSON object".to_string(),
+        )),
+    }
 }
 
 /// Verify an inbound token whose claim set carries `cnf.x5t#S256`.
@@ -212,9 +240,20 @@ pub fn inject_cnf_x5t_s256(
 ///
 /// Mapping to RFC 8705 §3 wire behaviour: every `Err` here is an
 /// `invalid_token` rejection at the HTTP layer.
-pub fn verify_cnf_x5t_s256(
+#[cfg(test)]
+fn verify_cnf_x5t_s256(
     claims: &serde_json::Value,
     headers: &HeaderMap,
+) -> Result<bool, MtlsBindingError> {
+    let actual = extract_client_cert_der(headers).map(|der| client_cert_thumbprint(&der));
+    verify_cnf_x5t_s256_thumbprint(claims, actual.as_deref())
+}
+
+/// Verify a signed `cnf.x5t#S256` claim against certificate identity
+/// already established by the host TLS stack.
+pub(crate) fn verify_cnf_x5t_s256_thumbprint(
+    claims: &serde_json::Value,
+    verified_thumbprint: Option<&str>,
 ) -> Result<bool, MtlsBindingError> {
     let Some(expected) = claims.get("cnf").and_then(|c| c.get("x5t#S256")) else {
         // Back-compat: no binding => not our concern.
@@ -223,15 +262,14 @@ pub fn verify_cnf_x5t_s256(
     let expected = expected.as_str().ok_or_else(|| {
         MtlsBindingError::PayloadInvalid("cnf.x5t#S256 must be a JSON string".to_string())
     })?;
-    let der = extract_client_cert_der(headers).ok_or(MtlsBindingError::MissingClientCert)?;
-    let actual = client_cert_thumbprint(&der);
+    let actual = verified_thumbprint.ok_or(MtlsBindingError::MissingClientCert)?;
     // Constant-time compare to avoid leaking the per-byte position
     // of a mismatch via timing. The thumbprints are public values
     // but the comparison cadence is cheap insurance.
     if !constant_time_eq(actual.as_bytes(), expected.as_bytes()) {
         return Err(MtlsBindingError::ThumbprintMismatch {
             expected: expected.to_string(),
-            actual,
+            actual: actual.to_string(),
         });
     }
     Ok(true)
@@ -274,6 +312,7 @@ pub enum MtlsBindingError {
 /// `Cert=` (the leaf cert as URL-encoded PEM). Multi-cert headers
 /// (multiple comma-separated entries) are treated as a chain and we
 /// take the leaf at position 0.
+#[cfg(test)]
 fn parse_xfcc_cert(raw: &str) -> Option<Vec<u8>> {
     // Each comma-separated section is one cert in the chain.
     let leaf = raw.split(',').next()?;
@@ -291,6 +330,7 @@ fn parse_xfcc_cert(raw: &str) -> Option<Vec<u8>> {
 /// Split one XFCC element into its `Key=Value` pairs. Values may be
 /// quoted with double quotes; embedded `;` inside quoted strings is
 /// part of the value.
+#[cfg(test)]
 fn split_xfcc_kvs(s: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
     let mut chars = s.chars().peekable();
@@ -336,6 +376,7 @@ fn split_xfcc_kvs(s: &str) -> HashMap<String, String> {
 /// Minimal URL-decode for `%xx` triplets. Envoy URL-encodes the PEM
 /// because it contains characters (`\n`, `=`, `;`, ` `, `+`, `/`)
 /// that would otherwise collide with the XFCC delimiter syntax.
+#[cfg(test)]
 fn url_decode(s: &str) -> Option<String> {
     let mut out = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
@@ -357,6 +398,7 @@ fn url_decode(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+#[cfg(test)]
 fn hex_value(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -369,6 +411,7 @@ fn hex_value(b: u8) -> Option<u8> {
 /// Strip PEM armor and base64-decode the body. Accepts the first
 /// `-----BEGIN CERTIFICATE-----` block; tolerates trailing chain
 /// blocks but ignores them (only the leaf matters for thumbprint).
+#[cfg(test)]
 fn pem_to_der(pem: &str) -> Option<Vec<u8>> {
     const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
     const END: &str = "-----END CERTIFICATE-----";
@@ -382,6 +425,7 @@ fn pem_to_der(pem: &str) -> Option<Vec<u8>> {
 /// Tolerant base64 decoder that accepts either the URL-safe or
 /// standard alphabet, with or without padding. Used for the bare-DER
 /// header shape.
+#[cfg(test)]
 fn decode_base64_loose(s: &str) -> Option<Vec<u8>> {
     // Strip newlines / whitespace so callers that pass a multi-line
     // base64 blob still work.
@@ -510,57 +554,84 @@ mod tests {
     }
 
     #[test]
-    fn inject_cnf_x5t_s256_adds_thumbprint_for_opaque_token() {
+    fn inject_cnf_x5t_s256_refuses_opaque_token_without_signed_claims() {
         let body = bytes::Bytes::from(
             r#"{"access_token":"opaque-1","token_type":"Bearer","expires_in":3600}"#,
         );
-        let rewritten = inject_cnf_x5t_s256(&body, FIXTURE_DER, None).unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
-        assert_eq!(parsed["cnf"]["x5t#S256"], fixture_thumbprint());
-        // Opaque tokens keep their original token_type. RFC 8705 does
-        // NOT introduce a new token_type; the binding lives in cnf.
-        assert_eq!(parsed["token_type"], "Bearer");
-        assert_eq!(parsed["access_token"], "opaque-1");
+        let err =
+            inject_cnf_x5t_s256(&body, FIXTURE_DER, None, "https://broker.example").unwrap_err();
+        assert!(err.to_string().contains("JWT"));
     }
 
     #[test]
-    fn inject_cnf_x5t_s256_passes_through_jwt_when_broker_cannot_resign() {
+    fn inject_cnf_x5t_s256_refuses_jwt_when_broker_cannot_resign() {
         let body = bytes::Bytes::from(
             r#"{"access_token":"hdr.payload.sig","token_type":"Bearer","expires_in":3600}"#,
         );
-        let result = inject_cnf_x5t_s256(&body, FIXTURE_DER, None).unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&result).unwrap();
-        // No cnf decoration when we cannot put it in the JWT payload.
-        assert!(parsed.get("cnf").is_none());
-        assert_eq!(parsed["token_type"], "Bearer");
-        assert_eq!(parsed["access_token"], "hdr.payload.sig");
+        let err =
+            inject_cnf_x5t_s256(&body, FIXTURE_DER, None, "https://broker.example").unwrap_err();
+        assert!(err.to_string().contains("signing key"));
     }
 
     #[test]
-    fn inject_cnf_x5t_s256_preserves_existing_cnf_members() {
-        // Token already has cnf.jkt from the DPoP path (rare but
-        // legal: a client may pin both bindings). The mTLS injection
-        // should add x5t#S256 without clobbering jkt.
-        let body = bytes::Bytes::from(
-            r#"{"access_token":"opaque","token_type":"DPoP","cnf":{"jkt":"existing-jkt"}}"#,
+    fn inject_cnf_x5t_s256_resigns_jwt_with_signed_thumbprint() {
+        use base64::Engine;
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "iss": "https://upstream.example",
+                "sub": "user-1",
+                "aud": "https://mcp.example",
+                "exp": 4102444800_i64,
+                "iat": 1700000000_i64,
+                "jti": "old-jti",
+                "client_id": "client-1",
+                "cnf": {"jkt": "existing-jkt"}
+            }))
+            .unwrap(),
         );
-        let rewritten = inject_cnf_x5t_s256(&body, FIXTURE_DER, None).unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
-        assert_eq!(parsed["cnf"]["jkt"], "existing-jkt");
-        assert_eq!(parsed["cnf"]["x5t#S256"], fixture_thumbprint());
+        let body = bytes::Bytes::from(
+            serde_json::json!({
+                "access_token": format!("{header}.{payload}.upstream-signature"),
+                "token_type": "Bearer",
+                "expires_in": 3600
+            })
+            .to_string(),
+        );
+        let key = crate::config::JwkKey::Pem {
+            pem: include_str!("../../sbproxy-modules/src/auth/dpop_test_ec_p256.pem").to_string(),
+            alg: "ES256".to_string(),
+            kid: Some("broker-key".to_string()),
+        };
+
+        let rewritten =
+            inject_cnf_x5t_s256(&body, FIXTURE_DER, Some(&key), "https://broker.example").unwrap();
+        let wrapper: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+        let token = wrapper["access_token"].as_str().unwrap();
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(token.split('.').nth(1).unwrap())
+            .unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(claims["iss"], "https://broker.example");
+        assert_eq!(claims["cnf"]["x5t#S256"], fixture_thumbprint());
+        assert_eq!(claims["cnf"]["jkt"], "existing-jkt");
+        assert_ne!(token.split('.').nth(2), Some("upstream-signature"));
     }
 
     #[test]
-    fn inject_cnf_x5t_s256_passes_through_non_object_body() {
+    fn inject_cnf_x5t_s256_rejects_non_object_body() {
         let body = bytes::Bytes::from(r#"["not","an","object"]"#);
-        let rewritten = inject_cnf_x5t_s256(&body, FIXTURE_DER, None).unwrap();
-        assert_eq!(rewritten, body);
+        let error = inject_cnf_x5t_s256(&body, FIXTURE_DER, None, "https://broker.example")
+            .expect_err("a bound token response must be an object");
+        assert!(error.to_string().contains("JSON object"));
     }
 
     #[test]
     fn inject_cnf_x5t_s256_rejects_non_object_cnf() {
         let body = bytes::Bytes::from(r#"{"access_token":"opaque","cnf":"oops"}"#);
-        let err = inject_cnf_x5t_s256(&body, FIXTURE_DER, None).unwrap_err();
+        let err =
+            inject_cnf_x5t_s256(&body, FIXTURE_DER, None, "https://broker.example").unwrap_err();
         assert!(matches!(err, MtlsBindingError::PayloadInvalid(_)));
     }
 

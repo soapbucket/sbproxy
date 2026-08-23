@@ -460,17 +460,7 @@ pub async fn fetch(
 
     // Enforce the size cap by reading the body with `take`. We avoid
     // `Content-Length` because servers may omit it or lie.
-    let body_bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| anyhow!("CIMD body read failed: {e}"))?;
-    if body_bytes.len() > max_doc_bytes {
-        bail!(
-            "CIMD document is {} bytes, exceeds max {}",
-            body_bytes.len(),
-            max_doc_bytes
-        );
-    }
+    let body_bytes = crate::remote_body::bounded_response_body(resp, max_doc_bytes, "CIMD").await?;
 
     let doc: ClientIdMetadataDocument = serde_json::from_slice(&body_bytes)
         .map_err(|e| anyhow!("CIMD document parse failed: {e}"))?;
@@ -582,16 +572,31 @@ pub trait CimdCache: Send + Sync {
 pub struct InMemoryCimdCache {
     entries: Mutex<HashMap<String, CachedDoc>>,
     default_ttl: Duration,
+    capacity: usize,
 }
+
+const DEFAULT_CIMD_CACHE_CAPACITY: usize = 1_024;
 
 impl InMemoryCimdCache {
     /// Build a fresh, empty cache with the given default TTL applied
     /// to documents whose response has no `Cache-Control: max-age`.
     pub fn new(default_ttl: Duration) -> Self {
-        Self {
+        Self::with_capacity(default_ttl, DEFAULT_CIMD_CACHE_CAPACITY)
+            .expect("non-zero default CIMD cache capacity")
+    }
+
+    /// Build a cache with an explicit entry cap. On insertion at
+    /// capacity the oldest live entry is evicted after expired entries
+    /// have been reclaimed.
+    pub fn with_capacity(default_ttl: Duration, capacity: usize) -> Result<Self> {
+        if default_ttl.is_zero() || capacity == 0 {
+            bail!("CIMD cache TTL and capacity must be greater than zero");
+        }
+        Ok(Self {
             entries: Mutex::new(HashMap::new()),
             default_ttl,
-        }
+            capacity,
+        })
     }
 
     /// Return the cache wrapped in an `Arc` for handler injection.
@@ -670,17 +675,8 @@ impl InMemoryCimdCache {
                 .get(reqwest::header::CACHE_CONTROL)
                 .and_then(|v| v.to_str().ok()),
         );
-        let body_bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| anyhow!("CIMD body read failed: {e}"))?;
-        if body_bytes.len() > max_doc_bytes {
-            bail!(
-                "CIMD document is {} bytes, exceeds max {}",
-                body_bytes.len(),
-                max_doc_bytes
-            );
-        }
+        let body_bytes =
+            crate::remote_body::bounded_response_body(resp, max_doc_bytes, "CIMD").await?;
         let doc: ClientIdMetadataDocument = serde_json::from_slice(&body_bytes)
             .map_err(|e| anyhow!("CIMD document parse failed: {e}"))?;
         if doc.client_id != client_id_url {
@@ -711,6 +707,7 @@ impl InMemoryCimdCache {
         ttl: Duration,
     ) {
         let mut guard = self.entries.lock().await;
+        Self::reclaim_and_make_room(&mut guard, client_id_url, self.capacity, Instant::now());
         guard.insert(
             client_id_url.to_string(),
             CachedDoc {
@@ -720,6 +717,24 @@ impl InMemoryCimdCache {
                 ttl,
             },
         );
+    }
+
+    fn reclaim_and_make_room(
+        entries: &mut HashMap<String, CachedDoc>,
+        incoming_key: &str,
+        capacity: usize,
+        now: Instant,
+    ) {
+        entries.retain(|_, entry| now.duration_since(entry.fetched_at) < entry.ttl);
+        if !entries.contains_key(incoming_key) && entries.len() >= capacity {
+            if let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.fetched_at)
+                .map(|(key, _)| key.clone())
+            {
+                entries.remove(&oldest);
+            }
+        }
     }
 }
 
@@ -734,7 +749,10 @@ impl CimdCache for InMemoryCimdCache {
         let now = Instant::now();
         // Fast path: cached and inside its TTL.
         let cached_etag = {
-            let guard = self.entries.lock().await;
+            let mut guard = self.entries.lock().await;
+            guard.retain(|key, entry| {
+                key == client_id_url || now.duration_since(entry.fetched_at) < entry.ttl
+            });
             if let Some(entry) = guard.get(client_id_url) {
                 if now.duration_since(entry.fetched_at) < entry.ttl {
                     return Ok(entry.doc.clone());
@@ -758,6 +776,12 @@ impl CimdCache for InMemoryCimdCache {
                 };
                 let arc = Arc::new(doc);
                 let mut guard = self.entries.lock().await;
+                Self::reclaim_and_make_room(
+                    &mut guard,
+                    client_id_url,
+                    self.capacity,
+                    Instant::now(),
+                );
                 guard.insert(
                     client_id_url.to_string(),
                     CachedDoc {
@@ -905,17 +929,7 @@ impl CimdCache for EphemeralKvCimdCache {
                 .get(reqwest::header::CACHE_CONTROL)
                 .and_then(|v| v.to_str().ok()),
         );
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| anyhow!("CIMD body read failed: {e}"))?;
-        if body.len() > max_doc_bytes {
-            bail!(
-                "CIMD doc {} bytes exceeds limit {}",
-                body.len(),
-                max_doc_bytes
-            );
-        }
+        let body = crate::remote_body::bounded_response_body(resp, max_doc_bytes, "CIMD").await?;
         let doc: ClientIdMetadataDocument =
             serde_json::from_slice(&body).map_err(|e| anyhow!("CIMD JSON parse failed: {e}"))?;
 
@@ -970,6 +984,46 @@ mod tests {
     }
 
     // --- Pure-function tests ---
+
+    #[tokio::test]
+    async fn in_memory_cache_reclaims_expired_unique_keys_and_evicts_oldest() {
+        let cache = InMemoryCimdCache::with_capacity(Duration::from_secs(60), 1).unwrap();
+        let first_url = "https://first.example/cimd";
+        cache
+            .seed(
+                first_url,
+                fixture_doc(first_url),
+                None,
+                Instant::now() - Duration::from_secs(2),
+                Duration::from_secs(1),
+            )
+            .await;
+        let second_url = "https://second.example/cimd";
+        cache
+            .seed(
+                second_url,
+                fixture_doc(second_url),
+                None,
+                Instant::now(),
+                Duration::from_secs(60),
+            )
+            .await;
+        assert_eq!(cache.entries.lock().await.len(), 1);
+        assert!(cache.entries.lock().await.contains_key(second_url));
+
+        let third_url = "https://third.example/cimd";
+        cache
+            .seed(
+                third_url,
+                fixture_doc(third_url),
+                None,
+                Instant::now(),
+                Duration::from_secs(60),
+            )
+            .await;
+        assert_eq!(cache.entries.lock().await.len(), 1);
+        assert!(cache.entries.lock().await.contains_key(third_url));
+    }
 
     #[test]
     fn parse_max_age_extracts_first_directive() {

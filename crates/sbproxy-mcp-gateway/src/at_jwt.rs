@@ -37,7 +37,9 @@
 //!   needs its own design discussion + e2e coverage.
 
 use anyhow::{anyhow, Result};
+use base64::Engine;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::config::JwkKey;
@@ -131,6 +133,84 @@ pub const REQUESTED_TOKEN_TYPE_AGENT: &str = "urn:ietf:params:oauth:token-type:t
 /// the [`JwkKey`]; the `kid` (when present) is included in the
 /// header so verifiers can pick the right entry from the JWKS.
 pub fn mint_at_jwt(claims: &AtJwtClaims, key: &JwkKey) -> Result<String> {
+    let (encoding, alg, kid) = build_encoding_key(key)?;
+    let mut header = Header::new(alg);
+    header.typ = Some("at+jwt".to_string());
+    header.kid = kid;
+    encode(&header, claims, &encoding).map_err(|e| anyhow!("at+jwt sign failed: {e}"))
+}
+
+/// Re-issue a JWT-shaped upstream access token as a broker-owned
+/// RFC 9068 access token after applying signed claim mutations.
+///
+/// The upstream signature is never copied. Only the payload is used as
+/// issuance input, the broker issuer and fresh `iat`/`jti` are stamped,
+/// and the broker signs a completely new compact JWS. Callers
+/// must invoke this only after a successful response from the configured
+/// upstream token endpoint.
+pub fn resign_at_jwt(
+    upstream_token: &str,
+    key: &JwkKey,
+    broker_issuer: &str,
+    mutations: &serde_json::Map<String, serde_json::Value>,
+) -> Result<String> {
+    if broker_issuer.trim().is_empty() {
+        return Err(anyhow!(
+            "broker issuer is required when re-signing an access token"
+        ));
+    }
+    let mut segments = upstream_token.split('.');
+    let _header = segments
+        .next()
+        .ok_or_else(|| anyhow!("access token is not a JWT"))?;
+    let payload = segments
+        .next()
+        .ok_or_else(|| anyhow!("access token is not a JWT"))?;
+    let _signature = segments
+        .next()
+        .ok_or_else(|| anyhow!("access token is not a JWT"))?;
+    if segments.next().is_some() {
+        return Err(anyhow!("access token is not a three-segment JWT"));
+    }
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|e| anyhow!("access token payload decode failed: {e}"))?;
+    let mut claims: serde_json::Value = serde_json::from_slice(&raw)
+        .map_err(|e| anyhow!("access token payload is not JSON: {e}"))?;
+    let object = claims
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("access token claims must be a JSON object"))?;
+    for required in ["sub", "aud", "exp", "client_id"] {
+        if !object.contains_key(required) {
+            return Err(anyhow!("access token missing required {required} claim"));
+        }
+    }
+    for (name, value) in mutations {
+        object.insert(name.clone(), value.clone());
+    }
+    object.insert(
+        "iss".to_string(),
+        serde_json::Value::String(broker_issuer.to_string()),
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| anyhow!("system clock is before UNIX epoch"))?
+        .as_secs() as i64;
+    object.insert("iat".to_string(), serde_json::Value::from(now));
+    let mut jti = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut jti);
+    object.insert(
+        "jti".to_string(),
+        serde_json::Value::String(
+            jti.iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        ),
+    );
+    mint_value_at_jwt(&claims, key)
+}
+
+fn mint_value_at_jwt(claims: &serde_json::Value, key: &JwkKey) -> Result<String> {
     let (encoding, alg, kid) = build_encoding_key(key)?;
     let mut header = Header::new(alg);
     header.typ = Some("at+jwt".to_string());
@@ -390,6 +470,33 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
         assert_eq!(payload["client_id"], "client-abc");
         assert_eq!(payload["scope"], "read write");
         assert_eq!(payload["jti"], "f47ac10b58cc4372a5670e02b2c3d479");
+    }
+
+    #[test]
+    fn resign_at_jwt_signs_mutated_claims_with_a_fresh_signature() {
+        let key = fixture_es256_pem();
+        let unsigned_shape = "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCJ9.eyJpc3MiOiJodHRwczovL3Vwc3RyZWFtLmV4YW1wbGUiLCJzdWIiOiJ1c2VyLTQyIiwiYXVkIjoiaHR0cHM6Ly9tY3AuZXhhbXBsZSIsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxNzAwMDAwMDAwLCJqdGkiOiJvbGQtaWQiLCJjbGllbnRfaWQiOiJjbGllbnQtYWJjIn0.invalid-signature";
+        let mutations = serde_json::json!({
+            "cnf": {"jkt": "proof-thumbprint"}
+        });
+
+        let resigned = resign_at_jwt(
+            unsigned_shape,
+            &key,
+            "https://broker.example",
+            mutations.as_object().unwrap(),
+        )
+        .expect("broker must mint a fresh signed token");
+
+        assert_ne!(resigned.split('.').nth(2), Some("invalid-signature"));
+        let payload = resigned.split('.').nth(1).unwrap();
+        let raw =
+            base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload)
+                .unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(claims["iss"], "https://broker.example");
+        assert_eq!(claims["cnf"]["jkt"], "proof-thumbprint");
+        assert_ne!(claims["jti"], "old-id");
     }
 
     #[test]

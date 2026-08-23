@@ -45,30 +45,24 @@
 //!
 //! # Wiring
 //!
-//! This crate does not attempt to register itself as an
-//! `sbproxy_plugin::AuthProvider` inside `sbproxy-modules`. Doing so
-//! would need an exhaustive match over every `Auth` enum variant in
-//! `sbproxy-core`'s request dispatch (`dispatch.rs`, `server.rs`,
-//! `server/request_phase.rs`) to grow a new arm, which is exactly the
-//! kind of shared-file change this ticket was scoped to avoid making.
-//! `McpResourceServerProvider` is instead a plain, dependency-free
-//! async type: an integrator wires `McpResourceServerProvider::authenticate`
-//! into whatever dispatch shim fronts their MCP origin, the same
-//! posture the enterprise version of this file already documented for
-//! its own engine ("until it grows [a per-provider hook], callers can
-//! invoke `metadata_document()` ... from a startup-hook-installed
-//! dispatch shim").
+//! An `action: mcp` can compile this provider from its nested
+//! `oauth.resource_server` configuration. Core dispatch applies it after
+//! MCP transport trust and before catalogue reads, body parsing, or
+//! upstream work. The same type remains usable directly by MCP servers
+//! that are not hosted behind sbproxy.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
+use base64::Engine;
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
-use crate::dpop::{jwk_thumbprint, parse_and_verify, DpopError};
+use crate::dpop::{jwk_thumbprint, parse_and_verify, DpopError, DpopReplayCache};
 
 // --- Audience ---
 
@@ -140,17 +134,14 @@ pub struct McpResourceServerConfig {
     #[serde(default = "default_metadata_path")]
     pub metadata_path: String,
 
-    /// When true, a token carrying a `cnf.jkt` claim MUST be
-    /// accompanied by a matching RFC 9449 DPoP proof. Tokens without
-    /// `cnf.jkt` are unaffected (they are bearer-style by the
-    /// broker's own choice, not a downgrade the resource server
-    /// forces).
+    /// Legacy compatibility knob. Signed `cnf.jkt` claims are always
+    /// enforced; setting this false cannot downgrade a bound token to
+    /// bearer semantics.
     #[serde(default)]
     pub dpop_enforce_binding: bool,
 
     /// Maximum acceptable skew between a DPoP proof's `iat` and wall
-    /// clock, in seconds. Honoured only when `dpop_enforce_binding` is
-    /// true.
+    /// clock, in seconds.
     #[serde(default = "default_dpop_skew_secs")]
     pub dpop_max_clock_skew_secs: u64,
 }
@@ -170,24 +161,16 @@ fn default_dpop_skew_secs() -> u64 {
 impl McpResourceServerConfig {
     /// Validate cross-field invariants.
     pub fn validate(&self) -> Result<()> {
-        if self.resource_uri.trim().is_empty() {
-            return Err(anyhow!("mcp_resource_server requires resource_uri"));
-        }
+        validate_absolute_http_url("resource_uri", &self.resource_uri)?;
         if self.authorization_servers.is_empty() {
             return Err(anyhow!(
                 "mcp_resource_server requires at least one authorization_servers entry"
             ));
         }
         for as_url in &self.authorization_servers {
-            if as_url.trim().is_empty() {
-                return Err(anyhow!(
-                    "mcp_resource_server authorization_servers entries must be non-empty"
-                ));
-            }
+            validate_absolute_http_url("authorization_servers entry", as_url)?;
         }
-        if self.jwks_url.trim().is_empty() {
-            return Err(anyhow!("mcp_resource_server requires jwks_url"));
-        }
+        validate_absolute_http_url("jwks_url", &self.jwks_url)?;
         if self.audience.as_list().is_empty()
             || self.audience.as_list().iter().any(|s| s.trim().is_empty())
         {
@@ -195,8 +178,37 @@ impl McpResourceServerConfig {
                 "mcp_resource_server audience must contain at least one non-empty value"
             ));
         }
+        if !self
+            .audience
+            .as_list()
+            .iter()
+            .any(|audience| audience == &self.resource_uri)
+        {
+            return Err(anyhow!(
+                "mcp_resource_server audience must include resource_uri"
+            ));
+        }
+        if !self.metadata_path.starts_with('/') || self.metadata_path.starts_with("//") {
+            return Err(anyhow!(
+                "mcp_resource_server metadata_path must be an origin-relative path"
+            ));
+        }
         Ok(())
     }
+}
+
+fn validate_absolute_http_url(field: &str, value: &str) -> Result<()> {
+    let parsed = url::Url::parse(value)
+        .map_err(|_| anyhow!("mcp_resource_server {field} must be an absolute HTTP(S) URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.has_host()
+        || parsed.fragment().is_some()
+    {
+        return Err(anyhow!(
+            "mcp_resource_server {field} must be an absolute HTTP(S) URL without a fragment"
+        ));
+    }
+    Ok(())
 }
 
 // --- Errors ---
@@ -300,16 +312,23 @@ pub struct McpResourceServerProvider {
     config: McpResourceServerConfig,
     http: reqwest::Client,
     jwks: JwksCache,
+    dpop_replay: Arc<DpopReplayCache>,
 }
 
 impl McpResourceServerProvider {
     /// Build a provider from validated config.
     pub fn new(config: McpResourceServerConfig) -> Result<Self> {
         config.validate()?;
+        let replay_ttl_secs = 300_u64.max(config.dpop_max_clock_skew_secs.saturating_mul(2));
         Ok(Self {
             config,
             http: sbproxy_httpkit::default_outbound(),
             jwks: JwksCache::new(),
+            dpop_replay: Arc::new(DpopReplayCache::with_prefix(
+                crate::LocalStore::arc(),
+                Duration::from_secs(replay_ttl_secs),
+                "resource:dpop:jti",
+            )),
         })
     }
 
@@ -349,11 +368,18 @@ impl McpResourceServerProvider {
 
     /// Build the RFC 6750 `WWW-Authenticate` header value for a 401.
     pub fn www_authenticate_header(&self, err: &ResourceServerAuthError) -> String {
-        let metadata_url = format!(
-            "{}{}",
-            self.config.resource_uri.trim_end_matches('/'),
-            self.config.metadata_path
-        );
+        // `metadata_path` is mounted at the resource origin by the live
+        // action adapter. Do not append it to a resource URI path (for
+        // example `/mcp`), which would advertise a route that is not served.
+        let metadata_url = url::Url::parse(&self.config.resource_uri)
+            .map(|url| {
+                format!(
+                    "{}{}",
+                    url.origin().ascii_serialization().trim_end_matches('/'),
+                    self.config.metadata_path
+                )
+            })
+            .unwrap_or_else(|_| self.config.metadata_path.clone());
         let escape = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
         format!(
             "Bearer realm=\"{realm}\", resource_metadata=\"{md}\", error=\"{ec}\", error_description=\"{desc}\"",
@@ -369,15 +395,30 @@ impl McpResourceServerProvider {
     /// resource binding, and (when configured) RFC 9449 DPoP binding.
     ///
     /// `authorization_header` is the raw `Authorization` header value.
-    /// `dpop_header`, `method`, and `url` are needed only when
-    /// `dpop_enforce_binding` is set and the presented token carries a
-    /// `cnf.jkt` claim.
+    /// `dpop_header`, `method`, and `url` are used whenever the
+    /// presented token carries a signed `cnf.jkt` claim.
     pub async fn authenticate(
         &self,
         authorization_header: Option<&str>,
         dpop_header: Option<&str>,
         method: &str,
         url: &url::Url,
+    ) -> Result<VerifiedToken, ResourceServerAuthError> {
+        self.authenticate_with_certificate(authorization_header, dpop_header, method, url, None)
+            .await
+    }
+
+    /// Authenticate with a certificate thumbprint obtained from the
+    /// verified TLS connection. Forwarded certificate headers are not
+    /// read here; the process integrating this provider owns the
+    /// trusted-proxy boundary and passes only verified identity.
+    pub async fn authenticate_with_certificate(
+        &self,
+        authorization_header: Option<&str>,
+        dpop_header: Option<&str>,
+        method: &str,
+        url: &url::Url,
+        verified_cert_x5t_s256: Option<&str>,
     ) -> Result<VerifiedToken, ResourceServerAuthError> {
         let token = authorization_header
             .and_then(|v| {
@@ -388,11 +429,17 @@ impl McpResourceServerProvider {
             .filter(|s| !s.is_empty())
             .ok_or(ResourceServerAuthError::MissingToken)?;
 
+        if crate::revoke::REVOCATIONS.contains(token).await {
+            return Err(ResourceServerAuthError::InvalidToken(
+                "token has been revoked".to_string(),
+            ));
+        }
+
         let claims = self.verify_signature_and_claims(token).await?;
         self.enforce_resource_binding(&claims)?;
-        if self.config.dpop_enforce_binding {
-            self.enforce_dpop_binding(&claims, dpop_header, method, url)?;
-        }
+        self.enforce_dpop_binding(&claims, token, dpop_header, method, url)
+            .await?;
+        self.enforce_mtls_binding(&claims, verified_cert_x5t_s256)?;
 
         let sub = claims
             .get("sub")
@@ -459,9 +506,10 @@ impl McpResourceServerProvider {
         }
     }
 
-    fn enforce_dpop_binding(
+    async fn enforce_dpop_binding(
         &self,
         claims: &serde_json::Value,
+        access_token: &str,
         dpop_header: Option<&str>,
         method: &str,
         url: &url::Url,
@@ -494,8 +542,58 @@ impl McpResourceServerProvider {
                 "DPoP key thumbprint mismatch".to_string(),
             ));
         }
+        let expected_ath = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(Sha256::digest(access_token.as_bytes()));
+        let actual_ath = proof.ath.as_deref().ok_or_else(|| {
+            ResourceServerAuthError::DpopBindingFailed(
+                "DPoP ath claim required when an access token is used".to_string(),
+            )
+        })?;
+        if !constant_time_eq(expected_ath.as_bytes(), actual_ath.as_bytes()) {
+            return Err(ResourceServerAuthError::DpopBindingFailed(
+                "DPoP ath does not match the presented access token".to_string(),
+            ));
+        }
+        self.dpop_replay
+            .record_jti(&proof)
+            .await
+            .map_err(|e| ResourceServerAuthError::DpopBindingFailed(e.to_string()))?;
         Ok(())
     }
+
+    fn enforce_mtls_binding(
+        &self,
+        claims: &serde_json::Value,
+        verified_cert_x5t_s256: Option<&str>,
+    ) -> Result<(), ResourceServerAuthError> {
+        let Some(expected) = claims.get("cnf").and_then(|cnf| cnf.get("x5t#S256")) else {
+            return Ok(());
+        };
+        let expected = expected.as_str().ok_or_else(|| {
+            ResourceServerAuthError::InvalidToken("cnf.x5t#S256 must be a string".to_string())
+        })?;
+        let actual = verified_cert_x5t_s256.ok_or_else(|| {
+            ResourceServerAuthError::InvalidToken(
+                "mTLS-bound token requires a verified client certificate".to_string(),
+            )
+        })?;
+        if !constant_time_eq(expected.as_bytes(), actual.as_bytes()) {
+            return Err(ResourceServerAuthError::InvalidToken(
+                "verified client certificate does not match cnf.x5t#S256".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |difference, (a, b)| difference | (a ^ b))
+        == 0
 }
 
 /// Candidate JWKs to try, in preference order: an exact `kid` match
@@ -636,6 +734,17 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
     }
 
     #[test]
+    fn validate_rejects_relative_or_mismatched_resource_configuration() {
+        let mut relative = base_config("http://x".to_string());
+        relative.resource_uri = "/mcp".to_string();
+        assert!(relative.validate().is_err());
+
+        let mut mismatch = base_config("http://x".to_string());
+        mismatch.audience = AudienceConfig::Single("https://other.example".to_string());
+        assert!(mismatch.validate().is_err());
+    }
+
+    #[test]
     fn audience_config_accepts_single_or_multi() {
         let single: AudienceConfig = serde_json::from_value(serde_json::json!("a")).unwrap();
         assert_eq!(single.as_list(), vec!["a"]);
@@ -676,6 +785,23 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
             .await
             .unwrap_err();
         assert!(matches!(err, ResourceServerAuthError::MissingToken));
+    }
+
+    #[tokio::test]
+    async fn locally_revoked_token_is_rejected_before_jwks_validation() {
+        let token = "resource-provider-revoked-token";
+        crate::revoke::REVOCATIONS.record(token).await.unwrap();
+        let provider = McpResourceServerProvider::new(base_config("http://x".to_string())).unwrap();
+        let err = provider
+            .authenticate(
+                Some(&format!("Bearer {token}")),
+                None,
+                "POST",
+                &url::Url::parse("https://mcp.example/api").unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("revoked"), "{err}");
     }
 
     #[tokio::test]
@@ -804,7 +930,7 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
     }
 
     #[tokio::test]
-    async fn dpop_bound_token_with_matching_proof_is_accepted() {
+    async fn dpop_bound_token_with_matching_key_but_no_ath_is_rejected() {
         let addr = spawn_jwks_server().await;
         let mut cfg = base_config(format!("http://{addr}/jwks.json"));
         cfg.dpop_enforce_binding = true;
@@ -832,11 +958,62 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
         });
         let proof = encode(&proof_header, &proof_claims, &key).unwrap();
         let auth_header = format!("DPoP {token}");
+        let err = provider
+            .authenticate(Some(&auth_header), Some(&proof), "POST", &url)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("ath"));
+    }
+
+    #[tokio::test]
+    async fn dpop_bound_token_requires_matching_ath_and_single_use_jti() {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        let addr = spawn_jwks_server().await;
+        let mut cfg = base_config(format!("http://{addr}/jwks.json"));
+        cfg.dpop_enforce_binding = true;
+        let provider = McpResourceServerProvider::new(cfg).unwrap();
+        let jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(jwk_value()).unwrap();
+        let jkt = jwk_thumbprint(&jwk).unwrap();
+        let token = issue_jwt(serde_json::json!({
+            "iss": "https://auth.example.com",
+            "sub": "user-1",
+            "aud": "https://mcp.example.com",
+            "resource": "https://mcp.example.com",
+            "exp": now() + 300,
+            "cnf": {"jkt": jkt},
+        }));
+        let ath = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(Sha256::digest(token.as_bytes()));
+        let url = url::Url::parse("https://mcp.example.com/tools/call").unwrap();
+        let key = EncodingKey::from_ec_pem(ES256_PRIVATE_PEM.as_bytes()).unwrap();
+        let mut proof_header = Header::new(jsonwebtoken::Algorithm::ES256);
+        proof_header.typ = Some("dpop+jwt".to_string());
+        proof_header.jwk = Some(jwk);
+        let proof = encode(
+            &proof_header,
+            &serde_json::json!({
+                "htm": "POST",
+                "htu": "https://mcp.example.com/tools/call",
+                "iat": now(),
+                "jti": "proof-single-use",
+                "ath": ath,
+            }),
+            &key,
+        )
+        .unwrap();
+        let auth_header = format!("DPoP {token}");
+
         let verified = provider
             .authenticate(Some(&auth_header), Some(&proof), "POST", &url)
             .await
-            .expect("dpop-bound token with matching proof must verify");
+            .expect("matching ath must verify once");
         assert_eq!(verified.sub, "user-1");
+        let replay = provider
+            .authenticate(Some(&auth_header), Some(&proof), "POST", &url)
+            .await
+            .unwrap_err();
+        assert!(replay.to_string().contains("replay"));
     }
 
     #[tokio::test]
@@ -859,6 +1036,40 @@ OF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n\
             .authenticate(Some(&header), None, "POST", &url)
             .await
             .expect("bearer-only token needs no DPoP proof");
+        assert_eq!(verified.sub, "user-1");
+    }
+
+    #[tokio::test]
+    async fn mtls_bound_token_requires_verified_connection_identity_not_xfcc() {
+        let addr = spawn_jwks_server().await;
+        let cfg = base_config(format!("http://{addr}/jwks.json"));
+        let provider = McpResourceServerProvider::new(cfg).unwrap();
+        let token = issue_jwt(serde_json::json!({
+            "iss": "https://auth.example.com",
+            "sub": "user-1",
+            "aud": "https://mcp.example.com",
+            "resource": "https://mcp.example.com",
+            "exp": now() + 300,
+            "cnf": {"x5t#S256": "verified-thumbprint"},
+        }));
+        let url = url::Url::parse("https://mcp.example.com/tools/call").unwrap();
+        let header = format!("Bearer {token}");
+
+        let missing = provider
+            .authenticate(Some(&header), None, "POST", &url)
+            .await
+            .unwrap_err();
+        assert!(missing.to_string().contains("verified client certificate"));
+        let verified = provider
+            .authenticate_with_certificate(
+                Some(&header),
+                None,
+                "POST",
+                &url,
+                Some("verified-thumbprint"),
+            )
+            .await
+            .expect("direct verified certificate identity must satisfy cnf");
         assert_eq!(verified.sub, "user-1");
     }
 }

@@ -555,10 +555,49 @@ oauth:
   scopes_supported: ["mcp.read", "mcp.call"]
 ```
 
-Token validation itself stays in the generic auth layer; this block
-only drives discovery and the challenge. A request that already
-carries an `Authorization` header is never re-challenged. See
-[`examples/mcp-oauth-discovery`](../examples/mcp-oauth-discovery).
+The discovery-only form above is still supported. Add `broker` and
+`resource_server` when this MCP action should own the OAuth flow and
+validate its tokens in the same sbproxy process:
+
+```yaml
+oauth:
+  authorization_servers: ["https://mcp.example.com/mcp/oauth"]
+  scopes_supported: ["mcp.read", "mcp.call"]
+  broker:
+    base_path: /mcp/oauth
+    external_base_url: https://mcp.example.com
+    upstream_authorization_server_url: https://idp.example.com/authorize
+    upstream_metadata_url: https://idp.example.com/.well-known/oauth-authorization-server
+    upstream_token_endpoint_url: https://idp.example.com/token
+    upstream_redirect_uri: https://mcp.example.com/mcp/oauth/callback
+    resource_uri: https://mcp.example.com/
+    allowed_redirect_uris: ["https://client.example.com/callback"]
+    session_ttl_secs: 600
+    broker_signing_key:
+      pem: "${MCP_BROKER_SIGNING_KEY_PEM}"
+      alg: ES256
+      kid: broker-2026-08
+  resource_server:
+    resource_uri: https://mcp.example.com/
+    authorization_servers: ["https://mcp.example.com/mcp/oauth"]
+    jwks_url: https://mcp.example.com/mcp/oauth/.well-known/jwks.json
+    audience: https://mcp.example.com/
+    issuer: https://mcp.example.com/mcp/oauth
+    scopes_supported: ["mcp.read", "mcp.call"]
+```
+
+The action compiler requires the discovery and verifier authorization
+servers/scopes to match. It also requires the broker and verifier to
+use the same RFC 8707 resource URI. Protected MCP requests reach the
+verifier before the catalog, request body, or upstream federation.
+The device verification route receives user identity only from
+sbproxy's completed authentication phase, and mTLS bindings receive a
+certificate thumbprint only from the verified TLS connection.
+
+See [`examples/mcp-oauth-discovery`](../examples/mcp-oauth-discovery)
+for the discovery-only shape. The full broker behavior and standalone
+embedding API are documented in
+[mcp-oauth-gateway.md](mcp-oauth-gateway.md).
 
 For an MCP server that is not itself proxied through `sbproxy`, see
 [mcp-oauth-gateway.md](mcp-oauth-gateway.md): a standalone OAuth 2.1

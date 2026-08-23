@@ -125,6 +125,7 @@ sbproxy-httpkit.workspace = true
 sbproxy-config.workspace = true
 sbproxy-tls.workspace = true
 sbproxy-modules.workspace = true
+sbproxy-mcp-gateway.workspace = true
 # WOR-1717: optional TLS on the hand-rolled admin listener.
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
