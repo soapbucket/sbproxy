@@ -12,8 +12,9 @@
 //! A stock SBproxy process installs a sidecar-backed implementation when
 //! `proxy.classifier_hooks.intent` is configured. The hook is lazy, bounded
 //! by the configured deadline, and reports a failed call as
-//! [`IntentSource::HeuristicDegraded`]; omitting the config reports
-//! [`IntentSource::HeuristicUnconfigured`]. See
+//! [`crate::intent_detection::IntentSource::HeuristicDegraded`]; omitting the
+//! config reports
+//! [`crate::intent_detection::IntentSource::HeuristicUnconfigured`]. See
 //! [`crate::intent_detection::detect_intent_async`] for exactly where it
 //! plugs in, and `docs/ai-gateway.md`'s intent-detection section for the
 //! operator-facing picture.
