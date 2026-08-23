@@ -4,7 +4,7 @@ name: hello-javascript
 version: 1.0.0
 runtime: javascript
 entry: entry.js
-sha256: 42c3e04fdb8ad0d2539fb743311d49bf498394c46c73df0999ff0b2e07061fb4
+sha256: c3e22fb687e2cafe791daed266d028f043ec700594d20caa9caf1e65f4506524
 hooks:
   - kind: action
     type: hello_javascript

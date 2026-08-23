@@ -1,5 +1,5 @@
 # Extension Bundles
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-22*
 
 Dynamic bundles add policies, request authentication, transforms, actions, HTTP filters, provider-neutral event hooks, and AI routing decisions without linking a new proxy binary. A local installation is a directory of bundle directories:
 
@@ -70,7 +70,7 @@ name: hello-javascript
 version: 1.0.0
 runtime: javascript
 entry: entry.js
-sha256: 42c3e04fdb8ad0d2539fb743311d49bf498394c46c73df0999ff0b2e07061fb4
+sha256: c3e22fb687e2cafe791daed266d028f043ec700594d20caa9caf1e65f4506524
 hooks:
   - kind: action
     type: hello_javascript
@@ -205,6 +205,8 @@ A manifest that declares `digest_scope: bundle_v1` without a `sha256` fails vali
 ## JavaScript and load-time TypeScript
 
 JavaScript and TypeScript entries are ES modules with named exports. The host passes one JSON value to the selected export and accepts one strict JSON result. For the configurable HTTP hooks:
+
+The sandbox is QuickJS with `eval` removed. The only host-provided globals beyond the language itself are `json_encode` (an alias of `JSON.stringify`) and `json_decode` (an alias of `JSON.parse`). There is no `atob`, `btoa`, `Buffer`, `TextEncoder`, `console.log`, or `crypto`. A hook that needs encoding or HMAC carries its own; see [Authentication](#authentication) and the worked `hmac-auth-javascript` bundle.
 
 | Hook | Input field | Valid result |
 |---|---|---|
@@ -346,6 +348,8 @@ origins:
 `filters` is an ordered list of `type`, `config`, and an optional `failure_posture` override. Body access comes from each manifest hook, not from the attachment. The chain buffers only when at least one attached filter declares `buffered`, using the smallest configured input limit among filters that consume a body. `none` plus `streamed` still streams, while a `none`-only chain passes bodies through untouched.
 
 An origin with filters must use a proxy action. If it has forward rules, every action those rules can select must also be a proxy action. A filtered origin cannot configure `fallback_origin`. Candidate validation rejects any other combination before publication.
+
+The same compile-time rule applies to `transforms:`: they are a `response_body_filter` stage, and `ai_proxy` never enters that pipeline. Attach `ai_guardrail_output` or `ai_tool_call` instead; a transform list on an `ai_proxy` origin is refused at config load.
 
 The host implements a bounded HTTP subset of Proxy-Wasm. Unsupported imports fail candidate load. A callback that returns `Pause` without resolving it is treated as a filter failure, so a guest cannot leave a request stalled. The attachment or bundle failure posture decides whether traffic is admitted or refused after that failure.
 

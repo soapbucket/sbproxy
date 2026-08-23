@@ -243,11 +243,10 @@ pub struct LocalServing {
 
 /// Whether the `git` binary is present, and what it reports.
 ///
-/// A config that declares `source: {kind: git}` shells out to `git` on
-/// every resolution, so `git` is a runtime dependency of that config and
-/// not just of the build. A host missing it should learn that from
-/// `doctor` before it boots rather than from a clone error during a
-/// change window, which is the failure this block exists to prevent.
+/// A config that declares `source: {kind: git}` prefers `git` on PATH
+/// and falls back to an in-process clone when the binary is missing.
+/// `verify_signature: true` still needs git. Doctor reports the binary
+/// so an operator can see which path a host will take.
 #[derive(Debug, Clone, Serialize)]
 pub struct GitBinary {
     /// Resolved path on `PATH`, `None` when absent.
@@ -396,8 +395,8 @@ pub struct DoctorReport {
     pub containers: ContainerInfo,
     /// System package managers.
     pub package_managers: PackageManagers,
-    /// The `git` binary, which any config declaring a
-    /// `source: {kind: git}` block needs at runtime.
+    /// The `git` binary. Preferred for `source: {kind: git}`; an
+    /// in-process fallback is used when it is absent.
     pub git: GitBinary,
     /// Python toolchain.
     pub python: PythonInfo,
@@ -1156,7 +1155,7 @@ impl DoctorReport {
                 (Some(path), Some(version)) => format!("{} ({version})", path.display()),
                 (Some(path), None) => path.display().to_string(),
                 (None, _) =>
-                    "not found (required only by a `source: {kind: git}` config)".to_string(),
+                    "not found (in-process fallback used for `source: {kind: git}`)".to_string(),
             }
         ));
 

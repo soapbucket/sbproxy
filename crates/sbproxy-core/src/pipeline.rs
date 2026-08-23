@@ -2421,6 +2421,7 @@ impl CompiledPipeline {
             };
             proxy_wasm_filters.push(proxy_wasm_filter);
             let origin_action_is_mcp = matches!(&action, Action::Mcp(_));
+            let origin_action_is_ai_proxy = matches!(&action, Action::AiProxy(_));
             actions.push(action);
 
             // Compile auth (optional per origin). Route through the
@@ -2542,6 +2543,21 @@ impl CompiledPipeline {
             // request-dependent transform on a cached origin is
             // refused here, where the compiled variant can answer for
             // itself, rather than trusted to an operator promise.
+            // WOR-2680: `handle_ai_proxy` writes the response itself and
+            // never reaches Pingora's `response_body_filter`, which is
+            // the only stage that runs the transform chain. A transform
+            // on an `ai_proxy` origin would load as `active` and then
+            // silently no-op. Refuse the pairing at compile, the same
+            // way Proxy-Wasm filters already refuse a non-proxy action.
+            // Use the AI-specific hooks (`ai_guardrail_output`,
+            // `ai_tool_call`, `ai_stream_event`) to inspect or rewrite
+            // model output instead.
+            if origin_action_is_ai_proxy && !origin_transforms.is_empty() {
+                anyhow::bail!(
+                    "origin `{}`: transforms require a proxy action; `ai_proxy` never reaches the transform pipeline. Use AI bundle hooks (`ai_guardrail_output`, `ai_tool_call`) instead",
+                    origin.origin_id
+                );
+            }
             if origin
                 .response_cache
                 .as_ref()
@@ -5892,6 +5908,29 @@ origins:
             vec![serde_json::json!({"type": "unknown_transform_type"})],
         );
         assert!(CompiledPipeline::from_config(config).is_err());
+    }
+
+    #[test]
+    fn pipeline_rejects_transforms_on_ai_proxy_origins() {
+        let config = make_config_with_transforms(
+            "ai.example",
+            serde_json::json!({
+                "type": "ai_proxy",
+                "providers": [{
+                    "name": "openai",
+                    "provider_type": "openai",
+                    "api_key": "fixture"
+                }]
+            }),
+            vec![serde_json::json!({"type": "json", "set": {"x": 1}})],
+        );
+        let error = match CompiledPipeline::from_config(config) {
+            Ok(_) => panic!("ai_proxy must refuse a transform attachment"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(error.contains("ai.example"), "{error}");
+        assert!(error.contains("ai_proxy"), "{error}");
+        assert!(error.contains("transform"), "{error}");
     }
 
     #[test]

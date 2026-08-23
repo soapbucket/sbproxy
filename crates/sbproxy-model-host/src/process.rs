@@ -2066,18 +2066,9 @@ fn spawn_engine_command(
 ) -> std::io::Result<SpawnedEngineChild> {
     use std::os::unix::process::CommandExt as _;
 
-    const EXEC_GATE: &str = "IFS= read -r release || exit 125\n\
-        [ \"$release\" = 1 ] || exit 125\n\
-        exec </dev/null\n\
-        exec \"$@\"";
-
     let parent_pid = unsafe { libc::getpid() };
-    let mut command = std::process::Command::new("/bin/sh");
+    let mut command = std::process::Command::new(executable);
     command
-        .arg("-c")
-        .arg(EXEC_GATE)
-        .arg("sbproxy-engine-gate")
-        .arg(executable)
         .args(arguments)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -2087,9 +2078,21 @@ fn spawn_engine_command(
     // Command owns descriptor setup and the complete fork/exec boundary
     // (including atomic CLOEXEC pipes on Linux), so there is no separate
     // application-managed fork window. The child hook performs only libc
-    // operations: signals stay blocked until inherited dispositions reset.
+    // operations: signals stay blocked until inherited dispositions reset,
+    // then the startup gate waits for the parent to persist ownership
+    // before the engine image is exec'd. The gate used to be a `/bin/sh
+    // -c` wrapper (WOR-2677); distroless images have no shell, so the
+    // wait lives in `pre_exec` instead.
     unsafe {
-        command.pre_exec(move || prepare_engine_child_signal_state(parent_pid));
+        command.pre_exec(move || {
+            // SAFETY: `pre_exec` runs in the child after fork. Both
+            // helpers are async-signal-safe libc sequences.
+            unsafe {
+                prepare_engine_child_signal_state(parent_pid)?;
+                wait_for_engine_release_gate()?;
+            }
+            Ok(())
+        });
     }
     // Block in the calling thread before fork so the child is protected from
     // inherited handlers from its first instruction. The child resets every
@@ -2466,6 +2469,57 @@ unsafe fn prepare_engine_child_signal_state(parent_pid: libc::pid_t) -> std::io:
     {
         return Err(std::io::Error::last_os_error());
     }
+    Ok(())
+}
+
+/// Wait for the parent to persist ownership, then point stdin at
+/// `/dev/null` before the engine image is exec'd.
+///
+/// Async-signal-safe: this runs in `pre_exec` after fork. The previous
+/// implementation was a `/bin/sh -c` wrapper (WOR-2677); distroless
+/// images have no shell, so the same protocol lives here in libc.
+#[cfg(target_os = "linux")]
+unsafe fn wait_for_engine_release_gate() -> std::io::Result<()> {
+    let mut byte = 0u8;
+    let mut saw_one = false;
+    loop {
+        let n = libc::read(
+            libc::STDIN_FILENO,
+            std::ptr::addr_of_mut!(byte).cast::<libc::c_void>(),
+            1,
+        );
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if n == 0 {
+            libc::_exit(125);
+        }
+        if byte == b'\n' {
+            break;
+        }
+        if byte == b'1' && !saw_one {
+            saw_one = true;
+            continue;
+        }
+        libc::_exit(125);
+    }
+    if !saw_one {
+        libc::_exit(125);
+    }
+    let path = b"/dev/null\0";
+    let fd = libc::open(
+        path.as_ptr().cast::<libc::c_char>(),
+        libc::O_RDONLY | libc::O_CLOEXEC,
+    );
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if libc::dup2(fd, libc::STDIN_FILENO) < 0 {
+        let err = std::io::Error::last_os_error();
+        libc::close(fd);
+        return Err(err);
+    }
+    libc::close(fd);
     Ok(())
 }
 
@@ -3717,6 +3771,34 @@ mod tests {
             assert!(child.wait().unwrap().success());
             assert!(marker.exists());
         }
+    }
+
+    fn true_executable() -> &'static Path {
+        ["/bin/true", "/usr/bin/true"]
+            .iter()
+            .map(Path::new)
+            .find(|path| path.exists())
+            .unwrap_or(Path::new("/bin/true"))
+    }
+
+    #[test]
+    fn engine_spawn_gate_does_not_require_a_shell_wrapper() {
+        let directory = tempfile::tempdir().unwrap();
+        let gate_directory = test_gate_directory(&directory);
+        let mut child = spawn_engine_child(
+            gate_directory.as_ref(),
+            true_executable(),
+            &[],
+            &BTreeMap::new(),
+        )
+        .expect("spawn /bin/true through the startup gate");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the engine image must not exec until the parent releases the gate"
+        );
+        child.release_after_durable_record().unwrap();
+        assert!(child.wait().unwrap().success());
     }
 
     #[test]

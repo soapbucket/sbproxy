@@ -1,6 +1,6 @@
 # Request flow
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-22*
 
 Every request SBproxy accepts runs through one pipeline, implemented as a
 sequence of Pingora `ProxyHttp` callbacks: `request_filter`,
@@ -169,11 +169,13 @@ The actual origin call branches by traffic type:
 - **Plain HTTP (`proxy`, `load_balancer`)** - an ordinary reverse-proxy
   call. See [api-gateway.md](api-gateway.md) and [routing.md](routing.md).
 - **AI (`ai_proxy`)** - a request to a hosted provider or local model.
-  Guardrail mesh hooks (`ai_guardrail_input`, `ai_guardrail_output`) and,
-  for streaming tool calls, an `ai_tool_call` hook can each return
-  `release`, `flag`, `block`, or (where the manifest declares
-  `execution.mutates: true`) `mutate` to rewrite the content in place
-  before the next hook runs. See [ai-gateway.md](ai-gateway.md),
+  Guardrail mesh hooks (`ai_guardrail_input`, `ai_guardrail_output`) and
+  `ai_tool_call` can each return `release`, `flag`, `block`, or (where the
+  manifest declares `execution.mutates: true`) `mutate` to rewrite the
+  content in place before the next hook runs. Output and tool-call hooks
+  run on both buffered and streamed completions. A streamed `mutate` that
+  cannot be written back as the client's wire shape is refused rather than
+  shipping the original. See [ai-gateway.md](ai-gateway.md),
   [ai-guardrail-mesh.md](ai-guardrail-mesh.md), and
   [extension-bundles.md's AI stream hooks section](extension-bundles.md).
 - **MCP / A2A** - a JSON-RPC tool call or an agent-to-agent envelope. See

@@ -1,6 +1,6 @@
 # SBproxy scripting reference: CEL, Rego, Lua, JavaScript, and WASM
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-22*
 
 SBproxy includes five scripting engines for custom logic: CEL (Common Expression Language), Rego (via Regorus), Lua, JavaScript, and WASM. All run in sandboxed environments with access to request context.
 
@@ -1005,7 +1005,7 @@ Limits apply to every Lua surface uniformly: request modifiers, response modifie
 
 ## 5. JavaScript scripting
 
-JavaScript runs on QuickJS via `rquickjs`. Every invocation gets a sandboxed engine with `eval` removed and two global helpers registered: `json_encode` (alias of `JSON.stringify`) and `json_decode` (alias of `JSON.parse`).
+JavaScript runs on QuickJS via `rquickjs`. Every invocation gets a sandboxed engine with `eval` removed and two global helpers registered: `json_encode` (alias of `JSON.stringify`) and `json_decode` (alias of `JSON.parse`). There is no `atob`, `btoa`, `Buffer`, `TextEncoder`, or `crypto`; a script that needs those carries its own.
 
 Response modifiers define `modify_response(resp, ctx)` and, like Lua, only the returned `set_headers` map is applied:
 

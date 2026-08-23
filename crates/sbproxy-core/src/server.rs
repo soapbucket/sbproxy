@@ -5107,6 +5107,10 @@ async fn check_buffered_dynamic_policies(
     if active_indexes.is_empty() {
         return None;
     }
+    // Consume the plan before the first enforcer runs so a later phase
+    // cannot dispatch the same buffered hook twice (WOR-2681).
+    ctx.dynamic_request_body_plan
+        .mark_buffered_policies_dispatched();
     let req_snapshot = match build_plugin_request_snapshot(session, body) {
         Some(request) => request,
         None => return Some((500, "policy: bad request".to_string(), "plugin")),
