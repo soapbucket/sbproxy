@@ -46,6 +46,7 @@
         "alerting": null,
         "admin": null,
         "model_host": null,
+        "classifier_hooks": null,
         "cluster": null,
         "config_authority": null,
         "secrets": null,
@@ -595,6 +596,18 @@
           "anyOf": [
             {
               "$ref": "#/definitions/ModelHostControlConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "classifier_hooks": {
+          "description": "Optional classifier-sidecar hooks for intent and quality routing.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ClassifierHooksConfig"
             },
             {
               "type": "null"
@@ -2544,6 +2557,103 @@
           ],
           "format": "uint64",
           "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "ClassifierHooksConfig": {
+      "description": "Classifier-sidecar hooks installed into the stock proxy runtime.",
+      "type": "object",
+      "required": [
+        "endpoint"
+      ],
+      "properties": {
+        "endpoint": {
+          "description": "HTTP(S) gRPC endpoint of the minimal or rich classifier sidecar.",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "description": "End-to-end deadline for one hook decision.",
+          "default": 500,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "intent": {
+          "description": "Optional classifier-backed prompt intent detection.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ClassifierIntentHookConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "quality": {
+          "description": "Optional classifier-backed provider quality routing.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ClassifierQualityHookConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ClassifierIntentHookConfig": {
+      "description": "Model used to classify a prompt into the five stock intent labels.",
+      "type": "object",
+      "properties": {
+        "model": {
+          "description": "Logical classifier model id loaded by the sidecar.",
+          "default": "intent",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ClassifierQualityHookConfig": {
+      "description": "Classifier-backed provider scorer for prompt-aware routing.",
+      "type": "object",
+      "properties": {
+        "minimum_score": {
+          "description": "Minimum positive-label score eligible to win provider selection.",
+          "default": 0.75,
+          "type": "number",
+          "format": "double"
+        },
+        "provider_models": {
+          "description": "Per-provider classifier model and positive-label contract.",
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/ClassifierProviderModelConfig"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ClassifierProviderModelConfig": {
+      "description": "One provider's prompt-quality classifier contract.",
+      "type": "object",
+      "required": [
+        "label",
+        "model"
+      ],
+      "properties": {
+        "model": {
+          "description": "Logical classifier model id loaded by the sidecar.",
+          "type": "string"
+        },
+        "label": {
+          "description": "Label whose score represents this provider's suitability.",
+          "type": "string"
         }
       },
       "additionalProperties": false

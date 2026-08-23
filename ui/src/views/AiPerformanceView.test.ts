@@ -27,6 +27,8 @@ describe("AI classifier and quality-routing visibility (WOR-2672)", () => {
     );
     expect(aiPerformanceView).toContain("Intent detection source");
     expect(aiPerformanceView).toContain("Quality-hook routing outcomes");
+    expect(aiPerformanceView).toContain('class="sb-mono">heuristic</span>');
+    expect(aiPerformanceView).toContain("heuristic_degraded");
   });
 
   it("explains that hook fallback preserves configured routing", () => {

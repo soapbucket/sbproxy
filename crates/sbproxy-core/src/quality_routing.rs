@@ -32,14 +32,12 @@
 //! strategy already owns the order, so the two mechanisms never fight over
 //! the same request.
 //!
-//! No extension in this OSS tree registers a `QualityScoringHook` today
-//! (see `crates/sbproxy-core/src/classifier_hooks.rs` for why a
-//! classifier-sidecar-backed one is not shipped for this trait
-//! specifically), so `quality_scoring` is `None` in every default build
-//! and the call site above is a no-op there; an operator's own extension
-//! plugs in by registering one through
-//! [`crate::hooks::PipelineLifecycleHook`], the same seam
-//! [`crate::intent_detection`]'s hook is dispatched through.
+//! A stock SBproxy process installs a classifier-backed implementation when
+//! `proxy.classifier_hooks.quality` is configured. Each candidate provider
+//! names a classifier model and positive label, and the validated
+//! `minimum_score` travels with the hook into the live dispatcher. Omitting
+//! the block leaves the optional slot empty. Linked lifecycle extensions can
+//! still supply their own implementation through the same hook seam.
 
 use std::sync::Arc;
 

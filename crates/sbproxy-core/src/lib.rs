@@ -80,10 +80,8 @@ pub mod billing_runtime;
 pub mod builtin_enforcers;
 /// P0 edge capture wired into the request pipeline.
 pub mod capture_envelope;
-/// WOR-2672 follow-up: a real [`hooks::IntentDetectionHook`] implementation
-/// backed by [`sbproxy_classifier_client::FallbackClassifier`] (WOR-2665),
-/// degrading to [`intent_detection::detect_intent_heuristic`] when no
-/// sidecar is configured or the configured one is unreachable.
+/// Stock classifier-backed intent and quality hooks, including the optional
+/// in-process intent fallback adapter used by embedders.
 pub mod classifier_hooks;
 /// Process owner for the shared local or distributed cluster handle.
 pub mod cluster;

@@ -1958,7 +1958,7 @@
     },
     {
       "id": 33,
-      "title": "Intent Detection Source (Hook vs Heuristic)",
+      "title": "Intent Classifier State",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
@@ -2010,7 +2010,7 @@
           }
         }
       ],
-      "description": "Which path answered intent detection: a registered classifier-sidecar IntentDetectionHook (`hook`), or the local keyword heuristic (`heuristic`, WOR-2672) used when no hook is registered or the registered one fails open. A deployment with no sidecar hook configured is 100% `heuristic` by design, which is not a problem; a deployment that configured a hook and shows a rising `heuristic` share is one whose sidecar has stopped answering, which is."
+      "description": "Intent source and classifier state: `hook` means the configured sidecar answered, `heuristic` means no hook is configured, and `heuristic_degraded` means a configured hook failed open. Alert on sustained `heuristic_degraded`; normal heuristic-only operation remains separately visible."
     },
     {
       "id": 34,

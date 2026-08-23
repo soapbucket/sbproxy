@@ -286,6 +286,9 @@ base64.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+sbproxy-classifier-proto = { path = "../sbproxy-classifier-proto" }
+tonic.workspace = true
+tokio-stream = { version = "0.1", features = ["net"] }
 tracing-subscriber.workspace = true
 rcgen.workspace = true
 tempfile = "3"

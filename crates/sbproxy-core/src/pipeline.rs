@@ -11,8 +11,9 @@
 //!   response cache: whichever backend `proxy.response_cache_store`
 //!   selects, or, when that block is absent, Redis if `config.l2_store`
 //!   is set and an in-memory LRU otherwise,
-//! * an optional [`Hooks`](crate::hooks::Hooks) bundle of traits populated by a
-//!   [`PipelineLifecycleHook`](crate::hooks::PipelineLifecycleHook) when registered.
+//! * an optional [`Hooks`](crate::hooks::Hooks) bundle populated from stock
+//!   classifier-hook config and/or a linked
+//!   [`PipelineLifecycleHook`](crate::hooks::PipelineLifecycleHook).
 //!
 //! This struct lives in `sbproxy-core` to avoid a circular dependency:
 //! config -> modules -> config would be circular, but core depends on both.
@@ -1799,10 +1800,10 @@ pub struct CompiledPipeline {
     pub cache_reserve_admission: Option<ReserveAdmission>,
     /// Optional pipeline hooks bundle.
     ///
-    /// All fields default to `None`. A lifecycle extension registers
-    /// implementations (classifier, semantic cache, etc.) via the
-    /// `PipelineLifecycleHook` pattern. Request-path code invokes these
-    /// optionally and no-ops when they are `None`.
+    /// All fields default to `None`. Stock classifier config can install the
+    /// intent and quality slots; a lifecycle extension can install or replace
+    /// implementations via the `PipelineLifecycleHook` pattern. Request-path
+    /// code invokes these optionally and no-ops when they are `None`.
     pub hooks: crate::hooks::Hooks,
     /// Pre-parsed CIDRs from `proxy.trusted_proxies`. When the immediate
     /// TCP peer's IP falls inside one of these networks, the proxy honors
@@ -2332,6 +2333,8 @@ impl CompiledPipeline {
         extension_registry: Arc<DynamicBundleRegistry>,
         start_background_tasks: bool,
     ) -> anyhow::Result<Self> {
+        let hooks =
+            crate::classifier_hooks::hooks_from_config(config.server.classifier_hooks.as_ref())?;
         // WOR-2084: async twin of the shared L2 store. The rate-limit
         // policy's hot path awaits `AsyncKVStore::incr_with_ttl`
         // directly when this is attached, instead of bridging every
@@ -3067,7 +3070,7 @@ impl CompiledPipeline {
             origin_cache_stores,
             cache_reserve,
             cache_reserve_admission,
-            hooks: crate::hooks::Hooks::default(),
+            hooks,
             trusted_proxy_cidrs,
             tls_fingerprint_config,
             agent_detect_config,
@@ -5927,6 +5930,44 @@ origins:
         assert!(pipeline.hooks.intent_detection.is_none());
         assert!(pipeline.hooks.quality_scoring.is_none());
         assert!(pipeline.hooks.stream_safety.is_none());
+    }
+
+    #[test]
+    fn stock_classifier_hook_config_installs_both_runtime_hooks_without_a_tokio_runtime() {
+        let config = sbproxy_config::compile_config(
+            r#"
+proxy:
+  classifier_hooks:
+    endpoint: http://127.0.0.1:9440
+    timeout_ms: 250
+    intent:
+      model: intent-v1
+    quality:
+      minimum_score: 0.8
+      provider_models:
+        primary:
+          model: quality-primary-v1
+          label: preferred
+origins:
+  ai.example.com:
+    action:
+      type: ai_proxy
+      providers:
+        - name: primary
+          provider_type: openai
+          api_key: test
+"#,
+        )
+        .expect("stock classifier hook config compiles");
+
+        let pipeline = CompiledPipeline::from_config_for_validation(config)
+            .expect("hook construction validates but does not dial the sidecar");
+        assert!(pipeline.hooks.intent_detection.is_some());
+        let quality = pipeline
+            .hooks
+            .quality_scoring
+            .expect("quality config installs the stock scoring hook");
+        assert_eq!(quality.minimum_score(), 0.8);
     }
 
     /// A default pipeline must carry an empty semantic-cache registry.

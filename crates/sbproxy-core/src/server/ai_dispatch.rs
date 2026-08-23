@@ -8782,16 +8782,16 @@ pub(super) async fn handle_ai_proxy(
     // (ported from `sbproxy-enterprise-ai::intent_detection`) now covers
     // both cases with the local keyword heuristic, so this field is
     // populated on every request that carries a prompt, and
-    // `record_intent_detection_source` below makes the hook-vs-heuristic
-    // split visible on the AI gateway dashboard.
+    // `record_intent_detection_source` below makes healthy,
+    // unconfigured, and degraded paths distinct on the AI gateway
+    // dashboard.
     if !extracted_prompt.is_empty() {
         let hook_ref = pipeline.hooks.intent_detection.as_ref();
         let (cat, source) =
             crate::intent_detection::detect_intent_with_source(hook_ref, &extracted_prompt).await;
-        // `source` reflects which path actually answered, not just
-        // whether a hook was registered: a registered hook that fails
-        // open (returns `None`) reports `Heuristic` here, matching the
-        // category `detect_intent_with_source` actually returned.
+        // `source` reflects both which path answered and whether a
+        // heuristic answer was normal unconfigured operation or a
+        // configured hook's fail-open degradation.
         sbproxy_ai::ai_metrics::record_intent_detection_source(&source.to_string());
         debug!(
             origin = %hostname,
@@ -10773,12 +10773,10 @@ pub(super) async fn handle_ai_proxy(
         .record();
     }
     // WOR-2672: quality-based provider routing
-    // (`sbproxy_core::quality_routing`). Optional and hook-driven, unlike
-    // the config-driven strategies above: no extension in this OSS tree
-    // registers a `QualityScoringHook` today (see that module's doc
-    // comment), so `pipeline.hooks.quality_scoring` is `None` in every
-    // existing build and test, and this block is a no-op there. When a
-    // hook IS registered, ask `select_from_quality_hook_async` to rank the
+    // (`sbproxy_core::quality_routing`). Optional and hook-driven. Stock
+    // `proxy.classifier_hooks.quality` config installs one; without that
+    // block (or a linked extension) this remains a no-op. When a hook is
+    // registered, ask `select_from_quality_hook_async` to rank the
     // providers `provider_order` is about to try and pin the winner to
     // the front, the same "collapse to the one decided target" shape
     // `cost_quality` uses above; a target that fell out of the eligible
@@ -10807,7 +10805,7 @@ pub(super) async fn handle_ai_proxy(
                 match crate::quality_routing::select_from_quality_hook_async(
                     &hook,
                     &quality_req,
-                    0.0,
+                    hook.minimum_score(),
                 )
                 .await
                 {
@@ -18924,10 +18922,15 @@ mod external_guardrail_context_tests {
 
     struct QualityVerdictHook {
         scores: Option<Vec<crate::hooks::QualityScore>>,
+        minimum_score: f64,
     }
 
     #[async_trait::async_trait]
     impl crate::hooks::QualityScoringHook for QualityVerdictHook {
+        fn minimum_score(&self) -> f64 {
+            self.minimum_score
+        }
+
         async fn score_providers(
             &self,
             _req: &crate::hooks::QualityRequest,
@@ -18940,7 +18943,22 @@ mod external_guardrail_context_tests {
         scores: Option<Vec<crate::hooks::QualityScore>>,
     ) -> crate::pipeline::CompiledPipeline {
         let mut pipeline = crate::pipeline::CompiledPipeline::default();
-        pipeline.hooks.quality_scoring = Some(Arc::new(QualityVerdictHook { scores }));
+        pipeline.hooks.quality_scoring = Some(Arc::new(QualityVerdictHook {
+            scores,
+            minimum_score: 0.0,
+        }));
+        pipeline
+    }
+
+    fn threshold_quality_hook_pipeline(
+        scores: Vec<crate::hooks::QualityScore>,
+        minimum_score: f64,
+    ) -> crate::pipeline::CompiledPipeline {
+        let mut pipeline = crate::pipeline::CompiledPipeline::default();
+        pipeline.hooks.quality_scoring = Some(Arc::new(QualityVerdictHook {
+            scores: Some(scores),
+            minimum_score,
+        }));
         pipeline
     }
 
@@ -18983,6 +19001,26 @@ mod external_guardrail_context_tests {
                             .get_label()
                             .iter()
                             .any(|label| label.name() == "outcome" && label.value() == outcome)
+                    })
+                    .map(|metric| metric.get_counter().value())
+                    .sum()
+            })
+            .unwrap_or_default()
+    }
+
+    fn intent_detection_source_count(source: &str) -> f64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "sbproxy_ai_intent_detection_source_total")
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        metric
+                            .get_label()
+                            .iter()
+                            .any(|label| label.name() == "source" && label.value() == source)
                     })
                     .map(|metric| metric.get_counter().value())
                     .sum()
@@ -19045,6 +19083,232 @@ mod external_guardrail_context_tests {
         assert!(
             quality_routing_decisions_count("selected") > selected_before,
             "a live hook choice must be visible to operators"
+        );
+    }
+
+    #[tokio::test]
+    async fn quality_hook_minimum_score_is_enforced_by_the_live_post_dispatcher() {
+        let (first_url, first_hits) =
+            upstream_fixture(r#"{"choices":[{"message":{"content":"first"}}]}"#).await;
+        let (second_url, second_hits) =
+            upstream_fixture(r#"{"choices":[{"message":{"content":"second"}}]}"#).await;
+        let config = two_provider_quality_config(&first_url, &second_url);
+        let pipeline = threshold_quality_hook_pipeline(
+            vec![
+                crate::hooks::QualityScore {
+                    provider: "first".into(),
+                    score: 0.2,
+                },
+                crate::hooks::QualityScore {
+                    provider: "second".into(),
+                    score: 0.7,
+                },
+            ],
+            0.8,
+        );
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("below-threshold scores preserve configured routing");
+        drop(session);
+        let response = live_downstream_body(client).await;
+
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        assert_eq!(first_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(second_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(context.admin_load_balancer_target.as_deref(), Some("first"));
+        assert_eq!(
+            context.ai_route_reason.as_deref(),
+            Some("quality_hook: unavailable, preserved configured routing")
+        );
+    }
+
+    #[tokio::test]
+    async fn stock_classifier_hook_config_drives_intent_and_quality_on_a_real_post() {
+        use sbproxy_classifier_proto::{
+            ClassifyRequest, ClassifyResponse, CompressRequest, CompressResponse, EmbedRequest,
+            EmbedResponse, InferenceService, InferenceServiceServer, Label, ModelInfoRequest,
+            ModelInfoResponse, VersionRequest, VersionResponse,
+        };
+        use tonic::{Request, Response, Status};
+
+        struct ClassifierFixture {
+            models: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        #[tonic::async_trait]
+        impl InferenceService for ClassifierFixture {
+            async fn classify(
+                &self,
+                request: Request<ClassifyRequest>,
+            ) -> Result<Response<ClassifyResponse>, Status> {
+                let request = request.into_inner();
+                self.models
+                    .lock()
+                    .expect("classifier model log")
+                    .push(request.model.clone());
+                let (name, score) = match request.model.as_str() {
+                    "intent-v1" => ("coding", 0.99),
+                    "quality-first-v1" => ("preferred", 0.2),
+                    "quality-second-v1" => ("preferred", 0.9),
+                    other => return Err(Status::not_found(format!("unknown model {other}"))),
+                };
+                Ok(Response::new(ClassifyResponse {
+                    labels: vec![Label {
+                        name: name.to_string(),
+                        score,
+                    }],
+                    latency_us: 1,
+                }))
+            }
+
+            async fn embed(
+                &self,
+                _request: Request<EmbedRequest>,
+            ) -> Result<Response<EmbedResponse>, Status> {
+                Err(Status::unimplemented("not used"))
+            }
+
+            async fn compress(
+                &self,
+                _request: Request<CompressRequest>,
+            ) -> Result<Response<CompressResponse>, Status> {
+                Err(Status::unimplemented("not used"))
+            }
+
+            async fn model_info(
+                &self,
+                _request: Request<ModelInfoRequest>,
+            ) -> Result<Response<ModelInfoResponse>, Status> {
+                Err(Status::unimplemented("not used"))
+            }
+
+            async fn version(
+                &self,
+                _request: Request<VersionRequest>,
+            ) -> Result<Response<VersionResponse>, Status> {
+                Err(Status::unimplemented("not used"))
+            }
+        }
+
+        let classifier_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind classifier fixture");
+        let classifier_address = classifier_listener
+            .local_addr()
+            .expect("classifier fixture address");
+        let models = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_models = Arc::clone(&models);
+        let classifier_task = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(InferenceServiceServer::new(ClassifierFixture {
+                    models: server_models,
+                }))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+                    classifier_listener,
+                ))
+                .await
+                .expect("serve classifier fixture");
+        });
+
+        let (first_url, first_hits) =
+            upstream_fixture(r#"{"choices":[{"message":{"content":"first"}}]}"#).await;
+        let (second_url, second_hits) =
+            upstream_fixture(r#"{"choices":[{"message":{"content":"second"}}]}"#).await;
+        let yaml = format!(
+            r#"
+proxy:
+  classifier_hooks:
+    endpoint: http://{classifier_address}
+    timeout_ms: 500
+    intent:
+      model: intent-v1
+    quality:
+      minimum_score: 0.8
+      provider_models:
+        first: {{ model: quality-first-v1, label: preferred }}
+        second: {{ model: quality-second-v1, label: preferred }}
+origins:
+  ai.test:
+    action:
+      type: ai_proxy
+      providers:
+        - name: first
+          provider_type: openai
+          base_url: {first_url}
+          allow_private_base_url: true
+          api_key: fixture-key
+        - name: second
+          provider_type: openai
+          base_url: {second_url}
+          allow_private_base_url: true
+          api_key: fixture-key
+      routing:
+        strategy: round_robin
+"#
+        );
+        let compiled = sbproxy_config::compile_config(&yaml).expect("compile stock hook config");
+        let pipeline = crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+            .expect("construct stock hook pipeline without dialing");
+        let sbproxy_modules::Action::AiProxy(action) = &pipeline.actions[0] else {
+            panic!("fixture must compile an AI proxy action");
+        };
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "please implement a parser"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        let hook_before = intent_detection_source_count("hook");
+
+        super::handle_ai_proxy(
+            &mut session,
+            &action.config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("stock classifier-backed request dispatches");
+        drop(session);
+        let response = live_downstream_body(client).await;
+        classifier_task.abort();
+
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        assert_eq!(first_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(second_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            context.classifier_intent,
+            Some(crate::hooks::IntentCategory::Coding)
+        );
+        assert_eq!(
+            context.admin_load_balancer_target.as_deref(),
+            Some("second")
+        );
+        assert_eq!(
+            context.ai_route_reason.as_deref(),
+            Some("quality_hook: selected second")
+        );
+        assert!(intent_detection_source_count("hook") > hook_before);
+        let mut seen_models = models.lock().expect("classifier model log").clone();
+        seen_models.sort();
+        assert_eq!(
+            seen_models,
+            ["intent-v1", "quality-first-v1", "quality-second-v1"]
         );
     }
 

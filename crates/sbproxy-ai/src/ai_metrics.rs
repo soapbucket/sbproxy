@@ -256,8 +256,9 @@ static AI_LB_DECISIONS: LazyLock<CounterVec> = LazyLock::new(|| {
 /// WOR-2672: intent-detection dispatch outcomes by which path answered.
 ///
 /// `source` is `"hook"` when a registered classifier-sidecar hook
-/// (`IntentDetectionHook`) returned a category, or `"heuristic"` when no
-/// hook was registered or the registered one failed open; see
+/// (`IntentDetectionHook`) returned a category, `"heuristic"` when no hook
+/// exists, or `"heuristic_degraded"` when a configured hook
+/// failed open; see
 /// `sbproxy_core::intent_detection::detect_intent_with_source`. A rising
 /// `heuristic` share on a deployment that configured a sidecar hook is a
 /// degradation signal: the sidecar is not answering and every request is
@@ -266,7 +267,7 @@ static AI_INTENT_DETECTION_SOURCE: LazyLock<CounterVec> = LazyLock::new(|| {
     register_counter_vec!(
         Opts::new(
             "sbproxy_ai_intent_detection_source_total",
-            "Intent-detection dispatches by which path answered: a registered sidecar hook or the local keyword-heuristic fallback"
+            "Intent-detection dispatches by healthy classifier hook, unconfigured heuristic, or degraded heuristic fallback"
         ),
         &["source"]
     )
@@ -279,12 +280,11 @@ static AI_INTENT_DETECTION_SOURCE: LazyLock<CounterVec> = LazyLock::new(|| {
 
 /// Record one intent-detection dispatch outcome (WOR-2672).
 ///
-/// `source` is normalized to a closed vocabulary: callers pass `"hook"` or
-/// `"heuristic"`; anything else folds into `"unknown"` so a caller cannot
-/// mint new label values.
+/// `source` is normalized to a closed vocabulary; anything else folds into
+/// `"unknown"` so a caller cannot mint new label values.
 pub fn record_intent_detection_source(source: &str) {
     let source = match source {
-        "hook" | "heuristic" => source,
+        "hook" | "heuristic" | "heuristic_degraded" => source,
         _ => "unknown",
     };
     AI_INTENT_DETECTION_SOURCE

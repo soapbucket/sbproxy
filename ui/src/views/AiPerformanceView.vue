@@ -329,7 +329,9 @@ const hasCompression = computed(() => compressionTotalRequests.value > 0);
     >
       <h2>Classifier and quality routing</h2>
       <p class="hint">
-        A rising heuristic share can indicate an unavailable intent sidecar.
+        <span class="sb-mono">heuristic</span> means no intent hook is
+        configured; <span class="sb-mono">heuristic_degraded</span>
+        means a configured sidecar failed open.
         A quality outcome of <span class="sb-mono">hook_unavailable</span>
         preserves the configured router instead of pinning a guessed provider.
       </p>

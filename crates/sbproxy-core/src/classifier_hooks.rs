@@ -29,29 +29,27 @@
 //! [`crate::intent_detection::detect_intent_with_source`] runs the
 //! heuristic on `None` the same as it would for a missing hook.
 //!
-//! # `QualityScoringHook` is deliberately not built here
-//!
-//! The sidecar's `quality` RPC ([`sbproxy_classifier_client::ClassifierClient::quality`])
-//! scores the *quality of a completed response text* (hedging, coherence,
-//! repetition, length: see `crates/sbproxy-classifier/src/quality.rs`),
-//! which answers a different question than
-//! [`crate::hooks::QualityScoringHook::score_providers`] asks: "which of
-//! these *not-yet-called* providers should this prompt route to." There
-//! is no text to score before a provider has answered, so wiring the
-//! sidecar's `quality` RPC into `QualityScoringHook` would mean scoring
-//! the prompt itself and calling it a provider verdict, which is not
-//! what the signal measures. An operator who wants sidecar-informed
-//! provider routing implements `QualityScoringHook` directly against
-//! whatever provider-reputation or cost signal they have; the seam
-//! ([`crate::quality_routing`]) does not require a classifier-shaped
-//! backend the way intent detection naturally does.
+//! Stock proxy configuration can install both intent and provider-quality
+//! hooks. Intent maps a classifier model's top label to the five categories
+//! above. Quality maps each provider to a classifier model plus the exact
+//! positive label whose score represents suitability for the current prompt.
+//! This deliberately uses `Classify`, not the rich sidecar's completed-text
+//! `Quality` RPC: provider routing happens before any provider has produced a
+//! response. Every configured candidate must answer inside one shared
+//! deadline or the request preserves its configured routing order.
 
 use async_trait::async_trait;
 use sbproxy_classifier_client::{
-    ClassifierClient, FallbackClassifier, InProcessClassifier, Verdict,
+    ClassifierClient, ClassifierClientError, ClassifyResponse, FallbackClassifier,
+    InProcessClassifier, Verdict,
 };
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 
-use crate::hooks::{IntentCategory, IntentDetectionHook};
+use crate::hooks::{
+    Hooks, IntentCategory, IntentDetectionHook, QualityRequest, QualityScore, QualityScoringHook,
+};
 use crate::intent_detection::detect_intent_heuristic;
 
 /// Adapts [`detect_intent_heuristic`] to [`InProcessClassifier`] so
@@ -131,6 +129,177 @@ impl IntentDetectionHook for ClassifierIntentHook {
         let verdict = self.inner.classify(prompt).await;
         category_from_label(&verdict.label)
     }
+}
+
+/// One lazily constructed channel shared by the stock intent and quality
+/// hooks. Pipeline compilation is synchronous and may run without a Tokio
+/// runtime, so only URI validation happens there. The channel is constructed
+/// on the first request-path call, inside the runtime, and then reused.
+struct LazyClassifierClient {
+    endpoint: String,
+    timeout: Duration,
+    client: tokio::sync::OnceCell<ClassifierClient>,
+}
+
+impl LazyClassifierClient {
+    fn new(endpoint: String, timeout: Duration) -> Self {
+        Self {
+            endpoint,
+            timeout,
+            client: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    async fn classify(
+        &self,
+        model: &str,
+        text: &str,
+    ) -> Result<ClassifyResponse, ClassifierClientError> {
+        let client = self
+            .client
+            .get_or_try_init(|| async {
+                ClassifierClient::connect_lazy(&self.endpoint, self.timeout)
+            })
+            .await?;
+        client.classify(model, text).await
+    }
+}
+
+/// Stock sidecar intent hook. Unlike [`ClassifierIntentHook`], it returns
+/// `None` when the configured sidecar fails so the shared dispatcher can
+/// report `heuristic_degraded` separately from unconfigured heuristic mode.
+struct StockClassifierIntentHook {
+    client: Arc<LazyClassifierClient>,
+    model: String,
+}
+
+#[async_trait]
+impl IntentDetectionHook for StockClassifierIntentHook {
+    async fn detect(&self, prompt: &str) -> Option<IntentCategory> {
+        match self.client.classify(&self.model, prompt).await {
+            Ok(response) => response
+                .labels
+                .first()
+                .and_then(|label| category_from_label(&label.name)),
+            Err(error) => {
+                tracing::debug!(
+                    error = %error,
+                    "configured intent classifier unavailable; using heuristic fallback"
+                );
+                None
+            }
+        }
+    }
+}
+
+/// Stock prompt-aware provider scorer backed by per-provider classifier
+/// contracts from `proxy.classifier_hooks.quality.provider_models`.
+struct ClassifierQualityHook {
+    client: Arc<LazyClassifierClient>,
+    timeout: Duration,
+    minimum_score: f64,
+    provider_models: HashMap<String, sbproxy_config::ClassifierProviderModelConfig>,
+}
+
+#[async_trait]
+impl QualityScoringHook for ClassifierQualityHook {
+    fn minimum_score(&self) -> f64 {
+        self.minimum_score
+    }
+
+    async fn score_providers(&self, req: &QualityRequest) -> Option<Vec<QualityScore>> {
+        const MAX_CANDIDATES: usize = 64;
+        if req.candidate_providers.len() > MAX_CANDIDATES {
+            tracing::warn!(
+                candidates = req.candidate_providers.len(),
+                maximum = MAX_CANDIDATES,
+                "quality classifier candidate limit exceeded; preserving configured routing"
+            );
+            return None;
+        }
+
+        let contracts = req
+            .candidate_providers
+            .iter()
+            .map(|provider| {
+                self.provider_models
+                    .get(provider)
+                    .cloned()
+                    .map(|contract| (provider.clone(), contract))
+            })
+            .collect::<Option<Vec<_>>>()?;
+
+        let calls = contracts.into_iter().map(|(provider, contract)| {
+            let client = Arc::clone(&self.client);
+            let prompt = req.prompt.clone();
+            async move {
+                let response = client.classify(&contract.model, &prompt).await;
+                (provider, contract.label, response)
+            }
+        });
+        let results = tokio::time::timeout(self.timeout, futures::future::join_all(calls))
+            .await
+            .ok()?;
+
+        let mut scores = Vec::with_capacity(results.len());
+        for (provider, positive_label, response) in results {
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::debug!(
+                        error = %error,
+                        provider,
+                        "configured quality classifier unavailable; preserving configured routing"
+                    );
+                    return None;
+                }
+            };
+            let score = response
+                .labels
+                .iter()
+                .find(|label| label.name == positive_label)
+                .map(|label| label.score)?;
+            scores.push(QualityScore { provider, score });
+        }
+        Some(scores)
+    }
+}
+
+/// Compile stock classifier hooks from operator configuration without
+/// dialing the sidecar. URI and resource-bound validation is eager; network
+/// availability remains fail-open on each request.
+pub(crate) fn hooks_from_config(
+    config: Option<&sbproxy_config::ClassifierHooksConfig>,
+) -> anyhow::Result<Hooks> {
+    let Some(config) = config else {
+        return Ok(Hooks::default());
+    };
+    config.validate()?;
+    ClassifierClient::validate_endpoint(&config.endpoint)
+        .map_err(|error| anyhow::anyhow!("proxy.classifier_hooks.endpoint: {error}"))?;
+
+    let timeout = Duration::from_millis(config.timeout_ms);
+    let client = Arc::new(LazyClassifierClient::new(config.endpoint.clone(), timeout));
+    let intent_detection = config.intent.as_ref().map(|intent| {
+        Arc::new(StockClassifierIntentHook {
+            client: Arc::clone(&client),
+            model: intent.model.clone(),
+        }) as Arc<dyn IntentDetectionHook>
+    });
+    let quality_scoring = config.quality.as_ref().map(|quality| {
+        Arc::new(ClassifierQualityHook {
+            client,
+            timeout,
+            minimum_score: quality.minimum_score,
+            provider_models: quality.provider_models.clone(),
+        }) as Arc<dyn QualityScoringHook>
+    });
+
+    Ok(Hooks {
+        intent_detection,
+        quality_scoring,
+        ..Hooks::default()
+    })
 }
 
 // --- Tests ---

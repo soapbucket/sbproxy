@@ -969,7 +969,7 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["source"],
-        description: "Intent-detection dispatches by which path answered: a registered sidecar hook or the local keyword-heuristic fallback.",
+        description: "Intent-detection dispatches by healthy classifier hook, unconfigured heuristic, or degraded heuristic fallback.",
         dead_reason: None,
     },
     MetricCapability {

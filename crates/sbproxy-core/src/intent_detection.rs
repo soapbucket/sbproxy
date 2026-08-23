@@ -9,13 +9,11 @@
 //! the local keyword heuristic in this module so intent detection never
 //! goes silent.
 //!
-//! [`crate::classifier_hooks::ClassifierIntentHook`] is a sidecar-backed
-//! [`crate::hooks::IntentDetectionHook`] implementation built on WOR-2665's
-//! `sbproxy-classifier-client`; nothing in this OSS binary registers it by
-//! default (hook population is an extension's job, via
-//! [`crate::hooks::PipelineLifecycleHook`]), but an embedder that wants
-//! sidecar-backed intent detection constructs one and registers it rather
-//! than writing a hook from scratch. See
+//! A stock SBproxy process installs a sidecar-backed implementation when
+//! `proxy.classifier_hooks.intent` is configured. The hook is lazy, bounded
+//! by the configured deadline, and reports a failed call as
+//! [`IntentSource::HeuristicDegraded`]; omitting the config reports
+//! [`IntentSource::HeuristicUnconfigured`]. See
 //! [`crate::intent_detection::detect_intent_async`] for exactly where it
 //! plugs in, and `docs/ai-gateway.md`'s intent-detection section for the
 //! operator-facing picture.
@@ -185,16 +183,19 @@ pub async fn detect_intent_async(
 pub enum IntentSource {
     /// A registered [`core_hooks::IntentDetectionHook`] returned `Some`.
     Hook,
-    /// No hook was registered, or the registered one returned `None`
-    /// (fail-open); [`detect_intent_heuristic`] answered instead.
-    Heuristic,
+    /// No hook was configured; [`detect_intent_heuristic`] answered.
+    HeuristicUnconfigured,
+    /// A configured hook returned `None` (fail-open), so
+    /// [`detect_intent_heuristic`] answered during a degradation.
+    HeuristicDegraded,
 }
 
 impl std::fmt::Display for IntentSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Hook => write!(f, "hook"),
-            Self::Heuristic => write!(f, "heuristic"),
+            Self::HeuristicUnconfigured => write!(f, "heuristic"),
+            Self::HeuristicDegraded => write!(f, "heuristic_degraded"),
         }
     }
 }
@@ -207,15 +208,16 @@ pub async fn detect_intent_with_source(
     hook: Option<&std::sync::Arc<dyn core_hooks::IntentDetectionHook>>,
     prompt: &str,
 ) -> (core_hooks::IntentCategory, IntentSource) {
-    if let Some(h) = hook {
-        if let Some(cat) = h.detect(prompt).await {
-            return (cat, IntentSource::Hook);
+    let source = match hook {
+        Some(h) => {
+            if let Some(cat) = h.detect(prompt).await {
+                return (cat, IntentSource::Hook);
+            }
+            IntentSource::HeuristicDegraded
         }
-    }
-    (
-        detect_intent_heuristic(prompt).into(),
-        IntentSource::Heuristic,
-    )
+        None => IntentSource::HeuristicUnconfigured,
+    };
+    (detect_intent_heuristic(prompt).into(), source)
 }
 
 // --- Tests ---
@@ -459,7 +461,7 @@ mod tests {
     async fn source_is_heuristic_when_no_hook_registered() {
         let (cat, source) = detect_intent_with_source(None, "Summarize this").await;
         assert_eq!(cat, core_hooks::IntentCategory::Summarization);
-        assert_eq!(source, IntentSource::Heuristic);
+        assert_eq!(source, IntentSource::HeuristicUnconfigured);
     }
 
     #[tokio::test]
@@ -470,7 +472,7 @@ mod tests {
         let hook: Arc<dyn core_hooks::IntentDetectionHook> = Arc::new(FailOpenHook);
         let (cat, source) = detect_intent_with_source(Some(&hook), "write code").await;
         assert_eq!(cat, core_hooks::IntentCategory::Coding);
-        assert_eq!(source, IntentSource::Heuristic);
+        assert_eq!(source, IntentSource::HeuristicDegraded);
     }
 
     #[tokio::test]
@@ -485,6 +487,10 @@ mod tests {
     #[test]
     fn intent_source_display_matches_metric_label_convention() {
         assert_eq!(IntentSource::Hook.to_string(), "hook");
-        assert_eq!(IntentSource::Heuristic.to_string(), "heuristic");
+        assert_eq!(IntentSource::HeuristicUnconfigured.to_string(), "heuristic");
+        assert_eq!(
+            IntentSource::HeuristicDegraded.to_string(),
+            "heuristic_degraded"
+        );
     }
 }

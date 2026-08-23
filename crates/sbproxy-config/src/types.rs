@@ -1150,6 +1150,141 @@ config_history:
     }
 }
 
+const fn default_classifier_hook_timeout_ms() -> u64 {
+    500
+}
+
+const fn default_quality_minimum_score() -> f64 {
+    0.75
+}
+
+/// Classifier-sidecar hooks installed into the stock proxy runtime.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClassifierHooksConfig {
+    /// HTTP(S) gRPC endpoint of the minimal or rich classifier sidecar.
+    pub endpoint: String,
+    /// End-to-end deadline for one hook decision.
+    #[serde(default = "default_classifier_hook_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Optional classifier-backed prompt intent detection.
+    #[serde(default)]
+    pub intent: Option<ClassifierIntentHookConfig>,
+    /// Optional classifier-backed provider quality routing.
+    #[serde(default)]
+    pub quality: Option<ClassifierQualityHookConfig>,
+}
+
+/// Model used to classify a prompt into the five stock intent labels.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClassifierIntentHookConfig {
+    /// Logical classifier model id loaded by the sidecar.
+    pub model: String,
+}
+
+impl Default for ClassifierIntentHookConfig {
+    fn default() -> Self {
+        Self {
+            model: "intent".to_string(),
+        }
+    }
+}
+
+/// Classifier-backed provider scorer for prompt-aware routing.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClassifierQualityHookConfig {
+    /// Minimum positive-label score eligible to win provider selection.
+    #[serde(default = "default_quality_minimum_score")]
+    pub minimum_score: f64,
+    /// Per-provider classifier model and positive-label contract.
+    pub provider_models: HashMap<String, ClassifierProviderModelConfig>,
+}
+
+impl Default for ClassifierQualityHookConfig {
+    fn default() -> Self {
+        Self {
+            minimum_score: default_quality_minimum_score(),
+            provider_models: HashMap::new(),
+        }
+    }
+}
+
+/// One provider's prompt-quality classifier contract.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClassifierProviderModelConfig {
+    /// Logical classifier model id loaded by the sidecar.
+    pub model: String,
+    /// Label whose score represents this provider's suitability.
+    pub label: String,
+}
+
+impl ClassifierHooksConfig {
+    /// Validate all sidecar hook resource and scoring bounds.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        const MAX_ENDPOINT_BYTES: usize = 2_048;
+        const MAX_IDENTIFIER_BYTES: usize = 256;
+        const MAX_PROVIDER_MODELS: usize = 64;
+        if self.endpoint.trim().is_empty() || self.endpoint.len() > MAX_ENDPOINT_BYTES {
+            anyhow::bail!("classifier_hooks.endpoint must contain 1..={MAX_ENDPOINT_BYTES} bytes");
+        }
+        if !(1..=30_000).contains(&self.timeout_ms) {
+            anyhow::bail!("classifier_hooks.timeout_ms must be between 1 and 30000");
+        }
+        if self.intent.is_none() && self.quality.is_none() {
+            anyhow::bail!("classifier_hooks must enable intent, quality, or both");
+        }
+        if let Some(intent) = self.intent.as_ref() {
+            validate_classifier_identifier(
+                &intent.model,
+                "classifier_hooks.intent.model",
+                MAX_IDENTIFIER_BYTES,
+            )?;
+        }
+        if let Some(quality) = self.quality.as_ref() {
+            if !quality.minimum_score.is_finite() || !(0.0..=1.0).contains(&quality.minimum_score) {
+                anyhow::bail!(
+                    "classifier_hooks.quality.minimum_score must be finite and in [0, 1]"
+                );
+            }
+            if quality.provider_models.is_empty()
+                || quality.provider_models.len() > MAX_PROVIDER_MODELS
+            {
+                anyhow::bail!(
+                    "classifier_hooks.quality.provider_models must contain 1..={MAX_PROVIDER_MODELS} entries"
+                );
+            }
+            for (provider, model) in &quality.provider_models {
+                validate_classifier_identifier(
+                    provider,
+                    "classifier_hooks.quality.provider_models provider name",
+                    MAX_IDENTIFIER_BYTES,
+                )?;
+                validate_classifier_identifier(
+                    &model.model,
+                    "classifier_hooks.quality.provider_models.model",
+                    MAX_IDENTIFIER_BYTES,
+                )?;
+                validate_classifier_identifier(
+                    &model.label,
+                    "classifier_hooks.quality.provider_models.label",
+                    MAX_IDENTIFIER_BYTES,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_classifier_identifier(value: &str, path: &str, maximum: usize) -> anyhow::Result<()> {
+    if value.trim().is_empty() || value.len() > maximum {
+        anyhow::bail!("{path} must contain 1..={maximum} bytes");
+    }
+    Ok(())
+}
+
 /// Server-level proxy configuration parsed from the top-level `proxy:`
 /// block of sb.yml.
 ///
@@ -1247,6 +1382,9 @@ pub struct ProxyServerConfig {
     /// Canonical desired state and lifecycle policy for models hosted by SBproxy.
     #[serde(default)]
     pub model_host: Option<crate::model_host::ModelHostControlConfig>,
+    /// Optional classifier-sidecar hooks for intent and quality routing.
+    #[serde(default)]
+    pub classifier_hooks: Option<ClassifierHooksConfig>,
     /// Optional shared cluster substrate for keys, metrics, and managed models.
     #[serde(default)]
     pub cluster: Option<crate::cluster::ClusterConfig>,
@@ -2066,6 +2204,7 @@ impl Default for ProxyServerConfig {
             alerting: None,
             admin: None,
             model_host: None,
+            classifier_hooks: None,
             cluster: None,
             config_authority: None,
             secrets: None,

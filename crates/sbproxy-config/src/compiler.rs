@@ -1680,6 +1680,12 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
     // example sweeps all inherit it without touching a backend.
     crate::secret_refs::check_secret_backend_references(&yaml, config_file.proxy.secrets.as_ref())?;
 
+    if let Some(classifier_hooks) = config_file.proxy.classifier_hooks.as_ref() {
+        classifier_hooks
+            .validate()
+            .context("config compile: proxy.classifier_hooks")?;
+    }
+
     {
         let mut names = std::collections::HashSet::with_capacity(config_file.flags.len());
         for flag in &config_file.flags {
@@ -12805,5 +12811,47 @@ origins:
              \"({store: true})\"\n",
         );
         compile_config(&yaml).expect("lua and js decision events must compile");
+    }
+
+    #[test]
+    fn classifier_hooks_are_a_validated_stock_proxy_config_surface() {
+        let valid = r#"
+proxy:
+  http_bind_port: 8080
+  classifier_hooks:
+    endpoint: http://127.0.0.1:9440
+    timeout_ms: 250
+    intent:
+      model: intent-v1
+    quality:
+      minimum_score: 0.8
+      provider_models:
+        primary:
+          model: quality-primary-v1
+          label: preferred
+origins:
+  ai.example.com:
+    action:
+      type: ai_proxy
+      providers:
+        - name: primary
+          provider_type: openai
+          api_key: test
+"#;
+        compile_config(valid).expect("classifier-backed hooks compile from stock config");
+
+        for invalid_block in [
+            "timeout_ms: 0\n    intent: {}",
+            "timeout_ms: 250\n    quality:\n      minimum_score: 1.1\n      provider_models:\n        primary: { model: q, label: preferred }",
+            "timeout_ms: 250\n    quality:\n      minimum_score: 0.8\n      provider_models: {}",
+        ] {
+            let yaml = format!(
+                "proxy:\n  http_bind_port: 8080\n  classifier_hooks:\n    endpoint: http://127.0.0.1:9440\n    {invalid_block}\norigins:\n  x.example.com:\n    action:\n      type: static\n      status_code: 200\n      content_type: text/plain\n      body: ok\n"
+            );
+            assert!(
+                compile_config(&yaml).is_err(),
+                "invalid classifier hook block compiled: {invalid_block}"
+            );
+        }
     }
 }

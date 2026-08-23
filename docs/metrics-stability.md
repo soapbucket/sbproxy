@@ -123,7 +123,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_ai_safety_guardrail_verdicts_total` | Counter | `stable` | `beta` | `guardrail`, `class`, `backend`, `verdict` | Built-in safety guardrail evaluations by class, backend, and verdict. |
 | `sbproxy_ai_external_guardrail_verdicts_total` | Counter | `stable` | `beta` | `provider`, `phase`, `outcome` | External guardrail evaluations by provider, phase, and outcome. |
 | `sbproxy_ai_inter_token_latency_seconds` | Histogram | `stable` | `beta` | `provider`, `model` | AI streaming average inter-token latency (TPOT). |
-| `sbproxy_ai_intent_detection_source_total` | Counter | `stable` | `beta` | `source` | Intent-detection dispatches by which path answered: a registered sidecar hook or the local keyword-heuristic fallback. |
+| `sbproxy_ai_intent_detection_source_total` | Counter | `stable` | `beta` | `source` | Intent-detection dispatches by healthy classifier hook, unconfigured heuristic, or degraded heuristic fallback. |
 | `sbproxy_ai_quality_routing_decisions_total` | Counter | `stable` | `beta` | `outcome` | Quality-hook routing decisions by selected or fallback outcome. |
 | `sbproxy_classifier_errors_total` | Counter | `stable` | `beta` | `transport`, `cmd`, `reason` | Rich classifier sidecar requests that could not complete, by transport, command, and bounded reason. |
 | `sbproxy_classifier_quality_score` | Histogram | `stable` | `beta` | `transport` | Heuristic quality scores returned by the rich classifier sidecar, by transport. |

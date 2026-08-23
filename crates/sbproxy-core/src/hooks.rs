@@ -1,11 +1,11 @@
 //! Optional hook traits exposed by the pipeline.
 //!
 //! `CompiledPipeline` owns an [`Hooks`] bundle of `Option<Arc<dyn TraitName>>`
-//! slots. Builds that do not register an extension leave every slot `None` and
-//! the request path falls through without annotation. Extensions register a single
-//! [`PipelineLifecycleHook`] via the `register_startup_hook!` macro; the
-//! startup hook populates the remaining slots with concrete implementations
-//! (gRPC classifier client, intent detector, etc.).
+//! slots. Stock classifier configuration installs intent and quality slots;
+//! otherwise builds without a linked extension leave every slot `None` and
+//! request paths fall through. Extensions register a single
+//! [`PipelineLifecycleHook`] via the `register_startup_hook!` macro and may
+//! populate the remaining slots with concrete implementations.
 //!
 //! Semantic caching is not a hook. It is compiled per action into
 //! [`crate::semantic_cache_runtime::SemanticCacheRuntimeRegistry`] and owned
@@ -204,6 +204,15 @@ pub struct QualityScore {
 /// router's default ordering."
 #[async_trait]
 pub trait QualityScoringHook: Send + Sync {
+    /// Minimum score a provider must reach to be eligible for selection.
+    ///
+    /// Hook implementations that do not expose a threshold retain the
+    /// historical `0.0` behavior. Stock classifier hooks override this with
+    /// the validated operator-configured value.
+    fn minimum_score(&self) -> f64 {
+        0.0
+    }
+
     /// Score each provider in `req.candidate_providers` for `req.prompt`.
     ///
     /// Returning `None` defers to the caller's default ordering. A `Some`
@@ -277,9 +286,10 @@ pub trait StreamSafetyHook: Send + Sync {
 
 /// Bundle of all optional hook slots owned by [`crate::pipeline::CompiledPipeline`].
 ///
-/// Every slot defaults to `None`. A registered lifecycle extension populates
-/// slots from its [`PipelineLifecycleHook::on_startup`] implementation. Request-path
-/// code checks each slot before dispatching and no-ops when `None`.
+/// Every slot defaults to `None`. Stock classifier config can populate intent
+/// and quality, while a registered lifecycle extension can populate or replace
+/// slots from its [`PipelineLifecycleHook::on_startup`] implementation.
+/// Request-path code checks each slot before dispatching and no-ops when `None`.
 #[derive(Default, Clone)]
 pub struct Hooks {
     /// Lifecycle hook that populates the other slots. Registered via

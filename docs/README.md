@@ -80,7 +80,7 @@ Route AI, govern the AI that calls you, and run AI models yourself.
 - [prompt-injection-v2.md](prompt-injection-v2.md) - the v2 guardrail: swappable detector returning score + label, with score-to-action mapping and a delegation-depth-aware action at the agent boundary.
 - [classifier-sidecar.md](classifier-sidecar.md) - running the ONNX classifier as a sidecar instead of in-process, and when that trade is worth it.
 - [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md) - the `outcome_aware` strategy: route by realized cost-per-success fed back from completed requests.
-- [intent-detection.md](intent-detection.md) - coarse prompt intent detection (live, hook-or-heuristic) and quality-based provider selection (library).
+- [intent-detection.md](intent-detection.md) - configure stock classifier-backed prompt intent and quality-based provider routing, including fail-open state visibility.
 - [prompt-versioning.md](prompt-versioning.md) - named, weighted prompt template versions for gradual rollouts and A/B experiments, distinct from the config-declared stored-prompt store above.
 - [ai-evaluation-harness.md](ai-evaluation-harness.md) - offline LLM-as-judge prompting, experiment tracking, versioned datasets, and custom pass/fail metrics.
 - [ai-predictive-budget.md](ai-predictive-budget.md) - predictive budgets with soft-landing: warn, then downgrade, then block as a scope approaches its cap.
