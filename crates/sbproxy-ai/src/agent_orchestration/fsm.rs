@@ -214,7 +214,7 @@ impl FsmExecution {
     pub fn current_action(&self) -> &str {
         self.workflow
             .action(&self.current_state)
-            .expect("validated workflow always contains its current state")
+            .unwrap_or_default()
     }
 
     /// Advance the FSM by applying `result` to the current state's transition

@@ -234,7 +234,10 @@ async fn handle_connection(
                 Command::Classify => handle_classify(registry, &msg)?,
                 Command::QualityScore => handle_quality_score(&msg)?,
                 Command::Register | Command::Delete | Command::List => {
-                    handle_admin(registry, auth.expect("admin mode validated"), command, &msg)?
+                    let auth = auth.ok_or_else(|| {
+                        anyhow::anyhow!("admin TCP transport is missing its authentication policy")
+                    })?;
+                    handle_admin(registry, auth, command, &msg)?
                 }
                 Command::Version => handle_version()?,
                 Command::IntentDetect => handle_intent_detect(&msg)?,

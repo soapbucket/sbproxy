@@ -36,8 +36,8 @@ static ERRORS_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static TENANTS: OnceLock<IntGauge> = OnceLock::new();
 static QUALITY_SCORE: OnceLock<HistogramVec> = OnceLock::new();
 static SAFETY_VERDICTS_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
-static ADMISSION_REFUSALS_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
-static ADMISSION_QUEUE: OnceLock<IntGaugeVec> = OnceLock::new();
+static ADMISSION_REFUSALS_TOTAL: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+static ADMISSION_QUEUE: OnceLock<Option<IntGaugeVec>> = OnceLock::new();
 
 fn normalize_transport(transport: &str) -> &'static str {
     match transport {
@@ -160,34 +160,70 @@ fn safety_verdicts_total() -> &'static IntCounterVec {
     })
 }
 
-fn admission_refusals_total() -> &'static IntCounterVec {
-    ADMISSION_REFUSALS_TOTAL.get_or_init(|| {
-        let counter = IntCounterVec::new(
-            Opts::new(
-                "sbproxy_classifier_admission_refusals_total",
-                "Rich-sidecar requests refused by bounded admission, by command and reason.",
-            ),
-            &["cmd", "reason"],
-        )
-        .expect("admission refusals counter constructs");
-        let _ = prometheus::register(Box::new(counter.clone()));
-        counter
-    })
+fn admission_refusals_total() -> Option<&'static IntCounterVec> {
+    ADMISSION_REFUSALS_TOTAL
+        .get_or_init(|| {
+            let counter = match IntCounterVec::new(
+                Opts::new(
+                    "sbproxy_classifier_admission_refusals_total",
+                    "Rich-sidecar requests refused by bounded admission, by command and reason.",
+                ),
+                &["cmd", "reason"],
+            ) {
+                Ok(counter) => counter,
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        metric = "sbproxy_classifier_admission_refusals_total",
+                        "failed to construct classifier admission metric"
+                    );
+                    return None;
+                }
+            };
+            if let Err(error) = prometheus::register(Box::new(counter.clone())) {
+                tracing::error!(
+                    error = %error,
+                    metric = "sbproxy_classifier_admission_refusals_total",
+                    "failed to register classifier admission metric"
+                );
+                return None;
+            }
+            Some(counter)
+        })
+        .as_ref()
 }
 
-fn admission_queue() -> &'static IntGaugeVec {
-    ADMISSION_QUEUE.get_or_init(|| {
-        let gauge = IntGaugeVec::new(
-            Opts::new(
-                "sbproxy_classifier_admission_queue",
-                "Rich-sidecar requests currently waiting for a bounded inference slot.",
-            ),
-            &["cmd"],
-        )
-        .expect("admission queue gauge constructs");
-        let _ = prometheus::register(Box::new(gauge.clone()));
-        gauge
-    })
+fn admission_queue() -> Option<&'static IntGaugeVec> {
+    ADMISSION_QUEUE
+        .get_or_init(|| {
+            let gauge = match IntGaugeVec::new(
+                Opts::new(
+                    "sbproxy_classifier_admission_queue",
+                    "Rich-sidecar requests currently waiting for a bounded inference slot.",
+                ),
+                &["cmd"],
+            ) {
+                Ok(gauge) => gauge,
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        metric = "sbproxy_classifier_admission_queue",
+                        "failed to construct classifier admission metric"
+                    );
+                    return None;
+                }
+            };
+            if let Err(error) = prometheus::register(Box::new(gauge.clone())) {
+                tracing::error!(
+                    error = %error,
+                    metric = "sbproxy_classifier_admission_queue",
+                    "failed to register classifier admission metric"
+                );
+                return None;
+            }
+            Some(gauge)
+        })
+        .as_ref()
 }
 
 /// Record one handled request for `(transport, cmd)`. `transport` is
@@ -235,16 +271,20 @@ pub fn record_safety_verdict(verdict: &str) {
 
 /// Record an admission refusal with closed command/reason labels.
 pub fn record_admission_refusal(command: &str, reason: &str) {
-    admission_refusals_total()
-        .with_label_values(&[normalize_command(command), normalize_reason(reason)])
-        .inc();
+    if let Some(counter) = admission_refusals_total() {
+        counter
+            .with_label_values(&[normalize_command(command), normalize_reason(reason)])
+            .inc();
+    }
 }
 
 /// Adjust the current queue depth for a closed command label.
 pub fn adjust_admission_queue(command: &str, delta: i64) {
-    admission_queue()
-        .with_label_values(&[normalize_command(command)])
-        .add(delta);
+    if let Some(gauge) = admission_queue() {
+        gauge
+            .with_label_values(&[normalize_command(command)])
+            .add(delta);
+    }
 }
 
 #[cfg(test)]

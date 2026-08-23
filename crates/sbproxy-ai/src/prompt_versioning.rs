@@ -198,7 +198,7 @@ impl WeightedPromptStore {
             digest.update(component);
         }
         let hash = digest.finalize();
-        let draw = u64::from_be_bytes(hash[..8].try_into().expect("SHA-256 prefix is 8 bytes"));
+        let draw = u64::from_be_bytes(hash[..8].try_into().unwrap_or_default());
         let unit = draw as f64 / (u64::MAX as f64 + 1.0);
         let pick = unit * total;
 

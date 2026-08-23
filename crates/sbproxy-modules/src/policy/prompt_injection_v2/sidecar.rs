@@ -320,11 +320,11 @@ impl SidecarDetector {
     ) -> Result<DetectionResult, ClassifierClientError> {
         // Build the channel on first use, once a Tokio runtime is available.
         let client = match self.client.get() {
-            Some(client) => client,
+            Some(client) => client.clone(),
             None => {
                 let client = ClassifierClient::connect_lazy(&self.endpoint, self.timeout)?;
-                let _ = self.client.set(client);
-                self.client.get().expect("client just set")
+                let _ = self.client.set(client.clone());
+                self.client.get().cloned().unwrap_or(client)
             }
         };
         let response = tokio::task::block_in_place(|| {
