@@ -38,20 +38,28 @@ const PROMPT_VARIANTS: &[(&str, &str)] = &[
 fn main() {
     // --- Dataset: what we're evaluating against ---
     let datasets = DatasetStore::new();
-    datasets.save(Dataset::new(
-        "support-qa",
-        vec![
-            DatasetEntry::with_expected(
-                "How do I reset my password?",
-                "Go to Settings, then Security, then Reset password.",
-            ),
-            DatasetEntry::with_expected(
-                "What is your refund policy?",
-                "Full refund within 30 days of purchase.",
-            ),
-        ],
-    ));
-    let ds = datasets.get("support-qa").expect("dataset was just saved");
+    datasets
+        .save(
+            Dataset::new(
+                "support-qa",
+                1,
+                vec![
+                    DatasetEntry::with_expected(
+                        "How do I reset my password?",
+                        "Go to Settings, then Security, then Reset password.",
+                    ),
+                    DatasetEntry::with_expected(
+                        "What is your refund policy?",
+                        "Full refund within 30 days of purchase.",
+                    ),
+                ],
+            )
+            .expect("valid dataset"),
+        )
+        .expect("new dataset version");
+    let ds = datasets
+        .latest("support-qa")
+        .expect("dataset was just saved");
     println!("Evaluating {} entries from '{}'", ds.entries.len(), ds.name);
 
     // --- Custom pass/fail metrics: cheap, deterministic, no model call ---
@@ -78,7 +86,8 @@ fn main() {
             r#"{{"scores": {{"accuracy": {}, "helpfulness": 8}}, "reasoning": "clear and on-topic"}}"#,
             if response.len() > 40 { 9 } else { 6 }
         );
-        let judged = parse_judge_response(&stub_judge_output).expect("stub judge JSON parses");
+        let judged = parse_judge_response(&stub_judge_output, &judge_criteria)
+            .expect("stub judge JSON parses");
         println!("  judge composite score (0-10): {:.1}", judged.score);
 
         scorer.record(PromptScore::new(

@@ -791,6 +791,10 @@ enum AiSub {
     Ledger(LedgerCmd),
     /// Versioned prompt tools.
     Prompt(Box<PromptCmd>),
+    /// Validate or execute a bounded agent workflow.
+    Workflow(WorkflowCmd),
+    /// Run deterministic offline checks over a versioned evaluation dataset.
+    Evaluate(EvaluateArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -803,6 +807,75 @@ struct PromptCmd {
 enum PromptSub {
     /// Compile a shorter static system prompt against an evaluation set.
     Optimize(PromptOptimizeArgs),
+    /// Select a weighted prompt version for a stable cohort.
+    Select(PromptSelectArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct WorkflowCmd {
+    #[command(subcommand)]
+    sub: WorkflowSub,
+}
+
+#[derive(Subcommand, Debug)]
+enum WorkflowSub {
+    /// Validate a YAML workflow graph and its execution bound.
+    Validate(WorkflowValidateArgs),
+    /// Apply an ordered outcome sequence to a YAML workflow.
+    Run(WorkflowRunArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct WorkflowValidateArgs {
+    /// YAML file containing the workflow graph.
+    path: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+struct WorkflowRunArgs {
+    /// YAML file containing the workflow graph.
+    path: PathBuf,
+    /// Outcome to apply at the current state. Repeat in execution order.
+    #[arg(long = "outcome", required = true)]
+    outcomes: Vec<String>,
+}
+
+#[derive(clap::Args, Debug)]
+struct EvaluateArgs {
+    /// JSON file containing one explicitly versioned dataset.
+    #[arg(long)]
+    dataset: PathBuf,
+    /// JSON array of model response strings, one per dataset entry.
+    #[arg(long)]
+    responses: PathBuf,
+    /// Keyword every response must contain. Repeat to require several.
+    #[arg(long = "required-keyword")]
+    required_keywords: Vec<String>,
+    /// Optional JSON Schema that every response must satisfy.
+    #[arg(long = "json-schema")]
+    json_schema: Option<PathBuf>,
+    /// Minimum response length in bytes.
+    #[arg(long = "min-bytes", default_value_t = 0)]
+    min_bytes: usize,
+    /// Maximum response length in bytes.
+    #[arg(long = "max-bytes", default_value_t = 1024 * 1024)]
+    max_bytes: usize,
+}
+
+#[derive(clap::Args, Debug)]
+struct PromptSelectArgs {
+    /// Prompt name to select.
+    #[arg(long)]
+    name: String,
+    /// JSON array of weighted prompt versions.
+    #[arg(long)]
+    versions: PathBuf,
+    /// Stable caller or experiment cohort key.
+    #[arg(long)]
+    cohort: String,
+    /// Experiment salt used to isolate independent rollouts.
+    #[arg(long)]
+    salt: String,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -10435,8 +10508,195 @@ fn handle_ai_subcommand(cmd: &AiCmd) -> anyhow::Result<i32> {
         },
         AiSub::Prompt(prompt) => match &prompt.sub {
             PromptSub::Optimize(args) => handle_prompt_optimize(args),
+            PromptSub::Select(args) => handle_prompt_select(args),
         },
+        AiSub::Workflow(workflow) => match &workflow.sub {
+            WorkflowSub::Validate(args) => handle_workflow_validate(args),
+            WorkflowSub::Run(args) => handle_workflow_run(args),
+        },
+        AiSub::Evaluate(args) => handle_ai_evaluate(args),
     }
+}
+
+const MAX_AI_TOOL_INPUT_BYTES: usize = 16 * 1024 * 1024;
+
+fn load_workflow(
+    path: &std::path::Path,
+) -> anyhow::Result<sbproxy_ai::agent_orchestration::FsmWorkflow> {
+    let bytes = read_bounded_cli_file(path, MAX_AI_TOOL_INPUT_BYTES, "workflow")?;
+    serde_yaml::from_slice(&bytes)
+        .map_err(|error| anyhow::anyhow!("parse workflow {}: {error}", path.display()))
+}
+
+fn handle_workflow_validate(args: &WorkflowValidateArgs) -> anyhow::Result<i32> {
+    let workflow = load_workflow(&args.path)?;
+    println!(
+        "workflow validate: OK ({:?}, max {} steps)",
+        workflow.name(),
+        workflow.max_steps()
+    );
+    Ok(0)
+}
+
+fn handle_workflow_run(args: &WorkflowRunArgs) -> anyhow::Result<i32> {
+    let workflow = load_workflow(&args.path)?;
+    let workflow_name = workflow.name().to_string();
+    let mut execution = sbproxy_ai::agent_orchestration::FsmExecution::new(workflow);
+    for outcome in &args.outcomes {
+        execution.transition(outcome)?;
+        if execution.is_completed() {
+            break;
+        }
+    }
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "workflow": workflow_name,
+            "state": execution.current_state(),
+            "action": execution.current_action(),
+            "completed": execution.is_completed(),
+            "steps": execution.history().len(),
+        }))?
+    );
+    Ok(0)
+}
+
+fn handle_ai_evaluate(args: &EvaluateArgs) -> anyhow::Result<i32> {
+    if args.min_bytes > args.max_bytes {
+        anyhow::bail!("--min-bytes must not exceed --max-bytes");
+    }
+    let dataset_bytes =
+        read_bounded_cli_file(&args.dataset, MAX_AI_TOOL_INPUT_BYTES, "evaluation dataset")?;
+    let parsed: sbproxy_ai::evaluation::Dataset =
+        serde_json::from_slice(&dataset_bytes).map_err(|error| {
+            anyhow::anyhow!(
+                "parse evaluation dataset {}: {error}",
+                args.dataset.display()
+            )
+        })?;
+    let dataset =
+        sbproxy_ai::evaluation::Dataset::new(parsed.name, parsed.version, parsed.entries)?;
+    let response_bytes = read_bounded_cli_file(
+        &args.responses,
+        MAX_AI_TOOL_INPUT_BYTES,
+        "evaluation responses",
+    )?;
+    let responses: Vec<String> = serde_json::from_slice(&response_bytes).map_err(|error| {
+        anyhow::anyhow!(
+            "parse evaluation responses {}: {error}",
+            args.responses.display()
+        )
+    })?;
+    if responses.len() != dataset.entries.len() {
+        anyhow::bail!(
+            "evaluation response count {} does not match dataset entry count {}",
+            responses.len(),
+            dataset.entries.len()
+        );
+    }
+
+    let mut metrics = vec![sbproxy_ai::evaluation::MetricType::LengthRange(
+        args.min_bytes,
+        args.max_bytes,
+    )];
+    if !args.required_keywords.is_empty() {
+        metrics.push(sbproxy_ai::evaluation::MetricType::ContainsKeywords(
+            args.required_keywords.clone(),
+        ));
+    }
+    if let Some(path) = args.json_schema.as_deref() {
+        let bytes = read_bounded_cli_file(path, MAX_AI_TOOL_INPUT_BYTES, "JSON Schema")?;
+        let schema: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|error| anyhow::anyhow!("parse JSON Schema {}: {error}", path.display()))?;
+        metrics.push(sbproxy_ai::evaluation::MetricType::JsonSchemaValid(schema));
+    }
+
+    let results: Vec<serde_json::Value> = dataset
+        .entries
+        .iter()
+        .zip(&responses)
+        .enumerate()
+        .map(|(index, (entry, response))| {
+            let metric_pass_rate = sbproxy_ai::evaluation::pass_rate(response, &metrics);
+            let expected_match = entry
+                .expected_output
+                .as_ref()
+                .is_none_or(|expected| expected == response);
+            serde_json::json!({
+                "index": index,
+                "metric_pass_rate": metric_pass_rate,
+                "expected_match": expected_match,
+                "passed": metric_pass_rate == 1.0 && expected_match,
+            })
+        })
+        .collect();
+    let passed = results
+        .iter()
+        .filter(|result| result["passed"] == true)
+        .count();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "dataset": dataset.name,
+            "version": dataset.version,
+            "cases": results.len(),
+            "passed": passed,
+            "results": results,
+        }))?
+    );
+    Ok(if passed == responses.len() { 0 } else { 1 })
+}
+
+#[derive(serde::Deserialize)]
+struct PromptVersionInput {
+    name: String,
+    version: u32,
+    content: String,
+    weight: f64,
+}
+
+fn handle_prompt_select(args: &PromptSelectArgs) -> anyhow::Result<i32> {
+    let bytes = read_bounded_cli_file(
+        &args.versions,
+        MAX_AI_TOOL_INPUT_BYTES,
+        "weighted prompt versions",
+    )?;
+    let versions: Vec<PromptVersionInput> = serde_json::from_slice(&bytes).map_err(|error| {
+        anyhow::anyhow!(
+            "parse weighted prompt versions {}: {error}",
+            args.versions.display()
+        )
+    })?;
+    let store = sbproxy_ai::prompt_versioning::WeightedPromptStore::new();
+    for version in versions {
+        let name = version.name;
+        let weighted = sbproxy_ai::prompt_versioning::WeightedPromptVersion::new(
+            name.clone(),
+            version.version,
+            version.content,
+            version.weight,
+        )?;
+        store.add_version(&name, weighted)?;
+    }
+    let selected = store
+        .select_for_cohort(&args.name, &args.cohort, &args.salt)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "weighted prompt {:?} has no version with positive total weight",
+                args.name
+            )
+        })?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "name": selected.name,
+            "version": selected.version,
+            "content": selected.content,
+            "weight": selected.weight,
+            "cohort": args.cohort,
+        }))?
+    );
+    Ok(0)
 }
 
 fn handle_prompt_optimize(args: &PromptOptimizeArgs) -> anyhow::Result<i32> {
@@ -16103,15 +16363,133 @@ origins:
         else {
             panic!("expected ai prompt optimize");
         };
-        let PromptCmd {
-            sub: PromptSub::Optimize(args),
-        } = *prompt;
+        let PromptSub::Optimize(args) = prompt.sub else {
+            panic!("expected ai prompt optimize");
+        };
         assert_eq!(args.metric, PromptEvalMetricArg::ExactMatch);
         assert_eq!(args.max_candidates, 8);
         assert_eq!(args.max_requests, 256);
         assert_eq!(args.timeout_secs, 60);
         assert_eq!(args.host_header.as_deref(), Some("ai.local"));
         assert_eq!(args.prompt_version, "2");
+    }
+
+    #[test]
+    fn orchestration_evaluation_and_rollout_have_supported_cli_surfaces() {
+        for arguments in [
+            vec!["sbproxy", "ai", "workflow", "validate", "workflow.yml"],
+            vec![
+                "sbproxy",
+                "ai",
+                "evaluate",
+                "--dataset",
+                "dataset.json",
+                "--responses",
+                "responses.json",
+            ],
+            vec![
+                "sbproxy",
+                "ai",
+                "prompt",
+                "select",
+                "--name",
+                "support",
+                "--versions",
+                "prompts.json",
+                "--cohort",
+                "customer-1",
+                "--salt",
+                "rollout-1",
+            ],
+        ] {
+            Cli::try_parse_from(arguments).expect("shipping AI CLI seam must parse");
+        }
+    }
+
+    #[test]
+    fn supported_ai_cli_surfaces_execute_validated_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "sbproxy-ai-tools-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let workflow_path = dir.join("workflow.yml");
+        std::fs::write(
+            &workflow_path,
+            r#"name: support
+initial_state: start
+max_steps: 2
+states:
+  - name: start
+    action: classify
+    transitions:
+      done: finish
+  - name: finish
+    action: answer
+    transitions: {}
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            handle_workflow_validate(&WorkflowValidateArgs {
+                path: workflow_path.clone(),
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            handle_workflow_run(&WorkflowRunArgs {
+                path: workflow_path,
+                outcomes: vec!["done".to_string(), "complete".to_string()],
+            })
+            .unwrap(),
+            0
+        );
+
+        let dataset = dir.join("dataset.json");
+        let responses = dir.join("responses.json");
+        std::fs::write(
+            &dataset,
+            r#"{"name":"support","version":2,"entries":[{"input":"q","expected_output":"yes","metadata":null}]}"#,
+        )
+        .unwrap();
+        std::fs::write(&responses, r#"["yes"]"#).unwrap();
+        assert_eq!(
+            handle_ai_evaluate(&EvaluateArgs {
+                dataset,
+                responses,
+                required_keywords: vec!["yes".to_string()],
+                json_schema: None,
+                min_bytes: 1,
+                max_bytes: 16,
+            })
+            .unwrap(),
+            0
+        );
+
+        let versions = dir.join("prompts.json");
+        std::fs::write(
+            &versions,
+            r#"[{"name":"support","version":1,"content":"v1","weight":90.0},{"name":"support","version":2,"content":"v2","weight":10.0}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            handle_prompt_select(&PromptSelectArgs {
+                name: "support".to_string(),
+                versions,
+                cohort: "customer-1".to_string(),
+                salt: "rollout-1".to_string(),
+            })
+            .unwrap(),
+            0
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

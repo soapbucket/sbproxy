@@ -4,12 +4,14 @@
 //! Datasets hold input/expected-output pairs used in offline evaluations.
 
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use thiserror::Error;
 
 // --- Types ---
 
 /// A single entry in an evaluation dataset.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatasetEntry {
     /// The input prompt or text.
     pub input: String,
@@ -40,7 +42,7 @@ impl DatasetEntry {
 }
 
 /// A versioned collection of evaluation entries.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dataset {
     /// Dataset name used as the storage key.
     pub name: String,
@@ -51,21 +53,51 @@ pub struct Dataset {
 }
 
 impl Dataset {
-    /// Create a new dataset at version 1.
-    pub fn new(name: impl Into<String>, entries: Vec<DatasetEntry>) -> Self {
-        Self {
-            name: name.into(),
-            version: 1,
-            entries,
+    /// Create an explicitly versioned dataset.
+    pub fn new(
+        name: impl Into<String>,
+        version: u32,
+        entries: Vec<DatasetEntry>,
+    ) -> Result<Self, DatasetError> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(DatasetError::EmptyName);
         }
+        if version == 0 {
+            return Err(DatasetError::ZeroVersion);
+        }
+        Ok(Self {
+            name,
+            version,
+            entries,
+        })
     }
+}
+
+/// Dataset construction or storage error.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum DatasetError {
+    /// Dataset names must be usable keys.
+    #[error("dataset name must not be empty")]
+    EmptyName,
+    /// Version zero is reserved and invalid.
+    #[error("dataset version must be greater than zero")]
+    ZeroVersion,
+    /// Immutable dataset versions cannot be overwritten.
+    #[error("dataset {name:?} version {version} already exists")]
+    VersionAlreadyExists {
+        /// Dataset name.
+        name: String,
+        /// Existing version.
+        version: u32,
+    },
 }
 
 // --- Store ---
 
 /// Thread-safe, in-memory dataset store.
 pub struct DatasetStore {
-    datasets: Mutex<HashMap<String, Dataset>>,
+    datasets: Mutex<HashMap<(String, u32), Dataset>>,
 }
 
 impl DatasetStore {
@@ -76,27 +108,59 @@ impl DatasetStore {
         }
     }
 
-    /// Save or replace a dataset. The name is taken from `dataset.name`.
-    pub fn save(&self, dataset: Dataset) {
-        self.datasets.lock().insert(dataset.name.clone(), dataset);
+    /// Save one immutable dataset version.
+    pub fn save(&self, dataset: Dataset) -> Result<(), DatasetError> {
+        if dataset.name.trim().is_empty() {
+            return Err(DatasetError::EmptyName);
+        }
+        if dataset.version == 0 {
+            return Err(DatasetError::ZeroVersion);
+        }
+        let key = (dataset.name.clone(), dataset.version);
+        let mut datasets = self.datasets.lock();
+        if datasets.contains_key(&key) {
+            return Err(DatasetError::VersionAlreadyExists {
+                name: key.0,
+                version: key.1,
+            });
+        }
+        datasets.insert(key, dataset);
+        Ok(())
     }
 
-    /// Retrieve a dataset by name. Returns `None` if not found.
-    pub fn get(&self, name: &str) -> Option<Dataset> {
-        self.datasets.lock().get(name).cloned()
+    /// Retrieve an exact dataset version.
+    pub fn get(&self, name: &str, version: u32) -> Option<Dataset> {
+        self.datasets
+            .lock()
+            .get(&(name.to_string(), version))
+            .cloned()
+    }
+
+    /// Retrieve the highest stored version of a dataset.
+    pub fn latest(&self, name: &str) -> Option<Dataset> {
+        self.datasets
+            .lock()
+            .iter()
+            .filter(|((candidate, _), _)| candidate == name)
+            .max_by_key(|((_, version), _)| *version)
+            .map(|(_, dataset)| dataset.clone())
     }
 
     /// List all stored dataset names, sorted alphabetically.
     pub fn list(&self) -> Vec<String> {
         let guard = self.datasets.lock();
-        let mut names: Vec<String> = guard.keys().cloned().collect();
+        let mut names: Vec<String> = guard.keys().map(|(name, _)| name.clone()).collect();
         names.sort();
+        names.dedup();
         names
     }
 
-    /// Delete a dataset by name. No-op if the dataset does not exist.
-    pub fn delete(&self, name: &str) {
-        self.datasets.lock().remove(name);
+    /// Delete an exact dataset version.
+    pub fn delete(&self, name: &str, version: u32) -> bool {
+        self.datasets
+            .lock()
+            .remove(&(name.to_string(), version))
+            .is_some()
     }
 
     /// Return the total number of stored datasets.
@@ -122,14 +186,14 @@ mod tests {
         let entries = (0..n)
             .map(|i| DatasetEntry::with_expected(format!("input-{i}"), format!("output-{i}")))
             .collect();
-        Dataset::new(name, entries)
+        Dataset::new(name, 1, entries).unwrap()
     }
 
     #[test]
     fn save_and_get_roundtrip() {
         let store = DatasetStore::new();
-        store.save(make_dataset("qa-bench", 3));
-        let ds = store.get("qa-bench").expect("should exist");
+        store.save(make_dataset("qa-bench", 3)).unwrap();
+        let ds = store.get("qa-bench", 1).expect("should exist");
         assert_eq!(ds.name, "qa-bench");
         assert_eq!(ds.entries.len(), 3);
     }
@@ -137,42 +201,45 @@ mod tests {
     #[test]
     fn get_returns_none_for_missing_dataset() {
         let store = DatasetStore::new();
-        assert!(store.get("nope").is_none());
+        assert!(store.get("nope", 1).is_none());
     }
 
     #[test]
     fn list_returns_sorted_names() {
         let store = DatasetStore::new();
-        store.save(make_dataset("z-set", 1));
-        store.save(make_dataset("a-set", 1));
-        store.save(make_dataset("m-set", 1));
+        store.save(make_dataset("z-set", 1)).unwrap();
+        store.save(make_dataset("a-set", 1)).unwrap();
+        store.save(make_dataset("m-set", 1)).unwrap();
         assert_eq!(store.list(), vec!["a-set", "m-set", "z-set"]);
     }
 
     #[test]
     fn delete_removes_dataset() {
         let store = DatasetStore::new();
-        store.save(make_dataset("to-delete", 2));
+        store.save(make_dataset("to-delete", 2)).unwrap();
         assert_eq!(store.count(), 1);
-        store.delete("to-delete");
+        assert!(store.delete("to-delete", 1));
         assert_eq!(store.count(), 0);
-        assert!(store.get("to-delete").is_none());
+        assert!(store.get("to-delete", 1).is_none());
     }
 
     #[test]
     fn delete_noop_when_not_found() {
         let store = DatasetStore::new();
-        store.delete("ghost"); // should not panic
+        assert!(!store.delete("ghost", 1));
         assert_eq!(store.count(), 0);
     }
 
     #[test]
-    fn save_replaces_existing_dataset() {
+    fn save_rejects_existing_dataset_version() {
         let store = DatasetStore::new();
-        store.save(make_dataset("bench", 2));
-        store.save(make_dataset("bench", 5));
-        let ds = store.get("bench").unwrap();
-        assert_eq!(ds.entries.len(), 5);
+        store.save(make_dataset("bench", 2)).unwrap();
+        assert!(matches!(
+            store.save(make_dataset("bench", 5)),
+            Err(DatasetError::VersionAlreadyExists { .. })
+        ));
+        let ds = store.get("bench", 1).unwrap();
+        assert_eq!(ds.entries.len(), 2);
     }
 
     #[test]
@@ -189,8 +256,44 @@ mod tests {
     }
 
     #[test]
-    fn dataset_version_defaults_to_one() {
+    fn dataset_version_is_explicit() {
         let ds = make_dataset("v-test", 0);
         assert_eq!(ds.version, 1);
+    }
+
+    #[test]
+    fn versions_are_preserved_and_duplicate_saves_are_rejected() {
+        let store = DatasetStore::new();
+        let v1 = Dataset::new("bench", 1, vec![DatasetEntry::new("one")]).unwrap();
+        let v2 = Dataset::new("bench", 2, vec![DatasetEntry::new("two")]).unwrap();
+        store.save(v1.clone()).unwrap();
+        store.save(v2.clone()).unwrap();
+        assert_eq!(store.get("bench", 1).unwrap().entries[0].input, "one");
+        assert_eq!(store.latest("bench").unwrap().version, 2);
+        assert!(matches!(
+            store.save(v2),
+            Err(DatasetError::VersionAlreadyExists { .. })
+        ));
+    }
+
+    #[test]
+    fn save_revalidates_public_dataset_fields() {
+        let store = DatasetStore::new();
+        assert!(matches!(
+            store.save(Dataset {
+                name: " ".to_string(),
+                version: 1,
+                entries: Vec::new(),
+            }),
+            Err(DatasetError::EmptyName)
+        ));
+        assert!(matches!(
+            store.save(Dataset {
+                name: "bench".to_string(),
+                version: 0,
+                entries: Vec::new(),
+            }),
+            Err(DatasetError::ZeroVersion)
+        ));
     }
 }

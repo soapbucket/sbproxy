@@ -16,19 +16,25 @@ const DRAWS: u32 = 1_000;
 
 fn main() {
     let store = WeightedPromptStore::new();
-    store.add_version(
-        PROMPT_NAME,
-        WeightedPromptVersion::new(PROMPT_NAME, 1, "You are a helpful support agent.", 90.0),
-    );
-    store.add_version(
-        PROMPT_NAME,
-        WeightedPromptVersion::new(
+    store
+        .add_version(
             PROMPT_NAME,
-            2,
-            "You are a concise, action-oriented support agent.",
-            10.0,
-        ),
-    );
+            WeightedPromptVersion::new(PROMPT_NAME, 1, "You are a helpful support agent.", 90.0)
+                .expect("valid v1"),
+        )
+        .expect("unique v1");
+    store
+        .add_version(
+            PROMPT_NAME,
+            WeightedPromptVersion::new(
+                PROMPT_NAME,
+                2,
+                "You are a concise, action-oriented support agent.",
+                10.0,
+            )
+            .expect("valid v2"),
+        )
+        .expect("unique v2");
 
     let latest = store
         .get_latest(PROMPT_NAME)
@@ -46,20 +52,11 @@ fn main() {
 
     println!("\nDrawing {DRAWS} times by weight (~90% v1, ~10% v2 expected):");
     let mut counts: HashMap<u32, u32> = HashMap::new();
-    for _ in 0..DRAWS {
+    for cohort in 0..DRAWS {
         let picked = store
-            .select_by_weight(PROMPT_NAME)
+            .select_for_cohort(PROMPT_NAME, &format!("customer-{cohort}"), "rollout-1")
             .expect("at least one positive-weight version is registered");
         *counts.entry(picked.version).or_insert(0) += 1;
-        // `select_by_weight` seeds its draw from the current microsecond
-        // clock reading (see its doc comment). A tight loop can execute
-        // several draws within the same microsecond tick and get the
-        // identical pick each time, which is a real property of this
-        // implementation worth surfacing honestly rather than hiding
-        // behind a busy loop fast enough to trigger it: this sleep is
-        // what makes 1,000 draws land on 1,000 distinct clock readings
-        // instead of a handful of repeated bursts.
-        std::thread::sleep(std::time::Duration::from_micros(1));
     }
 
     let mut versions: Vec<&u32> = counts.keys().collect();

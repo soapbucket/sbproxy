@@ -40,7 +40,9 @@ pub mod judge;
 pub mod prompt_scoring;
 
 pub use custom_metrics::{evaluate_all, evaluate_metric, pass_rate, MetricType};
-pub use datasets::{Dataset, DatasetEntry, DatasetStore};
+pub use datasets::{Dataset, DatasetEntry, DatasetError, DatasetStore};
 pub use experiments::{Experiment, ExperimentStore};
-pub use judge::{build_judge_prompt, parse_judge_response, JudgeConfig, JudgeResult};
+pub use judge::{
+    build_judge_prompt, parse_judge_response, JudgeConfig, JudgeParseError, JudgeResult,
+};
 pub use prompt_scoring::{PromptScore, PromptScorer};

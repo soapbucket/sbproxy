@@ -40,4 +40,6 @@ pub mod fsm;
 
 pub use auth::{generate_agent_token, verify_agent_token, A2AAuthConfig};
 pub use discovery::{AgentCapability, AgentRegistry};
-pub use fsm::{FsmExecution, FsmState, FsmWorkflow};
+pub use fsm::{
+    FsmExecution, FsmExecutionError, FsmState, FsmTransition, FsmValidationError, FsmWorkflow,
+};

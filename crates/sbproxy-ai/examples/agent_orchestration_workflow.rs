@@ -61,9 +61,7 @@ fn main() {
     println!("\nIssued a token for {target_agent}: {token}");
 
     // --- 3. Drive a triage -> dispatch workflow with the FSM orchestrator ---
-    let mut states = HashMap::new();
-    states.insert(
-        "triage".to_string(),
+    let states = vec![
         FsmState {
             name: "triage".to_string(),
             action: "triage-agent".to_string(),
@@ -73,40 +71,31 @@ fn main() {
             ]
             .into(),
         },
-    );
-    states.insert(
-        "code".to_string(),
         FsmState {
             name: "code".to_string(),
             action: "coding-agent".to_string(),
             transitions: HashMap::new(),
         },
-    );
-    states.insert(
-        "summarize".to_string(),
         FsmState {
             name: "summarize".to_string(),
             action: "summarizer-agent".to_string(),
             transitions: HashMap::new(),
         },
-    );
+    ];
 
-    let workflow = FsmWorkflow {
-        name: "support-triage".to_string(),
-        states,
-        initial_state: "triage".to_string(),
-    };
+    let workflow = FsmWorkflow::new("support-triage", "triage", states, 16)
+        .expect("example workflow is valid");
     let mut exec = FsmExecution::new(workflow);
     println!("\nWorkflow starts at: {}", exec.current_state());
 
-    let next = exec.transition("needs_code").map(str::to_string);
+    let next = exec.transition("needs_code");
     println!(
         "After 'needs_code': {next:?} (completed: {})",
         exec.is_completed()
     );
 
     // The "code" state has no transitions, so any result terminates it.
-    let terminal = exec.transition("done").map(str::to_string);
+    let terminal = exec.transition("done");
     println!(
         "After 'done': {terminal:?} (completed: {})",
         exec.is_completed()

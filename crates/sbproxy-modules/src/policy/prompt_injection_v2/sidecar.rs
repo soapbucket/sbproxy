@@ -25,7 +25,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use sbproxy_classifier_client::{ClassifierClient, ClassifierClientError, ClassifyResponse, Label};
+#[cfg(test)]
+use sbproxy_classifier_client::ClassifyResponse;
+use sbproxy_classifier_client::{ClassifierClient, ClassifierClientError, Label};
 use sbproxy_config::types::FailureMode;
 use serde::Deserialize;
 
@@ -271,6 +273,7 @@ impl SidecarDetector {
     /// arrives here as `Err(ClassifierClientError::Protocol)` and flows
     /// through the configured failure posture exactly like a transport error.
     /// A malformed response must never read as a clean verdict (WOR-2161).
+    #[cfg(test)]
     fn map_outcome(
         &self,
         outcome: Result<ClassifyResponse, ClassifierClientError>,

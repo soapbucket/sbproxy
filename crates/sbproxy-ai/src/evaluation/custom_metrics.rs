@@ -9,7 +9,7 @@
 pub enum MetricType {
     /// Response must match the provided regular expression.
     RegexMatch(String),
-    /// Response must be valid JSON (schema validation is structural only).
+    /// Response must be JSON that validates against the provided JSON Schema.
     JsonSchemaValid(serde_json::Value),
     /// Response length in bytes must fall within the inclusive `[min, max]` range.
     LengthRange(usize, usize),
@@ -27,11 +27,15 @@ pub fn evaluate_metric(response: &str, metric: &MetricType) -> bool {
         MetricType::RegexMatch(pattern) => regex::Regex::new(pattern)
             .map(|r| r.is_match(response))
             .unwrap_or(false),
-        MetricType::JsonSchemaValid(_schema) => {
-            // Structural JSON validity check; full schema validation would
-            // require an external crate (e.g. jsonschema).
-            serde_json::from_str::<serde_json::Value>(response).is_ok()
-        }
+        MetricType::JsonSchemaValid(schema) => serde_json::from_str::<serde_json::Value>(response)
+            .ok()
+            .and_then(|instance| {
+                jsonschema::JSONSchema::options()
+                    .compile(schema)
+                    .ok()
+                    .map(|compiled| compiled.is_valid(&instance))
+            })
+            .unwrap_or(false),
         MetricType::LengthRange(min, max) => response.len() >= *min && response.len() <= *max,
         MetricType::ContainsKeywords(keywords) => {
             keywords.iter().all(|kw| response.contains(kw.as_str()))
@@ -103,8 +107,19 @@ mod tests {
     }
 
     #[test]
+    fn json_schema_valid_enforces_required_properties() {
+        let metric = MetricType::JsonSchemaValid(json!({
+            "type": "object",
+            "required": ["answer"],
+            "properties": {"answer": {"type": "string"}}
+        }));
+        assert!(!evaluate_metric(r#"{}"#, &metric));
+        assert!(evaluate_metric(r#"{"answer":"yes"}"#, &metric));
+    }
+
+    #[test]
     fn json_schema_valid_passes_for_json_array() {
-        let metric = MetricType::JsonSchemaValid(json!([]));
+        let metric = MetricType::JsonSchemaValid(json!({"type": "array"}));
         assert!(evaluate_metric("[1, 2, 3]", &metric));
     }
 
