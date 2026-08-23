@@ -2083,16 +2083,22 @@ fn spawn_engine_command(
     // before the engine image is exec'd. The gate used to be a `/bin/sh
     // -c` wrapper (WOR-2677); distroless images have no shell, so the
     // wait lives in `pre_exec` instead.
+    //
+    // The closure's `unsafe` is a different unsafety context from
+    // `pre_exec` itself. Nesting them syntactically makes clippy's
+    // `unused_unsafe` fire on Linux CI even though the helpers remain
+    // `unsafe fn`s that a safe closure body cannot call.
+    let after_fork = move || {
+        // SAFETY: `pre_exec` runs in the child after fork. Both
+        // helpers are async-signal-safe libc sequences.
+        unsafe {
+            prepare_engine_child_signal_state(parent_pid)?;
+            wait_for_engine_release_gate()?;
+        }
+        Ok(())
+    };
     unsafe {
-        command.pre_exec(move || {
-            // SAFETY: `pre_exec` runs in the child after fork. Both
-            // helpers are async-signal-safe libc sequences.
-            unsafe {
-                prepare_engine_child_signal_state(parent_pid)?;
-                wait_for_engine_release_gate()?;
-            }
-            Ok(())
-        });
+        command.pre_exec(after_fork);
     }
     // Block in the calling thread before fork so the child is protected from
     // inherited handlers from its first instruction. The child resets every
