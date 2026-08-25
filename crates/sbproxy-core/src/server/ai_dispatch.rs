@@ -7941,16 +7941,18 @@ pub(super) async fn handle_ai_proxy(
             // Principal::api_key_id() is the existing safe identifier seam.
             // Never pass VirtualKeyConfig::key here because compiled keys hold
             // their raw bearer secret in that field.
-            let key_id = ctx.principal.api_key_id();
-            let key_id = (!key_id.is_empty()).then_some(key_id);
+            let key_id = ctx.principal.api_key_id().to_string();
+            let key_id_opt = (!key_id.is_empty()).then_some(key_id.as_str());
+            let request_id = ctx.request_id.to_string();
+            let tenant_id = ctx.tenant_id.to_string();
             evaluate_ai_body_prompt_injection(
                 body_policies,
                 &prompt_segments,
                 sbproxy_modules::BodyAwareAuditContext {
                     hostname,
-                    request_id: Some(ctx.request_id.as_str()),
-                    tenant_id: Some(ctx.tenant_id.as_str()),
-                    virtual_key_id: key_id,
+                    request_id: Some(request_id.as_str()),
+                    tenant_id: Some(tenant_id.as_str()),
+                    virtual_key_id: key_id_opt,
                     policy_version: Some(peer_policy_revision.as_str()),
                 },
                 bypass,

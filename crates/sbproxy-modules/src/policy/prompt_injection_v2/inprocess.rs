@@ -607,8 +607,10 @@ mod tests {
         for (field, value, expected) in [
             ("max_concurrent", serde_json::json!(0), "max_concurrent"),
             ("max_concurrent", serde_json::json!(65), "max_concurrent"),
+            ("max_concurrent", serde_json::json!(usize::MAX), "max_concurrent"),
             ("max_queued", serde_json::json!(0), "max_queued"),
             ("max_queued", serde_json::json!(1_025), "max_queued"),
+            ("max_queued", serde_json::json!(usize::MAX), "max_queued"),
             (
                 "inference_timeout_ms",
                 serde_json::json!(0),

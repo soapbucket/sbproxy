@@ -16,7 +16,7 @@ use crate::auth::AdminAuth;
 use crate::registry::Registry;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, AsyncReadExt};
 use tokio::net::TcpListener;
 use tracing::debug;
 
@@ -47,21 +47,57 @@ impl ReadyState {
 /// Serve `/healthz`, `/readyz`, `/metrics`, and authenticated `/tenants` on a
 /// pre-bound listener until
 /// the process exits or the listener errors.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 128;
+pub const DEFAULT_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub const MAX_REQUEST_BYTES: u64 = 8192;
+
+#[derive(Clone, Copy, Debug)]
+pub struct HttpLimits {
+    pub max_connections: usize,
+    pub io_timeout: std::time::Duration,
+}
+
+impl HttpLimits {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !(1..=100_000).contains(&self.max_connections) {
+            anyhow::bail!("HTTP max_connections must be in 1..=100000");
+        }
+        if self.io_timeout.is_zero() || self.io_timeout > std::time::Duration::from_secs(60) {
+            anyhow::bail!("HTTP io_timeout must be in 1..=60000ms");
+        }
+        Ok(())
+    }
+}
+
 pub async fn serve_on(
     listener: TcpListener,
     registry: Arc<Registry>,
     ready: ReadyState,
     auth: Option<Arc<AdminAuth>>,
+    limits: HttpLimits,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let slots = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
     loop {
         let (stream, _) = listener.accept().await?;
+        let permit = match Arc::clone(&slots).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => continue, // Drop on full
+        };
         let registry = Arc::clone(&registry);
         let ready = ready.clone();
         let auth = auth.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_health(stream, &registry, &ready, auth.as_deref()).await {
-                debug!(error = %e, "health connection ended");
+            let _permit = permit;
+            let result = tokio::time::timeout(
+                limits.io_timeout,
+                handle_health(stream, &registry, &ready, auth.as_deref()),
+            )
+            .await;
+            match result {
+                Ok(Err(e)) => debug!(error = %e, "health connection ended"),
+                Err(_) => debug!("health connection timed out"),
+                _ => {}
             }
         });
     }
@@ -74,7 +110,7 @@ async fn handle_health(
     auth: Option<&AdminAuth>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (reader, mut writer) = stream.split();
-    let mut reader = BufReader::new(reader);
+    let mut reader = BufReader::new(reader).take(MAX_REQUEST_BYTES);
 
     let mut request_line = String::new();
     reader.read_line(&mut request_line).await?;

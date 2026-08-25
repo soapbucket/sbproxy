@@ -239,10 +239,10 @@ impl SidecarDetector {
                 cfg.threshold
             ));
         }
-        if cfg.timeout_ms == 0 {
+        if cfg.timeout_ms == 0 || cfg.timeout_ms > 30_000 {
             return Err(anyhow::anyhow!(
-                "sidecar detector timeout_ms must be greater than zero; \
-                 with 0 every call would time out immediately"
+                "sidecar detector timeout_ms must be in 1..=30000, got {}",
+                cfg.timeout_ms
             ));
         }
         if cfg.injection_label.is_empty() {
@@ -482,14 +482,16 @@ mod tests {
     }
 
     #[test]
-    fn config_rejects_zero_timeout() {
-        let err = match SidecarDetector::from_config(&serde_json::json!({
-            "timeout_ms": 0,
-        })) {
-            Ok(_) => panic!("timeout_ms 0 must fail at config time"),
-            Err(e) => e,
-        };
-        assert!(err.to_string().contains("timeout_ms"));
+    fn config_rejects_out_of_bounds_timeout() {
+        for timeout in [0, 30_001, u64::MAX] {
+            let err = match SidecarDetector::from_config(&serde_json::json!({
+                "timeout_ms": timeout,
+            })) {
+                Ok(_) => panic!("timeout_ms {timeout} must fail at config time"),
+                Err(e) => e,
+            };
+            assert!(err.to_string().contains("timeout_ms"));
+        }
     }
 
     #[test]

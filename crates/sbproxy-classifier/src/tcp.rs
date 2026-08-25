@@ -61,6 +61,18 @@ pub struct TcpLimits {
     pub io_timeout: Duration,
 }
 
+impl TcpLimits {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !(1..=100_000).contains(&self.max_connections) {
+            anyhow::bail!("TCP max_connections must be in 1..=100000");
+        }
+        if self.io_timeout.is_zero() || self.io_timeout > Duration::from_secs(60) {
+            anyhow::bail!("TCP io_timeout must be in 1..=60000ms");
+        }
+        Ok(())
+    }
+}
+
 impl Default for TcpLimits {
     fn default() -> Self {
         Self {
@@ -726,5 +738,20 @@ mod tests {
             .unwrap();
         let error = result.expect_err("idle connection must hit its read deadline");
         assert!(error.to_string().contains("timeout"));
+    }
+
+    #[test]
+    fn config_rejects_out_of_bounds_tcp_limits() {
+        for (max, timeout) in [
+            (0, Duration::from_millis(100)),
+            (100_001, Duration::from_millis(100)),
+            (usize::MAX, Duration::from_millis(100)),
+            (10, Duration::from_millis(0)),
+            (10, Duration::from_secs(61)),
+            (10, Duration::MAX),
+        ] {
+            let limits = TcpLimits { max_connections: max, io_timeout: timeout };
+            assert!(limits.validate().is_err());
+        }
     }
 }

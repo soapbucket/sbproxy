@@ -28,11 +28,14 @@ impl Lease {
 
 impl Admission {
     pub fn new(max_running: usize, max_queued: usize, deadline: Duration) -> anyhow::Result<Self> {
-        if max_running == 0 {
-            bail!("inference max running must be greater than zero");
+        if !(1..=64).contains(&max_running) {
+            bail!("inference max running must be in 1..=64");
         }
-        if deadline.is_zero() {
-            bail!("inference deadline must be greater than zero");
+        if max_queued > 1024 {
+            bail!("inference max queued must be in 0..=1024");
+        }
+        if deadline.is_zero() || deadline > Duration::from_secs(30) {
+            bail!("inference deadline must be in 1..=30000ms");
         }
         Ok(Self {
             running: Arc::new(Semaphore::new(max_running)),
@@ -42,7 +45,9 @@ impl Admission {
     }
 
     pub async fn acquire(&self, command: &'static str) -> Result<Lease, Status> {
-        let expires = Instant::now() + self.deadline;
+        let expires = Instant::now()
+            .checked_add(self.deadline)
+            .ok_or_else(|| Status::deadline_exceeded("unrepresentable deadline"))?;
         let running = match Arc::clone(&self.running).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
@@ -130,6 +135,22 @@ impl Admission {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_rejects_out_of_bounds_limits() {
+        for (running, queued, deadline) in [
+            (0, 0, Duration::from_millis(100)),
+            (65, 0, Duration::from_millis(100)),
+            (usize::MAX, 0, Duration::from_millis(100)),
+            (1, 1025, Duration::from_millis(100)),
+            (1, usize::MAX, Duration::from_millis(100)),
+            (1, 0, Duration::from_millis(0)),
+            (1, 0, Duration::from_secs(31)),
+            (1, 0, Duration::MAX),
+        ] {
+            assert!(Admission::new(running, queued, deadline).is_err());
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn refuses_work_beyond_running_and_queue_budget() {

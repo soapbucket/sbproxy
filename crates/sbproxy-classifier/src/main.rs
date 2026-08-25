@@ -271,6 +271,7 @@ async fn main() -> Result<()> {
         max_connections: cli.tcp_max_connections,
         io_timeout: Duration::from_millis(cli.tcp_io_timeout_ms),
     };
+    tcp_limits.validate()?;
     let listeners =
         bind_required_listeners(grpc_addr, tcp_addr, metrics_addr, admin_addr, &ready).await?;
 
@@ -338,12 +339,18 @@ async fn main() -> Result<()> {
         })
     };
 
+    let http_limits = health::HttpLimits {
+        max_connections: health::DEFAULT_MAX_CONNECTIONS,
+        io_timeout: health::DEFAULT_IO_TIMEOUT,
+    };
+    http_limits.validate()?;
+
     let health_task = {
         let registry = Arc::clone(&registry);
         let ready = ready.clone();
         let auth = admin_auth.map(Arc::new);
         tokio::spawn(
-            async move { health::serve_on(listeners.metrics, registry, ready, auth).await },
+            async move { health::serve_on(listeners.metrics, registry, ready, auth, http_limits).await },
         )
     };
 

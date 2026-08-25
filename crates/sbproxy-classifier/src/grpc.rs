@@ -346,7 +346,7 @@ impl ClassifierService for ClassifierHandler {
                 })
                 .await;
             if let Err(status) = result {
-                let _ = error_tx.send(Err(status)).await;
+                let _ = error_tx.try_send(Err(status));
             }
         });
         let stream: SafetyStream = Box::pin(ReceiverStream::new(rx));
@@ -381,7 +381,7 @@ async fn run_stream_safety<S>(
         let token = match next {
             Ok(t) => t,
             Err(status) => {
-                let _ = tx.send(Err(status)).await;
+                let _ = tx.try_send(Err(status));
                 return;
             }
         };
@@ -390,10 +390,9 @@ async fn run_stream_safety<S>(
         if chunks > MAX_STREAM_CHUNKS || total_bytes > MAX_STREAM_BYTES {
             crate::metrics::record_error("grpc", "stream_safety", "resource_limit");
             let _ = tx
-                .send(Err(Status::resource_exhausted(
+                .try_send(Err(Status::resource_exhausted(
                     "stream_safety cumulative chunk or byte budget exceeded",
-                )))
-                .await;
+                )));
             return;
         }
         if first {
@@ -402,20 +401,18 @@ async fn run_stream_safety<S>(
             if rules.len() > MAX_STREAM_RULES || rule_bytes > MAX_STREAM_RULE_BYTES {
                 crate::metrics::record_error("grpc", "stream_safety", "resource_limit");
                 let _ = tx
-                    .send(Err(Status::resource_exhausted(
+                    .try_send(Err(Status::resource_exhausted(
                         "stream_safety rule budget exceeded",
-                    )))
-                    .await;
+                    )));
                 return;
             }
             max_rule_bytes = rules.iter().map(String::len).max().unwrap_or(0);
             first = false;
         } else if !token.rules.is_empty() {
             let _ = tx
-                .send(Err(Status::invalid_argument(
+                .try_send(Err(Status::invalid_argument(
                     "stream_safety rules are allowed only on the first message",
-                )))
-                .await;
+                )));
             return;
         }
 
@@ -443,7 +440,7 @@ async fn run_stream_safety<S>(
             }
         };
 
-        if tx.send(Ok(verdict)).await.is_err() {
+        if tx.try_send(Ok(verdict)).is_err() {
             // Caller dropped the response stream; stop reading input.
             return;
         }
