@@ -167,22 +167,19 @@ async fn walk_authority_hints(
             continue;
         };
 
-        // Pull the Subordinate Statement the superior signed about
-        // the current entity.
-        let subordinate_compact = match fetcher
-            .fetch_subordinate_statement(&fetch_endpoint, current_entity_id)
-            .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                last_error = Some(e);
-                continue;
-            }
-        };
-
         // Is the superior a configured trust anchor? If so we can
         // assemble + validate the chain right now.
         if resolver.anchors().jwks_for(superior_url.as_str()).is_some() {
+            let subordinate_compact = match fetcher
+                .fetch_subordinate_statement(&fetch_endpoint, current_entity_id)
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    last_error = Some(e);
+                    continue;
+                }
+            };
             let chain = leaf_to_anchor_chain(
                 visited,
                 &subordinate_compact,
@@ -208,6 +205,18 @@ async fn walk_authority_hints(
         .await;
         match recurse_result {
             Ok(child_chain) => {
+                // Fetch the subordinate statement only AFTER the superior's chain is authenticated
+                let subordinate_compact = match fetcher
+                    .fetch_subordinate_statement(&fetch_endpoint, current_entity_id)
+                    .await
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        last_error = Some(e);
+                        continue;
+                    }
+                };
+
                 // Splice this step's subordinate statement onto
                 // the chain returned by the deeper walk. The
                 // deeper walk yielded a chain starting with the

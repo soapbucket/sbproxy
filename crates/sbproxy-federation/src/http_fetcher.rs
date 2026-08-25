@@ -141,7 +141,7 @@ impl Default for ReqwestFederationFetcher {
 impl FederationFetcher for ReqwestFederationFetcher {
     async fn fetch_entity_configuration(&self, entity_id: &str) -> FederationResult<String> {
         let url = Self::well_known_url(entity_id)?;
-        let resp = self
+        let mut resp = self
             .client
             .get(url.clone())
             .timeout(DEFAULT_FETCH_TIMEOUT)
@@ -155,9 +155,14 @@ impl FederationFetcher for ReqwestFederationFetcher {
                 resp.status()
             )));
         }
-        resp.text()
-            .await
-            .map_err(|e| FederationError::FetchFailed(format!("reading body from {url}: {e}")))
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|e| FederationError::FetchFailed(format!("reading body from {url}: {e}")))? {
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() > 1_048_576 { // 1 MiB cap
+                return Err(FederationError::FetchFailed(format!("response too large from {url}")));
+            }
+        }
+        String::from_utf8(bytes).map_err(|e| FederationError::FetchFailed(format!("invalid utf8 from {url}: {e}")))
     }
 
     async fn fetch_subordinate_statement(
@@ -176,7 +181,7 @@ impl FederationFetcher for ReqwestFederationFetcher {
             )));
         }
         url.query_pairs_mut().append_pair("sub", subordinate);
-        let resp = self
+        let mut resp = self
             .client
             .get(url.clone())
             .timeout(DEFAULT_FETCH_TIMEOUT)
@@ -190,9 +195,14 @@ impl FederationFetcher for ReqwestFederationFetcher {
                 resp.status()
             )));
         }
-        resp.text()
-            .await
-            .map_err(|e| FederationError::FetchFailed(format!("reading body from {url}: {e}")))
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|e| FederationError::FetchFailed(format!("reading body from {url}: {e}")))? {
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() > 1_048_576 { // 1 MiB cap
+                return Err(FederationError::FetchFailed(format!("response too large from {url}")));
+            }
+        }
+        String::from_utf8(bytes).map_err(|e| FederationError::FetchFailed(format!("invalid utf8 from {url}: {e}")))
     }
 }
 

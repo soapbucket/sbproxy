@@ -53,14 +53,19 @@ const ALLOWED_ALGORITHMS: &[Algorithm] = &[
 /// by [`verify_entity_statement`] on a successful decode + signature
 /// check; carries the parsed claims + the original compact-JWS bytes
 /// so the caller can store the statement verbatim for cache replay.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EntityStatement {
-    /// Parsed claims.
     pub claims: EntityStatementClaims,
-    /// The original compact-JWS bytes. Useful when a trust-chain
-    /// resolver wants to store the on-the-wire form for cache lookup
-    /// without re-signing.
     pub compact_jws: String,
+}
+
+impl std::fmt::Debug for EntityStatement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EntityStatement")
+            .field("claims", &self.claims)
+            .field("compact_jws", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// §3 entity statement claim set. Field names match the wire shape so

@@ -103,35 +103,45 @@ pub struct FederationServerConfig {
 /// Signing-key inputs the issuer needs to produce the compact JWS.
 /// Split from the rest of the config so an operator can express
 /// "I gave you the PEM bytes plus a `kid` to advertise" without
-/// teaching the config type about the algorithm-specific PEM shape.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SigningKeyConfig {
     /// The PEM-encoded private key. EC keys MUST be PKCS#8 (the
-    /// `jsonwebtoken` ES256 loader rejects SEC1). RSA may be PKCS#1
-    /// or PKCS#8. Ed25519 MUST be PKCS#8.
+    /// `jsonwebtoken` loader rejects SEC1).
     pub pem: Vec<u8>,
-    /// Algorithm slug for the JWS header. The issuer validates this
-    /// against the OIDF allowlist on every sign call.
+    /// Algorithm slug for the JWS header.
     pub algorithm: Algorithm,
-    /// `kid` stamped on the JWS header. MUST match a `kid` in
-    /// [`FederationServerConfig::published_jwks`] so verifiers can
-    /// resolve the right public key.
+    /// `kid` stamped on the JWS header.
     pub kid: String,
+}
+
+impl std::fmt::Debug for SigningKeyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SigningKeyConfig")
+            .field("pem", &"[REDACTED]")
+            .field("algorithm", &self.algorithm)
+            .field("kid", &self.kid)
+            .finish()
+    }
 }
 
 /// Result of a `current()` call: the cached compact JWS plus the
 /// (parsed-once-at-sign-time) `exp` so the caller can stamp HTTP
 /// `Cache-Control: max-age` without re-parsing the JWS.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EntityConfigurationDocument {
-    /// The compact-JWS bytes a peer fetches from the well-known
-    /// endpoint. Always UTF-8 ASCII.
     pub compact_jws: String,
-    /// When this document was signed.
     pub issued_at: DateTime<Utc>,
-    /// When this document expires. The issuer re-signs as soon as
-    /// `now() + refresh_margin >= expires_at`.
     pub expires_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for EntityConfigurationDocument {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EntityConfigurationDocument")
+            .field("compact_jws", &"[REDACTED]")
+            .field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 impl EntityConfigurationDocument {
