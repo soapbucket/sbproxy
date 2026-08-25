@@ -203,7 +203,7 @@ async fn handle_connection(
 
         let msg_len = u32::from_be_bytes(len_buf) as usize;
         if msg_len > MAX_FRAME_BYTES {
-            error!(len = msg_len, "message too large, closing");
+            debug!(len = msg_len, "message too large, closing");
             return Ok(());
         }
 
@@ -215,7 +215,7 @@ async fn handle_connection(
         let msg: Message = match rmp_serde::from_slice(&payload) {
             Ok(m) => m,
             Err(e) => {
-                warn!(error = %e, "malformed request frame");
+                debug!(error = %e, "malformed request frame");
                 crate::metrics::record_error(TRANSPORT, "decode", "malformed_frame");
                 return Ok(());
             }
@@ -256,7 +256,7 @@ async fn handle_connection(
                 Command::StreamingSafety => handle_streaming_safety(&msg)?,
                 Command::ContentTypeDetect => handle_content_type_detect(&msg)?,
                 Command::Unknown => {
-                    warn!(cmd_len = msg.cmd.len(), "unknown command");
+                    debug!(cmd_len = msg.cmd.len(), "unknown command");
                     crate::metrics::record_error(transport, "unknown", "unknown_command");
                     admin_error(Command::Unknown, None, "unknown command")?
                 }
@@ -275,6 +275,14 @@ async fn handle_connection(
     }
 }
 
+fn sanitize(s: &str, max: usize) -> String {
+    if s.len() > max {
+        format!("{}...", &s[..max])
+    } else {
+        s.to_string()
+    }
+}
+
 fn admin_error(
     command: Command,
     tenant: Option<String>,
@@ -283,8 +291,8 @@ fn admin_error(
     Ok(rmp_serde::to_vec_named(&AdminResponse {
         ok: false,
         cmd: command.label().to_string(),
-        tenant,
-        error: Some(error.to_string()),
+        tenant: tenant.map(|t| sanitize(&t, 128)),
+        error: Some(sanitize(error, 256)),
         tenants: None,
     })?)
 }
@@ -325,13 +333,13 @@ fn handle_classify(
         Some(t) => t,
         None => {
             let tid = tenant_id.unwrap_or("(none)");
-            warn!(tenant = %tid, "tenant not registered");
+            debug!(tenant = %sanitize(tid, 128), "tenant not registered");
             crate::metrics::record_error(TRANSPORT, "classify", "tenant_not_registered");
             let resp = AdminResponse {
                 ok: false,
                 cmd: "classify".to_string(),
-                tenant: Some(tid.to_string()),
-                error: Some(format!("tenant not registered: {tid}")),
+                tenant: Some(sanitize(tid, 128)),
+                error: Some(format!("tenant not registered: {}", sanitize(tid, 64))),
                 tenants: None,
             };
             return Ok(rmp_serde::to_vec_named(&resp)?);
@@ -343,11 +351,11 @@ fn handle_classify(
     let latency_us = t0.elapsed().as_micros() as i64;
 
     let resp = ClassifyResponse {
-        id: msg.id.clone(),
+        id: sanitize(&msg.id, 128),
         labels,
         normalized,
         latency_us,
-        tenant: tenant_id.unwrap_or("").to_string(),
+        tenant: sanitize(tenant_id.unwrap_or(""), 128),
     };
 
     Ok(rmp_serde::to_vec_named(&resp)?)
@@ -362,7 +370,7 @@ fn handle_quality_score(
     let latency_us = t0.elapsed().as_micros() as i64;
 
     let resp = QualityScoreResponse {
-        id: msg.id.clone(),
+        id: sanitize(&msg.id, 128),
         score: result.score,
         signals: result.signals,
         latency_us,

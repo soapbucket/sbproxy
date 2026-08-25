@@ -48,6 +48,10 @@ impl AdminAuth {
                 );
             }
         }
+        let meta = std::fs::metadata(path).with_context(|| format!("reading admin token file metadata {}", path.display()))?;
+        if meta.len() > 256 * 1024 {
+            bail!("admin token file {} exceeds 256KB limit", path.display());
+        }
         let bytes = std::fs::read(path)
             .with_context(|| format!("reading admin token file {}", path.display()))?;
         Self::from_json(&bytes)
@@ -58,6 +62,23 @@ impl AdminAuth {
         let auth: AuthFile = serde_json::from_slice(bytes).context("invalid JSON")?;
         if auth.tokens.is_empty() {
             bail!("admin token file must contain at least one token grant");
+        }
+        if auth.tokens.len() > 1024 {
+            bail!("admin token file exceeds 1024 grant limit");
+        }
+        for grant in &auth.tokens {
+            if grant.token.len() > 256 {
+                bail!("admin token exceeds 256 byte limit");
+            }
+            if grant.tenants.len() > 1024 {
+                bail!("admin token grant exceeds 1024 tenant limit");
+            }
+            for tenant in &grant.tenants {
+                if tenant.len() > 128 {
+                    bail!("admin token grant tenant exceeds 128 byte limit");
+                }
+            }
+
         }
         let mut tokens = HashSet::new();
         for grant in &auth.tokens {
@@ -140,5 +161,18 @@ mod tests {
         assert!(policy.authorize(Some("secret-a"), Some("tenant-a")));
         assert!(!policy.authorize(Some("secret-a"), Some("tenant-b")));
         assert!(!policy.authorize(None, Some("tenant-a")));
+    }
+
+    #[test]
+    fn oversized_auth_file_shape_is_rejected() {
+        assert!(AdminAuth::from_json(b"").is_err());
+        assert!(AdminAuth::from_json(b"{\"tokens\":[]}").is_err());
+        let mut huge_tokens = String::new();
+        for _ in 0..1025 {
+            huge_tokens.push_str("{\"token\":\"a\",\"tenants\":[]},");
+        }
+        huge_tokens.pop();
+        let json = format!("{{\"tokens\":[{}]}}", huge_tokens);
+        assert!(AdminAuth::from_json(json.as_bytes()).unwrap_err().to_string().contains("1024 grant limit"));
     }
 }
