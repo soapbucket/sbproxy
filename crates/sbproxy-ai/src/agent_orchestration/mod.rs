@@ -31,7 +31,7 @@
 //! WOR-2661 port.
 //!
 //! See `docs/agent-orchestration.md` and
-//! `examples/agent-orchestration-workflow/` for a runnable multi-agent
+//! `examples/agent_orchestration_workflow.rs` for a runnable multi-agent
 //! workflow built on these three pieces together.
 
 pub mod auth;
@@ -41,5 +41,6 @@ pub mod fsm;
 pub use auth::{generate_agent_token, verify_agent_token, A2AAuthConfig};
 pub use discovery::{AgentCapability, AgentRegistry};
 pub use fsm::{
-    FsmExecution, FsmExecutionError, FsmState, FsmTransition, FsmValidationError, FsmWorkflow,
+    FsmExecution, FsmExecutionError, FsmLimitDimension, FsmState, FsmTransition,
+    FsmValidationError, FsmWorkflow,
 };

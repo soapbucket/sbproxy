@@ -1818,12 +1818,12 @@ fn reload_compiled_config_locked(
         warn_unwired_decision_audit_events(compiled);
         warn_legacy_policy_record_format(compiled);
 
-        // WOR-2476: arm the AiProvider, UsageSink, ModelArtifact, and
-        // TokenExchange gates from the compiled `egress:` section, and
-        // rebuild the AI client so it picks up `AiProvider`. The shared
-        // seam `run` (boot) also calls; see its doc comment for why this
-        // is one function with two callers rather than the two-call
-        // sequence it replaced.
+        // WOR-2476: arm the AiProvider, ClassifierHook, UsageSink,
+        // ModelArtifact, and TokenExchange gates from the compiled
+        // `egress:` section, and rebuild the AI client so it picks up
+        // `AiProvider`. The shared seam `run` (boot) also calls; see its
+        // doc comment for why this is one function with two callers rather
+        // than the two-call sequence it replaced.
         arm_egress_gates_from_config(compiled);
 
         // WOR-1164: refresh the detection singletons (agent-class resolver,
@@ -2565,10 +2565,10 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     warn_unwired_decision_audit_events(&compiled);
     warn_legacy_policy_record_format(&compiled);
     // WOR-2476: this is the startup path (the earlier call site runs on
-    // reload); arms the AiProvider/UsageSink/ModelArtifact/TokenExchange
-    // registry and rebuilds the AI client before the pipeline below is
-    // published, so a `deny_by_default` `egress:` section is live from
-    // this process's very first request, not just from its first reload.
+    // reload); arms the AiProvider/ClassifierHook/UsageSink/ModelArtifact/
+    // TokenExchange registry and rebuilds the AI client before the pipeline
+    // below is published, so a `deny_by_default` `egress:` section is live
+    // from this process's very first request, not just from its first reload.
     arm_egress_gates_from_config(&compiled);
 
     // Walk the inventory-based plugin registry once at startup and
@@ -4943,7 +4943,7 @@ fn install_usage_rollups_from_config(compiled: &sbproxy_config::CompiledConfig) 
 /// that gap the moment a future change touched one call site and not the
 /// other; call this one function from both instead.
 ///
-/// Four sub-blocks, five purposes: `usage_sinks:` compiles one
+/// Five reload-installed sub-blocks, six purposes: `usage_sinks:` compiles one
 /// allowlist under both `UsageSink` and `Webhook`, because the sinks
 /// underneath it authorize under two different, pre-existing purposes.
 /// The registry is an exact-key map, so both keys have to be written or
@@ -4957,12 +4957,12 @@ fn install_usage_rollups_from_config(compiled: &sbproxy_config::CompiledConfig) 
 /// than spelled out here a second time where it can disagree with what
 /// `compile_egress_gates` actually built.
 ///
-/// Four of the five purposes live behind their own, separate lazy
-/// reader: the usage-sink builder, the `events:` webhook sink, the
-/// model-artifact fetcher, and the outbound-credential resolver each
-/// read their own purpose out of the registry well after this function
-/// returns (the model-artifact fetcher's own staleness window against a
-/// registry-only reload is documented on
+/// Five of the six purposes live behind their own, separate lazy
+/// reader: the classifier client, the usage-sink builder, the `events:`
+/// webhook sink, the model-artifact fetcher, and the outbound-credential
+/// resolver each read their own purpose out of the registry well after
+/// this function returns (the model-artifact fetcher's own staleness
+/// window against a registry-only reload is documented on
 /// [`sbproxy_model_host::HttpArtifactTransport::with_configured_egress`]).
 /// `AiProvider` is the one purpose armed synchronously, right here,
 /// because `AiClient` is a process-wide `ArcSwap` this function owns
@@ -5006,6 +5006,10 @@ fn arm_egress_gates_from_config(compiled: &sbproxy_config::CompiledConfig) {
     arm(
         &[EgressPurpose::AiProvider],
         compiled.egress.ai_providers.clone(),
+    );
+    arm(
+        &[EgressPurpose::ClassifierHook],
+        compiled.egress.classifier_hooks.clone(),
     );
     arm(
         &[EgressPurpose::UsageSink, EgressPurpose::Webhook],
@@ -7305,6 +7309,9 @@ egress:
   ai_providers:
     mode: deny_by_default
     hosts: ["api.openai.com"]
+  classifier_hooks:
+    mode: deny_by_default
+    hosts: ["classifier.internal"]
   usage_sinks:
     mode: deny_by_default
     hosts: ["collector.internal"]
@@ -7318,6 +7325,7 @@ egress:
         let compiled = sbproxy_config::compile_config(yaml).expect("config compiles");
         let armed: Vec<sbproxy_security::egress::EgressPurpose> = [
             compiled.egress.ai_providers.as_ref(),
+            compiled.egress.classifier_hooks.as_ref(),
             compiled.egress.usage_sinks.as_ref(),
             compiled.egress.model_artifacts.as_ref(),
             compiled.egress.token_exchange.as_ref(),
@@ -7357,9 +7365,32 @@ egress:
             );
         }
 
+        // `allow_by_default` is the other shape that compiles to `None`.
+        // Prove it clears a previously armed classifier slot too, rather
+        // than testing only a fully omitted `egress:` section.
+        arm_egress_gates_from_config(&compiled);
+        let classifier_ungated = sbproxy_config::compile_config(
+            r#"
+proxy: {}
+egress:
+  classifier_hooks:
+    mode: allow_by_default
+    hosts: ["classifier.internal"]
+"#,
+        )
+        .expect("allow-by-default classifier config compiles");
+        arm_egress_gates_from_config(&classifier_ungated);
+        assert!(
+            sbproxy_security::egress::configured_gate(
+                sbproxy_security::egress::EgressPurpose::ClassifierHook
+            )
+            .is_none(),
+            "an allow-by-default reload left the prior ClassifierHook gate armed"
+        );
+
         // `arm_egress_gates_from_config` rebuilds the AI client itself,
-        // and the bare config above already restored the ungated one, so
-        // there is nothing left for this test to undo.
+        // and the allow-by-default config above restored the ungated one,
+        // so there is nothing left for this test to undo.
     }
 
     // WOR-2481: the reload-time seam for the boot-only OTLP trace and

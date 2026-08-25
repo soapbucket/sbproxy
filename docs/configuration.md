@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-25*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -270,7 +270,7 @@ origins:
 | `agent_classes` | object | unset | Agent catalog selection and resolver tuning. |
 | `rate_limits` | object | unset | Workspace-wide budget and auto-suspend state. Separate from per-origin policies. |
 | `audit` | object | unset | Admin-action and security/config/key audit trail. `sink: memory` (default) keeps rows in an in-memory ring and on the `tracing` targets; `sink: chain` additionally hash-chains and Ed25519-signs `security_audit` (plus `config_audit`/`key_audit`/admin-action rows when `config_path`/`key_path`/`admin_path` are set) to a durable file `sbproxy audit verify` can check. See [audit-log.md](audit-log.md). |
-| `egress` | object | unset | Per-purpose outbound allowlists (AI providers, usage sinks, model artifacts, token exchange, telemetry). See [Egress allowlists](#egress-allowlists). |
+| `egress` | object | unset | Per-purpose outbound allowlists (AI providers, classifier hooks, usage sinks, model artifacts, token exchange, telemetry). See [Egress allowlists](#egress-allowlists). |
 | `session_ledger` | object | unset | MCP tool-call session-ledger emission. |
 | `request_events` | object | unset | Where completed request events go: `none` (default), `logging`, or `file`. See [Request-event egress](observability.md#request-event-egress). |
 | `events` | object | unset | Where typed lifecycle events go: `none` (default), `file`, or `webhook`. Delivery is off the request path through a bounded queue. See [events.md](events.md). |
@@ -347,6 +347,11 @@ egress:
   ai_providers:
     mode: deny_by_default
     hosts: ["api.openai.com", "api.anthropic.com"]
+  classifier_hooks:
+    mode: deny_by_default
+    hosts: ["classifier.internal"]
+    ports: [50051]
+    allow_private: true
   usage_sinks:
     mode: deny_by_default
     hosts: ["cloud.langfuse.com"]
@@ -362,6 +367,7 @@ egress:
 | Sub-block | Purpose(s) armed | Gates |
 |---|---|---|
 | `ai_providers` | `ai_provider` | Every upstream AI provider dispatch the AI gateway client makes. |
+| `classifier_hooks` | `classifier_hook` | Stock intent-classification and prompt-aware provider-quality gRPC calls. The two hooks share this one purpose-scoped gate. Nonlocal `proxy.classifier_hooks.endpoint` destinations must already be `https://` and authenticated with bearer metadata, client mTLS, or both; see [intent-detection.md](intent-detection.md). |
 | `usage_sinks` | `usage_sink`, `webhook` | Langfuse, Datadog, and object-store usage-sink deliveries (`usage_sink`), plus webhook usage-sink deliveries and the `events:` webhook sink (`webhook`, a separate purpose the same sub-block arms with one allowlist). |
 | `model_artifacts` | `model_artifact` | The model-host artifact fetcher's HTTP downloads. |
 | `token_exchange` | `token_exchange` | Every OAuth token-endpoint call this proxy makes: the non-MCP outbound-credential resolver's, and the MCP run-as-user token exchange's. A per-server `egress:` block gates that server's upstream connects and OpenAPI tool calls; it does not reach this purpose, so this sub-block is the only way to arm a token endpoint. |

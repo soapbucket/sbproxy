@@ -1,5 +1,5 @@
 # AI chargeback and spend forecasting
-*Last modified: 2026-08-22*
+*Last modified: 2026-08-25*
 
 `sbproxy_ai::billing` (WOR-2672) is per-event usage attribution,
 chargeback rollups, unified bill generation, and spend forecasting for
@@ -24,21 +24,39 @@ usage_sinks:
     max_teams: 1000
 ```
 
+One chargeback sink is allowed per `ai_proxy` origin; config load rejects a
+second.
+
 All three limits are optional and the values above are the defaults. Raw
 entries retain the newest `max_entries` rows. Workspace and team maps
 reserve one of their configured rows for `"__other__"`; once a map is
 full, new caller-provided names fold into that row without losing their
 tokens, request count, or cost. Names and other raw string fields are
-capped at 256 bytes before retention.
+capped at 256 bytes before retention. Caller-supplied literal
+`"unattributed"` and `"__other__"` dimension values are escaped with a
+deterministic digest suffix so they cannot impersonate the internal
+missing/overflow buckets on the legacy v1 or CSV surfaces.
 
 The configured instance remains queryable after the sink is registered.
-Use authenticated `GET /admin/ai-chargeback` for the atomic JSON view or
-`GET /admin/ai-chargeback.csv` for workspace/team rollups. The JSON export
-includes retained raw entries, all rollups, and `recorded_entries`,
-`evicted_entries`, `collapsed_workspace_events`, and
-`collapsed_team_events`. Prometheus exports the process totals as
+Use authenticated `GET /admin/ai-chargeback` for the process-local JSON
+view or `GET /admin/ai-chargeback.csv` for workspace/team rollups. The
+JSON export includes retained raw entries, all rollups, and
+`recorded_entries`, `evicted_entries`, `collapsed_workspace_events`, and
+`collapsed_team_events`. `schema_version` defaults to `1`;
+`schema_version=2` keeps typed dimensions, and `limit` + `cursor` page
+only the retained raw `entries` while rollups and counters remain whole
+on every page. JSON and CSV are written directly from borrowed tracker
+state into a 512 KiB capped response buffer; CSV never snapshots the raw
+entry window. An export that exceeds the cap returns `413`. Retry an
+oversized JSON page with a smaller `limit`; for an oversized CSV export,
+use the paged JSON route. Prometheus exports the process totals as
 `sbproxy_ai_chargeback_entries_evicted_total` and
-`sbproxy_ai_chargeback_rollups_collapsed_total{dimension="workspace"|"team"}`.
+`sbproxy_ai_chargeback_rollups_collapsed_total{dimension="workspace"|"team"}`,
+the closed refusal counter
+`sbproxy_ai_chargeback_refusals_total{reason}`, the sticky completeness
+counter `sbproxy_ai_chargeback_incomplete_total{reason}`, and the admin
+boundary refusal counter
+`sbproxy_admin_chargeback_export_refusals_total{format,reason}`.
 
 An embedding can also construct a tracker directly when it needs a typed
 handle:
@@ -89,15 +107,31 @@ let workspace_totals = tracker.workspace_totals_snapshot(); // HashMap<tenant_id
 
 ## Unified billing statements
 
-Aggregate the same tracker's per-event log into a printable bill, one
-line item per (provider, model) pair:
+Generate a complete bill from one atomic tracker snapshot. This refuses a
+period whenever retained rows, all-time rollups, eviction evidence, or refusal
+counters cannot prove that the statement is complete:
 
 ```rust,ignore
-use sbproxy_ai::billing::generate_bill;
+use sbproxy_ai::billing::generate_bill_from_snapshot;
 
-let entries = tracker.entries_snapshot();
-// Half-open period: August 1 inclusive through September 1 exclusive.
-let bill = generate_bill(&entries, "2026-08-01", "2026-09-01")?;
+let snapshot = tracker.snapshot();
+let period_start = snapshot
+    .earliest_retained_timestamp
+    .as_deref()
+    .expect("example recorded rows");
+let latest = chrono::DateTime::parse_from_rfc3339(
+    snapshot
+        .latest_retained_timestamp
+        .as_deref()
+        .expect("example recorded rows"),
+)
+.expect("stored timestamp remains RFC 3339")
+.with_timezone(&chrono::Utc);
+let period_end = latest
+    .checked_add_signed(chrono::TimeDelta::seconds(1))
+    .expect("example window stays representable")
+    .to_rfc3339();
+let bill = generate_bill_from_snapshot(&snapshot, period_start, &period_end)?;
 for item in &bill.line_items {
     println!("{} / {}: {} requests, {} tokens, ${:.2}",
         item.provider, item.model, item.requests, item.tokens, item.cost);
@@ -111,6 +145,20 @@ Malformed bounds, empty/reversed periods, malformed entry timestamps,
 invalid costs, and arithmetic overflow return `BillError`; an
 August-labeled bill cannot silently include July or September usage or a
 wrapped monetary aggregate.
+
+### Caller-asserted-complete retained slices
+
+The lower-level retained-slice API is available only when the caller has an
+independent completeness guarantee (for example, the requested period is
+known to fit wholly inside retention):
+
+```rust,ignore
+use sbproxy_ai::billing::generate_bill;
+
+let entries = tracker.entries_snapshot();
+let bill = generate_bill(&entries, "2026-08-01", "2026-09-01")?;
+# Ok::<(), sbproxy_ai::billing::BillError>(())
+```
 
 ## Spend forecasting
 
@@ -142,8 +190,9 @@ degrades against, to raise the budget before soft-landing has to act.
 
 [`crates/sbproxy-ai/examples/ai_chargeback_billing.rs`](../crates/sbproxy-ai/examples/ai_chargeback_billing.rs)
 feeds a `ChargebackTracker` a batch of synthetic `LlmUsageEvent`s across
-two tenants and three provider/model pairs, then prints team totals, a
-unified bill, and a 30-day forecast:
+two tenants and three provider/model pairs, derives a bill window from
+the retained snapshot timestamps, then prints team totals, a unified
+bill, and a 30-day forecast:
 
 ```bash
 cargo run -p sbproxy-ai --example ai_chargeback_billing

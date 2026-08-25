@@ -16,6 +16,7 @@
 //! loopback default and refused by `compile_config` once `bind` or
 //! `allow_ips` makes the surface reachable from another host.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1655,12 +1656,14 @@ fn handle_ai_data_posture() -> (u16, &'static str, String) {
 
 // --- AI chargeback export (WOR-2672) ---
 
-fn live_ai_chargeback_snapshots(
-) -> std::collections::BTreeMap<String, Vec<sbproxy_ai::billing::ChargebackSnapshot>> {
+fn with_live_ai_chargeback_trackers<R>(
+    f: impl FnOnce(&BTreeMap<String, Vec<&sbproxy_ai::billing::ChargebackTracker>>) -> R,
+) -> R {
     use sbproxy_modules::Action;
 
     let pipeline = crate::reload::current_pipeline();
-    let mut origins = std::collections::BTreeMap::new();
+    let mut origins: BTreeMap<String, Vec<&sbproxy_ai::billing::ChargebackTracker>> =
+        BTreeMap::new();
     for (index, action) in pipeline.actions.iter().enumerate() {
         let Action::AiProxy(ai) = action else {
             continue;
@@ -1668,57 +1671,763 @@ fn live_ai_chargeback_snapshots(
         let Some(origin) = pipeline.config.origins.get(index) else {
             continue;
         };
-        let snapshots: Vec<_> = ai
+        let trackers: Vec<_> = ai
             .config
             .usage_sinks()
             .iter()
-            .filter_map(|sink| sink.chargeback_snapshot())
+            .filter_map(|sink| sink.chargeback_tracker())
             .collect();
-        if !snapshots.is_empty() {
-            origins.insert(origin.hostname.to_string(), snapshots);
+        if !trackers.is_empty() {
+            origins.insert(origin.hostname.to_string(), trackers);
         }
     }
-    origins
+    f(&origins)
 }
 
-/// Return all configured live chargeback trackers as an atomic JSON export.
-fn handle_ai_chargeback() -> (u16, &'static str, String) {
+#[cfg(test)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LegacyChargebackConversionCounters {
+    json_serialization_passes: usize,
+    csv_serialization_passes: usize,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static LEGACY_CHARGEBACK_CONVERSION_COUNTERS: std::cell::RefCell<
+        Option<LegacyChargebackConversionCounters>,
+    > = std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+struct LegacyChargebackConversionProbe;
+
+#[cfg(test)]
+impl LegacyChargebackConversionProbe {
+    fn install_for_current_thread() -> Self {
+        LEGACY_CHARGEBACK_CONVERSION_COUNTERS.with(|slot| {
+            let previous = slot.replace(Some(LegacyChargebackConversionCounters::default()));
+            assert!(
+                previous.is_none(),
+                "legacy chargeback conversion probe already installed"
+            );
+        });
+        Self
+    }
+
+    fn counters(&self) -> LegacyChargebackConversionCounters {
+        LEGACY_CHARGEBACK_CONVERSION_COUNTERS.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .expect("legacy chargeback conversion probe is installed")
+                .clone()
+        })
+    }
+}
+
+#[cfg(test)]
+impl Drop for LegacyChargebackConversionProbe {
+    fn drop(&mut self) {
+        LEGACY_CHARGEBACK_CONVERSION_COUNTERS.with(|slot| {
+            let _ = slot.replace(None);
+        });
+    }
+}
+
+#[cfg(test)]
+fn observe_legacy_chargeback_conversion(
+    update: impl FnOnce(&mut LegacyChargebackConversionCounters),
+) {
+    LEGACY_CHARGEBACK_CONVERSION_COUNTERS.with(|slot| {
+        if let Some(counters) = slot.borrow_mut().as_mut() {
+            update(counters);
+        }
+    });
+}
+
+const DEFAULT_AI_CHARGEBACK_PAGE_LIMIT: usize = 100;
+const MAX_AI_CHARGEBACK_PAGE_LIMIT: usize = 1_000;
+const MAX_AI_CHARGEBACK_RESPONSE_BYTES: usize = 512 * 1024;
+const CHARGEBACK_CURSOR_PREFIX: &str = "chargeback:";
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ChargebackEntrySlice {
+    offset: usize,
+    len: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ParsedChargebackPaging {
+    offset: usize,
+    limit: usize,
+    requested: bool,
+}
+
+#[derive(Debug)]
+struct ChargebackPagePlan {
+    slices: Vec<Vec<ChargebackEntrySlice>>,
+    next_cursor: Option<String>,
+}
+
+struct CappedResponseWriter {
+    body: Vec<u8>,
+    max_bytes: usize,
+    limit_exceeded: bool,
+}
+
+impl CappedResponseWriter {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            body: Vec::with_capacity(max_bytes.min(8 * 1024)),
+            max_bytes,
+            limit_exceeded: false,
+        }
+    }
+
+    fn limit_exceeded(&self) -> bool {
+        self.limit_exceeded
+    }
+
+    fn into_string(self) -> Result<String, std::string::FromUtf8Error> {
+        String::from_utf8(self.body)
+    }
+}
+
+impl std::io::Write for CappedResponseWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.len() > self.max_bytes.saturating_sub(self.body.len()) {
+            self.limit_exceeded = true;
+            return Err(std::io::Error::other(
+                "admin chargeback response exceeded its byte limit",
+            ));
+        }
+        self.body.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+struct BorrowedChargebackV2Entry<'a> {
+    workspace: &'a sbproxy_ai::billing::DimensionKey,
+    team: &'a sbproxy_ai::billing::DimensionKey,
+    project: &'a str,
+    provider: &'a str,
+    model: &'a str,
+    tokens: u64,
+    cost: f64,
+    timestamp: &'a str,
+}
+
+impl<'a> From<&'a sbproxy_ai::billing::ChargebackSnapshotEntry> for BorrowedChargebackV2Entry<'a> {
+    fn from(entry: &'a sbproxy_ai::billing::ChargebackSnapshotEntry) -> Self {
+        Self {
+            workspace: &entry.workspace,
+            team: &entry.team,
+            project: &entry.project,
+            provider: &entry.provider,
+            model: &entry.model,
+            tokens: entry.tokens,
+            cost: entry.cost,
+            timestamp: &entry.timestamp,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct BorrowedChargebackLegacyEntry<'a> {
+    team: Cow<'a, str>,
+    project: &'a str,
+    provider: &'a str,
+    model: &'a str,
+    tokens: u64,
+    cost: f64,
+    timestamp: &'a str,
+}
+
+impl<'a> From<&'a sbproxy_ai::billing::ChargebackSnapshotEntry>
+    for BorrowedChargebackLegacyEntry<'a>
+{
+    fn from(entry: &'a sbproxy_ai::billing::ChargebackSnapshotEntry) -> Self {
+        Self {
+            team: entry.team.legacy_projection(),
+            project: &entry.project,
+            provider: &entry.provider,
+            model: &entry.model,
+            tokens: entry.tokens,
+            cost: entry.cost,
+            timestamp: &entry.timestamp,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct BorrowedChargebackRollup<'a> {
+    dimension: &'a sbproxy_ai::billing::DimensionKey,
+    totals: &'a sbproxy_ai::billing::WorkspaceTotals,
+}
+
+#[derive(Serialize)]
+struct BorrowedChargebackRefusalCount<'a> {
+    reason: &'a sbproxy_ai::billing::ChargebackRecordError,
+    count: u64,
+}
+
+fn bounded_chargeback_schema_token(value: &str) -> String {
+    const MAX_SCHEMA_TOKEN_BYTES: usize = 64;
+    if value.len() <= MAX_SCHEMA_TOKEN_BYTES {
+        return value.to_string();
+    }
+    let mut end = MAX_SCHEMA_TOKEN_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+fn admin_chargeback_export_refusal_label(
+    reason: sbproxy_observe::metrics::AdminChargebackExportRefusalReason,
+) -> &'static str {
+    use sbproxy_observe::metrics::AdminChargebackExportRefusalReason;
+
+    match reason {
+        AdminChargebackExportRefusalReason::InvalidCursor => "invalid_cursor",
+        AdminChargebackExportRefusalReason::InvalidLimit => "invalid_limit",
+        AdminChargebackExportRefusalReason::UnsupportedSchemaVersion => {
+            "unsupported_schema_version"
+        }
+        AdminChargebackExportRefusalReason::ResponseTooLarge => "response_too_large",
+    }
+}
+
+fn admin_chargeback_export_format_label(
+    format: sbproxy_observe::metrics::AdminChargebackExportFormat,
+) -> &'static str {
+    use sbproxy_observe::metrics::AdminChargebackExportFormat;
+
+    match format {
+        AdminChargebackExportFormat::Json => "json",
+        AdminChargebackExportFormat::Csv => "csv",
+    }
+}
+
+fn record_admin_chargeback_export_refusal(
+    format: sbproxy_observe::metrics::AdminChargebackExportFormat,
+    reason: sbproxy_observe::metrics::AdminChargebackExportRefusalReason,
+    site: &'static str,
+) {
+    sbproxy_observe::metrics::record_admin_chargeback_export_refusal(format, reason);
+    tracing::warn!(
+        target: "sbproxy::admin::chargeback",
+        code = "chargeback_export_refused",
+        format = admin_chargeback_export_format_label(format),
+        reason = admin_chargeback_export_refusal_label(reason),
+        site,
+        "admin chargeback export refused"
+    );
+}
+
+fn unsupported_chargeback_schema_version(requested: &str) -> AdminResponse {
+    let requested = bounded_chargeback_schema_token(requested);
+    let requested = serde_json::from_str::<serde_json::Value>(&requested)
+        .ok()
+        .filter(serde_json::Value::is_number)
+        .unwrap_or_else(|| serde_json::Value::String(requested));
     (
-        200,
+        400,
         "application/json",
         serde_json::json!({
-            "schema_version": 1,
-            "origins": live_ai_chargeback_snapshots(),
+            "code": "unsupported_schema_version",
+            "requested_schema_version": requested,
+            "supported_schema_versions": [1, 2],
         })
         .to_string(),
     )
 }
 
-/// Return bounded workspace/team rollups in spreadsheet-safe CSV.
-fn handle_ai_chargeback_csv() -> (u16, &'static str, String) {
-    let mut csv = "origin,tracker,dimension,name,request_count,tokens,cost_usd\n".to_string();
-    for (origin, snapshots) in live_ai_chargeback_snapshots() {
-        for (tracker, snapshot) in snapshots.iter().enumerate() {
-            for (dimension, totals) in [
-                ("workspace", &snapshot.workspace_totals),
-                ("team", &snapshot.team_totals),
-            ] {
-                for (name, total) in totals {
-                    use std::fmt::Write as _;
-                    let _ = writeln!(
-                        csv,
-                        "{},{tracker},{dimension},{},{},{},{}",
-                        chargeback_csv_field(&origin),
-                        chargeback_csv_field(name),
-                        total.request_count,
-                        total.tokens,
-                        total.cost_usd
-                    );
-                }
+fn encode_chargeback_cursor(offset: usize) -> String {
+    use base64::Engine;
+
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(format!("{CHARGEBACK_CURSOR_PREFIX}{offset}"))
+}
+
+fn decode_chargeback_cursor(raw: &str) -> Option<usize> {
+    use base64::Engine;
+
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(raw)
+        .ok()?;
+    let text = std::str::from_utf8(&decoded).ok()?;
+    let offset = text.strip_prefix(CHARGEBACK_CURSOR_PREFIX)?;
+    offset.parse::<usize>().ok()
+}
+
+fn parse_chargeback_paging(path: &str) -> Result<ParsedChargebackPaging, AdminResponse> {
+    let cursor = decoded_query_param(path, "cursor");
+    let limit = decoded_query_param(path, "limit");
+    if cursor.is_none() && limit.is_none() {
+        return Ok(ParsedChargebackPaging {
+            offset: 0,
+            limit: usize::MAX,
+            requested: false,
+        });
+    }
+
+    let offset = match cursor {
+        None => 0,
+        Some(raw) => decode_chargeback_cursor(&raw).ok_or_else(|| {
+            record_admin_chargeback_export_refusal(
+                sbproxy_observe::metrics::AdminChargebackExportFormat::Json,
+                sbproxy_observe::metrics::AdminChargebackExportRefusalReason::InvalidCursor,
+                "cursor_decode",
+            );
+            admin_error(400, "cursor is invalid")
+        })?,
+    };
+    let limit = match limit {
+        None => DEFAULT_AI_CHARGEBACK_PAGE_LIMIT,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(0) | Err(_) => {
+                record_admin_chargeback_export_refusal(
+                    sbproxy_observe::metrics::AdminChargebackExportFormat::Json,
+                    sbproxy_observe::metrics::AdminChargebackExportRefusalReason::InvalidLimit,
+                    "limit_parse",
+                );
+                return Err(admin_error(400, "limit must be a positive whole number"));
             }
+            Ok(limit) => limit.min(MAX_AI_CHARGEBACK_PAGE_LIMIT),
+        },
+    };
+    Ok(ParsedChargebackPaging {
+        offset,
+        limit,
+        requested: true,
+    })
+}
+
+fn chargeback_response_too_large(limit: usize) -> AdminResponse {
+    (
+        413,
+        "application/json",
+        serde_json::json!({
+            "code": "chargeback_response_too_large",
+            "max_response_bytes": limit,
+            "hint": format!(
+                "retry with ?limit=<1..={MAX_AI_CHARGEBACK_PAGE_LIMIT}> and the returned next_cursor"
+            ),
+        })
+        .to_string(),
+    )
+}
+
+fn build_chargeback_page_plan(
+    origins: &BTreeMap<String, Vec<&sbproxy_ai::billing::ChargebackTracker>>,
+    paging: ParsedChargebackPaging,
+) -> Result<ChargebackPagePlan, AdminResponse> {
+    let total_entries = origins
+        .values()
+        .flat_map(|trackers| trackers.iter())
+        .map(|tracker| tracker.entries_count())
+        .sum::<usize>();
+    if paging.offset > total_entries {
+        record_admin_chargeback_export_refusal(
+            sbproxy_observe::metrics::AdminChargebackExportFormat::Json,
+            sbproxy_observe::metrics::AdminChargebackExportRefusalReason::InvalidCursor,
+            "cursor_offset",
+        );
+        return Err(admin_error(400, "cursor is invalid"));
+    }
+
+    let mut remaining_skip = paging.offset;
+    let mut remaining_take = paging.limit;
+    let mut slices = Vec::with_capacity(origins.len());
+    for trackers in origins.values() {
+        let mut origin_slices = Vec::with_capacity(trackers.len());
+        for tracker in trackers {
+            let count = tracker.entries_count();
+            let skip = remaining_skip.min(count);
+            remaining_skip = remaining_skip.saturating_sub(skip);
+            let available = count.saturating_sub(skip);
+            let len = if paging.requested {
+                let take = available.min(remaining_take);
+                remaining_take = remaining_take.saturating_sub(take);
+                take
+            } else {
+                available
+            };
+            origin_slices.push(ChargebackEntrySlice { offset: skip, len });
+        }
+        slices.push(origin_slices);
+    }
+    let returned_entries = if paging.requested {
+        paging.limit.saturating_sub(remaining_take)
+    } else {
+        total_entries.saturating_sub(paging.offset)
+    };
+    let next_cursor = (paging.requested
+        && paging.offset.saturating_add(returned_entries) < total_entries)
+        .then(|| encode_chargeback_cursor(paging.offset.saturating_add(returned_entries)));
+    Ok(ChargebackPagePlan {
+        slices,
+        next_cursor,
+    })
+}
+
+fn write_raw_json<W: std::io::Write>(
+    writer: &mut W,
+    bytes: &[u8],
+) -> Result<(), serde_json::Error> {
+    writer.write_all(bytes).map_err(serde_json::Error::io)
+}
+
+fn write_legacy_chargeback_totals<'a, W, I>(
+    writer: &mut W,
+    totals: I,
+) -> Result<(), serde_json::Error>
+where
+    W: std::io::Write,
+    I: Iterator<
+        Item = (
+            &'a sbproxy_ai::billing::DimensionKey,
+            &'a sbproxy_ai::billing::WorkspaceTotals,
+        ),
+    >,
+{
+    write_raw_json(writer, b"{")?;
+    for (index, (dimension, total)) in totals.enumerate() {
+        if index != 0 {
+            write_raw_json(writer, b",")?;
+        }
+        serde_json::to_writer(&mut *writer, dimension.legacy_projection().as_ref())?;
+        write_raw_json(writer, b":")?;
+        serde_json::to_writer(&mut *writer, total)?;
+    }
+    write_raw_json(writer, b"}")
+}
+
+fn write_chargeback_json_response<W: std::io::Write>(
+    writer: &mut W,
+    origins: &BTreeMap<String, Vec<&sbproxy_ai::billing::ChargebackTracker>>,
+    plan: &ChargebackPagePlan,
+    schema_version: u32,
+    paging: ParsedChargebackPaging,
+) -> Result<(), serde_json::Error> {
+    #[cfg(test)]
+    observe_legacy_chargeback_conversion(|counters| {
+        counters.json_serialization_passes += 1;
+    });
+    write_raw_json(writer, br#"{"schema_version":"#)?;
+    serde_json::to_writer(&mut *writer, &schema_version)?;
+    if paging.requested {
+        write_raw_json(writer, br#","limit":"#)?;
+        serde_json::to_writer(&mut *writer, &paging.limit)?;
+        write_raw_json(writer, br#","next_cursor":"#)?;
+        serde_json::to_writer(&mut *writer, &plan.next_cursor)?;
+    }
+    write_raw_json(writer, br#","origins":{"#)?;
+    for (origin_index, ((origin, trackers), origin_plan)) in
+        origins.iter().zip(plan.slices.iter()).enumerate()
+    {
+        if origin_index != 0 {
+            write_raw_json(writer, b",")?;
+        }
+        serde_json::to_writer(&mut *writer, origin)?;
+        write_raw_json(writer, b":[")?;
+        for (tracker_index, (tracker, slice)) in trackers.iter().zip(origin_plan.iter()).enumerate()
+        {
+            if tracker_index != 0 {
+                write_raw_json(writer, b",")?;
+            }
+            tracker.with_export_view(|view| {
+                write_raw_json(writer, b"{")?;
+                write_raw_json(writer, br#""max_entries":"#)?;
+                serde_json::to_writer(&mut *writer, &view.max_entries())?;
+                write_raw_json(writer, br#","max_workspaces":"#)?;
+                serde_json::to_writer(&mut *writer, &view.max_workspaces())?;
+                write_raw_json(writer, br#","max_teams":"#)?;
+                serde_json::to_writer(&mut *writer, &view.max_teams())?;
+                if schema_version == 1 {
+                    write_raw_json(writer, br#","entries":["#)?;
+                    for (entry_index, entry) in view.entries(slice.offset, slice.len).enumerate() {
+                        if entry_index != 0 {
+                            write_raw_json(writer, b",")?;
+                        }
+                        serde_json::to_writer(
+                            &mut *writer,
+                            &BorrowedChargebackLegacyEntry::from(entry),
+                        )?;
+                    }
+                    write_raw_json(writer, br#"],"workspace_totals":"#)?;
+                    write_legacy_chargeback_totals(writer, view.workspace_totals())?;
+                    write_raw_json(writer, br#","team_totals":"#)?;
+                    write_legacy_chargeback_totals(writer, view.team_totals())?;
+                    write_raw_json(writer, br#","recorded_entries":"#)?;
+                    serde_json::to_writer(&mut *writer, &view.recorded_entries())?;
+                    write_raw_json(writer, br#","evicted_entries":"#)?;
+                    serde_json::to_writer(&mut *writer, &view.evicted_entries())?;
+                    write_raw_json(writer, br#","collapsed_workspace_events":"#)?;
+                    serde_json::to_writer(&mut *writer, &view.collapsed_workspace_events())?;
+                    write_raw_json(writer, br#","collapsed_team_events":"#)?;
+                    serde_json::to_writer(&mut *writer, &view.collapsed_team_events())?;
+                } else {
+                    write_raw_json(writer, br#","schema_version":2"#)?;
+                    write_raw_json(writer, br#","entries":["#)?;
+                    for (entry_index, entry) in view.entries(slice.offset, slice.len).enumerate() {
+                        if entry_index != 0 {
+                            write_raw_json(writer, b",")?;
+                        }
+                        serde_json::to_writer(
+                            &mut *writer,
+                            &BorrowedChargebackV2Entry::from(entry),
+                        )?;
+                    }
+                    write_raw_json(writer, br#"],"workspace_rollups":["#)?;
+                    for (rollup_index, (dimension, totals)) in view.workspace_totals().enumerate() {
+                        if rollup_index != 0 {
+                            write_raw_json(writer, b",")?;
+                        }
+                        serde_json::to_writer(
+                            &mut *writer,
+                            &BorrowedChargebackRollup { dimension, totals },
+                        )?;
+                    }
+                    write_raw_json(writer, br#"],"team_rollups":["#)?;
+                    for (rollup_index, (dimension, totals)) in view.team_totals().enumerate() {
+                        if rollup_index != 0 {
+                            write_raw_json(writer, b",")?;
+                        }
+                        serde_json::to_writer(
+                            &mut *writer,
+                            &BorrowedChargebackRollup { dimension, totals },
+                        )?;
+                    }
+                    write_raw_json(writer, br#"],"recorded_entries":"#)?;
+                    serde_json::to_writer(&mut *writer, &view.recorded_entries())?;
+                    write_raw_json(writer, br#","evicted_entries":"#)?;
+                    serde_json::to_writer(&mut *writer, &view.evicted_entries())?;
+                    write_raw_json(writer, br#","collapsed_workspace_events":"#)?;
+                    serde_json::to_writer(&mut *writer, &view.collapsed_workspace_events())?;
+                    write_raw_json(writer, br#","collapsed_team_events":"#)?;
+                    serde_json::to_writer(&mut *writer, &view.collapsed_team_events())?;
+                    write_raw_json(writer, br#","complete":"#)?;
+                    serde_json::to_writer(&mut *writer, &view.complete())?;
+                    write_raw_json(writer, br#","refused_entries":"#)?;
+                    serde_json::to_writer(&mut *writer, &view.refused_entries())?;
+                    write_raw_json(writer, br#","refusal_counts":["#)?;
+                    for (refusal_index, (reason, count)) in view.refusal_counts().enumerate() {
+                        if refusal_index != 0 {
+                            write_raw_json(writer, b",")?;
+                        }
+                        serde_json::to_writer(
+                            &mut *writer,
+                            &BorrowedChargebackRefusalCount {
+                                reason,
+                                count: *count,
+                            },
+                        )?;
+                    }
+                    write_raw_json(writer, br#"],"earliest_retained_timestamp":"#)?;
+                    serde_json::to_writer(&mut *writer, &view.earliest_retained_timestamp())?;
+                    write_raw_json(writer, br#","latest_retained_timestamp":"#)?;
+                    serde_json::to_writer(&mut *writer, &view.latest_retained_timestamp())?;
+                    write_raw_json(writer, br#","eviction_watermark":"#)?;
+                    serde_json::to_writer(&mut *writer, view.eviction_watermark())?;
+                }
+                write_raw_json(writer, b"}")
+            })?;
+        }
+        write_raw_json(writer, b"]")?;
+    }
+    write_raw_json(writer, b"}}")
+}
+
+fn render_live_ai_chargeback_json_with_limit(
+    origins: &BTreeMap<String, Vec<&sbproxy_ai::billing::ChargebackTracker>>,
+    path: &str,
+    schema_version: Option<&str>,
+    max_response_bytes: usize,
+) -> AdminResponse {
+    let paging = match parse_chargeback_paging(path) {
+        Ok(paging) => paging,
+        Err(error) => return error,
+    };
+    let plan = match build_chargeback_page_plan(origins, paging) {
+        Ok(plan) => plan,
+        Err(error) => return error,
+    };
+    let schema_version = match schema_version {
+        None | Some("1") => 1,
+        Some("2") => 2,
+        Some(requested) => {
+            record_admin_chargeback_export_refusal(
+                sbproxy_observe::metrics::AdminChargebackExportFormat::Json,
+                sbproxy_observe::metrics::AdminChargebackExportRefusalReason::UnsupportedSchemaVersion,
+                "schema_version",
+            );
+            return unsupported_chargeback_schema_version(requested);
+        }
+    };
+
+    let mut writer = CappedResponseWriter::new(max_response_bytes);
+    if write_chargeback_json_response(&mut writer, origins, &plan, schema_version, paging).is_err()
+    {
+        if writer.limit_exceeded() {
+            record_admin_chargeback_export_refusal(
+                sbproxy_observe::metrics::AdminChargebackExportFormat::Json,
+                sbproxy_observe::metrics::AdminChargebackExportRefusalReason::ResponseTooLarge,
+                "response_size",
+            );
+            return chargeback_response_too_large(max_response_bytes);
+        }
+        return admin_error(500, "chargeback response serialization failed");
+    }
+    match writer.into_string() {
+        Ok(body) => (200, "application/json", body),
+        Err(_) => admin_error(500, "chargeback response serialization failed"),
+    }
+}
+
+#[cfg(test)]
+fn render_live_ai_chargeback_json_for_test(
+    origins: &BTreeMap<String, Vec<&sbproxy_ai::billing::ChargebackTracker>>,
+    path: &str,
+    max_response_bytes: usize,
+) -> AdminResponse {
+    let schema_version = decoded_query_param(path, "schema_version");
+    render_live_ai_chargeback_json_with_limit(
+        origins,
+        path,
+        schema_version.as_deref(),
+        max_response_bytes,
+    )
+}
+
+/// Return all configured live chargeback trackers as a capped JSON export.
+fn handle_ai_chargeback(path: &str) -> AdminResponse {
+    let schema_version = decoded_query_param(path, "schema_version");
+    with_live_ai_chargeback_trackers(|origins| {
+        render_live_ai_chargeback_json_with_limit(
+            origins,
+            path,
+            schema_version.as_deref(),
+            MAX_AI_CHARGEBACK_RESPONSE_BYTES,
+        )
+    })
+}
+
+fn write_chargeback_csv_rollups<'a, W, I>(
+    writer: &mut W,
+    origin: &str,
+    tracker: usize,
+    dimension: &str,
+    totals: I,
+) -> std::io::Result<()>
+where
+    W: std::io::Write,
+    I: Iterator<
+        Item = (
+            &'a sbproxy_ai::billing::DimensionKey,
+            &'a sbproxy_ai::billing::WorkspaceTotals,
+        ),
+    >,
+{
+    for (name, total) in totals {
+        writeln!(
+            writer,
+            "{origin},{tracker},{dimension},{},{},{},{}",
+            chargeback_csv_field(name.legacy_projection().as_ref()),
+            total.request_count,
+            total.tokens,
+            total.cost_usd
+        )?;
+    }
+    Ok(())
+}
+
+fn write_chargeback_csv_response<W: std::io::Write>(
+    writer: &mut W,
+    origins: &BTreeMap<String, Vec<&sbproxy_ai::billing::ChargebackTracker>>,
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    observe_legacy_chargeback_conversion(|counters| {
+        counters.csv_serialization_passes += 1;
+    });
+    writer.write_all(b"origin,tracker,dimension,name,request_count,tokens,cost_usd\n")?;
+    for (origin, trackers) in origins {
+        let origin = chargeback_csv_field(origin);
+        for (tracker_index, tracker) in trackers.iter().enumerate() {
+            tracker.with_export_view(|view| {
+                write_chargeback_csv_rollups(
+                    writer,
+                    &origin,
+                    tracker_index,
+                    "workspace",
+                    view.workspace_totals(),
+                )?;
+                write_chargeback_csv_rollups(
+                    writer,
+                    &origin,
+                    tracker_index,
+                    "team",
+                    view.team_totals(),
+                )
+            })?;
         }
     }
-    (200, "text/csv; charset=utf-8", csv)
+    Ok(())
+}
+
+fn chargeback_csv_response_too_large(limit: usize) -> AdminResponse {
+    (
+        413,
+        "application/json",
+        serde_json::json!({
+            "code": "chargeback_response_too_large",
+            "max_response_bytes": limit,
+            "hint": "use the paged JSON chargeback export for large datasets",
+        })
+        .to_string(),
+    )
+}
+
+fn render_live_ai_chargeback_csv_with_limit(
+    origins: &BTreeMap<String, Vec<&sbproxy_ai::billing::ChargebackTracker>>,
+    max_response_bytes: usize,
+) -> AdminResponse {
+    let mut writer = CappedResponseWriter::new(max_response_bytes);
+    if write_chargeback_csv_response(&mut writer, origins).is_err() {
+        if writer.limit_exceeded() {
+            record_admin_chargeback_export_refusal(
+                sbproxy_observe::metrics::AdminChargebackExportFormat::Csv,
+                sbproxy_observe::metrics::AdminChargebackExportRefusalReason::ResponseTooLarge,
+                "response_size",
+            );
+            return chargeback_csv_response_too_large(max_response_bytes);
+        }
+        return admin_error(500, "chargeback CSV serialization failed");
+    }
+    match writer.into_string() {
+        Ok(body) => (200, "text/csv; charset=utf-8", body),
+        Err(_) => admin_error(500, "chargeback CSV serialization failed"),
+    }
+}
+
+#[cfg(test)]
+fn render_live_ai_chargeback_csv_for_test(
+    origins: &BTreeMap<String, Vec<&sbproxy_ai::billing::ChargebackTracker>>,
+    max_response_bytes: usize,
+) -> AdminResponse {
+    render_live_ai_chargeback_csv_with_limit(origins, max_response_bytes)
+}
+
+/// Return bounded workspace/team rollups in spreadsheet-safe CSV.
+fn handle_ai_chargeback_csv() -> AdminResponse {
+    with_live_ai_chargeback_trackers(|origins| {
+        render_live_ai_chargeback_csv_with_limit(origins, MAX_AI_CHARGEBACK_RESPONSE_BYTES)
+    })
 }
 
 fn chargeback_csv_field(value: &str) -> String {
@@ -2112,7 +2821,7 @@ fn handle_config_read(state: &AdminState) -> (u16, &'static str, String) {
                 503,
                 "application/json",
                 r#"{"error":"config path not wired"}"#.to_string(),
-            )
+            );
         }
     };
     let yaml = match std::fs::read_to_string(path) {
@@ -2358,7 +3067,7 @@ fn handle_config_effective(state: &AdminState) -> (u16, &'static str, String) {
                 503,
                 "application/json",
                 r#"{"error":"config path not wired"}"#.to_string(),
-            )
+            );
         }
     };
     let local = match std::fs::read_to_string(path) {
@@ -2434,7 +3143,7 @@ fn handle_config_write(
                 503,
                 "application/json",
                 r#"{"error":"config path not wired"}"#.to_string(),
-            )
+            );
         }
     };
     let yaml = match body {
@@ -2444,7 +3153,7 @@ fn handle_config_write(
                 400,
                 "application/json",
                 r#"{"error":"empty config body"}"#.to_string(),
-            )
+            );
         }
     };
     // Optimistic concurrency: reject if the caller's expected revision no
@@ -2494,7 +3203,7 @@ fn handle_config_write(
                     r#"{{"error":"failed to resolve config source: {}"}}"#,
                     format!("{e:#}").replace('"', "'")
                 ),
-            )
+            );
         }
     };
     let compiled = match sbproxy_config::compile_config(&resolved_body.text) {
@@ -2507,7 +3216,7 @@ fn handle_config_write(
                     r#"{{"error":"invalid config: {}"}}"#,
                     e.to_string().replace('"', "'")
                 ),
-            )
+            );
         }
     };
     // Construct for validation only: this pipeline is dropped immediately,
@@ -2672,7 +3381,7 @@ fn handle_config_history_detail(state: &AdminState, digest: &str) -> (u16, &'sta
                     "error": format!("read stored revision: {error}"),
                 })
                 .to_string(),
-            )
+            );
         }
     };
     let document = String::from_utf8_lossy(&document_bytes).into_owned();
@@ -4106,7 +4815,7 @@ fn handle_audit_chain(method: &str, path: &str, state: &AdminState) -> (u16, &'s
                     400,
                     "application/json",
                     format!(r#"{{"error":"{name} must be an RFC 3339 timestamp"}}"#),
-                )
+                );
             }
         }
     }
@@ -4253,7 +4962,7 @@ pub fn handle_admin_request(
                     &state.health_registry,
                     env!("CARGO_PKG_VERSION"),
                     option_env!("SBPROXY_GIT_SHA").unwrap_or("unknown"),
-                )
+                );
             }
             "/readyz" | "/ready" => return sbproxy_observe::handle_readyz(&state.health_registry),
             "/livez" | "/live" => return sbproxy_observe::handle_livez(),
@@ -4516,7 +5225,7 @@ pub fn handle_admin_request(
                     400,
                     "application/json",
                     r#"{"error":"missing 'workspace'"}"#.to_string(),
-                )
+                );
             }
         };
         return match crate::rate_limit_budget::registry() {
@@ -5001,7 +5710,7 @@ pub fn handle_admin_request(
     // and sit behind the common operator-auth gate above.
     if path_only == "/admin/ai-chargeback" {
         if method.eq_ignore_ascii_case("GET") {
-            return handle_ai_chargeback();
+            return handle_ai_chargeback(path);
         }
         return (
             405,
@@ -5078,7 +5787,7 @@ pub fn handle_admin_request(
                         400,
                         "application/json",
                         r#"{"error":"missing 'level' directive"}"#.to_string(),
-                    )
+                    );
                 }
             };
             return match sbproxy_observe::set_log_filter(&level) {
@@ -8177,6 +8886,28 @@ mod tests {
                     .iter()
                     .any(|pair| pair.name() == "format" && pair.value() == format)
                 {
+                    return metric.get_counter().value() as u64;
+                }
+            }
+        }
+        0
+    }
+
+    fn admin_chargeback_export_refusals_total(format: &str, reason: &str) -> u64 {
+        for family in prometheus::gather() {
+            if family.name() != "sbproxy_admin_chargeback_export_refusals_total" {
+                continue;
+            }
+            for metric in family.get_metric() {
+                let format_matches = metric
+                    .get_label()
+                    .iter()
+                    .any(|pair| pair.name() == "format" && pair.value() == format);
+                let reason_matches = metric
+                    .get_label()
+                    .iter()
+                    .any(|pair| pair.name() == "reason" && pair.value() == reason);
+                if format_matches && reason_matches {
                     return metric.get_counter().value() as u64;
                 }
             }
@@ -12552,6 +13283,611 @@ origins:
         assert_eq!(chargeback_csv_field("team,west"), "\"team,west\"");
         assert_eq!(chargeback_csv_field("=1+1"), "'=1+1");
         assert_eq!(chargeback_csv_field("@SUM(A:A),x"), "\"'@SUM(A:A),x\"");
+    }
+
+    #[test]
+    fn group_f_v1_and_csv_preserve_collision_safe_long_identity_projection() {
+        let tracker = sbproxy_ai::billing::ChargebackTracker::with_limits(8, 8, 8);
+        let alpha = format!("{}-alpha", "界".repeat(86));
+        let beta = format!("{}-beta", "界".repeat(86));
+
+        for (identity, cost) in [(&alpha, 1.0), (&beta, 2.0)] {
+            let event: sbproxy_ai::usage_sink::LlmUsageEvent =
+                serde_json::from_value(serde_json::json!({
+                    "provider": identity,
+                    "model": identity,
+                    "prompt_tokens": 100,
+                    "completion_tokens": 50,
+                    "total_tokens": 150,
+                    "cost_usd": cost,
+                    "latency_ms": 25,
+                    "status": 200,
+                    "tenant_id": identity,
+                    "team": identity,
+                    "project": identity,
+                }))
+                .expect("complete long-identity usage event");
+            sbproxy_ai::usage_sink::UsageSink::record(&tracker, &event);
+        }
+
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.schema_version, 2);
+        assert_ne!(snapshot.entries[0].workspace, snapshot.entries[1].workspace);
+        assert_ne!(snapshot.entries[0].team, snapshot.entries[1].team);
+        assert_ne!(snapshot.entries[0].provider, snapshot.entries[1].provider);
+        assert_ne!(snapshot.entries[0].model, snapshot.entries[1].model);
+        assert_eq!(snapshot.workspace_rollups.len(), 2);
+        assert_eq!(snapshot.team_rollups.len(), 2);
+
+        let workspace_names = snapshot
+            .workspace_rollups
+            .iter()
+            .map(|rollup| rollup.dimension.legacy_projection().into_owned())
+            .collect::<Vec<_>>();
+        let team_names = snapshot
+            .team_rollups
+            .iter()
+            .map(|rollup| rollup.dimension.legacy_projection().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(workspace_names.len(), 2);
+        assert_eq!(team_names.len(), 2);
+        assert_ne!(workspace_names[0], workspace_names[1]);
+        assert_ne!(team_names[0], team_names[1]);
+        assert!(workspace_names.iter().all(|name| name.len() <= 256));
+        assert!(team_names.iter().all(|name| name.len() <= 256));
+
+        let origins = BTreeMap::from([("long.example".to_string(), vec![&tracker])]);
+        let (status, content_type, body) = render_live_ai_chargeback_json_for_test(
+            &origins,
+            "/admin/ai-chargeback",
+            MAX_AI_CHARGEBACK_RESPONSE_BYTES,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(content_type, "application/json");
+        let rendered: serde_json::Value = serde_json::from_str(&body).expect("legacy JSON");
+        let rendered_tracker = &rendered["origins"]["long.example"][0];
+        assert_eq!(
+            rendered_tracker["workspace_totals"]
+                .as_object()
+                .expect("workspace totals")
+                .len(),
+            2
+        );
+        assert_eq!(
+            rendered_tracker["team_totals"]
+                .as_object()
+                .expect("team totals")
+                .len(),
+            2
+        );
+        for name in workspace_names.iter().chain(team_names.iter()) {
+            assert!(body.contains(name), "missing collision-safe key {name}");
+        }
+
+        let (status, content_type, csv) =
+            render_live_ai_chargeback_csv_for_test(&origins, MAX_AI_CHARGEBACK_RESPONSE_BYTES);
+        assert_eq!(status, 200, "{csv}");
+        assert_eq!(content_type, "text/csv; charset=utf-8");
+        assert_eq!(csv.lines().count(), 5, "header plus two rows per dimension");
+        for name in workspace_names.iter().chain(team_names.iter()) {
+            assert!(csv.contains(name), "missing collision-safe CSV key {name}");
+        }
+    }
+
+    #[test]
+    fn group_f_v1_and_csv_keep_reserved_literals_distinct_from_internal_buckets() {
+        let tracker = sbproxy_ai::billing::ChargebackTracker::with_limits(8, 5, 5);
+        let record = |tenant_id: Option<&str>, team: Option<&str>, cost_usd: f64| {
+            sbproxy_ai::usage_sink::UsageSink::record(
+                &tracker,
+                &sbproxy_ai::usage_sink::LlmUsageEvent {
+                    provider: "openai".to_string(),
+                    model: "gpt-4o".to_string(),
+                    prompt_tokens: 100,
+                    completion_tokens: 50,
+                    total_tokens: 150,
+                    cost_usd,
+                    latency_ms: 25,
+                    status: 200,
+                    key_id: None,
+                    tenant_id: tenant_id.map(str::to_string),
+                    project: None,
+                    user: None,
+                    team: team.map(str::to_string),
+                    tags: Vec::new(),
+                    metadata: Default::default(),
+                    request_id: None,
+                    session_id: None,
+                    tag: None,
+                    priority: None,
+                    engine_version: None,
+                    agent_id: None,
+                    a2a_context_id: None,
+                    a2a_identity_verified: None,
+                    workflow_id: None,
+                    logical_model: None,
+                    served_model: None,
+                    finish_reason: None,
+                    shadow_of: None,
+                    credential_source: None,
+                },
+            );
+        };
+
+        record(None, None, 1.0);
+        record(Some("unattributed"), Some("unattributed"), 2.0);
+        record(Some("__other__"), Some("__other__"), 3.0);
+        record(Some("workspace-a"), Some("team-a"), 4.0);
+        record(
+            Some("workspace-forces-overflow"),
+            Some("team-forces-overflow"),
+            5.0,
+        );
+
+        let snapshot = tracker.snapshot();
+        let escaped_missing_workspace = snapshot.entries[1]
+            .workspace
+            .legacy_projection()
+            .into_owned();
+        let escaped_missing_team = snapshot.entries[1].team.legacy_projection().into_owned();
+        let escaped_overflow_workspace = snapshot.entries[2]
+            .workspace
+            .legacy_projection()
+            .into_owned();
+        let escaped_overflow_team = snapshot.entries[2].team.legacy_projection().into_owned();
+
+        let origins = BTreeMap::from([("reserved.example".to_string(), vec![&tracker])]);
+        let (status, content_type, body) = render_live_ai_chargeback_json_for_test(
+            &origins,
+            "/admin/ai-chargeback",
+            MAX_AI_CHARGEBACK_RESPONSE_BYTES,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(content_type, "application/json");
+        let rendered: serde_json::Value =
+            serde_json::from_str(&body).expect("default v1 response is JSON");
+        let tracker_json = &rendered["origins"]["reserved.example"][0];
+        assert_eq!(
+            tracker_json["workspace_totals"]["unattributed"]["request_count"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            tracker_json["workspace_totals"][escaped_missing_workspace.as_str()]["request_count"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            tracker_json["workspace_totals"][escaped_overflow_workspace.as_str()]["request_count"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            tracker_json["workspace_totals"]["__other__"]["request_count"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            tracker_json["team_totals"]["unattributed"]["request_count"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            tracker_json["team_totals"][escaped_missing_team.as_str()]["request_count"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            tracker_json["team_totals"][escaped_overflow_team.as_str()]["request_count"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            tracker_json["team_totals"]["__other__"]["request_count"],
+            serde_json::json!(1)
+        );
+
+        let (status, content_type, csv) =
+            render_live_ai_chargeback_csv_for_test(&origins, MAX_AI_CHARGEBACK_RESPONSE_BYTES);
+        assert_eq!(status, 200, "{csv}");
+        assert_eq!(content_type, "text/csv; charset=utf-8");
+        assert!(csv
+            .lines()
+            .any(|line| line == "reserved.example,0,workspace,unattributed,1,150,1"));
+        assert!(csv.lines().any(|line| {
+            line == format!("reserved.example,0,workspace,{escaped_missing_workspace},1,150,2")
+        }));
+        assert!(csv.lines().any(|line| {
+            line == format!("reserved.example,0,workspace,{escaped_overflow_workspace},1,150,3")
+        }));
+        assert!(csv
+            .lines()
+            .any(|line| line == "reserved.example,0,workspace,__other__,1,150,5"));
+        assert!(csv
+            .lines()
+            .any(|line| line == "reserved.example,0,team,unattributed,1,150,1"));
+        assert!(csv.lines().any(|line| {
+            line == format!("reserved.example,0,team,{escaped_missing_team},1,150,2")
+        }));
+        assert!(csv.lines().any(|line| {
+            line == format!("reserved.example,0,team,{escaped_overflow_team},1,150,3")
+        }));
+        assert!(csv
+            .lines()
+            .any(|line| line == "reserved.example,0,team,__other__,1,150,5"));
+    }
+
+    #[test]
+    fn group_f_default_v1_conversion_does_not_duplicate_entry_graph_at_million_row_bound() {
+        let allocator_control = allocation_counter::measure(|| {
+            let allocated = std::hint::black_box("allocator-control".repeat(2));
+            let _ = std::hint::black_box(&allocated);
+        });
+        assert!(allocator_control.count_total > 0);
+
+        let tracker = sbproxy_ai::billing::ChargebackTracker::with_limits(1_000_000, 8, 8);
+        for _ in 0..256 {
+            let entry = sbproxy_ai::billing::ChargebackEntry {
+                team: "move-team".to_string(),
+                project: "move-project".to_string(),
+                provider: "move-provider".to_string(),
+                model: "move-model".to_string(),
+                tokens: 7,
+                cost: 0.5,
+                timestamp: "2026-08-10T00:00:00Z".to_string(),
+            };
+            assert_eq!(tracker.try_record(Some("move-workspace"), entry), Ok(()));
+        }
+        let origins = BTreeMap::from([("million.example".to_string(), vec![&tracker])]);
+
+        let probe = LegacyChargebackConversionProbe::install_for_current_thread();
+        let mut response = None;
+        let allocations = allocation_counter::measure(|| {
+            response = Some(render_live_ai_chargeback_json_for_test(
+                &origins,
+                "/admin/ai-chargeback",
+                MAX_AI_CHARGEBACK_RESPONSE_BYTES,
+            ));
+        });
+        let (status, content_type, body) = response.expect("measured JSON response");
+        let counters = probe.counters();
+        assert_eq!(counters.json_serialization_passes, 1);
+        assert!(
+            allocations.count_total < 64,
+            "256 retained rows must be borrowed into one response buffer, not cloned into a second object graph: {allocations:?}"
+        );
+        drop(probe);
+
+        assert_eq!(status, 200);
+        assert_eq!(content_type, "application/json");
+        let rendered: serde_json::Value =
+            serde_json::from_str(&body).expect("default v1 response is JSON");
+        assert_eq!(rendered["schema_version"], 1);
+        let rendered_snapshot = &rendered["origins"]["million.example"][0];
+        assert_eq!(rendered_snapshot["max_entries"], 1_000_000);
+        assert_eq!(rendered_snapshot["entries"][0]["team"], "move-team");
+        assert_eq!(rendered_snapshot["entries"][0]["project"], "move-project");
+        assert_eq!(rendered_snapshot["entries"][0]["provider"], "move-provider");
+        assert_eq!(rendered_snapshot["entries"][0]["model"], "move-model");
+        assert_eq!(
+            rendered_snapshot["entries"]
+                .as_array()
+                .expect("legacy entries")
+                .len(),
+            256
+        );
+    }
+
+    #[test]
+    fn live_chargeback_route_paginates_exact_and_plus_one_entry_counts() {
+        let tracker = sbproxy_ai::billing::ChargebackTracker::with_limits(8, 8, 8);
+        for (workspace, team, timestamp, cost) in [
+            ("workspace-a", "team-a", "2026-08-20T00:00:00Z", 1.0),
+            ("workspace-b", "team-b", "2026-08-21T00:00:00Z", 2.0),
+            ("workspace-c", "team-c", "2026-08-22T00:00:00Z", 3.0),
+        ] {
+            let entry = sbproxy_ai::billing::ChargebackEntry {
+                team: team.to_string(),
+                project: format!("project-{team}"),
+                provider: "local-openai".to_string(),
+                model: "gpt-4o".to_string(),
+                tokens: 2,
+                cost,
+                timestamp: timestamp.to_string(),
+            };
+            assert_eq!(tracker.try_record(Some(workspace), entry), Ok(()));
+        }
+        let origins = BTreeMap::from([("page.example".to_string(), vec![&tracker])]);
+
+        let (status, _, exact_body) = render_live_ai_chargeback_json_for_test(
+            &origins,
+            "/admin/ai-chargeback?schema_version=2&limit=3",
+            MAX_AI_CHARGEBACK_RESPONSE_BYTES,
+        );
+        assert_eq!(status, 200, "got body: {exact_body}");
+        let exact: serde_json::Value = serde_json::from_str(&exact_body).expect("exact JSON page");
+        assert_eq!(exact["limit"], serde_json::json!(3));
+        assert_eq!(exact["next_cursor"], serde_json::Value::Null);
+        let exact_tracker = &exact["origins"]["page.example"][0];
+        assert_eq!(
+            exact_tracker["entries"]
+                .as_array()
+                .expect("typed entries")
+                .len(),
+            3
+        );
+        assert_eq!(exact_tracker["recorded_entries"], serde_json::json!(3));
+        assert_eq!(
+            exact_tracker["workspace_rollups"]
+                .as_array()
+                .expect("typed workspace rollups")
+                .len(),
+            3,
+            "rollups stay whole while raw rows page"
+        );
+
+        let (status, _, first_body) = render_live_ai_chargeback_json_for_test(
+            &origins,
+            "/admin/ai-chargeback?schema_version=2&limit=2",
+            MAX_AI_CHARGEBACK_RESPONSE_BYTES,
+        );
+        assert_eq!(status, 200, "got body: {first_body}");
+        let first: serde_json::Value = serde_json::from_str(&first_body).expect("first JSON page");
+        let cursor = first["next_cursor"]
+            .as_str()
+            .expect("plus-one first page returns a continuation")
+            .to_string();
+        assert_eq!(
+            first["origins"]["page.example"][0]["entries"]
+                .as_array()
+                .expect("first typed entries")
+                .len(),
+            2
+        );
+        assert_eq!(
+            first["origins"]["page.example"][0]["team_rollups"]
+                .as_array()
+                .expect("team rollups remain whole")
+                .len(),
+            3
+        );
+
+        let (status, _, second_body) = render_live_ai_chargeback_json_for_test(
+            &origins,
+            &format!("/admin/ai-chargeback?schema_version=2&limit=2&cursor={cursor}"),
+            MAX_AI_CHARGEBACK_RESPONSE_BYTES,
+        );
+        assert_eq!(status, 200, "got body: {second_body}");
+        let second: serde_json::Value =
+            serde_json::from_str(&second_body).expect("second JSON page");
+        assert_eq!(second["next_cursor"], serde_json::Value::Null);
+        assert_eq!(
+            second["origins"]["page.example"][0]["entries"]
+                .as_array()
+                .expect("tail typed entries")
+                .len(),
+            1
+        );
+        assert_eq!(
+            second["origins"]["page.example"][0]["recorded_entries"],
+            serde_json::json!(3)
+        );
+    }
+
+    #[test]
+    fn live_chargeback_route_honors_exact_and_under_response_byte_caps() {
+        let tracker = sbproxy_ai::billing::ChargebackTracker::with_limits(8, 8, 8);
+        let entry = sbproxy_ai::billing::ChargebackEntry {
+            team: "cap-team".to_string(),
+            project: "cap-project".to_string(),
+            provider: "cap-provider".to_string(),
+            model: "cap-model".to_string(),
+            tokens: 7,
+            cost: 0.5,
+            timestamp: "2026-08-20T00:00:00Z".to_string(),
+        };
+        assert_eq!(tracker.try_record(Some("cap-workspace"), entry), Ok(()));
+        let origins = BTreeMap::from([("cap.example".to_string(), vec![&tracker])]);
+
+        let probe = LegacyChargebackConversionProbe::install_for_current_thread();
+        let (status, _, exact_body) = render_live_ai_chargeback_json_for_test(
+            &origins,
+            "/admin/ai-chargeback",
+            MAX_AI_CHARGEBACK_RESPONSE_BYTES,
+        );
+        let counters = probe.counters();
+        drop(probe);
+        assert_eq!(status, 200, "got body: {exact_body}");
+        assert_eq!(
+            counters.json_serialization_passes, 1,
+            "admission and response generation must share one serialization pass"
+        );
+        let exact_bytes = exact_body.len();
+
+        let (status, _, exact_cap_body) =
+            render_live_ai_chargeback_json_for_test(&origins, "/admin/ai-chargeback", exact_bytes);
+        assert_eq!(status, 200, "got body: {exact_cap_body}");
+
+        let (status, _, refused_body) = render_live_ai_chargeback_json_for_test(
+            &origins,
+            "/admin/ai-chargeback",
+            exact_bytes.saturating_sub(1),
+        );
+        assert_eq!(status, 413, "got body: {refused_body}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&refused_body).expect("typed refusal body")
+                ["code"],
+            serde_json::json!("chargeback_response_too_large")
+        );
+    }
+
+    #[test]
+    fn live_chargeback_csv_is_borrowed_bounded_and_observable() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let allocator_control = allocation_counter::measure(|| {
+            let allocated = std::hint::black_box("allocator-control".repeat(2));
+            let _ = std::hint::black_box(&allocated);
+        });
+        assert!(allocator_control.count_total > 0);
+
+        let tracker = sbproxy_ai::billing::ChargebackTracker::with_limits(1_000_000, 8, 8);
+        for _ in 0..512 {
+            assert_eq!(
+                tracker.try_record(
+                    Some("csv-workspace"),
+                    sbproxy_ai::billing::ChargebackEntry {
+                        team: "csv-team".to_string(),
+                        project: "csv-project".to_string(),
+                        provider: "csv-provider".to_string(),
+                        model: "csv-model".to_string(),
+                        tokens: 1,
+                        cost: 0.0,
+                        timestamp: "2026-08-20T00:00:00Z".to_string(),
+                    },
+                ),
+                Ok(())
+            );
+        }
+        let origins = BTreeMap::from([("csv.example".to_string(), vec![&tracker])]);
+
+        let probe = LegacyChargebackConversionProbe::install_for_current_thread();
+        let mut response = None;
+        let allocations = allocation_counter::measure(|| {
+            response = Some(render_live_ai_chargeback_csv_for_test(
+                &origins,
+                MAX_AI_CHARGEBACK_RESPONSE_BYTES,
+            ));
+        });
+        let (status, content_type, body) = response.expect("measured CSV response");
+        let counters = probe.counters();
+        drop(probe);
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(content_type, "text/csv; charset=utf-8");
+        assert_eq!(counters.csv_serialization_passes, 1);
+        assert!(
+            allocations.count_total < 16,
+            "CSV must borrow the two rollup maps without cloning 512 retained rows: {allocations:?}"
+        );
+        assert_eq!(body.lines().count(), 3, "header plus two rollup rows");
+        assert!(body.contains("csv.example,0,workspace,csv-workspace,512,512,0"));
+        assert!(body.contains("csv.example,0,team,csv-team,512,512,0"));
+        let exact_bytes = body.len();
+
+        let (status, _, exact_body) = render_live_ai_chargeback_csv_for_test(&origins, exact_bytes);
+        assert_eq!(status, 200, "{exact_body}");
+        assert_eq!(exact_body.len(), exact_bytes);
+
+        let refusals_before = admin_chargeback_export_refusals_total("csv", "response_too_large");
+        let logged = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let subscriber = tracing_subscriber::registry().with(CaptureLayer {
+            sink: std::sync::Arc::clone(&logged),
+        });
+        let (status, content_type, refused_body) =
+            tracing::subscriber::with_default(subscriber, || {
+                render_live_ai_chargeback_csv_for_test(&origins, exact_bytes - 1)
+            });
+        assert_eq!(status, 413, "{refused_body}");
+        assert_eq!(content_type, "application/json");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&refused_body).expect("typed refusal body")
+                ["code"],
+            serde_json::json!("chargeback_response_too_large")
+        );
+        assert_eq!(
+            admin_chargeback_export_refusals_total("csv", "response_too_large"),
+            refusals_before + 1
+        );
+        let lines = logged
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            lines.iter().any(|line| {
+                line.contains("sbproxy::admin::chargeback")
+                    && line.contains("chargeback_export_refused")
+                    && line.contains("csv")
+                    && line.contains("response_too_large")
+            }),
+            "CSV cap refusal did not emit the closed warning: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn live_chargeback_route_records_closed_export_refusal_metrics() {
+        let tracker = sbproxy_ai::billing::ChargebackTracker::with_limits(8, 8, 8);
+        let entry = sbproxy_ai::billing::ChargebackEntry {
+            team: "cap-team".to_string(),
+            project: "cap-project".to_string(),
+            provider: "cap-provider".to_string(),
+            model: "cap-model".to_string(),
+            tokens: 7,
+            cost: 0.5,
+            timestamp: "2026-08-20T00:00:00Z".to_string(),
+        };
+        assert_eq!(tracker.try_record(Some("cap-workspace"), entry), Ok(()));
+        let origins = BTreeMap::from([("cap.example".to_string(), vec![&tracker])]);
+
+        let invalid_cursor_before =
+            admin_chargeback_export_refusals_total("json", "invalid_cursor");
+        let (status, _, body) = render_live_ai_chargeback_json_for_test(
+            &origins,
+            "/admin/ai-chargeback?schema_version=2&limit=1&cursor=not-a-cursor",
+            MAX_AI_CHARGEBACK_RESPONSE_BYTES,
+        );
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(
+            admin_chargeback_export_refusals_total("json", "invalid_cursor"),
+            invalid_cursor_before + 1
+        );
+
+        let offset_cursor = encode_chargeback_cursor(2);
+        let (status, _, body) = render_live_ai_chargeback_json_for_test(
+            &origins,
+            &format!("/admin/ai-chargeback?schema_version=2&limit=1&cursor={offset_cursor}"),
+            MAX_AI_CHARGEBACK_RESPONSE_BYTES,
+        );
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(
+            admin_chargeback_export_refusals_total("json", "invalid_cursor"),
+            invalid_cursor_before + 2
+        );
+
+        let invalid_limit_before = admin_chargeback_export_refusals_total("json", "invalid_limit");
+        let (status, _, body) = render_live_ai_chargeback_json_for_test(
+            &origins,
+            "/admin/ai-chargeback?schema_version=2&limit=0",
+            MAX_AI_CHARGEBACK_RESPONSE_BYTES,
+        );
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(
+            admin_chargeback_export_refusals_total("json", "invalid_limit"),
+            invalid_limit_before + 1
+        );
+
+        let unsupported_before =
+            admin_chargeback_export_refusals_total("json", "unsupported_schema_version");
+        let (status, _, body) = render_live_ai_chargeback_json_for_test(
+            &origins,
+            "/admin/ai-chargeback?schema_version=3",
+            MAX_AI_CHARGEBACK_RESPONSE_BYTES,
+        );
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(
+            admin_chargeback_export_refusals_total("json", "unsupported_schema_version"),
+            unsupported_before + 1
+        );
+
+        let (_, _, exact_body) = render_live_ai_chargeback_json_for_test(
+            &origins,
+            "/admin/ai-chargeback",
+            MAX_AI_CHARGEBACK_RESPONSE_BYTES,
+        );
+        let exact_bytes = exact_body.len();
+        let response_too_large_before =
+            admin_chargeback_export_refusals_total("json", "response_too_large");
+        let (status, _, body) = render_live_ai_chargeback_json_for_test(
+            &origins,
+            "/admin/ai-chargeback",
+            exact_bytes.saturating_sub(1),
+        );
+        assert_eq!(status, 413, "{body}");
+        assert_eq!(
+            admin_chargeback_export_refusals_total("json", "response_too_large"),
+            response_too_large_before + 1
+        );
     }
 
     #[test]

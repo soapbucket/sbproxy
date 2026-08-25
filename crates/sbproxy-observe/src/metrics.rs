@@ -4549,6 +4549,84 @@ pub fn record_admin_request_export(format: &'static str, rows: u64) {
     }
 }
 
+/// Closed export formats for the live admin chargeback route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminChargebackExportFormat {
+    /// The JSON admin route (`GET /admin/ai-chargeback`).
+    Json,
+    /// The CSV admin route (`GET /admin/ai-chargeback.csv`).
+    Csv,
+}
+
+impl AdminChargebackExportFormat {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Csv => "csv",
+        }
+    }
+}
+
+/// Closed refusal reasons for admin chargeback exports and pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminChargebackExportRefusalReason {
+    /// The supplied `cursor` did not decode to a valid page offset.
+    InvalidCursor,
+    /// The supplied `limit` was absent, non-numeric, or not positive.
+    InvalidLimit,
+    /// The caller requested an unsupported `schema_version`.
+    UnsupportedSchemaVersion,
+    /// The response would exceed the bounded admin byte budget.
+    ResponseTooLarge,
+}
+
+impl AdminChargebackExportRefusalReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidCursor => "invalid_cursor",
+            Self::InvalidLimit => "invalid_limit",
+            Self::UnsupportedSchemaVersion => "unsupported_schema_version",
+            Self::ResponseTooLarge => "response_too_large",
+        }
+    }
+}
+
+/// Count one live admin chargeback-export refusal on
+/// `sbproxy_admin_chargeback_export_refusals_total{format, reason}`.
+///
+/// This covers request-shape and page/response-admission refusals on the
+/// authenticated chargeback export boundary. Both labels are closed
+/// vocabularies selected in Rust, never caller input.
+pub fn record_admin_chargeback_export_refusal(
+    format: AdminChargebackExportFormat,
+    reason: AdminChargebackExportRefusalReason,
+) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static REFUSALS: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let warn_failed = |name: &'static str, error: &prometheus::Error| {
+        tracing::warn!(
+            metric = name,
+            %error,
+            "admin chargeback export refusal counter failed to register; refusal volume is not scrapeable"
+        );
+    };
+    let refusals = REFUSALS.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_admin_chargeback_export_refusals_total",
+            "Admin chargeback export refusals, by format and closed reason",
+            &["format", "reason"],
+        )
+        .inspect_err(|error| warn_failed("sbproxy_admin_chargeback_export_refusals_total", error))
+        .ok()
+    });
+    if let Some(counter) = refusals {
+        counter
+            .with_label_values(&[format.as_str(), reason.as_str()])
+            .inc();
+    }
+}
+
 /// Count one audit-chain read attempt on
 /// `sbproxy_audit_chain_read_total{channel, outcome}` (WOR-2579).
 ///

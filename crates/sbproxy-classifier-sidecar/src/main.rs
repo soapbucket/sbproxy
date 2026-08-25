@@ -21,6 +21,7 @@
 //! artifacts. The proxy-side child supervisor owns restart behavior.
 
 use std::collections::HashMap;
+use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,8 +41,12 @@ use sbproxy_classifiers::{
     OnnxTokenClassifier, TokenCompressionLimitError, TokenCompressionLimits,
     TokenCompressionOutput, TokenCompressionTarget, MAX_MODEL_BYTES_DEFAULT,
 };
+use serde::Deserialize;
+use subtle::ConstantTimeEq as _;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tonic::transport::Server;
+use tonic::codegen::InterceptedService;
+use tonic::service::Interceptor;
+use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status};
 
 const MAX_TOKEN_MODEL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -66,6 +71,8 @@ const MAX_INFERENCE_QUEUED: usize = 1_024;
 const MAX_INFERENCE_TIMEOUT_MS: u64 = 600_000;
 const MAX_MODEL_ID_BYTES: usize = 256;
 const DEFAULT_GRPC_DECODING_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_AUTH_FILE_BYTES: u64 = 256 * 1024;
+const MAX_LISTENER_TLS_PEM_BYTES: u64 = 256 * 1024;
 
 /// Smallest running set the derived concurrency default will produce.
 ///
@@ -188,6 +195,221 @@ fn validate_model_id(model: &str) -> std::result::Result<(), &'static str> {
         return Err("model id exceeds the 256-byte limit");
     }
     Ok(())
+}
+
+#[derive(Clone)]
+struct InferenceAuth {
+    tokens: Arc<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct InferenceAuthFile {
+    tokens: Vec<String>,
+}
+
+impl std::fmt::Debug for InferenceAuth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InferenceAuth")
+            .field("tokens", &self.tokens.len())
+            .finish()
+    }
+}
+
+impl InferenceAuth {
+    fn from_file(path: &Path) -> Result<Self> {
+        let bytes = read_bounded_file(path, "inference token file", MAX_AUTH_FILE_BYTES, true)?;
+        Self::from_json(&bytes)
+            .with_context(|| format!("parsing inference token file {}", path.display()))
+    }
+
+    fn from_json(bytes: &[u8]) -> Result<Self> {
+        let auth: InferenceAuthFile = serde_json::from_slice(bytes).context("invalid JSON")?;
+        if auth.tokens.is_empty() {
+            anyhow::bail!("inference token file must contain at least one token");
+        }
+        if auth.tokens.len() > 1024 {
+            anyhow::bail!("inference token file exceeds 1024 token limit");
+        }
+        let mut seen = std::collections::HashSet::new();
+        for token in &auth.tokens {
+            if token.is_empty() {
+                anyhow::bail!("inference token must not be empty");
+            }
+            if token.len() > 256 {
+                anyhow::bail!("inference token exceeds 256 byte limit");
+            }
+            if !seen.insert(token.as_str()) {
+                anyhow::bail!("inference token file contains a duplicate token");
+            }
+        }
+        Ok(Self {
+            tokens: Arc::new(auth.tokens),
+        })
+    }
+
+    fn authenticated(&self, presented: Option<&str>) -> bool {
+        let Some(presented) = presented else {
+            return false;
+        };
+        let mut matched = false;
+        for token in self.tokens.iter() {
+            let equal = token.len() == presented.len()
+                && bool::from(token.as_bytes().ct_eq(presented.as_bytes()));
+            if equal {
+                matched = true;
+            }
+        }
+        matched
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RequestAuthentication {
+    policy: Arc<InferenceAuth>,
+}
+
+impl RequestAuthentication {
+    fn bearer(policy: Arc<InferenceAuth>) -> Self {
+        Self { policy }
+    }
+
+    fn authorize(&self, metadata: &tonic::metadata::MetadataMap) -> Result<(), Status> {
+        let presented = metadata
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_bearer_authorization);
+        if self.policy.authenticated(presented) {
+            Ok(())
+        } else {
+            Err(Status::unauthenticated("gRPC request unauthenticated"))
+        }
+    }
+}
+
+fn parse_bearer_authorization(value: &str) -> Option<&str> {
+    let (scheme, token) = value.split_once(char::is_whitespace)?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+    Some(token)
+}
+
+#[derive(Clone, Debug)]
+struct SidecarAuthInterceptor {
+    request_auth: Option<RequestAuthentication>,
+}
+
+impl Interceptor for SidecarAuthInterceptor {
+    fn call(&mut self, request: Request<()>) -> std::result::Result<Request<()>, Status> {
+        if let Some(request_auth) = &self.request_auth {
+            request_auth.authorize(request.metadata())?;
+        }
+        Ok(request)
+    }
+}
+
+fn read_bounded_file(
+    path: &Path,
+    label: &str,
+    max_bytes: u64,
+    require_private_permissions: bool,
+) -> Result<Vec<u8>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("opening {label} {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("reading {label} metadata {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        anyhow::bail!("{label} {} must be a regular file", path.display());
+    }
+    #[cfg(unix)]
+    if require_private_permissions {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = metadata.permissions().mode();
+        if mode & 0o077 != 0 {
+            anyhow::bail!(
+                "{label} {} must not be readable or writable by group/other",
+                path.display()
+            );
+        }
+    }
+    if metadata.len() > max_bytes {
+        anyhow::bail!("{label} {} exceeds {max_bytes} byte limit", path.display());
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    (&mut file)
+        .take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {label} {}", path.display()))?;
+    if bytes.len() as u64 > max_bytes {
+        anyhow::bail!("{label} {} exceeds {max_bytes} byte limit", path.display());
+    }
+    Ok(bytes)
+}
+
+fn build_server_tls_config(
+    cert_file: Option<&Path>,
+    key_file: Option<&Path>,
+    client_ca_file: Option<&Path>,
+    client_auth_optional: bool,
+) -> Result<Option<ServerTlsConfig>> {
+    if cert_file.is_some() != key_file.is_some() {
+        anyhow::bail!("--listen-tls-cert-file and --listen-tls-key-file must be provided together");
+    }
+    if client_ca_file.is_some() && cert_file.is_none() {
+        anyhow::bail!(
+            "--listen-tls-client-ca-file requires --listen-tls-cert-file and --listen-tls-key-file"
+        );
+    }
+    if client_auth_optional && client_ca_file.is_none() {
+        anyhow::bail!("--listen-tls-client-auth-optional requires --listen-tls-client-ca-file");
+    }
+    let Some(cert_file) = cert_file else {
+        return Ok(None);
+    };
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let cert_pem = read_bounded_file(
+        cert_file,
+        "gRPC listener TLS certificate file",
+        MAX_LISTENER_TLS_PEM_BYTES,
+        false,
+    )?;
+    let key_pem = read_bounded_file(
+        key_file.expect("TLS key presence validated above"),
+        "gRPC listener TLS key file",
+        MAX_LISTENER_TLS_PEM_BYTES,
+        true,
+    )?;
+    let mut tls_config = ServerTlsConfig::new().identity(Identity::from_pem(cert_pem, key_pem));
+    if let Some(client_ca_file) = client_ca_file {
+        let ca_pem = read_bounded_file(
+            client_ca_file,
+            "gRPC listener TLS client CA file",
+            MAX_LISTENER_TLS_PEM_BYTES,
+            false,
+        )?;
+        tls_config = tls_config.client_ca_root(Certificate::from_pem(ca_pem));
+        if client_auth_optional {
+            tls_config = tls_config.client_auth_optional(true);
+        }
+    }
+    let _ = Server::builder()
+        .tls_config(tls_config.clone())
+        .context("validating gRPC listener TLS settings")?;
+    Ok(Some(tls_config))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -978,6 +1200,25 @@ struct Cli {
     /// model returns.
     #[arg(long, default_value_t = DEFAULT_INFERENCE_TIMEOUT_MS)]
     inference_timeout_ms: u64,
+    /// Mode-0600 JSON file containing bearer tokens accepted by the gRPC
+    /// inference listener. When present, requests must send
+    /// `authorization: Bearer <token>`.
+    #[arg(long = "inference-token-file")]
+    inference_token_file: Option<PathBuf>,
+    /// PEM certificate chain for TLS on the TCP gRPC listener.
+    #[arg(long = "listen-tls-cert-file")]
+    listen_tls_cert_file: Option<PathBuf>,
+    /// PEM private key for TLS on the TCP gRPC listener. Must be a mode-0600
+    /// regular file.
+    #[arg(long = "listen-tls-key-file")]
+    listen_tls_key_file: Option<PathBuf>,
+    /// Optional PEM CA bundle used to verify gRPC client certificates.
+    #[arg(long = "listen-tls-client-ca-file")]
+    listen_tls_client_ca_file: Option<PathBuf>,
+    /// If set with `--listen-tls-client-ca-file`, verify client certificates
+    /// when present but do not require one on every connection.
+    #[arg(long = "listen-tls-client-auth-optional")]
+    listen_tls_client_auth_optional: bool,
 }
 
 impl Cli {
@@ -995,6 +1236,33 @@ impl Cli {
             validate_model_id(default_model).map_err(anyhow::Error::msg)?;
         }
         Ok(())
+    }
+
+    fn request_auth(&self) -> Result<Option<RequestAuthentication>> {
+        Ok(self
+            .inference_token_file
+            .as_deref()
+            .map(InferenceAuth::from_file)
+            .transpose()?
+            .map(Arc::new)
+            .map(RequestAuthentication::bearer))
+    }
+
+    fn listener_tls_config(&self) -> Result<Option<ServerTlsConfig>> {
+        if self.listen_uds.is_some()
+            && (self.listen_tls_cert_file.is_some()
+                || self.listen_tls_key_file.is_some()
+                || self.listen_tls_client_ca_file.is_some()
+                || self.listen_tls_client_auth_optional)
+        {
+            anyhow::bail!("TLS flags are not supported with --listen-uds");
+        }
+        build_server_tls_config(
+            self.listen_tls_cert_file.as_deref(),
+            self.listen_tls_key_file.as_deref(),
+            self.listen_tls_client_ca_file.as_deref(),
+            self.listen_tls_client_auth_optional,
+        )
     }
 
     fn token_compression_limits(&self) -> Result<TokenCompressionRuntimeLimits> {
@@ -1193,6 +1461,26 @@ fn validate_compression_output(
     Ok(())
 }
 
+fn inference_service(
+    service: SidecarService,
+    max_decoding_message_size: usize,
+    request_auth: Option<RequestAuthentication>,
+) -> InterceptedService<InferenceServiceServer<SidecarService>, SidecarAuthInterceptor> {
+    InterceptedService::new(
+        InferenceServiceServer::new(service).max_decoding_message_size(max_decoding_message_size),
+        SidecarAuthInterceptor { request_auth },
+    )
+}
+
+fn tonic_server_builder(tls_config: Option<ServerTlsConfig>) -> Result<Server> {
+    match tls_config {
+        Some(tls_config) => Server::builder()
+            .tls_config(tls_config)
+            .context("configuring gRPC listener TLS"),
+        None => Ok(Server::builder()),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -1201,6 +1489,8 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     cli.validate_runtime_configuration()?;
+    let request_auth = cli.request_auth()?;
+    let tls_config = cli.listener_tls_config()?;
     let token_compression_limits = cli.token_compression_limits()?;
     let inference_limits = cli.inference_limits()?;
     // Tonic exposes one decoding cap for the entire service. Preserve its
@@ -1303,11 +1593,12 @@ async fn main() -> Result<()> {
             "classifier sidecar listening on Unix domain socket",
         );
         let stream = tokio_stream::wrappers::UnixListenerStream::new(listener);
-        Server::builder()
-            .add_service(
-                InferenceServiceServer::new(service)
-                    .max_decoding_message_size(max_decoding_message_size),
-            )
+        tonic_server_builder(tls_config)?
+            .add_service(inference_service(
+                service,
+                max_decoding_message_size,
+                request_auth,
+            ))
             .serve_with_incoming(stream)
             .await
             .context("classifier sidecar server failed")?;
@@ -1329,11 +1620,12 @@ async fn main() -> Result<()> {
         "classifier sidecar listening on TCP",
     );
 
-    Server::builder()
-        .add_service(
-            InferenceServiceServer::new(service)
-                .max_decoding_message_size(max_decoding_message_size),
-        )
+    tonic_server_builder(tls_config)?
+        .add_service(inference_service(
+            service,
+            max_decoding_message_size,
+            request_auth,
+        ))
         .serve(addr)
         .await
         .context("classifier sidecar server failed")?;
@@ -2245,6 +2537,82 @@ mod tests {
     }
 
     #[test]
+    fn inference_auth_debug_redacts_and_authenticates() {
+        let auth = InferenceAuth::from_json(br#"{"tokens":["secret-a","secret-b"]}"#).unwrap();
+        let debug = format!("{auth:?}");
+        assert!(debug.contains("InferenceAuth"));
+        assert!(debug.contains("2"));
+        assert!(!debug.contains("secret-a"));
+        assert!(!debug.contains("secret-b"));
+        assert!(auth.authenticated(Some("secret-a")));
+        assert!(!auth.authenticated(Some("missing")));
+    }
+
+    #[test]
+    fn listener_tls_validation_rejects_uds_and_partial_identity_flags() {
+        let uds_cli = Cli::try_parse_from([
+            "sbproxy-classifier-sidecar",
+            "--listen-uds",
+            "/tmp/sbproxy.sock",
+            "--listen-tls-cert-file",
+            "server.pem",
+            "--listen-tls-key-file",
+            "server.key",
+        ])
+        .expect("CLI syntax");
+        let uds_error = uds_cli.listener_tls_config().unwrap_err();
+        assert!(uds_error.to_string().contains("--listen-uds"));
+
+        let partial_cli = Cli::try_parse_from([
+            "sbproxy-classifier-sidecar",
+            "--listen-tls-cert-file",
+            "server.pem",
+        ])
+        .expect("CLI syntax");
+        let partial_error = partial_cli.listener_tls_config().unwrap_err();
+        assert!(partial_error.to_string().contains("provided together"));
+    }
+
+    #[test]
+    fn listener_tls_validation_rejects_invalid_pem_before_bind() {
+        let directory = std::env::temp_dir().join(format!(
+            "sbproxy-sidecar-tls-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).expect("tempdir");
+        let cert_path = directory.join("server.pem");
+        let key_path = directory.join("server.key");
+        std::fs::write(&cert_path, b"not a certificate").unwrap();
+        std::fs::write(&key_path, b"not a key").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut permissions = std::fs::metadata(&key_path).unwrap().permissions();
+            permissions.set_mode(0o600);
+            std::fs::set_permissions(&key_path, permissions).unwrap();
+        }
+
+        let cli = Cli::try_parse_from([
+            "sbproxy-classifier-sidecar",
+            "--listen-tls-cert-file",
+            cert_path.to_str().unwrap(),
+            "--listen-tls-key-file",
+            key_path.to_str().unwrap(),
+        ])
+        .expect("CLI syntax");
+        let error = cli.listener_tls_config().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("validating gRPC listener TLS settings"));
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
     fn load_embed_spec_rejects_malformed() {
         assert!(load_embed_spec("no-equals").is_err());
         assert!(load_embed_spec("id=only-one-path").is_err());
@@ -2301,7 +2669,9 @@ mod tests {
         );
     }
 
-    async fn spawn_wire_service() -> Option<InferenceServiceClient<tonic::transport::Channel>> {
+    async fn spawn_wire_service(
+        request_auth: Option<RequestAuthentication>,
+    ) -> Option<InferenceServiceClient<tonic::transport::Channel>> {
         let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
             Ok(listener) => listener,
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -2314,11 +2684,11 @@ mod tests {
         let stream = tokio_stream::wrappers::TcpListenerStream::new(listener);
         tokio::spawn(async move {
             Server::builder()
-                .add_service(
-                    InferenceServiceServer::new(empty_service()).max_decoding_message_size(
-                        grpc_decoding_message_limit(DEFAULT_TOKEN_MAX_REQUEST_BYTES),
-                    ),
-                )
+                .add_service(inference_service(
+                    empty_service(),
+                    grpc_decoding_message_limit(DEFAULT_TOKEN_MAX_REQUEST_BYTES),
+                    request_auth,
+                ))
                 .serve_with_incoming(stream)
                 .await
                 .expect("wire test server");
@@ -2332,7 +2702,7 @@ mod tests {
 
     #[tokio::test]
     async fn wire_decoder_admits_four_mib_and_the_handler_bounds_it() {
-        let Some(mut client) = spawn_wire_service().await else {
+        let Some(mut client) = spawn_wire_service(None).await else {
             return;
         };
         let error = client
@@ -2357,7 +2727,7 @@ mod tests {
 
     #[tokio::test]
     async fn wire_compress_enforces_the_exact_encoded_request_limit() {
-        let Some(mut client) = spawn_wire_service().await else {
+        let Some(mut client) = spawn_wire_service(None).await else {
             return;
         };
         let request = CompressRequest {
@@ -2372,6 +2742,60 @@ mod tests {
             .await
             .expect_err("logical Compress cap must reject before model lookup");
         assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn wire_bearer_auth_rejects_missing_metadata_and_allows_authorized_requests() {
+        let auth = RequestAuthentication::bearer(Arc::new(
+            InferenceAuth::from_json(br#"{"tokens":["secret-token"]}"#).unwrap(),
+        ));
+        let Some(mut client) = spawn_wire_service(Some(auth)).await else {
+            return;
+        };
+
+        let missing = client
+            .classify(ClassifyRequest {
+                model: "missing".to_string(),
+                text: "hello".to_string(),
+                top_k: 1,
+            })
+            .await
+            .expect_err("missing bearer token must be rejected");
+        assert_eq!(missing.code(), tonic::Code::Unauthenticated);
+
+        let mut request = Request::new(ClassifyRequest {
+            model: "missing".to_string(),
+            text: "hello".to_string(),
+            top_k: 1,
+        });
+        request
+            .metadata_mut()
+            .insert("authorization", "Bearer secret-token".parse().unwrap());
+        let authorized = client
+            .classify(request)
+            .await
+            .expect_err("authorized request must reach the empty service");
+        assert_eq!(authorized.code(), tonic::Code::NotFound);
+    }
+
+    #[test]
+    fn bearer_authorization_parser_is_case_insensitive_and_rejects_empty_tokens() {
+        assert_eq!(
+            parse_bearer_authorization("Bearer secret-token"),
+            Some("secret-token")
+        );
+        assert_eq!(
+            parse_bearer_authorization("bearer   secret-token  "),
+            Some("secret-token")
+        );
+        assert_eq!(
+            parse_bearer_authorization("BEARER\tsecret-token"),
+            Some("secret-token")
+        );
+        assert_eq!(parse_bearer_authorization("Basic secret-token"), None);
+        assert_eq!(parse_bearer_authorization("Bearer "), None);
+        assert_eq!(parse_bearer_authorization("Bearer\t  "), None);
+        assert_eq!(parse_bearer_authorization("Bearer"), None);
     }
 
     #[tokio::test]

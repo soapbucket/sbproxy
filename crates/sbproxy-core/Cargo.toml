@@ -293,6 +293,9 @@ tracing-subscriber.workspace = true
 rcgen.workspace = true
 tempfile = "3"
 loom = "0.7"
+# Thread-local allocation counts pin the bounded chargeback exporters without
+# installing a workspace-global allocator or adding unsafe test code.
+allocation-counter = "0.8.1"
 # WOR-2298: reset_process_resolver_for_test, so the WOR-2285 secret-resolver
 # delegation tests in key_plane.rs and cluster.rs are not order-dependent on
 # cargo test's single-process fallback run.

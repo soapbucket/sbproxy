@@ -11,7 +11,8 @@
 //! ```
 
 use sbproxy_ai::billing::{
-    forecast_spend, generate_bill, remaining_budget, ChargebackTracker, UsageDataPoint,
+    forecast_spend, generate_bill_from_snapshot, remaining_budget, ChargebackTracker,
+    UsageDataPoint,
 };
 use sbproxy_ai::usage_sink::{LlmUsageEvent, UsageSink};
 
@@ -119,9 +120,11 @@ fn main() {
     }
 
     println!("\nUnified bill for the period:");
-    let entries = tracker.entries_snapshot();
-    let bill = generate_bill(&entries, "2026-08-01", "2026-09-01")
-        .expect("example timestamps and the half-open August period are valid");
+    let snapshot = tracker.snapshot();
+    let (period_start, period_end) =
+        billing_period_from_snapshot(&snapshot).expect("example recorded rows");
+    let bill = generate_bill_from_snapshot(&snapshot, &period_start, &period_end)
+        .expect("example-derived billing period is valid for the retained snapshot");
     for item in &bill.line_items {
         println!(
             "  {:<10} {:<20} {:>3} req  {:>6} tok  ${:.2}",
@@ -141,4 +144,16 @@ fn main() {
     let remaining = remaining_budget(&daily_history, monthly_budget);
     println!("\nAt today's run rate, projected 30-day spend: ${projected:.2}");
     println!("Remaining budget under a ${monthly_budget:.2} monthly cap: ${remaining:.2}");
+}
+
+fn billing_period_from_snapshot(
+    snapshot: &sbproxy_ai::billing::ChargebackSnapshot,
+) -> Option<(String, String)> {
+    let period_start = snapshot.earliest_retained_timestamp.clone()?;
+    let latest =
+        chrono::DateTime::parse_from_rfc3339(snapshot.latest_retained_timestamp.as_deref()?)
+            .ok()?
+            .with_timezone(&chrono::Utc);
+    let period_end = latest.checked_add_signed(chrono::TimeDelta::seconds(1))?;
+    Some((period_start, period_end.to_rfc3339()))
 }

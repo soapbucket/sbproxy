@@ -2235,6 +2235,174 @@
         }
       ],
       "description": "Unavailable prompt-injection classifier stages. blocked means an effective block policy returned a generic 503 before prompt egress; degraded means tag or log admitted the request while explicitly recording that no trustworthy verdict was available. A double sidecar and local fallback failure contributes one primary_sidecar series and one local_fallback series, so both stages remain attributable. Labels are closed and never contain prompt text, endpoint addresses, model paths, or credentials."
+    },
+    {
+      "id": 38,
+      "title": "Chargeback Record Refusals",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 157
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "noValue": "No chargeback row has been refused"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (rate(sbproxy_ai_chargeback_refusals_total[5m]))",
+          "legendFormat": "{{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Exact-accounting refusals on the live chargeback record path. The reason label is a closed vocabulary derived from the typed refusal surface, so a non-zero rate means finance rows are being dropped for one specific bounded cause rather than silently blurred into generic request failures."
+    },
+    {
+      "id": 39,
+      "title": "Chargeback Incompleteness",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 157
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "noValue": "No chargeback tracker has become incomplete"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (rate(sbproxy_ai_chargeback_incomplete_total[5m]))",
+          "legendFormat": "{{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Sticky completeness poisons observed on the live chargeback path. `refused_row` means at least one finance event could not be represented exactly; `eviction_watermark_poisoned` means malformed retained timestamps made the evicted interval untrustworthy."
+    },
+    {
+      "id": 40,
+      "title": "Admin Chargeback Export Refusals",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 165
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "noValue": "No admin chargeback export has been refused"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (format, reason) (rate(sbproxy_admin_chargeback_export_refusals_total[5m]))",
+          "legendFormat": "{{format}} / {{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Authenticated admin chargeback export refusals on the request-shape and page/response-admission boundary. A sustained `json / response_too_large` rate means callers are asking for pages larger than the configured byte budget; `invalid_cursor`, `invalid_limit`, and `unsupported_schema_version` isolate caller misuse from genuine exporter pressure."
     }
   ],
   "templating": {

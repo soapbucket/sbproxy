@@ -21,16 +21,22 @@
 //!   exhaustion detection.
 //!
 //! No dependency on the classifier sidecar or any other WOR-2661 port.
-//! See `docs/ai-chargeback.md` and `examples/ai-chargeback-billing/`.
+//! See `docs/ai-chargeback.md` and `examples/ai_chargeback_billing.rs`.
 
 pub mod chargeback;
 pub mod forecast;
 pub mod unified;
 
 pub use chargeback::{
-    ChargebackEntry, ChargebackSnapshot, ChargebackTracker, WorkspaceTotals, OVERFLOW, UNATTRIBUTED,
+    ChargebackEntry, ChargebackEvictionWatermark, ChargebackOverflowField, ChargebackOverflowScope,
+    ChargebackRecordError, ChargebackRefusalCount, ChargebackRollup, ChargebackSnapshot,
+    ChargebackSnapshotEntry, ChargebackTracker, DimensionKey, WorkspaceTotals,
+    CHARGEBACK_SNAPSHOT_SCHEMA_VERSION, OVERFLOW, UNATTRIBUTED,
 };
 pub use forecast::{
     days_until_exhaustion, forecast_spend, remaining_budget, will_exceed_budget, UsageDataPoint,
 };
-pub use unified::{generate_bill, BillError, BillLineItem, UnifiedBill};
+pub use unified::{
+    generate_bill, generate_bill_from_snapshot, BillError, BillLineItem, PartialPeriodReason,
+    UnifiedBill,
+};

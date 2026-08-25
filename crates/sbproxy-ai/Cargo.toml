@@ -85,6 +85,10 @@ tracing.workspace = true
 chrono.workspace = true
 sha2.workspace = true
 hex.workspace = true
+# Exact binary-weight accounting for weighted rollout validation and selection.
+# Every finite f64 is represented in subnormal units so positive bands cannot
+# disappear through rounding and mathematical sums above f64::MAX are refused.
+num-bigint = "0.4.6"
 # Constant-time comparison for the A2A bearer token in
 # `agent_orchestration::auth`, the same crate `sbproxy-config`,
 # `sbproxy-middleware`, and `sbproxy-modules` already use for
@@ -141,3 +145,7 @@ tiktoken-rs = "0.11"
 [dev-dependencies]
 tempfile = "3"
 tracing-subscriber.workspace = true
+# Test-only, thread-local allocation observation for the finance validator.
+# Its safe API preserves this crate's `forbid(unsafe_code)` policy while making
+# a caller-sized scratch allocation before refusal mutation-visible.
+allocation-counter = "0.8.1"

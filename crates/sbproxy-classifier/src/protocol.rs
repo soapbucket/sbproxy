@@ -48,8 +48,8 @@ pub struct Message {
     /// Maximum number of labels to return for `cmd = "classify"`.
     #[serde(default = "default_top_k")]
     pub top_k: usize,
-    /// Tenant to classify against. `None` selects the sidecar's default
-    /// tenant.
+    /// Tenant to classify against. Classification refuses an absent or
+    /// unregistered tenant; the sidecar has no default tenant.
     #[serde(default)]
     pub tenant: Option<String>,
 
@@ -83,6 +83,16 @@ pub struct Message {
     /// (`cmd = "content_type_detect"`).
     #[serde(default)]
     pub detect_content: Option<String>,
+
+    // --- list paging fields ---
+    /// Optional page size override for `cmd = "list"`.
+    #[serde(default)]
+    pub page_size: Option<usize>,
+    /// Opaque cursor for the next `list` page. The cursor is exclusive:
+    /// the next page starts strictly after this tenant id in the visible,
+    /// already-filtered registry order.
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 fn default_cmd() -> String {
@@ -269,6 +279,9 @@ pub struct AdminResponse {
     /// Every registered tenant and its label set. Only present on `list`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenants: Option<Vec<TenantInfo>>,
+    /// Opaque cursor for the next page of `tenants`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// One registered tenant, as returned by the `list` command.
@@ -278,4 +291,12 @@ pub struct TenantInfo {
     pub id: String,
     /// Names of the labels this tenant classifies against.
     pub labels: Vec<String>,
+}
+
+/// JSON page shape returned by the authenticated `/tenants` endpoint.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TenantPageResponse {
+    pub tenants: Vec<TenantInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }

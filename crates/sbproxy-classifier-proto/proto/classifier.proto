@@ -176,6 +176,7 @@ message SafetyVerdict {
   bool safe = 1;
   // True on the message where a rule first matched.
   bool blocked = 2;
-  // Which rule matched, empty when `blocked` is false.
+  // Which rule matched. May remain populated on later unsafe messages even
+  // after `blocked` returns to false.
   string reason = 3;
 }

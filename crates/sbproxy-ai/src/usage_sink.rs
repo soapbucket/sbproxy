@@ -266,6 +266,16 @@ pub trait UsageSink: Send + Sync + std::fmt::Debug {
     fn chargeback_snapshot(&self) -> Option<crate::billing::ChargebackSnapshot> {
         None
     }
+
+    /// Return the live chargeback tracker when this sink owns one.
+    ///
+    /// This keeps the authenticated admin export on the same in-process
+    /// tracker instances the hot path records into, without forcing a full
+    /// `snapshot()` clone before the route can apply page and response-byte
+    /// admission.
+    fn chargeback_tracker(&self) -> Option<&crate::billing::ChargebackTracker> {
+        None
+    }
 }
 
 /// A sink that appends one JSON object per line to a file.
@@ -1349,7 +1359,8 @@ pub enum UsageSinkConfig {
     /// The live instance is queryable through [`UsageSink::chargeback_snapshot`]
     /// and the authenticated admin JSON/CSV endpoints. Raw entries evict
     /// oldest-first; workspace and team rollups fold excess cardinality into
-    /// `__other__` without dropping its spend.
+    /// `__other__` without dropping its spend. Config load rejects a second
+    /// chargeback sink on the same AI origin.
     Chargeback {
         /// Number of recent raw usage entries retained for billing exports.
         #[serde(default = "default_chargeback_max_entries")]

@@ -2333,8 +2333,10 @@ impl CompiledPipeline {
         extension_registry: Arc<DynamicBundleRegistry>,
         start_background_tasks: bool,
     ) -> anyhow::Result<Self> {
-        let hooks =
-            crate::classifier_hooks::hooks_from_config(config.server.classifier_hooks.as_ref())?;
+        let hooks = crate::classifier_hooks::hooks_from_config(
+            config.server.classifier_hooks.as_ref(),
+            config.egress.classifier_hooks.as_ref(),
+        )?;
         // WOR-2084: async twin of the shared L2 store. The rate-limit
         // policy's hot path awaits `AsyncKVStore::incr_with_ttl`
         // directly when this is attached, instead of bridging every

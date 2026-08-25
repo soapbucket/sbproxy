@@ -98,6 +98,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "allocation-counter"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "beb9e990c0a33699f1984d85a6abead615ccc72dd8130bf3e15dcabe2ca149c9"
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3573,6 +3579,7 @@ dependencies = [
  "http 1.4.0",
  "http-body 1.0.1",
  "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]
@@ -7697,6 +7704,7 @@ dependencies = [
  "rlimit",
  "rustls",
  "sbproxy-ai",
+ "sbproxy-classifier-proto",
  "sbproxy-config",
  "sbproxy-core",
  "sbproxy-extension",
@@ -7711,7 +7719,9 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-stream",
  "toml_edit",
+ "tonic 0.12.3",
  "tracing",
  "tracing-subscriber",
  "yaml_serde",
@@ -7738,6 +7748,7 @@ dependencies = [
 name = "sbproxy-ai"
 version = "0.1.0"
 dependencies = [
+ "allocation-counter",
  "anyhow",
  "arc-swap",
  "async-trait",
@@ -7755,6 +7766,7 @@ dependencies = [
  "jsonschema 0.17.1",
  "lru",
  "minijinja",
+ "num-bigint 0.4.6",
  "object_store",
  "parking_lot",
  "postcard",
@@ -7865,10 +7877,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "h2",
+ "http-body 1.0.1",
+ "http-body-util",
+ "libc",
  "prometheus",
  "prost 0.13.5",
  "regex",
  "rmp-serde",
+ "rustls",
  "sbproxy-classifier-proto",
  "sbproxy-classifiers",
  "serde",
@@ -7878,6 +7895,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic 0.12.3",
+ "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
  "unicode-normalization",
@@ -7888,8 +7906,10 @@ name = "sbproxy-classifier-client"
 version = "0.1.0"
 dependencies = [
  "hyper-util",
+ "rcgen",
  "sbproxy-classifier-proto",
  "sbproxy-classifiers",
+ "sbproxy-security",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -7914,9 +7934,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "prost 0.13.5",
+ "rustls",
  "sbproxy-classifier-proto",
  "sbproxy-classifiers",
+ "serde",
+ "serde_json",
+ "subtle",
  "tokio",
  "tokio-stream",
  "tonic 0.12.3",
@@ -7997,6 +8022,7 @@ dependencies = [
 name = "sbproxy-core"
 version = "1.13.0"
 dependencies = [
+ "allocation-counter",
  "anyhow",
  "arc-swap",
  "argon2",
@@ -10238,8 +10264,11 @@ dependencies = [
  "percent-encoding",
  "pin-project",
  "prost 0.13.5",
+ "rustls-native-certs 0.8.3",
+ "rustls-pemfile",
  "socket2 0.5.10",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower 0.4.13",
  "tower-layer",

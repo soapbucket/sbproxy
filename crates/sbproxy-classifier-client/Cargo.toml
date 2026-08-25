@@ -8,7 +8,8 @@ description = "Resilient gRPC client for the classifier sidecar InferenceService
 
 [dependencies]
 sbproxy-classifier-proto = { path = "../sbproxy-classifier-proto" }
-tonic = { workspace = true }
+sbproxy-security.workspace = true
+tonic = { workspace = true, features = ["tls-native-roots"] }
 tokio = { workspace = true, features = ["net", "process", "sync", "time", "macros", "rt"] }
 # WOR-2665: `open_stream_safety`'s outbound half is a `ReceiverStream`
 # wrapping a `Streaming` request body for `ClassifierService::StreamSafety`.
@@ -26,6 +27,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 
 [dev-dependencies]
 sbproxy-classifiers = { path = "../sbproxy-classifiers" }
+rcgen = { workspace = true }
 tokio = { workspace = true, features = ["full", "macros"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 # UDS test: bind in a tempdir so parallel test runs do not collide.

@@ -1,5 +1,5 @@
 # Agent orchestration
-*Last modified: 2026-08-22*
+*Last modified: 2026-08-25*
 
 `sbproxy_ai::agent_orchestration` (WOR-2672) is an in-process toolkit for
 building a multi-agent workflow on top of the AI gateway: capability
@@ -57,33 +57,71 @@ the next state. `FsmExecution` drives one in-progress run and records
 history:
 
 ```rust,ignore
-use sbproxy_ai::agent_orchestration::{FsmExecution, FsmState, FsmWorkflow};
-use std::collections::HashMap;
+use sbproxy_ai::agent_orchestration::{FsmExecution, FsmState, FsmTransition, FsmWorkflow};
 
-let mut states = HashMap::new();
-states.insert("triage".to_string(), FsmState {
-    name: "triage".to_string(),
-    action: "research-agent".to_string(),
-    transitions: [("needs_code".to_string(), "code".to_string()),
-                  ("needs_summary".to_string(), "summarize".to_string())].into(),
-});
-states.insert("code".to_string(), FsmState {
-    name: "code".to_string(), action: "coding-agent".to_string(), transitions: HashMap::new(),
-});
-states.insert("summarize".to_string(), FsmState {
-    name: "summarize".to_string(), action: "summarizer-agent".to_string(), transitions: HashMap::new(),
-});
+let states = vec![
+    FsmState {
+        name: "triage".to_string(),
+        action: "research-agent".to_string(),
+        transitions: [
+            ("needs_code".to_string(), "code".to_string()),
+            ("needs_summary".to_string(), "summarize".to_string()),
+        ]
+        .into(),
+    },
+    FsmState {
+        name: "code".to_string(),
+        action: "coding-agent".to_string(),
+        transitions: Default::default(),
+    },
+    FsmState {
+        name: "summarize".to_string(),
+        action: "summarizer-agent".to_string(),
+        transitions: Default::default(),
+    },
+];
 
-let workflow = FsmWorkflow { name: "support-triage".to_string(), states, initial_state: "triage".to_string() };
+let workflow = FsmWorkflow::new("support-triage", "triage", states, 16)?;
 let mut exec = FsmExecution::new(workflow);
-let next = exec.transition("needs_code"); // Some("code")
+let next = exec.transition("needs_code")?;
+assert_eq!(next, FsmTransition::Advanced("code".to_string()));
 assert!(!exec.is_completed());
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-A state with no matching transition for the result it receives is
-terminal: `FsmExecution::is_completed` flips to `true` and
-`FsmExecution::history` carries the full `(state, result)` trail for
-audit.
+A state is not completed merely because it has no outgoing transition.
+After execution advances into that state, the caller invokes its action
+once and passes the action's outcome to `transition`. If no transition
+matches that outcome, `FsmExecution::is_completed` flips to `true` and
+`FsmExecution::history` retains that terminal `(state, outcome)` record.
+This preserves one action invocation for every entered state, including
+the terminal state.
+
+### FSM resource limits
+
+Direct construction, YAML/JSON deserialization, and CLI execution share
+the same limits. String limits are measured in UTF-8 bytes, not Unicode
+scalar values.
+
+| Dimension | Maximum |
+|---|---:|
+| States | 256 |
+| Transition edges across all states | 2,048 |
+| Execution steps/history records | 1,024 |
+| Workflow name, initial-state name, state name, or transition target | 256 bytes each |
+| Action label | 512 bytes |
+| Outcome label or runtime outcome | 4,096 bytes |
+| Aggregate graph string payload | 1 MiB |
+| Retained execution-history string payload | 1 MiB |
+
+The graph budget is the sum of the workflow name, initial-state name,
+every state name and action, and every outcome/target pair. In-memory
+overhead is separately bounded by the 256-state and 2,048-edge ceilings;
+the state index can duplicate at most one bounded state name per state.
+The history budget counts retained state and outcome bytes, while its
+container overhead is separately bounded by 1,024 records. Inputs are
+refused before the graph index, history strings, or a max-plus-one state
+or transition body is materialized.
 
 ## Agent authentication
 

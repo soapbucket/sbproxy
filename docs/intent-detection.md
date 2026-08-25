@@ -1,5 +1,5 @@
 # Intent detection and quality-based routing
-*Last modified: 2026-08-22*
+*Last modified: 2026-08-25*
 
 SBproxy can classify each AI prompt into a coarse intent and use prompt-aware
 classifier scores to choose among eligible providers. Both capabilities are
@@ -12,8 +12,17 @@ reranking disabled.
 ```yaml
 proxy:
   classifier_hooks:
-    endpoint: http://127.0.0.1:9440
+    endpoint: https://classifier.internal:9440
     timeout_ms: 250
+    tls:
+      ca_pem: file:/etc/sbproxy/classifier-ca.pem
+      server_name: classifier.internal
+      client_identity:
+        cert_pem: file:/etc/sbproxy/classifier-client-cert.pem
+        key_pem: file:/etc/sbproxy/classifier-client-key.pem
+    authentication:
+      type: bearer
+      credential: ${CLASSIFIER_HOOK_BEARER_TOKEN}
     intent:
       model: intent-v1
     quality:
@@ -27,11 +36,33 @@ proxy:
           label: preferred
 ```
 
-`endpoint` is a gRPC endpoint for either classifier sidecar. `timeout_ms` is
-an end-to-end deadline in the closed range 1 through 30,000 milliseconds.
-The proxy validates the URI and all bounds at configuration load, but opens
-the shared channel lazily on the first AI request. A sidecar is therefore
-optional at boot and every request failure remains fail-open.
+`endpoint` is a gRPC endpoint for either classifier sidecar. Local loopback
+deployments may keep the old `http://127.0.0.1:9440` shape. Any nonlocal
+destination must use `https://` and must authenticate with bearer metadata,
+client mTLS, or both. `timeout_ms` is an end-to-end deadline in the closed
+range 1 through 30,000 milliseconds. The proxy validates the URI and all
+bounds at configuration load, but opens the shared channel lazily on the first
+AI request. A sidecar is therefore optional at boot and every request failure
+remains fail-open.
+
+The transport hardening fields map directly onto the sidecars' gRPC listener
+flags:
+
+- `tls.ca_pem` is an optional custom CA bundle for the remote classifier.
+- `tls.server_name` overrides the TLS server name / SNI; otherwise the endpoint
+  host is used.
+- `tls.client_identity.cert_pem` and `tls.client_identity.key_pem` carry the
+  client certificate and private key for classifier-hook mTLS.
+- `authentication.type: bearer` sends one metadata value on every request. The
+  default metadata key is `authorization` and the default scheme prefix is
+  `Bearer`, so the example above emits `authorization: Bearer <token>`.
+
+For nonlocal endpoints, secret-bearing fields must be secret references rather
+than inline literals. `authentication.credential`, `tls.ca_pem`, and
+`tls.client_identity.*` accept `${ENV}`, `env:NAME`, `file:/path`, and the
+configured provider-backed secret-reference URIs. Inline bearer tokens and
+inline PEM blocks are refused. Resolved values are redacted from debug output
+and errors identify the config field rather than echoing the secret.
 
 For quality routing, `provider_models` must contain a contract for every
 provider that may be considered on a hooked route. Each contract names the

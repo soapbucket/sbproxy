@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-25*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
@@ -1678,13 +1678,13 @@ gateway has reached (or attempted to reach) since process start, with its
 most recent authorization outcome. Both `admin` and `read_only` operators
 may call the route.
 
-Every one of the eleven wired egress purposes below goes through the same
+Every one of the twelve wired egress purposes below goes through the same
 authorizer and lands in the same inventory and, on denial, the same
 event:
 
 ```mermaid
 flowchart TD
-    A["Egress call site: AI provider, judge, MCP upstream,\nOpenAPI tool, token exchange, webhook, usage sink,\nmodel/engine artifact, bundle hook, telemetry"] --> B[EgressAuthorizer authorizes the destination]
+    A["Egress call site: AI provider, judge, classifier hook, MCP upstream,\nOpenAPI tool, token exchange, webhook, usage sink,\nmodel/engine artifact, bundle hook, telemetry"] --> B[EgressAuthorizer authorizes the destination]
     B -->|no authorizer armed for this purpose| C[ungated]
     B -->|authorizer armed| D{Destination allowed?}
     D -->|yes| E[allowed]
@@ -1736,17 +1736,18 @@ The inventory is process-lifetime and in-memory: it clears on restart and
 is capped at 1,024 tracked destinations, after which a new destination
 stops being tracked while every already-tracked one keeps updating. Every
 wired egress purpose writes here: AI providers, the dual-LLM quarantine
-judge, OpenAPI-backed MCP tools, token exchange, webhooks, usage sinks,
-model and engine artifact downloads, extension bundle hooks, and the
-OTLP telemetry exporters. `mcp_upstream` covers the base MCP connect
-for a plain `type: mcp` federated server, gated and DNS-pinned at the
-dial.
+judge, stock classifier hooks, OpenAPI-backed MCP tools, token exchange,
+webhooks, usage sinks, model and engine artifact downloads, extension
+bundle hooks, and the OTLP telemetry exporters. `mcp_upstream` covers the
+base MCP connect for a plain `type: mcp` federated server, gated and
+DNS-pinned at the dial.
 
 The top-level `egress:` section (see
-[Egress allowlists](configuration.md#egress-allowlists)) arms six of
-the purposes above through five sub-blocks: `ai_providers` (AI
-providers), `usage_sinks` (usage sinks and webhooks, one allowlist for
-both, including the `events:` webhook sink), `model_artifacts`,
+[Egress allowlists](configuration.md#egress-allowlists)) arms seven of
+the purposes above through six sub-blocks: `ai_providers` (AI
+providers), `classifier_hooks` (stock intent and provider-quality
+classifier RPCs), `usage_sinks` (usage sinks and webhooks, one allowlist
+for both, including the `events:` webhook sink), `model_artifacts`,
 `token_exchange` (both the non-MCP outbound-credential resolver and the
 MCP run-as-user token exchange), and `telemetry`. Until a sub-block sets
 `mode: deny_by_default`, its purpose stays `ungated`: reached, but
@@ -2468,10 +2469,22 @@ Read-only operators may call this; it has no write path.
 ### `GET /admin/ai-chargeback` and `GET /admin/ai-chargeback.csv`
 
 Read the bounded chargeback sink instances attached to the live AI
-pipeline. The JSON form is an atomic snapshot of recent raw entries,
-workspace/team rollups, configured capacities, and retention counters.
-The CSV form exports one workspace or team rollup per row for finance
-tools. A hot reload replaces the view with the new pipeline's trackers.
+pipeline. The JSON form is a process-local view of recent raw entries,
+workspace/team rollups, configured capacities, and retention
+counters. `schema_version` defaults to `1`; `schema_version=2` keeps the
+typed tracker shape. JSON raw rows page with `?limit=` (default 100 when
+pagination is requested; max 1000) and `?cursor=` (opaque
+continuation from the prior page). Rollups and tracker counters remain
+whole on every page while only the retained `entries` arrays page. The
+top-level `limit` and `next_cursor` fields appear only on paged JSON
+responses. The CSV form borrows only the workspace/team rollup maps and
+exports one rollup per row for finance tools; it does not snapshot the raw
+entry window. Both formats are written once into a 512 KiB capped response
+buffer. Caller-supplied literal names equal to the internal legacy
+bucket labels (`unattributed`, `__other__`) are escaped with a
+deterministic digest suffix so they cannot impersonate the missing or
+overflow buckets on schema v1 or CSV.
+A hot reload replaces the view with the new pipeline's trackers.
 
 ```json
 {
@@ -2497,9 +2510,9 @@ tools. A hot reload replaces the view with the new pipeline's trackers.
 }
 ```
 
-Origins without a configured `type: chargeback` sink are omitted. More
-than one configured chargeback sink produces more than one array entry in
-declaration order. The CSV header is
+Origins without a configured `type: chargeback` sink are omitted. Config
+load rejects a second chargeback sink on the same AI origin, so each
+origin contributes at most one array entry. The CSV header is
 `origin,tracker,dimension,name,request_count,tokens,cost_usd`; caller-derived
 names are quoted and spreadsheet-formula prefixes are neutralized.
 
@@ -2508,11 +2521,23 @@ or cross-replica totals. Use the JSON retention counters and the
 `sbproxy_ai_chargeback_entries_evicted_total` /
 `sbproxy_ai_chargeback_rollups_collapsed_total{dimension}` metrics to tell
 when raw history or named rollup cardinality exceeded its configured
-window. See [ai-chargeback.md](ai-chargeback.md).
+window. `sbproxy_ai_chargeback_refusals_total{reason}` counts rows the
+tracker refused before exact accounting could commit,
+`sbproxy_ai_chargeback_incomplete_total{reason}` records the bounded set
+of completeness poisons that occurred on the live path, and
+`sbproxy_admin_chargeback_export_refusals_total{format,reason}` counts
+request-shape and response-budget refusals on this authenticated admin
+boundary. An oversized JSON or CSV export is refused as
+`413 {"code":"chargeback_response_too_large", ...}` without a second
+serialization or a raw-row snapshot. Retry JSON with a smaller `limit`; use
+the paged JSON route when the all-rollup CSV export is too large. See
+[ai-chargeback.md](ai-chargeback.md).
 
 | Status | When |
 |---|---|
-| `200` | Always, once authenticated. With no configured tracker, JSON returns an empty `origins` map and CSV returns only its header. |
+| `200` | The export fits the response budget. With no configured tracker, JSON returns an empty `origins` map and CSV returns only its header. |
+| `400` | Unsupported `schema_version`, malformed `cursor`, or an invalid/non-positive `limit`. Unsupported schema versions return `{"code":"unsupported_schema_version","requested_schema_version":...,"supported_schema_versions":[1,2]}`. |
+| `413` | The requested JSON page or CSV export would exceed the bounded admin response budget. |
 | `401` | Missing or invalid credentials. |
 | `405` | Any method other than `GET`. |
 

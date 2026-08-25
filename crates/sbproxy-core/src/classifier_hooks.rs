@@ -40,17 +40,533 @@
 
 use async_trait::async_trait;
 use sbproxy_classifier_client::{
-    ClassifierClient, ClassifierClientError, ClassifyResponse, FallbackClassifier,
-    InProcessClassifier, Verdict,
+    ClassifierClient, ClassifierClientAuthenticationConfig, ClassifierClientError,
+    ClassifierClientIdentityConfig, ClassifierClientSecurityConfig, ClassifierClientTlsConfig,
+    ClassifyResponse, FallbackClassifier, InProcessClassifier, Verdict,
 };
+use sbproxy_security::egress::EgressAuthorizer;
 use std::collections::HashMap;
-use std::sync::Arc;
+#[cfg(test)]
+use std::collections::HashSet;
+use std::io::Read;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+use tokio::sync::Notify;
 
 use crate::hooks::{
     Hooks, IntentCategory, IntentDetectionHook, QualityRequest, QualityScore, QualityScoringHook,
 };
 use crate::intent_detection::detect_intent_heuristic;
+
+#[cfg(test)]
+tokio::task_local! {
+    static QUALITY_PROMPT_STORAGE: std::cell::RefCell<Vec<usize>>;
+}
+
+const QUALITY_FANOUT_MAX_CONCURRENT_CALLS: usize = 8;
+const QUALITY_FANOUT_MAX_LIVE_PROMPT_BYTES: usize = 1024 * 1024;
+const QUALITY_FANOUT_MAX_PROMPT_BYTES: usize = 1024 * 1024;
+const CLASSIFIER_HOOK_MAX_AUTH_BYTES: usize = 256;
+const CLASSIFIER_HOOK_MAX_PEM_BYTES: usize = 256 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct QualityFanoutLimits {
+    max_concurrent_calls: usize,
+    max_live_prompt_bytes: usize,
+    max_prompt_bytes: usize,
+}
+
+impl QualityFanoutLimits {
+    pub(crate) const fn max_concurrent_calls(self) -> usize {
+        self.max_concurrent_calls
+    }
+
+    pub(crate) const fn max_live_prompt_bytes(self) -> usize {
+        self.max_live_prompt_bytes
+    }
+
+    pub(crate) const fn max_prompt_bytes(self) -> usize {
+        self.max_prompt_bytes
+    }
+}
+
+pub(crate) const fn quality_fanout_limits() -> QualityFanoutLimits {
+    QualityFanoutLimits {
+        max_concurrent_calls: QUALITY_FANOUT_MAX_CONCURRENT_CALLS,
+        max_live_prompt_bytes: QUALITY_FANOUT_MAX_LIVE_PROMPT_BYTES,
+        max_prompt_bytes: QUALITY_FANOUT_MAX_PROMPT_BYTES,
+    }
+}
+
+fn read_bounded_classifier_hook_secret_file(
+    path: &str,
+    field: &str,
+    max_bytes: usize,
+) -> anyhow::Result<String> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| anyhow::anyhow!("read {field} file '{path}': {error}"))?;
+    let mut bytes = Vec::with_capacity(max_bytes.min(4096));
+    file.take(max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| anyhow::anyhow!("read {field} file '{path}': {error}"))?;
+    if bytes.len() > max_bytes {
+        anyhow::bail!("{field} exceeds the {max_bytes}-byte limit");
+    }
+    let value = String::from_utf8(bytes)
+        .map_err(|_| anyhow::anyhow!("{field} file '{path}' is not valid UTF-8 text"))?;
+    Ok(value.trim().to_string())
+}
+
+fn resolve_classifier_hook_secret_reference(
+    reference: &str,
+    field: &str,
+    max_bytes: usize,
+) -> anyhow::Result<String> {
+    let value = if let Some(path) = reference.trim().strip_prefix("file:") {
+        read_bounded_classifier_hook_secret_file(path, field, max_bytes)?
+    } else {
+        crate::config_source::resolve_secret_reference(reference, field)?
+    };
+    if value.is_empty() {
+        anyhow::bail!("{field} must not resolve to an empty value");
+    }
+    if value.len() > max_bytes {
+        anyhow::bail!("{field} exceeds the {max_bytes}-byte limit");
+    }
+    Ok(value)
+}
+
+struct QualityFanoutRuntime {
+    byte_notify: Notify,
+    state: Mutex<QualityFanoutState>,
+    #[cfg(test)]
+    owner_fingerprint: usize,
+}
+
+#[derive(Default)]
+struct QualityFanoutState {
+    leased_prompt_bytes: usize,
+    current_call_leases: usize,
+    #[cfg(test)]
+    peak_leased_prompt_bytes: usize,
+    #[cfg(test)]
+    live_owned_prompt_bytes: usize,
+    #[cfg(test)]
+    peak_owned_prompt_bytes: usize,
+    #[cfg(test)]
+    total_weighted_leases: usize,
+    #[cfg(test)]
+    total_weighted_lease_releases: usize,
+    #[cfg(test)]
+    total_prompt_owners: usize,
+    #[cfg(test)]
+    total_prompt_owner_releases: usize,
+    #[cfg(test)]
+    prompt_owners_without_prior_lease: usize,
+    #[cfg(test)]
+    dials_without_prompt_lease: usize,
+    #[cfg(test)]
+    byte_budget_blocks_by_origin: HashMap<String, usize>,
+    #[cfg(test)]
+    dials_by_origin: HashMap<String, usize>,
+    #[cfg(test)]
+    total_prompt_owners_by_origin: HashMap<String, usize>,
+    #[cfg(test)]
+    live_leases_by_origin: HashMap<String, usize>,
+    #[cfg(test)]
+    distinct_budget_owner_ids: HashSet<usize>,
+}
+
+impl QualityFanoutRuntime {
+    fn shared() -> &'static Self {
+        static RUNTIME: OnceLock<QualityFanoutRuntime> = OnceLock::new();
+        RUNTIME.get_or_init(|| Self {
+            byte_notify: Notify::new(),
+            state: Mutex::new(QualityFanoutState::default()),
+            #[cfg(test)]
+            owner_fingerprint: 1,
+        })
+    }
+
+    async fn acquire(
+        &'static self,
+        prompt_bytes: usize,
+        #[cfg(test)] origin: String,
+    ) -> Option<QualityFanoutLease> {
+        if prompt_bytes > quality_fanout_limits().max_prompt_bytes() {
+            return None;
+        }
+
+        loop {
+            let notified = self.byte_notify.notified();
+            {
+                let mut state = self.state.lock().expect("quality fanout state poisoned");
+                if state.current_call_leases < quality_fanout_limits().max_concurrent_calls()
+                    && state.leased_prompt_bytes + prompt_bytes
+                        <= quality_fanout_limits().max_live_prompt_bytes()
+                {
+                    state.leased_prompt_bytes += prompt_bytes;
+                    state.current_call_leases += 1;
+                    #[cfg(test)]
+                    {
+                        state.peak_leased_prompt_bytes = state
+                            .peak_leased_prompt_bytes
+                            .max(state.leased_prompt_bytes);
+                        state.total_weighted_leases += 1;
+                        *state
+                            .live_leases_by_origin
+                            .entry(origin.clone())
+                            .or_insert(0) += 1;
+                        state
+                            .distinct_budget_owner_ids
+                            .insert(self.owner_fingerprint);
+                    }
+                    return Some(QualityFanoutLease {
+                        runtime: self,
+                        #[cfg(test)]
+                        origin,
+                        prompt_bytes,
+                    });
+                }
+                #[cfg(test)]
+                {
+                    if state.leased_prompt_bytes + prompt_bytes
+                        > quality_fanout_limits().max_live_prompt_bytes()
+                    {
+                        *state
+                            .byte_budget_blocks_by_origin
+                            .entry(origin.clone())
+                            .or_insert(0) += 1;
+                    }
+                }
+            }
+            notified.await;
+        }
+    }
+
+    fn release_weighted_lease(&self, prompt_bytes: usize, #[cfg(test)] origin: &str) {
+        {
+            let mut state = self.state.lock().expect("quality fanout state poisoned");
+            state.leased_prompt_bytes = state
+                .leased_prompt_bytes
+                .checked_sub(prompt_bytes)
+                .expect("weighted prompt lease underflow");
+            state.current_call_leases = state
+                .current_call_leases
+                .checked_sub(1)
+                .expect("weighted prompt call lease underflow");
+            #[cfg(test)]
+            {
+                state.total_weighted_lease_releases += 1;
+                let remaining = state
+                    .live_leases_by_origin
+                    .get_mut(origin)
+                    .expect("missing origin lease count");
+                *remaining = remaining.checked_sub(1).expect("origin lease underflow");
+                if *remaining == 0 {
+                    state.live_leases_by_origin.remove(origin);
+                }
+            }
+        }
+        self.byte_notify.notify_waiters();
+    }
+
+    #[cfg(test)]
+    fn begin_owned_prompt(&self, origin: &str, prompt_bytes: usize) -> QualityOwnedPromptGuard<'_> {
+        let mut state = self.state.lock().expect("quality fanout state poisoned");
+        if state
+            .live_leases_by_origin
+            .get(origin)
+            .copied()
+            .unwrap_or_default()
+            == 0
+        {
+            state.prompt_owners_without_prior_lease += 1;
+        }
+        state.total_prompt_owners += 1;
+        *state
+            .total_prompt_owners_by_origin
+            .entry(origin.to_string())
+            .or_insert(0) += 1;
+        state.live_owned_prompt_bytes += prompt_bytes;
+        state.peak_owned_prompt_bytes = state
+            .peak_owned_prompt_bytes
+            .max(state.live_owned_prompt_bytes);
+        drop(state);
+        QualityOwnedPromptGuard {
+            runtime: self,
+            prompt_bytes,
+        }
+    }
+
+    #[cfg(test)]
+    fn finish_owned_prompt(&self, prompt_bytes: usize) {
+        let mut state = self.state.lock().expect("quality fanout state poisoned");
+        state.live_owned_prompt_bytes = state
+            .live_owned_prompt_bytes
+            .checked_sub(prompt_bytes)
+            .expect("owned prompt lease underflow");
+        state.total_prompt_owner_releases += 1;
+    }
+
+    #[cfg(test)]
+    fn note_dial(&self, origin: &str) {
+        let mut state = self.state.lock().expect("quality fanout state poisoned");
+        if state
+            .live_leases_by_origin
+            .get(origin)
+            .copied()
+            .unwrap_or_default()
+            == 0
+        {
+            state.dials_without_prompt_lease += 1;
+        }
+        *state.dials_by_origin.entry(origin.to_string()).or_insert(0) += 1;
+    }
+
+    #[cfg(test)]
+    fn reset_for_test(&self) {
+        *self.state.lock().expect("quality fanout state poisoned") = QualityFanoutState::default();
+        self.byte_notify.notify_waiters();
+    }
+}
+
+struct QualityFanoutLease {
+    runtime: &'static QualityFanoutRuntime,
+    #[cfg(test)]
+    origin: String,
+    prompt_bytes: usize,
+}
+
+impl Drop for QualityFanoutLease {
+    fn drop(&mut self) {
+        self.runtime.release_weighted_lease(
+            self.prompt_bytes,
+            #[cfg(test)]
+            &self.origin,
+        );
+    }
+}
+
+#[cfg(test)]
+struct QualityOwnedPromptGuard<'a> {
+    runtime: &'a QualityFanoutRuntime,
+    prompt_bytes: usize,
+}
+
+#[cfg(test)]
+impl Drop for QualityOwnedPromptGuard<'_> {
+    fn drop(&mut self) {
+        self.runtime.finish_owned_prompt(self.prompt_bytes);
+    }
+}
+
+#[cfg(test)]
+struct QualityFanoutProbe {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+#[cfg(test)]
+impl QualityFanoutProbe {
+    async fn acquire_unique() -> Self {
+        static TEST_GUARD: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+        let guard = TEST_GUARD
+            .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+            .lock_owned()
+            .await;
+        QualityFanoutRuntime::shared().reset_for_test();
+        Self { _guard: guard }
+    }
+
+    fn total_prompt_owners(&self) -> usize {
+        QualityFanoutRuntime::shared()
+            .state
+            .lock()
+            .expect("quality fanout state poisoned")
+            .total_prompt_owners
+    }
+
+    fn total_prompt_owners_for_origin(&self, origin: &str) -> usize {
+        QualityFanoutRuntime::shared()
+            .state
+            .lock()
+            .expect("quality fanout state poisoned")
+            .total_prompt_owners_by_origin
+            .get(origin)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn dials_for_origin(&self, origin: &str) -> usize {
+        QualityFanoutRuntime::shared()
+            .state
+            .lock()
+            .expect("quality fanout state poisoned")
+            .dials_by_origin
+            .get(origin)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn reset_high_water(&self) {
+        let mut state = QualityFanoutRuntime::shared()
+            .state
+            .lock()
+            .expect("quality fanout state poisoned");
+        state.peak_leased_prompt_bytes = state.leased_prompt_bytes;
+        state.peak_owned_prompt_bytes = state.live_owned_prompt_bytes;
+    }
+
+    async fn wait_for_origin_blocked_on_byte_budget(
+        &self,
+        origin: &str,
+        within: Duration,
+    ) -> Result<(), ()> {
+        self.wait_for_origin_byte_budget_blocks(origin, 1, within)
+            .await
+    }
+
+    fn byte_budget_blocks_for_origin(&self, origin: &str) -> usize {
+        QualityFanoutRuntime::shared()
+            .state
+            .lock()
+            .expect("quality fanout state poisoned")
+            .byte_budget_blocks_by_origin
+            .get(origin)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    async fn wait_for_origin_byte_budget_blocks(
+        &self,
+        origin: &str,
+        minimum: usize,
+        within: Duration,
+    ) -> Result<(), ()> {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            if self.byte_budget_blocks_for_origin(origin) >= minimum {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    fn distinct_budget_owner_ids(&self) -> usize {
+        QualityFanoutRuntime::shared()
+            .state
+            .lock()
+            .expect("quality fanout state poisoned")
+            .distinct_budget_owner_ids
+            .len()
+    }
+
+    fn prompt_owners_without_prior_lease(&self) -> usize {
+        QualityFanoutRuntime::shared()
+            .state
+            .lock()
+            .expect("quality fanout state poisoned")
+            .prompt_owners_without_prior_lease
+    }
+
+    fn dials_without_prompt_lease(&self) -> usize {
+        QualityFanoutRuntime::shared()
+            .state
+            .lock()
+            .expect("quality fanout state poisoned")
+            .dials_without_prompt_lease
+    }
+
+    fn peak_leased_prompt_bytes(&self) -> usize {
+        QualityFanoutRuntime::shared()
+            .state
+            .lock()
+            .expect("quality fanout state poisoned")
+            .peak_leased_prompt_bytes
+    }
+
+    fn peak_owned_prompt_bytes(&self) -> usize {
+        QualityFanoutRuntime::shared()
+            .state
+            .lock()
+            .expect("quality fanout state poisoned")
+            .peak_owned_prompt_bytes
+    }
+
+    fn current_leased_prompt_bytes(&self) -> usize {
+        QualityFanoutRuntime::shared()
+            .state
+            .lock()
+            .expect("quality fanout state poisoned")
+            .leased_prompt_bytes
+    }
+
+    fn current_owned_prompt_bytes(&self) -> usize {
+        QualityFanoutRuntime::shared()
+            .state
+            .lock()
+            .expect("quality fanout state poisoned")
+            .live_owned_prompt_bytes
+    }
+
+    fn current_call_leases(&self) -> usize {
+        QualityFanoutRuntime::shared()
+            .state
+            .lock()
+            .expect("quality fanout state poisoned")
+            .current_call_leases
+    }
+
+    fn available_call_permits(&self) -> usize {
+        quality_fanout_limits().max_concurrent_calls() - self.current_call_leases()
+    }
+
+    fn available_prompt_bytes(&self) -> usize {
+        quality_fanout_limits().max_live_prompt_bytes() - self.current_leased_prompt_bytes()
+    }
+
+    async fn wait_for_no_live_leases(&self, within: Duration) -> Result<(), ()> {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            if self.current_call_leases() == 0
+                && self.current_leased_prompt_bytes() == 0
+                && self.current_owned_prompt_bytes() == 0
+            {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    fn assert_every_owner_released_exactly_once(&self) {
+        let state = QualityFanoutRuntime::shared()
+            .state
+            .lock()
+            .expect("quality fanout state poisoned");
+        assert_eq!(state.total_prompt_owners, state.total_prompt_owner_releases);
+        assert_eq!(state.live_owned_prompt_bytes, 0);
+    }
+
+    fn assert_every_weighted_lease_released_exactly_once(&self) {
+        let state = QualityFanoutRuntime::shared()
+            .state
+            .lock()
+            .expect("quality fanout state poisoned");
+        assert_eq!(
+            state.total_weighted_leases,
+            state.total_weighted_lease_releases
+        );
+        assert_eq!(state.leased_prompt_bytes, 0);
+        assert_eq!(state.current_call_leases, 0);
+    }
+}
 
 /// Adapts [`detect_intent_heuristic`] to [`InProcessClassifier`] so
 /// [`FallbackClassifier`] can degrade to it without a network round trip.
@@ -138,16 +654,45 @@ impl IntentDetectionHook for ClassifierIntentHook {
 struct LazyClassifierClient {
     endpoint: String,
     timeout: Duration,
+    egress: Option<EgressAuthorizer>,
+    security: Option<ClassifierClientSecurityConfig>,
     client: tokio::sync::OnceCell<ClassifierClient>,
 }
 
 impl LazyClassifierClient {
-    fn new(endpoint: String, timeout: Duration) -> Self {
+    fn new(
+        endpoint: String,
+        timeout: Duration,
+        egress: Option<EgressAuthorizer>,
+        security: Option<ClassifierClientSecurityConfig>,
+    ) -> Self {
         Self {
             endpoint,
             timeout,
+            egress,
+            security,
             client: tokio::sync::OnceCell::new(),
         }
+    }
+
+    async fn client(&self) -> Result<&ClassifierClient, ClassifierClientError> {
+        self.client
+            .get_or_try_init(|| async {
+                match self.egress.clone() {
+                    Some(egress) => ClassifierClient::connect_governed_lazy_with_security(
+                        &self.endpoint,
+                        self.timeout,
+                        egress,
+                        self.security.clone(),
+                    ),
+                    None => ClassifierClient::connect_lazy_with_security(
+                        &self.endpoint,
+                        self.timeout,
+                        self.security.clone(),
+                    ),
+                }
+            })
+            .await
     }
 
     async fn classify(
@@ -155,13 +700,28 @@ impl LazyClassifierClient {
         model: &str,
         text: &str,
     ) -> Result<ClassifyResponse, ClassifierClientError> {
-        let client = self
-            .client
-            .get_or_try_init(|| async {
-                ClassifierClient::connect_lazy(&self.endpoint, self.timeout)
-            })
-            .await?;
+        #[cfg(test)]
+        let _ = QUALITY_PROMPT_STORAGE.try_with(|pointers| {
+            pointers.borrow_mut().push(text.as_ptr() as usize);
+        });
+        let client = self.client().await?;
         client.classify(model, text).await
+    }
+
+    async fn classify_owned(
+        &self,
+        model: &str,
+        text: String,
+        #[cfg(test)] origin: &str,
+    ) -> Result<ClassifyResponse, ClassifierClientError> {
+        let client = self.client().await?;
+        #[cfg(test)]
+        let runtime = QualityFanoutRuntime::shared();
+        #[cfg(test)]
+        let _owned_prompt = runtime.begin_owned_prompt(origin, text.len());
+        #[cfg(test)]
+        runtime.note_dial(origin);
+        client.classify_owned(model, text).await
     }
 }
 
@@ -217,6 +777,14 @@ impl QualityScoringHook for ClassifierQualityHook {
             );
             return None;
         }
+        if req.prompt.len() > quality_fanout_limits().max_prompt_bytes() {
+            tracing::warn!(
+                prompt_bytes = req.prompt.len(),
+                maximum = quality_fanout_limits().max_prompt_bytes(),
+                "quality classifier prompt limit exceeded; preserving configured routing"
+            );
+            return None;
+        }
 
         let contracts = req
             .candidate_providers
@@ -229,17 +797,58 @@ impl QualityScoringHook for ClassifierQualityHook {
             })
             .collect::<Option<Vec<_>>>()?;
 
-        let calls = contracts.into_iter().map(|(provider, contract)| {
+        let prompt = req.prompt.as_str();
+        #[cfg(test)]
+        let origin = req.origin.clone();
+        let calls = contracts.into_iter().map(move |(provider, contract)| {
             let client = Arc::clone(&self.client);
-            let prompt = req.prompt.clone();
+            #[cfg(test)]
+            let origin = origin.clone();
             async move {
-                let response = client.classify(&contract.model, &prompt).await;
+                #[cfg(test)]
+                let _ = QUALITY_PROMPT_STORAGE.try_with(|pointers| {
+                    pointers.borrow_mut().push(prompt.as_ptr() as usize);
+                });
+                let Some(_lease) = QualityFanoutRuntime::shared()
+                    .acquire(
+                        prompt.len(),
+                        #[cfg(test)]
+                        origin.clone(),
+                    )
+                    .await
+                else {
+                    return (
+                        provider,
+                        contract.label,
+                        Err(ClassifierClientError::InvalidRequest(
+                            "quality prompt exceeds fanout byte budget".to_string(),
+                        )),
+                    );
+                };
+                let response = client
+                    .classify_owned(
+                        &contract.model,
+                        prompt.to_string(),
+                        #[cfg(test)]
+                        &origin,
+                    )
+                    .await;
                 (provider, contract.label, response)
             }
         });
-        let results = tokio::time::timeout(self.timeout, futures::future::join_all(calls))
-            .await
-            .ok()?;
+        // Arm the shared deadline before any candidate starts. Individual
+        // classifier RPCs use the same configured timeout, so a regular
+        // `timeout(join_all(...))` can poll newly completed inner timeouts
+        // first and admit queued candidates at the outer deadline. Deadline
+        // precedence prevents new prompt ownership once the shared fanout
+        // budget has expired.
+        let deadline = tokio::time::sleep(self.timeout);
+        tokio::pin!(deadline);
+        let results = tokio::select! {
+            biased;
+            () = &mut deadline => return None,
+            results = futures::future::join_all(calls) => results,
+        };
 
         let mut scores = Vec::with_capacity(results.len());
         for (provider, positive_label, response) in results {
@@ -265,11 +874,85 @@ impl QualityScoringHook for ClassifierQualityHook {
     }
 }
 
+fn classifier_hook_security_config(
+    config: &sbproxy_config::ClassifierHooksConfig,
+) -> anyhow::Result<Option<ClassifierClientSecurityConfig>> {
+    let tls = config
+        .tls
+        .as_ref()
+        .map(|tls| {
+            let ca_pem = tls
+                .ca_pem
+                .as_deref()
+                .map(|reference| {
+                    resolve_classifier_hook_secret_reference(
+                        reference,
+                        "proxy.classifier_hooks.tls.ca_pem",
+                        CLASSIFIER_HOOK_MAX_PEM_BYTES,
+                    )
+                })
+                .transpose()?;
+            let client_identity = tls
+                .client_identity
+                .as_ref()
+                .map(|identity| {
+                    Ok::<_, anyhow::Error>(ClassifierClientIdentityConfig {
+                        cert_pem: resolve_classifier_hook_secret_reference(
+                            &identity.cert_pem,
+                            "proxy.classifier_hooks.tls.client_identity.cert_pem",
+                            CLASSIFIER_HOOK_MAX_PEM_BYTES,
+                        )?,
+                        key_pem: resolve_classifier_hook_secret_reference(
+                            &identity.key_pem,
+                            "proxy.classifier_hooks.tls.client_identity.key_pem",
+                            CLASSIFIER_HOOK_MAX_PEM_BYTES,
+                        )?,
+                    })
+                })
+                .transpose()?;
+            Ok::<_, anyhow::Error>(ClassifierClientTlsConfig {
+                ca_pem,
+                server_name: tls.server_name.clone(),
+                client_identity,
+            })
+        })
+        .transpose()?;
+    let authentication = config
+        .authentication
+        .as_ref()
+        .map(|authentication| -> anyhow::Result<_> {
+            match authentication {
+                sbproxy_config::ClassifierHooksAuthenticationConfig::Bearer {
+                    credential,
+                    header,
+                    scheme,
+                } => Ok(ClassifierClientAuthenticationConfig::Bearer {
+                    credential: resolve_classifier_hook_secret_reference(
+                        credential,
+                        "proxy.classifier_hooks.authentication.credential",
+                        CLASSIFIER_HOOK_MAX_AUTH_BYTES,
+                    )?,
+                    header: header.clone(),
+                    scheme: scheme.clone(),
+                }),
+            }
+        })
+        .transpose()?;
+    if tls.is_none() && authentication.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(ClassifierClientSecurityConfig {
+        tls,
+        authentication,
+    }))
+}
+
 /// Compile stock classifier hooks from operator configuration without
 /// dialing the sidecar. URI and resource-bound validation is eager; network
 /// availability remains fail-open on each request.
 pub(crate) fn hooks_from_config(
     config: Option<&sbproxy_config::ClassifierHooksConfig>,
+    egress: Option<&EgressAuthorizer>,
 ) -> anyhow::Result<Hooks> {
     let Some(config) = config else {
         return Ok(Hooks::default());
@@ -279,7 +962,13 @@ pub(crate) fn hooks_from_config(
         .map_err(|error| anyhow::anyhow!("proxy.classifier_hooks.endpoint: {error}"))?;
 
     let timeout = Duration::from_millis(config.timeout_ms);
-    let client = Arc::new(LazyClassifierClient::new(config.endpoint.clone(), timeout));
+    let security = classifier_hook_security_config(config)?;
+    let client = Arc::new(LazyClassifierClient::new(
+        config.endpoint.clone(),
+        timeout,
+        egress.cloned(),
+        security,
+    ));
     let intent_detection = config.intent.as_ref().map(|intent| {
         Arc::new(StockClassifierIntentHook {
             client: Arc::clone(&client),
@@ -307,6 +996,8 @@ pub(crate) fn hooks_from_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+    use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -407,5 +1098,916 @@ mod tests {
         let verdict = inner.classify("describe this screenshot").await;
         assert_eq!(verdict.label, "vision");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn quality_only_config() -> sbproxy_config::ClassifierHooksConfig {
+        sbproxy_config::ClassifierHooksConfig {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            timeout_ms: 100,
+            tls: None,
+            authentication: None,
+            intent: None,
+            quality: Some(sbproxy_config::ClassifierQualityHookConfig {
+                minimum_score: 0.75,
+                provider_models: HashMap::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn classifier_hook_security_config_bounds_auth_credentials_from_env() {
+        let variable = "SBPROXY_CLASSIFIER_HOOK_TOKEN_BOUND";
+        let exact = "t".repeat(CLASSIFIER_HOOK_MAX_AUTH_BYTES);
+        std::env::set_var(variable, &exact);
+        let mut config = quality_only_config();
+        config.authentication = Some(
+            sbproxy_config::ClassifierHooksAuthenticationConfig::Bearer {
+                credential: format!("env:{variable}"),
+                header: "authorization".to_string(),
+                scheme: "Bearer".to_string(),
+            },
+        );
+        let security =
+            classifier_hook_security_config(&config).expect("exact token bound must be accepted");
+        let Some(ClassifierClientSecurityConfig {
+            authentication: Some(ClassifierClientAuthenticationConfig::Bearer { credential, .. }),
+            ..
+        }) = security
+        else {
+            panic!("expected bearer authentication");
+        };
+        assert_eq!(credential.len(), CLASSIFIER_HOOK_MAX_AUTH_BYTES);
+
+        std::env::set_var(variable, "t".repeat(CLASSIFIER_HOOK_MAX_AUTH_BYTES + 1));
+        let error = classifier_hook_security_config(&config).unwrap_err();
+        assert!(error.to_string().contains(
+            "proxy.classifier_hooks.authentication.credential exceeds the 256-byte limit"
+        ));
+        std::env::remove_var(variable);
+    }
+
+    #[test]
+    fn classifier_hook_security_config_bounds_auth_credentials_from_file_and_provider() {
+        let exact_file = tempfile::NamedTempFile::new().expect("temp token file");
+        std::fs::write(
+            exact_file.path(),
+            "f".repeat(CLASSIFIER_HOOK_MAX_AUTH_BYTES),
+        )
+        .expect("write exact token file");
+        let mut config = quality_only_config();
+        config.authentication = Some(
+            sbproxy_config::ClassifierHooksAuthenticationConfig::Bearer {
+                credential: format!("file:{}", exact_file.path().display()),
+                header: "authorization".to_string(),
+                scheme: "Bearer".to_string(),
+            },
+        );
+        classifier_hook_security_config(&config).expect("exact file token bound must be accepted");
+
+        let over_file = tempfile::NamedTempFile::new().expect("temp oversized token file");
+        std::fs::write(
+            over_file.path(),
+            "f".repeat(CLASSIFIER_HOOK_MAX_AUTH_BYTES + 1),
+        )
+        .expect("write oversized token file");
+        config.authentication = Some(
+            sbproxy_config::ClassifierHooksAuthenticationConfig::Bearer {
+                credential: format!("file:{}", over_file.path().display()),
+                header: "authorization".to_string(),
+                scheme: "Bearer".to_string(),
+            },
+        );
+        let error = classifier_hook_security_config(&config).unwrap_err();
+        assert!(error.to_string().contains(
+            "proxy.classifier_hooks.authentication.credential exceeds the 256-byte limit"
+        ));
+
+        sbproxy_vault::reset_process_resolver_for_test();
+        let vault = sbproxy_vault::LocalVault::new();
+        vault
+            .set_secret("token", &"p".repeat(CLASSIFIER_HOOK_MAX_AUTH_BYTES))
+            .expect("store exact provider token");
+        let mut manager = sbproxy_vault::VaultManager::new();
+        manager.register("fixture", Box::new(vault));
+        sbproxy_vault::install_process_resolver(Arc::new(
+            sbproxy_vault::SecretResolver::new().with_manager(Arc::new(manager)),
+        ));
+        config.authentication = Some(
+            sbproxy_config::ClassifierHooksAuthenticationConfig::Bearer {
+                credential: "secret://fixture/token".to_string(),
+                header: "authorization".to_string(),
+                scheme: "Bearer".to_string(),
+            },
+        );
+        classifier_hook_security_config(&config)
+            .expect("exact provider token bound must be accepted");
+        sbproxy_vault::reset_process_resolver_for_test();
+
+        let vault = sbproxy_vault::LocalVault::new();
+        vault
+            .set_secret("token", &"p".repeat(CLASSIFIER_HOOK_MAX_AUTH_BYTES + 1))
+            .expect("store oversized provider token");
+        let mut manager = sbproxy_vault::VaultManager::new();
+        manager.register("fixture", Box::new(vault));
+        sbproxy_vault::install_process_resolver(Arc::new(
+            sbproxy_vault::SecretResolver::new().with_manager(Arc::new(manager)),
+        ));
+        let error = classifier_hook_security_config(&config).unwrap_err();
+        assert!(error.to_string().contains(
+            "proxy.classifier_hooks.authentication.credential exceeds the 256-byte limit"
+        ));
+        sbproxy_vault::reset_process_resolver_for_test();
+    }
+
+    #[test]
+    fn classifier_hook_security_config_bounds_tls_pem_material() {
+        let exact_pem = tempfile::NamedTempFile::new().expect("temp pem file");
+        exact_pem
+            .as_file()
+            .write_all(&vec![b'c'; CLASSIFIER_HOOK_MAX_PEM_BYTES])
+            .expect("write exact pem file");
+        let mut config = quality_only_config();
+        config.tls = Some(sbproxy_config::ClassifierHooksTlsConfig {
+            ca_pem: Some(format!("file:{}", exact_pem.path().display())),
+            server_name: None,
+            client_identity: None,
+        });
+        classifier_hook_security_config(&config).expect("exact PEM bound must be accepted");
+
+        let over_pem = tempfile::NamedTempFile::new().expect("temp oversized pem file");
+        over_pem
+            .as_file()
+            .write_all(&vec![b'c'; CLASSIFIER_HOOK_MAX_PEM_BYTES + 1])
+            .expect("write oversized pem file");
+        config.tls = Some(sbproxy_config::ClassifierHooksTlsConfig {
+            ca_pem: Some(format!("file:{}", over_pem.path().display())),
+            server_name: None,
+            client_identity: None,
+        });
+        let error = classifier_hook_security_config(&config).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("proxy.classifier_hooks.tls.ca_pem exceeds the 262144-byte limit"));
+    }
+
+    #[tokio::test]
+    async fn quality_hook_shares_pre_rpc_prompt_storage_across_candidates() {
+        let _fanout_probe = QualityFanoutProbe::acquire_unique().await;
+        const CANDIDATES: usize = 16;
+        let mut provider_models = HashMap::new();
+        let candidate_providers = (0..CANDIDATES)
+            .map(|index| {
+                let provider = format!("provider-{index}");
+                provider_models.insert(
+                    provider.clone(),
+                    sbproxy_config::ClassifierProviderModelConfig {
+                        model: format!("quality-{index}"),
+                        label: "suitable".to_string(),
+                    },
+                );
+                provider
+            })
+            .collect();
+        let config = sbproxy_config::ClassifierHooksConfig {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            timeout_ms: 100,
+            tls: None,
+            authentication: None,
+            intent: None,
+            quality: Some(sbproxy_config::ClassifierQualityHookConfig {
+                minimum_score: 0.75,
+                provider_models,
+            }),
+        };
+        let hook = hooks_from_config(Some(&config), None)
+            .unwrap()
+            .quality_scoring
+            .expect("quality hook configured");
+        let request = QualityRequest {
+            origin: "ai.example".to_string(),
+            model_id: Some("model-a".to_string()),
+            prompt: "large prompt ".repeat(64 * 1024),
+            candidate_providers,
+        };
+
+        let pointers = QUALITY_PROMPT_STORAGE
+            .scope(std::cell::RefCell::new(Vec::new()), async {
+                let result = hook.score_providers(&request).await;
+                assert!(
+                    result.is_none(),
+                    "dead sidecar must preserve configured routing"
+                );
+                QUALITY_PROMPT_STORAGE.with(|seen| seen.borrow().clone())
+            })
+            .await;
+        assert_eq!(pointers.len(), CANDIDATES);
+        let distinct: HashSet<_> = pointers.into_iter().collect();
+        assert_eq!(
+            distinct.len(),
+            1,
+            "quality candidates must borrow or share one full prompt allocation"
+        );
+    }
+
+    struct HoldingInferenceState {
+        active: AtomicUsize,
+        peak_active: AtomicUsize,
+        live_prompt_bytes: AtomicUsize,
+        peak_prompt_bytes: AtomicUsize,
+        total_calls: AtomicUsize,
+        small_release: tokio::sync::Semaphore,
+        large_release: tokio::sync::Semaphore,
+    }
+
+    impl HoldingInferenceState {
+        fn new() -> Self {
+            Self {
+                active: AtomicUsize::new(0),
+                peak_active: AtomicUsize::new(0),
+                live_prompt_bytes: AtomicUsize::new(0),
+                peak_prompt_bytes: AtomicUsize::new(0),
+                total_calls: AtomicUsize::new(0),
+                small_release: tokio::sync::Semaphore::new(0),
+                large_release: tokio::sync::Semaphore::new(0),
+            }
+        }
+
+        fn hold(self: &Arc<Self>, text: String) -> HeldProtoRequest {
+            let bytes = text.len();
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak_active.fetch_max(active, Ordering::SeqCst);
+            let live_bytes = self.live_prompt_bytes.fetch_add(bytes, Ordering::SeqCst) + bytes;
+            self.peak_prompt_bytes
+                .fetch_max(live_bytes, Ordering::SeqCst);
+            self.total_calls.fetch_add(1, Ordering::SeqCst);
+            HeldProtoRequest {
+                state: Arc::clone(self),
+                text,
+            }
+        }
+
+        async fn wait_for_active(&self, expected: usize, within: Duration) -> Result<(), ()> {
+            let deadline = tokio::time::Instant::now() + within;
+            loop {
+                if self.active.load(Ordering::SeqCst) == expected {
+                    return Ok(());
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(());
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        async fn wait_for_total_calls_at_least(
+            &self,
+            expected: usize,
+            within: Duration,
+        ) -> Result<(), ()> {
+            let deadline = tokio::time::Instant::now() + within;
+            loop {
+                if self.total_calls.load(Ordering::SeqCst) >= expected {
+                    return Ok(());
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(());
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    }
+
+    struct HeldProtoRequest {
+        state: Arc<HoldingInferenceState>,
+        text: String,
+    }
+
+    impl Drop for HeldProtoRequest {
+        fn drop(&mut self) {
+            self.state.active.fetch_sub(1, Ordering::SeqCst);
+            self.state
+                .live_prompt_bytes
+                .fetch_sub(self.text.len(), Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Clone)]
+    struct HoldingInference(Arc<HoldingInferenceState>);
+
+    #[tonic::async_trait]
+    impl sbproxy_classifier_proto::InferenceService for HoldingInference {
+        async fn classify(
+            &self,
+            request: tonic::Request<sbproxy_classifier_proto::ClassifyRequest>,
+        ) -> Result<tonic::Response<sbproxy_classifier_proto::ClassifyResponse>, tonic::Status>
+        {
+            let request = request.into_inner();
+            let score = request
+                .model
+                .strip_prefix("quality-")
+                .and_then(|index| index.parse::<usize>().ok())
+                .map(|index| 0.5 + index as f64 / 100.0)
+                .unwrap_or(0.5);
+            let held = self.0.hold(request.text);
+            let release = if held.text.len() <= 384 * 1024 {
+                &self.0.small_release
+            } else {
+                &self.0.large_release
+            };
+            let permit = release
+                .acquire()
+                .await
+                .map_err(|_| tonic::Status::unavailable("test release closed"))?;
+            permit.forget();
+            drop(held);
+            Ok(tonic::Response::new(
+                sbproxy_classifier_proto::ClassifyResponse {
+                    labels: vec![sbproxy_classifier_proto::Label {
+                        name: "suitable".to_string(),
+                        score,
+                    }],
+                    latency_us: 1,
+                },
+            ))
+        }
+
+        async fn embed(
+            &self,
+            _request: tonic::Request<sbproxy_classifier_proto::EmbedRequest>,
+        ) -> Result<tonic::Response<sbproxy_classifier_proto::EmbedResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("not used by quality test"))
+        }
+
+        async fn compress(
+            &self,
+            _request: tonic::Request<sbproxy_classifier_proto::CompressRequest>,
+        ) -> Result<tonic::Response<sbproxy_classifier_proto::CompressResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("not used by quality test"))
+        }
+
+        async fn model_info(
+            &self,
+            _request: tonic::Request<sbproxy_classifier_proto::ModelInfoRequest>,
+        ) -> Result<tonic::Response<sbproxy_classifier_proto::ModelInfoResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("not used by quality test"))
+        }
+
+        async fn version(
+            &self,
+            _request: tonic::Request<sbproxy_classifier_proto::VersionRequest>,
+        ) -> Result<tonic::Response<sbproxy_classifier_proto::VersionResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("not used by quality test"))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quality_hook_bounds_real_downstream_protobuf_prompt_high_water() {
+        const CANDIDATES_PER_HOOK: usize = 6;
+        const TOTAL_CANDIDATES: usize = 2 * CANDIDATES_PER_HOOK;
+        const MAX_CALLS: usize = 8;
+        const MAX_LIVE_COPIES: usize = 4;
+        const FANOUT_BYTE_BUDGET: usize = 1024 * 1024;
+        const LARGE_PROMPT_BYTES: usize = 768 * 1024;
+        const SMALL_PROMPT_BYTES: usize = 384 * 1024;
+        const MAX_PROMPT_BYTES: usize = 1024 * 1024;
+        assert_eq!(quality_fanout_limits().max_concurrent_calls(), MAX_CALLS);
+        assert_eq!(
+            quality_fanout_limits().max_live_prompt_bytes(),
+            FANOUT_BYTE_BUDGET
+        );
+        assert_eq!(quality_fanout_limits().max_prompt_bytes(), MAX_PROMPT_BYTES);
+
+        // This production probe attaches to the constructor that creates the
+        // leased `ClassifyRequest.text`, not to the earlier borrowed prompt.
+        // It observes the actual lease -> ownership -> dial sequence without
+        // supplying an alternate handler/client path.
+        let ownership_probe = QualityFanoutProbe::acquire_unique().await;
+        let state = Arc::new(HoldingInferenceState::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_state = Arc::clone(&state);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(sbproxy_classifier_proto::InferenceServiceServer::new(
+                    HoldingInference(server_state),
+                ))
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    async move {
+                        let _ = shutdown_rx.await;
+                    },
+                )
+                .await
+        });
+
+        let mut provider_models = HashMap::new();
+        let candidate_providers = (0..TOTAL_CANDIDATES)
+            .map(|index| {
+                let provider = format!("provider-{index}");
+                provider_models.insert(
+                    provider.clone(),
+                    sbproxy_config::ClassifierProviderModelConfig {
+                        model: format!("quality-{index}"),
+                        label: "suitable".to_string(),
+                    },
+                );
+                provider
+            })
+            .collect::<Vec<_>>();
+        let config = sbproxy_config::ClassifierHooksConfig {
+            endpoint: format!("http://{address}"),
+            timeout_ms: 5_000,
+            tls: None,
+            authentication: None,
+            intent: None,
+            quality: Some(sbproxy_config::ClassifierQualityHookConfig {
+                minimum_score: 0.75,
+                provider_models,
+            }),
+        };
+        let first_hook = hooks_from_config(Some(&config), None)
+            .unwrap()
+            .quality_scoring
+            .expect("first quality hook configured");
+        let second_hook = hooks_from_config(Some(&config), None)
+            .unwrap()
+            .quality_scoring
+            .expect("second quality hook configured");
+
+        let calls_before_oversize = state.total_calls.load(Ordering::SeqCst);
+        let allocations_before_oversize = ownership_probe.total_prompt_owners();
+        let oversized_result = tokio::time::timeout(
+            Duration::from_secs(3),
+            first_hook.score_providers(&QualityRequest {
+                origin: "oversized.example".to_string(),
+                model_id: Some("model-a".to_string()),
+                prompt: "o".repeat(MAX_PROMPT_BYTES + 1),
+                candidate_providers: candidate_providers[..CANDIDATES_PER_HOOK].to_vec(),
+            }),
+        )
+        .await
+        .expect("oversized fanout refusal is bounded");
+        assert!(oversized_result.is_none(), "oversized fanout fails open");
+        assert_eq!(
+            state.total_calls.load(Ordering::SeqCst),
+            calls_before_oversize
+        );
+        assert_eq!(
+            ownership_probe.total_prompt_owners(),
+            allocations_before_oversize,
+            "oversized input is rejected before protobuf ownership"
+        );
+        assert_eq!(
+            ownership_probe.dials_for_origin("oversized.example"),
+            0,
+            "oversized input must not dial the sidecar"
+        );
+
+        ownership_probe.reset_high_water();
+        let first_providers = candidate_providers[..CANDIDATES_PER_HOOK].to_vec();
+        let second_providers = candidate_providers[CANDIDATES_PER_HOOK..].to_vec();
+        let expected_first = first_providers.clone();
+        let expected_second = second_providers.clone();
+        let second_score_task = tokio::spawn(async move {
+            second_hook
+                .score_providers(&QualityRequest {
+                    origin: "second.example".to_string(),
+                    model_id: Some("model-a".to_string()),
+                    prompt: "q".repeat(SMALL_PROMPT_BYTES),
+                    candidate_providers: second_providers,
+                })
+                .await
+        });
+
+        state
+            .wait_for_active(2, Duration::from_secs(3))
+            .await
+            .expect("two 384 KiB protobuf requests fit concurrently in the one MiB owner");
+        assert_eq!(
+            state.live_prompt_bytes.load(Ordering::SeqCst),
+            2 * SMALL_PROMPT_BYTES,
+            "the accepted small-request control must exercise byte weighting, not count-one serialization"
+        );
+
+        let first_score_task = tokio::spawn(async move {
+            first_hook
+                .score_providers(&QualityRequest {
+                    origin: "first.example".to_string(),
+                    model_id: Some("model-a".to_string()),
+                    prompt: "p".repeat(LARGE_PROMPT_BYTES),
+                    candidate_providers: first_providers,
+                })
+                .await
+        });
+        ownership_probe
+            .wait_for_origin_blocked_on_byte_budget("first.example", Duration::from_secs(3))
+            .await
+            .expect("a 768 KiB request cannot consume the 256 KiB remainder");
+        let first_blocks_before_drain =
+            ownership_probe.byte_budget_blocks_for_origin("first.example");
+        assert_eq!(
+            ownership_probe.dials_for_origin("first.example"),
+            0,
+            "the large request remains before allocation and dial while only 256 KiB is free"
+        );
+        let peak_active = state.peak_active.load(Ordering::SeqCst);
+        let peak_prompt_bytes = state.peak_prompt_bytes.load(Ordering::SeqCst);
+        assert_eq!(peak_active, 2);
+        assert_eq!(peak_prompt_bytes, 2 * SMALL_PROMPT_BYTES);
+        assert_eq!(
+            ownership_probe.distinct_budget_owner_ids(),
+            1,
+            "independently built hooks share the same process fanout owner"
+        );
+        assert_eq!(
+            ownership_probe.prompt_owners_without_prior_lease(),
+            0,
+            "the byte lease precedes every real ClassifyRequest.text allocation"
+        );
+        assert_eq!(
+            ownership_probe.dials_without_prompt_lease(),
+            0,
+            "every dial remains inside the weighted prompt lease"
+        );
+        assert!(
+            ownership_probe.peak_leased_prompt_bytes() <= FANOUT_BYTE_BUDGET,
+            "weighted lease high-water exceeded its process budget"
+        );
+        assert!(
+            ownership_probe.peak_owned_prompt_bytes() <= FANOUT_BYTE_BUDGET,
+            "protobuf strings were allocated ahead of the weighted gate"
+        );
+        // Keep one small request live while admitting each queued small
+        // candidate. If both initial requests are released together, the
+        // intentionally non-FIFO weighted gate may admit a large request
+        // first and this test would wait on the wrong release semaphore.
+        for expected_total_calls in 3..=CANDIDATES_PER_HOOK {
+            state.small_release.add_permits(1);
+            state
+                .wait_for_total_calls_at_least(expected_total_calls, Duration::from_secs(3))
+                .await
+                .expect("the next small candidate is admitted before releasing another");
+        }
+        state.small_release.add_permits(2);
+        let second_scores = tokio::time::timeout(Duration::from_secs(3), second_score_task)
+            .await
+            .expect("all small-prompt candidate calls finish")
+            .unwrap()
+            .expect("every small-prompt classifier response is accepted");
+        state
+            .wait_for_active(1, Duration::from_secs(3))
+            .await
+            .expect("after the small origin drains exactly one 768 KiB protobuf body is live");
+        assert_eq!(
+            state.live_prompt_bytes.load(Ordering::SeqCst),
+            LARGE_PROMPT_BYTES,
+            "a global count-two mutation would hold two large bodies and exceed one MiB"
+        );
+        ownership_probe
+            .wait_for_origin_byte_budget_blocks(
+                "first.example",
+                first_blocks_before_drain + 1,
+                Duration::from_secs(3),
+            )
+            .await
+            .expect("the next large candidate remains pre-allocation behind the first");
+        state.large_release.add_permits(CANDIDATES_PER_HOOK);
+        let first_scores = tokio::time::timeout(Duration::from_secs(3), first_score_task)
+            .await
+            .expect("all large-prompt candidate calls finish")
+            .unwrap()
+            .expect("every large-prompt classifier response is accepted");
+        let total_calls = state.total_calls.load(Ordering::SeqCst);
+        let final_peak_active = state.peak_active.load(Ordering::SeqCst);
+        let final_peak_prompt_bytes = state.peak_prompt_bytes.load(Ordering::SeqCst);
+        let final_peak_leased_prompt_bytes = ownership_probe.peak_leased_prompt_bytes();
+        let final_peak_owned_prompt_bytes = ownership_probe.peak_owned_prompt_bytes();
+
+        state
+            .wait_for_active(0, Duration::from_secs(3))
+            .await
+            .expect("all downstream response children exit before listener cleanup");
+        assert_eq!(state.live_prompt_bytes.load(Ordering::SeqCst), 0);
+        assert!(
+            !server.is_finished(),
+            "local downstream listener exited before explicit cleanup"
+        );
+        shutdown_tx
+            .send(())
+            .expect("local downstream shutdown receiver remains owned");
+        let server_join = tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("local downstream server joins before its cleanup deadline")
+            .expect("local downstream listener task must not panic");
+        server_join.expect("local downstream listener reports clean graceful shutdown");
+
+        assert_eq!(total_calls, TOTAL_CANDIDATES);
+        assert_eq!(
+            first_scores
+                .iter()
+                .map(|score| score.provider.as_str())
+                .collect::<Vec<_>>(),
+            expected_first
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            "bounded unordered execution must restore first-hook candidate order"
+        );
+        assert_eq!(
+            second_scores
+                .iter()
+                .map(|score| score.provider.as_str())
+                .collect::<Vec<_>>(),
+            expected_second
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            "bounded unordered execution must restore second-hook candidate order"
+        );
+        assert!(
+            final_peak_active <= MAX_LIVE_COPIES,
+            "{final_peak_active} decoded protobuf prompt copies were live; maximum is {MAX_LIVE_COPIES}"
+        );
+        assert!(
+            final_peak_prompt_bytes <= FANOUT_BYTE_BUDGET,
+            "{final_peak_prompt_bytes} unequal live prompt bytes exceeded the weighted downstream budget"
+        );
+        assert!(final_peak_leased_prompt_bytes <= FANOUT_BYTE_BUDGET);
+        assert!(final_peak_owned_prompt_bytes <= FANOUT_BYTE_BUDGET);
+        assert_eq!(ownership_probe.total_prompt_owners(), TOTAL_CANDIDATES);
+        assert_eq!(
+            ownership_probe.total_prompt_owners_for_origin("first.example"),
+            CANDIDATES_PER_HOOK
+        );
+        assert_eq!(
+            ownership_probe.total_prompt_owners_for_origin("second.example"),
+            CANDIDATES_PER_HOOK
+        );
+        ownership_probe.assert_every_owner_released_exactly_once();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quality_fanout_admits_feasible_calls_without_cross_resource_hold_and_wait() {
+        const LARGE_PROMPT_BYTES: usize = 768 * 1024;
+        const SMALL_PROMPT_BYTES: usize = 256 * 1024;
+        const BLOCKED_LARGE_CALLS: usize = 7;
+
+        let ownership_probe = QualityFanoutProbe::acquire_unique().await;
+        let runtime = QualityFanoutRuntime::shared();
+        let large_lease = runtime
+            .acquire(LARGE_PROMPT_BYTES, "large-owner.example".to_string())
+            .await
+            .expect("the first large prompt fits");
+
+        let mut blocked = Vec::with_capacity(BLOCKED_LARGE_CALLS);
+        for _ in 0..BLOCKED_LARGE_CALLS {
+            blocked.push(tokio::spawn(async {
+                QualityFanoutRuntime::shared()
+                    .acquire(LARGE_PROMPT_BYTES, "large-waiters.example".to_string())
+                    .await
+            }));
+        }
+        ownership_probe
+            .wait_for_origin_byte_budget_blocks(
+                "large-waiters.example",
+                BLOCKED_LARGE_CALLS,
+                Duration::from_secs(3),
+            )
+            .await
+            .expect("every additional large call waits on bytes without owning call capacity");
+
+        let small_lease = tokio::time::timeout(
+            Duration::from_secs(3),
+            runtime.acquire(SMALL_PROMPT_BYTES, "small-owner.example".to_string()),
+        )
+        .await
+        .expect("a feasible small call is not starved by byte waiters")
+        .expect("the small prompt fits exactly in the remaining budget");
+        assert_eq!(
+            ownership_probe.current_leased_prompt_bytes(),
+            quality_fanout_limits().max_live_prompt_bytes()
+        );
+        assert_eq!(ownership_probe.current_call_leases(), 2);
+
+        for waiter in blocked {
+            waiter.abort();
+            match waiter.await {
+                Err(error) => assert!(error.is_cancelled()),
+                Ok(_) => panic!("cancelled byte waiter must not acquire a lease"),
+            }
+        }
+        drop(small_lease);
+        drop(large_lease);
+        ownership_probe
+            .wait_for_no_live_leases(Duration::from_secs(3))
+            .await
+            .expect("mixed-size admission returns all capacity");
+        ownership_probe.assert_every_weighted_lease_released_exactly_once();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quality_hook_timeout_returns_weighted_leases_and_full_capacity_recovers() {
+        const CANDIDATES: usize = 6;
+        const FANOUT_BYTE_BUDGET: usize = 1024 * 1024;
+        const MAX_CALLS: usize = 8;
+        const MAX_RECOVERY_ACTIVE_CALLS: usize = 4;
+        const TIMED_PROMPT_BYTES: usize = 384 * 1024;
+        const RECOVERY_PROMPT_BYTES: usize = 256 * 1024;
+
+        fn config(
+            endpoint: String,
+            timeout_ms: u64,
+            candidate_providers: &[String],
+        ) -> sbproxy_config::ClassifierHooksConfig {
+            let provider_models = candidate_providers
+                .iter()
+                .enumerate()
+                .map(|(index, provider)| {
+                    (
+                        provider.clone(),
+                        sbproxy_config::ClassifierProviderModelConfig {
+                            model: format!("quality-{index}"),
+                            label: "suitable".to_string(),
+                        },
+                    )
+                })
+                .collect();
+            sbproxy_config::ClassifierHooksConfig {
+                endpoint,
+                timeout_ms,
+                tls: None,
+                authentication: None,
+                intent: None,
+                quality: Some(sbproxy_config::ClassifierQualityHookConfig {
+                    minimum_score: 0.75,
+                    provider_models,
+                }),
+            }
+        }
+
+        let ownership_probe = QualityFanoutProbe::acquire_unique().await;
+        let state = Arc::new(HoldingInferenceState::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_state = Arc::clone(&state);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(sbproxy_classifier_proto::InferenceServiceServer::new(
+                    HoldingInference(server_state),
+                ))
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    async move {
+                        let _ = shutdown_rx.await;
+                    },
+                )
+                .await
+        });
+        let candidate_providers = (0..CANDIDATES)
+            .map(|index| format!("provider-{index}"))
+            .collect::<Vec<_>>();
+
+        let timeout_hook = hooks_from_config(
+            Some(&config(
+                format!("http://{address}"),
+                5_000,
+                &candidate_providers,
+            )),
+            None,
+        )
+        .unwrap()
+        .quality_scoring
+        .unwrap();
+        let timed_candidates = candidate_providers.clone();
+        let timed = tokio::spawn(async move {
+            timeout_hook
+                .score_providers(&QualityRequest {
+                    origin: "timeout.example".to_string(),
+                    model_id: Some("model-a".to_string()),
+                    prompt: "t".repeat(TIMED_PROMPT_BYTES),
+                    candidate_providers: timed_candidates,
+                })
+                .await
+        });
+        state
+            .wait_for_active(2, Duration::from_secs(3))
+            .await
+            .expect("two weighted requests are live beyond the shared hook timeout");
+        assert_eq!(
+            state.live_prompt_bytes.load(Ordering::SeqCst),
+            2 * TIMED_PROMPT_BYTES
+        );
+        assert_eq!(
+            ownership_probe.current_leased_prompt_bytes(),
+            2 * TIMED_PROMPT_BYTES
+        );
+        assert_eq!(
+            ownership_probe.current_owned_prompt_bytes(),
+            2 * TIMED_PROMPT_BYTES
+        );
+
+        let timed_result = tokio::time::timeout(Duration::from_secs(7), timed)
+            .await
+            .expect("the shared quality-hook timeout has one outer deadline")
+            .expect("the timed quality task does not panic");
+        assert!(
+            timed_result.is_none(),
+            "quality timeout preserves fail-open policy"
+        );
+        state
+            .wait_for_active(0, Duration::from_secs(3))
+            .await
+            .expect("cancelling the timed hook drops every real downstream handler");
+        ownership_probe
+            .wait_for_no_live_leases(Duration::from_secs(3))
+            .await
+            .expect("timeout cancellation returns every weighted process lease");
+        assert_eq!(ownership_probe.current_leased_prompt_bytes(), 0);
+        assert_eq!(ownership_probe.current_owned_prompt_bytes(), 0);
+        assert_eq!(ownership_probe.current_call_leases(), 0);
+        assert_eq!(ownership_probe.available_call_permits(), MAX_CALLS);
+        assert_eq!(ownership_probe.available_prompt_bytes(), FANOUT_BYTE_BUDGET);
+        assert_eq!(
+            ownership_probe.total_prompt_owners_for_origin("timeout.example"),
+            2,
+            "blocked candidates must be cancelled before protobuf ownership"
+        );
+
+        let recovery_hook = hooks_from_config(
+            Some(&config(
+                format!("http://{address}"),
+                10_000,
+                &candidate_providers,
+            )),
+            None,
+        )
+        .unwrap()
+        .quality_scoring
+        .unwrap();
+        let recovery_candidates = candidate_providers.clone();
+        let recovery = tokio::spawn(async move {
+            recovery_hook
+                .score_providers(&QualityRequest {
+                    origin: "recovery.example".to_string(),
+                    model_id: Some("model-a".to_string()),
+                    prompt: "r".repeat(RECOVERY_PROMPT_BYTES),
+                    candidate_providers: recovery_candidates,
+                })
+                .await
+        });
+        state
+            .wait_for_active(MAX_RECOVERY_ACTIVE_CALLS, Duration::from_secs(3))
+            .await
+            .expect("the next hook reuses the full one-MiB byte budget without shrinking the global call budget");
+        assert_eq!(
+            state.live_prompt_bytes.load(Ordering::SeqCst),
+            FANOUT_BYTE_BUDGET
+        );
+        assert_eq!(
+            ownership_probe.current_leased_prompt_bytes(),
+            FANOUT_BYTE_BUDGET
+        );
+        state.small_release.add_permits(CANDIDATES);
+        let recovered = tokio::time::timeout(Duration::from_secs(3), recovery)
+            .await
+            .expect("post-timeout full-capacity hook has one outer deadline")
+            .expect("post-timeout quality task does not panic")
+            .expect("post-timeout hook evaluates every candidate");
+        assert_eq!(recovered.len(), CANDIDATES);
+        state
+            .wait_for_active(0, Duration::from_secs(3))
+            .await
+            .expect("every recovered downstream response child exits");
+        ownership_probe
+            .wait_for_no_live_leases(Duration::from_secs(3))
+            .await
+            .expect("recovery also returns every weighted lease");
+        assert_eq!(ownership_probe.available_call_permits(), MAX_CALLS);
+        assert_eq!(ownership_probe.available_prompt_bytes(), FANOUT_BYTE_BUDGET);
+        assert_eq!(
+            ownership_probe.total_prompt_owners_for_origin("recovery.example"),
+            CANDIDATES
+        );
+        ownership_probe.assert_every_owner_released_exactly_once();
+        ownership_probe.assert_every_weighted_lease_released_exactly_once();
+        assert_eq!(state.live_prompt_bytes.load(Ordering::SeqCst), 0);
+        assert!(
+            !server.is_finished(),
+            "timeout fixture listener exited before explicit cleanup"
+        );
+        shutdown_tx
+            .send(())
+            .expect("timeout fixture shutdown receiver remains owned");
+        let join = tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("timeout fixture listener joins before cleanup deadline")
+            .expect("timeout fixture listener task must not panic");
+        join.expect("timeout fixture listener reports clean graceful shutdown");
     }
 }

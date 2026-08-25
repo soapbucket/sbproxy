@@ -1,6 +1,6 @@
 # Classifier Sidecar
 
-*Last modified: 2026-08-22*
+*Last modified: 2026-08-25*
 
 SBproxy heavily invests in out-of-process AI safety via the `sbproxy-classifier-sidecar`, `sbproxy-classifier`, and `sbproxy-classifier-client` crates. These components allow you to run remote or local Machine Learning safety classifiers (e.g., prompt injection detection, PII detection, toxicity) outside of the main proxy process using gRPC, plus (for `sbproxy-classifier`) TCP + MessagePack.
 
@@ -44,6 +44,56 @@ cargo run -p sbproxy-classifier-sidecar -- \
   --listen-uds /run/sbproxy/classifier.sock \
   --model prompt-injection=/opt/models/deberta-injection.onnx:/opt/models/tokenizer.json
 ```
+
+### Optional bearer auth and TLS on the gRPC listener
+
+Both sidecar binaries can harden their gRPC listener with the same controls:
+
+| Flag | Meaning |
+|---|---|
+| `--inference-token-file` | Require `authorization: Bearer <token>` on every gRPC RPC on that listener. |
+| `--listen-tls-cert-file` + `--listen-tls-key-file` | Serve the gRPC listener over TLS. Both flags are required together. |
+| `--listen-tls-client-ca-file` | Verify client certificates against this CA bundle and, by default, require one on every TLS connection. |
+| `--listen-tls-client-auth-optional` | Only with `--listen-tls-client-ca-file`: verify any presented client certificate but do not require one. |
+
+The token file is JSON shaped like:
+
+```json
+{"tokens":["secret-token-a","secret-token-b"]}
+```
+
+The sidecars validate these files before the first bind:
+
+- the inference-token file must be a regular file, no-follow, at most 256 KiB,
+  with at least one token, at most 1024 tokens total, and each token at most
+  256 bytes;
+- on Unix, the inference-token file and the TLS private-key file are refused
+  if any group/other permission bit is set;
+- TLS certificate, key, and optional client-CA PEM files are each capped at
+  256 KiB;
+- inconsistent TLS flag sets and invalid PEM fail startup before the listener
+  binds or publishes readiness.
+
+Secret material is not echoed back in diagnostics: the sidecars' debug output
+and client-side debug output redact bearer credentials and PEM contents, while
+startup errors identify the flag or file path rather than printing the secret
+itself.
+
+Example: minimal sidecar with bearer auth plus mutually authenticated TLS:
+
+```bash
+cargo run -p sbproxy-classifier-sidecar -- \
+  --listen 127.0.0.1:9440 \
+  --model prompt-injection=/opt/models/deberta-injection.onnx:/opt/models/tokenizer.json \
+  --inference-token-file /etc/sbproxy/classifier-auth.json \
+  --listen-tls-cert-file /etc/sbproxy/classifier-server-cert.pem \
+  --listen-tls-key-file /etc/sbproxy/classifier-server-key.pem \
+  --listen-tls-client-ca-file /etc/sbproxy/classifier-client-ca.pem
+```
+
+Bearer auth works on TCP or UDS. TLS is TCP-only:
+`sbproxy-classifier-sidecar` rejects the TLS flags when `--listen-uds` is
+used.
 
 ## 3. Request Limits and Load Shedding
 
@@ -215,7 +265,17 @@ policies:
         injection_label: INJECTION
 ```
 
-`model` selects the sidecar classifier by the id used on `--model` above (`prompt-injection` in the example). `fallback` is required and is verified and loaded at config construction, before traffic can be served. It handles transport, timeout, RPC, admission, and response-validation failures from the primary. See [local-inference.md](local-inference.md#enable-first-class-onnx-prompt-injection) for the full local artifact field reference.
+`model` selects the sidecar classifier by the id used on `--model` above
+(`prompt-injection` in the example). `fallback` is required and is verified
+and loaded at config construction, before traffic can be served. It handles
+transport, timeout, RPC, admission, and response-validation failures from the
+primary. See
+[local-inference.md](local-inference.md#enable-first-class-onnx-prompt-injection)
+for the full local artifact field reference.
+
+This detector surface is still loopback/plain-HTTP only. The authenticated
+remote-sidecar path is `proxy.classifier_hooks`, which can dial either sidecar
+over `https://` with bearer metadata, a custom CA, and optional client mTLS.
 
 See [`examples/prompt-injection-sidecar/`](../examples/prompt-injection-sidecar/) for a complete working config, including both a `tag` and a `block` origin against the same sidecar.
 
@@ -261,7 +321,66 @@ cargo run -p sbproxy-classifier -- \
   --model prompt-injection=/models/model.onnx:/models/tokenizer.json
 ```
 
-`--model` / `--embed-model` / `--default-model` / `--default-embed-model` mirror the minimal sidecar's flags of the same name. `/healthz`, `/readyz`, `/metrics` (Prometheus text), and `/tenants` are served on `--metrics-addr`.
+`--model` / `--embed-model` / `--default-model` / `--default-embed-model`
+mirror the minimal sidecar's flags of the same name. `/healthz`, `/readyz`,
+`/metrics` (Prometheus text), and `/tenants` are served on `--metrics-addr`.
+`/tenants` is an authenticated, bounded paging endpoint: send
+`Authorization: Bearer <admin-token>` and use `page_size` (default 32) plus
+the returned tenant-id `cursor` to traverse the registry. The response
+includes only tenants visible to that token; malformed, duplicate, or unknown
+query parameters are rejected.
+
+The gRPC listener on `--listen` accepts the same `--inference-token-file` and
+`--listen-tls-*` hardening flags described in section 2. On the rich binary
+they protect both the shared `InferenceService` RPCs and the rich-only
+`ClassifierService` RPCs (`Quality`, `StreamSafety`). These controls are
+independent of `--admin-token-file`, which still applies only to the admin TCP
+listener and `/tenants` on `--metrics-addr`.
+
+The rich sidecar validates its configurable refusal limits before binding any
+listener or publishing readiness:
+
+| Flag | Default | Accepted maximum |
+|---|---:|---:|
+| `--inference-max-running` | `4` | `64` |
+| `--inference-max-queued` | `32` | `1024` |
+| `--inference-deadline-ms` | `5000` | `30000` |
+| `--tcp-max-connections` | `128` | `128` |
+| `--tcp-io-timeout-ms` | `5000` | `60000` |
+
+Running connections and both deadlines must be at least one; the inference
+queue alone may be zero. The TCP connection limit applies independently to
+the public and optional admin listeners, while both listeners share the same
+16 MiB in-flight frame-byte budget. Each frame remains capped at 4 MiB, and
+the process acquires its share of the aggregate budget before allocating the
+caller-declared body. A client that exhausts that budget is disconnected.
+
+Other rich-sidecar refusal limits are fixed:
+
+| Surface | Limit |
+|---|---:|
+| gRPC text in one `Classify`, `Quality`, or `Embed` request | 1 MiB |
+| gRPC `Embed` batch | 64 items and 1 MiB aggregate text |
+| gRPC `StreamSafety` stream | 4096 chunks and 1 MiB aggregate token text |
+| gRPC `StreamSafety` first-message rules | 64 rules and 64 KiB aggregate rule text |
+| TCP MessagePack frame | 4 MiB per frame; 16 MiB in flight process-wide |
+| HTTP health/metrics connections | 128, each with a 5-second whole-connection deadline |
+| HTTP request line plus headers | 8192 bytes, including the required blank header terminator |
+| Admin token file | 256 KiB and 1024 token grants |
+| Admin token grant | 256-byte token and 1024 tenant scopes |
+| Admin tenant scope | 128 bytes |
+| Inference token file | 256 KiB and 1024 bearer tokens |
+| Inference bearer token | 256 bytes |
+| Listener TLS certificate, key, and client-CA files | 256 KiB each |
+
+An admin token path must open as a regular file. On Unix the sidecar opens it
+nonblocking and with no-follow enabled, then checks file type, group/other
+permission bits, size, and contents through that same descriptor. It does not
+follow a final symlink and refuses FIFOs, sockets, devices, and directories;
+this prevents a no-writer FIFO from blocking startup. Use mode `0600` for the
+file (the enforced rule is that no group or other permission bit may be set).
+The optional `--listen-admin` address must be loopback and requires
+`--admin-token-file`.
 
 ### The optional-degrade architecture
 
@@ -299,7 +418,7 @@ The two tiers coexist: local ONNX is the zero-extra-process baseline and verifie
 
 ### Metrics
 
-`sbproxy-classifier` exposes seven Prometheus families on `--metrics-addr`'s `/metrics` (see `crates/sbproxy-classifier/src/metrics.rs`): `sbproxy_classifier_admission_queue{cmd}`, `sbproxy_classifier_admission_refusals_total{cmd,reason}`, `sbproxy_classifier_requests_total{transport,cmd}`, `sbproxy_classifier_errors_total{transport,cmd,reason}`, `sbproxy_classifier_tenants`, `sbproxy_classifier_quality_score{transport}`, and `sbproxy_classifier_safety_verdicts_total{verdict}`. All seven are in the central [metric stability catalog](metrics-stability.md), even though this standalone process serves them from its own scrape endpoint. `dashboards/grafana/sbproxy-classifier.json` graphs all seven; import it alongside the existing `sbproxy-model-host.json` and `sbproxy-mesh-storage.json` dashboards, which chart their own similarly out-of-process binaries the same way.
+`sbproxy-classifier` exposes eleven Prometheus families on `--metrics-addr`'s `/metrics` (see `crates/sbproxy-classifier/src/metrics.rs`). The typed lifecycle families are `sbproxy_classifier_attempts_total{transport,cmd}`, `sbproxy_classifier_completions_total{transport,cmd}`, and `sbproxy_classifier_terminal_outcomes_total{transport,cmd,stage,reason}`; together they distinguish accepted work, responses that reached their completion boundary, and every non-success terminal outcome. `sbproxy_classifier_startup_owner_info{entrypoint,owner}` attests that the shipped release entrypoint owns the prepared runtime capability used by all three listener owners. Compatibility and domain-specific families remain `sbproxy_classifier_requests_total{transport,cmd}`, `sbproxy_classifier_errors_total{transport,cmd,reason}`, `sbproxy_classifier_admission_queue{cmd}`, `sbproxy_classifier_admission_refusals_total{cmd,reason}`, `sbproxy_classifier_tenants`, `sbproxy_classifier_quality_score{transport}`, and `sbproxy_classifier_safety_verdicts_total{verdict}`. All eleven are in the central [metric stability catalog](metrics-stability.md) and graphed by `dashboards/grafana/sbproxy-classifier.json`, even though this standalone process serves them from its own scrape endpoint. Import the dashboard alongside `sbproxy-model-host.json` and `sbproxy-mesh-storage.json`, which chart their own similarly out-of-process binaries the same way.
 
 ## See also
 

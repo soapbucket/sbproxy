@@ -1466,9 +1466,18 @@ impl AiHandlerConfig {
              the `resilience:` block rather than a sibling of it"
         );
         let mut config: Self = serde_json::from_value(value)?;
+        let mut chargeback_sink_index = None;
         for (index, sink) in config.usage_sinks.iter().enumerate() {
             sink.validate()
                 .map_err(|error| anyhow::anyhow!("ai usage_sinks[{index}]: {error}"))?;
+            if matches!(sink, crate::usage_sink::UsageSinkConfig::Chargeback { .. }) {
+                if let Some(first_index) = chargeback_sink_index {
+                    anyhow::bail!(
+                        "ai usage_sinks[{index}]: only one `type: chargeback` sink is allowed per ai_proxy action (first at usage_sinks[{first_index}])"
+                    );
+                }
+                chargeback_sink_index = Some(index);
+            }
         }
         // WOR-2556: a typed fallback list is an aimed allowlist. A name
         // matching no provider would leave the trigger configured and
@@ -3064,6 +3073,27 @@ mod tests {
             .to_string();
         assert!(error.contains("usage_sinks[0]"), "{error}");
         assert!(error.contains("max_entries"), "{error}");
+    }
+
+    #[test]
+    fn second_chargeback_sink_is_rejected_at_config_load() {
+        let action = serde_json::json!({
+            "providers": [{"name": "openai", "api_key": "k", "models": ["gpt-4o-mini"]}],
+            "usage_sinks": [
+                {"type": "chargeback"},
+                {"type": "chargeback"}
+            ]
+        });
+
+        let error = AiHandlerConfig::from_config(action)
+            .expect_err("a second chargeback sink must fail before sinks are built")
+            .to_string();
+        assert!(error.contains("usage_sinks[1]"), "{error}");
+        assert!(
+            error.contains("only one `type: chargeback` sink"),
+            "{error}"
+        );
+        assert!(error.contains("usage_sinks[0]"), "{error}");
     }
 
     #[test]

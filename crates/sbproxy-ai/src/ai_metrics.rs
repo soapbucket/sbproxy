@@ -2793,6 +2793,26 @@ pub(crate) fn replica_selection_excluded_value(stage: &str) -> f64 {
 
 // --- Chargeback retention metrics ---
 
+/// Closed reasons a chargeback tracker can become incomplete on the
+/// production record/retention path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChargebackIncompleteReason {
+    /// At least one chargeback row was refused.
+    RefusedRow,
+    /// An evicted retained row carried an untrustworthy timestamp, so the
+    /// eviction watermark interval is poisoned.
+    EvictionWatermarkPoisoned,
+}
+
+impl ChargebackIncompleteReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::RefusedRow => "refused_row",
+            Self::EvictionWatermarkPoisoned => "eviction_watermark_poisoned",
+        }
+    }
+}
+
 /// Raw chargeback rows evicted from bounded in-memory retention.
 static AI_CHARGEBACK_ENTRIES_EVICTED: LazyLock<Option<Counter>> = LazyLock::new(|| {
     match register_counter!(
@@ -2832,6 +2852,48 @@ static AI_CHARGEBACK_ROLLUPS_COLLAPSED: LazyLock<Option<CounterVec>> = LazyLock:
     }
 });
 
+/// Chargeback rows refused before exact accounting could commit.
+static AI_CHARGEBACK_REFUSALS: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
+    match register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_chargeback_refusals_total",
+            "Chargeback rows refused before exact accounting could commit, by closed reason"
+        ),
+        &["reason"]
+    ) {
+        Ok(counter) => Some(counter),
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                metric = "sbproxy_ai_chargeback_refusals_total",
+                "failed to register chargeback metric"
+            );
+            None
+        }
+    }
+});
+
+/// Chargeback incompleteness causes observed on the live record path.
+static AI_CHARGEBACK_INCOMPLETE: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
+    match register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_chargeback_incomplete_total",
+            "Chargeback incompleteness causes observed on the live record and retention path"
+        ),
+        &["reason"]
+    ) {
+        Ok(counter) => Some(counter),
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                metric = "sbproxy_ai_chargeback_incomplete_total",
+                "failed to register chargeback metric"
+            );
+            None
+        }
+    }
+});
+
 pub(crate) fn record_chargeback_entry_evicted() {
     if let Some(counter) = AI_CHARGEBACK_ENTRIES_EVICTED.as_ref() {
         counter.inc();
@@ -2845,9 +2907,105 @@ pub(crate) fn record_chargeback_rollup_collapsed(dimension: &'static str) {
     }
 }
 
+/// Count one chargeback record refusal on
+/// `sbproxy_ai_chargeback_refusals_total{reason}`.
+///
+/// The `reason` label is derived from the closed
+/// [`crate::billing::chargeback::ChargebackRecordError`] vocabulary. The
+/// current label set is:
+/// `invalid_cost`, `invalid_timestamp`,
+/// `tracker_recorded_entries_overflow`, `tracker_request_count_overflow`,
+/// `tracker_tokens_overflow`, `tracker_cost_overflow`,
+/// `workspace_recorded_entries_overflow`,
+/// `workspace_request_count_overflow`, `workspace_tokens_overflow`,
+/// `workspace_cost_overflow`, `team_recorded_entries_overflow`,
+/// `team_request_count_overflow`,
+/// `team_tokens_overflow`, and `team_cost_overflow`.
+pub fn record_chargeback_refusal(error: crate::billing::chargeback::ChargebackRecordError) {
+    let reason = chargeback_refusal_reason(error);
+    if let Some(counter) = AI_CHARGEBACK_REFUSALS.as_ref() {
+        counter.with_label_values(&[reason]).inc();
+    }
+}
+
+fn chargeback_refusal_reason(
+    error: crate::billing::chargeback::ChargebackRecordError,
+) -> &'static str {
+    use crate::billing::chargeback::{
+        ChargebackOverflowField, ChargebackOverflowScope, ChargebackRecordError,
+    };
+
+    match error {
+        ChargebackRecordError::InvalidCost => "invalid_cost",
+        ChargebackRecordError::InvalidTimestamp => "invalid_timestamp",
+        ChargebackRecordError::ArithmeticOverflow {
+            scope: ChargebackOverflowScope::Tracker,
+            field: ChargebackOverflowField::RecordedEntries,
+        } => "tracker_recorded_entries_overflow",
+        ChargebackRecordError::ArithmeticOverflow {
+            scope: ChargebackOverflowScope::Tracker,
+            field: ChargebackOverflowField::RequestCount,
+        } => "tracker_request_count_overflow",
+        ChargebackRecordError::ArithmeticOverflow {
+            scope: ChargebackOverflowScope::Tracker,
+            field: ChargebackOverflowField::Tokens,
+        } => "tracker_tokens_overflow",
+        ChargebackRecordError::ArithmeticOverflow {
+            scope: ChargebackOverflowScope::Tracker,
+            field: ChargebackOverflowField::Cost,
+        } => "tracker_cost_overflow",
+        ChargebackRecordError::ArithmeticOverflow {
+            scope: ChargebackOverflowScope::Workspace,
+            field: ChargebackOverflowField::RecordedEntries,
+        } => "workspace_recorded_entries_overflow",
+        ChargebackRecordError::ArithmeticOverflow {
+            scope: ChargebackOverflowScope::Workspace,
+            field: ChargebackOverflowField::RequestCount,
+        } => "workspace_request_count_overflow",
+        ChargebackRecordError::ArithmeticOverflow {
+            scope: ChargebackOverflowScope::Workspace,
+            field: ChargebackOverflowField::Tokens,
+        } => "workspace_tokens_overflow",
+        ChargebackRecordError::ArithmeticOverflow {
+            scope: ChargebackOverflowScope::Workspace,
+            field: ChargebackOverflowField::Cost,
+        } => "workspace_cost_overflow",
+        ChargebackRecordError::ArithmeticOverflow {
+            scope: ChargebackOverflowScope::Team,
+            field: ChargebackOverflowField::RecordedEntries,
+        } => "team_recorded_entries_overflow",
+        ChargebackRecordError::ArithmeticOverflow {
+            scope: ChargebackOverflowScope::Team,
+            field: ChargebackOverflowField::RequestCount,
+        } => "team_request_count_overflow",
+        ChargebackRecordError::ArithmeticOverflow {
+            scope: ChargebackOverflowScope::Team,
+            field: ChargebackOverflowField::Tokens,
+        } => "team_tokens_overflow",
+        ChargebackRecordError::ArithmeticOverflow {
+            scope: ChargebackOverflowScope::Team,
+            field: ChargebackOverflowField::Cost,
+        } => "team_cost_overflow",
+    }
+}
+
+/// Count one chargeback incompleteness observation on
+/// `sbproxy_ai_chargeback_incomplete_total{reason}`.
+///
+/// Wire this at the transition that makes a tracker incomplete, not at
+/// every later read of an already-incomplete snapshot.
+pub fn record_chargeback_incomplete(reason: ChargebackIncompleteReason) {
+    if let Some(counter) = AI_CHARGEBACK_INCOMPLETE.as_ref() {
+        counter.with_label_values(&[reason.as_str()]).inc();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::billing::chargeback::{
+        ChargebackOverflowField, ChargebackOverflowScope, ChargebackRecordError,
+    };
 
     #[test]
     fn bedrock_inline_verdict_is_labeled_separately_from_apply_guardrail() {
@@ -2868,6 +3026,102 @@ mod tests {
             "unknown",
             "the set stays closed; only the exact spelling is admitted"
         );
+    }
+
+    #[test]
+    fn chargeback_refusal_reason_labels_cover_the_closed_error_vocabulary() {
+        let cases = [
+            (ChargebackRecordError::InvalidCost, "invalid_cost"),
+            (ChargebackRecordError::InvalidTimestamp, "invalid_timestamp"),
+            (
+                ChargebackRecordError::ArithmeticOverflow {
+                    scope: ChargebackOverflowScope::Tracker,
+                    field: ChargebackOverflowField::RecordedEntries,
+                },
+                "tracker_recorded_entries_overflow",
+            ),
+            (
+                ChargebackRecordError::ArithmeticOverflow {
+                    scope: ChargebackOverflowScope::Tracker,
+                    field: ChargebackOverflowField::RequestCount,
+                },
+                "tracker_request_count_overflow",
+            ),
+            (
+                ChargebackRecordError::ArithmeticOverflow {
+                    scope: ChargebackOverflowScope::Tracker,
+                    field: ChargebackOverflowField::Tokens,
+                },
+                "tracker_tokens_overflow",
+            ),
+            (
+                ChargebackRecordError::ArithmeticOverflow {
+                    scope: ChargebackOverflowScope::Tracker,
+                    field: ChargebackOverflowField::Cost,
+                },
+                "tracker_cost_overflow",
+            ),
+            (
+                ChargebackRecordError::ArithmeticOverflow {
+                    scope: ChargebackOverflowScope::Workspace,
+                    field: ChargebackOverflowField::RecordedEntries,
+                },
+                "workspace_recorded_entries_overflow",
+            ),
+            (
+                ChargebackRecordError::ArithmeticOverflow {
+                    scope: ChargebackOverflowScope::Workspace,
+                    field: ChargebackOverflowField::RequestCount,
+                },
+                "workspace_request_count_overflow",
+            ),
+            (
+                ChargebackRecordError::ArithmeticOverflow {
+                    scope: ChargebackOverflowScope::Workspace,
+                    field: ChargebackOverflowField::Tokens,
+                },
+                "workspace_tokens_overflow",
+            ),
+            (
+                ChargebackRecordError::ArithmeticOverflow {
+                    scope: ChargebackOverflowScope::Workspace,
+                    field: ChargebackOverflowField::Cost,
+                },
+                "workspace_cost_overflow",
+            ),
+            (
+                ChargebackRecordError::ArithmeticOverflow {
+                    scope: ChargebackOverflowScope::Team,
+                    field: ChargebackOverflowField::RecordedEntries,
+                },
+                "team_recorded_entries_overflow",
+            ),
+            (
+                ChargebackRecordError::ArithmeticOverflow {
+                    scope: ChargebackOverflowScope::Team,
+                    field: ChargebackOverflowField::RequestCount,
+                },
+                "team_request_count_overflow",
+            ),
+            (
+                ChargebackRecordError::ArithmeticOverflow {
+                    scope: ChargebackOverflowScope::Team,
+                    field: ChargebackOverflowField::Tokens,
+                },
+                "team_tokens_overflow",
+            ),
+            (
+                ChargebackRecordError::ArithmeticOverflow {
+                    scope: ChargebackOverflowScope::Team,
+                    field: ChargebackOverflowField::Cost,
+                },
+                "team_cost_overflow",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(chargeback_refusal_reason(error), expected);
+        }
     }
 
     #[test]

@@ -8,7 +8,9 @@
 //! cargo run -p sbproxy-ai --example prompt_versioning_rollout
 //! ```
 
-use sbproxy_ai::prompt_versioning::{WeightedPromptStore, WeightedPromptVersion};
+use sbproxy_ai::prompt_versioning::{
+    PromptSelectionError, WeightedPromptStore, WeightedPromptVersion,
+};
 use std::collections::HashMap;
 
 const PROMPT_NAME: &str = "support-system-prompt";
@@ -17,24 +19,26 @@ const DRAWS: u32 = 1_000;
 fn main() {
     let store = WeightedPromptStore::new();
     store
-        .add_version(
+        .replace_versions(
             PROMPT_NAME,
-            WeightedPromptVersion::new(PROMPT_NAME, 1, "You are a helpful support agent.", 90.0)
+            vec![
+                WeightedPromptVersion::new(
+                    PROMPT_NAME,
+                    1,
+                    "You are a helpful support agent.",
+                    90.0,
+                )
                 .expect("valid v1"),
+                WeightedPromptVersion::new(
+                    PROMPT_NAME,
+                    2,
+                    "You are a concise, action-oriented support agent.",
+                    10.0,
+                )
+                .expect("valid v2"),
+            ],
         )
-        .expect("unique v1");
-    store
-        .add_version(
-            PROMPT_NAME,
-            WeightedPromptVersion::new(
-                PROMPT_NAME,
-                2,
-                "You are a concise, action-oriented support agent.",
-                10.0,
-            )
-            .expect("valid v2"),
-        )
-        .expect("unique v2");
+        .expect("the rollout is valid as one batch");
 
     let latest = store
         .get_latest(PROMPT_NAME)
@@ -53,9 +57,19 @@ fn main() {
     println!("\nDrawing {DRAWS} times by weight (~90% v1, ~10% v2 expected):");
     let mut counts: HashMap<u32, u32> = HashMap::new();
     for cohort in 0..DRAWS {
-        let picked = store
-            .select_for_cohort(PROMPT_NAME, &format!("customer-{cohort}"), "rollout-1")
-            .expect("at least one positive-weight version is registered");
+        let picked = match store.select_for_cohort_typed(
+            PROMPT_NAME,
+            &format!("customer-{cohort}"),
+            "rollout-1",
+        ) {
+            Ok(version) => version,
+            Err(PromptSelectionError::MissingRollout { .. }) => {
+                panic!("the example installs the rollout before selecting from it")
+            }
+            Err(PromptSelectionError::InvalidTotalWeight { total, .. }) => {
+                panic!("the example rollout has a positive finite total weight, got {total}")
+            }
+        };
         *counts.entry(picked.version).or_insert(0) += 1;
     }
 

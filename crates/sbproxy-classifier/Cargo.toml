@@ -21,8 +21,11 @@ sbproxy-classifiers = { workspace = true }
 
 tokio = { workspace = true, features = ["net"] }
 tokio-stream = { version = "0.1", features = ["net", "sync"] }
-tonic = { workspace = true }
+tonic = { workspace = true, features = ["tls"] }
+rustls.workspace = true
 prost = { workspace = true }
+tower = { version = "0.5", features = ["load-shed"] }
+http-body = "1"
 
 # MessagePack, for the legacy TCP protocol on port 9400.
 rmp-serde = "1"
@@ -37,6 +40,7 @@ clap = { version = "4", features = ["derive"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+libc = "0.2"
 subtle = { workspace = true }
 
 # Sidecar-local Prometheus exposition. Matches the `prometheus` crate the
@@ -45,5 +49,7 @@ subtle = { workspace = true }
 prometheus = { workspace = true }
 
 [dev-dependencies]
+h2 = "0.4"
+http-body-util = { workspace = true, features = ["channel"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

@@ -451,11 +451,12 @@ pub enum AuditSinkKind {
 ///
 /// Every sub-block is independently optional. A purpose whose sub-block is
 /// omitted stays legacy ungated: `AiClient`'s documented `None` contract,
-/// the usage sinks' unauthenticated dispatch, the model-artifact fetcher's
-/// unauthenticated download, the non-MCP token-exchange resolver, and the
-/// OTLP exporters all keep behaving exactly as they did before this
-/// section existed. `compile_config` compiles each configured sub-block
-/// into a [`sbproxy_security::egress::EgressAuthorizer`] once, on
+/// the classifier hooks' legacy ungated dispatch, the usage sinks'
+/// unauthenticated dispatch, the model-artifact fetcher's unauthenticated
+/// download, the non-MCP token-exchange resolver, and the OTLP exporters
+/// all keep behaving exactly as they did before this section existed.
+/// `compile_config` compiles each configured sub-block into a
+/// [`sbproxy_security::egress::EgressAuthorizer`] once, on
 /// [`crate::snapshot::CompiledConfig::egress`]; nothing downstream parses
 /// this raw struct directly.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -465,6 +466,10 @@ pub struct EgressTopLevelConfig {
     /// dispatch the AI gateway's client makes.
     #[serde(default)]
     pub ai_providers: Option<EgressPurposeConfig>,
+    /// Arms `EgressPurpose::ClassifierHook`: the stock intent and
+    /// prompt-aware provider-quality classifier RPCs.
+    #[serde(default)]
+    pub classifier_hooks: Option<EgressPurposeConfig>,
     /// Arms Langfuse, Datadog, and object-store usage-sink deliveries
     /// under `EgressPurpose::UsageSink`, and webhook deliveries under
     /// `EgressPurpose::Webhook` (a separate, pre-existing purpose the
@@ -1158,6 +1163,14 @@ const fn default_quality_minimum_score() -> f64 {
     0.75
 }
 
+fn default_classifier_hook_auth_header() -> String {
+    "authorization".to_string()
+}
+
+fn default_classifier_hook_auth_scheme() -> String {
+    "Bearer".to_string()
+}
+
 /// Classifier-sidecar hooks installed into the stock proxy runtime.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1167,12 +1180,64 @@ pub struct ClassifierHooksConfig {
     /// End-to-end deadline for one hook decision.
     #[serde(default = "default_classifier_hook_timeout_ms")]
     pub timeout_ms: u64,
+    /// Optional transport-level TLS configuration for HTTPS endpoints.
+    #[serde(default)]
+    pub tls: Option<ClassifierHooksTlsConfig>,
+    /// Optional request authentication presented to the classifier service.
+    #[serde(default)]
+    pub authentication: Option<ClassifierHooksAuthenticationConfig>,
     /// Optional classifier-backed prompt intent detection.
     #[serde(default)]
     pub intent: Option<ClassifierIntentHookConfig>,
     /// Optional classifier-backed provider quality routing.
     #[serde(default)]
     pub quality: Option<ClassifierQualityHookConfig>,
+}
+
+/// TLS material for a classifier-hook gRPC endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClassifierHooksTlsConfig {
+    /// Optional CA bundle used to verify the remote classifier.
+    ///
+    /// Resolved through the process secret resolver so the value may be a
+    /// provider URI, `${ENV}`, `env:NAME`, or `file:/path`.
+    #[serde(default)]
+    pub ca_pem: Option<String>,
+    /// Override for the TLS server name / SNI. Defaults to the endpoint host.
+    #[serde(default)]
+    pub server_name: Option<String>,
+    /// Optional client certificate presented to the classifier for mTLS.
+    #[serde(default)]
+    pub client_identity: Option<ClassifierHooksClientIdentityConfig>,
+}
+
+/// Client certificate + private key for classifier-hook mTLS.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClassifierHooksClientIdentityConfig {
+    /// Client certificate chain in PEM format, supplied via a secret reference.
+    pub cert_pem: String,
+    /// Client private key in PEM format, supplied via a secret reference.
+    pub key_pem: String,
+}
+
+/// Request authentication presented to the classifier hook service.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum ClassifierHooksAuthenticationConfig {
+    /// Bearer-style metadata authentication on every gRPC request.
+    Bearer {
+        /// Secret reference for the bearer token value.
+        credential: String,
+        /// Metadata key that carries the token. Defaults to `authorization`.
+        #[serde(default = "default_classifier_hook_auth_header")]
+        header: String,
+        /// Optional value prefix. Defaults to `Bearer`.
+        #[serde(default = "default_classifier_hook_auth_scheme")]
+        scheme: String,
+    },
 }
 
 /// Model used to classify a prompt into the five stock intent labels.
@@ -1227,11 +1292,101 @@ impl ClassifierHooksConfig {
         const MAX_ENDPOINT_BYTES: usize = 2_048;
         const MAX_IDENTIFIER_BYTES: usize = 256;
         const MAX_PROVIDER_MODELS: usize = 64;
+        const MAX_SECRET_REFERENCE_BYTES: usize = 2_048;
         if self.endpoint.trim().is_empty() || self.endpoint.len() > MAX_ENDPOINT_BYTES {
             anyhow::bail!("classifier_hooks.endpoint must contain 1..={MAX_ENDPOINT_BYTES} bytes");
         }
+        let endpoint = self.endpoint.trim().parse::<http::Uri>().map_err(|_| {
+            anyhow::anyhow!("classifier_hooks.endpoint must be an absolute http:// or https:// URI")
+        })?;
+        let scheme = endpoint.scheme_str().ok_or_else(|| {
+            anyhow::anyhow!("classifier_hooks.endpoint must include an http:// or https:// scheme")
+        })?;
+        if !matches!(scheme, "http" | "https") {
+            anyhow::bail!("classifier_hooks.endpoint must use http:// or https://");
+        }
+        let host = endpoint
+            .host()
+            .ok_or_else(|| anyhow::anyhow!("classifier_hooks.endpoint must include a host"))?;
+        let local_endpoint = classifier_hooks_endpoint_is_local(host);
         if !(1..=30_000).contains(&self.timeout_ms) {
             anyhow::bail!("classifier_hooks.timeout_ms must be between 1 and 30000");
+        }
+        if self.tls.is_some() && scheme != "https" {
+            anyhow::bail!("classifier_hooks.tls requires an https:// endpoint");
+        }
+        if !local_endpoint && scheme != "https" {
+            anyhow::bail!("classifier_hooks.endpoint must use https:// for nonlocal destinations");
+        }
+        if !local_endpoint
+            && self.authentication.is_none()
+            && self
+                .tls
+                .as_ref()
+                .and_then(|tls| tls.client_identity.as_ref())
+                .is_none()
+        {
+            anyhow::bail!(
+                "classifier_hooks requires bearer authentication or mTLS for nonlocal destinations"
+            );
+        }
+        if let Some(tls) = self.tls.as_ref() {
+            if let Some(ca_pem) = tls.ca_pem.as_deref() {
+                validate_classifier_secret_reference(
+                    ca_pem,
+                    "classifier_hooks.tls.ca_pem",
+                    MAX_SECRET_REFERENCE_BYTES,
+                )?;
+            }
+            if let Some(server_name) = tls.server_name.as_deref() {
+                validate_classifier_identifier(
+                    server_name,
+                    "classifier_hooks.tls.server_name",
+                    MAX_IDENTIFIER_BYTES,
+                )?;
+            }
+            if let Some(identity) = tls.client_identity.as_ref() {
+                validate_classifier_secret_reference(
+                    &identity.cert_pem,
+                    "classifier_hooks.tls.client_identity.cert_pem",
+                    MAX_SECRET_REFERENCE_BYTES,
+                )?;
+                validate_classifier_secret_reference(
+                    &identity.key_pem,
+                    "classifier_hooks.tls.client_identity.key_pem",
+                    MAX_SECRET_REFERENCE_BYTES,
+                )?;
+            }
+        }
+        if let Some(authentication) = self.authentication.as_ref() {
+            match authentication {
+                ClassifierHooksAuthenticationConfig::Bearer {
+                    credential,
+                    header,
+                    scheme,
+                } => {
+                    validate_classifier_secret_reference(
+                        credential,
+                        "classifier_hooks.authentication.credential",
+                        MAX_SECRET_REFERENCE_BYTES,
+                    )?;
+                    validate_classifier_identifier(
+                        header,
+                        "classifier_hooks.authentication.header",
+                        MAX_IDENTIFIER_BYTES,
+                    )?;
+                    if http::header::HeaderName::from_bytes(header.as_bytes()).is_err() {
+                        anyhow::bail!(
+                            "classifier_hooks.authentication.header must be a valid HTTP metadata name"
+                        );
+                    }
+                    validate_classifier_identifier(
+                        scheme,
+                        "classifier_hooks.authentication.scheme",
+                        MAX_IDENTIFIER_BYTES,
+                    )?;
+                }
+            }
         }
         if self.intent.is_none() && self.quality.is_none() {
             anyhow::bail!("classifier_hooks must enable intent, quality, or both");
@@ -1283,6 +1438,29 @@ fn validate_classifier_identifier(value: &str, path: &str, maximum: usize) -> an
         anyhow::bail!("{path} must contain 1..={maximum} bytes");
     }
     Ok(())
+}
+
+fn validate_classifier_secret_reference(
+    value: &str,
+    path: &str,
+    maximum: usize,
+) -> anyhow::Result<()> {
+    if value.trim().is_empty() || value.len() > maximum {
+        anyhow::bail!("{path} must contain 1..={maximum} bytes");
+    }
+    if !is_secret_reference(value) {
+        anyhow::bail!(
+            "{path} must be a secret reference (`env:NAME`, `${{NAME}}`, `file:/path`, or `secret://backend/name`), not inline material"
+        );
+    }
+    Ok(())
+}
+
+fn classifier_hooks_endpoint_is_local(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.to_canonical().is_loopback())
 }
 
 /// Server-level proxy configuration parsed from the top-level `proxy:`

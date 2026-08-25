@@ -2658,6 +2658,11 @@ fn compile_egress_gates(cfg: Option<&EgressTopLevelConfig>) -> Result<CompiledEg
             cfg.ai_providers.as_ref(),
             "ai_providers",
         )?,
+        classifier_hooks: compile_egress_purpose(
+            &[EgressPurpose::ClassifierHook],
+            cfg.classifier_hooks.as_ref(),
+            "classifier_hooks",
+        )?,
         // WOR-2476 fix: `usage_sinks:` has to arm the Webhook sink too,
         // not just the three sinks that already share
         // `EgressPurpose::UsageSink` internally (Langfuse, Datadog,
@@ -6073,6 +6078,7 @@ origins:
 "#;
         let compiled = compile_config(yaml).expect("config with no egress: block compiles");
         assert!(compiled.egress.ai_providers.is_none());
+        assert!(compiled.egress.classifier_hooks.is_none());
         assert!(compiled.egress.usage_sinks.is_none());
         assert!(compiled.egress.model_artifacts.is_none());
         assert!(compiled.egress.token_exchange.is_none());
@@ -6081,7 +6087,7 @@ origins:
 
     #[test]
     fn egress_purpose_omitted_from_the_section_stays_ungated() {
-        // Only `ai_providers` is configured; the other four purposes must
+        // Only `ai_providers` is configured; the other five sub-blocks must
         // still compile to `None` even though `egress:` itself is present.
         let yaml = r#"
 proxy:
@@ -6098,6 +6104,7 @@ origins:
 "#;
         let compiled = compile_config(yaml).expect("config compiles");
         assert!(compiled.egress.ai_providers.is_some());
+        assert!(compiled.egress.classifier_hooks.is_none());
         assert!(compiled.egress.usage_sinks.is_none());
         assert!(compiled.egress.model_artifacts.is_none());
         assert!(compiled.egress.token_exchange.is_none());
@@ -6125,6 +6132,64 @@ origins:
         assert!(
             compiled.egress.ai_providers.is_none(),
             "allow_by_default (the default) must compile to no authorizer"
+        );
+    }
+
+    #[test]
+    fn egress_classifier_hooks_preserves_legacy_ungated_default() {
+        let yaml = r#"
+proxy: {}
+egress:
+  classifier_hooks:
+    hosts: ["127.0.0.1"]
+    ports: [50051]
+    allow_private: true
+"#;
+        let compiled = compile_config(yaml).expect("config compiles");
+        assert!(
+            compiled.egress.classifier_hooks.is_none(),
+            "an omitted classifier_hooks mode must remain legacy ungated"
+        );
+    }
+
+    #[test]
+    fn egress_classifier_hooks_compiles_an_exact_purpose_authorizer() {
+        let yaml = r#"
+proxy: {}
+egress:
+  classifier_hooks:
+    mode: deny_by_default
+    hosts: ["127.0.0.1"]
+    ports: [50051]
+    allow_private: true
+"#;
+        let compiled = compile_config(yaml).expect("config compiles");
+        let authorizer = compiled
+            .egress
+            .classifier_hooks
+            .expect("deny_by_default must compile a classifier-hook authorizer");
+
+        use sbproxy_security::egress::{EgressDenied, EgressPurpose, SystemHostResolver};
+        assert!(
+            authorizer
+                .authorize(
+                    EgressPurpose::ClassifierHook,
+                    "http://127.0.0.1:50051",
+                    &SystemHostResolver,
+                )
+                .is_ok(),
+            "the configured destination must authorize under ClassifierHook"
+        );
+        assert_eq!(
+            authorizer
+                .authorize(
+                    EgressPurpose::AiProvider,
+                    "http://127.0.0.1:50051",
+                    &SystemHostResolver,
+                )
+                .unwrap_err(),
+            EgressDenied::UnlistedPurpose,
+            "the classifier-hooks block must not grant another purpose"
         );
     }
 
@@ -12853,5 +12918,74 @@ origins:
                 "invalid classifier hook block compiled: {invalid_block}"
             );
         }
+    }
+
+    #[test]
+    fn classifier_hooks_reject_nonlocal_plaintext_and_inline_credentials() {
+        let insecure_plaintext = r#"
+proxy:
+  http_bind_port: 8080
+  classifier_hooks:
+    endpoint: http://classifier.example:9440
+    intent:
+      model: intent-v1
+origins:
+  x.example.com:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: ok
+"#;
+        assert!(
+            compile_config(insecure_plaintext).is_err(),
+            "nonlocal classifier hooks must not allow plaintext transport"
+        );
+
+        let inline_bearer = r#"
+proxy:
+  http_bind_port: 8080
+  classifier_hooks:
+    endpoint: https://classifier.example:9440
+    authentication:
+      type: bearer
+      credential: inline-token
+    intent:
+      model: intent-v1
+origins:
+  x.example.com:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: ok
+"#;
+        assert!(
+            compile_config(inline_bearer).is_err(),
+            "nonlocal classifier hooks must not accept inline bearer material"
+        );
+
+        let valid_secret_backed = r#"
+proxy:
+  http_bind_port: 8080
+  classifier_hooks:
+    endpoint: https://classifier.example:9440
+    authentication:
+      type: bearer
+      credential: env:SB_CLASSIFIER_TOKEN
+    tls:
+      ca_pem: file:/etc/sbproxy/classifier-ca.pem
+    intent:
+      model: intent-v1
+origins:
+  x.example.com:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: ok
+"#;
+        compile_config(valid_secret_backed)
+            .expect("secret-backed nonlocal classifier hook transport must compile");
     }
 }

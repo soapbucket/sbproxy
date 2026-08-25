@@ -25,6 +25,10 @@ use sbproxy_classifier_proto::{
     EmbedRequest, InferenceServiceClient, QualityRequest, SafetyToken, VersionRequest,
     VersionResponse,
 };
+use sbproxy_security::egress::{
+    record_egress_refused, record_egress_seen, CachedSystemResolver, EgressAuthorizer,
+    EgressDenied, EgressPurpose, EgressSightingStatus, HostResolver,
+};
 
 /// Classification response types, re-exported so callers of
 /// [`ClassifierClient::classify`] can name them without depending on the
@@ -36,8 +40,89 @@ pub use sbproxy_classifier_proto::{ClassifyResponse, Label};
 /// a direct `sbproxy-classifier-proto` dependency just to name these.
 pub use sbproxy_classifier_proto::{QualityResponse, SafetyVerdict};
 use tokio::net::UnixStream;
-use tonic::transport::{Channel, Endpoint};
+use tonic::metadata::{Ascii, MetadataKey, MetadataValue};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
+use tonic::Request;
 use tower::service_fn;
+
+const CLASSIFIER_HOOK_CONNECT_ORIGIN: &str = "classifier_hooks";
+const CLASSIFIER_HOOK_CONNECT_TENANT: &str = "unset";
+
+/// Resolved transport security for the classifier-hook gRPC client.
+#[derive(Clone, Default)]
+pub struct ClassifierClientSecurityConfig {
+    pub tls: Option<ClassifierClientTlsConfig>,
+    pub authentication: Option<ClassifierClientAuthenticationConfig>,
+}
+
+/// HTTPS/TLS settings for the classifier-hook gRPC client.
+#[derive(Clone)]
+pub struct ClassifierClientTlsConfig {
+    pub ca_pem: Option<String>,
+    pub server_name: Option<String>,
+    pub client_identity: Option<ClassifierClientIdentityConfig>,
+}
+
+/// Client certificate chain + private key for classifier-hook mTLS.
+#[derive(Clone)]
+pub struct ClassifierClientIdentityConfig {
+    pub cert_pem: String,
+    pub key_pem: String,
+}
+
+/// Request authentication presented to the classifier service.
+#[derive(Clone)]
+pub enum ClassifierClientAuthenticationConfig {
+    Bearer {
+        header: String,
+        scheme: String,
+        credential: String,
+    },
+}
+
+impl std::fmt::Debug for ClassifierClientSecurityConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClassifierClientSecurityConfig")
+            .field("tls", &self.tls)
+            .field("authentication", &self.authentication)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ClassifierClientTlsConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClassifierClientTlsConfig")
+            .field("has_ca_pem", &self.ca_pem.is_some())
+            .field("server_name", &self.server_name)
+            .field("has_client_identity", &self.client_identity.is_some())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ClassifierClientIdentityConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClassifierClientIdentityConfig")
+            .field("cert_pem", &"<redacted>")
+            .field("key_pem", &"<redacted>")
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ClassifierClientAuthenticationConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bearer { header, scheme, .. } => formatter
+                .debug_struct("ClassifierClientAuthenticationConfig::Bearer")
+                .field("header", header)
+                .field("scheme", scheme)
+                .field("credential", &"<redacted>")
+                .finish(),
+        }
+    }
+}
 
 /// WOR-705 part 2: child supervisor that owns the lifecycle of a
 /// co-located sidecar binary. Pairs with `connect_uds_lazy`: the
@@ -73,12 +158,10 @@ pub enum ClassifierClientError {
     #[error("classifier call timed out after {0:?}")]
     Timeout(Duration),
     /// The sidecar returned a gRPC error status.
-    #[error("classifier rpc failed ({code:?}): {message}")]
+    #[error("classifier rpc failed ({code:?})")]
     Rpc {
         /// Structured gRPC status code returned by the sidecar.
         code: tonic::Code,
-        /// Status message returned by the sidecar.
-        message: String,
     },
     /// The sidecar returned a structurally invalid response (see
     /// `validate_classify_response` / `validate_compress_response`).
@@ -92,7 +175,6 @@ pub enum ClassifierClientError {
 fn rpc_error(status: tonic::Status) -> ClassifierClientError {
     ClassifierClientError::Rpc {
         code: status.code(),
-        message: status.message().to_string(),
     }
 }
 
@@ -120,9 +202,193 @@ pub struct ClassifierClient {
     /// which the caller's fail policy handles like any other RPC error.
     classifier: ClassifierServiceClient<Channel>,
     timeout: Duration,
+    request_auth: Option<ResolvedClassifierRequestAuth>,
+}
+
+#[derive(Clone)]
+struct ResolvedClassifierRequestAuth {
+    header: MetadataKey<Ascii>,
+    value: MetadataValue<Ascii>,
+}
+
+impl std::fmt::Debug for ResolvedClassifierRequestAuth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResolvedClassifierRequestAuth")
+            .field("header", &self.header)
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
+impl ResolvedClassifierRequestAuth {
+    fn from_config(
+        authentication: &ClassifierClientAuthenticationConfig,
+    ) -> Result<Self, ClassifierClientError> {
+        match authentication {
+            ClassifierClientAuthenticationConfig::Bearer {
+                header,
+                scheme,
+                credential,
+            } => {
+                let header =
+                    MetadataKey::<Ascii>::from_bytes(header.as_bytes()).map_err(|error| {
+                        ClassifierClientError::Connect(format!(
+                            "classifier hook auth metadata name is invalid: {error}"
+                        ))
+                    })?;
+                let value = if scheme.is_empty() {
+                    credential.clone()
+                } else {
+                    format!("{scheme} {credential}")
+                };
+                let mut value =
+                    MetadataValue::<Ascii>::try_from(value.as_str()).map_err(|error| {
+                        ClassifierClientError::Connect(format!(
+                            "classifier hook auth metadata value is invalid: {error}"
+                        ))
+                    })?;
+                value.set_sensitive(true);
+                Ok(Self { header, value })
+            }
+        }
+    }
+
+    fn apply<T>(&self, request: &mut Request<T>) {
+        request
+            .metadata_mut()
+            .insert(self.header.clone(), self.value.clone());
+    }
+}
+
+fn classifier_hook_denied_io_error(denied: EgressDenied) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!("classifier hook egress denied ({})", denied.as_label()),
+    )
+}
+
+fn record_classifier_hook_denial(endpoint: &str, denied: EgressDenied) {
+    record_egress_seen(
+        EgressPurpose::ClassifierHook,
+        endpoint,
+        CLASSIFIER_HOOK_CONNECT_ORIGIN,
+        EgressSightingStatus::Denied,
+        Some(denied),
+    );
+    record_egress_refused(
+        EgressPurpose::ClassifierHook,
+        denied,
+        CLASSIFIER_HOOK_CONNECT_TENANT,
+        CLASSIFIER_HOOK_CONNECT_ORIGIN,
+    );
+}
+
+async fn dial_governed_classifier_endpoint<R>(
+    endpoint: String,
+    authorizer: EgressAuthorizer,
+    resolver: R,
+    connect_timeout: Duration,
+) -> Result<hyper_util::rt::TokioIo<tokio::net::TcpStream>, std::io::Error>
+where
+    R: HostResolver + Clone + Send + Sync + 'static,
+{
+    let destination = authorizer
+        .authorize(EgressPurpose::ClassifierHook, &endpoint, &resolver)
+        .map_err(|denied| {
+            record_classifier_hook_denial(&endpoint, denied);
+            classifier_hook_denied_io_error(denied)
+        })?;
+    let verified_addrs = authorizer
+        .verify_dial_addrs(&destination, &resolver)
+        .map_err(|denied| {
+            record_classifier_hook_denial(&endpoint, denied);
+            classifier_hook_denied_io_error(denied)
+        })?;
+    record_egress_seen(
+        EgressPurpose::ClassifierHook,
+        &endpoint,
+        CLASSIFIER_HOOK_CONNECT_ORIGIN,
+        EgressSightingStatus::Allowed,
+        None,
+    );
+    let deadline = tokio::time::Instant::now() + connect_timeout;
+    let mut last_error = None;
+    for addr in verified_addrs {
+        match tokio::time::timeout_at(deadline, tokio::net::TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => return Ok(hyper_util::rt::TokioIo::new(stream)),
+            Ok(Err(error)) => last_error = Some(error),
+            Err(_) => {
+                last_error = Some(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "classifier hook connect timed out",
+                ));
+                break;
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "classifier hook connect produced no verified address",
+        )
+    }))
 }
 
 impl ClassifierClient {
+    fn configure_endpoint_security(
+        endpoint: Endpoint,
+        security: Option<&ClassifierClientSecurityConfig>,
+    ) -> Result<Endpoint, ClassifierClientError> {
+        let mut endpoint = endpoint;
+        let scheme = endpoint.uri().scheme_str();
+        let tls = security.and_then(|security| security.tls.as_ref());
+        if matches!(scheme, Some("https")) || tls.is_some() {
+            let mut tls_config = ClientTlsConfig::new().with_enabled_roots();
+            if let Some(tls) = tls {
+                if let Some(server_name) = tls.server_name.as_deref() {
+                    tls_config = tls_config.domain_name(server_name.to_string());
+                }
+                if let Some(ca_pem) = tls.ca_pem.as_deref() {
+                    tls_config =
+                        tls_config.ca_certificate(Certificate::from_pem(ca_pem.as_bytes()));
+                }
+                if let Some(identity) = tls.client_identity.as_ref() {
+                    tls_config = tls_config.identity(Identity::from_pem(
+                        identity.cert_pem.as_bytes(),
+                        identity.key_pem.as_bytes(),
+                    ));
+                }
+            }
+            endpoint = endpoint
+                .tls_config(tls_config)
+                .map_err(|error| ClassifierClientError::Connect(error.to_string()))?;
+        }
+        Ok(endpoint)
+    }
+
+    fn resolve_request_auth(
+        security: Option<&ClassifierClientSecurityConfig>,
+    ) -> Result<Option<ResolvedClassifierRequestAuth>, ClassifierClientError> {
+        security
+            .and_then(|security| security.authentication.as_ref())
+            .map(ResolvedClassifierRequestAuth::from_config)
+            .transpose()
+    }
+
+    fn from_channel(
+        channel: Channel,
+        timeout: Duration,
+        request_auth: Option<ResolvedClassifierRequestAuth>,
+    ) -> Self {
+        Self {
+            inner: InferenceServiceClient::new(channel.clone()),
+            classifier: ClassifierServiceClient::new(channel),
+            timeout,
+            request_auth,
+        }
+    }
+
     /// Connect to a sidecar at `endpoint` (e.g. `http://127.0.0.1:9440`),
     /// applying `connect_timeout` to the dial and `call_timeout` to each RPC.
     pub async fn connect(
@@ -130,17 +396,28 @@ impl ClassifierClient {
         connect_timeout: Duration,
         call_timeout: Duration,
     ) -> Result<Self, ClassifierClientError> {
-        let channel = Endpoint::from_shared(endpoint.to_string())
-            .map_err(|e| ClassifierClientError::Connect(e.to_string()))?
-            .connect_timeout(connect_timeout)
+        Self::connect_with_security(endpoint, connect_timeout, call_timeout, None).await
+    }
+
+    /// Connect to a sidecar with explicit HTTPS/TLS and request-auth settings.
+    pub async fn connect_with_security(
+        endpoint: &str,
+        connect_timeout: Duration,
+        call_timeout: Duration,
+        security: Option<ClassifierClientSecurityConfig>,
+    ) -> Result<Self, ClassifierClientError> {
+        let endpoint = Self::configure_endpoint_security(
+            Endpoint::from_shared(endpoint.to_string())
+                .map_err(|e| ClassifierClientError::Connect(e.to_string()))?
+                .connect_timeout(connect_timeout),
+            security.as_ref(),
+        )?;
+        let request_auth = Self::resolve_request_auth(security.as_ref())?;
+        let channel = endpoint
             .connect()
             .await
             .map_err(|e| ClassifierClientError::Connect(e.to_string()))?;
-        Ok(Self {
-            inner: InferenceServiceClient::new(channel.clone()),
-            classifier: ClassifierServiceClient::new(channel),
-            timeout: call_timeout,
-        })
+        Ok(Self::from_channel(channel, call_timeout, request_auth))
     }
 
     /// Validate an endpoint URI without building a channel.
@@ -169,15 +446,86 @@ impl ClassifierClient {
         endpoint: &str,
         call_timeout: Duration,
     ) -> Result<Self, ClassifierClientError> {
-        let channel = Endpoint::from_shared(endpoint.to_string())
-            .map_err(|e| ClassifierClientError::Connect(e.to_string()))?
-            .connect_timeout(call_timeout)
-            .connect_lazy();
-        Ok(Self {
-            inner: InferenceServiceClient::new(channel.clone()),
-            classifier: ClassifierServiceClient::new(channel),
-            timeout: call_timeout,
-        })
+        Self::connect_lazy_with_security(endpoint, call_timeout, None)
+    }
+
+    pub fn connect_lazy_with_security(
+        endpoint: &str,
+        call_timeout: Duration,
+        security: Option<ClassifierClientSecurityConfig>,
+    ) -> Result<Self, ClassifierClientError> {
+        let endpoint = Self::configure_endpoint_security(
+            Endpoint::from_shared(endpoint.to_string())
+                .map_err(|e| ClassifierClientError::Connect(e.to_string()))?
+                .connect_timeout(call_timeout),
+            security.as_ref(),
+        )?;
+        let request_auth = Self::resolve_request_auth(security.as_ref())?;
+        let channel = endpoint.connect_lazy();
+        Ok(Self::from_channel(channel, call_timeout, request_auth))
+    }
+
+    fn connect_governed_lazy_with_resolver<R>(
+        endpoint: &str,
+        call_timeout: Duration,
+        authorizer: EgressAuthorizer,
+        resolver: R,
+        security: Option<ClassifierClientSecurityConfig>,
+    ) -> Result<Self, ClassifierClientError>
+    where
+        R: HostResolver + Clone + Send + Sync + 'static,
+    {
+        let endpoint_string = endpoint.to_string();
+        let tonic_endpoint = Self::configure_endpoint_security(
+            Endpoint::from_shared(endpoint_string.clone())
+                .map_err(|e| ClassifierClientError::Connect(e.to_string()))?
+                .connect_timeout(call_timeout),
+            security.as_ref(),
+        )?;
+        let connector_endpoint = endpoint_string.clone();
+        let connector_authorizer = authorizer.clone();
+        let connector_resolver = resolver.clone();
+        let request_auth = Self::resolve_request_auth(security.as_ref())?;
+        let channel = tonic_endpoint.connect_with_connector_lazy(service_fn(move |_| {
+            dial_governed_classifier_endpoint(
+                connector_endpoint.clone(),
+                connector_authorizer.clone(),
+                connector_resolver.clone(),
+                call_timeout,
+            )
+        }));
+        Ok(Self::from_channel(channel, call_timeout, request_auth))
+    }
+
+    /// Build a lazy client whose every physical TCP connect/reconnect is
+    /// re-authorized, re-resolved, and pinned through the exact classifier
+    /// hook egress policy generation that built it.
+    ///
+    /// The original endpoint URI remains the channel authority and TLS
+    /// identity. The governed connector overrides only the socket address it
+    /// dials, and only after that address has been freshly verified against
+    /// the connection attempt's pinned DNS answer.
+    pub fn connect_governed_lazy(
+        endpoint: &str,
+        call_timeout: Duration,
+        authorizer: EgressAuthorizer,
+    ) -> Result<Self, ClassifierClientError> {
+        Self::connect_governed_lazy_with_security(endpoint, call_timeout, authorizer, None)
+    }
+
+    pub fn connect_governed_lazy_with_security(
+        endpoint: &str,
+        call_timeout: Duration,
+        authorizer: EgressAuthorizer,
+        security: Option<ClassifierClientSecurityConfig>,
+    ) -> Result<Self, ClassifierClientError> {
+        Self::connect_governed_lazy_with_resolver(
+            endpoint,
+            call_timeout,
+            authorizer,
+            CachedSystemResolver,
+            security,
+        )
     }
 
     /// Connect to a sidecar over a Unix domain socket.
@@ -210,11 +558,7 @@ impl ClassifierClient {
             }))
             .await
             .map_err(|e| ClassifierClientError::Connect(format!("uds {path:?}: {e}")))?;
-        Ok(Self {
-            inner: InferenceServiceClient::new(channel.clone()),
-            classifier: ClassifierServiceClient::new(channel),
-            timeout: call_timeout,
-        })
+        Ok(Self::from_channel(channel, call_timeout, None))
     }
 
     /// Build a UDS client that connects lazily on first use.
@@ -242,11 +586,7 @@ impl ClassifierClient {
                 Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
             }
         }));
-        Ok(Self {
-            inner: InferenceServiceClient::new(channel.clone()),
-            classifier: ClassifierServiceClient::new(channel),
-            timeout: call_timeout,
-        })
+        Ok(Self::from_channel(channel, call_timeout, None))
     }
 
     /// Classify `text` with the named model (empty = the sidecar's default).
@@ -264,11 +604,28 @@ impl ClassifierClient {
         model: &str,
         text: &str,
     ) -> Result<ClassifyResponse, ClassifierClientError> {
-        let request = ClassifyRequest {
+        self.classify_owned(model, text.to_string()).await
+    }
+
+    /// Classify with a caller-owned request body.
+    ///
+    /// This exists for admission-controlled call sites that must acquire any
+    /// process-global byte/concurrency lease before creating the one owned
+    /// `ClassifyRequest.text` allocation. Callers that only have a borrowed
+    /// `&str` should keep using [`Self::classify`].
+    pub async fn classify_owned(
+        &self,
+        model: &str,
+        text: String,
+    ) -> Result<ClassifyResponse, ClassifierClientError> {
+        let mut request = Request::new(ClassifyRequest {
             model: model.to_string(),
-            text: text.to_string(),
+            text,
             top_k: 0,
-        };
+        });
+        if let Some(request_auth) = self.request_auth.as_ref() {
+            request_auth.apply(&mut request);
+        }
         // Clone the inner client so this method takes `&self`: tonic clients
         // require `&mut self`, and the channel clone shares the connection.
         let mut client = self.inner.clone();
@@ -292,10 +649,13 @@ impl ClassifierClient {
         model: &str,
         inputs: &[String],
     ) -> Result<Vec<Vec<f32>>, ClassifierClientError> {
-        let request = EmbedRequest {
+        let mut request = Request::new(EmbedRequest {
             model: model.to_string(),
             texts: inputs.to_vec(),
-        };
+        });
+        if let Some(request_auth) = self.request_auth.as_ref() {
+            request_auth.apply(&mut request);
+        }
         let mut client = self.inner.clone();
         match tokio::time::timeout(self.timeout, client.embed(request)).await {
             Ok(Ok(resp)) => Ok(resp
@@ -341,11 +701,14 @@ impl ClassifierClient {
                 ))
             }
         };
-        let request = CompressRequest {
+        let mut request = Request::new(CompressRequest {
             model: model.to_string(),
             text: text.to_string(),
             target: Some(target),
-        };
+        });
+        if let Some(request_auth) = self.request_auth.as_ref() {
+            request_auth.apply(&mut request);
+        }
         let mut client = self.inner.clone();
         let response = match tokio::time::timeout(self.timeout, client.compress(request)).await {
             Ok(Ok(response)) => response.into_inner(),
@@ -358,8 +721,12 @@ impl ClassifierClient {
 
     /// Probe the sidecar's version + served model ids (startup capability check).
     pub async fn version(&self) -> Result<VersionResponse, ClassifierClientError> {
+        let mut request = Request::new(VersionRequest {});
+        if let Some(request_auth) = self.request_auth.as_ref() {
+            request_auth.apply(&mut request);
+        }
         let mut client = self.inner.clone();
-        match tokio::time::timeout(self.timeout, client.version(VersionRequest {})).await {
+        match tokio::time::timeout(self.timeout, client.version(request)).await {
             Ok(Ok(resp)) => Ok(resp.into_inner()),
             Ok(Err(status)) => Err(rpc_error(status)),
             Err(_) => Err(ClassifierClientError::Timeout(self.timeout)),
@@ -375,10 +742,13 @@ impl ClassifierClient {
         tenant: &str,
         text: &str,
     ) -> Result<QualityResponse, ClassifierClientError> {
-        let request = QualityRequest {
+        let mut request = Request::new(QualityRequest {
             tenant: tenant.to_string(),
             text: text.to_string(),
-        };
+        });
+        if let Some(request_auth) = self.request_auth.as_ref() {
+            request_auth.apply(&mut request);
+        }
         let mut client = self.classifier.clone();
         match tokio::time::timeout(self.timeout, client.quality(request)).await {
             Ok(Ok(resp)) => Ok(resp.into_inner()),
@@ -403,7 +773,11 @@ impl ClassifierClient {
         let (tx, rx) = tokio::sync::mpsc::channel::<SafetyToken>(16);
         let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
         let mut client = self.classifier.clone();
-        let response = tokio::time::timeout(self.timeout, client.stream_safety(outbound))
+        let mut request = Request::new(outbound);
+        if let Some(request_auth) = self.request_auth.as_ref() {
+            request_auth.apply(&mut request);
+        }
+        let response = tokio::time::timeout(self.timeout, client.stream_safety(request))
             .await
             .map_err(|_| ClassifierClientError::Timeout(self.timeout))?
             .map_err(rpc_error)?;
@@ -526,18 +900,14 @@ fn validate_classify_response(
             ));
         }
         if !label.score.is_finite() || !(0.0..=1.0).contains(&label.score) {
-            return Err(ClassifierClientError::Protocol(format!(
-                "classification response label {:?} has invalid score {}: \
-                 must be finite and in [0.0, 1.0]",
-                label.name, label.score
-            )));
+            return Err(ClassifierClientError::Protocol(
+                "classification response contains an invalid label score".to_string(),
+            ));
         }
         if !seen.insert(label.name.to_ascii_lowercase()) {
-            return Err(ClassifierClientError::Protocol(format!(
-                "classification response contains duplicate label {:?} \
-                 (names are compared case-insensitively)",
-                label.name
-            )));
+            return Err(ClassifierClientError::Protocol(
+                "classification response contains duplicate labels".to_string(),
+            ));
         }
     }
     // total_cmp is safe here: every score was just checked finite.
@@ -588,8 +958,41 @@ mod tests {
         CompressRequest, CompressResponse, EmbedRequest, EmbedResponse, Embedding,
         InferenceService, InferenceServiceServer, Label, ModelInfoRequest, ModelInfoResponse,
     };
+    use sbproxy_security::egress::{
+        EgressAuthorizer, EgressConfig, EgressPurpose, HostResolver, PurposeAllowlist,
+    };
+    use std::collections::{HashMap, HashSet};
+    use std::net::{SocketAddr, TcpListener};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
     use tokio_stream::StreamExt as _;
     use tonic::{Request, Response, Status, Streaming};
+
+    #[derive(Clone)]
+    struct StaticResolver(Vec<SocketAddr>);
+
+    impl HostResolver for StaticResolver {
+        fn resolve(&self, _host: &str, _port: u16) -> Result<Vec<SocketAddr>, ()> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[derive(Clone)]
+    struct SequenceResolver(Arc<Mutex<Vec<Vec<SocketAddr>>>>);
+
+    impl HostResolver for SequenceResolver {
+        fn resolve(&self, _host: &str, _port: u16) -> Result<Vec<SocketAddr>, ()> {
+            let mut answers = self
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if answers.is_empty() {
+                Err(())
+            } else {
+                Ok(answers.remove(0))
+            }
+        }
+    }
 
     #[tokio::test]
     async fn cancelled_first_safety_send_preserves_tenant_and_rules_for_retry() {
@@ -633,11 +1036,18 @@ mod tests {
             &self,
             req: Request<ClassifyRequest>,
         ) -> Result<Response<ClassifyResponse>, Status> {
-            let model = req.into_inner().model;
+            let request = req.into_inner();
+            let model = request.model;
             // Malformed-response fixtures keyed by model name, mirroring the
             // compress stubs below: each one is structurally valid protobuf
             // that the client must reject as a protocol error (WOR-2161).
             let labels = match model.as_str() {
+                "rpc-secret-reflection" => {
+                    return Err(Status::invalid_argument(format!(
+                        "reflected upstream text={} token=super-secret-token",
+                        request.text
+                    )))
+                }
                 "empty-labels" => vec![],
                 "empty-name" => vec![Label {
                     name: String::new(),
@@ -933,6 +1343,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn classify_protocol_errors_do_not_reflect_remote_label_data() {
+        let remote_secret = "operator prompt with super-secret-token";
+        let cases = [
+            (
+                ClassifyResponse {
+                    labels: vec![Label {
+                        name: remote_secret.to_string(),
+                        score: f64::NAN,
+                    }],
+                    latency_us: 1,
+                },
+                "classifier protocol error: classification response contains an invalid label score",
+            ),
+            (
+                ClassifyResponse {
+                    labels: vec![
+                        Label {
+                            name: remote_secret.to_string(),
+                            score: 0.9,
+                        },
+                        Label {
+                            name: remote_secret.to_string(),
+                            score: 0.1,
+                        },
+                    ],
+                    latency_us: 1,
+                },
+                "classifier protocol error: classification response contains duplicate labels",
+            ),
+        ];
+
+        for (mut response, expected) in cases {
+            let error = validate_classify_response(&mut response)
+                .expect_err("malformed remote labels must fail closed");
+            let rendered = error.to_string();
+            assert_eq!(rendered, expected);
+            assert!(!rendered.contains(remote_secret));
+            assert!(!rendered.contains("super-secret-token"));
+        }
+    }
+
     #[tokio::test]
     async fn classify_sorts_labels_highest_score_first() {
         // The proto documents this ordering but the client enforces it, so
@@ -1087,11 +1539,38 @@ mod tests {
             .await
             .expect_err("stub exhaustion must reach the caller");
 
-        let ClassifierClientError::Rpc { code, message } = error else {
+        let ClassifierClientError::Rpc { code } = error else {
             panic!("unexpected error: {error:?}");
         };
         assert_eq!(code, tonic::Code::ResourceExhausted);
-        assert_eq!(message, "compression queue is full");
+    }
+
+    #[tokio::test]
+    async fn rpc_errors_do_not_reflect_remote_status_messages() {
+        let Some(endpoint) = spawn_stub().await else {
+            return;
+        };
+        let client =
+            ClassifierClient::connect(&endpoint, Duration::from_secs(2), Duration::from_secs(2))
+                .await
+                .expect("connect");
+
+        let prompt = "operator prompt with secret payload";
+        let error = client
+            .classify("rpc-secret-reflection", prompt)
+            .await
+            .expect_err("stub invalid argument must reach the caller");
+
+        let rendered = error.to_string();
+        assert!(matches!(
+            error,
+            ClassifierClientError::Rpc {
+                code: tonic::Code::InvalidArgument
+            }
+        ));
+        assert!(!rendered.contains(prompt));
+        assert!(!rendered.contains("super-secret-token"));
+        assert_eq!(rendered, "classifier rpc failed (InvalidArgument)");
     }
 
     #[tokio::test]
@@ -1228,6 +1707,157 @@ mod tests {
                 ClassifierClientError::Timeout(_) | ClassifierClientError::Rpc { .. }
             ),
             "expected Timeout or Rpc, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn security_debug_redacts_and_bearer_metadata_is_applied() {
+        let security = ClassifierClientSecurityConfig {
+            tls: Some(ClassifierClientTlsConfig {
+                ca_pem: Some("secret://fixture/ca".to_string()),
+                server_name: Some("classifier.example".to_string()),
+                client_identity: Some(ClassifierClientIdentityConfig {
+                    cert_pem: "secret://fixture/cert".to_string(),
+                    key_pem: "secret://fixture/key".to_string(),
+                }),
+            }),
+            authentication: Some(ClassifierClientAuthenticationConfig::Bearer {
+                header: "authorization".to_string(),
+                scheme: "Bearer".to_string(),
+                credential: "super-secret-token".to_string(),
+            }),
+        };
+        let debug = format!("{security:?}");
+        assert!(!debug.contains("super-secret-token"));
+        assert!(!debug.contains("secret://fixture/key"));
+        assert!(!debug.contains("secret://fixture/cert"));
+
+        let auth =
+            ResolvedClassifierRequestAuth::from_config(security.authentication.as_ref().unwrap())
+                .expect("bearer auth resolves");
+        let mut request = Request::new(());
+        auth.apply(&mut request);
+        assert_eq!(
+            request.metadata().get("authorization").unwrap(),
+            "Bearer super-secret-token"
+        );
+        assert!(request
+            .metadata()
+            .get("authorization")
+            .unwrap()
+            .is_sensitive());
+    }
+
+    #[tokio::test]
+    async fn governed_lazy_denial_never_reaches_accept() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind denial observer");
+        listener
+            .set_nonblocking(true)
+            .expect("bound denial observer is bounded");
+        let address = listener.local_addr().expect("read denial observer address");
+        let accepted = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_accepted = Arc::clone(&accepted);
+        let thread_stop = Arc::clone(&stop);
+        let observer = std::thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((_stream, _peer)) => {
+                        thread_accepted.store(true, Ordering::Release);
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let mut purposes = HashMap::new();
+        purposes.insert(
+            EgressPurpose::ClassifierHook,
+            PurposeAllowlist {
+                hosts: HashSet::new(),
+                schemes: HashSet::from(["http".to_string()]),
+                ports: HashSet::from([address.port()]),
+                allow_private: true,
+            },
+        );
+        let client = ClassifierClient::connect_governed_lazy_with_resolver(
+            &format!("http://127.0.0.1:{}", address.port()),
+            Duration::from_millis(200),
+            EgressAuthorizer::new(EgressConfig { purposes }),
+            StaticResolver(vec![address]),
+            None,
+        )
+        .expect("lazy governed build does not dial");
+        let _ = client
+            .version()
+            .await
+            .expect_err("denied classifier hook egress must fail closed before connect");
+        stop.store(true, Ordering::Release);
+        observer.join().expect("join denial observer");
+        assert!(
+            !accepted.load(Ordering::Acquire),
+            "a denied classifier hook destination must never reach accept()"
+        );
+    }
+
+    #[tokio::test]
+    async fn governed_lazy_reverifies_the_pinned_answer_before_connect() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind verify observer");
+        listener
+            .set_nonblocking(true)
+            .expect("bound verify observer is bounded");
+        let address = listener.local_addr().expect("read verify observer address");
+        let accepted = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_accepted = Arc::clone(&accepted);
+        let thread_stop = Arc::clone(&stop);
+        let observer = std::thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((_stream, _peer)) => {
+                        thread_accepted.store(true, Ordering::Release);
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let mut purposes = HashMap::new();
+        purposes.insert(
+            EgressPurpose::ClassifierHook,
+            PurposeAllowlist {
+                hosts: HashSet::from(["classifier.test".to_string()]),
+                schemes: HashSet::from(["http".to_string()]),
+                ports: HashSet::from([address.port()]),
+                allow_private: true,
+            },
+        );
+        let mismatched = SocketAddr::from(([127, 0, 0, 1], address.port().saturating_add(1)));
+        let client = ClassifierClient::connect_governed_lazy_with_resolver(
+            &format!("http://classifier.test:{}", address.port()),
+            Duration::from_millis(200),
+            EgressAuthorizer::new(EgressConfig { purposes }),
+            SequenceResolver(Arc::new(Mutex::new(vec![vec![address], vec![mismatched]]))),
+            None,
+        )
+        .expect("lazy governed build does not dial");
+        let _ = client
+            .version()
+            .await
+            .expect_err("a pin mismatch must fail before any TCP connect");
+        stop.store(true, Ordering::Release);
+        observer.join().expect("join verify observer");
+        assert!(
+            !accepted.load(Ordering::Acquire),
+            "pin mismatch must fail before the connector reaches accept()"
         );
     }
 

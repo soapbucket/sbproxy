@@ -2579,6 +2579,30 @@
           "format": "uint64",
           "minimum": 0.0
         },
+        "tls": {
+          "description": "Optional transport-level TLS configuration for HTTPS endpoints.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ClassifierHooksTlsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "authentication": {
+          "description": "Optional request authentication presented to the classifier service.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ClassifierHooksAuthenticationConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "intent": {
           "description": "Optional classifier-backed prompt intent detection.",
           "default": null,
@@ -2605,6 +2629,96 @@
         }
       },
       "additionalProperties": false
+    },
+    "ClassifierHooksTlsConfig": {
+      "description": "TLS material for a classifier-hook gRPC endpoint.",
+      "type": "object",
+      "properties": {
+        "ca_pem": {
+          "description": "Optional CA bundle used to verify the remote classifier.\n\nResolved through the process secret resolver so the value may be a provider URI, `${ENV}`, `env:NAME`, or `file:/path`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server_name": {
+          "description": "Override for the TLS server name / SNI. Defaults to the endpoint host.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_identity": {
+          "description": "Optional client certificate presented to the classifier for mTLS.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ClassifierHooksClientIdentityConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ClassifierHooksClientIdentityConfig": {
+      "description": "Client certificate + private key for classifier-hook mTLS.",
+      "type": "object",
+      "required": [
+        "cert_pem",
+        "key_pem"
+      ],
+      "properties": {
+        "cert_pem": {
+          "description": "Client certificate chain in PEM format, supplied via a secret reference.",
+          "type": "string"
+        },
+        "key_pem": {
+          "description": "Client private key in PEM format, supplied via a secret reference.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ClassifierHooksAuthenticationConfig": {
+      "description": "Request authentication presented to the classifier hook service.",
+      "oneOf": [
+        {
+          "description": "Bearer-style metadata authentication on every gRPC request.",
+          "type": "object",
+          "required": [
+            "credential",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "bearer"
+              ]
+            },
+            "credential": {
+              "description": "Secret reference for the bearer token value.",
+              "type": "string"
+            },
+            "header": {
+              "description": "Metadata key that carries the token. Defaults to `authorization`.",
+              "default": "authorization",
+              "type": "string"
+            },
+            "scheme": {
+              "description": "Optional value prefix. Defaults to `Bearer`.",
+              "default": "Bearer",
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
     },
     "ClassifierIntentHookConfig": {
       "description": "Model used to classify a prompt into the five stock intent labels.",
@@ -11216,11 +11330,23 @@
       ]
     },
     "EgressTopLevelConfig": {
-      "description": "Top-level `egress:` section: operator-authored allowlists that arm the per-purpose egress gates (WOR-2476), plus the OTLP exporter gate (WOR-2481).\n\nReuses the mode/hosts/allow_private vocabulary the per-tool MCP/OpenAPI `egress:` block already ships (`sbproxy_extension::mcp::egress::EgressPolicy`); this crate cannot depend on `sbproxy-extension` (that dependency runs the other way), so the shape is redeclared here rather than shared by type.\n\nEvery sub-block is independently optional. A purpose whose sub-block is omitted stays legacy ungated: `AiClient`'s documented `None` contract, the usage sinks' unauthenticated dispatch, the model-artifact fetcher's unauthenticated download, the non-MCP token-exchange resolver, and the OTLP exporters all keep behaving exactly as they did before this section existed. `compile_config` compiles each configured sub-block into a [`sbproxy_security::egress::EgressAuthorizer`] once, on [`crate::snapshot::CompiledConfig::egress`]; nothing downstream parses this raw struct directly.",
+      "description": "Top-level `egress:` section: operator-authored allowlists that arm the per-purpose egress gates (WOR-2476), plus the OTLP exporter gate (WOR-2481).\n\nReuses the mode/hosts/allow_private vocabulary the per-tool MCP/OpenAPI `egress:` block already ships (`sbproxy_extension::mcp::egress::EgressPolicy`); this crate cannot depend on `sbproxy-extension` (that dependency runs the other way), so the shape is redeclared here rather than shared by type.\n\nEvery sub-block is independently optional. A purpose whose sub-block is omitted stays legacy ungated: `AiClient`'s documented `None` contract, the classifier hooks' legacy ungated dispatch, the usage sinks' unauthenticated dispatch, the model-artifact fetcher's unauthenticated download, the non-MCP token-exchange resolver, and the OTLP exporters all keep behaving exactly as they did before this section existed. `compile_config` compiles each configured sub-block into a [`sbproxy_security::egress::EgressAuthorizer`] once, on [`crate::snapshot::CompiledConfig::egress`]; nothing downstream parses this raw struct directly.",
       "type": "object",
       "properties": {
         "ai_providers": {
           "description": "Arms `EgressPurpose::AiProvider`: every upstream AI provider dispatch the AI gateway's client makes.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EgressPurposeConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "classifier_hooks": {
+          "description": "Arms `EgressPurpose::ClassifierHook`: the stock intent and prompt-aware provider-quality classifier RPCs.",
           "default": null,
           "anyOf": [
             {
