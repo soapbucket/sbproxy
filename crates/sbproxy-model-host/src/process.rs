@@ -9,6 +9,8 @@ use std::ffi::{CStr, CString, OsStr, OsString};
 use std::io::Read as _;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::io::Write as _;
+#[cfg(target_os = "linux")]
+use std::os::fd::{FromRawFd as _, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -1866,29 +1868,23 @@ fn spawn_engine_child(
     .map_err(|error| error.to_string())
 }
 
-#[cfg(target_os = "linux")]
-type NativeChild = std::process::Child;
-#[cfg(target_os = "macos")]
-type NativeChild = MacProcessChild;
-#[cfg(target_os = "linux")]
-type NativeReleaseWriter = std::process::ChildStdin;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+type NativeChild = UnixPidChild;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 type NativeReleaseWriter = std::fs::File;
-#[cfg(target_os = "linux")]
-type NativeStderrReader = std::process::ChildStderr;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 type NativeStderrReader = std::fs::File;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug)]
-struct MacProcessChild {
+struct UnixPidChild {
     pid: libc::pid_t,
 }
 
-#[cfg(target_os = "macos")]
-impl MacProcessChild {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl UnixPidChild {
     fn id(&self) -> u32 {
-        u32::try_from(self.pid).expect("posix_spawn returned a positive process ID")
+        u32::try_from(self.pid).expect("spawn returned a positive process ID")
     }
 
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
@@ -2064,61 +2060,226 @@ fn spawn_engine_command(
     arguments: &[String],
     environment: &BTreeMap<String, String>,
 ) -> std::io::Result<SpawnedEngineChild> {
-    use std::os::unix::process::CommandExt as _;
+    use std::os::unix::ffi::OsStrExt as _;
 
-    const EXEC_GATE: &str = "IFS= read -r release || exit 125\n\
-        [ \"$release\" = 1 ] || exit 125\n\
-        exec </dev/null\n\
-        exec \"$@\"";
+    // `std::process::Command::pre_exec` cannot host the startup gate.
+    // `spawn` waits for exec (or pre_exec to return) before it hands
+    // back the stdin write end, so a child that reads the release pipe
+    // in `pre_exec` deadlocks with the parent. The historical `/bin/sh
+    // -c` wrapper avoided that because the wait ran after exec. Distroless
+    // has no shell (WOR-2677), so the parent forks itself, returns at
+    // once, and the child waits with only async-signal-safe libc.
+    let (gate_read, gate_write) = linux_cloexec_pipe()?;
+    let (stderr_read, stderr_write) = linux_cloexec_pipe()?;
+    let pipes = LinuxChildPipes {
+        gate_read,
+        gate_write,
+        stderr_read,
+        stderr_write,
+    };
+
+    let executable = CString::new(executable.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "engine executable contains a NUL byte",
+        )
+    })?;
+    let mut argument_values = vec![executable.clone()];
+    for argument in arguments {
+        argument_values.push(CString::new(argument.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "engine argument contains a NUL byte",
+            )
+        })?);
+    }
+    let mut argument_pointers = argument_values
+        .iter()
+        .map(|value| value.as_ptr().cast_mut())
+        .collect::<Vec<_>>();
+    argument_pointers.push(std::ptr::null_mut());
+    let environment_values = unix_engine_environment(environment)?;
+    let mut environment_pointers = environment_values
+        .iter()
+        .map(|value| value.as_ptr().cast_mut())
+        .collect::<Vec<_>>();
+    environment_pointers.push(std::ptr::null_mut());
 
     let parent_pid = unsafe { libc::getpid() };
-    let mut command = std::process::Command::new("/bin/sh");
-    command
-        .arg("-c")
-        .arg(EXEC_GATE)
-        .arg("sbproxy-engine-gate")
-        .arg(executable)
-        .args(arguments)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .process_group(0);
-    apply_engine_environment(&mut command, environment);
-    // Command owns descriptor setup and the complete fork/exec boundary
-    // (including atomic CLOEXEC pipes on Linux), so there is no separate
-    // application-managed fork window. The child hook performs only libc
-    // operations: signals stay blocked until inherited dispositions reset.
-    unsafe {
-        command.pre_exec(move || prepare_engine_child_signal_state(parent_pid));
-    }
-    // Block in the calling thread before fork so the child is protected from
-    // inherited handlers from its first instruction. The child resets every
-    // catchable disposition before unblocking in `pre_exec`.
     let signal_mask = ParentSignalMask::block_all()?;
-    let spawn_result = command.spawn();
-    signal_mask.restore()?;
-    let mut child = spawn_result?;
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(pipes.gate_read);
+            libc::close(pipes.gate_write);
+            libc::close(pipes.stderr_read);
+            libc::close(pipes.stderr_write);
+        }
+        return Err(error);
+    }
+    if pid == 0 {
+        // SAFETY: this is the child after fork. The function only uses
+        // async-signal-safe libc and then execvpe or _exit.
+        unsafe {
+            linux_engine_child_after_fork(
+                parent_pid,
+                pipes,
+                executable.as_ptr(),
+                argument_pointers.as_ptr().cast(),
+                environment_pointers.as_ptr().cast(),
+            );
+        }
+    }
+    // POSIX: both parent and child call setpgid so the parent can
+    // observe an isolated group before the child reaches exec. Returning
+    // from fork before that (unlike Command::spawn, which waits through
+    // pre_exec) would otherwise fail the exact-leader snapshot.
+    if unsafe { libc::setpgid(pid, pid) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EACCES) {
+            unsafe {
+                libc::close(pipes.gate_read);
+                libc::close(pipes.gate_write);
+                libc::close(pipes.stderr_read);
+                libc::close(pipes.stderr_write);
+                libc::kill(pid, libc::SIGKILL);
+                let mut status = 0;
+                let _ = libc::waitpid(pid, &mut status, 0);
+            }
+            let _ = signal_mask.restore();
+            return Err(error);
+        }
+    }
+    if let Err(error) = signal_mask.restore() {
+        unsafe {
+            libc::close(pipes.gate_read);
+            libc::close(pipes.gate_write);
+            libc::close(pipes.stderr_read);
+            libc::close(pipes.stderr_write);
+            libc::kill(pid, libc::SIGKILL);
+            let mut status = 0;
+            let _ = libc::waitpid(pid, &mut status, 0);
+        }
+        return Err(error);
+    }
+    unsafe {
+        libc::close(pipes.gate_read);
+        libc::close(pipes.stderr_write);
+    }
+    let child = UnixPidChild { pid };
     let exact_identity = process_identity(child.id())
         .filter(|identity| process_group_for(identity.pid) == Some(identity.pid));
-    let stderr = child.stderr.take().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "engine startup gate did not provide stderr",
-        )
-    })?;
-    let release = child.stdin.take().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "engine startup gate did not provide stdin",
-        )
-    })?;
     Ok(SpawnedEngineChild {
         child,
-        release: Some(release),
-        stderr: Some(stderr),
+        release: Some(unsafe { std::fs::File::from_raw_fd(pipes.gate_write) }),
+        stderr: Some(unsafe { std::fs::File::from_raw_fd(pipes.stderr_read) }),
         status: None,
         exact_identity,
     })
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct LinuxChildPipes {
+    gate_read: RawFd,
+    gate_write: RawFd,
+    stderr_read: RawFd,
+    stderr_write: RawFd,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cloexec_pipe() -> std::io::Result<(RawFd, RawFd)> {
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((fds[0], fds[1]))
+}
+
+/// Child side of [`spawn_engine_command`]. Never returns.
+///
+/// # Safety
+///
+/// Must run only in the child after `fork`, before any allocator or
+/// lock is used. The parent may still be multithreaded. Only
+/// async-signal-safe libc, then `execvpe` or `_exit`.
+#[cfg(target_os = "linux")]
+unsafe fn linux_engine_child_after_fork(
+    parent_pid: libc::pid_t,
+    pipes: LinuxChildPipes,
+    executable: *const libc::c_char,
+    arguments: *const *const libc::c_char,
+    environment: *const *const libc::c_char,
+) -> ! {
+    if libc::setpgid(0, 0) != 0 {
+        libc::_exit(125);
+    }
+    if libc::dup2(pipes.gate_read, libc::STDIN_FILENO) < 0 {
+        libc::_exit(125);
+    }
+    if pipes.gate_read != libc::STDIN_FILENO {
+        libc::close(pipes.gate_read);
+    }
+    libc::close(pipes.gate_write);
+    libc::close(pipes.stderr_read);
+    let null_path = b"/dev/null\0";
+    let null_fd = libc::open(
+        null_path.as_ptr().cast::<libc::c_char>(),
+        libc::O_RDWR | libc::O_CLOEXEC,
+    );
+    if null_fd < 0 || libc::dup2(null_fd, libc::STDOUT_FILENO) < 0 {
+        libc::_exit(125);
+    }
+    if null_fd != libc::STDOUT_FILENO {
+        libc::close(null_fd);
+    }
+    if libc::dup2(pipes.stderr_write, libc::STDERR_FILENO) < 0 {
+        libc::_exit(125);
+    }
+    if pipes.stderr_write != libc::STDERR_FILENO {
+        libc::close(pipes.stderr_write);
+    }
+    if prepare_engine_child_signal_state(parent_pid).is_err()
+        || wait_for_engine_release_gate().is_err()
+    {
+        libc::_exit(125);
+    }
+    libc::execvpe(executable, arguments, environment);
+    // `/bin/sh -c exec` used to print the missing path on this
+    // failure. Keep that diagnostic on the captured stderr pipe so
+    // callers can tell exec failed, then exit 127 like a shell.
+    linux_write_all(libc::STDERR_FILENO, b"exec: ");
+    linux_write_cstr(libc::STDERR_FILENO, executable);
+    linux_write_all(libc::STDERR_FILENO, b": not found\n");
+    libc::_exit(127);
+}
+
+/// Async-signal-safe write of a whole buffer. Best-effort: a short
+/// write still lets the child exit.
+#[cfg(target_os = "linux")]
+unsafe fn linux_write_all(fd: libc::c_int, bytes: &[u8]) {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let wrote = libc::write(fd, bytes.as_ptr().add(offset).cast(), bytes.len() - offset);
+        if wrote <= 0 {
+            return;
+        }
+        offset += wrote as usize;
+    }
+}
+
+/// Async-signal-safe write of a NUL-terminated path. `strlen` is not
+/// on the async-signal-safe list, so the length is counted here.
+#[cfg(target_os = "linux")]
+unsafe fn linux_write_cstr(fd: libc::c_int, value: *const libc::c_char) {
+    let mut len = 0;
+    while *value.add(len) != 0 {
+        len += 1;
+    }
+    if len > 0 {
+        let _ = libc::write(fd, value.cast(), len);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -2210,7 +2371,7 @@ fn spawn_engine_command(
         .collect::<Vec<_>>();
     argument_pointers.push(std::ptr::null_mut());
 
-    let environment_values = macos_engine_environment(environment)?;
+    let environment_values = unix_engine_environment(environment)?;
     let mut environment_pointers = environment_values
         .iter()
         .map(|value| value.as_ptr().cast_mut())
@@ -2234,7 +2395,7 @@ fn spawn_engine_command(
     drop(stderr_writer);
     drop(null_file);
 
-    let child = MacProcessChild { pid };
+    let child = UnixPidChild { pid };
     let exact_identity = process_identity(child.id())
         .filter(|identity| process_group_for(identity.pid) == Some(identity.pid));
     Ok(SpawnedEngineChild {
@@ -2246,8 +2407,8 @@ fn spawn_engine_command(
     })
 }
 
-#[cfg(target_os = "macos")]
-fn macos_engine_environment(overrides: &BTreeMap<String, String>) -> std::io::Result<Vec<CString>> {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn unix_engine_environment(overrides: &BTreeMap<String, String>) -> std::io::Result<Vec<CString>> {
     use std::os::unix::ffi::OsStrExt as _;
 
     let mut values = BTreeMap::<Vec<u8>, Vec<u8>>::new();
@@ -2466,6 +2627,58 @@ unsafe fn prepare_engine_child_signal_state(parent_pid: libc::pid_t) -> std::io:
     {
         return Err(std::io::Error::last_os_error());
     }
+    Ok(())
+}
+
+/// Wait for the parent to persist ownership, then point stdin at
+/// `/dev/null` before the engine image is exec'd.
+///
+/// Async-signal-safe: this runs in the child after `fork`, before
+/// `execvpe`. The previous implementation was a `/bin/sh -c` wrapper
+/// (WOR-2677); distroless images have no shell, so the same protocol
+/// lives here in libc.
+#[cfg(target_os = "linux")]
+unsafe fn wait_for_engine_release_gate() -> std::io::Result<()> {
+    let mut byte = 0u8;
+    let mut saw_one = false;
+    loop {
+        let n = libc::read(
+            libc::STDIN_FILENO,
+            std::ptr::addr_of_mut!(byte).cast::<libc::c_void>(),
+            1,
+        );
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if n == 0 {
+            libc::_exit(125);
+        }
+        if byte == b'\n' {
+            break;
+        }
+        if byte == b'1' && !saw_one {
+            saw_one = true;
+            continue;
+        }
+        libc::_exit(125);
+    }
+    if !saw_one {
+        libc::_exit(125);
+    }
+    let path = b"/dev/null\0";
+    let fd = libc::open(
+        path.as_ptr().cast::<libc::c_char>(),
+        libc::O_RDONLY | libc::O_CLOEXEC,
+    );
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if libc::dup2(fd, libc::STDIN_FILENO) < 0 {
+        let err = std::io::Error::last_os_error();
+        libc::close(fd);
+        return Err(err);
+    }
+    libc::close(fd);
     Ok(())
 }
 
@@ -3717,6 +3930,34 @@ mod tests {
             assert!(child.wait().unwrap().success());
             assert!(marker.exists());
         }
+    }
+
+    fn true_executable() -> &'static Path {
+        ["/bin/true", "/usr/bin/true"]
+            .iter()
+            .map(Path::new)
+            .find(|path| path.exists())
+            .unwrap_or(Path::new("/bin/true"))
+    }
+
+    #[test]
+    fn engine_spawn_gate_does_not_require_a_shell_wrapper() {
+        let directory = tempfile::tempdir().unwrap();
+        let gate_directory = test_gate_directory(&directory);
+        let mut child = spawn_engine_child(
+            gate_directory.as_ref(),
+            true_executable(),
+            &[],
+            &BTreeMap::new(),
+        )
+        .expect("spawn /bin/true through the startup gate");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the engine image must not exec until the parent releases the gate"
+        );
+        child.release_after_durable_record().unwrap();
+        assert!(child.wait().unwrap().success());
     }
 
     #[test]

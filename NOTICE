@@ -457,6 +457,15 @@ https://github.com/yeslogic/unicode-general-category
 
 ===========================================================================
 
+unicode-bom
+Copyright 2018-2026 Phil Booth
+Licensed under the Apache License, Version 2.0
+https://gitlab.com/philbooth/unicode-bom
+
+Pulled in by the in-process git fallback (`gix`).
+
+===========================================================================
+
 CHANGES TO THIRD-PARTY CODE
 
 This project uses Pingora as a dependency via Cargo (crates.io v0.8.0).

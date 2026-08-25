@@ -5,7 +5,7 @@
 //! `use super::*` re-imports the parent module's private items and
 //! `use` aliases, so the moved code needs no rewiring.
 
-use super::downstream_body::{buffered_body_limit, read_capped_request_body, BufferedPolicyGate};
+use super::downstream_body::{buffered_body_limit, read_capped_request_body};
 use super::*;
 use crate::key_plane::key_store_entrypoint;
 #[cfg(test)]
@@ -6474,12 +6474,22 @@ pub(super) async fn handle_ai_proxy(
                 ctx,
                 buffered_body_limit(config.max_body_size),
                 "AI request body too large",
-                BufferedPolicyGate::Ignore,
             )
             .await?
             else {
                 return Ok(());
             };
+            if !super::action_dispatch::run_deferred_body_policies(
+                session,
+                ctx,
+                pipeline,
+                origin_idx,
+                body_bytes.clone(),
+            )
+            .await?
+            {
+                return Ok(());
+            }
             if body_bytes.is_empty() {
                 (None, Vec::new())
             } else {
@@ -6493,6 +6503,17 @@ pub(super) async fn handle_ai_proxy(
                 }
             }
         } else {
+            if !super::action_dispatch::run_deferred_body_policies(
+                session,
+                ctx,
+                pipeline,
+                origin_idx,
+                bytes::Bytes::new(),
+            )
+            .await?
+            {
+                return Ok(());
+            }
             (None, Vec::new())
         };
 
@@ -6865,12 +6886,22 @@ pub(super) async fn handle_ai_proxy(
         ctx,
         buffered_body_limit(config.max_body_size),
         "AI request body too large",
-        BufferedPolicyGate::Ignore,
     )
     .await?
     else {
         return Ok(());
     };
+    if !super::action_dispatch::run_deferred_body_policies(
+        session,
+        ctx,
+        pipeline,
+        origin_idx,
+        body_bytes.clone(),
+    )
+    .await?
+    {
+        return Ok(());
+    }
 
     // WOR-229: stash the native body so the dispatcher can
     // byte-forward the inbound bytes to the upstream when the
@@ -14128,6 +14159,49 @@ async fn send_ai_stream_extension_block_before_headers(
     Ok(true)
 }
 
+/// Emit a client-safe SSE error frame after headers are already committed.
+///
+/// `send_ai_stream_extension_block_before_headers` can only replace the
+/// status when the stream has not started. A tool-call or output block
+/// that lands later used to close the connection with no payload
+/// (WOR-2683). This frame reuses the same bounded `ErrorEnvelope` every
+/// other block response writes.
+async fn send_ai_stream_extension_block_after_headers(
+    session: &mut Session,
+    ctx: &mut Option<&mut RequestContext>,
+    block: &crate::ai_extensions::AiExtensionBlock,
+) -> Result<()> {
+    if let Some(context) = ctx.as_deref_mut() {
+        mark_guardrail_block(context, block.code.clone());
+    }
+    let payload = ErrorEnvelope::new("guardrail_violation", &block.message)
+        .code(&block.code)
+        .to_bytes();
+    let mut frame = Vec::with_capacity(payload.len().saturating_add(8));
+    frame.extend_from_slice(b"data: ");
+    frame.extend_from_slice(&payload);
+    frame.extend_from_slice(b"\n\n");
+    session
+        .write_response_body(Some(bytes::Bytes::from(frame)), true)
+        .await
+}
+
+async fn send_ai_stream_extension_block(
+    session: &mut Session,
+    pending_header: &mut Option<Box<pingora_http::ResponseHeader>>,
+    ctx: &mut Option<&mut RequestContext>,
+    ai_span: &tracing::Span,
+    block: &crate::ai_extensions::AiExtensionBlock,
+) -> Result<bool> {
+    if send_ai_stream_extension_block_before_headers(session, pending_header, ctx, ai_span, block)
+        .await?
+    {
+        return Ok(true);
+    }
+    send_ai_stream_extension_block_after_headers(session, ctx, block).await?;
+    Ok(true)
+}
+
 async fn send_ai_stream_guardrail_block_before_headers(
     session: &mut Session,
     pending_header: &mut Option<Box<pingora_http::ResponseHeader>>,
@@ -14472,6 +14546,103 @@ pub(super) async fn relay_ai_response_with_cache(
                         .code(&block.code)
                         .to_bytes();
                     return send_response(session, block.status, "application/json", &body).await;
+                }
+            }
+            if extensions.needs_tool_assembly() {
+                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&resp_body) {
+                    let completed =
+                        match buffered_completed_tool_calls(&value, extensions.holds_tool_frames())
+                        {
+                            Ok(completed) => completed,
+                            Err(block) => {
+                                if let Some(request_ctx) = ctx.as_mut() {
+                                    return send_ai_extension_block_response(
+                                        session,
+                                        request_ctx,
+                                        &ai_span,
+                                        block,
+                                    )
+                                    .await;
+                                }
+                                let body =
+                                    ErrorEnvelope::new("guardrail_violation", &block.message)
+                                        .code(&block.code)
+                                        .to_bytes();
+                                return send_response(
+                                    session,
+                                    block.status,
+                                    "application/json",
+                                    &body,
+                                )
+                                .await;
+                            }
+                        };
+                    if !completed.is_empty() {
+                        match extensions.tool_calls(&completed).await {
+                            Ok(rewritten) if rewritten.is_empty() => {}
+                            Ok(rewritten) => {
+                                match apply_ai_tool_call_mutations(&resp_body, &rewritten) {
+                                    Some(new_body) => {
+                                        let new_body = bytes::Bytes::from(new_body);
+                                        if direct_client_body.is_some() {
+                                            direct_client_body = Some(restore_reversible_pii(
+                                                &new_body,
+                                                &reversible_pairs,
+                                            ));
+                                        }
+                                        resp_body = new_body;
+                                    }
+                                    None => {
+                                        let block = crate::ai_extensions::AiExtensionBlock::mutation_unrepresentable();
+                                        if let Some(request_ctx) = ctx.as_mut() {
+                                            return send_ai_extension_block_response(
+                                                session,
+                                                request_ctx,
+                                                &ai_span,
+                                                block,
+                                            )
+                                            .await;
+                                        }
+                                        let body = ErrorEnvelope::new(
+                                            "guardrail_violation",
+                                            &block.message,
+                                        )
+                                        .code(&block.code)
+                                        .to_bytes();
+                                        return send_response(
+                                            session,
+                                            block.status,
+                                            "application/json",
+                                            &body,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                            Err(block) => {
+                                if let Some(request_ctx) = ctx.as_mut() {
+                                    return send_ai_extension_block_response(
+                                        session,
+                                        request_ctx,
+                                        &ai_span,
+                                        block,
+                                    )
+                                    .await;
+                                }
+                                let body =
+                                    ErrorEnvelope::new("guardrail_violation", &block.message)
+                                        .code(&block.code)
+                                        .to_bytes();
+                                return send_response(
+                                    session,
+                                    block.status,
+                                    "application/json",
+                                    &body,
+                                )
+                                .await;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -15631,9 +15802,284 @@ fn apply_ai_output_mutation(original: &[u8], content: &str) -> Option<Vec<u8>> {
     }
 }
 
+fn assemble_hub_assistant_text(events: &[sbproxy_ai::format::HubChunk], assembled: &mut String) {
+    const MAX: usize = 1024 * 1024;
+    for event in events {
+        if let sbproxy_ai::format::HubChunk::ContentDelta {
+            delta: sbproxy_ai::format::ContentPartDelta::Text(text),
+            ..
+        } = event
+        {
+            let remaining = MAX.saturating_sub(assembled.len());
+            if remaining == 0 {
+                return;
+            }
+            // Cut on a UTF-8 boundary. Slicing at `remaining` panics when
+            // the next delta starts with a multi-byte character that
+            // straddles the 1 MiB budget (WOR-2682 review).
+            let end = text.floor_char_boundary(remaining.min(text.len()));
+            if end == 0 {
+                return;
+            }
+            assembled.push_str(&text[..end]);
+        }
+    }
+}
+
+/// Rebuild streamed assistant text after an output hook rewrote it.
+///
+/// Held JSON is spliced in place. Held SSE (or an empty hold) is
+/// re-emitted in the client's inbound wire shape via the same
+/// `ChatFormat` emitters the relay uses, so a `/v1/messages` or
+/// `/v1/responses` client does not receive Chat Completions chunks.
+/// `None` means the rewrite cannot be represented and the caller must
+/// refuse rather than ship the original.
+fn apply_stream_output_mutation(
+    content: &str,
+    held: &[Bytes],
+    inbound_format: Option<&str>,
+) -> Option<Vec<u8>> {
+    let original: Vec<u8> = held
+        .iter()
+        .flat_map(|chunk| chunk.iter().copied())
+        .collect();
+    if original.is_empty() || original.windows(5).any(|window| window == b"data:") {
+        return synthetic_inbound_content_stream(content, inbound_format);
+    }
+    apply_ai_output_mutation(&original, content)
+}
+
+fn synthetic_inbound_content_stream(text: &str, inbound_format: Option<&str>) -> Option<Vec<u8>> {
+    use sbproxy_ai::format::{
+        AnthropicMessagesFormat, BridgeContext, ChatFormat, ContentPartDelta, FinishReason,
+        HubChunk, OpenAiChatFormat, OpenAiResponsesFormat,
+    };
+    let mut ctx = BridgeContext {
+        inbound_format: inbound_format.unwrap_or("openai").to_string(),
+        stream: true,
+        ..Default::default()
+    };
+    let emitter: Box<dyn ChatFormat> = match inbound_format {
+        None | Some("openai") => Box::new(OpenAiChatFormat),
+        Some("anthropic") => Box::new(AnthropicMessagesFormat),
+        Some("responses") => Box::new(OpenAiResponsesFormat),
+        Some(_) => return None,
+    };
+    let chunks = [
+        HubChunk::MessageStart {
+            id: "sbproxy-mutate".into(),
+            model: "mutated".into(),
+        },
+        HubChunk::ContentDelta {
+            index: 0,
+            delta: ContentPartDelta::Text(text.to_string()),
+        },
+        HubChunk::MessageStop {
+            finish_reason: FinishReason::Stop,
+        },
+    ];
+    let mut out = String::new();
+    for chunk in &chunks {
+        let frames = emitter.from_hub_stream(chunk, &mut ctx).ok()?;
+        for frame in frames {
+            out.push_str(&frame);
+        }
+    }
+    Some(out.into_bytes())
+}
+
+/// What [`dispatch_stream_guard_output`] decided to do with the held stream.
+enum StreamGuardOutput {
+    Unchanged,
+    ResponseSent,
+    Mutated(String),
+}
+
+fn synthetic_assistant_json(text: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "choices": [{"message": {"role": "assistant", "content": text}}]
+    }))
+    .unwrap_or_else(|_| b"{\"choices\":[{\"message\":{\"content\":\"\"}}]}".to_vec())
+}
+
+fn buffered_completed_tool_calls(
+    value: &serde_json::Value,
+    fail_closed_over_cap: bool,
+) -> Result<
+    Vec<sbproxy_ai::guardrails::stream::CompletedToolCall>,
+    crate::ai_extensions::AiExtensionBlock,
+> {
+    let (calls, overflow) = extract_tool_calls_with_overflow(value);
+    if overflow && fail_closed_over_cap {
+        return Err(crate::ai_extensions::AiExtensionBlock::event_too_large());
+    }
+    Ok(calls
+        .into_iter()
+        .enumerate()
+        .map(
+            |(index, (id, name, args_json))| sbproxy_ai::guardrails::stream::CompletedToolCall {
+                index,
+                id: if id.is_empty() { None } else { Some(id) },
+                name,
+                args_json,
+                truncated: false,
+            },
+        )
+        .collect())
+}
+
+fn apply_ai_tool_call_mutations(
+    original: &[u8],
+    rewritten: &[sbproxy_plugin::AiExtensionToolCall],
+) -> Option<Vec<u8>> {
+    let mut value: serde_json::Value = serde_json::from_slice(original).ok()?;
+    for call in rewritten {
+        let mut applied = false;
+        if let Some(choices) = value.get_mut("choices").and_then(|v| v.as_array_mut()) {
+            for choice in choices.iter_mut() {
+                let Some(tool_calls) = choice
+                    .get_mut("message")
+                    .and_then(|message| message.get_mut("tool_calls"))
+                    .and_then(|v| v.as_array_mut())
+                else {
+                    continue;
+                };
+                if let Some(slot) = tool_calls.get_mut(call.index) {
+                    if let Some(id) = &call.id {
+                        slot["id"] = serde_json::Value::String(id.clone());
+                    }
+                    slot["function"]["name"] = serde_json::Value::String(call.name.clone());
+                    slot["function"]["arguments"] =
+                        serde_json::Value::String(call.arguments_json.clone());
+                    applied = true;
+                }
+            }
+        }
+        if !applied {
+            if let Some(content) = value.get_mut("content").and_then(|v| v.as_array_mut()) {
+                let mut tool_index = 0usize;
+                for block in content.iter_mut() {
+                    if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
+                        continue;
+                    }
+                    if tool_index == call.index {
+                        if let Some(id) = &call.id {
+                            block["id"] = serde_json::Value::String(id.clone());
+                        }
+                        block["name"] = serde_json::Value::String(call.name.clone());
+                        block["input"] = serde_json::from_str(&call.arguments_json).ok()?;
+                        applied = true;
+                        break;
+                    }
+                    tool_index += 1;
+                }
+            }
+        }
+        if !applied {
+            return None;
+        }
+    }
+    serde_json::to_vec(&value).ok()
+}
+
+async fn dispatch_stream_guard_output(
+    extensions: &mut crate::ai_extensions::AiRequestExtensions,
+    assembled: &str,
+    session: &mut Session,
+    pending_header: &mut Option<Box<pingora_http::ResponseHeader>>,
+    ctx: &mut Option<&mut RequestContext>,
+    ai_span: &tracing::Span,
+) -> Result<StreamGuardOutput> {
+    if !extensions.needs_output() {
+        return Ok(StreamGuardOutput::Unchanged);
+    }
+    let body = synthetic_assistant_json(assembled);
+    match extensions.guard_output(&body).await {
+        Ok(None) => Ok(StreamGuardOutput::Unchanged),
+        Ok(Some(content)) => Ok(StreamGuardOutput::Mutated(content)),
+        Err(block) => {
+            warn!(
+                extension_code = %block.code,
+                "AI proxy: extension hook blocked streamed output"
+            );
+            sbproxy_ai::tracing_spans::record_error(
+                ai_span,
+                sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                &block.message,
+            );
+            if send_ai_stream_extension_block(session, pending_header, ctx, ai_span, &block).await?
+            {
+                Ok(StreamGuardOutput::ResponseSent)
+            } else {
+                Ok(StreamGuardOutput::Unchanged)
+            }
+        }
+    }
+}
+
+struct StreamGuardSink<'a> {
+    holdback: &'a mut RelayBodyHoldback,
+    mutated_stream_body: &'a mut Option<Bytes>,
+    extension_response_sent: &'a mut bool,
+    output_guard_blocked: &'a mut bool,
+    stream_output_guarded: &'a mut bool,
+    inbound_format: Option<&'a str>,
+}
+
+async fn commit_stream_guard_output(
+    outcome: StreamGuardOutput,
+    session: &mut Session,
+    pending_header: &mut Option<Box<pingora_http::ResponseHeader>>,
+    ctx: &mut Option<&mut RequestContext>,
+    ai_span: &tracing::Span,
+    sink: StreamGuardSink<'_>,
+) -> Result<()> {
+    *sink.stream_output_guarded = true;
+    match outcome {
+        StreamGuardOutput::Unchanged => Ok(()),
+        StreamGuardOutput::ResponseSent => {
+            *sink.extension_response_sent = true;
+            *sink.output_guard_blocked = true;
+            Ok(())
+        }
+        StreamGuardOutput::Mutated(content) => {
+            let held = sink.holdback.take_buffered();
+            match apply_stream_output_mutation(&content, &held, sink.inbound_format) {
+                Some(body) => {
+                    *sink.mutated_stream_body = Some(Bytes::from(body));
+                    Ok(())
+                }
+                None => {
+                    let block = crate::ai_extensions::AiExtensionBlock::mutation_unrepresentable();
+                    warn!(
+                        extension_code = %block.code,
+                        "AI proxy: streamed output mutation could not be written back"
+                    );
+                    sbproxy_ai::tracing_spans::record_error(
+                        ai_span,
+                        sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
+                        &block.message,
+                    );
+                    if send_ai_stream_extension_block(session, pending_header, ctx, ai_span, &block)
+                        .await?
+                    {
+                        *sink.extension_response_sent = true;
+                        *sink.output_guard_blocked = true;
+                    }
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod mutation_write_back_tests {
-    use super::apply_ai_output_mutation;
+    use super::{
+        apply_ai_output_mutation, apply_stream_output_mutation, assemble_hub_assistant_text,
+    };
+    use bytes::Bytes;
+    use sbproxy_ai::format::{ContentPartDelta, HubChunk};
 
     #[test]
     fn output_mutation_splices_json_and_replaces_plain_text() {
@@ -15654,6 +16100,75 @@ mod mutation_write_back_tests {
             "clean",
         )
         .is_none());
+    }
+
+    #[test]
+    fn assembled_hub_text_cuts_on_a_char_boundary() {
+        let prefix = "a".repeat(1024 * 1024 - 1);
+        let mut assembled = String::new();
+        assemble_hub_assistant_text(
+            &[HubChunk::ContentDelta {
+                index: 0,
+                delta: ContentPartDelta::Text(format!("{prefix}é")),
+            }],
+            &mut assembled,
+        );
+        assert_eq!(assembled, prefix);
+        assert!(assembled.is_char_boundary(assembled.len()));
+    }
+
+    #[test]
+    fn stream_output_mutation_rebuilds_openai_sse() {
+        let held = [Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"raw\"}}]}\n\n",
+        )];
+        let rebuilt =
+            apply_stream_output_mutation("clean", &held, Some("openai")).expect("sse rewrite");
+        let text = String::from_utf8(rebuilt).expect("utf8");
+        assert!(text.contains("clean"), "{text}");
+        assert!(!text.contains("raw"), "{text}");
+        assert!(text.contains("chat.completion.chunk"), "{text}");
+        assert!(text.contains("data: [DONE]"), "{text}");
+    }
+
+    #[test]
+    fn stream_output_mutation_rebuilds_anthropic_sse() {
+        let held = [Bytes::from_static(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"raw\"}}\n\n",
+        )];
+        let rebuilt =
+            apply_stream_output_mutation("clean", &held, Some("anthropic")).expect("sse rewrite");
+        let text = String::from_utf8(rebuilt).expect("utf8");
+        assert!(text.contains("clean"), "{text}");
+        assert!(!text.contains("raw"), "{text}");
+        assert!(text.contains("event: content_block_delta"), "{text}");
+        assert!(
+            !text.contains("chat.completion.chunk"),
+            "Anthropic inbound must not be rebuilt as Chat Completions: {text}"
+        );
+    }
+
+    #[test]
+    fn stream_output_mutation_rebuilds_responses_sse() {
+        let held = [Bytes::from_static(
+            b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"raw\"}\n\n",
+        )];
+        let rebuilt =
+            apply_stream_output_mutation("clean", &held, Some("responses")).expect("sse rewrite");
+        let text = String::from_utf8(rebuilt).expect("utf8");
+        assert!(text.contains("clean"), "{text}");
+        assert!(!text.contains("raw"), "{text}");
+        assert!(text.contains("event: response.output_text.delta"), "{text}");
+        assert!(
+            !text.contains("chat.completion.chunk"),
+            "Responses inbound must not be rebuilt as Chat Completions: {text}"
+        );
+    }
+
+    #[test]
+    fn stream_output_mutation_unknown_format_is_unrepresentable() {
+        let held = [Bytes::from_static(b"data: {}\n\n")];
+        assert!(apply_stream_output_mutation("clean", &held, Some("gemini")).is_none());
     }
 }
 
@@ -15795,6 +16310,12 @@ impl RelayBodyHoldback {
         if self.failed || (self.guardrail.is_some() && !self.canonical_validated) {
             return Vec::new();
         }
+        self.buffered_bytes = 0;
+        self.canonical_validated = false;
+        std::mem::take(&mut self.chunks)
+    }
+
+    fn take_buffered(&mut self) -> Vec<Bytes> {
         self.buffered_bytes = 0;
         self.canonical_validated = false;
         std::mem::take(&mut self.chunks)
@@ -16488,7 +17009,13 @@ pub(super) async fn relay_ai_stream(
     let response_holdback_guardrail = guard_session
         .as_ref()
         .and_then(|session| session.response_holdback_guardrail())
-        .map(str::to_string);
+        .map(str::to_string)
+        .or_else(|| {
+            ai_extensions.as_ref().and_then(|ext| {
+                ext.holds_output_until_close()
+                    .then(|| "ai_guardrail_output".to_string())
+            })
+        });
     let mut response_body_holdback = RelayBodyHoldback::new(
         response_holdback_guardrail.as_deref(),
         sbproxy_ai::guardrails::stream::MAX_STREAM_GUARD_BUFFER_BYTES,
@@ -16574,6 +17101,9 @@ pub(super) async fn relay_ai_stream(
     // violating output does not reach the client.
     let mut output_guard_blocked = false;
     let mut extension_response_sent = false;
+    let mut stream_output_guarded = false;
+    let mut assembled_output = String::new();
+    let mut mutated_stream_body: Option<Bytes> = None;
     let mut pending_builtin_block: Option<sbproxy_ai::guardrails::GuardrailBlock> = None;
     'relay: loop {
         match stream.next().await {
@@ -16672,6 +17202,10 @@ pub(super) async fn relay_ai_stream(
                         None
                     };
 
+                if let Some(events) = decoded.as_deref() {
+                    assemble_hub_assistant_text(events, &mut assembled_output);
+                }
+
                 if guard_raw_mode {
                     if let Some(block) = response_body_holdback.decode_fallback_block() {
                         warn!(
@@ -16769,7 +17303,7 @@ pub(super) async fn relay_ai_stream(
                                 sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
                                 &block.message,
                             );
-                            if send_ai_stream_extension_block_before_headers(
+                            if send_ai_stream_extension_block(
                                 session,
                                 &mut pending_stream_header,
                                 &mut ctx,
@@ -16782,11 +17316,6 @@ pub(super) async fn relay_ai_stream(
                                 output_guard_blocked = true;
                                 break 'relay;
                             }
-                            if let Some(context) = ctx.as_deref_mut() {
-                                mark_guardrail_block(context, block.code);
-                            }
-                            output_guard_blocked = true;
-                            break 'relay;
                         }
                     }
                 }
@@ -17000,6 +17529,34 @@ pub(super) async fn relay_ai_stream(
                     output_guard_blocked = true;
                     break;
                 }
+                assemble_hub_assistant_text(&tail_events, &mut assembled_output);
+                if let Some(extensions) = ai_extensions.as_mut() {
+                    let outcome = dispatch_stream_guard_output(
+                        extensions,
+                        &assembled_output,
+                        session,
+                        &mut pending_stream_header,
+                        &mut ctx,
+                        &ai_span,
+                    )
+                    .await?;
+                    commit_stream_guard_output(
+                        outcome,
+                        session,
+                        &mut pending_stream_header,
+                        &mut ctx,
+                        &ai_span,
+                        StreamGuardSink {
+                            holdback: &mut response_body_holdback,
+                            mutated_stream_body: &mut mutated_stream_body,
+                            extension_response_sent: &mut extension_response_sent,
+                            output_guard_blocked: &mut output_guard_blocked,
+                            stream_output_guarded: &mut stream_output_guarded,
+                            inbound_format: format_args.inbound_format.as_deref(),
+                        },
+                    )
+                    .await?;
+                }
                 if let Some(extensions) = ai_extensions.as_mut() {
                     let already_closed = extensions.is_closed();
                     let decision = dispatch_ai_hub_events(
@@ -17027,7 +17584,7 @@ pub(super) async fn relay_ai_stream(
                             sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
                             &block.message,
                         );
-                        if send_ai_stream_extension_block_before_headers(
+                        if send_ai_stream_extension_block(
                             session,
                             &mut pending_stream_header,
                             &mut ctx,
@@ -17040,12 +17597,10 @@ pub(super) async fn relay_ai_stream(
                             output_guard_blocked = true;
                             break 'relay;
                         }
-                        if let Some(context) = ctx.as_deref_mut() {
-                            mark_guardrail_block(context, block.code);
-                        }
-                        output_guard_blocked = true;
-                        break;
                     }
+                }
+                if extension_response_sent {
+                    break;
                 }
                 if let Some(emitter) = inbound_emitter
                     .as_ref()
@@ -17182,14 +17737,26 @@ pub(super) async fn relay_ai_stream(
                     output_guard_blocked = true;
                     break;
                 }
-                for ready in response_body_holdback.release() {
-                    if let Some(trace) = trace_stream_content.as_mut() {
-                        trace.feed(&ready);
+                if !extension_response_sent {
+                    if let Some(mutated) = mutated_stream_body.take() {
+                        if let Some(trace) = trace_stream_content.as_mut() {
+                            trace.feed(&mutated);
+                        }
+                        if let Some(header) = pending_stream_header.take() {
+                            session.write_response_header(header, false).await?;
+                        }
+                        session.write_response_body(Some(mutated), false).await?;
+                    } else {
+                        for ready in response_body_holdback.release() {
+                            if let Some(trace) = trace_stream_content.as_mut() {
+                                trace.feed(&ready);
+                            }
+                            if let Some(header) = pending_stream_header.take() {
+                                session.write_response_header(header, false).await?;
+                            }
+                            session.write_response_body(Some(ready), false).await?;
+                        }
                     }
-                    if let Some(header) = pending_stream_header.take() {
-                        session.write_response_header(header, false).await?;
-                    }
-                    session.write_response_body(Some(ready), false).await?;
                 }
                 upstream_complete = true;
                 break;
@@ -17231,6 +17798,36 @@ pub(super) async fn relay_ai_stream(
         }
     }
 
+    if !stream_output_guarded && !extension_response_sent {
+        if let Some(extensions) = ai_extensions.as_mut() {
+            let outcome = dispatch_stream_guard_output(
+                extensions,
+                &assembled_output,
+                session,
+                &mut pending_stream_header,
+                &mut ctx,
+                &ai_span,
+            )
+            .await?;
+            commit_stream_guard_output(
+                outcome,
+                session,
+                &mut pending_stream_header,
+                &mut ctx,
+                &ai_span,
+                StreamGuardSink {
+                    holdback: &mut response_body_holdback,
+                    mutated_stream_body: &mut mutated_stream_body,
+                    extension_response_sent: &mut extension_response_sent,
+                    output_guard_blocked: &mut output_guard_blocked,
+                    stream_output_guarded: &mut stream_output_guarded,
+                    inbound_format: format_args.inbound_format.as_deref(),
+                },
+            )
+            .await?;
+        }
+    }
+
     if let Some(extensions) = ai_extensions.as_mut() {
         let already_closed = extensions.is_closed();
         let close_result = extensions.close().await;
@@ -17247,7 +17844,7 @@ pub(super) async fn relay_ai_stream(
                 sbproxy_ai::tracing_spans::error_type::GUARDRAIL_BLOCKED,
                 &block.message,
             );
-            if send_ai_stream_extension_block_before_headers(
+            if send_ai_stream_extension_block(
                 session,
                 &mut pending_stream_header,
                 &mut ctx,
@@ -17257,8 +17854,6 @@ pub(super) async fn relay_ai_stream(
             .await?
             {
                 extension_response_sent = true;
-            } else if let Some(context) = ctx.as_deref_mut() {
-                mark_guardrail_block(context, block.code);
             }
             output_guard_blocked = true;
         }
@@ -17268,6 +17863,12 @@ pub(super) async fn relay_ai_stream(
     // `upstream_complete` false, which the budget branch below reports as
     // a partial delivery.
     if !extension_response_sent {
+        if let Some(mutated) = mutated_stream_body.take() {
+            if let Some(header) = pending_stream_header.take() {
+                session.write_response_header(header, false).await?;
+            }
+            session.write_response_body(Some(mutated), false).await?;
+        }
         if let Some(header) = pending_stream_header.take() {
             session.write_response_header(header, false).await?;
         }
@@ -20371,6 +20972,68 @@ origins:
         (directory, pipeline)
     }
 
+    struct DenyingBufferedPolicy;
+
+    impl sbproxy_plugin::PolicyEnforcer for DenyingBufferedPolicy {
+        fn policy_type(&self) -> &'static str {
+            "buffered_deny_fixture"
+        }
+
+        fn enforce(
+            &self,
+            _req: &http::Request<bytes::Bytes>,
+            _ctx: &mut dyn std::any::Any,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = sbproxy_plugin::PluginResult<sbproxy_plugin::PolicyDecision>,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async {
+                Ok(sbproxy_plugin::PolicyDecision::Deny {
+                    status: 403,
+                    message: "buffered policy denied".to_string(),
+                })
+            })
+        }
+    }
+
+    fn buffered_deny_metadata() -> sbproxy_modules::DynamicHookMetadata {
+        sbproxy_modules::DynamicHookMetadata::new(
+            "fixture-bundle",
+            "buffered_deny_fixture",
+            sbproxy_config::BundleRuntime::Wasm,
+            sbproxy_config::BundleBodyMode::Buffered,
+            8192,
+            sbproxy_config::FailureMode::Closed,
+        )
+    }
+
+    fn pipeline_with_buffered_deny_policy() -> crate::pipeline::CompiledPipeline {
+        let config = sbproxy_config::compile_config(
+            r#"
+origins:
+  "ai.test":
+    action:
+      type: static
+      body: unused
+"#,
+        )
+        .expect("fixture config");
+        let mut pipeline =
+            crate::pipeline::CompiledPipeline::from_config(config).expect("fixture pipeline");
+        pipeline.enforcers = vec![vec![crate::builtin_enforcers::CompiledEnforcer {
+            surface: sbproxy_observe::events::PolicySurface::Plugin,
+            engine: sbproxy_observe::decision::DecisionEngine::Wasm,
+            enforcer: Box::new(DenyingBufferedPolicy),
+            dynamic_hook: Some(buffered_deny_metadata()),
+            shared_admission: None,
+        }]];
+        pipeline
+    }
+
     fn anthropic_proxy_config(upstream_url: &str) -> sbproxy_ai::AiHandlerConfig {
         sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
             "providers": [{
@@ -21240,6 +21903,264 @@ origins:
         assert!(response.starts_with("HTTP/1.1 451"), "{response}");
         assert!(response.contains("fixture_output"), "{response}");
         assert!(!response.contains("provider-private-output"), "{response}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    fn openai_content_stream(text: &str) -> Vec<u8> {
+        let content = serde_json::to_string(text).expect("content JSON string");
+        format!(
+            "data: {{\"id\":\"chatcmpl-out\",\"object\":\"chat.completion.chunk\",\"created\":1,\
+             \"model\":\"requested-model\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\
+             \"assistant\",\"content\":{content}}}}}]}}\n\n\
+             data: {{\"id\":\"chatcmpl-out\",\"object\":\"chat.completion.chunk\",\"created\":1,\
+             \"model\":\"requested-model\",\"choices\":[{{\"index\":0,\"delta\":{{}},\
+             \"finish_reason\":\"stop\"}}]}}\n\n\
+             data: [DONE]\n\n"
+        )
+        .into_bytes()
+    }
+
+    fn canonical_tool_call_response() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "id": "chatcmpl-tool",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "selected-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "dangerous_lookup", "arguments": "{\"id\":42}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+        }))
+        .expect("tool-call response JSON")
+    }
+
+    fn openai_role_then_tool_call_stream() -> Vec<u8> {
+        concat!(
+            "data: {\"id\":\"chatcmpl-tool\",\"object\":\"chat.completion.chunk\",",
+            "\"created\":1,\"model\":\"requested-model\",\"choices\":[{\"index\":0,",
+            "\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl-tool\",\"object\":\"chat.completion.chunk\",",
+            "\"created\":1,\"model\":\"requested-model\",\"choices\":[{\"index\":0,",
+            "\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",",
+            "\"function\":{\"name\":\"dangerous_lookup\",\"arguments\":\"{\\\"id\\\":42}\"}}]},",
+            "\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .as_bytes()
+        .to_vec()
+    }
+
+    #[tokio::test]
+    async fn bundled_ai_output_block_replaces_the_streaming_provider_response() {
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture(
+            openai_content_stream("provider-private-output"),
+            "text/event-stream",
+        )
+        .await;
+        let config = openai_proxy_config(&upstream_url);
+        let (_directory, pipeline) = pipeline_with_ai_javascript(
+            "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: output-block\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: ai_guardrail_output\n    type: block_output\n    export: inspect\n",
+            r#"export function inspect(input) { if (input.event.content !== "provider-private-output") throw new Error("wrong output"); return {version:"sbproxy-envelope/v1",decision:"block",status:451,code:"fixture_output",message:"output refused by fixture"}; }"#,
+        );
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("bundled streaming output refusal is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response UTF-8");
+        assert!(response.starts_with("HTTP/1.1 451"), "{response}");
+        assert!(response.contains("fixture_output"), "{response}");
+        assert!(!response.contains("provider-private-output"), "{response}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn bundled_ai_output_mutate_replaces_the_streaming_provider_response() {
+        let (upstream_url, upstream_hits) = upstream_bytes_fixture(
+            openai_content_stream("provider-private-output"),
+            "text/event-stream",
+        )
+        .await;
+        let config = openai_proxy_config(&upstream_url);
+        let (_directory, pipeline) = pipeline_with_ai_javascript(
+            "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: output-rewrite\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: ai_guardrail_output\n    type: rewrite_output\n    export: inspect\n    execution:\n      mutates: true\n",
+            // base64 of "redacted-output"
+            r#"export function inspect(input) { if (input.event.content !== "provider-private-output") throw new Error("wrong output"); return {version:"sbproxy-envelope/v1",decision:"mutate",code:"redacted",body_base64:"cmVkYWN0ZWQtb3V0cHV0"}; }"#,
+        );
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("bundled streaming output mutation is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response UTF-8");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("redacted-output"), "{response}");
+        assert!(!response.contains("provider-private-output"), "{response}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn ai_proxy_runs_deferred_buffered_policies_before_the_provider() {
+        let (upstream_url, upstream_hits) =
+            upstream_bytes_fixture(canonical_chat_response("secret"), "application/json").await;
+        let config = openai_proxy_config(&upstream_url);
+        let pipeline = pipeline_with_buffered_deny_policy();
+        let metadata = buffered_deny_metadata();
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        context.dynamic_request_body_plan =
+            crate::request_body_plan::DynamicRequestBodyPlan::from_policy_metadata([(
+                0,
+                Some(&metadata),
+            )]);
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("a denied AI request still terminates");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response UTF-8");
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "removing the ai_proxy deferred-policy dispatch admits this request: {response}"
+        );
+        assert!(
+            response.contains("buffered policy denied"),
+            "response: {response}"
+        );
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            0,
+            "a fail-closed buffered policy must decide before the provider is contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn bundled_ai_tool_block_replaces_the_buffered_provider_response() {
+        let (upstream_url, upstream_hits) =
+            upstream_bytes_fixture(canonical_tool_call_response(), "application/json").await;
+        let config = openai_proxy_config(&upstream_url);
+        let (_directory, pipeline) = pipeline_with_ai_javascript(
+            "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: tool-block\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: ai_tool_call\n    type: block_tool\n    export: inspect\n",
+            r#"export function inspect(input) { const call=input.event.call; if (call.name !== "dangerous_lookup" || call.arguments_json !== "{\"id\":42}") throw new Error("wrong tool call"); return {version:"sbproxy-envelope/v1",decision:"block",status:409,code:"fixture_tool",message:"tool refused by fixture"}; }"#,
+        );
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("bundled buffered tool refusal is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response UTF-8");
+        assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+        assert!(response.contains("fixture_tool"), "{response}");
+        assert!(!response.contains("dangerous_lookup"), "{response}");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn bundled_ai_tool_block_after_headers_writes_an_sse_error() {
+        let (upstream_url, upstream_hits) =
+            upstream_bytes_fixture(openai_role_then_tool_call_stream(), "text/event-stream").await;
+        let config = openai_proxy_config(&upstream_url);
+        let (_directory, pipeline) = pipeline_with_ai_javascript(
+            "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: tool-block\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: ai_tool_call\n    type: block_tool\n    export: inspect\n",
+            r#"export function inspect(input) { return {version:"sbproxy-envelope/v1",decision:"block",status:409,code:"fixture_tool",message:"tool refused by fixture"}; }"#,
+        );
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("post-commit tool refusal is handled");
+        drop(session);
+
+        let response =
+            String::from_utf8(live_downstream_body(client).await).expect("response UTF-8");
+        assert!(response.contains("fixture_tool"), "{response}");
+        assert!(
+            response.contains("guardrail_violation") || response.contains("HTTP/1.1 409"),
+            "the client must see a named refusal, not a silent close: {response}"
+        );
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
     }
 

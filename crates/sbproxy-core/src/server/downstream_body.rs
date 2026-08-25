@@ -51,25 +51,6 @@ pub(super) const PLAN_STAGE_DECLARED: &str = "declared_length";
 /// The length that produced a plan decision: bytes actually received.
 pub(super) const PLAN_STAGE_BUFFERED: &str = "buffered_length";
 
-/// Whether the reader advances the buffered-policy plan as it reads.
-///
-/// The plan holds each buffered dynamic policy's own
-/// `max_buffer_bytes`, and only a caller that is going to *dispatch*
-/// those policies may spend it. The AI paths must not: an AI origin can
-/// carry buffered bundle policies that only the proxied path ever runs,
-/// so skipping one here, or refusing on its cap, would charge an AI
-/// request for a decision nothing was ever going to make.
-#[derive(Clone, Copy)]
-pub(super) enum BufferedPolicyGate {
-    /// Leave the plan untouched. The caller dispatches no buffered
-    /// dynamic policies.
-    Ignore,
-    /// Settle the plan against the running length before each append,
-    /// so a closed policy's `max_buffer_bytes` bounds the allocation
-    /// instead of being checked once the buffer is already full.
-    SettlePerChunk,
-}
-
 /// Resolve the byte cap for a body this process is going to hold whole.
 ///
 /// `Some(0)` reads as "unset" rather than "refuse everything", which is
@@ -91,10 +72,9 @@ pub(super) fn buffered_body_limit(configured: Option<usize>) -> usize {
 /// bytes; the per-chunk check then catches the chunked upload that
 /// declares nothing, which is the case `request_limit` cannot see.
 ///
-/// Under [`BufferedPolicyGate::SettlePerChunk`] each chunk is also
-/// settled against the buffered-policy plan before it is appended, so a
-/// hook's own `max_buffer_bytes` bounds the allocation rather than
-/// being discovered once the buffer is already full.
+/// Each chunk is settled against the buffered-policy plan before it is
+/// appended, so a hook's own `max_buffer_bytes` bounds the allocation
+/// rather than being discovered once the buffer is already full.
 ///
 /// `ctx.request_body_bytes` is maintained here because the access log
 /// and the meter runtime read it for `bytes_in`, and a terminal action
@@ -104,7 +84,6 @@ pub(super) async fn read_capped_request_body(
     ctx: &mut RequestContext,
     cap: usize,
     message: &str,
-    gate: BufferedPolicyGate,
 ) -> Result<Option<Bytes>> {
     let declared = session
         .req_header()
@@ -141,10 +120,7 @@ pub(super) async fn read_capped_request_body(
         // and settling only once the read finished would let a chunked
         // client push the whole host cap through a control that asked
         // for a kilobyte.
-        if matches!(gate, BufferedPolicyGate::SettlePerChunk)
-            && !settle_buffered_policy_plan(session, ctx, proposed, None, PLAN_STAGE_BUFFERED)
-                .await?
-        {
+        if !settle_buffered_policy_plan(session, ctx, proposed, None, PLAN_STAGE_BUFFERED).await? {
             return Ok(None);
         }
         ctx.request_body_bytes = ctx.request_body_bytes.saturating_add(chunk.len() as u64);

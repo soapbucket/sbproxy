@@ -27,6 +27,34 @@ use crate::key_plane::key_store_entrypoint;
 /// empty-body digest.
 const DEFERRED_BODY_DIGEST_PROVIDERS: &[&str] = &["bot_auth", "hmac_auth"];
 
+/// True when this request will not produce a request-body phase.
+///
+/// `check_policies` defers `BundleBodyMode::Buffered` hooks to that
+/// phase. A GET/HEAD (or any request that declared no body and is not
+/// chunked) never reaches it, so those hooks would otherwise stay
+/// queued forever (WOR-2681).
+fn request_carries_no_body(session: &Session) -> bool {
+    let headers = &session.req_header().headers;
+    if headers
+        .get(http::header::TRANSFER_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
+    {
+        return false;
+    }
+    if let Some(length) = headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return length == 0;
+    }
+    matches!(
+        session.req_header().method.as_str(),
+        "GET" | "HEAD" | "OPTIONS" | "DELETE"
+    )
+}
+
 /// Arm the deferred `content-digest` body binding for a request that
 /// authenticated on a signature covering `content-digest`.
 ///
@@ -4010,6 +4038,23 @@ pub(super) async fn request_filter(
             // `ctx.rate_limit_info` was populated in-place by the
             // RateLimitEnforcer wrapper, so the response_filter has
             // the data it needs for X-RateLimit-* headers.
+            // WOR-2681: `BundleBodyMode::Buffered` (the hook default)
+            // is skipped above and only runs once the body is complete.
+            // A request with no body never enters `request_body_filter`,
+            // so run those hooks here against an empty body rather than
+            // silently admitting the request.
+            if request_carries_no_body(session)
+                && !super::action_dispatch::run_deferred_body_policies(
+                    session,
+                    ctx,
+                    &pipeline,
+                    Some(origin_idx),
+                    bytes::Bytes::new(),
+                )
+                .await?
+            {
+                return Ok(true);
+            }
         }
         Some((status, msg, policy_type)) => {
             // The wrappers stamp `ctx.rate_limit_info` (and
@@ -7519,5 +7564,175 @@ origins:
         );
 
         ticker.abort();
+    }
+}
+
+/// WOR-2681: a GET never enters `request_body_filter`, so the header
+/// phase is the only place a `body_mode: buffered` policy can run.
+#[cfg(test)]
+mod empty_body_buffered_policy_tests {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::time::Duration;
+
+    use pingora_core::protocols::l4::stream::Stream;
+    use sbproxy_config::{BundleBodyMode, BundleRuntime, FailureMode};
+    use sbproxy_modules::DynamicHookMetadata;
+    use sbproxy_observe::decision::DecisionEngine;
+    use sbproxy_observe::events::PolicySurface;
+    use sbproxy_plugin::{PluginResult, PolicyDecision, PolicyEnforcer};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+    use crate::builtin_enforcers::CompiledEnforcer;
+
+    struct DenyingBufferedPolicy;
+
+    impl PolicyEnforcer for DenyingBufferedPolicy {
+        fn policy_type(&self) -> &'static str {
+            "buffered_deny_fixture"
+        }
+
+        fn enforce(
+            &self,
+            _req: &http::Request<bytes::Bytes>,
+            _ctx: &mut dyn std::any::Any,
+        ) -> Pin<Box<dyn Future<Output = PluginResult<PolicyDecision>> + Send + '_>> {
+            Box::pin(async {
+                Ok(PolicyDecision::Deny {
+                    status: 403,
+                    message: "buffered policy denied".to_string(),
+                })
+            })
+        }
+    }
+
+    fn buffered_policy_metadata() -> DynamicHookMetadata {
+        DynamicHookMetadata::new(
+            "fixture-bundle",
+            "buffered_deny_fixture",
+            BundleRuntime::Wasm,
+            BundleBodyMode::Buffered,
+            8192,
+            FailureMode::Closed,
+        )
+    }
+
+    fn pipeline_with_buffered_deny() -> crate::pipeline::CompiledPipeline {
+        let config = sbproxy_config::compile_config(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: static
+      status: 200
+      content_type: text/plain
+      body: "should-not-run"
+"#,
+        )
+        .expect("fixture config");
+        let mut pipeline =
+            crate::pipeline::CompiledPipeline::from_config(config).expect("fixture pipeline");
+        pipeline.enforcers = vec![vec![CompiledEnforcer {
+            surface: PolicySurface::Plugin,
+            engine: DecisionEngine::Wasm,
+            enforcer: Box::new(DenyingBufferedPolicy),
+            dynamic_hook: Some(buffered_policy_metadata()),
+            shared_admission: None,
+        }]];
+        pipeline
+    }
+
+    fn http_response_is_complete(buffer: &[u8]) -> bool {
+        let Some(header_end) = buffer
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|position| position + 4)
+        else {
+            return false;
+        };
+        let headers = String::from_utf8_lossy(&buffer[..header_end]);
+        let declared = headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        });
+        match declared {
+            Some(length) => buffer.len() - header_end >= length,
+            None => true,
+        }
+    }
+
+    async fn read_http_response(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut response = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            match stream.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(read) => response.extend_from_slice(&chunk[..read]),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ConnectionReset
+                        && http_response_is_complete(&response) =>
+                {
+                    break;
+                }
+                Err(error) => panic!(
+                    "read downstream response: {error:?} after {} bytes: {}",
+                    response.len(),
+                    String::from_utf8_lossy(&response)
+                ),
+            }
+        }
+        response
+    }
+
+    #[tokio::test]
+    async fn a_get_runs_deferred_buffered_policies_instead_of_admitting() {
+        let pipeline = pipeline_with_buffered_deny();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind downstream fixture");
+        let address = listener.local_addr().expect("downstream address");
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect downstream fixture");
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: plugin.test\r\nconnection: close\r\n\r\n")
+                .await
+                .expect("write request");
+            stream.shutdown().await.expect("half-close request");
+            read_http_response(&mut stream).await
+        });
+        let (stream, _) = listener.accept().await.expect("accept downstream");
+        let mut session = Session::new_h1(Box::new(Stream::from(stream)));
+        session
+            .as_downstream_mut()
+            .read_request()
+            .await
+            .expect("parse downstream request");
+        let mut ctx = crate::context::RequestContext::new();
+        ctx.pipeline = std::sync::Arc::new(pipeline);
+
+        let handled = request_filter(&mut session, &mut ctx)
+            .await
+            .expect("GET with a buffered deny still terminates");
+        drop(session);
+        let wire = tokio::time::timeout(Duration::from_secs(2), client)
+            .await
+            .expect("downstream response timeout")
+            .expect("downstream client task");
+        let response = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        assert!(handled, "a denied GET must short-circuit: {response}");
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "removing the empty-body dispatch admits this GET as 200: {response}"
+        );
+        assert!(
+            response.contains("buffered policy denied"),
+            "response: {response}"
+        );
     }
 }

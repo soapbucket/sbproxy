@@ -6,7 +6,7 @@
 //! `use` aliases, so the moved code needs no rewiring.
 
 use super::downstream_body::{
-    buffered_body_limit, read_capped_request_body, settle_buffered_policy_plan, BufferedPolicyGate,
+    buffered_body_limit, read_capped_request_body, settle_buffered_policy_plan,
     PLAN_STAGE_BUFFERED, PLAN_STAGE_DECLARED,
 };
 use super::*;
@@ -42,7 +42,7 @@ fn declared_body_length(headers: &http::HeaderMap) -> Option<usize> {
 /// before the handler sees content it would have denied.
 ///
 /// Returns `Ok(false)` once it has written the deny itself.
-async fn run_deferred_body_policies(
+pub(crate) async fn run_deferred_body_policies(
     session: &mut Session,
     ctx: &mut RequestContext,
     pipeline: &CompiledPipeline,
@@ -1344,14 +1344,8 @@ pub(super) async fn handle_action(
                 // that asked to hold 1 KiB must not have the whole host
                 // cap streamed past it before anyone consults its
                 // number.
-                let Some(body) = read_capped_request_body(
-                    session,
-                    ctx,
-                    cap,
-                    "request entity too large",
-                    BufferedPolicyGate::SettlePerChunk,
-                )
-                .await?
+                let Some(body) =
+                    read_capped_request_body(session, ctx, cap, "request entity too large").await?
                 else {
                     return Ok(true);
                 };

@@ -6395,7 +6395,7 @@ source:
 | `path` | string | required for `git` | Path to the config file inside the repository. Relative, and `..` components are refused: this names a file in the repository, not a file on the proxy host. |
 | `credential` | secret ref | | `env:NAME`, `${NAME}`, `file:/path`, or `secret://backend/name`. An inline literal is refused. |
 | `verify_signature` | bool | `false` | Require a verifiable signature on the resolved tag or commit. |
-| `timeout_secs` | int | `60` | Hard timeout for one fetch, 1 to 3600. The `git` child process is killed when it expires. |
+| `timeout_secs` | int | `60` | Hard timeout for one fetch, 1 to 3600. A `git` child, or the in-process clone, is stopped when it expires. |
 | `refresh_interval_secs` | int | `60` | How often to re-resolve while running. `0` resolves at boot and on ordinary reloads only. |
 
 ### What a git source proves, and what it does not
@@ -6407,14 +6407,16 @@ Two settings close most of that gap, and both are yours to choose:
 - **Pin `revision` to a full commit sha.** After fetching, SBproxy resolves `HEAD` and refuses the document when it is not the commit you named. A branch moving underneath a pinned node cannot be followed silently, and a pinned node never reloads on someone else's push.
 - **Set `verify_signature: true`.** The resolved tag is checked first, then the commit, and a missing or unverifiable signature refuses the document. The signing key has to be in the git trust store on the proxy host.
 
-### `git` is a runtime dependency
+### How a git source is fetched
 
-Resolution shells out to the `git` binary, so every host that resolves a git source needs `git` installed, container images included. A missing binary is a named failure that says so rather than a confusing clone error, and `sbproxy doctor` reports it in the `tooling` block:
+Resolution prefers the `git` binary on `PATH` and falls back to an in-process clone when that binary is missing. Distroless images have no git and no shell; the fallback is what a git-sourced config uses there. `sbproxy doctor` still reports the binary so you can see which path a host will take:
 
 ```text
 tooling
   git         /usr/bin/git (git version 2.43.0)
 ```
+
+`verify_signature: true` always needs `git`, because GPG and SSH signature verification are not in the in-process path. A missing binary with signature verification set is a named failure rather than a confusing clone error.
 
 One implementation note, because it changes what your git server has to allow: `git clone --depth 1` cannot fetch an arbitrary commit sha unless the server sets `uploadpack.allowReachableSHA1InWant`. Pinning to a sha therefore fetches the single commit when the server allows it and falls back to a full fetch when it does not. Pinning works either way; on a server without that setting it costs a full clone.
 
@@ -6426,8 +6428,8 @@ The interval carries jitter, so a fleet that restarts together does not hit your
 
 | Situation | Behavior |
 |---|---|
-| Remote unreachable, or `git` missing | Keep serving the document already applied. Error log, `unreachable` counter. |
-| Fetch exceeded `timeout_secs` | Child process killed. Keep serving. `timeout`. |
+| Remote unreachable | Keep serving the document already applied. Error log, `unreachable` counter. |
+| Fetch exceeded `timeout_secs` | The fetch is cancelled (the `git` child is killed; the in-process fallback stops cooperatively). Keep serving. `timeout`. |
 | `revision` pins a sha and `HEAD` is a different commit | Refuse the document. `revision_mismatch`. |
 | `verify_signature` set and no verifiable signature | Refuse the document. `verify_failed`. |
 | Resolved document does not compile or cannot be constructed | Refuse the document. `compile_failed`. |
@@ -6545,7 +6547,7 @@ sbproxy validate /etc/sbproxy/sb.yml --no-fetch
 
 ### Not in this version
 
-No write-back: nothing here commits to a repository. Be aware that on a git-sourced node the admin config editor still writes the local pointer file, which the next refresh then resolves past, so the repository is the only place a configuration change sticks. Making that editor read-only is not part of this version. No `db` source kind, no submodule or LFS support, and no in-process git implementation; the `git` binary stays the transport.
+No write-back: nothing here commits to a repository. Be aware that on a git-sourced node the admin config editor still writes the local pointer file, which the next refresh then resolves past, so the repository is the only place a configuration change sticks. Making that editor read-only is not part of this version. No `db` source kind, and no submodule or LFS support. Fetch prefers the `git` binary on `PATH` and falls back to an in-process clone when that binary is missing (the official distroless image has neither a shell nor git). `verify_signature: true` still requires `git`, because GPG and SSH signature verification are not in the in-process path.
 
 ---
 

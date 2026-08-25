@@ -47,7 +47,7 @@ impl AiExtensionBlock {
         }
     }
 
-    fn event_too_large() -> Self {
+    pub(crate) fn event_too_large() -> Self {
         Self {
             status: 413,
             code: "ai_extension_event_too_large".to_owned(),
@@ -146,11 +146,15 @@ impl AiRequestExtensions {
     }
 
     pub(crate) const fn needs_stream_decode(&self) -> bool {
-        self.kinds.stream || self.kinds.tool || self.kinds.close
+        self.kinds.stream || self.kinds.tool || self.kinds.close || self.kinds.output
     }
 
     pub(crate) const fn needs_tool_assembly(&self) -> bool {
         self.kinds.tool
+    }
+
+    pub(crate) const fn needs_output(&self) -> bool {
+        self.kinds.output
     }
 
     pub(crate) const fn enforces_stream_events(&self) -> bool {
@@ -158,7 +162,11 @@ impl AiRequestExtensions {
     }
 
     pub(crate) const fn delays_first_downstream_byte(&self) -> bool {
-        self.kinds.enforcing_stream || self.kinds.enforcing_tool
+        self.kinds.enforcing_stream || self.kinds.enforcing_tool || self.kinds.enforcing_output
+    }
+
+    pub(crate) const fn holds_output_until_close(&self) -> bool {
+        self.kinds.enforcing_output
     }
 
     pub(crate) const fn holds_tool_frames(&self) -> bool {
