@@ -51,31 +51,60 @@ const CLASSIFIER_HOOK_CONNECT_TENANT: &str = "unset";
 /// Resolved transport security for the classifier-hook gRPC client.
 #[derive(Clone, Default)]
 pub struct ClassifierClientSecurityConfig {
+    /// TLS material for the channel, or `None` to leave the transport as the
+    /// endpoint scheme implies. `configure_endpoint_security` reads this at
+    /// construction and turns on TLS when it is set even for an `http://`
+    /// endpoint.
     pub tls: Option<ClassifierClientTlsConfig>,
+    /// Credential presented on every RPC, or `None` for an unauthenticated
+    /// channel. `resolve_request_auth` reads this once at construction and
+    /// resolves it into the gRPC metadata pair attached to each request.
     pub authentication: Option<ClassifierClientAuthenticationConfig>,
 }
 
 /// HTTPS/TLS settings for the classifier-hook gRPC client.
 #[derive(Clone)]
 pub struct ClassifierClientTlsConfig {
+    /// PEM-encoded certificate authority bundle used to verify the sidecar,
+    /// added to the platform roots rather than replacing them. `None` trusts
+    /// the platform roots alone.
     pub ca_pem: Option<String>,
+    /// Domain name to verify the sidecar certificate against, overriding the
+    /// endpoint authority. Set it when the sidecar is dialed by address but
+    /// its certificate names a host.
     pub server_name: Option<String>,
+    /// Client certificate and key presented for mutual TLS, or `None` for a
+    /// server-authenticated channel.
     pub client_identity: Option<ClassifierClientIdentityConfig>,
 }
 
 /// Client certificate chain + private key for classifier-hook mTLS.
 #[derive(Clone)]
 pub struct ClassifierClientIdentityConfig {
+    /// PEM-encoded client certificate chain, leaf first, presented during the
+    /// mTLS handshake.
     pub cert_pem: String,
+    /// PEM-encoded private key for `cert_pem`. Held in memory for the life of
+    /// the client and redacted from this type's `Debug` output.
     pub key_pem: String,
 }
 
 /// Request authentication presented to the classifier service.
 #[derive(Clone)]
 pub enum ClassifierClientAuthenticationConfig {
+    /// A static credential sent as one gRPC metadata entry on every RPC. The
+    /// resolved value is marked sensitive, so tonic keeps it out of logs and
+    /// out of HPACK's shared table.
     Bearer {
+        /// Metadata key the credential is sent under, lowercase ASCII (for
+        /// example `authorization`). An invalid key fails the constructor
+        /// with [`ClassifierClientError::Connect`].
         header: String,
+        /// Scheme prefix joined to `credential` by a single space (for
+        /// example `Bearer`). Empty sends the credential on its own.
         scheme: String,
+        /// The secret itself. Never logged: it is redacted from `Debug` and
+        /// the resolved metadata value is flagged sensitive.
         credential: String,
     },
 }
@@ -449,6 +478,12 @@ impl ClassifierClient {
         Self::connect_lazy_with_security(endpoint, call_timeout, None)
     }
 
+    /// [`connect_lazy`](Self::connect_lazy) with explicit transport security.
+    ///
+    /// `security` supplies the TLS material and the per-RPC credential; `None`
+    /// is the plaintext, unauthenticated channel `connect_lazy` builds. Both
+    /// are resolved here rather than per call, so a malformed certificate or
+    /// metadata key fails at construction.
     pub fn connect_lazy_with_security(
         endpoint: &str,
         call_timeout: Duration,
@@ -513,6 +548,13 @@ impl ClassifierClient {
         Self::connect_governed_lazy_with_security(endpoint, call_timeout, authorizer, None)
     }
 
+    /// [`connect_governed_lazy`](Self::connect_governed_lazy) with explicit
+    /// transport security.
+    ///
+    /// The egress policy governs which address is dialed; `security` governs
+    /// what is presented once the socket is open. The endpoint URI stays the
+    /// channel authority and TLS identity, so pinning a resolved address does
+    /// not weaken certificate verification.
     pub fn connect_governed_lazy_with_security(
         endpoint: &str,
         call_timeout: Duration,

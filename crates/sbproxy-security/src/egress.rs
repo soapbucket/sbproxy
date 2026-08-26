@@ -306,7 +306,7 @@ impl EgressAuthorizer {
     ///
     /// Re-resolves the destination host through `resolver` and checks
     /// every returned address against the pin set recorded at authorize
-    /// time via [`Self::verify_pinned`]. All addresses must be pinned:
+    /// time by `verify_pinned`. All addresses must be pinned:
     /// a connector may pick any address it is handed, so one unpinned
     /// address in the answer refuses the whole dial rather than
     /// trusting the connector's choice. On success the verified
