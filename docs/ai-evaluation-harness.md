@@ -26,7 +26,7 @@ proxy:
     enabled: true
     port: 9090
     username: admin
-    password: ${SB_ADMIN_PASSWORD}
+    password: ${SB_ADMIN_PASSWORD:-change-this-before-running}
   ai_toolkit:
     limits:
       max_datasets: 8
