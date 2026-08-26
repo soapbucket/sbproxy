@@ -340,17 +340,25 @@ impl AiToolkitRuntime {
                 &agent_id,
                 agent.shared_secret.expose(),
             ));
-            let outbound = self
-                .no_redirect_client
-                .post(&agent.endpoint)
-                .header("x-sbproxy-agent-id", &agent_id)
-                .bearer_auth(token.as_str())
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(body)
-                .build()
-                .map_err(|_| ToolkitError::InvalidConfiguration {
-                    field: "agent.request",
-                })?;
+            // The agent hop is an outbound call the proxy makes while
+            // serving somebody's toolkit request, so it belongs in that
+            // request's trace. The runtime is handed no `TraceContext`,
+            // but the run executes inside the caller's span, so the
+            // ambient context is the one to propagate and `None` is the
+            // right argument rather than an absence of one.
+            let outbound = sbproxy_observe::telemetry::inject_reqwest_trace_context(
+                self.no_redirect_client
+                    .post(&agent.endpoint)
+                    .header("x-sbproxy-agent-id", &agent_id)
+                    .bearer_auth(token.as_str())
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body),
+                None,
+            )
+            .build()
+            .map_err(|_| ToolkitError::InvalidConfiguration {
+                field: "agent.request",
+            })?;
             drop(token);
             let governed = GovernedEgress {
                 purpose: egress.purpose,
