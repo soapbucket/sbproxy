@@ -267,10 +267,7 @@ mod tests {
         };
         assert_eq!(status, 503);
         assert_eq!(message, "service unavailable");
-        assert_eq!(
-            ctx.deny_policy_type.as_deref(),
-            Some("prompt_injection_unavailable")
-        );
+        assert_eq!(ctx.deny_policy_type, Some("prompt_injection_unavailable"));
         assert!(!message.contains("Tokio"));
         assert!(!message.contains("onnx"));
         assert!(!message.contains("127.0.0.1"));

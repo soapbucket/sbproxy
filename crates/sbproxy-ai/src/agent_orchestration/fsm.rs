@@ -1409,7 +1409,15 @@ mod tests {
         (result, events)
     }
 
-    fn traced_map_workflow(
+    /// One traced map fixture, named rather than positional.
+    ///
+    /// Six of the eight fields are `String` and every call site varies
+    /// exactly one of them against the same minimal valid workflow, so a
+    /// positional argument list made a transposition invisible: `"w", "s",
+    /// "s", "a", "go", "s"` reads the same whichever two are swapped.
+    /// `Default` carries that base and each case names only what it is
+    /// about.
+    struct TracedMapWorkflow {
         workflow_name: String,
         initial_state: String,
         state_name: String,
@@ -1418,7 +1426,34 @@ mod tests {
         target: String,
         root_unknown_key: Option<String>,
         state_unknown_key: Option<String>,
-    ) -> StringTraceValue {
+    }
+
+    impl Default for TracedMapWorkflow {
+        fn default() -> Self {
+            Self {
+                workflow_name: "w".to_string(),
+                initial_state: "s".to_string(),
+                state_name: "s".to_string(),
+                action: "a".to_string(),
+                outcome: "go".to_string(),
+                target: "s".to_string(),
+                root_unknown_key: None,
+                state_unknown_key: None,
+            }
+        }
+    }
+
+    fn traced_map_workflow(fixture: TracedMapWorkflow) -> StringTraceValue {
+        let TracedMapWorkflow {
+            workflow_name,
+            initial_state,
+            state_name,
+            action,
+            outcome,
+            target,
+            root_unknown_key,
+            state_unknown_key,
+        } = fixture;
         let mut state_entries = Vec::new();
         if let Some(unknown) = state_unknown_key {
             state_entries.push((
@@ -1628,13 +1663,9 @@ mod tests {
             + "s000".len()
             + EXPECTED_MAX_STATES * ("s000".len() + "a".len())
             + EXPECTED_MAX_EDGES * "s000".len();
-        let outcome_bytes = match target_bytes.checked_sub(fixed_bytes) {
-            Some(outcome_bytes) => outcome_bytes,
-            None => {
-                assert!(false, "test graph target must cover fixed graph bytes");
-                0
-            }
-        };
+        let outcome_bytes = target_bytes
+            .checked_sub(fixed_bytes)
+            .expect("test graph target must cover fixed graph bytes");
         let short_outcome_len = outcome_bytes / EXPECTED_MAX_EDGES;
         let longer_outcomes = outcome_bytes % EXPECTED_MAX_EDGES;
         assert!(
@@ -1673,10 +1704,9 @@ mod tests {
                     observed,
                 }
             ),
-            Ok(_) => assert!(
-                false,
-                "workflow limit unexpectedly accepted: limit={limit}, observed={observed}"
-            ),
+            Ok(_) => {
+                panic!("workflow limit unexpectedly accepted: limit={limit}, observed={observed}")
+            }
         }
     }
 
@@ -1714,8 +1744,7 @@ mod tests {
                     observed,
                 }
             ),
-            Ok(transition) => assert!(
-                false,
+            Ok(transition) => panic!(
                 "execution limit unexpectedly accepted as {transition:?}: limit={limit}, observed={observed}"
             ),
         }
@@ -2067,10 +2096,7 @@ mod tests {
             .insert(exact_outcome.clone(), "s".to_string());
         let workflow = match FsmWorkflow::new("runtime-outcome", "s", vec![looping], 2) {
             Ok(workflow) => workflow,
-            Err(error) => {
-                assert!(false, "4,096-byte runtime control must validate: {error}");
-                return;
-            }
+            Err(error) => panic!("4,096-byte runtime control must validate: {error}"),
         };
         let mut execution = FsmExecution::new(workflow);
         let exact_probe = FsmCallsiteProbe::install_for_current_thread();
@@ -2117,10 +2143,7 @@ mod tests {
         looping.transitions.insert(String::new(), "s".to_string());
         let workflow = match FsmWorkflow::new("history-quota", "s", vec![looping], 1_024) {
             Ok(workflow) => workflow,
-            Err(error) => {
-                assert!(false, "history quota control must validate: {error}");
-                return;
-            }
+            Err(error) => panic!("history quota control must validate: {error}"),
         };
 
         // Seed a consistent retained snapshot using only independently valid
@@ -2261,10 +2284,7 @@ mod tests {
     fn yaml_states_document(states: &[serde_json::Value]) -> String {
         let encoded = match serde_yaml::to_string(states) {
             Ok(encoded) => encoded,
-            Err(error) => {
-                assert!(false, "sentinel fixture failed to serialize: {error}");
-                String::new()
-            }
+            Err(error) => panic!("sentinel fixture failed to serialize: {error}"),
         };
         let indented = encoded
             .lines()
@@ -2484,16 +2504,10 @@ mod tests {
         // method requested by the application visitor. This makes no claim
         // about any format scanner's internal buffering.
         let outcome = traced_limit_case_passes(
-            traced_map_workflow(
-                "n".repeat(HUGE_SCALAR_BYTES),
-                "s".to_string(),
-                "s".to_string(),
-                "a".to_string(),
-                "go".to_string(),
-                "s".to_string(),
-                None,
-                None,
-            ),
+            traced_map_workflow(TracedMapWorkflow {
+                workflow_name: "n".repeat(HUGE_SCALAR_BYTES),
+                ..Default::default()
+            }),
             "root.name",
             FsmLimitDimension::WorkflowNameBytes,
             256,
@@ -2509,16 +2523,11 @@ mod tests {
     fn huge_unknown_key_is_refused_before_application_string_ownership() {
         const HUGE_UNKNOWN_KEY_BYTES: usize = 2 * 1024 * 1024 + 1;
 
-        let (result, events) = deserialize_with_string_trace(traced_map_workflow(
-            "w".to_string(),
-            "s".to_string(),
-            "s".to_string(),
-            "a".to_string(),
-            "go".to_string(),
-            "s".to_string(),
-            Some("u".repeat(HUGE_UNKNOWN_KEY_BYTES)),
-            None,
-        ));
+        let (result, events) =
+            deserialize_with_string_trace(traced_map_workflow(TracedMapWorkflow {
+                root_unknown_key: Some("u".repeat(HUGE_UNKNOWN_KEY_BYTES)),
+                ..Default::default()
+            }));
         let connected_without_ownership =
             string_role_is_connected_without_ownership(&events, "root.key.unknown");
 
@@ -2548,16 +2557,12 @@ mod tests {
             "root.key.max_steps",
         ];
 
-        let (control, control_events) = deserialize_with_string_trace(traced_map_workflow(
-            "w".to_string(),
-            "s".to_string(),
-            "s".to_string(),
-            "a".to_string(),
-            "go".to_string(),
-            "s".to_string(),
-            Some("root-extra".to_string()),
-            Some("state-extra".to_string()),
-        ));
+        let (control, control_events) =
+            deserialize_with_string_trace(traced_map_workflow(TracedMapWorkflow {
+                root_unknown_key: Some("root-extra".to_string()),
+                state_unknown_key: Some("state-extra".to_string()),
+                ..Default::default()
+            }));
         let connected = MAP_ROLES
             .iter()
             .all(|role| control_events.iter().any(|event| event.role == *role));
@@ -2571,16 +2576,10 @@ mod tests {
             (
                 "workflow name",
                 traced_limit_case_passes(
-                    traced_map_workflow(
-                        "w".repeat(257),
-                        "s".to_string(),
-                        "s".to_string(),
-                        "a".to_string(),
-                        "go".to_string(),
-                        "s".to_string(),
-                        None,
-                        None,
-                    ),
+                    traced_map_workflow(TracedMapWorkflow {
+                        workflow_name: "w".repeat(257),
+                        ..Default::default()
+                    }),
                     "root.name",
                     FsmLimitDimension::WorkflowNameBytes,
                     256,
@@ -2590,16 +2589,10 @@ mod tests {
             (
                 "initial state",
                 traced_limit_case_passes(
-                    traced_map_workflow(
-                        "w".to_string(),
-                        "i".repeat(257),
-                        "s".to_string(),
-                        "a".to_string(),
-                        "go".to_string(),
-                        "s".to_string(),
-                        None,
-                        None,
-                    ),
+                    traced_map_workflow(TracedMapWorkflow {
+                        initial_state: "i".repeat(257),
+                        ..Default::default()
+                    }),
                     "root.initial_state",
                     FsmLimitDimension::InitialStateBytes,
                     256,
@@ -2609,16 +2602,10 @@ mod tests {
             (
                 "state name",
                 traced_limit_case_passes(
-                    traced_map_workflow(
-                        "w".to_string(),
-                        "s".to_string(),
-                        "n".repeat(257),
-                        "a".to_string(),
-                        "go".to_string(),
-                        "s".to_string(),
-                        None,
-                        None,
-                    ),
+                    traced_map_workflow(TracedMapWorkflow {
+                        state_name: "n".repeat(257),
+                        ..Default::default()
+                    }),
                     "state.name",
                     FsmLimitDimension::StateNameBytes,
                     256,
@@ -2628,16 +2615,10 @@ mod tests {
             (
                 "action",
                 traced_limit_case_passes(
-                    traced_map_workflow(
-                        "w".to_string(),
-                        "s".to_string(),
-                        "s".to_string(),
-                        "a".repeat(513),
-                        "go".to_string(),
-                        "s".to_string(),
-                        None,
-                        None,
-                    ),
+                    traced_map_workflow(TracedMapWorkflow {
+                        action: "a".repeat(513),
+                        ..Default::default()
+                    }),
                     "state.action",
                     FsmLimitDimension::ActionBytes,
                     512,
@@ -2647,16 +2628,10 @@ mod tests {
             (
                 "outcome",
                 traced_limit_case_passes(
-                    traced_map_workflow(
-                        "w".to_string(),
-                        "s".to_string(),
-                        "s".to_string(),
-                        "a".to_string(),
-                        "o".repeat(4_097),
-                        "s".to_string(),
-                        None,
-                        None,
-                    ),
+                    traced_map_workflow(TracedMapWorkflow {
+                        outcome: "o".repeat(4_097),
+                        ..Default::default()
+                    }),
                     "transition.outcome",
                     FsmLimitDimension::OutcomeBytes,
                     4_096,
@@ -2666,16 +2641,10 @@ mod tests {
             (
                 "transition target",
                 traced_limit_case_passes(
-                    traced_map_workflow(
-                        "w".to_string(),
-                        "s".to_string(),
-                        "s".to_string(),
-                        "a".to_string(),
-                        "go".to_string(),
-                        "t".repeat(257),
-                        None,
-                        None,
-                    ),
+                    traced_map_workflow(TracedMapWorkflow {
+                        target: "t".repeat(257),
+                        ..Default::default()
+                    }),
                     "transition.target",
                     FsmLimitDimension::TransitionTargetBytes,
                     256,
@@ -2690,30 +2659,18 @@ mod tests {
         let structural_failures = [
             (
                 "root unknown key",
-                traced_map_workflow(
-                    "w".to_string(),
-                    "s".to_string(),
-                    "s".to_string(),
-                    "a".to_string(),
-                    "go".to_string(),
-                    "s".to_string(),
-                    Some("r".repeat(2 * 1024 * 1024 + 1)),
-                    None,
-                ),
+                traced_map_workflow(TracedMapWorkflow {
+                    root_unknown_key: Some("r".repeat(2 * 1024 * 1024 + 1)),
+                    ..Default::default()
+                }),
                 "root.key.unknown",
             ),
             (
                 "state unknown key",
-                traced_map_workflow(
-                    "w".to_string(),
-                    "s".to_string(),
-                    "s".to_string(),
-                    "a".to_string(),
-                    "go".to_string(),
-                    "s".to_string(),
-                    None,
-                    Some("q".repeat(2 * 1024 * 1024 + 1)),
-                ),
+                traced_map_workflow(TracedMapWorkflow {
+                    state_unknown_key: Some("q".repeat(2 * 1024 * 1024 + 1)),
+                    ..Default::default()
+                }),
                 "state.key.unknown",
             ),
         ]
@@ -2988,10 +2945,7 @@ mod tests {
             .insert("ok".to_string(), "s".to_string());
         let workflow = match FsmWorkflow::new("runtime-limit", "s", vec![looping], 2) {
             Ok(workflow) => workflow,
-            Err(error) => {
-                assert!(false, "small workflow must validate: {error}");
-                return;
-            }
+            Err(error) => panic!("small workflow must validate: {error}"),
         };
         let mut execution = FsmExecution::new(workflow);
         let oversized = "o".repeat(EXPECTED_MAX_OUTCOME_BYTES + 1);
@@ -3029,10 +2983,7 @@ mod tests {
             .insert("ok".to_string(), "s".to_string());
         let workflow = match FsmWorkflow::new("step-precedence", "s", vec![looping], 1) {
             Ok(workflow) => workflow,
-            Err(error) => {
-                assert!(false, "small workflow must validate: {error}");
-                return;
-            }
+            Err(error) => panic!("small workflow must validate: {error}"),
         };
         let mut execution = FsmExecution::new(workflow);
         let first = execution.transition("ok");
@@ -3070,10 +3021,7 @@ mod tests {
             .insert("ok".to_string(), "s".to_string());
         let workflow = match FsmWorkflow::new("runtime-control", "s", vec![looping], 2) {
             Ok(workflow) => workflow,
-            Err(error) => {
-                assert!(false, "small workflow must validate: {error}");
-                return;
-            }
+            Err(error) => panic!("small workflow must validate: {error}"),
         };
         let mut execution = FsmExecution::new(workflow);
         let probe = FsmCallsiteProbe::install_for_current_thread();
@@ -3102,28 +3050,17 @@ mod tests {
         let workflow =
             match FsmWorkflow::new("history-limit", "s", vec![looping], EXPECTED_MAX_STEPS) {
                 Ok(workflow) => workflow,
-                Err(error) => {
-                    assert!(false, "bounded cycle must validate: {error}");
-                    return;
-                }
+                Err(error) => panic!("bounded cycle must validate: {error}"),
             };
         let mut execution = FsmExecution::new(workflow);
 
         for _ in 0..1_023 {
             if let Err(error) = execution.transition(&exact_record_outcome) {
-                assert!(
-                    false,
-                    "history below the exact byte maximum was rejected: {error}"
-                );
-                return;
+                panic!("history below the exact byte maximum was rejected: {error}");
             }
         }
         if let Err(error) = execution.transition(&exact_record_outcome) {
-            assert!(
-                false,
-                "history at the exact byte maximum was rejected: {error}"
-            );
-            return;
+            panic!("history at the exact byte maximum was rejected: {error}");
         }
         let retained_bytes = execution
             .history()
@@ -3135,8 +3072,7 @@ mod tests {
         let mut overflowing_execution = FsmExecution::new(execution.workflow.clone());
         for _ in 0..1_023 {
             if let Err(error) = overflowing_execution.transition(&exact_record_outcome) {
-                assert!(false, "history overflow control setup failed: {error}");
-                return;
+                panic!("history overflow control setup failed: {error}");
             }
         }
         let history_before = overflowing_execution.history().to_vec();

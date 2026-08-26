@@ -228,7 +228,7 @@ pub struct PromptRolloutInput {
 }
 
 /// All materialized inputs for one immutable runtime generation.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct AiToolkitConfigInput {
     /// Runtime bounds.
     pub limits: AiToolkitLimits,
@@ -244,20 +244,6 @@ pub struct AiToolkitConfigInput {
     pub prompt_rollouts: Vec<PromptRolloutInput>,
     /// Exact-generation egress authorizer, required when agents exist.
     pub agent_egress: Option<AgentEgressInput>,
-}
-
-impl Default for AiToolkitConfigInput {
-    fn default() -> Self {
-        Self {
-            limits: AiToolkitLimits::default(),
-            allowed_scopes: Vec::new(),
-            agents: Vec::new(),
-            workflows: Vec::new(),
-            datasets: Vec::new(),
-            prompt_rollouts: Vec::new(),
-            agent_egress: None,
-        }
-    }
 }
 
 /// Scoped agent discovery request.

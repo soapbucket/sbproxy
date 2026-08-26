@@ -568,7 +568,7 @@ struct ChargebackCallsiteCounters {
 #[cfg(test)]
 std::thread_local! {
     static CHARGEBACK_CALLSITE_COUNTERS: std::cell::RefCell<Option<ChargebackCallsiteCounters>> =
-        std::cell::RefCell::new(None);
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Scoped, current-thread observation of the real accepted-record callsites.
@@ -1078,9 +1078,10 @@ fn rollup_key(
     requested_key: &DimensionKey,
     max_dimensions: usize,
 ) -> (DimensionKey, bool) {
-    if totals.contains_key(requested_key) {
-        (requested_key.clone(), false)
-    } else if totals.len() < max_dimensions.saturating_sub(1) {
+    // Two reasons for the same answer: the dimension already owns a row, or
+    // there is still room below the ceiling for a new one. Anything else
+    // folds into the shared overflow bucket.
+    if totals.contains_key(requested_key) || totals.len() < max_dimensions.saturating_sub(1) {
         (requested_key.clone(), false)
     } else {
         (DimensionKey::Overflow, true)
@@ -1552,7 +1553,7 @@ mod tests {
             let after_row = after
                 .refusal_counts
                 .iter()
-                .find(|candidate| &candidate.reason == &before_row.reason)
+                .find(|candidate| candidate.reason == before_row.reason)
                 .expect("every preexisting refusal row must remain present");
             let expected = if &before_row.reason == reason {
                 before_row
@@ -1571,8 +1572,7 @@ mod tests {
             if &after_row.reason != reason {
                 assert!(
                     before.refusal_counts.iter().any(|before_row| {
-                        &before_row.reason == &after_row.reason
-                            && before_row.count == after_row.count
+                        before_row.reason == after_row.reason && before_row.count == after_row.count
                     }),
                     "a refusal must not create or alter any unselected reason"
                 );

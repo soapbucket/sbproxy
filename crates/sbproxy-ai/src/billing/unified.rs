@@ -128,7 +128,7 @@ struct SnapshotBillingCallsiteCounters {
 std::thread_local! {
     static SNAPSHOT_BILLING_CALLSITE_COUNTERS: std::cell::RefCell<
         Option<SnapshotBillingCallsiteCounters>,
-    > = std::cell::RefCell::new(None);
+    > = const { std::cell::RefCell::new(None) };
 }
 
 /// Scoped test observation of the snapshot billing conversion path.
@@ -342,14 +342,8 @@ fn consistent_rollup_token_total(
         {
             return None;
         }
-        let Some(next_requests) = requests.checked_add(row.totals.request_count) else {
-            return None;
-        };
-        let Some(next_tokens) = tokens.checked_add(row.totals.tokens) else {
-            return None;
-        };
-        requests = next_requests;
-        tokens = next_tokens;
+        requests = requests.checked_add(row.totals.request_count)?;
+        tokens = tokens.checked_add(row.totals.tokens)?;
         if row.dimension == DimensionKey::Overflow {
             overflow_requests = Some(row.totals.request_count);
         }

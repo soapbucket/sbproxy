@@ -188,7 +188,7 @@ enum Cmd {
     /// origin without starting the proxy.
     Projections(ProjectionsCmd),
     /// AI gateway tools (usage ledger verification, ...).
-    Ai(AiCmd),
+    Ai(Box<AiCmd>),
     /// Audit-trail tools (verify the tamper-evident security or config
     /// audit chain).
     Audit(AuditCmd),
@@ -798,7 +798,7 @@ enum AiSub {
     /// Register immutable evaluation datasets with the live toolkit runtime.
     Dataset(DatasetCmd),
     /// Run a bounded evaluation against an exact live dataset version.
-    Evaluate(EvaluateArgs),
+    Evaluate(Box<EvaluateArgs>),
 }
 
 #[derive(clap::Args, Debug)]
@@ -12112,12 +12112,12 @@ mod tests {
             "json",
         ])
         .unwrap();
-        let Some(Cmd::Ai(AiCmd {
-            sub:
-                AiSub::Ledger(LedgerCmd {
-                    sub: LedgerSub::Report(args),
-                }),
-        })) = cli.cmd
+        let Some(Cmd::Ai(cmd)) = cli.cmd else {
+            panic!("ai ledger report parsed to the wrong command");
+        };
+        let AiSub::Ledger(LedgerCmd {
+            sub: LedgerSub::Report(args),
+        }) = cmd.sub
         else {
             panic!("ai ledger report parsed to the wrong command");
         };
@@ -12240,12 +12240,12 @@ mod tests {
             "json",
         ])
         .unwrap();
-        let Some(Cmd::Ai(AiCmd {
-            sub:
-                AiSub::Ledger(LedgerCmd {
-                    sub: LedgerSub::Reconcile(args),
-                }),
-        })) = cli.cmd
+        let Some(Cmd::Ai(cmd)) = cli.cmd else {
+            panic!("ai ledger reconcile parsed to the wrong command");
+        };
+        let AiSub::Ledger(LedgerCmd {
+            sub: LedgerSub::Reconcile(args),
+        }) = cmd.sub
         else {
             panic!("ai ledger reconcile parsed to the wrong command");
         };
@@ -16603,10 +16603,10 @@ origins:
             "artifact.json",
         ])
         .expect("prompt optimizer CLI parses");
-        let Some(Cmd::Ai(AiCmd {
-            sub: AiSub::Prompt(prompt),
-        })) = cli.cmd
-        else {
+        let Some(Cmd::Ai(cmd)) = cli.cmd else {
+            panic!("expected ai prompt optimize");
+        };
+        let AiSub::Prompt(prompt) = cmd.sub else {
             panic!("expected ai prompt optimize");
         };
         let PromptSub::Optimize(args) = prompt.sub else {
@@ -16750,10 +16750,10 @@ origins:
         .expect("evaluation dataset version must parse without selecting CLI version output");
 
         assert!(!cli.version);
-        let Some(Cmd::Ai(AiCmd {
-            sub: AiSub::Evaluate(args),
-        })) = cli.cmd
-        else {
+        let Some(Cmd::Ai(cmd)) = cli.cmd else {
+            panic!("expected ai evaluate command");
+        };
+        let AiSub::Evaluate(args) = cmd.sub else {
             panic!("expected ai evaluate command");
         };
         assert_eq!(args.version, 2);

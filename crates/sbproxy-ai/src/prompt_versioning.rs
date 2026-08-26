@@ -944,7 +944,7 @@ mod tests {
         let selection = store.select_for_cohort_typed("bounded", "customer-1", "rollout-1");
         match selection {
             Ok(version) => assert_eq!(version.version, 2),
-            Err(error) => assert!(false, "valid rollout was not selectable: {error:?}"),
+            Err(error) => panic!("valid rollout was not selectable: {error:?}"),
         }
     }
 
@@ -963,7 +963,7 @@ mod tests {
             Err(PromptVersionError::InvalidTotalWeight { total }) => {
                 assert_eq!(total, 0.0)
             }
-            other => assert!(false, "zero total returned the wrong result: {other:?}"),
+            other => panic!("zero total returned the wrong result: {other:?}"),
         }
         assert_eq!(
             rollout_fingerprint(&store, "atomic"),
@@ -979,10 +979,7 @@ mod tests {
             Err(PromptVersionError::InvalidTotalWeight { total }) => {
                 assert_eq!(total, f64::INFINITY)
             }
-            other => assert!(
-                false,
-                "non-finite aggregate returned the wrong result: {other:?}"
-            ),
+            other => panic!("non-finite aggregate returned the wrong result: {other:?}"),
         }
         assert_eq!(
             rollout_fingerprint(&store, "atomic"),
@@ -1987,10 +1984,7 @@ mod tests {
                 assert_eq!(version.version, 1);
                 assert_eq!(version.weight.to_bits(), f64::MAX.to_bits());
             }
-            Err(error) => assert!(
-                false,
-                "a single finite f64::MAX batch was not selectable: {error:?}"
-            ),
+            Err(error) => panic!("a single finite f64::MAX batch was not selectable: {error:?}"),
         }
 
         let legacy = WeightedPromptStore::new();
@@ -2007,10 +2001,9 @@ mod tests {
                 assert_eq!(version.version, 1);
                 assert_eq!(version.weight.to_bits(), f64::MAX.to_bits());
             }
-            Err(error) => assert!(
-                false,
-                "a single finite f64::MAX legacy rollout was not selectable: {error:?}"
-            ),
+            Err(error) => {
+                panic!("a single finite f64::MAX legacy rollout was not selectable: {error:?}")
+            }
         }
     }
 

@@ -843,12 +843,14 @@ mod tests {
             String::from_utf8_lossy(&bytes).into_owned()
         }
 
-        fn drain_pipe_bounded<R>(
-            mut pipe: R,
-        ) -> (
+        /// A bounded pipe drain: the receiver of one capture attempt, and the
+        /// thread doing the reading.
+        type BoundedDrain = (
             std::sync::mpsc::Receiver<std::io::Result<(Vec<u8>, usize)>>,
             std::thread::JoinHandle<()>,
-        )
+        );
+
+        fn drain_pipe_bounded<R>(mut pipe: R) -> BoundedDrain
         where
             R: std::io::Read + Send + 'static,
         {

@@ -287,11 +287,17 @@ impl ChildGuard {
     fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
         match self.child.as_mut() {
             Some(child) => child.try_wait(),
-            None => Ok(self.exited.as_ref().map(|child| child.status.clone())),
+            None => Ok(self.exited.as_ref().map(|child| child.status)),
         }
     }
 
-    fn cleanup_before(mut self, deadline: Instant) -> Result<CleanupReport, ChildCleanupError> {
+    // The error hands the child guard back to the caller so a failed cleanup
+    // can still be retried or dropped deliberately, which makes it far larger
+    // than the success value. Boxing keeps the common `Ok` path cheap.
+    fn cleanup_before(
+        mut self,
+        deadline: Instant,
+    ) -> Result<CleanupReport, Box<ChildCleanupError>> {
         if self.exited.is_none() {
             let Some(mut child) = self.child.take() else {
                 return Err(self.cleanup_error(
@@ -419,13 +425,13 @@ impl ChildGuard {
         stage: CleanupStage,
         kind: CleanupFailureKind,
         source: Option<std::io::Error>,
-    ) -> ChildCleanupError {
-        ChildCleanupError {
+    ) -> Box<ChildCleanupError> {
+        Box::new(ChildCleanupError {
             stage,
             kind,
             source,
             guard: self,
-        }
+        })
     }
 }
 

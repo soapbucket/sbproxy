@@ -1152,6 +1152,10 @@ async fn handle_health(
     .await
 }
 
+// Six shipped parameters, within the limit; the `#[cfg(test)]` probe handles
+// push the test build over it. Bundling them would reshape the production
+// signature to satisfy a count only the test build reaches.
+#[allow(clippy::too_many_arguments)]
 async fn serve_connection(
     mut stream: tokio::net::TcpStream,
     registry: &Registry,
@@ -1302,7 +1306,7 @@ async fn handle_health_internal(
             crate::metrics::Stage::Read,
             crate::metrics::Reason::Io,
         );
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, "synthetic read fault").into());
+        return Err(std::io::Error::other("synthetic read fault").into());
     }
 
     let mut request_line = String::new();
@@ -1623,6 +1627,9 @@ async fn handle_health_internal(
     .await
 }
 
+// Seven shipped parameters, exactly at the limit; the `#[cfg(test)]` control
+// handle pushes the test build over it. Same call as `serve_connection`.
+#[allow(clippy::too_many_arguments)]
 async fn write_response(
     writer: &mut tokio::net::tcp::WriteHalf<'_>,
     status: u16,

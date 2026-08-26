@@ -274,6 +274,11 @@ impl RequestAuthentication {
         Self { policy }
     }
 
+    // `tonic::Status` is 176 bytes, over `result_large_err`'s threshold. It is
+    // the error every gRPC surface in this binary already speaks, and boxing a
+    // third-party type only to unbox it one frame up buys nothing, so this
+    // takes the allow the same way the request-budget helpers below do.
+    #[allow(clippy::result_large_err)]
     fn authorize(&self, metadata: &tonic::metadata::MetadataMap) -> Result<(), Status> {
         let presented = metadata
             .get("authorization")

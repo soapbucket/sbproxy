@@ -744,12 +744,12 @@ impl FrameAllocationLease {
             .try_acquire_many_owned(permits)
             .map_err(|_| BudgetedFrameError::BudgetExhausted)?;
         #[cfg(test)]
-        frame_probe_enter_live_lease(permit.num_permits() as usize, &budget);
+        frame_probe_enter_live_lease(permit.num_permits(), &budget);
         Ok(Self(permit))
     }
 
     fn bytes(&self) -> usize {
-        self.0.num_permits() as usize
+        self.0.num_permits()
     }
 
     fn into_permit(self) -> tokio::sync::OwnedSemaphorePermit {
@@ -1030,6 +1030,13 @@ struct TcpModeCounters {
     connection_refusals: std::sync::atomic::AtomicUsize,
 }
 
+/// Barrier/fault pairs parked per public-worker checkpoint name.
+#[cfg(test)]
+type PublicWorkerHolds = std::collections::HashMap<
+    &'static str,
+    std::collections::VecDeque<(Arc<PublicWorkerBarrier>, Arc<ArmedTcpFault>)>,
+>;
+
 #[cfg(test)]
 #[derive(Default)]
 struct TcpControlState {
@@ -1038,12 +1045,7 @@ struct TcpControlState {
     faults: std::sync::Mutex<
         std::collections::HashMap<TransportMode, std::collections::VecDeque<PendingTcpFault>>,
     >,
-    public_worker_holds: std::sync::Mutex<
-        std::collections::HashMap<
-            &'static str,
-            std::collections::VecDeque<(Arc<PublicWorkerBarrier>, Arc<ArmedTcpFault>)>,
-        >,
-    >,
+    public_worker_holds: std::sync::Mutex<PublicWorkerHolds>,
     public_worker_probe: Arc<PublicWorkerProbe>,
 }
 
@@ -1214,14 +1216,13 @@ impl TcpListenerCleanupProbe {
                 .deadline
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            let deadline = match *slot {
+            match *slot {
                 Some(current) if current <= deadline => current,
                 _ => {
                     *slot = Some(deadline);
                     deadline
                 }
-            };
-            deadline
+            }
         };
         self.deadline_id.store(
             tcp_instant_id(deadline),
@@ -1712,13 +1713,15 @@ impl TcpListenerAssembly {
                             let _permit = permit;
                             let result = handle_production_connection(
                                 stream,
-                                &registry,
                                 TransportMode::Public,
-                                auth.as_deref(),
-                                limits,
-                                frame_budget,
-                                public_executor,
-                                Some(shutdown),
+                                ListenerResources {
+                                    registry: &registry,
+                                    auth: auth.as_deref(),
+                                    limits,
+                                    frame_budget,
+                                    public_executor,
+                                    shutdown: Some(shutdown),
+                                },
                                 #[cfg(test)]
                                 Some(control),
                                 #[cfg(test)]
@@ -1787,13 +1790,15 @@ impl TcpListenerAssembly {
                             let _permit = permit;
                             let result = handle_production_connection(
                                 stream,
-                                &registry,
                                 TransportMode::Admin,
-                                Some(auth.as_ref()),
-                                limits,
-                                frame_budget,
-                                None,
-                                Some(shutdown),
+                                ListenerResources {
+                                    registry: &registry,
+                                    auth: Some(auth.as_ref()),
+                                    limits,
+                                    frame_budget,
+                                    public_executor: None,
+                                    shutdown: Some(shutdown),
+                                },
                                 #[cfg(test)]
                                 Some(control),
                                 #[cfg(test)]
@@ -1963,18 +1968,35 @@ async fn read_frame_payload(
     Ok(Ok(()))
 }
 
-async fn handle_production_connection(
-    mut stream: TcpStream,
-    registry: &Registry,
-    mode: TransportMode,
-    auth: Option<&AdminAuth>,
+/// Everything a connection borrows from the listener that owns it.
+///
+/// Bundled rather than passed one by one: the two are the same six values on
+/// both call sites, and naming them at the call site says which transport is
+/// getting which executor.
+struct ListenerResources<'a> {
+    registry: &'a Registry,
+    auth: Option<&'a AdminAuth>,
     limits: TcpLimits,
     frame_budget: Arc<tokio::sync::Semaphore>,
     public_executor: Option<Arc<crate::admission::BlockingWorkExecutor>>,
     shutdown: Option<Arc<TcpListenerCleanupProbe>>,
+}
+
+async fn handle_production_connection(
+    mut stream: TcpStream,
+    mode: TransportMode,
+    resources: ListenerResources<'_>,
     #[cfg(test)] controls: Option<Arc<TcpTestControl>>,
     #[cfg(test)] allocation_probe: Option<Arc<FrameAllocationProbe>>,
 ) -> Result<(), std::io::Error> {
+    let ListenerResources {
+        registry,
+        auth,
+        limits,
+        frame_budget,
+        public_executor,
+        shutdown,
+    } = resources;
     loop {
         #[cfg(test)]
         let request_fault = controls
@@ -2105,7 +2127,7 @@ async fn handle_production_connection(
                                 sanitize(msg.tenant.as_deref().unwrap_or("(none)"), 64)
                             ),
                         )
-                        .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?,
+                        .map_err(std::io::Error::other)?,
                         PlannedOutcome::Failure(
                             crate::metrics::Stage::Handler,
                             crate::metrics::Reason::TenantNotFound,
@@ -2153,9 +2175,8 @@ async fn handle_production_connection(
                             .await
                         {
                             Ok(response) => (
-                                rmp_serde::to_vec_named(&response).map_err(|error| {
-                                    std::io::Error::new(std::io::ErrorKind::Other, error)
-                                })?,
+                                rmp_serde::to_vec_named(&response)
+                                    .map_err(std::io::Error::other)?,
                                 PlannedOutcome::Success,
                             ),
                             Err(status) if status.code() == tonic::Code::ResourceExhausted => (
@@ -2164,9 +2185,7 @@ async fn handle_production_connection(
                                     msg.tenant.clone(),
                                     "classifier inference queue is full",
                                 )
-                                .map_err(|error| {
-                                    std::io::Error::new(std::io::ErrorKind::Other, error)
-                                })?,
+                                .map_err(std::io::Error::other)?,
                                 PlannedOutcome::Failure(
                                     crate::metrics::Stage::Admission,
                                     crate::metrics::Reason::QueueFull,
@@ -2178,9 +2197,7 @@ async fn handle_production_connection(
                                     msg.tenant.clone(),
                                     "classifier inference deadline exceeded",
                                 )
-                                .map_err(|error| {
-                                    std::io::Error::new(std::io::ErrorKind::Other, error)
-                                })?,
+                                .map_err(std::io::Error::other)?,
                                 PlannedOutcome::Failure(
                                     crate::metrics::Stage::Worker,
                                     crate::metrics::Reason::Deadline,
@@ -2192,9 +2209,7 @@ async fn handle_production_connection(
                                     msg.tenant.clone(),
                                     "classifier inference failed",
                                 )
-                                .map_err(|error| {
-                                    std::io::Error::new(std::io::ErrorKind::Other, error)
-                                })?,
+                                .map_err(std::io::Error::other)?,
                                 PlannedOutcome::Failure(
                                     crate::metrics::Stage::Worker,
                                     crate::metrics::Reason::InferenceFailed,
@@ -2203,9 +2218,7 @@ async fn handle_production_connection(
                         }
                     } else {
                         (
-                            handle_classify(registry, &msg).map_err(|error| {
-                                std::io::Error::new(std::io::ErrorKind::Other, error)
-                            })?,
+                            handle_classify(registry, &msg).map_err(std::io::Error::other)?,
                             PlannedOutcome::Success,
                         )
                     }
@@ -2213,37 +2226,30 @@ async fn handle_production_connection(
                     {
                         let _ = &public_executor;
                         (
-                            handle_classify(registry, &msg).map_err(|error| {
-                                std::io::Error::new(std::io::ErrorKind::Other, error)
-                            })?,
+                            handle_classify(registry, &msg).map_err(std::io::Error::other)?,
                             PlannedOutcome::Success,
                         )
                     }
                 }
             }
             (TransportMode::Public, Command::QualityScore) => (
-                handle_quality_score(&msg)
-                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?,
+                handle_quality_score(&msg).map_err(std::io::Error::other)?,
                 PlannedOutcome::Success,
             ),
             (TransportMode::Public, Command::Version) => (
-                handle_version()
-                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?,
+                handle_version().map_err(std::io::Error::other)?,
                 PlannedOutcome::Success,
             ),
             (TransportMode::Public, Command::IntentDetect) => (
-                handle_intent_detect(&msg)
-                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?,
+                handle_intent_detect(&msg).map_err(std::io::Error::other)?,
                 PlannedOutcome::Success,
             ),
             (TransportMode::Public, Command::StreamingSafety) => (
-                handle_streaming_safety(&msg)
-                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?,
+                handle_streaming_safety(&msg).map_err(std::io::Error::other)?,
                 PlannedOutcome::Success,
             ),
             (TransportMode::Public, Command::ContentTypeDetect) => (
-                handle_content_type_detect(&msg)
-                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?,
+                handle_content_type_detect(&msg).map_err(std::io::Error::other)?,
                 PlannedOutcome::Success,
             ),
             (TransportMode::Admin, Command::Register | Command::Delete | Command::List) => {
@@ -2252,9 +2258,8 @@ async fn handle_production_connection(
                 })?;
                 if !auth.authenticated(msg.admin_token.as_deref()) {
                     (
-                        admin_error(command, msg.tenant.clone(), "unauthorized").map_err(
-                            |error| std::io::Error::new(std::io::ErrorKind::Other, error),
-                        )?,
+                        admin_error(command, msg.tenant.clone(), "unauthorized")
+                            .map_err(std::io::Error::other)?,
                         PlannedOutcome::Failure(
                             crate::metrics::Stage::Authorize,
                             crate::metrics::Reason::Unauthorized,
@@ -2265,9 +2270,7 @@ async fn handle_production_connection(
                 {
                     (
                         admin_error(command, msg.tenant.clone(), "tenant scope forbidden")
-                            .map_err(|error| {
-                                std::io::Error::new(std::io::ErrorKind::Other, error)
-                            })?,
+                            .map_err(std::io::Error::other)?,
                         PlannedOutcome::Failure(
                             crate::metrics::Stage::Authorize,
                             crate::metrics::Reason::Forbidden,
@@ -2276,9 +2279,9 @@ async fn handle_production_connection(
                 } else {
                     match command {
                         Command::Register => {
-                            let bytes = handle_register(registry, &msg).await.map_err(|error| {
-                                std::io::Error::new(std::io::ErrorKind::Other, error)
-                            })?;
+                            let bytes = handle_register(registry, &msg)
+                                .await
+                                .map_err(std::io::Error::other)?;
                             let response_ok = rmp_serde::from_slice::<AdminResponse>(&bytes)
                                 .map(|response| response.ok)
                                 .unwrap_or(false);
@@ -2301,9 +2304,8 @@ async fn handle_production_connection(
                             (bytes, planned)
                         }
                         Command::Delete => {
-                            let bytes = handle_delete(registry, &msg).map_err(|error| {
-                                std::io::Error::new(std::io::ErrorKind::Other, error)
-                            })?;
+                            let bytes =
+                                handle_delete(registry, &msg).map_err(std::io::Error::other)?;
                             let response_ok = rmp_serde::from_slice::<AdminResponse>(&bytes)
                                 .map(|response| response.ok)
                                 .unwrap_or(false);
@@ -2327,14 +2329,8 @@ async fn handle_production_connection(
                             match handle_list(registry, auth, msg.admin_token.as_deref(), &msg) {
                                 Ok(bytes) => (bytes, PlannedOutcome::Success),
                                 Err(error) => (
-                                    admin_error(command, None, &error.to_string()).map_err(
-                                        |serialize_error| {
-                                            std::io::Error::new(
-                                                std::io::ErrorKind::Other,
-                                                serialize_error,
-                                            )
-                                        },
-                                    )?,
+                                    admin_error(command, None, &error.to_string())
+                                        .map_err(std::io::Error::other)?,
                                     PlannedOutcome::Failure(
                                         crate::metrics::Stage::Handler,
                                         crate::metrics::Reason::ResourceLimit,
@@ -2352,7 +2348,7 @@ async fn handle_production_connection(
                     msg.tenant.clone(),
                     "admin command unavailable on public transport",
                 )
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?,
+                .map_err(std::io::Error::other)?,
                 PlannedOutcome::Failure(
                     crate::metrics::Stage::Authorize,
                     crate::metrics::Reason::Forbidden,
@@ -2364,7 +2360,7 @@ async fn handle_production_connection(
                     msg.tenant.clone(),
                     "inference command unavailable on admin transport",
                 )
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?,
+                .map_err(std::io::Error::other)?,
                 PlannedOutcome::Failure(
                     crate::metrics::Stage::Authorize,
                     crate::metrics::Reason::Forbidden,
@@ -2372,7 +2368,7 @@ async fn handle_production_connection(
             ),
             (_, Command::Unknown) => (
                 admin_error(Command::Unknown, None, "unknown command")
-                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?,
+                    .map_err(std::io::Error::other)?,
                 PlannedOutcome::Failure(
                     crate::metrics::Stage::Route,
                     crate::metrics::Reason::UnknownCommand,
@@ -2380,7 +2376,7 @@ async fn handle_production_connection(
             ),
             _ => (
                 admin_error(command, msg.tenant.clone(), "unsupported command")
-                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?,
+                    .map_err(std::io::Error::other)?,
                 PlannedOutcome::Failure(
                     crate::metrics::Stage::Handler,
                     crate::metrics::Reason::Internal,
@@ -2457,10 +2453,7 @@ async fn handle_production_connection(
         #[cfg(test)]
         if matches!(request_fault, Some(TcpFault::PanicAfterWrite(fault_command)) if fault_command == metrics_command(command))
         {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                CHILD_PANIC_SIGNAL,
-            ));
+            return Err(std::io::Error::other(CHILD_PANIC_SIGNAL));
         }
     }
 }
@@ -2715,14 +2708,14 @@ mod tests {
     }
 
     impl<T: ?Sized> AmbiguousIfFrameLeaseClone<()> for T {}
-    impl<T: ?Sized + Clone> AmbiguousIfFrameLeaseClone<u8> for T {}
+    impl<T: Clone> AmbiguousIfFrameLeaseClone<u8> for T {}
 
     trait AmbiguousIfFrameLeaseDefault<Marker> {
         fn assert_not_default() {}
     }
 
     impl<T: ?Sized> AmbiguousIfFrameLeaseDefault<()> for T {}
-    impl<T: ?Sized + Default> AmbiguousIfFrameLeaseDefault<u8> for T {}
+    impl<T: Default> AmbiguousIfFrameLeaseDefault<u8> for T {}
 
     struct WarningCounter(Arc<AtomicUsize>);
 
@@ -3927,8 +3920,6 @@ mod tests {
             rmp_serde::from_slice(&wire_exchange(&mut admin, &exact_page).await).unwrap();
         no_page_serialization.assert_not_triggered();
         no_page_materialization.assert_not_triggered();
-        drop(no_page_serialization);
-        drop(no_page_materialization);
         assert!(
             !oversized_page.ok,
             "a one-byte-larger deterministic page must be refused before serialization"
@@ -4212,8 +4203,6 @@ mod tests {
         .await;
         forbid_http_serialization.assert_not_triggered();
         forbid_http_materialization.assert_not_triggered();
-        drop(forbid_http_serialization);
-        drop(forbid_http_materialization);
         assert_eq!(
             http_plus_one.status, 507,
             "the one-byte-oversized JSON page is refused before serialization"
@@ -4493,7 +4482,6 @@ mod tests {
                 "refused registration replaced original tenant identity: {id}"
             );
         }
-        drop(compile_sentinel);
 
         let mut delete = msg("delete");
         delete.tenant = Some("tenant-00.example".to_string());
@@ -4509,7 +4497,6 @@ mod tests {
         let held_reader_response: AdminResponse =
             rmp_serde::from_slice(&wire_exchange(&mut admin, &plus_one).await).unwrap();
         live_reader_compile_sentinel.assert_not_triggered();
-        drop(live_reader_compile_sentinel);
         assert_eq!(compile_probe.started(), compilation_before_reader_release);
         assert!(registry.get(Some("overflow-one.example")).is_none());
         drop(deleted_reader);
@@ -4638,7 +4625,6 @@ mod tests {
         let warnings_after_pattern_plus_one = compile_probe.warnings_emitted();
         let count_after_pattern_plus_one = registry.tenant_count();
         pattern_compile_sentinel.assert_not_triggered();
-        drop(pattern_compile_sentinel);
         assert_eq!(compile_probe.started(), compile_before_pattern_plus_one);
 
         let exact_rules = (0..MAX_RULES)
@@ -4694,7 +4680,6 @@ mod tests {
         let rule_plus_one_response: AdminResponse =
             rmp_serde::from_slice(&wire_exchange(&mut admin, &register).await).unwrap();
         rule_compile_sentinel.assert_not_triggered();
-        drop(rule_compile_sentinel);
         assert_eq!(compile_probe.started(), compile_before_rule_plus_one);
 
         let mut exact_bytes = sample_tenant_config();
@@ -4756,7 +4741,6 @@ mod tests {
         let warnings_after_bytes_plus_one = compile_probe.warnings_emitted();
         let count_after_byte_plus_one = registry.tenant_count();
         bytes_compile_sentinel.assert_not_triggered();
-        drop(bytes_compile_sentinel);
         assert_eq!(compile_probe.started(), compile_before_bytes_plus_one);
 
         let mut exact_config_bytes = sample_tenant_config();
@@ -4811,7 +4795,6 @@ mod tests {
         let config_plus_one_response: AdminResponse =
             rmp_serde::from_slice(&wire_exchange(&mut admin, &register).await).unwrap();
         config_compile_sentinel.assert_not_triggered();
-        drop(config_compile_sentinel);
         assert_eq!(compile_probe.started(), compile_before_config_plus_one);
 
         pair.stop().await;
@@ -4963,7 +4946,6 @@ mod tests {
         let refused: AdminResponse =
             rmp_serde::from_slice(&wire_exchange(&mut admin, &extra).await).unwrap();
         no_compile.assert_not_triggered();
-        drop(no_compile);
         assert!(!refused.ok);
         assert_eq!(compile_probe.started(), compile_before_refusal);
         assert!(registry.get(Some("extra.example")).is_none());

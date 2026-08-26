@@ -1695,7 +1695,7 @@ struct LegacyChargebackConversionCounters {
 std::thread_local! {
     static LEGACY_CHARGEBACK_CONVERSION_COUNTERS: std::cell::RefCell<
         Option<LegacyChargebackConversionCounters>,
-    > = std::cell::RefCell::new(None);
+    > = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]

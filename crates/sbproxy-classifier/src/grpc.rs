@@ -1047,6 +1047,10 @@ impl GrpcRequestAuthentication {
         }
     }
 
+    // `tonic::Status` is 176 bytes, over `result_large_err`'s threshold; see
+    // `check_text_bytes` above for why every gRPC surface here takes the allow
+    // rather than boxing the transport's own error type.
+    #[allow(clippy::result_large_err)]
     fn authorize(&self, headers: &http::HeaderMap) -> Result<(), Status> {
         let presented = headers
             .get(&self.header)
@@ -2310,6 +2314,10 @@ impl GrpcRuntime {
         }
     }
 
+    // `tonic::Status` is 176 bytes, over `result_large_err`'s threshold; see
+    // `check_text_bytes` above for why every gRPC surface here takes the allow
+    // rather than boxing the transport's own error type.
+    #[allow(clippy::result_large_err)]
     fn try_acquire_outer_request(
         &self,
         command: crate::metrics::Command,
@@ -2436,6 +2444,10 @@ impl BoundedInferenceHandler {
     async fn maybe_hold(&self, _command: crate::metrics::Command) {}
 
     #[cfg(test)]
+    // `tonic::Status` is 176 bytes, over `result_large_err`'s threshold; see
+    // `check_text_bytes` above for why every gRPC surface here takes the allow
+    // rather than boxing the transport's own error type.
+    #[allow(clippy::result_large_err)]
     fn maybe_response_write_fault(&self, command: crate::metrics::Command) -> Result<(), Status> {
         if let Some(control) = &self.control {
             if control.take_response_write_fault(command).is_some() {
@@ -2446,6 +2458,9 @@ impl BoundedInferenceHandler {
     }
 
     #[cfg(not(test))]
+    // `tonic::Status` is 176 bytes, over `result_large_err`'s threshold; the
+    // `#[cfg(test)]` twin above carries the same signature and the same allow.
+    #[allow(clippy::result_large_err)]
     fn maybe_response_write_fault(&self, _command: crate::metrics::Command) -> Result<(), Status> {
         Ok(())
     }
@@ -2463,6 +2478,10 @@ impl BoundedClassifierHandler {
     async fn maybe_hold(&self, _command: crate::metrics::Command) {}
 
     #[cfg(test)]
+    // `tonic::Status` is 176 bytes, over `result_large_err`'s threshold; see
+    // `check_text_bytes` above for why every gRPC surface here takes the allow
+    // rather than boxing the transport's own error type.
+    #[allow(clippy::result_large_err)]
     fn maybe_response_write_fault(&self, command: crate::metrics::Command) -> Result<(), Status> {
         if let Some(control) = &self.control {
             if control.take_response_write_fault(command).is_some() {
@@ -2473,6 +2492,9 @@ impl BoundedClassifierHandler {
     }
 
     #[cfg(not(test))]
+    // `tonic::Status` is 176 bytes, over `result_large_err`'s threshold; the
+    // `#[cfg(test)]` twin above carries the same signature and the same allow.
+    #[allow(clippy::result_large_err)]
     fn maybe_response_write_fault(&self, _command: crate::metrics::Command) -> Result<(), Status> {
         Ok(())
     }
@@ -3574,6 +3596,10 @@ mod tests {
         bounded_stream_terminal_error_within(operation, stream, max_messages, EXTERNAL_WAIT).await
     }
 
+    // The closure below returns a `tonic::Status` from `stream.message()`,
+    // which is 176 bytes; see `check_text_bytes` for why this file takes the
+    // allow rather than boxing the transport's own error type.
+    #[allow(clippy::result_large_err)]
     async fn bounded_stream_terminal_error_within(
         operation: &'static str,
         stream: &mut tonic::Streaming<SafetyVerdict>,

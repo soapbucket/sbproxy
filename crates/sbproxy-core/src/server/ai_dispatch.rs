@@ -18505,12 +18505,11 @@ fn bridge_toolkit_responses_prompt_object(
 ) -> Option<Result<sbproxy_ai::toolkit::PromptSelectionResult, sbproxy_ai::toolkit::ToolkitError>> {
     let name = bare_responses_rollout_name(body)?;
     let selection = select_toolkit_prompt(pipeline, origin_idx, hostname, ctx, name)?;
-    Some(selection.map(|selected| {
+    Some(selection.inspect(|selected| {
         prepend_responses_instructions(body, &selected.content);
         if let Some(object) = body.as_object_mut() {
             object.remove("prompt");
         }
-        selected
     }))
 }
 

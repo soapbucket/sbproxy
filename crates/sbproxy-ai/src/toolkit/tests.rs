@@ -451,8 +451,10 @@ fn global_dataset_version_limit_covers_seed_and_atomic_registration() {
 
     let second_scope = ToolkitScope::new("origin-b", "tenant-b").expect("second scope");
     let third_scope = ToolkitScope::new("origin-c", "tenant-c").expect("third scope");
-    let mut seeded = AiToolkitConfigInput::default();
-    seeded.allowed_scopes = vec![scope(), second_scope.clone(), third_scope.clone()];
+    let mut seeded = AiToolkitConfigInput {
+        allowed_scopes: vec![scope(), second_scope.clone(), third_scope.clone()],
+        ..Default::default()
+    };
     seeded.limits.max_dataset_versions_total = 2;
     seeded.datasets.extend([
         dataset(scope(), "case-1"),
@@ -470,8 +472,10 @@ fn global_dataset_version_limit_covers_seed_and_atomic_registration() {
         }
     ));
 
-    let mut input = AiToolkitConfigInput::default();
-    input.allowed_scopes = vec![scope(), second_scope.clone(), third_scope.clone()];
+    let mut input = AiToolkitConfigInput {
+        allowed_scopes: vec![scope(), second_scope.clone(), third_scope.clone()],
+        ..Default::default()
+    };
     input.limits.max_dataset_versions_total = 2;
     let runtime = AiToolkitRuntime::try_new(input).expect("runtime");
     for (dataset_scope, case) in [(scope(), "case-1"), (second_scope, "case-2")] {
@@ -524,8 +528,10 @@ fn global_dataset_byte_limit_covers_seed_and_atomic_registration() {
         .checked_add(second_bytes)
         .expect("small fixture total");
 
-    let mut seeded = AiToolkitConfigInput::default();
-    seeded.allowed_scopes = vec![scope(), second_scope.clone()];
+    let mut seeded = AiToolkitConfigInput {
+        allowed_scopes: vec![scope(), second_scope.clone()],
+        ..Default::default()
+    };
     seeded.limits.max_dataset_bytes_total = serialized_bytes;
     seeded.datasets.extend([
         ToolkitDatasetInput {
@@ -551,8 +557,10 @@ fn global_dataset_byte_limit_covers_seed_and_atomic_registration() {
         } if limit + 1 == observed && observed == serialized_bytes
     ));
 
-    let mut exact = AiToolkitConfigInput::default();
-    exact.allowed_scopes = vec![scope(), second_scope.clone()];
+    let mut exact = AiToolkitConfigInput {
+        allowed_scopes: vec![scope(), second_scope.clone()],
+        ..Default::default()
+    };
     exact.limits.max_dataset_bytes_total = serialized_bytes;
     let exact = AiToolkitRuntime::try_new(exact).expect("runtime at exact byte limit");
     for (dataset_scope, entries) in [
@@ -570,8 +578,10 @@ fn global_dataset_byte_limit_covers_seed_and_atomic_registration() {
     }
     assert_eq!(exact.datasets.lock().retained_bytes, serialized_bytes);
 
-    let mut over = AiToolkitConfigInput::default();
-    over.allowed_scopes = vec![scope(), second_scope.clone()];
+    let mut over = AiToolkitConfigInput {
+        allowed_scopes: vec![scope(), second_scope.clone()],
+        ..Default::default()
+    };
     over.limits.max_dataset_bytes_total = serialized_bytes - 1;
     let over = AiToolkitRuntime::try_new(over).expect("runtime below the dataset byte size");
     over.register_dataset(DatasetRegistrationRequest {
@@ -671,11 +681,13 @@ fn generation_validation_rejects_plaintext_agents_off_loopback() {
         EgressPurpose::AgentOrchestration,
         PurposeAllowlist::default(),
     );
-    let mut input = AiToolkitConfigInput::default();
-    input.agent_egress = Some(AgentEgressInput {
-        authorizer: EgressAuthorizer::new(EgressConfig { purposes }),
-        purpose: EgressPurpose::AgentOrchestration,
-    });
+    let mut input = AiToolkitConfigInput {
+        agent_egress: Some(AgentEgressInput {
+            authorizer: EgressAuthorizer::new(EgressConfig { purposes }),
+            purpose: EgressPurpose::AgentOrchestration,
+        }),
+        ..Default::default()
+    };
     input.agents.push(ToolkitAgentInput {
         scope: scope(),
         id: "agent-a".into(),
@@ -707,11 +719,13 @@ fn generation_validation_allows_https_and_plaintext_loopback_agents() {
             EgressPurpose::AgentOrchestration,
             PurposeAllowlist::default(),
         );
-        let mut input = AiToolkitConfigInput::default();
-        input.agent_egress = Some(AgentEgressInput {
-            authorizer: EgressAuthorizer::new(EgressConfig { purposes }),
-            purpose: EgressPurpose::AgentOrchestration,
-        });
+        let mut input = AiToolkitConfigInput {
+            agent_egress: Some(AgentEgressInput {
+                authorizer: EgressAuthorizer::new(EgressConfig { purposes }),
+                purpose: EgressPurpose::AgentOrchestration,
+            }),
+            ..Default::default()
+        };
         input.agents.push(ToolkitAgentInput {
             scope: scope(),
             id: "agent-a".into(),

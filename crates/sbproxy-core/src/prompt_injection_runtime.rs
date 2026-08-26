@@ -138,17 +138,32 @@ struct FailureHealth {
     sequence: u64,
 }
 
+/// One observed detector failure, named rather than positional.
+///
+/// `origin_id` and `scan_path` are both string slices and sat next to each
+/// other in the argument list, which is the transposition the compiler cannot
+/// catch.
+struct FailureObservation<'a> {
+    origin_id: &'a str,
+    stage: DetectionFailureStage,
+    scan_path: &'static str,
+    action: PromptInjectionAction,
+    outcome: UnavailableDecision,
+    now: Instant,
+    now_unix_ms: u64,
+}
+
 impl FailureHealth {
-    fn note(
-        &mut self,
-        origin_id: &str,
-        stage: DetectionFailureStage,
-        scan_path: &'static str,
-        action: PromptInjectionAction,
-        outcome: UnavailableDecision,
-        now: Instant,
-        now_unix_ms: u64,
-    ) -> Option<u64> {
+    fn note(&mut self, observed: FailureObservation<'_>) -> Option<u64> {
+        let FailureObservation {
+            origin_id,
+            stage,
+            scan_path,
+            action,
+            outcome,
+            now,
+            now_unix_ms,
+        } = observed;
         let key = FailureKey {
             origin_id: origin_id.to_string(),
             stage: stage.origin.as_str(),
@@ -329,7 +344,7 @@ pub(crate) fn record_unavailable(
             outcome.as_str(),
             tenant_id,
         );
-        let suppressed = health().lock().note(
+        let suppressed = health().lock().note(FailureObservation {
             origin_id,
             stage,
             scan_path,
@@ -337,7 +352,7 @@ pub(crate) fn record_unavailable(
             outcome,
             now,
             now_unix_ms,
-        );
+        });
         if let Some(suppressed) = suppressed {
             tracing::warn!(
                 target: "sbproxy::prompt_injection_v2",
@@ -383,27 +398,27 @@ mod tests {
         };
 
         assert_eq!(
-            state.note(
-                "origin-a",
+            state.note(FailureObservation {
+                origin_id: "origin-a",
                 stage,
-                "header_scan",
-                PromptInjectionAction::Log,
-                UnavailableDecision::Degraded,
+                scan_path: "header_scan",
+                action: PromptInjectionAction::Log,
+                outcome: UnavailableDecision::Degraded,
                 now,
-                1,
-            ),
+                now_unix_ms: 1,
+            }),
             Some(0)
         );
         assert_eq!(
-            state.note(
-                "origin-a",
+            state.note(FailureObservation {
+                origin_id: "origin-a",
                 stage,
-                "header_scan",
-                PromptInjectionAction::Log,
-                UnavailableDecision::Degraded,
-                now + Duration::from_secs(1),
-                2,
-            ),
+                scan_path: "header_scan",
+                action: PromptInjectionAction::Log,
+                outcome: UnavailableDecision::Degraded,
+                now: now + Duration::from_secs(1),
+                now_unix_ms: 2,
+            }),
             None
         );
 

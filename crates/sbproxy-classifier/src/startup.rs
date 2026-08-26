@@ -1198,7 +1198,7 @@ impl StartupProbe {
             .unwrap_or_else(|e| e.into_inner());
         if stored_deadline
             .as_ref()
-            .map_or(true, |current| deadline < *current)
+            .is_none_or(|current| deadline < *current)
         {
             *stored_deadline = Some(deadline);
             self.shutdown_deadline_id
@@ -1252,7 +1252,7 @@ async fn wait_for_shutdown_deadline_update(_deadline_id: u64) {
 fn active_shutdown_deadline() -> Option<(tokio::time::Instant, u64)> {
     #[cfg(test)]
     {
-        return STARTUP_PROBE
+        STARTUP_PROBE
             .try_with(|probe| {
                 let deadline = probe
                     .shutdown_deadline
@@ -1264,7 +1264,7 @@ fn active_shutdown_deadline() -> Option<(tokio::time::Instant, u64)> {
                     .map(|deadline| (deadline, probe.shutdown_deadline_id.load(Ordering::SeqCst)))
             })
             .ok()
-            .flatten();
+            .flatten()
     }
     #[cfg(not(test))]
     None

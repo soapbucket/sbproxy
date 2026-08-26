@@ -378,14 +378,14 @@ mod tests {
     }
 
     impl<T: ?Sized> AmbiguousIfClone<()> for T {}
-    impl<T: ?Sized + Clone> AmbiguousIfClone<u8> for T {}
+    impl<T: Clone> AmbiguousIfClone<u8> for T {}
 
     trait AmbiguousIfDefault<Marker> {
         fn assert_not_default() {}
     }
 
     impl<T: ?Sized> AmbiguousIfDefault<()> for T {}
-    impl<T: ?Sized + Default> AmbiguousIfDefault<u8> for T {}
+    impl<T: Default> AmbiguousIfDefault<u8> for T {}
 
     #[tokio::test]
     async fn production_entrypoint_orders_preparation_and_listener_owners_before_readiness() {
