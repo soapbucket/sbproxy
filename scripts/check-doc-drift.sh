@@ -100,7 +100,7 @@ CORPUS_LAG=(
 )
 corpus_lag_reason() {
   local entry
-  for entry in "${CORPUS_LAG[@]}"; do
+  for entry in ${CORPUS_LAG[@]+"${CORPUS_LAG[@]}"}; do
     if [ "${entry%% :: *}" = "$1" ]; then
       printf '%s' "${entry#* :: }"
       return 0
@@ -179,7 +179,7 @@ done
 # Reverse audit on the lag list, the same way NOT_OUR_CATALOG is audited
 # below. A lag entry that matches nothing means the regen happened, so
 # the entry is now a standing exemption for a string that is gone.
-for entry in "${CORPUS_LAG[@]}"; do
+for entry in ${CORPUS_LAG[@]+"${CORPUS_LAG[@]}"}; do
   needle="${entry%% :: *}"
   case "$corpus_lag_seen" in
     *"|$needle|"*) ;;
