@@ -25,34 +25,42 @@ use super::{
 pub(crate) fn metric_outcome<T>(result: &Result<T, ToolkitError>) -> AiToolkitOutcome {
     match result {
         Ok(_) => AiToolkitOutcome::Success,
-        Err(ToolkitError::NotFound { .. }) => AiToolkitOutcome::NotFound,
-        Err(ToolkitError::Deadline { .. }) => AiToolkitOutcome::Timeout,
-        Err(ToolkitError::GovernedEgress {
+        Err(error) => error_metric_outcome(error),
+    }
+}
+
+/// The single authoritative mapping from a toolkit error to its closed
+/// metric outcome. The admin layer's metric and typed-event streams both
+/// route through this, so the two label streams cannot drift apart.
+pub fn error_metric_outcome(error: &ToolkitError) -> AiToolkitOutcome {
+    match error {
+        ToolkitError::NotFound { .. } => AiToolkitOutcome::NotFound,
+        ToolkitError::Deadline { .. } => AiToolkitOutcome::Timeout,
+        ToolkitError::Busy { .. } => AiToolkitOutcome::Busy,
+        ToolkitError::GovernedEgress {
             reason: "egress_denied",
-        }) => AiToolkitOutcome::EgressRefused,
-        Err(ToolkitError::GovernedEgress {
+        } => AiToolkitOutcome::EgressRefused,
+        ToolkitError::GovernedEgress {
             reason: "response_too_large",
-        }) => AiToolkitOutcome::ResponseTooLarge,
-        Err(ToolkitError::LimitExceeded { resource, .. })
+        } => AiToolkitOutcome::ResponseTooLarge,
+        ToolkitError::LimitExceeded { resource, .. }
             if resource.contains("response") || resource.contains("output") =>
         {
             AiToolkitOutcome::ResponseTooLarge
         }
-        Err(ToolkitError::LimitExceeded { resource, .. })
+        ToolkitError::LimitExceeded { resource, .. }
             if resource.contains("request") || resource.contains("input") =>
         {
             AiToolkitOutcome::BodyTooLarge
         }
-        Err(ToolkitError::LimitExceeded { .. }) => AiToolkitOutcome::Invalid,
-        Err(
-            ToolkitError::InvalidConfiguration { .. }
-            | ToolkitError::InvalidSchema { .. }
-            | ToolkitError::Duplicate { .. }
-            | ToolkitError::SchemaViolation { .. }
-            | ToolkitError::InvalidAgentResponse
-            | ToolkitError::InvalidJudgeResponse,
-        ) => AiToolkitOutcome::Invalid,
-        Err(_) => AiToolkitOutcome::Internal,
+        ToolkitError::LimitExceeded { .. } => AiToolkitOutcome::Invalid,
+        ToolkitError::InvalidConfiguration { .. }
+        | ToolkitError::InvalidSchema { .. }
+        | ToolkitError::Duplicate { .. }
+        | ToolkitError::SchemaViolation { .. }
+        | ToolkitError::InvalidAgentResponse
+        | ToolkitError::InvalidJudgeResponse => AiToolkitOutcome::Invalid,
+        _ => AiToolkitOutcome::Internal,
     }
 }
 
@@ -291,7 +299,11 @@ impl AiToolkitRuntime {
     ) -> Result<AgentDiscoveryResult, ToolkitError> {
         let scope = request.scope.clone();
         let result = self.discover_agents_inner(request);
-        self.record_operation(scope, "agent_discovery", metric_outcome(&result).as_label());
+        // Successful discovery reads stay out of the bounded operations
+        // ring so polling cannot evict mutating history; failures record.
+        if result.is_err() {
+            self.record_operation(scope, "agent_discovery", metric_outcome(&result).as_label());
+        }
         record_ai_toolkit_operation(AiToolkitCapability::Workflow, metric_outcome(&result));
         result
     }
@@ -448,12 +460,30 @@ impl AiToolkitRuntime {
             recorded_at: chrono::Utc::now().to_rfc3339(),
         };
         let mut operations = self.operations.lock();
-        let _retained = retain_scoped_row(
+        let retained = retain_scoped_row(
             &mut operations,
             scope,
             row,
             self.limits.max_retained_operations,
         );
+        if !retained {
+            // The process-wide ring is full of other scopes' rows, so this
+            // scope's first row cannot be retained without evicting another
+            // tenant's history. The operation itself was still counted in
+            // the metric and, for admin operations, the typed event; say so
+            // loudly once, because an empty snapshot must be
+            // distinguishable from "no activity".
+            static RETENTION_DROP_REPORTED: std::sync::Once = std::sync::Once::new();
+            RETENTION_DROP_REPORTED.call_once(|| {
+                tracing::warn!(
+                    target: "sbproxy::ai::toolkit",
+                    total_ceiling = MAX_TOTAL_RETAINED_ROWS,
+                    "toolkit operation row dropped: the process-wide retention ring is full of \
+                     other scopes' rows; the scope's snapshot will show no operations even \
+                     though its metric and event streams recorded them"
+                );
+            });
+        }
     }
 
     pub(crate) fn retain_experiment(

@@ -1203,3 +1203,19 @@ async fn absolute_deadline_releases_the_only_workflow_permit_for_recovery() {
     assert!(auth_ok.load(Ordering::SeqCst));
     server.await.expect("server task");
 }
+
+#[test]
+fn busy_maps_to_its_own_closed_outcome_not_internal() {
+    // A concurrency-admission refusal is capacity signal, not an internal
+    // fault: alerting on `outcome="internal"` must not page for saturation.
+    let busy = ToolkitError::Busy {
+        operation: "agent_workflow",
+    };
+    let outcome = error_metric_outcome(&busy);
+    assert_eq!(outcome, crate::ai_metrics::AiToolkitOutcome::Busy);
+    assert_eq!(outcome.as_label(), "busy");
+    assert_eq!(
+        error_metric_outcome(&ToolkitError::InvalidAgentResponse).as_label(),
+        "invalid"
+    );
+}

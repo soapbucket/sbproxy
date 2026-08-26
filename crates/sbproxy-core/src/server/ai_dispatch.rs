@@ -10938,7 +10938,10 @@ pub(super) async fn handle_ai_proxy(
                             sbproxy_ai::ai_metrics::record_quality_routing_decision(
                                 "target_ineligible",
                             );
-                            tracing::warn!(
+                            // Per-request and already counted by the
+                            // target_ineligible metric label: debug, not
+                            // warn, so a sustained miss cannot flood logs.
+                            tracing::debug!(
                                 event = "ai.quality_routing.route_miss",
                                 provider = %picked,
                                 "quality routing target provider not eligible; using default order"
@@ -10952,7 +10955,11 @@ pub(super) async fn handle_ai_proxy(
                     },
                     None => {
                         sbproxy_ai::ai_metrics::record_quality_routing_decision("hook_unavailable");
-                        tracing::warn!(
+                        // A dead scoring sidecar makes this fire on every
+                        // request; the hook_unavailable counter carries the
+                        // alerting signal, so log at debug to deny the outage
+                        // a log-flood primitive.
+                        tracing::debug!(
                             event = "ai.quality_routing.hook_unavailable",
                             "quality routing hook returned no eligible score; using configured routing"
                         );
@@ -18397,7 +18404,9 @@ fn resolve_string_prompt_with_rollout(
                 .map_err(StringPromptRefusal::Store),
         );
     }
-    if !reference.contains('@') {
+    if !reference.contains('@')
+        && string_reference_names_rollout(pipeline, origin_idx, hostname, ctx, reference)
+    {
         if let Some(result) = select_toolkit_prompt(pipeline, origin_idx, hostname, ctx, reference)
         {
             return Some(
@@ -18503,6 +18512,33 @@ fn bridge_toolkit_responses_prompt_object(
         }
         selected
     }))
+}
+
+/// Gate for the canonical chat string path: a bare string reference enters
+/// the rollout layer only when it names an armed rollout in this generation.
+/// A reference that fails scope or identifier validation is plain prompt
+/// text, not a refusal; the request keeps its documented pass-through
+/// semantics. The Responses object path stays strict: `prompt.id` is a
+/// genuine gateway field, so its shape violations remain typed 400s.
+fn string_reference_names_rollout(
+    pipeline: &CompiledPipeline,
+    origin_idx: Option<usize>,
+    hostname: &str,
+    ctx: &RequestContext,
+    reference: &str,
+) -> bool {
+    let origin_id = origin_idx
+        .and_then(|index| pipeline.config.origins.get(index))
+        .map(|origin| origin.origin_id.as_str())
+        .unwrap_or(hostname);
+    let Ok(scope) = sbproxy_ai::toolkit::ToolkitScope::new(origin_id, ctx.tenant_id.as_str())
+    else {
+        return false;
+    };
+    pipeline
+        .ai_toolkit
+        .has_prompt_rollout(&scope, reference)
+        .unwrap_or(false)
 }
 
 /// Select a bare prompt name with a content-free stable cohort key. A missing
@@ -18664,6 +18700,36 @@ origins:
             .expect("overlay prompt store");
         sbproxy_ai::prompts::RuntimePromptOverlay {
             by_host: std::collections::HashMap::from([("ai.test".into(), overlay_store)]),
+        }
+    }
+
+    #[test]
+    fn plain_text_string_prompt_falls_through_the_rollout_layer() {
+        let pipeline = rollout_pipeline();
+        let overlay = sbproxy_ai::prompts::RuntimePromptOverlay::default();
+        let ctx = RequestContext::new();
+        // Three shapes that can never be rollout identifiers: longer than the
+        // 128-byte identifier bound, whitespace-only, and NUL-containing. On
+        // the canonical chat path each is plain prompt text and must fall
+        // through to the (absent) config store, never refuse the request.
+        let long_prompt =
+            "Summarize the following incident report and list the top three ".repeat(4);
+        assert!(long_prompt.len() > 128 && !long_prompt.contains('@'));
+        for reference in [long_prompt.as_str(), "   ", "hello\0world"] {
+            let resolution = resolve_string_prompt_with_rollout(
+                &pipeline,
+                Some(0),
+                "ai.test",
+                &ctx,
+                reference,
+                &overlay,
+                None,
+                &serde_json::json!({}),
+            );
+            assert!(
+                resolution.is_none(),
+                "plain text {reference:?} must pass through, got {resolution:?}"
+            );
         }
     }
 

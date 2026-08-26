@@ -282,6 +282,15 @@ tokenizer before the proxy can serve: both paths and SHA-256 pins are
 mandatory, the configured size budgets are enforced, and optional
 Ed25519 signatures must be complete and valid when supplied.
 
+Every scanned prompt travels to `detector_config.endpoint`, and this
+policy-side dial is not routed through the `egress.classifier_hooks`
+allowlist that governs `proxy.classifier_hooks` (that block also refuses
+plain `http://` to nonlocal hosts; this one does not, because the shape
+has been accepted since the detector shipped). Keep the sidecar on
+loopback, or front a remote one with TLS: a nonlocal plain-`http`
+endpoint sends prompt text unencrypted, and the proxy says so with a
+load-time warning.
+
 ### Mandatory verified fallback
 
 A sidecar that is down, slower than `timeout_ms`, returns an RPC error,

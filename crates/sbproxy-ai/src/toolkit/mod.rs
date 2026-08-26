@@ -8,7 +8,7 @@ mod types;
 mod validation;
 mod workflow;
 
-pub use runtime::AiToolkitRuntime;
+pub use runtime::{error_metric_outcome, AiToolkitRuntime};
 pub use types::*;
 
 #[cfg(test)]

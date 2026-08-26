@@ -6,12 +6,6 @@
 
 use sha2::{Digest, Sha256};
 
-/// Configuration for A2A authentication.
-pub struct A2AAuthConfig {
-    /// Secret shared between all participating agents.
-    pub shared_secret: String,
-}
-
 /// Derive a deterministic token for `agent_id` using `secret`.
 ///
 /// The token is the hex-encoded SHA-256 digest of `"<agent_id>:<secret>"`.
@@ -24,6 +18,13 @@ pub fn generate_agent_token(agent_id: &str, secret: &str) -> String {
 }
 
 /// Return `true` if `token` is the correct token for `agent_id` and `secret`.
+///
+/// This is the agent-server half of the contract: sbproxy's workflow runner
+/// only ever generates tokens (it is the caller), so nothing in the proxy
+/// dispatches this function. It ships for the counterparty an operator
+/// builds, so an agent endpoint can verify inbound workflow calls against
+/// the same derivation; `examples/agent_orchestration_workflow.rs`
+/// demonstrates both halves together.
 ///
 /// Compares in constant time: `generate_agent_token`'s output is a
 /// long-lived bearer credential (unsalted, non-expiring), so a
@@ -94,14 +95,5 @@ mod tests {
     fn verify_with_wrong_agent_id_fails() {
         let token = generate_agent_token("agent-real", "secret");
         assert!(!verify_agent_token("agent-fake", &token, "secret"));
-    }
-
-    #[test]
-    fn a2a_auth_config_holds_secret() {
-        let config = A2AAuthConfig {
-            shared_secret: "top_secret".to_string(),
-        };
-        let token = generate_agent_token("bot", &config.shared_secret);
-        assert!(verify_agent_token("bot", &token, &config.shared_secret));
     }
 }

@@ -101,7 +101,12 @@ impl From<IntentCategory> for core_hooks::IntentCategory {
 /// not configured. For async call sites that also want the sidecar path,
 /// prefer [`detect_intent_async`].
 pub fn detect_intent_heuristic(prompt: &str) -> IntentCategory {
-    let lower = prompt.to_lowercase();
+    // Intent shows in a prompt's head. Bounding the lowercased window keeps
+    // this hot-path fallback from allocating a full copy of an arbitrarily
+    // large prompt (a 1 MiB chat body previously cost a 1 MiB allocation
+    // plus ~30 linear scans here on every request).
+    const MAX_HEURISTIC_SCAN_BYTES: usize = 8 * 1024;
+    let lower = sbproxy_util::truncate_utf8(prompt, MAX_HEURISTIC_SCAN_BYTES).to_lowercase();
 
     if lower.contains("code")
         || lower.contains("function")

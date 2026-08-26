@@ -1363,6 +1363,14 @@ timeout_ms: 3000
     token_digest.update(b"loopback-agent:");
     token_digest.update(AGENT_SECRET.as_bytes());
     let expected_token = hex::encode(token_digest.finalize());
+    // The digest above is computed by hand so this stays an independent
+    // proof of the wire format; the library's agent-side verifier must
+    // agree with that observed token or the two halves have drifted.
+    assert!(sbproxy_ai::agent_orchestration::verify_agent_token(
+        "loopback-agent",
+        &expected_token,
+        AGENT_SECRET
+    ));
     let expected_authorization = format!("Bearer {expected_token}");
     assert_eq!(
         agent_request

@@ -941,12 +941,15 @@ struct EvaluateArgs {
     /// Optional JSON Schema that every response must satisfy.
     #[arg(long = "json-schema")]
     json_schema: Option<PathBuf>,
-    /// Minimum response length in bytes.
-    #[arg(long = "min-bytes", default_value_t = 0)]
-    min_bytes: usize,
-    /// Maximum response length in bytes.
-    #[arg(long = "max-bytes", default_value_t = 1024 * 1024)]
-    max_bytes: usize,
+    /// Minimum response length in bytes. Setting either bound adds one
+    /// inclusive length-range metric; leaving both unset adds none, so the
+    /// reported metric pass rate reflects only the metrics you asked for.
+    #[arg(long = "min-bytes")]
+    min_bytes: Option<usize>,
+    /// Maximum response length in bytes (defaults to 1 MiB when only
+    /// `--min-bytes` is given).
+    #[arg(long = "max-bytes")]
+    max_bytes: Option<usize>,
     /// Admin endpoint and credentials.
     #[command(flatten)]
     admin: ModelsAdminArgs,
@@ -10821,8 +10824,16 @@ fn handle_dataset_register(args: &DatasetRegisterArgs) -> anyhow::Result<i32> {
 }
 
 fn handle_ai_evaluate(args: &EvaluateArgs) -> anyhow::Result<i32> {
-    if args.min_bytes > args.max_bytes {
-        anyhow::bail!("--min-bytes must not exceed --max-bytes");
+    let length_bounds = (args.min_bytes.is_some() || args.max_bytes.is_some()).then(|| {
+        (
+            args.min_bytes.unwrap_or(0),
+            args.max_bytes.unwrap_or(1024 * 1024),
+        )
+    });
+    if let Some((min_bytes, max_bytes)) = length_bounds {
+        if min_bytes > max_bytes {
+            anyhow::bail!("--min-bytes must not exceed --max-bytes");
+        }
     }
     let responses = load_ai_toolkit_json(
         &args.responses,
@@ -10833,11 +10844,17 @@ fn handle_ai_evaluate(args: &EvaluateArgs) -> anyhow::Result<i32> {
         anyhow::bail!("evaluation responses must be a JSON array");
     }
 
-    let mut metrics = vec![serde_json::json!({
-        "type": "length_range",
-        "min": args.min_bytes,
-        "max": args.max_bytes,
-    })];
+    // Injected only when a bound was asked for: an always-on metric diluted
+    // the reported pass rate, and its 1 MiB default was refused outright by
+    // configs that lower `limits.max_response_bytes` below it.
+    let mut metrics = Vec::new();
+    if let Some((min_bytes, max_bytes)) = length_bounds {
+        metrics.push(serde_json::json!({
+            "type": "length_range",
+            "min": min_bytes,
+            "max": max_bytes,
+        }));
+    }
     if !args.required_keywords.is_empty() {
         metrics.push(serde_json::json!({
             "type": "contains_keywords",

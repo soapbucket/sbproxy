@@ -13,11 +13,16 @@ impl AiToolkitRuntime {
     ) -> Result<ToolkitSnapshot, ToolkitError> {
         let scope = request.scope.clone();
         let result = self.snapshot_inner(request);
-        self.record_operation(
-            scope,
-            "toolkit_snapshot",
-            metric_outcome(&result).as_label(),
-        );
+        // Successful reads stay out of the bounded operations ring: a
+        // dashboard polling this snapshot must not evict the scope's real
+        // decision history. Failed reads are still worth a row.
+        if result.is_err() {
+            self.record_operation(
+                scope,
+                "toolkit_snapshot",
+                metric_outcome(&result).as_label(),
+            );
+        }
         result
     }
 

@@ -39,7 +39,11 @@ missing/overflow buckets on the legacy v1 or CSV surfaces.
 
 The configured instance remains queryable after the sink is registered.
 Use authenticated `GET /admin/ai-chargeback` for the process-local JSON
-view or `GET /admin/ai-chargeback.csv` for workspace/team rollups. The
+view or `GET /admin/ai-chargeback.csv` for workspace/team rollups. Both
+exports are deployment-wide: an operator carrying a
+`proxy.admin.operators[].tenant` restriction is refused with `403`,
+because the team and project rollups aggregate across tenants and no
+narrowed view of them can be correct. The
 JSON export includes retained raw entries, all rollups, and
 `recorded_entries`, `evicted_entries`, `collapsed_workspace_events`, and
 `collapsed_team_events`. `schema_version` defaults to `1`;

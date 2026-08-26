@@ -2305,6 +2305,55 @@ fn render_live_ai_chargeback_json_for_test(
     )
 }
 
+/// WOR-2672: route the bounded live chargeback exports with the resolved
+/// principal in hand. Runs on the connection task rather than in
+/// `handle_admin_request` because the synchronous handler is never given the
+/// principal and therefore cannot enforce the operator's tenant restriction.
+///
+/// The team and project rollup dimensions aggregate usage across tenants, so
+/// no post-hoc filter can produce a correct tenant-narrowed export. A
+/// tenant-restricted operator is refused outright, mirroring the meter
+/// routes' refusal-over-silent-narrowing rule; the unrestricted operator
+/// keeps the deployment-wide export, whose `workspace` dimension already
+/// breaks usage down by tenant.
+pub(crate) fn dispatch_ai_chargeback(
+    method: &str,
+    path: &str,
+    principal: Option<&AdminPrincipal>,
+) -> Option<AdminResponse> {
+    let path_only = path.split('?').next().unwrap_or(path);
+    if path_only != "/admin/ai-chargeback" && path_only != "/admin/ai-chargeback.csv" {
+        return None;
+    }
+    if !method.eq_ignore_ascii_case("GET") {
+        return Some((
+            405,
+            "application/json",
+            r#"{"error":"method not allowed"}"#.to_string(),
+        ));
+    }
+    let Some(principal) = principal else {
+        return Some((
+            401,
+            "application/json",
+            r#"{"error":"authentication required"}"#.to_string(),
+        ));
+    };
+    if principal.tenant.is_some() {
+        return Some((
+            403,
+            "application/json",
+            r#"{"error":"chargeback exports are deployment-wide; a tenant-scoped operator cannot read them"}"#
+                .to_string(),
+        ));
+    }
+    Some(if path_only == "/admin/ai-chargeback" {
+        handle_ai_chargeback(path)
+    } else {
+        handle_ai_chargeback_csv()
+    })
+}
+
 /// Return all configured live chargeback trackers as a capped JSON export.
 fn handle_ai_chargeback(path: &str) -> AdminResponse {
     let schema_version = decoded_query_param(path, "schema_version");
@@ -5705,29 +5754,12 @@ pub fn handle_admin_request(
             r#"{"error":"method not allowed"}"#.to_string(),
         );
     }
-    // WOR-2672: bounded live chargeback results from the same sink
-    // instances the request path records into. Both forms are read-only
-    // and sit behind the common operator-auth gate above.
-    if path_only == "/admin/ai-chargeback" {
-        if method.eq_ignore_ascii_case("GET") {
-            return handle_ai_chargeback(path);
-        }
-        return (
-            405,
-            "application/json",
-            r#"{"error":"method not allowed"}"#.to_string(),
-        );
-    }
-    if path_only == "/admin/ai-chargeback.csv" {
-        if method.eq_ignore_ascii_case("GET") {
-            return handle_ai_chargeback_csv();
-        }
-        return (
-            405,
-            "application/json",
-            r#"{"error":"method not allowed"}"#.to_string(),
-        );
-    }
+    // WOR-2672: `/admin/ai-chargeback` and `/admin/ai-chargeback.csv` are
+    // NOT handled here. They dispatch on the connection task (see
+    // `dispatch_ai_chargeback`) because this synchronous handler never sees
+    // the resolved principal, and the chargeback export is the most granular
+    // consumption surface in the deployment: serving it here would hand a
+    // tenant-restricted operator every tenant's rows.
     if path_only == "/admin/config" {
         if method.eq_ignore_ascii_case("GET") {
             return handle_config_read(state);
@@ -6861,6 +6893,17 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
             &cors,
         )
         .await;
+        return;
+    }
+
+    // WOR-2672: the chargeback exports need the resolved principal so a
+    // tenant-restricted operator is refused rather than handed every
+    // tenant's consumption rows; the sync dispatcher below cannot see the
+    // restriction.
+    if let Some(response) = dispatch_ai_chargeback(method, path, principal.as_ref()) {
+        let _ =
+            write_admin_response_headed(sock, response.0, response.1, response.2.as_bytes(), &cors)
+                .await;
         return;
     }
 
@@ -13293,20 +13336,59 @@ origins:
         action.config.usage_sinks()[0].record(&event);
         drop(pipeline);
 
+        // The chargeback exports moved off the unscoped synchronous seam:
+        // even an authenticated request through `handle_admin_request` must
+        // fall through (404), never serve cross-tenant rows.
         let (status, _, _) =
-            handle_admin_request("GET", "/admin/ai-chargeback", &state, None, None);
+            handle_admin_request("GET", "/admin/ai-chargeback", &state, Some(&auth), None);
+        assert_eq!(status, 404, "sync seam must not own the chargeback export");
+
+        let unscoped = AdminPrincipal {
+            username: "op-root".to_string(),
+            role: sbproxy_config::types::AdminRole::Admin,
+            via_session: false,
+            csrf: None,
+            tenant: None,
+        };
+        let scoped = AdminPrincipal {
+            username: "op-a".to_string(),
+            role: sbproxy_config::types::AdminRole::Admin,
+            via_session: false,
+            csrf: None,
+            tenant: Some("tenant-a".to_string()),
+        };
+
+        let (status, _, _) = dispatch_ai_chargeback("GET", "/admin/ai-chargeback", None)
+            .expect("route is owned by the chargeback dispatcher");
         assert_eq!(status, 401);
-        let (status, _, _) = handle_admin_request(
-            "POST",
-            "/admin/ai-chargeback.csv",
-            &state,
-            Some(&auth),
-            None,
-        );
+        let (status, _, _) =
+            dispatch_ai_chargeback("POST", "/admin/ai-chargeback.csv", Some(&unscoped))
+                .expect("route is owned by the chargeback dispatcher");
         assert_eq!(status, 405);
+        assert!(
+            dispatch_ai_chargeback("GET", "/admin/ai-data-posture", Some(&unscoped)).is_none(),
+            "other admin routes must fall through"
+        );
+
+        // A tenant-restricted operator is refused outright: the team and
+        // project rollups aggregate across tenants, so no narrowed view of
+        // this export can be correct.
+        for path in ["/admin/ai-chargeback", "/admin/ai-chargeback.csv"] {
+            let (status, _, body) = dispatch_ai_chargeback("GET", path, Some(&scoped))
+                .expect("route is owned by the chargeback dispatcher");
+            assert_eq!(
+                status, 403,
+                "tenant-scoped operator must be refused: {body}"
+            );
+            assert!(
+                !body.contains("workspace-a") && !body.contains("team-a"),
+                "refusal must not leak rows: {body}"
+            );
+        }
 
         let (status, _, body) =
-            handle_admin_request("GET", "/admin/ai-chargeback", &state, Some(&auth), None);
+            dispatch_ai_chargeback("GET", "/admin/ai-chargeback", Some(&unscoped))
+                .expect("route is owned by the chargeback dispatcher");
         assert_eq!(status, 200, "got body: {body}");
         let chargeback: serde_json::Value = serde_json::from_str(&body).expect("chargeback JSON");
         assert_eq!(chargeback["schema_version"], 1);
@@ -13319,7 +13401,8 @@ origins:
         assert_eq!(tracker["team_totals"]["team-a"]["cost_usd"], 0.25);
 
         let (status, content_type, csv) =
-            handle_admin_request("GET", "/admin/ai-chargeback.csv", &state, Some(&auth), None);
+            dispatch_ai_chargeback("GET", "/admin/ai-chargeback.csv", Some(&unscoped))
+                .expect("route is owned by the chargeback dispatcher");
         assert_eq!(status, 200, "got body: {csv}");
         assert_eq!(content_type, "text/csv; charset=utf-8");
         assert!(csv.starts_with("origin,tracker,dimension,name,request_count,tokens,cost_usd\n"));

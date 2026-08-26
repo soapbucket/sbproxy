@@ -224,15 +224,8 @@ impl AiToolkitRuntime {
         let permit = match self.agent_semaphore.try_acquire() {
             Ok(permit) => permit,
             Err(_) => {
-                self.record_operation(
-                    scope,
-                    "agent_workflow",
-                    AiToolkitOutcome::Internal.as_label(),
-                );
-                record_ai_toolkit_operation(
-                    AiToolkitCapability::Workflow,
-                    AiToolkitOutcome::Internal,
-                );
+                self.record_operation(scope, "agent_workflow", AiToolkitOutcome::Busy.as_label());
+                record_ai_toolkit_operation(AiToolkitCapability::Workflow, AiToolkitOutcome::Busy);
                 return Err(ToolkitError::Busy {
                     operation: "agent_workflow",
                 });

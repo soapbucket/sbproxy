@@ -50,11 +50,11 @@ impl AiToolkitRuntime {
                 self.record_operation(
                     scope,
                     "offline_evaluation",
-                    AiToolkitOutcome::Internal.as_label(),
+                    AiToolkitOutcome::Busy.as_label(),
                 );
                 record_ai_toolkit_operation(
                     AiToolkitCapability::Evaluation,
-                    AiToolkitOutcome::Internal,
+                    AiToolkitOutcome::Busy,
                 );
                 return Err(ToolkitError::Busy {
                     operation: "offline_evaluation",

@@ -9,8 +9,8 @@
 //! ```
 
 use sbproxy_ai::agent_orchestration::{
-    generate_agent_token, verify_agent_token, A2AAuthConfig, AgentCapability, AgentRegistry,
-    FsmExecution, FsmState, FsmWorkflow,
+    generate_agent_token, verify_agent_token, AgentCapability, AgentRegistry, FsmExecution,
+    FsmState, FsmWorkflow,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -48,16 +48,12 @@ fn main() {
     println!("All registered agents: {:?}", registry.list_agents());
 
     // --- 2. Authenticate a call to the agent the triage step picks ---
-    let auth = A2AAuthConfig {
-        shared_secret: "operator-managed-secret".to_string(),
-    };
+    // The proxy's workflow runner generates this token when it dials the
+    // agent; the agent server verifies it with the same derivation.
+    let shared_secret = "operator-managed-secret";
     let target_agent = "coding-agent";
-    let token = generate_agent_token(target_agent, &auth.shared_secret);
-    assert!(verify_agent_token(
-        target_agent,
-        &token,
-        &auth.shared_secret
-    ));
+    let token = generate_agent_token(target_agent, shared_secret);
+    assert!(verify_agent_token(target_agent, &token, shared_secret));
     println!("\nIssued a token for {target_agent}: {token}");
 
     // --- 3. Drive a triage -> dispatch workflow with the FSM orchestrator ---

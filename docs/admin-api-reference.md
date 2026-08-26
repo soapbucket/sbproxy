@@ -2487,6 +2487,12 @@ deterministic digest suffix so they cannot impersonate the missing or
 overflow buckets on schema v1 or CSV.
 A hot reload replaces the view with the new pipeline's trackers.
 
+Both routes require an operator whose `proxy.admin.operators` entry has
+no `tenant` restriction. The team and project rollups aggregate usage
+across tenants, so a tenant-restricted operator receives `403` rather
+than a silently narrowed or mixed export; the unrestricted export's
+`workspace` dimension already breaks usage down per tenant.
+
 ```json
 {
   "schema_version": 1,

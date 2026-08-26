@@ -77,6 +77,13 @@ The dataset file contains `name`, `version`, and `entries`; the CLI supplies the
 scope separately and sends the request to
 `POST /admin/ai-toolkit/datasets/register`.
 
+Registration is generation-pinned: a config reload builds a fresh toolkit
+runtime from `proxy.ai_toolkit` alone, so datasets registered over this
+API, retained experiment summaries, and recorded operation rows all vanish
+at the next reload, even one that changes nothing else. Datasets that must
+survive reloads belong in the config's `ai_toolkit.datasets:` block, which
+re-seeds every generation.
+
 ```json
 {
   "name": "support-answers",
@@ -122,9 +129,12 @@ sbproxy ai evaluate \
   --max-bytes 512
 ```
 
-The CLI always adds an inclusive length-range metric. Repeat
-`--required-keyword` to require several literal keywords, and use
-`--json-schema <file>` to validate structural JSON output. The runtime also
+Setting `--min-bytes` or `--max-bytes` adds one inclusive length-range
+metric; leaving both unset adds none, so the reported `metric_pass_rate`
+covers exactly the metrics you asked for (and is `1.0` when a run
+declares no metrics at all). Repeat `--required-keyword` to require
+several literal keywords, and use `--json-schema <file>` to validate
+structural JSON output. The runtime also
 supports bounded regular-expression, JSON-Schema, length-range, and keyword
 metric specifications on the admin wire.
 

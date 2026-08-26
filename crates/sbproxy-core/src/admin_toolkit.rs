@@ -352,37 +352,9 @@ fn record_response_outcome(route: &str, response: &AdminToolkitResponse) {
 fn metric_outcome(
     error: &sbproxy_ai::toolkit::ToolkitError,
 ) -> sbproxy_ai::ai_metrics::AiToolkitOutcome {
-    use sbproxy_ai::ai_metrics::AiToolkitOutcome;
-    use sbproxy_ai::toolkit::ToolkitError;
-
-    match error {
-        ToolkitError::NotFound { .. } => AiToolkitOutcome::NotFound,
-        ToolkitError::Deadline { .. } => AiToolkitOutcome::Timeout,
-        ToolkitError::GovernedEgress {
-            reason: "egress_denied",
-        } => AiToolkitOutcome::EgressRefused,
-        ToolkitError::GovernedEgress {
-            reason: "response_too_large",
-        } => AiToolkitOutcome::ResponseTooLarge,
-        ToolkitError::LimitExceeded { resource, .. }
-            if resource.contains("response") || resource.contains("output") =>
-        {
-            AiToolkitOutcome::ResponseTooLarge
-        }
-        ToolkitError::LimitExceeded { resource, .. }
-            if resource.contains("request") || resource.contains("input") =>
-        {
-            AiToolkitOutcome::BodyTooLarge
-        }
-        ToolkitError::LimitExceeded { .. } => AiToolkitOutcome::Invalid,
-        ToolkitError::InvalidConfiguration { .. }
-        | ToolkitError::InvalidSchema { .. }
-        | ToolkitError::Duplicate { .. }
-        | ToolkitError::SchemaViolation { .. }
-        | ToolkitError::InvalidAgentResponse
-        | ToolkitError::InvalidJudgeResponse => AiToolkitOutcome::Invalid,
-        _ => AiToolkitOutcome::Internal,
-    }
+    // One authoritative table lives beside the runtime; a second copy here
+    // held the two label streams equal only by convention.
+    sbproxy_ai::toolkit::error_metric_outcome(error)
 }
 
 fn event_outcome(
@@ -400,6 +372,7 @@ fn event_outcome(
         AiToolkitOutcome::Timeout => EventOutcome::Timeout,
         AiToolkitOutcome::BodyTooLarge => EventOutcome::BodyTooLarge,
         AiToolkitOutcome::ResponseTooLarge => EventOutcome::ResponseTooLarge,
+        AiToolkitOutcome::Busy => EventOutcome::Busy,
         AiToolkitOutcome::Internal => EventOutcome::Internal,
     }
 }

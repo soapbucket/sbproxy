@@ -364,6 +364,10 @@ pub enum AiToolkitOutcome {
     BodyTooLarge,
     /// The bounded response could not fit its response-byte limit.
     ResponseTooLarge,
+    /// Concurrency admission refused the operation; the caller retries
+    /// later. Kept distinct from `Internal` so capacity exhaustion can be
+    /// alerted on without paging for internal faults.
+    Busy,
     /// An internal failure prevented a closed public outcome.
     Internal,
 }
@@ -380,6 +384,7 @@ impl AiToolkitOutcome {
             Self::Timeout => "timeout",
             Self::BodyTooLarge => "body_too_large",
             Self::ResponseTooLarge => "response_too_large",
+            Self::Busy => "busy",
             Self::Internal => "internal",
         }
     }
@@ -387,24 +392,27 @@ impl AiToolkitOutcome {
 
 /// Workflow, evaluation, and weighted-rollout operations by closed
 /// capability and terminal outcome.
-static AI_TOOLKIT_OPERATIONS: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
+static AI_TOOLKIT_OPERATIONS: LazyLock<CounterVec> = LazyLock::new(|| {
     register_counter_vec!(
         Opts::new(
             "sbproxy_ai_toolkit_operations_total",
-            "AI toolkit operations by capability (workflow, evaluation, prompt_rollout) and terminal outcome (success, invalid, unauthorized, not_found, egress_refused, timeout, body_too_large, response_too_large, internal)"
+            "AI toolkit operations by capability (workflow, evaluation, prompt_rollout) and terminal outcome (success, invalid, unauthorized, not_found, egress_refused, timeout, body_too_large, response_too_large, busy, internal)"
         ),
         &["capability", "outcome"]
     )
-    .ok()
+    // Same contract as the sibling families above: every input is a fixed
+    // literal, so the only possible failure is a same-name/different-type
+    // double registration, a programming error to catch at first use. The
+    // earlier `.ok()` form would have turned that error into a counter
+    // that silently reads zero forever.
+    .expect("sbproxy_ai_toolkit_operations_total is a fixed, unique metric family")
 });
 
 /// Record one terminal AI-toolkit operation.
 pub fn record_ai_toolkit_operation(capability: AiToolkitCapability, outcome: AiToolkitOutcome) {
-    if let Some(operations) = AI_TOOLKIT_OPERATIONS.as_ref() {
-        operations
-            .with_label_values(&[capability.as_label(), outcome.as_label()])
-            .inc();
-    }
+    AI_TOOLKIT_OPERATIONS
+        .with_label_values(&[capability.as_label(), outcome.as_label()])
+        .inc();
 }
 
 /// AI routing decisions that intentionally use a fallback path.
@@ -3123,13 +3131,13 @@ mod tests {
         }
 
         let before = AI_TOOLKIT_OPERATIONS
-            .as_ref()
-            .map(|operations| operations.with_label_values(&["workflow", "success"]).get());
+            .with_label_values(&["workflow", "success"])
+            .get();
         record_ai_toolkit_operation(AiToolkitCapability::Workflow, AiToolkitOutcome::Success);
         let after = AI_TOOLKIT_OPERATIONS
-            .as_ref()
-            .map(|operations| operations.with_label_values(&["workflow", "success"]).get());
-        assert_eq!(after, before.map(|value| value + 1.0));
+            .with_label_values(&["workflow", "success"])
+            .get();
+        assert_eq!(after, before + 1.0);
     }
 
     #[test]

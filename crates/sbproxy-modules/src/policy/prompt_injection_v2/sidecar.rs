@@ -115,6 +115,36 @@ struct SidecarDetectorConfig {
     threshold: f64,
 }
 
+/// Whether the endpoint's host is `localhost` or a literal loopback IP,
+/// after the same bracket and canonicalization rules
+/// `proxy.classifier_hooks` validation applies (`endpoint_host_is_local`
+/// in `sbproxy-config`). A host this cannot prove local is treated as
+/// nonlocal, so DNS names other than `localhost` warn.
+fn endpoint_is_local(endpoint: &str) -> bool {
+    let authority = endpoint
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(endpoint);
+    let authority = authority.split(['/', '?', '#']).next().unwrap_or("");
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or("")
+    } else {
+        authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, port)| {
+                if port.chars().all(|c| c.is_ascii_digit()) {
+                    host
+                } else {
+                    authority
+                }
+            })
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.to_canonical().is_loopback())
+}
+
 fn default_endpoint() -> String {
     DEFAULT_ENDPOINT.to_string()
 }
@@ -252,6 +282,22 @@ impl SidecarDetector {
             ));
         }
         cfg.validate_failure_posture()?;
+        if !endpoint_is_local(&cfg.endpoint) && !cfg.endpoint.starts_with("https://") {
+            // Every scanned prompt ships to this socket, and unlike
+            // `proxy.classifier_hooks` this policy-side dial is not routed
+            // through `egress.classifier_hooks` and carries no
+            // https-for-nonlocal refusal (the shape has been accepted since
+            // the detector first shipped, so refusing it now would break
+            // released configs; tightening that is a separate deprecation
+            // decision). Make the boundary loud at load instead of silent.
+            tracing::warn!(
+                target: "sbproxy::policy::prompt_injection_v2",
+                endpoint = %cfg.endpoint,
+                "sidecar detector endpoint is nonlocal and not https: prompt text will leave \
+                 this host unencrypted and outside egress.classifier_hooks governance; keep the \
+                 sidecar on loopback or front it with TLS"
+            );
+        }
         let failure_posture = cfg.failure_posture();
         Ok(Self {
             endpoint: cfg.endpoint,
@@ -417,6 +463,45 @@ mod tests {
             "fail_closed": fail_closed,
         }))
         .expect("valid config")
+    }
+
+    #[test]
+    fn endpoint_locality_matches_the_stock_hook_classification() {
+        for local in [
+            "http://127.0.0.1:9440",
+            "http://localhost:9440",
+            "http://LOCALHOST:9440",
+            "http://[::1]:9440",
+            "https://127.0.0.1",
+            "http://127.0.0.1",
+        ] {
+            assert!(endpoint_is_local(local), "{local} must classify local");
+        }
+        for nonlocal in [
+            "http://10.9.8.7:9500",
+            "http://classifier.internal:9500",
+            "http://169.254.169.254:9500",
+            "http://[2001:db8::1]:9500",
+            "https://classifier.internal:9500",
+        ] {
+            assert!(
+                !endpoint_is_local(nonlocal),
+                "{nonlocal} must classify nonlocal"
+            );
+        }
+    }
+
+    #[test]
+    fn nonlocal_plain_http_endpoint_still_parses_for_released_compat() {
+        // The warn-not-refuse posture is deliberate: this shape has been
+        // accepted since the detector shipped, so construction must keep
+        // succeeding while the load-time warning marks the boundary.
+        SidecarDetector::from_config(&serde_json::json!({
+            "endpoint": "http://10.9.8.7:9500",
+            "timeout_ms": 200,
+            "fail_closed": true,
+        }))
+        .expect("released nonlocal-http shape must keep parsing");
     }
 
     #[test]

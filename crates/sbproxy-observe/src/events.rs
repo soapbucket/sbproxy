@@ -220,6 +220,8 @@ pub enum AiToolkitEventOutcome {
     BodyTooLarge,
     /// A bounded response could not fit the response limit.
     ResponseTooLarge,
+    /// Concurrency admission refused the operation; retry later.
+    Busy,
     /// Any failure that is not safe to expose as a more specific outcome.
     Internal,
 }
@@ -236,6 +238,7 @@ impl AiToolkitEventOutcome {
             Self::Timeout => "timeout",
             Self::BodyTooLarge => "body_too_large",
             Self::ResponseTooLarge => "response_too_large",
+            Self::Busy => "busy",
             Self::Internal => "internal",
         }
     }

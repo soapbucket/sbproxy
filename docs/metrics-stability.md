@@ -130,7 +130,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_ai_inter_token_latency_seconds` | Histogram | `stable` | `beta` | `provider`, `model` | AI streaming average inter-token latency (TPOT). |
 | `sbproxy_ai_intent_detection_source_total` | Counter | `stable` | `beta` | `source` | Intent-detection dispatches by healthy classifier hook, unconfigured heuristic, or degraded heuristic fallback. |
 | `sbproxy_ai_quality_routing_decisions_total` | Counter | `stable` | `beta` | `outcome` | Quality-hook routing decisions by selected or fallback outcome. |
-| `sbproxy_ai_toolkit_operations_total` | Counter | `stable` | `beta` | `capability`, `outcome` | AI toolkit operations by capability (workflow, evaluation, prompt_rollout) and terminal outcome (success, invalid, unauthorized, not_found, egress_refused, timeout, body_too_large, response_too_large, internal). |
+| `sbproxy_ai_toolkit_operations_total` | Counter | `stable` | `beta` | `capability`, `outcome` | AI toolkit operations by capability (workflow, evaluation, prompt_rollout) and terminal outcome (success, invalid, unauthorized, not_found, egress_refused, timeout, body_too_large, response_too_large, busy, internal). |
 | `sbproxy_classifier_admission_queue` | Gauge | `stable` | `beta` | `cmd` | Rich-sidecar requests currently waiting for a bounded inference slot, by command. |
 | `sbproxy_classifier_admission_refusals_total` | Counter | `stable` | `beta` | `cmd`, `reason` | Rich-sidecar requests refused by bounded admission, by command and closed reason. |
 | `sbproxy_classifier_attempts_total` | Counter | `stable` | `beta` | `transport`, `cmd` | Rich classifier sidecar request attempts observed at a typed transport boundary. |

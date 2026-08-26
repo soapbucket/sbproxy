@@ -169,7 +169,15 @@ impl QualityFanoutRuntime {
         loop {
             let notified = self.byte_notify.notified();
             {
-                let mut state = self.state.lock().expect("quality fanout state poisoned");
+                // Poison recovery is deliberate: this lock guards request-path
+                // admission, and inheriting a panicking writer's poison would
+                // turn one bug into a standing outage for every quality-scored
+                // request until restart. The counters the writer may have left
+                // behind only over-count, which admission tolerates.
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if state.current_call_leases < quality_fanout_limits().max_concurrent_calls()
                     && state.leased_prompt_bytes + prompt_bytes
                         <= quality_fanout_limits().max_live_prompt_bytes()
@@ -215,15 +223,29 @@ impl QualityFanoutRuntime {
 
     fn release_weighted_lease(&self, prompt_bytes: usize, #[cfg(test)] origin: &str) {
         {
-            let mut state = self.state.lock().expect("quality fanout state poisoned");
-            state.leased_prompt_bytes = state
-                .leased_prompt_bytes
-                .checked_sub(prompt_bytes)
-                .expect("weighted prompt lease underflow");
-            state.current_call_leases = state
-                .current_call_leases
-                .checked_sub(1)
-                .expect("weighted prompt call lease underflow");
+            // Runs from `Drop`. A panic here while holding the lock would
+            // poison request-path admission, so recover the lock and treat an
+            // underflow (a would-be double release) as a loud invariant report
+            // rather than a poisoning panic.
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            debug_assert!(
+                state.leased_prompt_bytes >= prompt_bytes && state.current_call_leases >= 1,
+                "weighted prompt lease released more than it acquired"
+            );
+            if state.leased_prompt_bytes < prompt_bytes || state.current_call_leases == 0 {
+                static UNDERFLOW_REPORTED: std::sync::Once = std::sync::Once::new();
+                UNDERFLOW_REPORTED.call_once(|| {
+                    tracing::error!(
+                        target: "sbproxy::classifier_hooks",
+                        "weighted quality-fanout lease underflow: a lease was released twice;                          admission accounting saturates instead of poisoning the request path"
+                    );
+                });
+            }
+            state.leased_prompt_bytes = state.leased_prompt_bytes.saturating_sub(prompt_bytes);
+            state.current_call_leases = state.current_call_leases.saturating_sub(1);
             #[cfg(test)]
             {
                 state.total_weighted_lease_releases += 1;
