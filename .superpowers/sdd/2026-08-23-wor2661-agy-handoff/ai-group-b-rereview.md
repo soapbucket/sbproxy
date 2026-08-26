@@ -6,7 +6,7 @@
 
 ## Adversarial review
 
-Reviewer: Codex, fresh independent static re-review
+Reviewer: fresh independent static re-review
 
 Findings: 0 Blocker, 5 Major, 0 Minor
 
