@@ -285,12 +285,13 @@ jobs:
           #     --run-ignored only -j1 \
           #     -E 'test(storage::async_redis::tests::redis_connection_recovers_after_server_restart)'
           #
-          # but it is not part of the required PR gate. The gate keeps the
-          # secure-DSN / live-Lua-state contracts and leaves the restart-path
-          # timing probe opt-in.
+          # The separate redis_secure restart probe remains explicitly runnable
+          # with `-E 'test(pooled_connection_recovers_after_redis_kill_and_restart)'`.
+          # Neither restart timing probe is part of the required PR gate. The
+          # gate keeps the secure-DSN / live-Lua-state contracts only.
           cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci \
             --run-ignored only -j1 \
-            -E 'binary(redis_secure) + test(compression_store::redis::tests::live_redis_) + test(semantic_cache_runtime::redis::tests::live_redis_semantic_) + binary(governance_redis) + binary(quota_pool_redis)'
+            -E '(binary(redis_secure) & not test(pooled_connection_recovers_after_redis_kill_and_restart)) + test(compression_store::redis::tests::live_redis_) + test(semantic_cache_runtime::redis::tests::live_redis_semantic_) + binary(governance_redis) + binary(quota_pool_redis)'
 
       # nextest does not execute doctests, so they need their own pass.
       - name: doctests
