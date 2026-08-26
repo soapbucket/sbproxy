@@ -293,6 +293,20 @@ jobs:
             --run-ignored only -j1 \
             -E '(binary(redis_secure) & not test(pooled_connection_recovers_after_redis_kill_and_restart)) + test(compression_store::redis::tests::live_redis_) + test(semantic_cache_runtime::redis::tests::live_redis_semantic_) + binary(governance_redis) + binary(quota_pool_redis)'
 
+      # The two Redis restart-recovery probes are timing probes: they kill
+      # and restart a daemon and time the reconnect, which is exactly the
+      # kind of test a shared runner turns red for reasons that are not
+      # regressions. They used to be opt-in only, which left the
+      # reconnect-after-restart contract with no automated lane at all. This
+      # step runs both on every PR and reports, but does not gate: a red
+      # here is a signal to open the log, not a reason to block the merge.
+      - name: Redis restart probes (non-blocking)
+        continue-on-error: true
+        run: |
+          cargo nextest run --workspace --exclude sbproxy-e2e --locked --profile ci \
+            --run-ignored only -j1 \
+            -E 'test(storage::async_redis::tests::redis_connection_recovers_after_server_restart) + test(pooled_connection_recovers_after_redis_kill_and_restart)'
+
       # nextest does not execute doctests, so they need their own pass.
       - name: doctests
         run: cargo test --workspace --exclude sbproxy-e2e --locked --doc
