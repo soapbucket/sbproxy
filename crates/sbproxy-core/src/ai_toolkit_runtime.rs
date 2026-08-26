@@ -188,40 +188,95 @@ fn bounded_identifier(value: &str) -> String {
     value.chars().take(128).collect()
 }
 
+/// Overlay one configured override onto its runtime default.
+///
+/// An omitted field leaves the default in place, which is what makes
+/// every key in `proxy.ai_toolkit.limits` optional.
+fn apply_limit<T: Copy>(limit: &mut T, configured: Option<T>) {
+    if let Some(value) = configured {
+        *limit = value;
+    }
+}
+
+/// Lower the optional `proxy.ai_toolkit.limits` overrides onto the runtime
+/// defaults.
+///
+/// Every field is named twice, by hand. A macro over the field list is
+/// shorter and was what this did, but the config-reader guard proves a
+/// schema key is wired by finding a `configured.<field>` read in
+/// production source, and a macro body is invisible to it, so the whole
+/// `limits` subtree read as accepted-and-inert. Spelling the reads out is
+/// what lets that guard see them.
 fn lower_limits(configured: &sbproxy_config::types::AiToolkitLimitsConfig) -> AiToolkitLimits {
     let mut limits = AiToolkitLimits::default();
-    macro_rules! apply {
-        ($($field:ident),+ $(,)?) => {
-            $(if let Some(value) = configured.$field {
-                limits.$field = value;
-            })+
-        };
-    }
-    apply!(
-        max_agents,
-        max_capabilities_per_agent,
-        max_workflows,
-        max_datasets,
-        max_dataset_versions,
-        max_dataset_versions_total,
-        max_dataset_entries,
-        max_dataset_bytes_total,
-        max_rollouts,
-        max_rollout_versions,
-        max_retained_operations,
-        max_request_bytes,
-        max_response_bytes,
-        max_identifier_bytes,
-        max_description_bytes,
-        max_schema_bytes,
-        max_secret_bytes,
-        max_evaluation_cases,
-        max_metrics,
-        max_judge_criteria,
-        agent_concurrency,
-        evaluation_concurrency,
-        default_workflow_timeout_ms,
-        max_workflow_timeout_ms,
+    apply_limit(&mut limits.max_agents, configured.max_agents);
+    apply_limit(
+        &mut limits.max_capabilities_per_agent,
+        configured.max_capabilities_per_agent,
+    );
+    apply_limit(&mut limits.max_workflows, configured.max_workflows);
+    apply_limit(&mut limits.max_datasets, configured.max_datasets);
+    apply_limit(
+        &mut limits.max_dataset_versions,
+        configured.max_dataset_versions,
+    );
+    apply_limit(
+        &mut limits.max_dataset_versions_total,
+        configured.max_dataset_versions_total,
+    );
+    apply_limit(
+        &mut limits.max_dataset_entries,
+        configured.max_dataset_entries,
+    );
+    apply_limit(
+        &mut limits.max_dataset_bytes_total,
+        configured.max_dataset_bytes_total,
+    );
+    apply_limit(&mut limits.max_rollouts, configured.max_rollouts);
+    apply_limit(
+        &mut limits.max_rollout_versions,
+        configured.max_rollout_versions,
+    );
+    apply_limit(
+        &mut limits.max_retained_operations,
+        configured.max_retained_operations,
+    );
+    apply_limit(&mut limits.max_request_bytes, configured.max_request_bytes);
+    apply_limit(
+        &mut limits.max_response_bytes,
+        configured.max_response_bytes,
+    );
+    apply_limit(
+        &mut limits.max_identifier_bytes,
+        configured.max_identifier_bytes,
+    );
+    apply_limit(
+        &mut limits.max_description_bytes,
+        configured.max_description_bytes,
+    );
+    apply_limit(&mut limits.max_schema_bytes, configured.max_schema_bytes);
+    apply_limit(&mut limits.max_secret_bytes, configured.max_secret_bytes);
+    apply_limit(
+        &mut limits.max_evaluation_cases,
+        configured.max_evaluation_cases,
+    );
+    apply_limit(&mut limits.max_metrics, configured.max_metrics);
+    apply_limit(
+        &mut limits.max_judge_criteria,
+        configured.max_judge_criteria,
+    );
+    apply_limit(&mut limits.agent_concurrency, configured.agent_concurrency);
+    apply_limit(
+        &mut limits.evaluation_concurrency,
+        configured.evaluation_concurrency,
+    );
+    apply_limit(
+        &mut limits.default_workflow_timeout_ms,
+        configured.default_workflow_timeout_ms,
+    );
+    apply_limit(
+        &mut limits.max_workflow_timeout_ms,
+        configured.max_workflow_timeout_ms,
     );
     limits
 }
