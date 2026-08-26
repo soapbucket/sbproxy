@@ -231,16 +231,18 @@ impl QualityFanoutRuntime {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            debug_assert!(
-                state.leased_prompt_bytes >= prompt_bytes && state.current_call_leases >= 1,
-                "weighted prompt lease released more than it acquired"
-            );
+            // Deliberately no `debug_assert!`. It is live in every non-release
+            // profile, so it would put a panic back on the exact path this
+            // saturation exists to keep panic-free: a drop running during
+            // another panic's unwind would abort the process instead of
+            // reaching the report below.
             if state.leased_prompt_bytes < prompt_bytes || state.current_call_leases == 0 {
                 static UNDERFLOW_REPORTED: std::sync::Once = std::sync::Once::new();
                 UNDERFLOW_REPORTED.call_once(|| {
                     tracing::error!(
                         target: "sbproxy::classifier_hooks",
-                        "weighted quality-fanout lease underflow: a lease was released twice;                          admission accounting saturates instead of poisoning the request path"
+                        "weighted quality-fanout lease underflow: a lease was released twice; \
+                         admission accounting saturates instead of poisoning the request path"
                     );
                 });
             }
@@ -2020,5 +2022,193 @@ mod tests {
             .expect("timeout fixture listener joins before cleanup deadline")
             .expect("timeout fixture listener task must not panic");
         join.expect("timeout fixture listener reports clean graceful shutdown");
+    }
+
+    // --- Weighted-lease accounting under a double release and a poisoned lock ---
+
+    #[derive(Clone)]
+    struct CapturedErrors(Arc<Mutex<Vec<u8>>>);
+
+    struct CapturedErrorsGuard(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedErrors {
+        type Writer = CapturedErrorsGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedErrorsGuard(Arc::clone(&self.0))
+        }
+    }
+
+    impl Write for CapturedErrorsGuard {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run `body` with a local subscriber and return the `ERROR` lines it
+    /// emitted, so a once-only report can be counted rather than eyeballed.
+    fn capture_error_lines(body: impl FnOnce()) -> Vec<String> {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::ERROR)
+            .with_writer(CapturedErrors(Arc::clone(&captured)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, body);
+        let bytes = captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        String::from_utf8(bytes)
+            .expect("captured log is UTF-8")
+            .lines()
+            .filter(|line| line.contains("quality-fanout lease underflow"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// A runtime of this test's own.
+    ///
+    /// `QualityFanoutRuntime::shared()` is a process-wide `OnceLock` whose
+    /// mutex, once poisoned, stays poisoned for every later test in the
+    /// binary. `release_weighted_lease` takes `&self` rather than
+    /// `&'static self`, so these tests can drive it on an instance nobody
+    /// else can see.
+    fn isolated_runtime() -> QualityFanoutRuntime {
+        QualityFanoutRuntime {
+            byte_notify: Notify::new(),
+            state: Mutex::new(QualityFanoutState::default()),
+            owner_fingerprint: 0,
+        }
+    }
+
+    /// Seed the production counters for exactly one live lease of
+    /// `prompt_bytes`, with enough per-origin headroom that the test-only
+    /// ledger survives a second release and leaves the production counters
+    /// as the thing under test.
+    fn seed_one_live_lease(runtime: &QualityFanoutRuntime, prompt_bytes: usize, origin: &str) {
+        let mut state = runtime
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.leased_prompt_bytes = prompt_bytes;
+        state.current_call_leases = 1;
+        state.live_leases_by_origin.insert(origin.to_string(), 8);
+    }
+
+    #[test]
+    fn releasing_a_weighted_lease_twice_saturates_instead_of_panicking() {
+        // Pins two remedies at once. Restoring the
+        // `.checked_sub(..).expect(..)` this replaced makes the second
+        // release panic; so does putting the `debug_assert!` back, because
+        // debug assertions are live in every non-release profile and this
+        // path runs from `Drop`.
+        const PROMPT_BYTES: usize = 64;
+        let runtime = isolated_runtime();
+        seed_one_live_lease(&runtime, PROMPT_BYTES, "origin-a");
+
+        runtime.release_weighted_lease(PROMPT_BYTES, "origin-a");
+        runtime.release_weighted_lease(PROMPT_BYTES, "origin-a");
+
+        let state = runtime
+            .state
+            .lock()
+            .expect("a saturating release must not poison the admission lock");
+        assert_eq!(
+            state.leased_prompt_bytes, 0,
+            "byte accounting saturates at zero rather than underflowing"
+        );
+        assert_eq!(
+            state.current_call_leases, 0,
+            "lease accounting saturates at zero rather than underflowing"
+        );
+    }
+
+    #[test]
+    fn a_lease_underflow_reports_once_and_then_stays_quiet() {
+        const PROMPT_BYTES: usize = 64;
+        let runtime = isolated_runtime();
+        seed_one_live_lease(&runtime, PROMPT_BYTES, "origin-a");
+        runtime.release_weighted_lease(PROMPT_BYTES, "origin-a");
+
+        // The `Once` behind the report is process-wide, so whether this
+        // first underflow is the one that speaks depends on what else ran
+        // in this binary. Bound it rather than pin it.
+        let first =
+            capture_error_lines(|| runtime.release_weighted_lease(PROMPT_BYTES, "origin-a"));
+        assert!(
+            first.len() <= 1,
+            "the underflow report is once-only, saw {first:?}"
+        );
+
+        // By here the `Once` is spent no matter what ran before, so a
+        // further underflow has to be silent. This is the half that fails
+        // if the report is ever moved out from behind its `Once` and starts
+        // writing a line per release on a hot path.
+        let second =
+            capture_error_lines(|| runtime.release_weighted_lease(PROMPT_BYTES, "origin-a"));
+        assert!(
+            second.is_empty(),
+            "the once-only underflow report must not repeat, saw {second:?}"
+        );
+    }
+
+    #[test]
+    fn a_poisoned_admission_lock_is_recovered_rather_than_propagated() {
+        const PROMPT_BYTES: usize = 64;
+        let runtime = isolated_runtime();
+        seed_one_live_lease(&runtime, PROMPT_BYTES, "origin-a");
+
+        // Poison the lock the way a panicking writer on the request path
+        // would. The hook swap keeps the deliberate panic from printing a
+        // backtrace that reads like a failure; it is restored immediately.
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = runtime
+                .state
+                .lock()
+                .expect("a fresh runtime's lock is unpoisoned");
+            panic!("simulated panic while holding the admission lock");
+        }));
+        std::panic::set_hook(previous_hook);
+
+        assert!(panicked.is_err(), "the fixture must actually panic");
+        // Bound and released explicitly: the poisoned `Err` still carries a
+        // live guard, and holding it across the release below would deadlock
+        // rather than fail.
+        let poison_probe = runtime.state.lock();
+        let is_poisoned = poison_probe.is_err();
+        drop(poison_probe);
+        assert!(
+            is_poisoned,
+            "the lock must really be poisoned or this test proves nothing"
+        );
+
+        // Admission recovers instead of inheriting the poison: one bug must
+        // not become a standing outage for every quality-scored request.
+        runtime.release_weighted_lease(PROMPT_BYTES, "origin-a");
+
+        let state = runtime
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            state.leased_prompt_bytes, 0,
+            "the recovered writer still returns the leased bytes"
+        );
+        assert_eq!(
+            state.current_call_leases, 0,
+            "the recovered writer still returns the lease slot"
+        );
     }
 }

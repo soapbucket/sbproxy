@@ -400,6 +400,48 @@ mod tests {
         );
     }
 
+    /// The 8 KiB scan bound is load-bearing and, until this test, invisible.
+    ///
+    /// Deleting the `truncate_utf8` call restores the unbounded
+    /// `prompt.to_lowercase()` (a 1 MiB chat body costing a 1 MiB
+    /// allocation plus ~30 linear scans on every request) and leaves every
+    /// other test in this module green, including
+    /// `heuristic_alias_matches_detect_intent`. Pin the bound by its one
+    /// observable effect: a keyword past it does not reach the scan.
+    #[test]
+    fn heuristic_ignores_keywords_past_the_scan_bound() {
+        const SCAN_BYTES: usize = 8 * 1024;
+        // Filler carrying no keyword from any of the five categories.
+        let filler = "z".repeat(SCAN_BYTES);
+
+        // Control. The keyword has to be detectable inside the window, or
+        // the assertion below would pass for the wrong reason.
+        assert_eq!(
+            detect_intent_heuristic(&format!("write a function {filler}")),
+            IntentCategory::Coding,
+            "the control keyword must be detectable inside the scan window"
+        );
+
+        assert_eq!(
+            detect_intent_heuristic(&format!("{filler} write a function")),
+            IntentCategory::General,
+            "a keyword past the 8 KiB scan bound must not change the category"
+        );
+    }
+
+    #[test]
+    fn heuristic_scan_bound_cuts_on_a_char_boundary() {
+        // 8192 is not a multiple of 3, so a window of three-byte code
+        // points puts the cut inside one. Slicing by raw byte index panics
+        // here; `truncate_utf8` walks back to the boundary.
+        const SCAN_BYTES: usize = 8 * 1024;
+        let filler = "界".repeat(SCAN_BYTES);
+        assert_eq!(
+            detect_intent_heuristic(&format!("{filler} summarize this")),
+            IntentCategory::General
+        );
+    }
+
     #[test]
     fn local_to_core_conversion_roundtrips() {
         for cat in [

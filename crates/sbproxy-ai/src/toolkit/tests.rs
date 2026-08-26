@@ -903,6 +903,90 @@ fn experiment_retention_refuses_instead_of_reporting_a_dropped_success() {
         .any(|(_, existing)| existing.experiment_id == "new-experiment"));
 }
 
+/// A polling dashboard must not evict a scope's decision history.
+///
+/// `snapshot` and `discover_agents` are read paths an admin console hits on
+/// a timer. They used to call `record_operation` unconditionally, so a
+/// console polling once a second filled the bounded ring with its own reads
+/// and pushed out the workflow and evaluation rows the ring exists to keep.
+/// Restoring either unconditional call fails this test.
+#[test]
+fn successful_toolkit_reads_stay_out_of_the_bounded_operations_ring() {
+    let address = SocketAddr::from(([127, 0, 0, 1], 1));
+    let runtime = workflow_runtime(
+        address,
+        true,
+        json!({"type": "object"}),
+        json!({"type": "object"}),
+        1_000_000,
+        1_000,
+        1,
+    );
+
+    for _ in 0..4 {
+        runtime
+            .discover_agents(AgentDiscoveryRequest {
+                scope: scope(),
+                capability: None,
+            })
+            .expect("discovery succeeds for the configured scope");
+        runtime
+            .snapshot(ToolkitSnapshotRequest {
+                scope: scope(),
+                limit: Some(16),
+            })
+            .expect("snapshot succeeds for the configured scope");
+    }
+
+    let retained: Vec<String> = runtime
+        .operations
+        .lock()
+        .iter()
+        .map(|(_, row)| row.operation.clone())
+        .collect();
+    assert!(
+        retained.is_empty(),
+        "successful reads must not retain a row: {retained:?}"
+    );
+}
+
+/// The other half of the bargain, and what keeps the test above from
+/// passing because the recorder is simply unreachable from these paths: a
+/// *failed* read is still worth a row.
+#[test]
+fn failed_toolkit_reads_are_still_retained() {
+    let address = SocketAddr::from(([127, 0, 0, 1], 1));
+    let runtime = workflow_runtime(
+        address,
+        true,
+        json!({"type": "object"}),
+        json!({"type": "object"}),
+        1_000_000,
+        1_000,
+        1,
+    );
+    // A well-formed scope that owns no agents: past `validate_scope`, so
+    // the row is retainable, and refused by the registry lookup.
+    let empty = ToolkitScope::new("origin-b", "tenant-b").expect("valid scope");
+
+    runtime
+        .discover_agents(AgentDiscoveryRequest {
+            scope: empty.clone(),
+            capability: None,
+        })
+        .expect_err("no agent is registered in this scope");
+
+    let operations = runtime.operations.lock();
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|(candidate, row)| candidate == &empty && row.operation == "agent_discovery")
+            .count(),
+        1,
+        "a refused discovery is still worth a row"
+    );
+}
+
 #[test]
 fn invalid_deserialized_scope_is_never_retained() {
     let runtime = AiToolkitRuntime::try_new(AiToolkitConfigInput::default()).expect("runtime");
