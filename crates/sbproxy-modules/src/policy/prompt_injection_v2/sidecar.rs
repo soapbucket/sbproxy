@@ -292,7 +292,7 @@ impl SidecarDetector {
             // decision). Make the boundary loud at load instead of silent.
             tracing::warn!(
                 target: "sbproxy::policy::prompt_injection_v2",
-                endpoint = %cfg.endpoint,
+                endpoint = %sbproxy_security::url_redact::redacted_url(&cfg.endpoint),
                 "sidecar detector endpoint is nonlocal and not https: prompt text will leave \
                  this host unencrypted and outside egress.classifier_hooks governance; keep the \
                  sidecar on loopback or front it with TLS"
