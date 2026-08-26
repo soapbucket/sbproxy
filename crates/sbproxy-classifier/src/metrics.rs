@@ -574,11 +574,7 @@ impl OutcomeGuard {
     pub(crate) fn success(mut self) {
         self.finished = true;
         record_completion(self.transport, self.command);
-        if let Some(counter) = requests_total() {
-            counter
-                .with_label_values(&[self.transport.as_label(), self.command.as_label()])
-                .inc();
-        }
+        record_request(self.transport.as_label(), self.command.as_label());
     }
 
     pub(crate) fn failure(mut self, stage: Stage, reason: Reason) {
@@ -633,9 +629,19 @@ pub(crate) fn record_release_startup_owner() {
     }
 }
 
-/// Record one handled request for `(transport, cmd)`. `transport` is
-/// `"tcp"` or `"grpc"`; `cmd` is the command/RPC name.
-#[cfg(test)]
+/// Record one handled request for `(transport, cmd)` on
+/// `sbproxy_classifier_requests_total`.
+///
+/// `transport` is `"tcp"`, `"admin_tcp"`, `"grpc"`, or `"http"`; `cmd` is
+/// the command/RPC name. Both are normalized to the closed label
+/// vocabularies below, so an unrecognized spelling lands on `unknown`
+/// rather than opening the label space.
+///
+/// `OutcomeGuard::success` is the production caller: every listener
+/// finalizes through the guard, which is what keeps this family and
+/// `sbproxy_classifier_terminal_outcomes_total` counting the same
+/// requests. It was `#[cfg(test)]` and inlined into the guard, which left
+/// the writer the metric registry names existing only in test builds.
 pub fn record_request(transport: &str, cmd: &str) {
     let normalized_transport = normalize_transport(transport);
     let normalized_command = normalize_command(cmd);

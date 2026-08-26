@@ -897,7 +897,9 @@ impl ChargebackTracker {
         observe_chargeback_callsite(|counters| counters.accepted_commits += 1);
         drop(state);
         if entry_evicted {
-            self.publish_finance_metric(crate::ai_metrics::record_chargeback_entry_evicted);
+            self.publish_finance_metric(|| {
+                crate::ai_metrics::record_chargeback_entry_evicted();
+            });
         }
         if workspace_collapsed {
             self.publish_finance_metric(|| {
@@ -3029,6 +3031,57 @@ mod tests {
         assert_eq!(
             snapshot.latest_retained_timestamp.as_deref(),
             Some("2026-08-20T00:00:00Z")
+        );
+    }
+
+    /// The bounded-retention drop is the only writer of
+    /// `sbproxy_ai_chargeback_entries_evicted_total`. The metric registry
+    /// names `record_chargeback_entry_evicted` as that writer, and the
+    /// drift guard proves the symbol has a production call site; this
+    /// proves the call site is the eviction itself and that the counter
+    /// actually moves when a row is dropped.
+    ///
+    /// The counter is process-global and other tests in this binary evict
+    /// too, so the assertion is on the delta rather than on an absolute
+    /// value.
+    #[test]
+    fn group_f_evicting_a_raw_entry_increments_the_eviction_counter() {
+        fn evicted_total() -> u64 {
+            counter_total("sbproxy_ai_chargeback_entries_evicted_total", &[])
+        }
+
+        let tracker = ChargebackTracker::with_limits(1, 4, 4);
+        assert_eq!(
+            record_at(
+                &tracker,
+                Some("workspace-a"),
+                "team-a",
+                "2026-08-01T00:00:00Z",
+                1.0,
+            ),
+            Ok(())
+        );
+        assert_eq!(tracker.snapshot().evicted_entries, 0, "nothing dropped yet");
+
+        let before = evicted_total();
+        // `max_entries` is 1, so this row displaces the first.
+        assert_eq!(
+            record_at(
+                &tracker,
+                Some("workspace-a"),
+                "team-a",
+                "2026-08-02T00:00:00Z",
+                1.0,
+            ),
+            Ok(())
+        );
+        let after = evicted_total();
+
+        assert_eq!(tracker.snapshot().evicted_entries, 1, "one row was dropped");
+        assert!(
+            after > before,
+            "sbproxy_ai_chargeback_entries_evicted_total must move on an eviction, \
+             saw {before} then {after}"
         );
     }
 
