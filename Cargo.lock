@@ -8637,6 +8637,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "yaml_serde",
+ "zeroize",
 ]
 
 [[package]]

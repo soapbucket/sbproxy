@@ -28,6 +28,7 @@ built-in dashboard over this same API, see [admin-ui.md](admin-ui.md).
 - [Read routes](#read-routes-authenticated) - request log + stream + report + export, routing decisions, extension inventory, alerts, health, spend, attested-metering, audit, egress inventory, rate-limit budget, UI settings, OpenAPI
 - [AI compression session state](#ai-compression-session-state)
 - [Config and control routes](#config-and-control-routes-authenticated) - reload, drift, config read/write, config history, log level, the owasp_api_top10 pack manifest, AI provider data posture
+- [AI toolkit admin](#ai-toolkit-admin) - scoped agents, workflows, immutable datasets, offline evaluation, and prompt selection
 - [Model host admin](#model-host-admin) - catalog, deployments, lifecycle, artifact cache
 - [Cache admin](#cache-admin) - response cache and key-policy cache
 - [Cluster control plane](#cluster-control-plane) - status, deployments, enrollment, replicated state
@@ -2842,6 +2843,176 @@ file** against the last-loaded content hash, which is narrower than
 A node whose repository moved is not "drifted" by this measure, and a
 node serving a stale bundle because the authority is unreachable is not
 either. Alert on the age gauge for those.
+
+---
+
+## AI toolkit admin
+
+These protected routes operate on the bounded AI toolkit generation published
+from `proxy.ai_toolkit`. Read routes accept `admin` and `read_only`; mutation
+and execution routes require `admin`. Tenant/origin scope is resolved on the
+server from the requested configured origin and the authenticated principal;
+clients never submit a tenant id to widen that scope.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/admin/ai-toolkit/snapshot?origin=&limit=` | Bounded, redacted inventory and recent aggregate operation summaries. `origin` is required; `limit` is optional. |
+| GET | `/admin/ai-toolkit/agents?origin=&capability=` | Discover scoped agents, optionally filtered by one exact capability. |
+| POST | `/admin/ai-toolkit/workflows/validate` | Validate a bounded workflow document without publishing or invoking it. |
+| POST | `/admin/ai-toolkit/workflows/run` | Execute one configured finite-state workflow. |
+| POST | `/admin/ai-toolkit/datasets/register` | Atomically register one exact immutable dataset version. |
+| POST | `/admin/ai-toolkit/evaluations/run` | Evaluate already-recorded responses against an exact dataset version. |
+| POST | `/admin/ai-toolkit/prompts/select` | Select a stable weighted prompt version for one scoped cohort. |
+
+All toolkit POST bodies are capped at 256 KiB before allocation and then checked against the
+stricter operation limits in `proxy.ai_toolkit.limits`. JSON responses are
+capped at 1 MiB. Error bodies carry a
+closed reason, limit, or status where applicable; they do not echo submitted
+workflow input, dataset content, model or judge responses, prompt content,
+agent endpoints, credentials, tokens, or secret references.
+
+### Snapshot and discovery
+
+`GET /admin/ai-toolkit/snapshot?origin=ai.local` returns only bounded, redacted runtime state:
+scoped agent/capability names, workflow names and limits, dataset name/version
+and entry count, rollout version/weight pairs, aggregate experiment summaries,
+closed operation/outcome rows, and a `truncated` flag. Agent endpoints and
+secrets, workflow inputs and outputs, dataset entries and responses, prompt
+content and rollout salt, and raw cohort keys are excluded.
+
+Discover agents for one existing configured origin:
+
+```http
+GET /admin/ai-toolkit/agents?origin=ai.local&capability=research HTTP/1.1
+Authorization: Basic ...
+```
+
+`origin` is required; `capability` is optional. A successful response is a
+sorted list of agent ids and sorted capability names. It does not expose agent
+descriptions, schemas, endpoints, or authentication material.
+
+### Validate and run a workflow
+
+Validation accepts the origin separately from the document:
+
+```json
+{
+  "origin": "ai.local",
+  "workflow": {
+    "name": "research-flow",
+    "initial_state": "research",
+    "max_steps": 2,
+    "timeout_ms": 2000,
+    "states": [
+      {"name": "research", "action": "research", "transitions": {}}
+    ]
+  }
+}
+```
+
+`POST /admin/ai-toolkit/workflows/validate` compiles schemas and graph
+invariants but does not mutate the running generation. Execute a workflow that
+is already present in the published config with:
+
+```json
+{
+  "origin": "ai.local",
+  "workflow": "research-flow",
+  "input": {"question": "Summarize the release notes."}
+}
+```
+
+The run response contains workflow id, completion/final-state metadata,
+bounded step summaries, and the final schema-validated agent output. The
+typed event and retained snapshot exclude that output.
+
+### Register and evaluate an immutable dataset
+
+Registration accepts one explicit non-zero version:
+
+```json
+{
+  "origin": "ai.local",
+  "name": "support-answers",
+  "version": 1,
+  "entries": [
+    {
+      "input": "When can I request a refund?",
+      "expected_output": "Refunds are available within 30 days.",
+      "metadata": {"case": "refund-window"}
+    }
+  ]
+}
+```
+
+The tuple `(authenticated scope, name, version)` is immutable. A duplicate is
+refused atomically. Evaluation always names that exact tuple and never selects
+a latest version implicitly:
+
+```json
+{
+  "origin": "ai.local",
+  "experiment_id": "support-v1-run-1",
+  "experiment_name": "support-v1-baseline",
+  "dataset": {"name": "support-answers", "version": 1},
+  "model": "recorded-model",
+  "prompt_version": "support-v1",
+  "parameters": {},
+  "responses": ["Refunds are available within 30 days."],
+  "judge": null,
+  "metrics": [
+    {"type": "length_range", "min": 1, "max": 512},
+    {"type": "contains_keywords", "keywords": ["refund"]}
+  ]
+}
+```
+
+Responses and optional judge results are already-recorded inputs. The route
+makes no model or judge network call. Its response and the retained snapshot
+contain aggregate counts and scores only; raw case material is discarded.
+
+### Select a prompt rollout
+
+```json
+{
+  "origin": "ai.local",
+  "name": "support-system",
+  "cohort": "stable-caller-key"
+}
+```
+
+Selection is stable for the same scoped rollout generation and cohort. The
+admin response identifies the selected name/version/weight and a lowercase
+SHA-256 cohort digest. It never returns prompt content, rollout salt, or the raw
+cohort. The request's raw cohort is not retained or emitted.
+
+### Status and observability contract
+
+| Status | Meaning |
+|---|---|
+| `200` | Read, validation, execution, registration, evaluation, or selection completed. |
+| `400` | Invalid document, schema, graph, metric, version, count, or other typed input. |
+| `401` / `403` | Authentication failed or the operator role/scope is insufficient. |
+| `404` | The scoped origin, agent, workflow, dataset version, or rollout does not exist. |
+| `409` | An immutable dataset version already exists. |
+| `413` | The request or an operation-specific count/byte limit is exceeded. |
+| `429` | A bounded workflow or evaluation concurrency permit is unavailable. |
+| `502` | Governed agent egress or the agent operation failed. |
+| `504` | A workflow deadline elapsed. |
+| `500` | A closed internal failure or the 1 MiB response cap prevented a safe result. |
+
+Discovery, workflow validation/execution, dataset registration, evaluation,
+and prompt selection increment
+`sbproxy_ai_toolkit_operations_total{capability,outcome}`; authenticated POSTs
+also enter the admin audit channel. Typed terminal payloads are narrower:
+workflow execution publishes `ai_workflow_operation`, an evaluation run
+publishes `ai_evaluation_operation`, and a successful admin or live prompt
+selection publishes `ai_prompt_rollout_selected`. Discovery, validation, and
+dataset registration have no typed payload kind. The three event payloads
+carry only scoped identifiers, closed outcomes, counts, durations, and the
+prompt selection digest. See [Agent orchestration](agent-orchestration.md),
+[AI evaluation harness](ai-evaluation-harness.md), and
+[Weighted prompt versioning](prompt-versioning.md).
 
 ---
 

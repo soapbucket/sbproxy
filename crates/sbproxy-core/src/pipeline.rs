@@ -1637,6 +1637,9 @@ pub struct CompiledPipeline {
     pub(crate) extension_registry: Arc<DynamicBundleRegistry>,
     /// Awaited AI hook chain prepared with this exact generation.
     pub(crate) ai_extension_chain: Arc<sbproxy_extension::bundle::AiExtensionChain>,
+    /// Bounded workflow/evaluation/rollout runtime prepared and published with
+    /// this exact pipeline generation.
+    pub(crate) ai_toolkit: Arc<sbproxy_ai::toolkit::AiToolkitRuntime>,
     /// Prepared payment hook chain selected by this generation's config.
     #[cfg(feature = "payments")]
     pub(crate) payment_extension_chain: Option<sbproxy_extension::bundle::PaymentExtensionChain>,
@@ -1956,6 +1959,7 @@ impl Default for CompiledPipeline {
             config,
             extension_registry,
             ai_extension_chain,
+            ai_toolkit: sbproxy_ai::toolkit::AiToolkitRuntime::disabled(),
             #[cfg(feature = "payments")]
             payment_extension_chain: None,
             extension_inventory,
@@ -3044,11 +3048,16 @@ impl CompiledPipeline {
                     .filter(|chain| !chain.is_empty()),
             },
         )?;
+        let ai_toolkit = crate::ai_toolkit_runtime::build(
+            &config,
+            matches!(mode, PipelineConstructionMode::Runtime),
+        )?;
 
         let pipeline = Self {
             config,
             extension_registry,
             ai_extension_chain,
+            ai_toolkit,
             #[cfg(feature = "payments")]
             payment_extension_chain,
             extension_inventory,
@@ -5961,6 +5970,61 @@ origins:
         assert!(pipeline.forward_rules.is_empty());
         assert!(pipeline.fallbacks.is_empty());
         assert!(pipeline.config.origins.is_empty());
+        let scope = sbproxy_ai::toolkit::ToolkitScope::new("default", "__default__")
+            .expect("bounded scope");
+        let snapshot = pipeline
+            .ai_toolkit
+            .snapshot(sbproxy_ai::toolkit::ToolkitSnapshotRequest {
+                scope,
+                limit: Some(1),
+            })
+            .expect("disabled runtime has an empty snapshot");
+        assert!(snapshot.agents.is_empty());
+        assert!(snapshot.workflows.is_empty());
+    }
+
+    #[test]
+    fn toolkit_validation_does_not_resolve_agent_secrets() {
+        let compiled = sbproxy_config::compile_config(
+            r#"
+proxy:
+  ai_toolkit:
+    agents:
+      - origin: ai.example.test
+        id: worker
+        endpoint: https://agents.example.test/invoke
+        auth:
+          shared_secret: file:/definitely/not/read-during-validation
+        capabilities:
+          - name: answer
+            input_schema: {type: object}
+            output_schema: {type: object}
+origins:
+  ai.example.test:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: ok
+egress:
+  agent_orchestration:
+    mode: deny_by_default
+    hosts: ["agents.example.test"]
+"#,
+        )
+        .expect("declaration parses without resolving its secret");
+        let pipeline = CompiledPipeline::from_config_for_validation(compiled)
+            .expect("validation uses a protected placeholder instead of resolving the file");
+        let scope = sbproxy_ai::toolkit::ToolkitScope::new("ai.example.test", "__default__")
+            .expect("bounded scope");
+        let agents = pipeline
+            .ai_toolkit
+            .discover_agents(sbproxy_ai::toolkit::AgentDiscoveryRequest {
+                scope,
+                capability: None,
+            })
+            .expect("agent inventory is valid");
+        assert_eq!(agents.agents.len(), 1);
     }
 
     #[test]

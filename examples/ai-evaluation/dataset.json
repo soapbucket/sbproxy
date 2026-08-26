@@ -1,0 +1,16 @@
+{
+  "name": "support-answers",
+  "version": 1,
+  "entries": [
+    {
+      "input": "When can I request a refund?",
+      "expected_output": "Refunds are available within 30 days.",
+      "metadata": {"case": "refund-window"}
+    },
+    {
+      "input": "How do I reset my password?",
+      "expected_output": "Open Settings, then Security.",
+      "metadata": {"case": "password-reset"}
+    }
+  ]
+}

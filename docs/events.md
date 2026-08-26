@@ -1,8 +1,8 @@
 # SBproxy events
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-25*
 
-SBproxy hands a SIEM three different things, and this page is the map of how they fit together: typed proxy events (the `events:` block, a closed set of nineteen), decision-audit records (`observability.log.decision_audit`, nineteen pipeline decisions normalized to OCSF), and four audit channels that write to their own tracing targets (`security_audit`, `config_audit`, `key_audit`, and the admin action ring). Two of those four, `security_audit` and `config_audit`, can additionally be hash-chained and Ed25519-signed for tamper evidence.
+SBproxy hands a SIEM three different things, and this page is the map of how they fit together: typed proxy events (the `events:` block, a closed set of twenty-two), decision-audit records (`observability.log.decision_audit`, nineteen pipeline decisions normalized to OCSF), and four audit channels that write to their own tracing targets (`security_audit`, `config_audit`, `key_audit`, and the admin action ring). Two of those four, `security_audit` and `config_audit`, can additionally be hash-chained and Ed25519-signed for tamper evidence.
 
 If you only read one section, read [How the four audit channels relate to the event stream](#how-the-four-audit-channels-relate-to-the-event-stream). It is the piece that is easy to miss: `events:` is a delivery mechanism, not a source of truth, and most of what it delivers is a typed copy of a record another channel already produced.
 
@@ -50,14 +50,17 @@ all.
 | `key_blocked` | A key or upstream credential was marked blocked. | Yes |
 | `credential_resolved` | An upstream credential's material was actually resolved, or a rotation grace window started serving the last known-good value. Never once per request. | Yes |
 | `credential_fallback` | An AI provider refused a provider entry's own key with a `401`/`403` and the request was retried against the same provider on the operator's `fallback_credential_id`, or that credential could not be resolved. | Yes |
+| `ai_workflow_operation` | An authenticated governed workflow execution completed or was refused. | Yes |
+| `ai_evaluation_operation` | An authenticated governed evaluation run completed or was refused. | Yes |
+| `ai_prompt_rollout_selected` | An admin dry-run or real AI request selected a concrete weighted prompt version. | Yes |
 | `cache_hit` | A response was served from the response cache. | No |
 | `cache_miss` | The cache lookup found no usable entry. | No |
 
-Seventeen of the nineteen publish today. The other two, `cache_hit` and `cache_miss`, are declared on purpose and will not be wired: both fire on every cacheable request, and putting an NDJSON line on a configured webhook per cache lookup is a cost nobody asked to pay. The forensic question either answers, "did this response come from cache," already has a home: the `cache.admit` and `cache.key` decision-audit events (below) and the access log's `cache_status` column. If you write `events.types: [cache_hit]`, the proxy still boots, because refusing a name here would also block pre-configuring a type a later release wires. It just tells you at startup that nothing will ever arrive.
+Twenty of the twenty-two publish today. The other two, `cache_hit` and `cache_miss`, are declared on purpose and will not be wired: both fire on every cacheable request, and putting an NDJSON line on a configured webhook per cache lookup is a cost nobody asked to pay. The forensic question either answers, "did this response come from cache," already has a home: the `cache.admit` and `cache.key` decision-audit events (below) and the access log's `cache_status` column. If you write `events.types: [cache_hit]`, the proxy still boots, because refusing a name here would also block pre-configuring a type a later release wires. It just tells you at startup that nothing will ever arrive.
 
 ### The boot warning, so a quiet sink is a fact, not a guess
 
-An empty `events:` sink and a broken one look identical from the outside: neither delivers anything. So at boot, the proxy checks every name in `events.types:` (or, when `types:` is absent, every name that means "all nineteen") against the emitters that actually exist, and warns once, by name, for anything that will never fire:
+An empty `events:` sink and a broken one look identical from the outside: neither delivers anything. So at boot, the proxy checks every name in `events.types:` (or, when `types:` is absent, every name that means "all twenty-two") against the emitters that actually exist, and warns once, by name, for anything that will never fire:
 
 ```
 WARN events.types selects event types that nothing publishes yet; the configured sink will not
@@ -68,17 +71,20 @@ This is the same shape `observability.log.decision_audit` has used for a while, 
 
 ### Verdict-level, not per-request
 
-Five of the seventeen wired events are worth being explicit about, because "wired" does not mean "fires on every request that touches the feature":
+Eight of the twenty wired events are worth being explicit about, because "wired" does not mean "fires on every request that touches the feature":
 
 - **`provider_selected`** fires on a provider failover or advance, never on the provider chosen for an ordinary first attempt. The data carries `from_provider`, `to_provider`, and the reason (`http_503`, `transport`, `pre_header_timeout`, `content_policy`, `managed_cold_fallback`). A deployment with healthy providers and no failovers sees none of these, which is correct: routing choice by itself is not a security-relevant event, a transition off the configured plan is.
 - **`budget_exceeded`** fires once per request that actually crosses a configured cap and gets blocked, at the same site that already builds the 402 response body. It does not fire for a request that stays under budget, and it does not fire on a soft-landing downgrade, only on a hard block. The data carries `scope` (the limit's scope label), `reason`, `max_tokens`, `max_cost_usd`, and `window_secs`.
 - **`guardrail_triggered`** fires once per guardrail evaluation stage (input, RAG-augmented input, or output) that ends in a block, never per streamed chunk and never on an allow. The data carries `stage`, `guardrail` (which one blocked), `flagged_count` (how many others flagged without blocking), `spans`, and `spans_dropped`. The span fields are populated on a `pii` block: each span is an entity type plus a byte offset and length into the scanned text (positions, never the matched value), capped at 32 with `spans_dropped` counting anything past the cap; every other guardrail publishes them empty. See [observability.md](observability.md#decision-audit-records) for which text the offsets index on each stage.
 - **`credential_resolved`** fires once per actual resolution of an upstream credential's material (an envelope opened, a vault reference dereferenced, or a plaintext record read), never on the per-request cache hit. The data carries `op`, `resource`, `id`, `outcome` (`resolved` or `stale_served`), and, on a fresh resolution only, `source` (`plaintext`, `envelope`, or `vault_ref`). A `stale_served` event is the one worth an alert rule: it means the secret backend was unreachable and the credential kept working from the last known-good value. It fires **once per outage, not once per request in the grace window**: the grace path deliberately does not refresh the cached value's timestamp (a refresh would make it look fresh and cancel the grace deadline), so every request for the length of the window retries and falls back, and only the transition into stale serving publishes. The next successful resolution arms the next one. If you want the per-request count, `sbproxy_credential_resolution_duration_seconds{cache="stale"}` has it as a rate, which is the shape an alert wants anyway. A resolution *refusal* publishes nothing here; the request that needed it is refused, and that refusal is carried by the request-side channels.
 - **`credential_fallback`** fires once per AI provider-key fallback *decision*, not once per request that carries a fallback credential. The data carries `op`, `resource`, `id` (the credential named by `fallback_credential_id`), `provider` (the entry whose own key was refused), `status` (`401` or `403`), and `outcome`. `outcome: engaged` means the operator's credential resolved and the retry was queued; `outcome: unavailable` means it did not resolve and the provider's rejection was returned unchanged. The second one is the alertable event: it means your house credential is broken, and the only other evidence is a `401` that reads like the tenant's fault. Neither payload carries the entry's own key, the fallback credential's material, or a vault reference. A request whose credential came from the caller (`inbound_key_mode: native`) never falls back and so never publishes here.
+- **`ai_workflow_operation`** records one terminal bounded workflow execution, not discovery or validation. Its data is exactly `origin_id`, `workflow_id`, `outcome`, `steps`, and `duration_ms`. Agent inputs and outputs, invocation endpoints, authentication tokens, and secret references are excluded.
+- **`ai_evaluation_operation`** records one terminal bounded evaluation run, not dataset registration. Its data is exactly `origin_id`, `dataset`, `dataset_version`, `experiment_id`, `outcome`, `cases`, and `duration_ms`. Dataset entries, model or judge response content, scores, judge endpoints, credentials, and secret references are excluded.
+- **`ai_prompt_rollout_selected`** records the concrete version selected by an admin dry-run or on a real AI request before provider dispatch. Its data is exactly `origin_id`, `prompt`, `version`, `outcome`, and `cohort_digest`. It never carries prompt content, request content, rollout salt, or the raw cohort key; the digest must be 64-character lowercase SHA-256 hex before the payload builder accepts it.
 
 ## Decision-audit: the other nineteen
 
-Most of the nineteen typed proxy events map onto request lifecycle and infrastructure facts. The gateway's actual security decisions, "did the WAF block this," "did the AI guardrail block this," "did this MCP tool dispatch succeed," live on a separate, wider channel: `DecisionEvent`, configured under `proxy.observability.log.decision_audit` and documented in full in [observability.md](observability.md#decision-audit-records) and the generated [decision-records.md](decision-records.md).
+Most of the twenty-two typed proxy events map onto request lifecycle and infrastructure facts. The gateway's actual security decisions, "did the WAF block this," "did the AI guardrail block this," "did this MCP tool dispatch succeed," live on a separate, wider channel: `DecisionEvent`, configured under `proxy.observability.log.decision_audit` and documented in full in [observability.md](observability.md#decision-audit-records) and the generated [decision-records.md](decision-records.md).
 
 The short version, because this page is where the two channels need to be told apart:
 
@@ -185,7 +191,7 @@ events:
 | `path` | Output file for `sink: file`. Parent directories are created at boot. Required by `file`, refused otherwise. |
 | `url` | Destination for `sink: webhook`. Must be `http://` or `https://`. Required by `webhook`, refused otherwise. |
 | `signing_secret` | HMAC-SHA256 key for the webhook signature. Takes a secret reference and nothing else; see below. |
-| `types` | Which event types to deliver. Empty or absent means all nineteen. An unrecognized name is refused at compile time with the accepted list; a recognized but unwired name compiles and warns at boot (see above). |
+| `types` | Which event types to deliver. Empty or absent means all twenty-two. An unrecognized name is refused at compile time with the accepted list; a recognized but unwired name compiles and warns at boot (see above). |
 | `fail_closed` | Event type names that must never be silently dropped. Empty by default. Same accepted set and refusal as `types`. See [Fail-closed delivery](#fail-closed-delivery). |
 | `queue_capacity` | Depth of the hand-off queue. Defaults to 4096. Zero is refused. |
 
@@ -200,6 +206,9 @@ events:
     - guardrail_triggered
     - provider_selected
     - egress_refused
+    - ai_workflow_operation
+    - ai_evaluation_operation
+    - ai_prompt_rollout_selected
 ```
 
 The file form is a line per event, the same shape a `jq` filter or a Vector source expects:
@@ -426,7 +435,7 @@ Every one of these is a config that would compile, boot, serve traffic, and deli
 - A `url` that is not `http://` or `https://`.
 - `queue_capacity: 0`.
 - `types:` or `queue_capacity:` under `sink: none`.
-- An event name `types:` or `fail_closed:` does not recognize. The error quotes the name and lists all nineteen.
+- An event name `types:` or `fail_closed:` does not recognize. The error quotes the name and lists all twenty-two.
 - Any key the block does not define, so a hopeful `retries:`, `batch_size:`, or `retention:` fails rather than being dropped. See [Retention](#retention) for why the last one is absent on purpose.
 
 A recognized but unwired name (`cache_hit`, `cache_miss`) is different from all of the above: it compiles, because the config layer cannot know which names a future release will wire, and it warns once at boot instead. See [The boot warning](#the-boot-warning-so-a-quiet-sink-is-a-fact-not-a-guess).

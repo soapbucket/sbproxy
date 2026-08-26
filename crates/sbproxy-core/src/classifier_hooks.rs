@@ -48,7 +48,6 @@ use sbproxy_security::egress::EgressAuthorizer;
 use std::collections::HashMap;
 #[cfg(test)]
 use std::collections::HashSet;
-use std::io::Read;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -98,42 +97,12 @@ pub(crate) const fn quality_fanout_limits() -> QualityFanoutLimits {
     }
 }
 
-fn read_bounded_classifier_hook_secret_file(
-    path: &str,
-    field: &str,
-    max_bytes: usize,
-) -> anyhow::Result<String> {
-    let file = std::fs::File::open(path)
-        .map_err(|error| anyhow::anyhow!("read {field} file '{path}': {error}"))?;
-    let mut bytes = Vec::with_capacity(max_bytes.min(4096));
-    file.take(max_bytes as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| anyhow::anyhow!("read {field} file '{path}': {error}"))?;
-    if bytes.len() > max_bytes {
-        anyhow::bail!("{field} exceeds the {max_bytes}-byte limit");
-    }
-    let value = String::from_utf8(bytes)
-        .map_err(|_| anyhow::anyhow!("{field} file '{path}' is not valid UTF-8 text"))?;
-    Ok(value.trim().to_string())
-}
-
 fn resolve_classifier_hook_secret_reference(
     reference: &str,
     field: &str,
     max_bytes: usize,
 ) -> anyhow::Result<String> {
-    let value = if let Some(path) = reference.trim().strip_prefix("file:") {
-        read_bounded_classifier_hook_secret_file(path, field, max_bytes)?
-    } else {
-        crate::config_source::resolve_secret_reference(reference, field)?
-    };
-    if value.is_empty() {
-        anyhow::bail!("{field} must not resolve to an empty value");
-    }
-    if value.len() > max_bytes {
-        anyhow::bail!("{field} exceeds the {max_bytes}-byte limit");
-    }
-    Ok(value)
+    crate::config_source::resolve_secret_reference_bounded(reference, field, max_bytes)
 }
 
 struct QualityFanoutRuntime {
@@ -1114,11 +1083,19 @@ mod tests {
         }
     }
 
+    fn assert_secret_limit_error(error: anyhow::Error, field: &str, maximum: usize) {
+        let message = format!("{error:#}");
+        assert!(message.contains(field), "{message}");
+        assert!(
+            message.contains(&format!("{maximum}-byte limit")),
+            "{message}"
+        );
+    }
+
     #[test]
     fn classifier_hook_security_config_bounds_auth_credentials_from_env() {
         let variable = "SBPROXY_CLASSIFIER_HOOK_TOKEN_BOUND";
         let exact = "t".repeat(CLASSIFIER_HOOK_MAX_AUTH_BYTES);
-        std::env::set_var(variable, &exact);
         let mut config = quality_only_config();
         config.authentication = Some(
             sbproxy_config::ClassifierHooksAuthenticationConfig::Bearer {
@@ -1127,23 +1104,29 @@ mod tests {
                 scheme: "Bearer".to_string(),
             },
         );
-        let security =
-            classifier_hook_security_config(&config).expect("exact token bound must be accepted");
-        let Some(ClassifierClientSecurityConfig {
-            authentication: Some(ClassifierClientAuthenticationConfig::Bearer { credential, .. }),
-            ..
-        }) = security
-        else {
-            panic!("expected bearer authentication");
-        };
-        assert_eq!(credential.len(), CLASSIFIER_HOOK_MAX_AUTH_BYTES);
+        {
+            let _env = crate::test_env::EnvVarGuard::set(&[(variable, Some(exact.as_str()))]);
+            let security = classifier_hook_security_config(&config)
+                .expect("exact token bound must be accepted");
+            let Some(ClassifierClientSecurityConfig {
+                authentication:
+                    Some(ClassifierClientAuthenticationConfig::Bearer { credential, .. }),
+                ..
+            }) = security
+            else {
+                panic!("expected bearer authentication");
+            };
+            assert_eq!(credential.len(), CLASSIFIER_HOOK_MAX_AUTH_BYTES);
+        }
 
-        std::env::set_var(variable, "t".repeat(CLASSIFIER_HOOK_MAX_AUTH_BYTES + 1));
+        let oversized = "t".repeat(CLASSIFIER_HOOK_MAX_AUTH_BYTES + 1);
+        let _env = crate::test_env::EnvVarGuard::set(&[(variable, Some(oversized.as_str()))]);
         let error = classifier_hook_security_config(&config).unwrap_err();
-        assert!(error.to_string().contains(
-            "proxy.classifier_hooks.authentication.credential exceeds the 256-byte limit"
-        ));
-        std::env::remove_var(variable);
+        assert_secret_limit_error(
+            error,
+            "proxy.classifier_hooks.authentication.credential",
+            CLASSIFIER_HOOK_MAX_AUTH_BYTES,
+        );
     }
 
     #[test]
@@ -1178,9 +1161,11 @@ mod tests {
             },
         );
         let error = classifier_hook_security_config(&config).unwrap_err();
-        assert!(error.to_string().contains(
-            "proxy.classifier_hooks.authentication.credential exceeds the 256-byte limit"
-        ));
+        assert_secret_limit_error(
+            error,
+            "proxy.classifier_hooks.authentication.credential",
+            CLASSIFIER_HOOK_MAX_AUTH_BYTES,
+        );
 
         sbproxy_vault::reset_process_resolver_for_test();
         let vault = sbproxy_vault::LocalVault::new();
@@ -1213,9 +1198,11 @@ mod tests {
             sbproxy_vault::SecretResolver::new().with_manager(Arc::new(manager)),
         ));
         let error = classifier_hook_security_config(&config).unwrap_err();
-        assert!(error.to_string().contains(
-            "proxy.classifier_hooks.authentication.credential exceeds the 256-byte limit"
-        ));
+        assert_secret_limit_error(
+            error,
+            "proxy.classifier_hooks.authentication.credential",
+            CLASSIFIER_HOOK_MAX_AUTH_BYTES,
+        );
         sbproxy_vault::reset_process_resolver_for_test();
     }
 
@@ -1245,9 +1232,11 @@ mod tests {
             client_identity: None,
         });
         let error = classifier_hook_security_config(&config).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("proxy.classifier_hooks.tls.ca_pem exceeds the 262144-byte limit"));
+        assert_secret_limit_error(
+            error,
+            "proxy.classifier_hooks.tls.ca_pem",
+            CLASSIFIER_HOOK_MAX_PEM_BYTES,
+        );
     }
 
     #[tokio::test]

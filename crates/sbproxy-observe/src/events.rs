@@ -188,6 +188,269 @@ pub struct ProxyEvent {
     pub data: serde_json::Value,
 }
 
+/// Maximum UTF-8 bytes retained for an AI-toolkit identifier in a typed event.
+///
+/// The toolkit validates the same ceiling before publication. Applying it a
+/// second time at the egress boundary prevents a future producer from turning
+/// an operator-controlled identifier into an unbounded webhook payload.
+pub(crate) const AI_TOOLKIT_EVENT_ID_MAX_BYTES: usize = 128;
+
+/// Closed terminal outcome vocabulary shared by AI-toolkit event payloads.
+///
+/// This intentionally matches `sbproxy_ai_toolkit_operations_total` exactly.
+/// Adding an operational error detail here would also create a new metric label
+/// and a third-party event field, so callers map internal error variants onto
+/// this fixed public contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiToolkitEventOutcome {
+    /// The operation completed successfully.
+    Success,
+    /// Input, schema, or immutable-resource state was invalid.
+    Invalid,
+    /// The caller was not authenticated or authorized.
+    Unauthorized,
+    /// The requested scoped resource did not exist.
+    NotFound,
+    /// Purpose-scoped egress governance refused the agent destination.
+    EgressRefused,
+    /// The operation exceeded its deadline.
+    Timeout,
+    /// The inbound body exceeded the operation limit.
+    BodyTooLarge,
+    /// A bounded response could not fit the response limit.
+    ResponseTooLarge,
+    /// Any failure that is not safe to expose as a more specific outcome.
+    Internal,
+}
+
+impl AiToolkitEventOutcome {
+    /// Closed event/metric label for this outcome.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Invalid => "invalid",
+            Self::Unauthorized => "unauthorized",
+            Self::NotFound => "not_found",
+            Self::EgressRefused => "egress_refused",
+            Self::Timeout => "timeout",
+            Self::BodyTooLarge => "body_too_large",
+            Self::ResponseTooLarge => "response_too_large",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+/// A workflow's content-safe terminal event payload.
+///
+/// The explicit field allowlist is the privacy boundary. It cannot represent
+/// agent inputs or outputs, an endpoint, a token, or any secret material.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct AiWorkflowOperationData {
+    /// Stable compiled-origin identifier owning the workflow.
+    pub origin_id: String,
+    /// Scoped configured workflow identifier.
+    pub workflow_id: String,
+    /// Closed terminal outcome.
+    pub outcome: AiToolkitEventOutcome,
+    /// Number of workflow states invoked.
+    pub steps: usize,
+    /// Whole-operation wall-clock duration.
+    pub duration_ms: u64,
+}
+
+impl AiWorkflowOperationData {
+    /// Build a bounded workflow payload.
+    pub fn new(
+        origin_id: &str,
+        workflow_id: &str,
+        outcome: AiToolkitEventOutcome,
+        steps: usize,
+        duration_ms: u64,
+    ) -> Self {
+        Self {
+            origin_id: bounded_ai_toolkit_event_id(origin_id),
+            workflow_id: bounded_ai_toolkit_event_id(workflow_id),
+            outcome,
+            steps,
+            duration_ms,
+        }
+    }
+
+    /// Wrap this payload in the exact typed event envelope.
+    pub fn into_proxy_event(
+        self,
+        hostname: impl Into<String>,
+        tenant_id: impl Into<String>,
+    ) -> ProxyEvent {
+        let mut data = serde_json::Map::with_capacity(5);
+        data.insert("origin_id".to_owned(), self.origin_id.into());
+        data.insert("workflow_id".to_owned(), self.workflow_id.into());
+        data.insert("outcome".to_owned(), self.outcome.as_str().into());
+        data.insert("steps".to_owned(), self.steps.into());
+        data.insert("duration_ms".to_owned(), self.duration_ms.into());
+        ProxyEvent::new(
+            EventType::AiWorkflowOperation,
+            hostname.into(),
+            tenant_id.into(),
+            serde_json::Value::Object(data),
+        )
+    }
+}
+
+/// An offline evaluation's content-safe terminal event payload.
+///
+/// Dataset entries, candidate and judge responses, prompts, model endpoints,
+/// credentials, and free-form error text have no representable field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct AiEvaluationOperationData {
+    /// Stable compiled-origin identifier owning the evaluation.
+    pub origin_id: String,
+    /// Scoped immutable dataset name.
+    pub dataset: String,
+    /// Exact immutable dataset version.
+    pub dataset_version: u32,
+    /// Scoped operator-supplied experiment identifier.
+    pub experiment_id: String,
+    /// Closed terminal outcome.
+    pub outcome: AiToolkitEventOutcome,
+    /// Number of cases evaluated before the terminal outcome.
+    pub cases: usize,
+    /// Whole-operation wall-clock duration.
+    pub duration_ms: u64,
+}
+
+impl AiEvaluationOperationData {
+    /// Build a bounded evaluation payload.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        origin_id: &str,
+        dataset: &str,
+        dataset_version: u32,
+        experiment_id: &str,
+        outcome: AiToolkitEventOutcome,
+        cases: usize,
+        duration_ms: u64,
+    ) -> Self {
+        Self {
+            origin_id: bounded_ai_toolkit_event_id(origin_id),
+            dataset: bounded_ai_toolkit_event_id(dataset),
+            dataset_version,
+            experiment_id: bounded_ai_toolkit_event_id(experiment_id),
+            outcome,
+            cases,
+            duration_ms,
+        }
+    }
+
+    /// Wrap this payload in the exact typed event envelope.
+    pub fn into_proxy_event(
+        self,
+        hostname: impl Into<String>,
+        tenant_id: impl Into<String>,
+    ) -> ProxyEvent {
+        let mut data = serde_json::Map::with_capacity(7);
+        data.insert("origin_id".to_owned(), self.origin_id.into());
+        data.insert("dataset".to_owned(), self.dataset.into());
+        data.insert("dataset_version".to_owned(), self.dataset_version.into());
+        data.insert("experiment_id".to_owned(), self.experiment_id.into());
+        data.insert("outcome".to_owned(), self.outcome.as_str().into());
+        data.insert("cases".to_owned(), self.cases.into());
+        data.insert("duration_ms".to_owned(), self.duration_ms.into());
+        ProxyEvent::new(
+            EventType::AiEvaluationOperation,
+            hostname.into(),
+            tenant_id.into(),
+            serde_json::Value::Object(data),
+        )
+    }
+}
+
+/// Validation failure while constructing an AI-toolkit event payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AiToolkitEventDataError {
+    /// The prompt runtime did not supply exact lowercase SHA-256 hex.
+    #[error("AI prompt rollout cohort digest must be 64 lowercase hexadecimal characters")]
+    InvalidCohortDigest,
+}
+
+/// A weighted prompt selection's content-safe event payload.
+///
+/// The constructor accepts only a digest already computed by the owning
+/// runtime generation. Raw cohort keys, rollout salt, and prompt content cannot
+/// be stored in this type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct AiPromptRolloutSelectedData {
+    /// Stable compiled-origin identifier owning the rollout.
+    pub origin_id: String,
+    /// Scoped prompt-rollout identifier.
+    pub prompt: String,
+    /// Selected immutable prompt version.
+    pub version: u32,
+    /// Closed terminal outcome.
+    pub outcome: AiToolkitEventOutcome,
+    /// Lowercase SHA-256 of the runtime's length-framed scope, name, salt, and
+    /// raw cohort key.
+    pub cohort_digest: String,
+}
+
+impl AiPromptRolloutSelectedData {
+    /// Build a bounded prompt-selection payload from a runtime-generated
+    /// cohort digest.
+    pub fn new(
+        origin_id: &str,
+        prompt: &str,
+        version: u32,
+        outcome: AiToolkitEventOutcome,
+        cohort_digest: &str,
+    ) -> Result<Self, AiToolkitEventDataError> {
+        if !is_lowercase_sha256(cohort_digest) {
+            return Err(AiToolkitEventDataError::InvalidCohortDigest);
+        }
+        Ok(Self {
+            origin_id: bounded_ai_toolkit_event_id(origin_id),
+            prompt: bounded_ai_toolkit_event_id(prompt),
+            version,
+            outcome,
+            cohort_digest: cohort_digest.to_owned(),
+        })
+    }
+
+    /// Wrap this payload in the exact typed event envelope.
+    pub fn into_proxy_event(
+        self,
+        hostname: impl Into<String>,
+        tenant_id: impl Into<String>,
+    ) -> ProxyEvent {
+        let mut data = serde_json::Map::with_capacity(5);
+        data.insert("origin_id".to_owned(), self.origin_id.into());
+        data.insert("prompt".to_owned(), self.prompt.into());
+        data.insert("version".to_owned(), self.version.into());
+        data.insert("outcome".to_owned(), self.outcome.as_str().into());
+        data.insert("cohort_digest".to_owned(), self.cohort_digest.into());
+        ProxyEvent::new(
+            EventType::AiPromptRolloutSelected,
+            hostname.into(),
+            tenant_id.into(),
+            serde_json::Value::Object(data),
+        )
+    }
+}
+
+fn bounded_ai_toolkit_event_id(value: &str) -> String {
+    sbproxy_util::truncate_utf8(value, AI_TOOLKIT_EVENT_ID_MAX_BYTES).to_owned()
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// Enumeration of proxy event types emitted on the event bus.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -245,6 +508,19 @@ pub enum EventType {
     /// `fallback_credential_id`. Names the provider, the credential id,
     /// and whether the retry was served; never any secret.
     CredentialFallback,
+    /// Event name `ai_workflow_operation`. A governed workflow execution
+    /// completed or was refused. Its payload is bounded metadata;
+    /// agent inputs, outputs, endpoints, tokens, and secrets are excluded.
+    AiWorkflowOperation,
+    /// Event name `ai_evaluation_operation`. A governed evaluation run
+    /// completed or was refused. Its payload excludes model and
+    /// judge response content, endpoints, credentials, and secret references.
+    AiEvaluationOperation,
+    /// Event name `ai_prompt_rollout_selected`. A weighted prompt selection
+    /// completed on the admin or live request path. Its payload may identify
+    /// the prompt and version and carry a cohort digest, but never prompt
+    /// content or the raw cohort key.
+    AiPromptRolloutSelected,
 }
 
 impl ProxyEvent {
@@ -284,10 +560,10 @@ impl ProxyEvent {
 ///
 /// The array length is written out, so a variant added to the enum and
 /// not added here fails to compile. That is deliberate. The failure
-/// mode this prevents is a twentieth event type that no `events:` sink
+/// mode this prevents is a twenty-third event type that no `events:` sink
 /// can ever be told to deliver, which looks exactly like a working sink
 /// to everyone except the operator waiting for the event.
-pub const ALL_EVENT_TYPES: [EventType; 19] = [
+pub const ALL_EVENT_TYPES: [EventType; 22] = [
     EventType::RequestStarted,
     EventType::RequestCompleted,
     EventType::RequestError,
@@ -307,6 +583,9 @@ pub const ALL_EVENT_TYPES: [EventType; 19] = [
     EventType::KeyBlocked,
     EventType::CredentialResolved,
     EventType::CredentialFallback,
+    EventType::AiWorkflowOperation,
+    EventType::AiEvaluationOperation,
+    EventType::AiPromptRolloutSelected,
 ];
 
 impl EventType {
@@ -338,6 +617,9 @@ impl EventType {
             Self::KeyBlocked => "key_blocked",
             Self::CredentialResolved => "credential_resolved",
             Self::CredentialFallback => "credential_fallback",
+            Self::AiWorkflowOperation => "ai_workflow_operation",
+            Self::AiEvaluationOperation => "ai_evaluation_operation",
+            Self::AiPromptRolloutSelected => "ai_prompt_rollout_selected",
         }
     }
 
@@ -373,6 +655,9 @@ impl EventType {
             Self::KeyBlocked => 16,
             Self::CredentialResolved => 17,
             Self::CredentialFallback => 18,
+            Self::AiWorkflowOperation => 19,
+            Self::AiEvaluationOperation => 20,
+            Self::AiPromptRolloutSelected => 21,
         }
     }
 
@@ -418,6 +703,12 @@ impl EventType {
                 // arm in `sbproxy_core::server::ai_dispatch` that swaps
                 // the credential mid-request.
                 | Self::CredentialFallback
+                // Group D's generation-owned toolkit runtime publishes
+                // workflow/evaluation operation events, and the live AI
+                // request dispatcher publishes the concrete rollout pick.
+                | Self::AiWorkflowOperation
+                | Self::AiEvaluationOperation
+                | Self::AiPromptRolloutSelected
         )
         // `CacheHit` and `CacheMiss` are deliberately absent: wiring
         // them per-request would put an NDJSON line on every configured
@@ -699,6 +990,16 @@ mod tests {
             (EventType::KeyRotated, "\"key_rotated\""),
             (EventType::KeyBlocked, "\"key_blocked\""),
             (EventType::CredentialResolved, "\"credential_resolved\""),
+            (EventType::CredentialFallback, "\"credential_fallback\""),
+            (EventType::AiWorkflowOperation, "\"ai_workflow_operation\""),
+            (
+                EventType::AiEvaluationOperation,
+                "\"ai_evaluation_operation\"",
+            ),
+            (
+                EventType::AiPromptRolloutSelected,
+                "\"ai_prompt_rollout_selected\"",
+            ),
         ];
 
         for (variant, expected) in variants {
@@ -753,6 +1054,123 @@ mod tests {
     }
 
     #[test]
+    fn ai_toolkit_payload_builders_are_bounded_and_exclude_content() {
+        let long_id = "雪".repeat(80);
+        let workflow =
+            AiWorkflowOperationData::new(&long_id, &long_id, AiToolkitEventOutcome::Success, 3, 42)
+                .into_proxy_event("ai.example", "tenant-a");
+        let evaluation = AiEvaluationOperationData::new(
+            &long_id,
+            &long_id,
+            7,
+            &long_id,
+            AiToolkitEventOutcome::Invalid,
+            11,
+            84,
+        )
+        .into_proxy_event("ai.example", "tenant-a");
+
+        assert_eq!(workflow.event_type, EventType::AiWorkflowOperation);
+        assert_eq!(evaluation.event_type, EventType::AiEvaluationOperation);
+        for event in [&workflow, &evaluation] {
+            for field in event.data.as_object().expect("typed object").values() {
+                if let Some(value) = field.as_str() {
+                    assert!(
+                        value.len() <= AI_TOOLKIT_EVENT_ID_MAX_BYTES,
+                        "identifier escaped its event byte bound: {value}"
+                    );
+                    assert!(value.is_char_boundary(value.len()));
+                }
+            }
+        }
+
+        let wire = serde_json::to_string(&[workflow, evaluation]).expect("serialize payloads");
+        for forbidden in [
+            "prompt",
+            "response",
+            "endpoint",
+            "token",
+            "shared_secret",
+            "secret_ref",
+        ] {
+            assert!(
+                !wire.contains(forbidden),
+                "payload field accidentally opened a sensitive surface: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_rollout_payload_accepts_only_a_validated_digest() {
+        let digest = "a".repeat(64);
+        let first = AiPromptRolloutSelectedData::new(
+            "origin-a",
+            "support-system",
+            2,
+            AiToolkitEventOutcome::Success,
+            &digest,
+        )
+        .expect("runtime-generated digest")
+        .into_proxy_event("ai.example", "tenant-a");
+        let same = AiPromptRolloutSelectedData::new(
+            "origin-a",
+            "support-system",
+            2,
+            AiToolkitEventOutcome::Success,
+            &digest,
+        )
+        .expect("runtime-generated digest")
+        .into_proxy_event("ai.example", "tenant-a");
+
+        assert_eq!(first.event_type, EventType::AiPromptRolloutSelected);
+        assert_eq!(first.data["cohort_digest"], same.data["cohort_digest"]);
+        let serialized_digest = first.data["cohort_digest"].as_str().expect("digest");
+        assert_eq!(serialized_digest, digest);
+
+        let wire = serde_json::to_string(&first).expect("serialize payload");
+        assert!(!wire.contains("content"));
+        for invalid in [
+            "a",
+            "A234567890123456789012345678901234567890123456789012345678901234",
+            "z234567890123456789012345678901234567890123456789012345678901234",
+        ] {
+            assert_eq!(
+                AiPromptRolloutSelectedData::new(
+                    "origin-a",
+                    "support-system",
+                    2,
+                    AiToolkitEventOutcome::Success,
+                    invalid,
+                )
+                .expect_err("only exact lowercase SHA-256 hex is accepted"),
+                AiToolkitEventDataError::InvalidCohortDigest
+            );
+        }
+    }
+
+    #[test]
+    fn ai_toolkit_event_outcomes_match_the_metric_vocabulary() {
+        let outcomes = [
+            (AiToolkitEventOutcome::Success, "success"),
+            (AiToolkitEventOutcome::Invalid, "invalid"),
+            (AiToolkitEventOutcome::Unauthorized, "unauthorized"),
+            (AiToolkitEventOutcome::NotFound, "not_found"),
+            (AiToolkitEventOutcome::EgressRefused, "egress_refused"),
+            (AiToolkitEventOutcome::Timeout, "timeout"),
+            (AiToolkitEventOutcome::BodyTooLarge, "body_too_large"),
+            (
+                AiToolkitEventOutcome::ResponseTooLarge,
+                "response_too_large",
+            ),
+            (AiToolkitEventOutcome::Internal, "internal"),
+        ];
+        for (outcome, expected) in outcomes {
+            assert_eq!(outcome.as_str(), expected);
+            assert_eq!(serde_json::to_value(outcome).expect("serialize"), expected);
+        }
+    }
+
+    #[test]
     fn event_type_from_name_round_trips_and_rejects_unknown() {
         for variant in ALL_EVENT_TYPES {
             assert_eq!(EventType::from_name(variant.as_str()), Some(variant));
@@ -774,7 +1192,7 @@ mod tests {
         }
     }
 
-    /// WOR-2655: the nineteenth type, pinned across all four
+    /// WOR-2655: the credential-fallback type, pinned across all four
     /// hand-maintained surfaces at once.
     ///
     /// The array length is compile-checked; `index()`, `as_str()` and
@@ -799,8 +1217,8 @@ mod tests {
         );
         assert_eq!(
             EventType::CredentialFallback.index(),
-            ALL_EVENT_TYPES.len() - 1,
-            "the new variant is appended, so its bit is the last one"
+            18,
+            "later event additions must not move an existing wire bit"
         );
         assert!(
             EventType::CredentialFallback.has_emitter(),

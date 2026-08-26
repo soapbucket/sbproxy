@@ -8,6 +8,7 @@
 
 use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -89,7 +90,14 @@ fn free_port() -> u16 {
         .port()
 }
 
-fn config(admin_port: u16, upstream_port: u16, capture_content: bool) -> String {
+fn config(
+    admin_port: u16,
+    upstream_port: u16,
+    capture_content: bool,
+    key_store_path: &Path,
+) -> String {
+    let key_store_path = serde_json::to_string(&key_store_path.display().to_string())
+        .expect("serialize key store path as a YAML string");
     format!(
         r#"
 proxy:
@@ -103,7 +111,7 @@ proxy:
     enabled: true
     store:
       backend: embedded
-      path: /tmp/sbproxy-e2e-content-capture-{admin_port}.redb
+      path: {key_store_path}
     crypto:
       pepper: e2e-pepper-value-not-a-real-secret
       master_key: e2e-master-value-not-a-real-secret
@@ -206,9 +214,18 @@ fn fetch_content(admin_port: u16, request_id: &str) -> (u16, serde_json::Value) 
 #[test]
 fn both_gates_on_captures_a_redacted_sample_and_audits_the_read() {
     let admin_port = free_port();
+    let state = tempfile::tempdir().expect("isolated content-capture key store");
     let stub = ChatStub::start().expect("chat stub");
-    let harness =
-        ProxyHarness::start_with_yaml(&config(admin_port, stub.port, true)).expect("proxy starts");
+    let harness = ProxyHarness::start_with_yaml(&config(
+        admin_port,
+        stub.port,
+        true,
+        &state.path().join("keys.redb"),
+    ))
+    .expect("proxy starts");
+    harness
+        .wait_for_secondary_port(admin_port, Duration::from_secs(5))
+        .expect("admin listener starts");
 
     let (token, key_id) = mint_key(admin_port, true);
     let planted = "please use sk-ant-api03-planted-e2e-secret-0123456789abcdef for auth";
@@ -253,9 +270,18 @@ fn both_gates_on_captures_a_redacted_sample_and_audits_the_read() {
 #[test]
 fn a_key_without_consent_produces_no_sample_even_when_the_origin_opts_in() {
     let admin_port = free_port();
+    let state = tempfile::tempdir().expect("isolated content-capture key store");
     let stub = ChatStub::start().expect("chat stub");
-    let harness =
-        ProxyHarness::start_with_yaml(&config(admin_port, stub.port, true)).expect("proxy starts");
+    let harness = ProxyHarness::start_with_yaml(&config(
+        admin_port,
+        stub.port,
+        true,
+        &state.path().join("keys.redb"),
+    ))
+    .expect("proxy starts");
+    harness
+        .wait_for_secondary_port(admin_port, Duration::from_secs(5))
+        .expect("admin listener starts");
 
     let (token, key_id) = mint_key(admin_port, false);
     assert_eq!(chat(&harness, &token, "no consent from this key"), 200);
@@ -268,9 +294,18 @@ fn a_key_without_consent_produces_no_sample_even_when_the_origin_opts_in() {
 #[test]
 fn an_origin_without_the_flag_produces_no_sample_even_when_the_key_consents() {
     let admin_port = free_port();
+    let state = tempfile::tempdir().expect("isolated content-capture key store");
     let stub = ChatStub::start().expect("chat stub");
-    let harness =
-        ProxyHarness::start_with_yaml(&config(admin_port, stub.port, false)).expect("proxy starts");
+    let harness = ProxyHarness::start_with_yaml(&config(
+        admin_port,
+        stub.port,
+        false,
+        &state.path().join("keys.redb"),
+    ))
+    .expect("proxy starts");
+    harness
+        .wait_for_secondary_port(admin_port, Duration::from_secs(5))
+        .expect("admin listener starts");
 
     let (token, key_id) = mint_key(admin_port, true);
     assert_eq!(chat(&harness, &token, "origin never opted in"), 200);

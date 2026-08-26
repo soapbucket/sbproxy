@@ -6408,6 +6408,7 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
     let mut content_length: Option<usize> = None;
     let mut header_end: Option<usize> = None;
     let mut request_too_large = false;
+    let mut request_body_limit = MAX_ADMIN_BODY_BYTES;
     loop {
         match sock.read(&mut tmp).await {
             Ok(0) => break,
@@ -6421,6 +6422,11 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
                         }
                         header_end = Some(p);
                         let head = String::from_utf8_lossy(&buf[..p]);
+                        request_body_limit = head
+                            .lines()
+                            .next()
+                            .map(crate::admin_toolkit::request_body_limit)
+                            .unwrap_or(MAX_ADMIN_BODY_BYTES);
                         for line in head.lines() {
                             let rest = match line
                                 .strip_prefix("Content-Length:")
@@ -6433,7 +6439,7 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
                                 content_length = Some(v);
                             }
                         }
-                        if content_length.is_some_and(|length| length > MAX_ADMIN_BODY_BYTES) {
+                        if content_length.is_some_and(|length| length > request_body_limit) {
                             request_too_large = true;
                             break;
                         }
@@ -6445,7 +6451,7 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
                 if let (Some(end), Some(cl)) = (header_end, content_length) {
                     // header bytes + 4 for "\r\n\r\n" + cl body bytes
                     let body_start = end + 4;
-                    if buf.len().saturating_sub(body_start) > MAX_ADMIN_BODY_BYTES {
+                    if buf.len().saturating_sub(body_start) > request_body_limit {
                         request_too_large = true;
                         break;
                     }
@@ -6470,6 +6476,17 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
         return;
     }
     if request_too_large {
+        let oversized_path = String::from_utf8_lossy(&buf)
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .map(str::to_owned);
+        if let Some(path) = oversized_path.as_deref() {
+            crate::admin_toolkit::record_boundary_outcome(
+                path,
+                sbproxy_ai::ai_metrics::AiToolkitOutcome::BodyTooLarge,
+            );
+        }
         let _ = write_admin_response(
             sock,
             413,
@@ -6477,7 +6494,7 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
             &serde_json::json!({
                 "code": "request_body_too_large",
                 "error": format!(
-                    "admin request body exceeds {MAX_ADMIN_BODY_BYTES} bytes"
+                    "admin request body exceeds {request_body_limit} bytes"
                 ),
             })
             .to_string(),
@@ -6492,6 +6509,10 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
     let method = parts.next().unwrap_or("GET");
     let path = parts.next().unwrap_or("/");
     if !path_is_exempt_from_rate_limit(path) && !rate_limiter.check(peer_ip) {
+        crate::admin_toolkit::record_boundary_outcome(
+            path,
+            sbproxy_ai::ai_metrics::AiToolkitOutcome::Internal,
+        );
         let _ = write_admin_response(
             sock,
             429,
@@ -6631,6 +6652,10 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
                 _ => false,
             };
             if !ok {
+                crate::admin_toolkit::record_boundary_outcome(
+                    path,
+                    sbproxy_ai::ai_metrics::AiToolkitOutcome::Unauthorized,
+                );
                 let _ = write_admin_response_headed(
                     sock,
                     403,
@@ -6643,6 +6668,10 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
             }
         }
         if p.role == AdminRole::ReadOnly && mutating {
+            crate::admin_toolkit::record_boundary_outcome(
+                path,
+                sbproxy_ai::ai_metrics::AiToolkitOutcome::Unauthorized,
+            );
             let _ = write_admin_response_headed(
                 sock,
                 403,
@@ -6813,6 +6842,25 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
         let _ =
             write_admin_response_headed(sock, response.0, response.1, response.2.as_bytes(), &cors)
                 .await;
+        return;
+    }
+
+    // The toolkit runtime is generation-pinned and tenant-scoped. Keep this
+    // async route on the connection task so the resolved principal (including
+    // its tenant restriction) reaches it intact; the sync dispatcher below
+    // receives only a synthesized Basic header for session callers.
+    if let Some(response) =
+        crate::admin_toolkit::dispatch(method, path, body_owned.as_deref(), principal.as_ref())
+            .await
+    {
+        let _ = write_admin_response_headed(
+            sock,
+            response.status,
+            response.content_type,
+            response.body.as_bytes(),
+            &cors,
+        )
+        .await;
         return;
     }
 
@@ -7105,7 +7153,9 @@ fn reason_phrase(status: u16) -> &'static str {
         413 => "Payload Too Large",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
+        502 => "Bad Gateway",
         503 => "Service Unavailable",
+        504 => "Gateway Timeout",
         _ => "OK",
     }
 }

@@ -1,0 +1,8 @@
+name: research-flow
+initial_state: research
+max_steps: 2
+timeout_ms: 2000
+states:
+  - name: research
+    action: research
+    transitions: {}

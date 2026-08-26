@@ -1,11 +1,16 @@
 //! Prompt versioning and weighted A/B selection (WOR-2672 port of
 //! `sbproxy-enterprise-ai::prompt_versioning`).
 //!
-//! Allows an embedder to maintain multiple versions of a prompt template
-//! under a single name, retrieve the latest version, and perform weighted
-//! stable cohort selection for gradual rollouts and A/B experiments. Fully
-//! self-contained and in-memory: no config surface, no request-path
-//! wiring, no rendering.
+//! Maintains multiple immutable versions of a prompt under one name, retrieves
+//! the latest version, and performs stable weighted cohort selection for
+//! gradual rollouts and A/B experiments. [`WeightedPromptStore`] is the
+//! self-contained in-memory selection primitive and performs no template
+//! rendering. The production proxy builds it from
+//! `proxy.ai_toolkit.prompt_rollouts`, publishes it with the compiled pipeline
+//! generation, exposes dry-run selection through
+//! `POST /admin/ai-toolkit/prompts/select` and `sbproxy ai prompt select`, and
+//! consults it for a bare prompt name on the live `ai_proxy` request path after
+//! the runtime prompt overlay misses.
 //!
 //! # Not [`crate::prompts`]
 //!
@@ -20,7 +25,7 @@
 //!
 //! The capability gap this module fills that `crate::prompts` does not:
 //! `crate::prompts`'s pin is deterministic (one version is live at a
-//! time); this module's [`crate::prompt_versioning::WeightedPromptStore::select_for_cohort`] instead
+//! time); this module's [`crate::prompt_versioning::WeightedPromptStore::select_for_cohort_typed`] instead
 //! answers "which version should THIS caller get" from a weighted random
 //! draw, which is what a gradual percentage rollout needs. It is shipped
 //! through the supported `sbproxy ai prompt select` command. See

@@ -466,6 +466,11 @@ pub struct EgressTopLevelConfig {
     /// dispatch the AI gateway's client makes.
     #[serde(default)]
     pub ai_providers: Option<EgressPurposeConfig>,
+    /// Arms `EgressPurpose::AgentOrchestration`: HTTP invocations made by
+    /// configured AI toolkit workflows. Agent endpoints fail closed unless
+    /// this purpose is configured with `mode: deny_by_default`.
+    #[serde(default)]
+    pub agent_orchestration: Option<EgressPurposeConfig>,
     /// Arms `EgressPurpose::ClassifierHook`: the stock intent and
     /// prompt-aware provider-quality classifier RPCs.
     #[serde(default)]
@@ -1308,7 +1313,7 @@ impl ClassifierHooksConfig {
         let host = endpoint
             .host()
             .ok_or_else(|| anyhow::anyhow!("classifier_hooks.endpoint must include a host"))?;
-        let local_endpoint = classifier_hooks_endpoint_is_local(host);
+        let local_endpoint = endpoint_host_is_local(host);
         if !(1..=30_000).contains(&self.timeout_ms) {
             anyhow::bail!("classifier_hooks.timeout_ms must be between 1 and 30000");
         }
@@ -1456,11 +1461,219 @@ fn validate_classifier_secret_reference(
     Ok(())
 }
 
-fn classifier_hooks_endpoint_is_local(host: &str) -> bool {
+pub(crate) fn endpoint_host_is_local(host: &str) -> bool {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
     host.eq_ignore_ascii_case("localhost")
         || host
             .parse::<std::net::IpAddr>()
             .is_ok_and(|ip| ip.to_canonical().is_loopback())
+}
+
+/// Bounded, generation-pinned AI workflow and evaluation configuration.
+///
+/// The runtime resolves agent credentials only while constructing a candidate
+/// pipeline. This parsed form therefore retains secret references, never the
+/// referenced secret material itself.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct AiToolkitConfig {
+    /// Optional overrides for the runtime's conservative public limits.
+    pub limits: AiToolkitLimitsConfig,
+    /// Governed agent endpoints available to workflows.
+    pub agents: Vec<AiToolkitAgentConfig>,
+    /// Finite-state workflows compiled into this pipeline generation.
+    pub workflows: Vec<AiToolkitWorkflowConfig>,
+    /// Immutable evaluation dataset versions seeded at publication.
+    pub datasets: Vec<AiToolkitDatasetConfig>,
+    /// Stable weighted prompt rollouts selected on the live request path.
+    pub prompt_rollouts: Vec<AiToolkitPromptRolloutConfig>,
+}
+
+/// Optional overrides for AI toolkit resource and deadline limits.
+///
+/// An omitted field inherits the runtime default. Keeping these overrides
+/// optional avoids copying runtime defaults into the config compiler, where
+/// the two sets of values could drift.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct AiToolkitLimitsConfig {
+    /// Maximum configured agents.
+    pub max_agents: Option<usize>,
+    /// Maximum capabilities advertised by one agent.
+    pub max_capabilities_per_agent: Option<usize>,
+    /// Maximum configured workflows.
+    pub max_workflows: Option<usize>,
+    /// Maximum distinct dataset names retained per scope.
+    pub max_datasets: Option<usize>,
+    /// Maximum immutable versions retained per dataset.
+    pub max_dataset_versions: Option<usize>,
+    /// Maximum immutable dataset versions retained across all scopes (hard maximum 16,384).
+    pub max_dataset_versions_total: Option<usize>,
+    /// Maximum entries in one dataset version.
+    pub max_dataset_entries: Option<usize>,
+    /// Maximum serialized dataset-entry bytes retained across all scopes (hard maximum 512 MiB).
+    pub max_dataset_bytes_total: Option<usize>,
+    /// Maximum configured prompt rollouts.
+    pub max_rollouts: Option<usize>,
+    /// Maximum versions in one prompt rollout.
+    pub max_rollout_versions: Option<usize>,
+    /// Maximum recent operation summaries retained per scope.
+    pub max_retained_operations: Option<usize>,
+    /// Maximum serialized request bytes accepted by a toolkit operation.
+    pub max_request_bytes: Option<usize>,
+    /// Maximum serialized response bytes accepted from an agent or retained.
+    pub max_response_bytes: Option<usize>,
+    /// Maximum bytes in a public identifier.
+    pub max_identifier_bytes: Option<usize>,
+    /// Maximum bytes in a public description.
+    pub max_description_bytes: Option<usize>,
+    /// Maximum bytes in one serialized JSON schema.
+    pub max_schema_bytes: Option<usize>,
+    /// Maximum bytes resolved from one agent credential reference.
+    pub max_secret_bytes: Option<usize>,
+    /// Maximum cases evaluated by one run.
+    pub max_evaluation_cases: Option<usize>,
+    /// Maximum custom metrics evaluated by one run.
+    pub max_metrics: Option<usize>,
+    /// Maximum offline-judge criteria evaluated by one run.
+    pub max_judge_criteria: Option<usize>,
+    /// Maximum concurrent governed agent calls.
+    pub agent_concurrency: Option<usize>,
+    /// Maximum concurrent evaluation cases.
+    pub evaluation_concurrency: Option<usize>,
+    /// Default workflow deadline when a run does not supply one.
+    pub default_workflow_timeout_ms: Option<u64>,
+    /// Hard ceiling for every workflow deadline.
+    pub max_workflow_timeout_ms: Option<u64>,
+}
+
+/// One governed agent endpoint available within an origin's tenant scope.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiToolkitAgentConfig {
+    /// Stable configured origin id (or hostname) that owns this agent.
+    pub origin: String,
+    /// Stable agent id within the origin scope.
+    pub id: String,
+    /// HTTP endpoint invoked through the agent-orchestration egress gate.
+    pub endpoint: String,
+    /// Authentication material expressed only as a secret reference.
+    pub auth: AiToolkitAgentAuthConfig,
+    /// Capabilities advertised by this agent.
+    #[serde(default)]
+    pub capabilities: Vec<AiToolkitCapabilityConfig>,
+}
+
+/// Agent authentication configuration retained as an unresolved reference.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiToolkitAgentAuthConfig {
+    /// Secret reference used to derive the agent bearer credential.
+    pub shared_secret: String,
+}
+
+/// One discoverable agent capability and its request/response schemas.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiToolkitCapabilityConfig {
+    /// Stable capability name used by workflow actions.
+    pub name: String,
+    /// Bounded operator-facing description.
+    #[serde(default)]
+    pub description: String,
+    /// JSON Schema for the agent request body.
+    pub input_schema: serde_json::Value,
+    /// JSON Schema for the agent response body.
+    pub output_schema: serde_json::Value,
+}
+
+/// One finite-state workflow owned by an origin scope.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiToolkitWorkflowConfig {
+    /// Stable configured origin id (or hostname) that owns this workflow.
+    pub origin: String,
+    /// Stable workflow name within the origin scope.
+    pub name: String,
+    /// State entered first.
+    pub initial_state: String,
+    /// Maximum transitions in one execution.
+    pub max_steps: usize,
+    /// Whole-workflow deadline in milliseconds.
+    pub timeout_ms: u64,
+    /// Bounded workflow graph.
+    pub states: Vec<AiToolkitWorkflowStateConfig>,
+}
+
+/// One state in a configured AI toolkit workflow.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiToolkitWorkflowStateConfig {
+    /// Stable state name.
+    pub name: String,
+    /// Capability name discovered and invoked when this state runs.
+    pub action: String,
+    /// Outcome label to next-state name. An absent match completes the run.
+    #[serde(default)]
+    pub transitions: HashMap<String, String>,
+}
+
+/// One immutable evaluation dataset version seeded from configuration.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiToolkitDatasetConfig {
+    /// Stable configured origin id (or hostname) that owns this dataset.
+    pub origin: String,
+    /// Dataset name within the origin scope.
+    pub name: String,
+    /// Explicit immutable version; zero is invalid.
+    pub version: u32,
+    /// Bounded evaluation cases.
+    #[serde(default)]
+    pub entries: Vec<AiToolkitDatasetEntryConfig>,
+}
+
+/// One input/expected-output pair in a configured evaluation dataset.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiToolkitDatasetEntryConfig {
+    /// Input supplied to the evaluated model or offline response set.
+    pub input: String,
+    /// Optional expected output used by correctness metrics.
+    #[serde(default)]
+    pub expected_output: Option<String>,
+    /// Bounded caller metadata retained with the case.
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+/// One stable weighted prompt rollout owned by an origin scope.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiToolkitPromptRolloutConfig {
+    /// Stable configured origin id (or hostname) that owns this rollout.
+    pub origin: String,
+    /// Prompt name used by bare request references.
+    pub name: String,
+    /// Stable operator-controlled cohort salt.
+    pub salt: String,
+    /// Weighted immutable prompt versions.
+    pub versions: Vec<AiToolkitPromptRolloutVersionConfig>,
+}
+
+/// One immutable member of a weighted prompt rollout.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiToolkitPromptRolloutVersionConfig {
+    /// Positive numeric prompt version.
+    pub version: u32,
+    /// Prompt template/content selected for this version.
+    pub content: String,
+    /// Finite non-negative relative weight.
+    pub weight: f64,
 }
 
 /// Server-level proxy configuration parsed from the top-level `proxy:`
@@ -1563,6 +1776,9 @@ pub struct ProxyServerConfig {
     /// Optional classifier-sidecar hooks for intent and quality routing.
     #[serde(default)]
     pub classifier_hooks: Option<ClassifierHooksConfig>,
+    /// Optional bounded AI workflow, evaluation, and rollout runtime.
+    #[serde(default)]
+    pub ai_toolkit: Option<AiToolkitConfig>,
     /// Optional shared cluster substrate for keys, metrics, and managed models.
     #[serde(default)]
     pub cluster: Option<crate::cluster::ClusterConfig>,
@@ -2383,6 +2599,7 @@ impl Default for ProxyServerConfig {
             admin: None,
             model_host: None,
             classifier_hooks: None,
+            ai_toolkit: None,
             cluster: None,
             config_authority: None,
             secrets: None,

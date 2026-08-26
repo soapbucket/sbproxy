@@ -1,5 +1,5 @@
 # SBproxy Dashboards and Alerts
-*Last modified: 2026-08-22*
+*Last modified: 2026-08-25*
 
 Grafana dashboards and Prometheus alert/recording rules for monitoring SBproxy.
 
@@ -22,7 +22,7 @@ scrape_configs:
 | Dashboard | File | UID | Description |
 |-----------|------|-----|-------------|
 | SBProxy Overview | `grafana/sbproxy-overview.json` | `sbproxy-overview` | Request rate, latency percentiles, error rate, active connections, cache hit ratio, bandwidth |
-| AI Gateway | `grafana/sbproxy-ai-gateway.json` | `sbproxy-ai-gateway` | AI provider request rates, token usage, TTFT, guardrail triggers, fallbacks, context-compression savings, latency, failures, and state coordination, plus pre-provider admission refusals by reason and by share of each surface's arriving traffic, and an arrived / dispatched / refused reconciliation. A routing and reliability section below that covers post-commit streaming failures by cause and by provider share, provider-key fallbacks, named model group member selection, prompt-cache affinity decisions against its lease evictions, service tier dispositions, per-request timeout override outcomes, shadow evaluation call outcomes and latency, and prompt-injection classifier failures by stage, reason, action, and blocked/degraded outcome. Four `absent()` tiles head that section, because five of those families are absent rather than zero until the feature behind them is configured |
+| AI Gateway | `grafana/sbproxy-ai-gateway.json` | `sbproxy-ai-gateway` | AI provider request rates, token usage, TTFT, guardrail triggers, fallbacks, context-compression savings, latency, failures, and state coordination, plus pre-provider admission refusals by reason and by share of each surface's arriving traffic, and an arrived / dispatched / refused reconciliation. The routing and reliability section covers post-commit streaming failures, provider-key fallbacks, model groups, prompt-cache affinity, service tiers, request-timeout overrides, shadow evaluation, classifier failures, chargeback integrity, and the live workflow/evaluation/prompt-rollout toolkit outcomes. |
 | AI Value | `grafana/sbproxy-ai-value.json` | `sbproxy-ai-value` | Per-credential, multi-tenant, multi-model value tracking: spend, token volume, p95 model latency, value-vs-waste by outcome, and success-only compression tokens and cost saved. Tokenizer precision stays visible. Ends with a trust row that says how much of the spend figure is measured: which price table produced each price, price-ceiling outcomes, token-estimate error p05 and p95 by model, and semantic-cache dollars saved. |
 | Judge Backend | `grafana/sbproxy-judge-backend.json` | `sbproxy-judge-backend` | LLM-as-judge call rate by verdict, cache hit ratio, latency, cost per decision, budget exhaustion |
 | Policy Verdicts | `grafana/sbproxy-policy-verdicts.json` | `sbproxy-policy-verdicts` | Verdict rate by tag, audit bus drops per tenant, plugin vs built-in surface ratio, decision latency percentiles, top policies |
@@ -43,6 +43,14 @@ rather than a series sitting at zero. Read the tile before reading the chart.
 Provider-key fallbacks and post-commit stream failures are the other kind: they
 are absent because nothing has gone wrong yet, and an empty chart there is the
 healthy state.
+
+The final three AI Gateway panels slice the single bounded
+`sbproxy_ai_toolkit_operations_total{capability,outcome}` family into workflow,
+evaluation, and prompt-rollout views. Capability and outcome are closed enums.
+Workflow names, datasets, prompt names, run IDs, endpoints, prompt/response
+content, tokens, and secret references are intentionally absent from labels;
+use authenticated bounded admin records and typed events for per-operation
+diagnosis.
 
 One family cannot be charted at all and it is the obvious one to reach for on
 the mesh board: `mesh_peer_count`. The coverage scanner in

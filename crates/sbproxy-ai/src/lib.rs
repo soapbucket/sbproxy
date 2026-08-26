@@ -72,6 +72,8 @@ pub mod semantic_cache;
 pub mod service_tier;
 pub mod session;
 pub mod token_estimate;
+/// Bounded production facade for governed agents, offline evaluation, and rollouts.
+pub mod toolkit;
 pub mod tracing_spans;
 pub mod translators;
 pub mod typed_fallbacks;

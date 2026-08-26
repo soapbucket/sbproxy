@@ -1002,33 +1002,92 @@ origins:
     // the abort lands before headers flush the client sees a 502, and
     // when the response was already committed the client sees the 200
     // header with a truncated body (often surfacing as a read error).
-    // The invariants this test pins are timing-free: the raw upstream
-    // content never arrives intact, and nothing is admitted to the
-    // cache, so every request keeps reaching the upstream.
-    let assert_refused = |label: &str| match proxy.get("/doc", "cache.localhost") {
-        Err(_) => {}
-        Ok(response) => {
-            assert_ne!(
-                response.headers.get("x-sbproxy-cache").map(String::as_str),
-                Some("HIT"),
-                "{label}: a refused response must never be served from cache"
-            );
-            let intact = response
-                .text()
-                .is_ok_and(|text| text.contains("plain text, not json"));
-            assert!(
-                response.status >= 500 || !intact,
-                "{label}: the raw body must not reach the client intact (status {})",
-                response.status
-            );
+    // A transport error can also happen before the proxy admits the
+    // request upstream, so two fixed client attempts do not prove two
+    // cache misses. Retry against the observable condition instead:
+    // two requests must reach the upstream, and every client-visible
+    // response on the way must remain refused and never advertise HIT.
+    const MAX_REFUSAL_ATTEMPTS: usize = 32;
+    const MAX_REFUSAL_DIAGNOSTIC_BYTES: usize = 4 * 1024;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut attempt_count = 0_usize;
+    let mut attempts = String::with_capacity(MAX_REFUSAL_DIAGNOSTIC_BYTES);
+    let mut diagnostics_truncated = false;
+    let record_attempt =
+        |attempts: &mut String, diagnostics_truncated: &mut bool, diagnostic: String| {
+            let separator_bytes = if attempts.is_empty() { 0 } else { 2 };
+            let next_len = attempts
+                .len()
+                .saturating_add(separator_bytes)
+                .saturating_add(diagnostic.len());
+            if next_len <= MAX_REFUSAL_DIAGNOSTIC_BYTES {
+                if separator_bytes != 0 {
+                    attempts.push_str("; ");
+                }
+                attempts.push_str(&diagnostic);
+            } else {
+                *diagnostics_truncated = true;
+            }
+        };
+    while upstream.captured().len() < 2
+        && attempt_count < MAX_REFUSAL_ATTEMPTS
+        && std::time::Instant::now() < deadline
+    {
+        attempt_count += 1;
+        let attempt = attempt_count;
+        match proxy.get("/doc", "cache.localhost") {
+            Err(_) => record_attempt(
+                &mut attempts,
+                &mut diagnostics_truncated,
+                format!(
+                    "attempt {attempt}: client_error; upstream_hits={}",
+                    upstream.captured().len()
+                ),
+            ),
+            Ok(response) => {
+                let status = response.status;
+                let cache = match response.headers.get("x-sbproxy-cache").map(String::as_str) {
+                    Some("HIT") => "HIT",
+                    Some("MISS") => "MISS",
+                    Some(_) => "other",
+                    None => "none",
+                };
+                let intact = response
+                    .text()
+                    .is_ok_and(|text| text.contains("plain text, not json"));
+                record_attempt(
+                    &mut attempts,
+                    &mut diagnostics_truncated,
+                    format!(
+                        "attempt {attempt}: status={status}, cache={cache}, intact={intact}, \
+                         upstream_hits={}",
+                        upstream.captured().len()
+                    ),
+                );
+                assert_ne!(
+                    cache, "HIT",
+                    "a refused response must never be served from cache: {attempts}"
+                );
+                assert!(
+                    !intact,
+                    "the raw body must not reach the client intact: {attempts}"
+                );
+            }
         }
-    };
-    assert_refused("first request");
-    assert_refused("second request");
+        if upstream.captured().len() >= 2 {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        std::thread::sleep(remaining.min(std::time::Duration::from_millis(20)));
+    }
     assert_eq!(
         upstream.captured().len(),
         2,
-        "every request must reach the upstream because nothing was stored"
+        "every admitted request must reach the upstream because nothing was stored; \
+         attempt_count={attempt_count}; attempts={attempts}; \
+         diagnostics_truncated={diagnostics_truncated}; max_attempts={MAX_REFUSAL_ATTEMPTS}; \
+         max_diagnostic_bytes={MAX_REFUSAL_DIAGNOSTIC_BYTES}; deadline_elapsed={}",
+        std::time::Instant::now() >= deadline
     );
 }
 

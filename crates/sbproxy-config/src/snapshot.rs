@@ -261,6 +261,8 @@ pub struct CompiledOrigin {
 pub struct CompiledEgressGates {
     /// Arms `EgressPurpose::AiProvider`.
     pub ai_providers: Option<sbproxy_security::egress::EgressAuthorizer>,
+    /// Arms `EgressPurpose::AgentOrchestration`.
+    pub agent_orchestration: Option<sbproxy_security::egress::EgressAuthorizer>,
     /// Arms `EgressPurpose::ClassifierHook`.
     pub classifier_hooks: Option<sbproxy_security::egress::EgressAuthorizer>,
     /// Arms `EgressPurpose::UsageSink`.

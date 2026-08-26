@@ -43,6 +43,8 @@ pub mod admin_payments;
 pub mod admin_playground;
 /// Admin browser sessions + operator identity (WOR-1714 / WOR-1716).
 pub mod admin_session;
+/// Authenticated and tenant-scoped AI toolkit operator routes.
+pub mod admin_toolkit;
 /// Static-asset surface for the built-in admin
 /// dashboard at `/admin/ui/*`. Embedded via `include_dir!` when the
 /// `embed-admin-ui` feature is on; serves a one-line operator hint
@@ -54,6 +56,8 @@ pub mod admin_ui;
 pub mod agent_class;
 /// Generation-pinned dispatch for provider-neutral AI extension events.
 pub mod ai_extensions;
+/// Generation-pinned assembly for the bounded AI toolkit runtime.
+pub(crate) mod ai_toolkit_runtime;
 /// Boot wiring for the alert evaluation loop (dispatcher + engine + drain).
 pub mod alerting;
 /// Lowering `proxy.attestation` into the metering vocabulary the

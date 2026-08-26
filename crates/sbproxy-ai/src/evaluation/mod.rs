@@ -2,10 +2,16 @@
 //! `sbproxy-enterprise-ai::evaluation`): judges, experiments, datasets,
 //! prompt scoring, and custom metrics.
 //!
-//! This is an offline evaluation toolkit an embedder drives from a script,
-//! test, or CI job to compare model versions and prompt templates against
-//! recorded datasets, not a request-path feature. It does not touch live
-//! traffic.
+//! These are the in-memory primitives for comparing model versions and prompt
+//! templates against recorded datasets. Evaluation remains offline and does
+//! not send dataset entries, candidate responses, or judge material to a model
+//! endpoint. The production proxy seeds datasets from
+//! `proxy.ai_toolkit.datasets`, supports
+//! immutable registration through `POST /admin/ai-toolkit/datasets/register`
+//! and `sbproxy ai dataset register`, and runs recorded evaluations through
+//! `POST /admin/ai-toolkit/evaluations/run` and `sbproxy ai evaluate`. Those
+//! authenticated control-plane operations use live generation-owned state but
+//! do not participate in ordinary AI request traffic.
 //!
 //! ## Not the same "judge" as `sbproxy_ai::judge`
 //!
@@ -31,7 +37,7 @@
 //!
 //! Self-contained: entirely in-memory, no dependency on the classifier
 //! sidecar or any other WOR-2661 port. See `docs/ai-evaluation-harness.md`
-//! and `examples/ai-evaluation-harness/` for a runnable walkthrough.
+//! and `examples/ai-evaluation/` for a runnable walkthrough.
 
 pub mod custom_metrics;
 pub mod datasets;

@@ -1,0 +1,34 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Register an immutable dataset and evaluate already-recorded responses through
+# the live, authenticated AI toolkit control plane. No Redis or model call is
+# involved.
+
+# sbproxy-docs:begin
+proxy:
+  http_bind_port: 8080
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: ${SB_ADMIN_PASSWORD}
+  ai_toolkit:
+    limits:
+      max_datasets: 8
+      max_dataset_versions: 4
+      max_dataset_versions_total: 32
+      max_dataset_entries: 100
+      max_dataset_bytes_total: 8388608
+      max_evaluation_cases: 100
+      evaluation_concurrency: 2
+    agents: []
+    workflows: []
+    datasets: []
+
+origins:
+  "ai.local":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: AI toolkit control-plane scope
+# sbproxy-docs:end

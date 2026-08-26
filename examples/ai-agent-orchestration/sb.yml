@@ -1,0 +1,69 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Governed, bounded agent discovery and workflow execution.
+#
+# The agent is deliberately a loopback dependency: run your compatible agent
+# on 127.0.0.1:18777 before executing the workflow. Discovery and workflow
+# validation do not call the agent.
+
+# sbproxy-docs:begin
+proxy:
+  http_bind_port: 8080
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: ${SB_ADMIN_PASSWORD}
+  ai_toolkit:
+    limits:
+      max_agents: 8
+      max_workflows: 8
+      agent_concurrency: 4
+      default_workflow_timeout_ms: 2000
+      max_workflow_timeout_ms: 5000
+    agents:
+      - origin: ai.local
+        id: local-researcher
+        endpoint: http://127.0.0.1:18777/invoke
+        auth:
+          shared_secret: env:SB_AGENT_SECRET
+        capabilities:
+          - name: research
+            description: Return a bounded research summary
+            input_schema:
+              type: object
+              required: [question]
+              properties:
+                question: {type: string}
+              additionalProperties: false
+            output_schema:
+              type: object
+              required: [summary]
+              properties:
+                summary: {type: string}
+              additionalProperties: false
+    workflows:
+      - origin: ai.local
+        name: research-flow
+        initial_state: research
+        max_steps: 2
+        timeout_ms: 2000
+        states:
+          - name: research
+            action: research
+            transitions: {}
+
+egress:
+  agent_orchestration:
+    mode: deny_by_default
+    hosts: ["127.0.0.1"]
+    ports: [18777]
+    allow_private: true
+
+origins:
+  "ai.local":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: AI toolkit control-plane scope
+# sbproxy-docs:end

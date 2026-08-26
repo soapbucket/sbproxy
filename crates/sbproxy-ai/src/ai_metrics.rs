@@ -318,6 +318,95 @@ pub fn record_quality_routing_decision(outcome: &str) {
         .inc();
 }
 
+/// Live AI-toolkit capability recorded by
+/// `sbproxy_ai_toolkit_operations_total`.
+///
+/// This enum is the metric's cardinality boundary. Workflow names, dataset
+/// names, prompt names, and run identifiers belong in bounded operation
+/// records, never in Prometheus labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiToolkitCapability {
+    /// A governed multi-agent workflow operation.
+    Workflow,
+    /// A governed evaluation operation.
+    Evaluation,
+    /// A weighted prompt-rollout selection from either the admin or live path.
+    PromptRollout,
+}
+
+impl AiToolkitCapability {
+    /// Closed Prometheus label value for this capability.
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Workflow => "workflow",
+            Self::Evaluation => "evaluation",
+            Self::PromptRollout => "prompt_rollout",
+        }
+    }
+}
+
+/// Terminal outcome of a live AI-toolkit operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiToolkitOutcome {
+    /// The operation completed successfully.
+    Success,
+    /// Typed input or stored configuration was invalid.
+    Invalid,
+    /// The caller did not authenticate or lacked permission.
+    Unauthorized,
+    /// The requested workflow, dataset, run, prompt, or version was absent.
+    NotFound,
+    /// Purpose-scoped egress governance refused an outbound call.
+    EgressRefused,
+    /// The operation exceeded its configured deadline.
+    Timeout,
+    /// The request body exceeded its operation-specific limit.
+    BodyTooLarge,
+    /// The bounded response could not fit its response-byte limit.
+    ResponseTooLarge,
+    /// An internal failure prevented a closed public outcome.
+    Internal,
+}
+
+impl AiToolkitOutcome {
+    /// Closed Prometheus label value for this outcome.
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Invalid => "invalid",
+            Self::Unauthorized => "unauthorized",
+            Self::NotFound => "not_found",
+            Self::EgressRefused => "egress_refused",
+            Self::Timeout => "timeout",
+            Self::BodyTooLarge => "body_too_large",
+            Self::ResponseTooLarge => "response_too_large",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+/// Workflow, evaluation, and weighted-rollout operations by closed
+/// capability and terminal outcome.
+static AI_TOOLKIT_OPERATIONS: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
+    register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_toolkit_operations_total",
+            "AI toolkit operations by capability (workflow, evaluation, prompt_rollout) and terminal outcome (success, invalid, unauthorized, not_found, egress_refused, timeout, body_too_large, response_too_large, internal)"
+        ),
+        &["capability", "outcome"]
+    )
+    .ok()
+});
+
+/// Record one terminal AI-toolkit operation.
+pub fn record_ai_toolkit_operation(capability: AiToolkitCapability, outcome: AiToolkitOutcome) {
+    if let Some(operations) = AI_TOOLKIT_OPERATIONS.as_ref() {
+        operations
+            .with_label_values(&[capability.as_label(), outcome.as_label()])
+            .inc();
+    }
+}
+
 /// AI routing decisions that intentionally use a fallback path.
 ///
 /// `strategy` comes from the closed routing enum. `reason` is normalized by
@@ -3006,6 +3095,42 @@ mod tests {
     use crate::billing::chargeback::{
         ChargebackOverflowField, ChargebackOverflowScope, ChargebackRecordError,
     };
+
+    #[test]
+    fn ai_toolkit_metric_uses_only_the_closed_capability_and_outcome_labels() {
+        let capabilities = [
+            (AiToolkitCapability::Workflow, "workflow"),
+            (AiToolkitCapability::Evaluation, "evaluation"),
+            (AiToolkitCapability::PromptRollout, "prompt_rollout"),
+        ];
+        let outcomes = [
+            (AiToolkitOutcome::Success, "success"),
+            (AiToolkitOutcome::Invalid, "invalid"),
+            (AiToolkitOutcome::Unauthorized, "unauthorized"),
+            (AiToolkitOutcome::NotFound, "not_found"),
+            (AiToolkitOutcome::EgressRefused, "egress_refused"),
+            (AiToolkitOutcome::Timeout, "timeout"),
+            (AiToolkitOutcome::BodyTooLarge, "body_too_large"),
+            (AiToolkitOutcome::ResponseTooLarge, "response_too_large"),
+            (AiToolkitOutcome::Internal, "internal"),
+        ];
+
+        for (capability, label) in capabilities {
+            assert_eq!(capability.as_label(), label);
+        }
+        for (outcome, label) in outcomes {
+            assert_eq!(outcome.as_label(), label);
+        }
+
+        let before = AI_TOOLKIT_OPERATIONS
+            .as_ref()
+            .map(|operations| operations.with_label_values(&["workflow", "success"]).get());
+        record_ai_toolkit_operation(AiToolkitCapability::Workflow, AiToolkitOutcome::Success);
+        let after = AI_TOOLKIT_OPERATIONS
+            .as_ref()
+            .map(|operations| operations.with_label_values(&["workflow", "success"]).get());
+        assert_eq!(after, before.map(|value| value + 1.0));
+    }
 
     #[test]
     fn bedrock_inline_verdict_is_labeled_separately_from_apply_guardrail() {

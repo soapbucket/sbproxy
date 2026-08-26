@@ -7011,14 +7011,17 @@ pub(super) async fn handle_ai_proxy(
                     {
                         let request_ctx = build_prompt_request_ctx(session, &parsed);
                         let overlay = sbproxy_ai::prompts::current_runtime_overlay();
-                        match bridge_responses_prompt_object(
+                        match bridge_responses_prompt_object_with_rollout(
                             &mut parsed,
+                            pipeline,
+                            origin_idx,
                             hostname,
+                            ctx,
                             &overlay,
                             config.prompts.as_ref(),
                             &request_ctx,
                         ) {
-                            Some(Ok(rendered)) => {
+                            Some(Ok(ResponsesPromptResolution::Store(rendered))) => {
                                 // Serializing a Value cannot realistically
                                 // fail; if it ever did, the original bytes
                                 // fall through and the translator's own
@@ -7030,7 +7033,30 @@ pub(super) async fn handle_ai_proxy(
                                     ctx.ai_prompt_version = Some(rendered.version);
                                 }
                             }
-                            Some(Err((status, message))) => {
+                            Some(Ok(ResponsesPromptResolution::Rollout(selected))) => {
+                                match serde_json::to_vec(&parsed) {
+                                    Ok(rewritten) => {
+                                        inbound_bytes = bytes::Bytes::from(rewritten);
+                                        ctx.ai_prompt_name = Some(selected.name);
+                                        ctx.ai_prompt_version = Some(selected.version.to_string());
+                                    }
+                                    Err(_) => {
+                                        record_ai_admission_refusal(
+                                            ctx,
+                                            surface_label,
+                                            "prompt_rollout_serialization_failed",
+                                        );
+                                        send_error(
+                                            session,
+                                            400,
+                                            "prompt error: selected rollout could not be applied",
+                                        )
+                                        .await?;
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                            Some(Err(ResponsesPromptRefusal::Store(status, message))) => {
                                 // The bridge returns prose rather than a
                                 // `ChatError`, so the code is chosen here.
                                 // Its two shapes (an unknown reference,
@@ -7048,6 +7074,20 @@ pub(super) async fn handle_ai_proxy(
                                     "AI proxy: Responses prompt bridge refused request"
                                 );
                                 send_error(session, status, &message).await?;
+                                return Ok(());
+                            }
+                            Some(Err(ResponsesPromptRefusal::Rollout(error))) => {
+                                record_ai_admission_refusal(
+                                    ctx,
+                                    surface_label,
+                                    "prompt_rollout_selection_failed",
+                                );
+                                warn!(
+                                    error = %error,
+                                    "AI proxy: Responses prompt rollout selection failed"
+                                );
+                                send_error(session, 400, "prompt error: rollout selection failed")
+                                    .await?;
                                 return Ok(());
                             }
                             None => {}
@@ -8076,51 +8116,54 @@ pub(super) async fn handle_ai_proxy(
     {
         let request_ctx = build_prompt_request_ctx(session, &body);
         let overlay = sbproxy_ai::prompts::current_runtime_overlay();
-        let result = overlay
-            .resolve(hostname, &reference, &request_ctx)
-            .or_else(|| {
-                config
-                    .prompts
-                    .as_ref()
-                    .map(|store| store.render(&reference, &request_ctx))
-            });
-        match result {
-            Some(Ok(rendered)) => {
+        match resolve_string_prompt_with_rollout(
+            pipeline,
+            origin_idx,
+            hostname,
+            ctx,
+            &reference,
+            &overlay,
+            config.prompts.as_ref(),
+            &request_ctx,
+        ) {
+            Some(Ok(StringPromptResolution::Store(rendered))) => {
                 prepend_system_message(&mut body, &rendered.text);
                 ctx.ai_prompt_name = Some(rendered.name);
                 ctx.ai_prompt_version = Some(rendered.version);
-                // Drop the gateway-only `prompt` field so it is not
-                // forwarded to the provider.
-                if let Some(obj) = body.as_object_mut() {
-                    obj.remove("prompt");
+                if let Some(object) = body.as_object_mut() {
+                    object.remove("prompt");
                 }
             }
-            Some(Err(e)) => {
+            Some(Ok(StringPromptResolution::Rollout(selected))) => {
+                prepend_system_message(&mut body, &selected.content);
+                ctx.ai_prompt_name = Some(selected.name);
+                ctx.ai_prompt_version = Some(selected.version.to_string());
+                if let Some(object) = body.as_object_mut() {
+                    object.remove("prompt");
+                }
+            }
+            Some(Err(StringPromptRefusal::Store(error))) => {
                 record_ai_admission_refusal(ctx, surface_label, "prompt_render_failed");
                 warn!(
                     reference = %prompt_reference_for_log(&reference),
-                    error = %e,
+                    error = %error,
                     "AI proxy: prompt render failed"
                 );
-                send_error(session, 400, &format!("prompt error: {e}")).await?;
+                send_error(session, 400, &format!("prompt error: {error}")).await?;
                 return Ok(());
             }
-            // A miss on both layers. On the canonical chat path this
-            // stays a pass-through: `prompt` is a legacy completions
-            // field there, an origin may have no `prompts:` block at
-            // all, and a provider that understands the field has every
-            // right to receive it. WOR-2597: on a native inbound
-            // surface it cannot be either of those things. `prompt` is
-            // not a field of the Anthropic Messages or OpenAI Responses
-            // wire format, so a caller who sent one meant this
-            // gateway's store, and forwarding the key to the provider
-            // would ship a gateway-only field upstream while running
-            // the request without the template it named. Refuse, and
-            // strip the key on the way out so no later path can
-            // forward it.
+            Some(Err(StringPromptRefusal::Rollout(error))) => {
+                record_ai_admission_refusal(ctx, surface_label, "prompt_rollout_selection_failed");
+                warn!(error = %error, "AI proxy: prompt rollout selection failed");
+                send_error(session, 400, "prompt error: rollout selection failed").await?;
+                return Ok(());
+            }
+            // A miss on every layer. On the canonical chat path this
+            // remains a pass-through. Native inbound surfaces must fail
+            // closed because `prompt` is a gateway-only field there.
             None if lifted_prompt_reference.is_some() => {
-                if let Some(obj) = body.as_object_mut() {
-                    obj.remove("prompt");
+                if let Some(object) = body.as_object_mut() {
+                    object.remove("prompt");
                 }
                 record_ai_admission_refusal(ctx, surface_label, "prompt_reference_not_found");
                 warn!(
@@ -18309,6 +18352,242 @@ fn bridge_responses_prompt_object(
     )
 }
 
+#[derive(Debug)]
+enum ResponsesPromptResolution {
+    Store(sbproxy_ai::prompts::RenderedPrompt),
+    Rollout(sbproxy_ai::toolkit::PromptSelectionResult),
+}
+
+#[derive(Debug)]
+enum ResponsesPromptRefusal {
+    Store(u16, String),
+    Rollout(sbproxy_ai::toolkit::ToolkitError),
+}
+
+#[derive(Debug)]
+enum StringPromptResolution {
+    Store(sbproxy_ai::prompts::RenderedPrompt),
+    Rollout(sbproxy_ai::toolkit::PromptSelectionResult),
+}
+
+#[derive(Debug)]
+enum StringPromptRefusal {
+    Store(sbproxy_ai::prompts::PromptError),
+    Rollout(sbproxy_ai::toolkit::ToolkitError),
+}
+
+/// Resolve string prompt references without allowing a generation rollout to
+/// shadow an operator's live overlay. Exact `name@version` references bypass
+/// rollout selection and keep their existing overlay/config semantics.
+#[allow(clippy::too_many_arguments)]
+fn resolve_string_prompt_with_rollout(
+    pipeline: &CompiledPipeline,
+    origin_idx: Option<usize>,
+    hostname: &str,
+    ctx: &RequestContext,
+    reference: &str,
+    overlay: &sbproxy_ai::prompts::RuntimePromptOverlay,
+    config_store: Option<&sbproxy_ai::prompts::PromptStore>,
+    request_ctx: &serde_json::Value,
+) -> Option<Result<StringPromptResolution, StringPromptRefusal>> {
+    if let Some(result) = overlay.resolve(hostname, reference, request_ctx) {
+        return Some(
+            result
+                .map(StringPromptResolution::Store)
+                .map_err(StringPromptRefusal::Store),
+        );
+    }
+    if !reference.contains('@') {
+        if let Some(result) = select_toolkit_prompt(pipeline, origin_idx, hostname, ctx, reference)
+        {
+            return Some(
+                result
+                    .map(StringPromptResolution::Rollout)
+                    .map_err(StringPromptRefusal::Rollout),
+            );
+        }
+    }
+    config_store.map(|store| {
+        store
+            .render(reference, request_ctx)
+            .map(StringPromptResolution::Store)
+            .map_err(StringPromptRefusal::Store)
+    })
+}
+
+/// Resolve an object prompt with the same precedence as the string path:
+/// runtime overlay, generation rollout for a valid bare reference, then the
+/// config-declared prompt store. Explicit versions never enter a rollout.
+#[allow(clippy::too_many_arguments)]
+fn bridge_responses_prompt_object_with_rollout(
+    body: &mut serde_json::Value,
+    pipeline: &CompiledPipeline,
+    origin_idx: Option<usize>,
+    hostname: &str,
+    ctx: &RequestContext,
+    overlay: &sbproxy_ai::prompts::RuntimePromptOverlay,
+    config_store: Option<&sbproxy_ai::prompts::PromptStore>,
+    request_ctx: &serde_json::Value,
+) -> Option<Result<ResponsesPromptResolution, ResponsesPromptRefusal>> {
+    let rollout_name = bare_responses_rollout_name(body);
+    let overlay_owns_name = rollout_name.is_some_and(|name| {
+        overlay
+            .by_host
+            .get(hostname)
+            .is_some_and(|store| store.templates.contains_key(name))
+    });
+
+    if !overlay_owns_name {
+        if let Some(selection) =
+            bridge_toolkit_responses_prompt_object(body, pipeline, origin_idx, hostname, ctx)
+        {
+            return Some(
+                selection
+                    .map(ResponsesPromptResolution::Rollout)
+                    .map_err(ResponsesPromptRefusal::Rollout),
+            );
+        }
+    }
+
+    bridge_responses_prompt_object(body, hostname, overlay, config_store, request_ctx).map(
+        |result| {
+            result
+                .map(ResponsesPromptResolution::Store)
+                .map_err(|(status, message)| ResponsesPromptRefusal::Store(status, message))
+        },
+    )
+}
+
+/// Return the bare rollout name only when the whole Responses object has the
+/// strict supported shape. Malformed objects stay on the existing bridge so
+/// its typed 400 refusal cannot be bypassed by a matching rollout name.
+fn bare_responses_rollout_name(body: &serde_json::Value) -> Option<&str> {
+    let prompt = body.get("prompt")?.as_object()?;
+    if prompt
+        .keys()
+        .any(|key| !matches!(key.as_str(), "id" | "version" | "variables"))
+    {
+        return None;
+    }
+    if prompt
+        .get("version")
+        .is_some_and(|version| !version.is_null())
+    {
+        return None;
+    }
+    match prompt.get("variables") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::Object(variables))
+            if variables.values().all(serde_json::Value::is_string) => {}
+        _ => return None,
+    }
+    prompt.get("id")?.as_str().filter(|name| !name.is_empty())
+}
+
+/// Resolve a bare Responses prompt object through this pipeline generation's
+/// weighted rollout store. Explicit versions deliberately return `None` so the
+/// canonical prompt-store bridge below remains authoritative for pinned calls.
+fn bridge_toolkit_responses_prompt_object(
+    body: &mut serde_json::Value,
+    pipeline: &CompiledPipeline,
+    origin_idx: Option<usize>,
+    hostname: &str,
+    ctx: &RequestContext,
+) -> Option<Result<sbproxy_ai::toolkit::PromptSelectionResult, sbproxy_ai::toolkit::ToolkitError>> {
+    let name = bare_responses_rollout_name(body)?;
+    let selection = select_toolkit_prompt(pipeline, origin_idx, hostname, ctx, name)?;
+    Some(selection.map(|selected| {
+        prepend_responses_instructions(body, &selected.content);
+        if let Some(object) = body.as_object_mut() {
+            object.remove("prompt");
+        }
+        selected
+    }))
+}
+
+/// Select a bare prompt name with a content-free stable cohort key. A missing
+/// rollout is a normal fall-through to the existing prompt store.
+fn select_toolkit_prompt(
+    pipeline: &CompiledPipeline,
+    origin_idx: Option<usize>,
+    hostname: &str,
+    ctx: &RequestContext,
+    name: &str,
+) -> Option<Result<sbproxy_ai::toolkit::PromptSelectionResult, sbproxy_ai::toolkit::ToolkitError>> {
+    let origin_id = origin_idx
+        .and_then(|index| pipeline.config.origins.get(index))
+        .map(|origin| origin.origin_id.as_str())
+        .unwrap_or(hostname);
+    let scope = match sbproxy_ai::toolkit::ToolkitScope::new(origin_id, ctx.tenant_id.as_str()) {
+        Ok(scope) => scope,
+        Err(error) => {
+            sbproxy_ai::ai_metrics::record_ai_toolkit_operation(
+                sbproxy_ai::ai_metrics::AiToolkitCapability::PromptRollout,
+                sbproxy_ai::ai_metrics::AiToolkitOutcome::Invalid,
+            );
+            return Some(Err(error));
+        }
+    };
+    match pipeline.ai_toolkit.has_prompt_rollout(&scope, name) {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(error) => {
+            sbproxy_ai::ai_metrics::record_ai_toolkit_operation(
+                sbproxy_ai::ai_metrics::AiToolkitCapability::PromptRollout,
+                sbproxy_ai::ai_metrics::AiToolkitOutcome::Invalid,
+            );
+            return Some(Err(error));
+        }
+    }
+    let request = sbproxy_ai::toolkit::PromptSelectionRequest {
+        scope: scope.clone(),
+        name: name.to_string(),
+        cohort: prompt_rollout_cohort(ctx),
+    };
+    let result = pipeline.ai_toolkit.select_prompt(request);
+    if let Ok(selected) = &result {
+        publish_request_prompt_selection(hostname, &scope, selected);
+    }
+    Some(result)
+}
+
+fn publish_request_prompt_selection(
+    hostname: &str,
+    scope: &sbproxy_ai::toolkit::ToolkitScope,
+    selected: &sbproxy_ai::toolkit::PromptSelectionResult,
+) {
+    use sbproxy_observe::events::{AiPromptRolloutSelectedData, AiToolkitEventOutcome};
+
+    let Ok(data) = AiPromptRolloutSelectedData::new(
+        &scope.origin_id,
+        &selected.name,
+        selected.version,
+        AiToolkitEventOutcome::Success,
+        &selected.cohort_digest,
+    ) else {
+        return;
+    };
+    let event = data.into_proxy_event(hostname, scope.tenant_id.clone());
+    sbproxy_observe::publish_proxy_event(
+        sbproxy_observe::EventType::AiPromptRolloutSelected,
+        || event,
+    );
+}
+
+fn prompt_rollout_cohort(ctx: &RequestContext) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    let mut digest = Sha256::new();
+    for component in [
+        ctx.tenant_id.as_bytes(),
+        ctx.principal.api_key_id().as_bytes(),
+    ] {
+        digest.update((component.len() as u64).to_be_bytes());
+        digest.update(component);
+    }
+    hex::encode(digest.finalize())
+}
+
 #[cfg(test)]
 mod responses_prompt_bridge_tests {
     use super::*;
@@ -18338,6 +18617,187 @@ mod responses_prompt_bridge_tests {
             Some(&store()),
             &serde_json::json!({}),
         )
+    }
+
+    fn rollout_pipeline() -> CompiledPipeline {
+        let compiled = sbproxy_config::compile_config(
+            r#"
+proxy:
+  ai_toolkit:
+    prompt_rollouts:
+      - origin: ai.test
+        name: concierge
+        salt: stable-test-salt
+        versions:
+          - version: 1
+            content: rollout one
+            weight: 1.0
+          - version: 2
+            content: rollout two
+            weight: 1.0
+origins:
+  ai.test:
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: ok
+"#,
+        )
+        .expect("rollout config compiles");
+        CompiledPipeline::from_config_for_validation(compiled)
+            .expect("rollout runtime validates without side effects")
+    }
+
+    fn overlay_with_same_prompt_name() -> sbproxy_ai::prompts::RuntimePromptOverlay {
+        let overlay_store: sbproxy_ai::prompts::PromptStore =
+            serde_json::from_value(serde_json::json!({
+                "templates": {
+                    "concierge": {
+                        "default_version": "9",
+                        "versions": {
+                            "9": { "template": "runtime overlay wins" }
+                        }
+                    }
+                }
+            }))
+            .expect("overlay prompt store");
+        sbproxy_ai::prompts::RuntimePromptOverlay {
+            by_host: std::collections::HashMap::from([("ai.test".into(), overlay_store)]),
+        }
+    }
+
+    #[test]
+    fn runtime_overlay_wins_over_rollout_for_string_reference() {
+        let pipeline = rollout_pipeline();
+        let overlay = overlay_with_same_prompt_name();
+        let ctx = RequestContext::new();
+        let result = resolve_string_prompt_with_rollout(
+            &pipeline,
+            Some(0),
+            "ai.test",
+            &ctx,
+            "concierge",
+            &overlay,
+            None,
+            &serde_json::json!({}),
+        )
+        .expect("prompt resolves")
+        .expect("overlay renders");
+        match result {
+            StringPromptResolution::Store(rendered) => {
+                assert_eq!(rendered.text, "runtime overlay wins");
+                assert_eq!(rendered.version, "9");
+            }
+            StringPromptResolution::Rollout(_) => panic!("rollout shadowed runtime overlay"),
+        }
+    }
+
+    #[test]
+    fn runtime_overlay_wins_over_rollout_for_responses_object() {
+        let pipeline = rollout_pipeline();
+        let overlay = overlay_with_same_prompt_name();
+        let ctx = RequestContext::new();
+        let mut body = serde_json::json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "prompt": {"id": "concierge"}
+        });
+        let result = bridge_responses_prompt_object_with_rollout(
+            &mut body,
+            &pipeline,
+            Some(0),
+            "ai.test",
+            &ctx,
+            &overlay,
+            None,
+            &serde_json::json!({}),
+        )
+        .expect("prompt object resolves")
+        .expect("overlay renders");
+        match result {
+            ResponsesPromptResolution::Store(rendered) => {
+                assert_eq!(rendered.text, "runtime overlay wins");
+                assert_eq!(rendered.version, "9");
+                assert_eq!(body["instructions"], "runtime overlay wins");
+            }
+            ResponsesPromptResolution::Rollout(_) => {
+                panic!("rollout shadowed runtime overlay")
+            }
+        }
+    }
+
+    #[test]
+    fn bare_responses_prompt_object_uses_the_generation_rollout() {
+        let pipeline = rollout_pipeline();
+        let mut body = serde_json::json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "prompt": {"id": "concierge"}
+        });
+        let ctx = RequestContext::new();
+        let selected =
+            bridge_toolkit_responses_prompt_object(&mut body, &pipeline, Some(0), "ai.test", &ctx)
+                .expect("bare object is a rollout candidate")
+                .expect("rollout selects");
+        assert_eq!(selected.name, "concierge");
+        assert!(selected.version == 1 || selected.version == 2);
+        assert!(body.get("prompt").is_none());
+        assert!(matches!(
+            body["instructions"].as_str(),
+            Some("rollout one" | "rollout two")
+        ));
+    }
+
+    #[test]
+    fn explicit_responses_prompt_version_bypasses_the_rollout() {
+        let pipeline = rollout_pipeline();
+        let mut body = serde_json::json!({
+            "prompt": {"id": "concierge", "version": "1"}
+        });
+        let ctx = RequestContext::new();
+        assert!(bridge_toolkit_responses_prompt_object(
+            &mut body,
+            &pipeline,
+            Some(0),
+            "ai.test",
+            &ctx,
+        )
+        .is_none());
+        assert_eq!(body["prompt"]["version"], "1");
+    }
+
+    #[test]
+    fn absent_valid_rollout_falls_through_without_selection() {
+        let pipeline = rollout_pipeline();
+        let mut body = serde_json::json!({"prompt": {"id": "not-configured"}});
+        let ctx = RequestContext::new();
+        assert!(bridge_toolkit_responses_prompt_object(
+            &mut body,
+            &pipeline,
+            Some(0),
+            "ai.test",
+            &ctx,
+        )
+        .is_none());
+        assert_eq!(body["prompt"]["id"], "not-configured");
+    }
+
+    #[test]
+    fn oversized_bare_rollout_name_is_rejected_before_lookup() {
+        let pipeline = rollout_pipeline();
+        let oversized = "x".repeat(129);
+        let mut body = serde_json::json!({"prompt": {"id": oversized}});
+        let ctx = RequestContext::new();
+        let error =
+            bridge_toolkit_responses_prompt_object(&mut body, &pipeline, Some(0), "ai.test", &ctx)
+                .expect("a malformed candidate is a refusal")
+                .expect_err("oversized rollout names fail closed");
+        assert!(matches!(
+            error,
+            sbproxy_ai::toolkit::ToolkitError::LimitExceeded { .. }
+                | sbproxy_ai::toolkit::ToolkitError::InvalidConfiguration { .. }
+        ));
     }
 
     #[test]

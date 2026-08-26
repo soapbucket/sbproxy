@@ -274,6 +274,37 @@ pub fn resolve_secret_reference(reference: &str, field: &str) -> anyhow::Result<
     )
 }
 
+/// Resolve a required secret reference under a caller-owned byte ceiling.
+///
+/// This is the shared startup path for bounded credentials. It preserves the
+/// process resolver's provider authority while ensuring `file:` references
+/// stop reading after `max_bytes + 1`. Plain strings and unknown provider
+/// schemes fail closed instead of becoming literal credential material.
+pub fn resolve_secret_reference_bounded(
+    reference: &str,
+    field: &str,
+    max_bytes: usize,
+) -> anyhow::Result<String> {
+    let reference = reference.trim();
+    if !sbproxy_config::is_secret_reference(reference) {
+        anyhow::bail!("{field} must be a valid secret reference");
+    }
+    if reference.contains("://") {
+        sbproxy_vault::VaultRef::parse(reference)
+            .map_err(|error| anyhow::anyhow!("resolve {field}: {error}"))?;
+    }
+
+    let resolved = match sbproxy_vault::process_resolver() {
+        Some(resolver) => resolver.resolve_bounded(reference, max_bytes),
+        None => sbproxy_vault::SecretResolver::new().resolve_bounded(reference, max_bytes),
+    }
+    .map_err(|error| anyhow::anyhow!("resolve {field}: {error:#}"))?;
+    if resolved.is_empty() {
+        anyhow::bail!("{field} must not resolve to an empty value");
+    }
+    Ok(resolved)
+}
+
 /// Whether the `git` binary this host would use is present and runnable,
 /// and what it reports as its version.
 ///
@@ -979,6 +1010,46 @@ mod tests {
             !debug.contains(&secret_path.to_string_lossy().to_string()),
             "{debug}"
         );
+    }
+
+    #[test]
+    fn bounded_secret_resolution_caps_file_input_before_materializing_it() {
+        let exact = tempfile::NamedTempFile::new().expect("exact secret file");
+        std::fs::write(exact.path(), b"12345678").expect("write exact secret");
+        let exact_reference = format!("file:{}", exact.path().display());
+        assert_eq!(
+            resolve_secret_reference_bounded(&exact_reference, "test.secret", 8)
+                .expect("exact bound resolves"),
+            "12345678"
+        );
+
+        let oversized = tempfile::NamedTempFile::new().expect("oversized secret file");
+        std::fs::write(oversized.path(), vec![b'x'; 1024 * 1024]).expect("write oversized secret");
+        let oversized_reference = format!("file:{}", oversized.path().display());
+        let mut result = None;
+        let allocations = allocation_counter::measure(|| {
+            result = Some(resolve_secret_reference_bounded(
+                &oversized_reference,
+                "test.secret",
+                8,
+            ));
+        });
+        let error = result
+            .expect("measured call stores its result")
+            .expect_err("the ninth byte must be refused");
+        assert!(error.to_string().contains("8-byte limit"), "{error:#}");
+        assert!(
+            allocations.bytes_total < 64 * 1024,
+            "bounded resolution must not allocate the 1 MiB file: {allocations:?}"
+        );
+    }
+
+    #[test]
+    fn bounded_secret_resolution_rejects_unknown_provider_schemes() {
+        let error =
+            resolve_secret_reference_bounded("typo-secret://backend/name", "test.secret", 256)
+                .expect_err("an unknown provider scheme must not become literal secret material");
+        assert!(error.to_string().contains("test.secret"), "{error:#}");
     }
 
     #[test]

@@ -81,8 +81,8 @@ Route AI, govern the AI that calls you, and run AI models yourself.
 - [classifier-sidecar.md](classifier-sidecar.md) - running the ONNX classifier as a sidecar instead of in-process, and when that trade is worth it.
 - [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md) - the `outcome_aware` strategy: route by realized cost-per-success fed back from completed requests.
 - [intent-detection.md](intent-detection.md) - configure stock classifier-backed prompt intent and quality-based provider routing, including fail-open state visibility.
-- [prompt-versioning.md](prompt-versioning.md) - named, weighted prompt template versions for gradual rollouts and A/B experiments, distinct from the config-declared stored-prompt store above.
-- [ai-evaluation-harness.md](ai-evaluation-harness.md) - offline LLM-as-judge prompting, experiment tracking, versioned datasets, and custom pass/fail metrics.
+- [prompt-versioning.md](prompt-versioning.md) - live, scoped, stable weighted prompt rollouts with a config, admin, CLI, event, and metric contract.
+- [ai-evaluation-harness.md](ai-evaluation-harness.md) - immutable dataset registration and offline evaluation of recorded responses through the live authenticated toolkit runtime.
 - [ai-predictive-budget.md](ai-predictive-budget.md) - predictive budgets with soft-landing: warn, then downgrade, then block as a scope approaches its cap.
 - [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md) - classify upstream failures (timeout, rate-limit, context-window, content-policy) and set per-error retry counts.
 - [ai-context-compression.md](ai-context-compression.md) - selectable compression profiles, explicit input budgets, Redis summary state, value accounting, evaluation, metrics, and logs.
@@ -113,7 +113,7 @@ Route AI, govern the AI that calls you, and run AI models yourself.
 - [admin-mcp.md](admin-mcp.md) - manage SBproxy from an MCP client: the gateway's own admin API as governed, read-only-by-default MCP tools for Claude Code or Cursor.
 - [tool-versioning.md](tool-versioning.md) - the rollout plane (publish several versions of one tool, resolve per consumer, adapt, sunset) plus the compatibility oracle: a contract digest and a semver grade per tool, with a version-bump linter that fails an under-bump.
 - [a2a-gateway.md](a2a-gateway.md) - the `a2a` action and policy: envelope trust, per-hop chain limits, push-notification target validation, typed AgentCard, and modality negotiation helpers.
-- [agent-orchestration.md](agent-orchestration.md) - in-process multi-agent workflow toolkit (capability discovery, FSM orchestrator, shared-secret agent auth); not the same A2A as the entry above.
+- [agent-orchestration.md](agent-orchestration.md) - governed agent discovery and bounded finite-state workflows through the live authenticated toolkit runtime; not the same A2A as the entry above.
 - [agent-skills.md](agent-skills.md) - Agent Skills v0.2.0 well-known projection: schema, integrity, archive safety, no-script-execution contract.
 - [cloudflare-code-mode.md](cloudflare-code-mode.md) - typed TypeScript module emission for Cloudflare Code Mode agents over the MCP federation registry.
 - [content-for-agents.md](content-for-agents.md) - operator guide to agent-aware content delivery: shape negotiation, body transforms, well-known license posture.
@@ -185,7 +185,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [audit-log.md](audit-log.md) - tamper-evident audit log of admin actions.
 - [observability.md](observability.md) - metrics, logs, traces, and the bundled dashboards.
 - [clickhouse-attribution.md](clickhouse-attribution.md) - access-log schema, pre-aggregations, and sample attribution queries.
-- [events.md](events.md) - the thirteen typed events, the `events:` file and webhook sinks, decision-audit, and how the pieces fit into a SIEM integration.
+- [events.md](events.md) - the twenty-two typed events, the `events:` file and webhook sinks, decision-audit, and how the pieces fit into a SIEM integration.
 - [metrics-stability.md](metrics-stability.md) - Prometheus metric naming and stability.
 - [decision-records.md](decision-records.md) - what a SIEM consumer may rely on from the decision-audit feed.
 - [operator-runbook.md](operator-runbook.md) - the `runbook_id` index every paging alert resolves through, a response section per id, plus dashboard triage and rollback actions.

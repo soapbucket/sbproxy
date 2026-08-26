@@ -92,6 +92,8 @@ pub enum EgressPurpose {
     AiProvider,
     /// AI judge / evaluation endpoint.
     AiJudge,
+    /// Agent endpoint invoked by the governed AI workflow runner.
+    AgentOrchestration,
     /// Stock intent and provider-quality classifier hook RPC.
     ClassifierHook,
     /// Federated MCP upstream.
@@ -126,6 +128,7 @@ impl EgressPurpose {
         match self {
             Self::AiProvider => "ai_provider",
             Self::AiJudge => "ai_judge",
+            Self::AgentOrchestration => "agent_orchestration",
             Self::ClassifierHook => "classifier_hook",
             Self::McpUpstream => "mcp_upstream",
             Self::OpenApiTool => "openapi_tool",
@@ -1658,6 +1661,7 @@ mod tests {
         for (purpose, expected) in [
             (EgressPurpose::AiProvider, "ai_provider"),
             (EgressPurpose::AiJudge, "ai_judge"),
+            (EgressPurpose::AgentOrchestration, "agent_orchestration"),
             (EgressPurpose::ClassifierHook, "classifier_hook"),
             (EgressPurpose::McpUpstream, "mcp_upstream"),
             (EgressPurpose::OpenApiTool, "openapi_tool"),

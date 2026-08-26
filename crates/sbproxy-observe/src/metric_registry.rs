@@ -1041,6 +1041,17 @@ pub const METRICS: &[MetricCapability] = &[
         description: "Quality-hook routing decisions by selected or fallback outcome.",
         dead_reason: None,
     },
+    MetricCapability {
+        name: "sbproxy_ai_toolkit_operations_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_ai_toolkit_operation"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["capability", "outcome"],
+        description: "AI toolkit operations by capability (workflow, evaluation, prompt_rollout) and terminal outcome (success, invalid, unauthorized, not_found, egress_refused, timeout, body_too_large, response_too_large, internal).",
+        dead_reason: None,
+    },
     // Rich classifier sidecar metrics. These use the Prometheus default
     // registry inside the standalone `sbproxy-classifier` process, and the
     // writer symbols below live in that binary crate. Keeping them in this

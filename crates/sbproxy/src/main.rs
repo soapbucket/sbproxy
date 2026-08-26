@@ -67,7 +67,9 @@ const HELP_FOOTER: &str = concat!(
 struct Cli {
     /// Print the version line and exit. Output shape:
     /// `sbproxy <semver> (rev <sha>, built <yyyy-mm-dd>)`.
-    #[arg(short = 'V', long = "version", action = ArgAction::SetTrue, global = true)]
+    /// Keep this root-scoped: `ai evaluate --version <u32>` uses the same
+    /// public spelling for an immutable dataset version.
+    #[arg(short = 'V', long = "version", action = ArgAction::SetTrue)]
     version: bool,
 
     /// Validate the config and exit without starting the proxy.
@@ -793,7 +795,9 @@ enum AiSub {
     Prompt(Box<PromptCmd>),
     /// Validate or execute a bounded agent workflow.
     Workflow(WorkflowCmd),
-    /// Run deterministic offline checks over a versioned evaluation dataset.
+    /// Register immutable evaluation datasets with the live toolkit runtime.
+    Dataset(DatasetCmd),
+    /// Run a bounded evaluation against an exact live dataset version.
     Evaluate(EvaluateArgs),
 }
 
@@ -819,35 +823,118 @@ struct WorkflowCmd {
 
 #[derive(Subcommand, Debug)]
 enum WorkflowSub {
-    /// Validate a YAML workflow graph and its execution bound.
+    /// Discover configured agents by capability through the admin API.
+    Discover(WorkflowDiscoverArgs),
+    /// Validate a YAML workflow graph through the live admin API.
     Validate(WorkflowValidateArgs),
-    /// Apply an ordered outcome sequence to a YAML workflow.
+    /// Execute a configured workflow through the live admin API.
     Run(WorkflowRunArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct WorkflowDiscoverArgs {
+    /// Configured proxy origin that owns the agent registry.
+    #[arg(long)]
+    origin: String,
+    /// Optional capability used to filter the discovered agents.
+    #[arg(long)]
+    capability: Option<String>,
+    /// Admin endpoint and credentials.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
 }
 
 #[derive(clap::Args, Debug)]
 struct WorkflowValidateArgs {
     /// YAML file containing the workflow graph.
     path: PathBuf,
+    /// Configured proxy origin that will own the workflow.
+    #[arg(long)]
+    origin: String,
+    /// Admin endpoint and credentials.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
 }
 
 #[derive(clap::Args, Debug)]
 struct WorkflowRunArgs {
-    /// YAML file containing the workflow graph.
-    path: PathBuf,
-    /// Outcome to apply at the current state. Repeat in execution order.
-    #[arg(long = "outcome", required = true)]
-    outcomes: Vec<String>,
+    /// Configured proxy origin that owns the workflow.
+    #[arg(long)]
+    origin: String,
+    /// Name of a configured workflow.
+    #[arg(long)]
+    workflow: String,
+    /// JSON input passed to the workflow's initial capability.
+    #[arg(long)]
+    input: PathBuf,
+    /// Admin endpoint and credentials.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
+}
+
+#[derive(clap::Args, Debug)]
+struct DatasetCmd {
+    #[command(subcommand)]
+    sub: DatasetSub,
+}
+
+#[derive(Subcommand, Debug)]
+enum DatasetSub {
+    /// Register one immutable, explicitly versioned JSON dataset.
+    Register(DatasetRegisterArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct DatasetRegisterArgs {
+    /// Configured proxy origin that owns the dataset.
+    #[arg(long)]
+    origin: String,
+    /// JSON file containing one explicitly versioned dataset.
+    #[arg(long)]
+    dataset: PathBuf,
+    /// Admin endpoint and credentials.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
 }
 
 #[derive(clap::Args, Debug)]
 struct EvaluateArgs {
-    /// JSON file containing one explicitly versioned dataset.
+    /// Configured proxy origin that owns the dataset.
     #[arg(long)]
-    dataset: PathBuf,
+    origin: String,
+    /// Exact registered dataset name.
+    #[arg(long)]
+    dataset: String,
+    /// Exact immutable dataset version.
+    #[arg(long)]
+    version: u32,
     /// JSON array of model response strings, one per dataset entry.
     #[arg(long)]
     responses: PathBuf,
+    /// Stable operator-supplied experiment identifier.
+    #[arg(long = "experiment-id")]
+    experiment_id: String,
+    /// Human-readable experiment name.
+    #[arg(long = "experiment-name")]
+    experiment_name: String,
+    /// Model label recorded with the evaluation summary.
+    #[arg(long)]
+    model: String,
+    /// Optional concrete prompt version recorded with the evaluation.
+    #[arg(long = "prompt-version")]
+    prompt_version: Option<String>,
+    /// Optional JSON object of bounded experiment parameters.
+    #[arg(long)]
+    parameters: Option<PathBuf>,
+    /// Optional JSON array of offline judge responses, one per case.
+    #[arg(long = "judge-responses")]
+    judge_responses: Option<PathBuf>,
+    /// Judge model label required with `--judge-responses`.
+    #[arg(long = "judge-model")]
+    judge_model: Option<String>,
+    /// Judge criterion. Repeat to score several criteria.
+    #[arg(long = "judge-criterion")]
+    judge_criteria: Vec<String>,
     /// Keyword every response must contain. Repeat to require several.
     #[arg(long = "required-keyword")]
     required_keywords: Vec<String>,
@@ -860,22 +947,26 @@ struct EvaluateArgs {
     /// Maximum response length in bytes.
     #[arg(long = "max-bytes", default_value_t = 1024 * 1024)]
     max_bytes: usize,
+    /// Admin endpoint and credentials.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
 }
 
 #[derive(clap::Args, Debug)]
 struct PromptSelectArgs {
+    /// Configured proxy origin that owns the prompt rollout.
+    #[arg(long)]
+    origin: String,
     /// Prompt name to select.
     #[arg(long)]
     name: String,
-    /// JSON array of weighted prompt versions.
-    #[arg(long)]
-    versions: PathBuf,
-    /// Stable caller or experiment cohort key.
+    /// Stable dry-run cohort key. The authenticated admin scope is added
+    /// server-side before selection.
     #[arg(long)]
     cohort: String,
-    /// Experiment salt used to isolate independent rollouts.
-    #[arg(long)]
-    salt: String,
+    /// Admin endpoint and credentials.
+    #[command(flatten)]
+    admin: ModelsAdminArgs,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -9059,6 +9150,26 @@ enum AdminOutcome {
     Unreachable(String),
 }
 
+/// Decode one admin JSON response without ever retaining more than the
+/// caller's fixed ceiling plus the sentinel byte used to detect overflow.
+fn read_bounded_admin_json(
+    reader: impl std::io::Read,
+    maximum: usize,
+    surface: &str,
+) -> anyhow::Result<serde_json::Value> {
+    use std::io::Read as _;
+
+    let mut bytes = Vec::new();
+    reader
+        .take((maximum as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| anyhow::anyhow!("read {surface} admin response: {error}"))?;
+    if bytes.len() > maximum {
+        anyhow::bail!("{surface} admin response exceeds the {maximum} byte limit");
+    }
+    Ok(serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+}
+
 /// Send one admin request, returning the status alongside the body.
 ///
 /// `admin_request_json` collapses every non-2xx into an error, which is
@@ -9071,6 +9182,46 @@ fn admin_request_parts(
     method: reqwest::Method,
     path: &str,
     body: Option<AdminRequestBody>,
+) -> anyhow::Result<AdminOutcome> {
+    admin_request_parts_with_timeout(args, method, path, body, std::time::Duration::from_secs(60))
+}
+
+fn admin_request_parts_with_timeout(
+    args: &ModelsAdminArgs,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<AdminRequestBody>,
+    timeout: std::time::Duration,
+) -> anyhow::Result<AdminOutcome> {
+    admin_request_parts_inner(args, method, path, body, timeout, None)
+}
+
+fn admin_request_parts_bounded_with_timeout(
+    args: &ModelsAdminArgs,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<AdminRequestBody>,
+    timeout: std::time::Duration,
+    maximum_response_bytes: usize,
+    surface: &'static str,
+) -> anyhow::Result<AdminOutcome> {
+    admin_request_parts_inner(
+        args,
+        method,
+        path,
+        body,
+        timeout,
+        Some((maximum_response_bytes, surface)),
+    )
+}
+
+fn admin_request_parts_inner(
+    args: &ModelsAdminArgs,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<AdminRequestBody>,
+    timeout: std::time::Duration,
+    response_limit: Option<(usize, &'static str)>,
 ) -> anyhow::Result<AdminOutcome> {
     use zeroize::Zeroize;
 
@@ -9088,7 +9239,7 @@ fn admin_request_parts(
         // Publishing runs the full boot-equivalent validation on the
         // server, so the read budget matches `apply`'s rather than the
         // 30s the read-only model-host routes use.
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(timeout)
         .build()?;
     let mut request = client
         .request(method, &url)
@@ -9111,7 +9262,18 @@ fn admin_request_parts(
         Err(error) => return Ok(AdminOutcome::Unreachable(error.to_string())),
     };
     let status = response.status();
-    let body = response.json().unwrap_or(serde_json::Value::Null);
+    if let Some((maximum, surface)) = response_limit {
+        if response
+            .content_length()
+            .is_some_and(|length| length > maximum as u64)
+        {
+            anyhow::bail!("{surface} admin response exceeds the {maximum} byte limit");
+        }
+    }
+    let body = match response_limit {
+        Some((maximum, surface)) => read_bounded_admin_json(response, maximum, surface)?,
+        None => response.json().unwrap_or(serde_json::Value::Null),
+    };
     Ok(AdminOutcome::Answered { status, body })
 }
 
@@ -10511,192 +10673,253 @@ fn handle_ai_subcommand(cmd: &AiCmd) -> anyhow::Result<i32> {
             PromptSub::Select(args) => handle_prompt_select(args),
         },
         AiSub::Workflow(workflow) => match &workflow.sub {
+            WorkflowSub::Discover(args) => handle_workflow_discover(args),
             WorkflowSub::Validate(args) => handle_workflow_validate(args),
             WorkflowSub::Run(args) => handle_workflow_run(args),
+        },
+        AiSub::Dataset(dataset) => match &dataset.sub {
+            DatasetSub::Register(args) => handle_dataset_register(args),
         },
         AiSub::Evaluate(args) => handle_ai_evaluate(args),
     }
 }
 
-const MAX_AI_TOOL_INPUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_AI_TOOLKIT_DOCUMENT_BYTES: usize = 256 * 1024;
+const MAX_AI_WORKFLOW_INPUT_BYTES: usize = 256 * 1024;
+const MAX_AI_TOOLKIT_ADMIN_RESPONSE_BYTES: usize = 1024 * 1024;
 
-fn load_workflow(
-    path: &std::path::Path,
-) -> anyhow::Result<sbproxy_ai::agent_orchestration::FsmWorkflow> {
-    let bytes = read_bounded_cli_file(path, MAX_AI_TOOL_INPUT_BYTES, "workflow")?;
+fn load_workflow_document(path: &std::path::Path) -> anyhow::Result<serde_json::Value> {
+    let bytes = read_bounded_cli_file(path, MAX_AI_TOOLKIT_DOCUMENT_BYTES, "workflow")?;
     serde_yaml::from_slice(&bytes)
         .map_err(|error| anyhow::anyhow!("parse workflow {}: {error}", path.display()))
 }
 
+fn load_ai_toolkit_json(
+    path: &std::path::Path,
+    limit: usize,
+    description: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let bytes = read_bounded_cli_file(path, limit, description)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| anyhow::anyhow!("parse {description} {}: {error}", path.display()))
+}
+
+fn handle_ai_toolkit_admin(
+    command: &str,
+    admin: &ModelsAdminArgs,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> anyhow::Result<i32> {
+    validate_ai_toolkit_admin_body(command, body.as_ref())?;
+    match admin_request_parts_bounded_with_timeout(
+        admin,
+        method,
+        path,
+        body.map(AdminRequestBody::Json),
+        std::time::Duration::from_secs(65),
+        MAX_AI_TOOLKIT_ADMIN_RESPONSE_BYTES,
+        "AI toolkit",
+    )? {
+        AdminOutcome::Answered { status, body } if status.is_success() => {
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            Ok(0)
+        }
+        AdminOutcome::Answered { status, body } => Ok(report_admin_refusal(command, status, &body)),
+        AdminOutcome::Unreachable(reason) => Ok(report_admin_unreachable(command, admin, &reason)),
+    }
+}
+
+fn validate_ai_toolkit_admin_body(
+    command: &str,
+    body: Option<&serde_json::Value>,
+) -> anyhow::Result<()> {
+    let Some(value) = body else {
+        return Ok(());
+    };
+    let bytes = serde_json::to_vec(value)?;
+    if bytes.len() > MAX_AI_TOOLKIT_DOCUMENT_BYTES {
+        anyhow::bail!(
+            "{command} request exceeds the {MAX_AI_TOOLKIT_DOCUMENT_BYTES}-byte aggregate limit"
+        );
+    }
+    Ok(())
+}
+
+fn handle_workflow_discover(args: &WorkflowDiscoverArgs) -> anyhow::Result<i32> {
+    let mut url = reqwest::Url::parse("http://localhost/admin/ai-toolkit/agents")?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("origin", &args.origin);
+        if let Some(capability) = args.capability.as_deref() {
+            query.append_pair("capability", capability);
+        }
+    }
+    let path = match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_string(),
+    };
+    handle_ai_toolkit_admin(
+        "ai workflow discover",
+        &args.admin,
+        reqwest::Method::GET,
+        &path,
+        None,
+    )
+}
+
 fn handle_workflow_validate(args: &WorkflowValidateArgs) -> anyhow::Result<i32> {
-    let workflow = load_workflow(&args.path)?;
-    println!(
-        "workflow validate: OK ({:?}, max {} steps)",
-        workflow.name(),
-        workflow.max_steps()
-    );
-    Ok(0)
+    let workflow = load_workflow_document(&args.path)?;
+    handle_ai_toolkit_admin(
+        "ai workflow validate",
+        &args.admin,
+        reqwest::Method::POST,
+        "/admin/ai-toolkit/workflows/validate",
+        Some(serde_json::json!({
+            "origin": args.origin,
+            "workflow": workflow,
+        })),
+    )
 }
 
 fn handle_workflow_run(args: &WorkflowRunArgs) -> anyhow::Result<i32> {
-    let workflow = load_workflow(&args.path)?;
-    let workflow_name = workflow.name().to_string();
-    let mut execution = sbproxy_ai::agent_orchestration::FsmExecution::new(workflow);
-    for outcome in &args.outcomes {
-        execution.transition(outcome)?;
-        if execution.is_completed() {
-            break;
-        }
-    }
-    println!(
-        "{}",
-        serde_json::to_string(&serde_json::json!({
-            "workflow": workflow_name,
-            "state": execution.current_state(),
-            "action": execution.current_action(),
-            "completed": execution.is_completed(),
-            "steps": execution.history().len(),
-        }))?
+    let input = load_ai_toolkit_json(&args.input, MAX_AI_WORKFLOW_INPUT_BYTES, "workflow input")?;
+    handle_ai_toolkit_admin(
+        "ai workflow run",
+        &args.admin,
+        reqwest::Method::POST,
+        "/admin/ai-toolkit/workflows/run",
+        Some(serde_json::json!({
+            "origin": args.origin,
+            "workflow": args.workflow,
+            "input": input,
+        })),
+    )
+}
+
+fn handle_dataset_register(args: &DatasetRegisterArgs) -> anyhow::Result<i32> {
+    let dataset = load_ai_toolkit_json(
+        &args.dataset,
+        MAX_AI_TOOLKIT_DOCUMENT_BYTES,
+        "evaluation dataset",
+    )?;
+    let mut dataset = dataset
+        .as_object()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("evaluation dataset must be a JSON object"))?;
+    dataset.insert(
+        "origin".to_string(),
+        serde_json::Value::String(args.origin.clone()),
     );
-    Ok(0)
+    handle_ai_toolkit_admin(
+        "ai dataset register",
+        &args.admin,
+        reqwest::Method::POST,
+        "/admin/ai-toolkit/datasets/register",
+        Some(serde_json::Value::Object(dataset)),
+    )
 }
 
 fn handle_ai_evaluate(args: &EvaluateArgs) -> anyhow::Result<i32> {
     if args.min_bytes > args.max_bytes {
         anyhow::bail!("--min-bytes must not exceed --max-bytes");
     }
-    let dataset_bytes =
-        read_bounded_cli_file(&args.dataset, MAX_AI_TOOL_INPUT_BYTES, "evaluation dataset")?;
-    let parsed: sbproxy_ai::evaluation::Dataset =
-        serde_json::from_slice(&dataset_bytes).map_err(|error| {
-            anyhow::anyhow!(
-                "parse evaluation dataset {}: {error}",
-                args.dataset.display()
-            )
-        })?;
-    let dataset =
-        sbproxy_ai::evaluation::Dataset::new(parsed.name, parsed.version, parsed.entries)?;
-    let response_bytes = read_bounded_cli_file(
+    let responses = load_ai_toolkit_json(
         &args.responses,
-        MAX_AI_TOOL_INPUT_BYTES,
+        MAX_AI_TOOLKIT_DOCUMENT_BYTES,
         "evaluation responses",
     )?;
-    let responses: Vec<String> = serde_json::from_slice(&response_bytes).map_err(|error| {
-        anyhow::anyhow!(
-            "parse evaluation responses {}: {error}",
-            args.responses.display()
-        )
-    })?;
-    if responses.len() != dataset.entries.len() {
-        anyhow::bail!(
-            "evaluation response count {} does not match dataset entry count {}",
-            responses.len(),
-            dataset.entries.len()
-        );
+    if !responses.is_array() {
+        anyhow::bail!("evaluation responses must be a JSON array");
     }
 
-    let mut metrics = vec![sbproxy_ai::evaluation::MetricType::LengthRange(
-        args.min_bytes,
-        args.max_bytes,
-    )];
+    let mut metrics = vec![serde_json::json!({
+        "type": "length_range",
+        "min": args.min_bytes,
+        "max": args.max_bytes,
+    })];
     if !args.required_keywords.is_empty() {
-        metrics.push(sbproxy_ai::evaluation::MetricType::ContainsKeywords(
-            args.required_keywords.clone(),
-        ));
+        metrics.push(serde_json::json!({
+            "type": "contains_keywords",
+            "keywords": args.required_keywords,
+        }));
     }
     if let Some(path) = args.json_schema.as_deref() {
-        let bytes = read_bounded_cli_file(path, MAX_AI_TOOL_INPUT_BYTES, "JSON Schema")?;
-        let schema: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|error| anyhow::anyhow!("parse JSON Schema {}: {error}", path.display()))?;
-        metrics.push(sbproxy_ai::evaluation::MetricType::JsonSchemaValid(schema));
+        let schema = load_ai_toolkit_json(path, MAX_AI_TOOLKIT_DOCUMENT_BYTES, "JSON Schema")?;
+        metrics.push(serde_json::json!({
+            "type": "json_schema",
+            "schema": schema,
+        }));
     }
 
-    let results: Vec<serde_json::Value> = dataset
-        .entries
-        .iter()
-        .zip(&responses)
-        .enumerate()
-        .map(|(index, (entry, response))| {
-            let metric_pass_rate = sbproxy_ai::evaluation::pass_rate(response, &metrics);
-            let expected_match = entry
-                .expected_output
-                .as_ref()
-                .is_none_or(|expected| expected == response);
-            serde_json::json!({
-                "index": index,
-                "metric_pass_rate": metric_pass_rate,
-                "expected_match": expected_match,
-                "passed": metric_pass_rate == 1.0 && expected_match,
-            })
-        })
-        .collect();
-    let passed = results
-        .iter()
-        .filter(|result| result["passed"] == true)
-        .count();
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "dataset": dataset.name,
-            "version": dataset.version,
-            "cases": results.len(),
-            "passed": passed,
-            "results": results,
-        }))?
-    );
-    Ok(if passed == responses.len() { 0 } else { 1 })
-}
+    let parameters = match args.parameters.as_deref() {
+        Some(path) => {
+            load_ai_toolkit_json(path, MAX_AI_TOOLKIT_DOCUMENT_BYTES, "evaluation parameters")?
+        }
+        None => serde_json::json!({}),
+    };
+    let judge = match args.judge_responses.as_deref() {
+        Some(path) => {
+            let judge_model = args.judge_model.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("--judge-model is required with --judge-responses")
+            })?;
+            if args.judge_criteria.is_empty() {
+                anyhow::bail!("at least one --judge-criterion is required with --judge-responses");
+            }
+            let judge_responses = load_ai_toolkit_json(
+                path,
+                MAX_AI_TOOLKIT_DOCUMENT_BYTES,
+                "offline judge responses",
+            )?;
+            if !judge_responses.is_array() {
+                anyhow::bail!("offline judge responses must be a JSON array");
+            }
+            Some(serde_json::json!({
+                "judge_model": judge_model,
+                "criteria": args.judge_criteria,
+                "responses": judge_responses,
+            }))
+        }
+        None => {
+            if args.judge_model.is_some() || !args.judge_criteria.is_empty() {
+                anyhow::bail!("--judge-model and --judge-criterion require --judge-responses");
+            }
+            None
+        }
+    };
 
-#[derive(serde::Deserialize)]
-struct PromptVersionInput {
-    name: String,
-    version: u32,
-    content: String,
-    weight: f64,
+    handle_ai_toolkit_admin(
+        "ai evaluate",
+        &args.admin,
+        reqwest::Method::POST,
+        "/admin/ai-toolkit/evaluations/run",
+        Some(serde_json::json!({
+            "origin": args.origin,
+            "experiment_id": args.experiment_id,
+            "experiment_name": args.experiment_name,
+            "dataset": {"name": args.dataset, "version": args.version},
+            "model": args.model,
+            "prompt_version": args.prompt_version,
+            "parameters": parameters,
+            "responses": responses,
+            "judge": judge,
+            "metrics": metrics,
+        })),
+    )
 }
 
 fn handle_prompt_select(args: &PromptSelectArgs) -> anyhow::Result<i32> {
-    let bytes = read_bounded_cli_file(
-        &args.versions,
-        MAX_AI_TOOL_INPUT_BYTES,
-        "weighted prompt versions",
-    )?;
-    let versions: Vec<PromptVersionInput> = serde_json::from_slice(&bytes).map_err(|error| {
-        anyhow::anyhow!(
-            "parse weighted prompt versions {}: {error}",
-            args.versions.display()
-        )
-    })?;
-    let store = sbproxy_ai::prompt_versioning::WeightedPromptStore::new();
-    for version in versions {
-        let name = version.name;
-        let weighted = sbproxy_ai::prompt_versioning::WeightedPromptVersion::new(
-            name.clone(),
-            version.version,
-            version.content,
-            version.weight,
-        )?;
-        store.add_version(&name, weighted)?;
-    }
-    let selected = store
-        .select_for_cohort(&args.name, &args.cohort, &args.salt)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "weighted prompt {:?} has no version with positive total weight",
-                args.name
-            )
-        })?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "name": selected.name,
-            "version": selected.version,
-            "content": selected.content,
-            "weight": selected.weight,
+    handle_ai_toolkit_admin(
+        "ai prompt select",
+        &args.admin,
+        reqwest::Method::POST,
+        "/admin/ai-toolkit/prompts/select",
+        Some(serde_json::json!({
+            "origin": args.origin,
+            "name": args.name,
             "cohort": args.cohort,
-        }))?
-    );
-    Ok(0)
+        })),
+    )
 }
 
 fn handle_prompt_optimize(args: &PromptOptimizeArgs) -> anyhow::Result<i32> {
@@ -10770,16 +10993,22 @@ fn read_bounded_cli_file(
     maximum: usize,
     label: &str,
 ) -> anyhow::Result<Vec<u8>> {
-    let metadata = std::fs::metadata(path)
+    let file = std::fs::File::open(path)
         .map_err(|error| anyhow::anyhow!("read {label} {}: {error}", path.display()))?;
-    if metadata.len() > maximum as u64 {
-        anyhow::bail!(
-            "{label} {} exceeds the {} byte limit",
-            path.display(),
-            maximum
-        );
-    }
-    let bytes = std::fs::read(path)
+    read_bounded_cli_open_file(file, path, maximum, label)
+}
+
+fn read_bounded_cli_open_file(
+    file: std::fs::File,
+    path: &std::path::Path,
+    maximum: usize,
+    label: &str,
+) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    let mut bytes = Vec::new();
+    file.take((maximum as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
         .map_err(|error| anyhow::anyhow!("read {label} {}: {error}", path.display()))?;
     if bytes.len() > maximum {
         anyhow::bail!(
@@ -16377,29 +16606,99 @@ origins:
     #[test]
     fn orchestration_evaluation_and_rollout_have_supported_cli_surfaces() {
         for arguments in [
-            vec!["sbproxy", "ai", "workflow", "validate", "workflow.yml"],
+            vec![
+                "sbproxy",
+                "ai",
+                "workflow",
+                "discover",
+                "--origin",
+                "api.local",
+                "--admin-url",
+                "http://127.0.0.1:9090",
+                "--password",
+                "secret",
+            ],
+            vec![
+                "sbproxy",
+                "ai",
+                "workflow",
+                "validate",
+                "workflow.yml",
+                "--origin",
+                "api.local",
+                "--admin-url",
+                "http://127.0.0.1:9090",
+                "--password",
+                "secret",
+            ],
+            vec![
+                "sbproxy",
+                "ai",
+                "workflow",
+                "run",
+                "--origin",
+                "api.local",
+                "--workflow",
+                "support",
+                "--input",
+                "input.json",
+                "--admin-url",
+                "http://127.0.0.1:9090",
+                "--password",
+                "secret",
+            ],
+            vec![
+                "sbproxy",
+                "ai",
+                "dataset",
+                "register",
+                "--origin",
+                "api.local",
+                "--dataset",
+                "dataset.json",
+                "--admin-url",
+                "http://127.0.0.1:9090",
+                "--password",
+                "secret",
+            ],
             vec![
                 "sbproxy",
                 "ai",
                 "evaluate",
+                "--origin",
+                "api.local",
                 "--dataset",
-                "dataset.json",
+                "support",
+                "--version",
+                "2",
                 "--responses",
                 "responses.json",
+                "--experiment-id",
+                "run-1",
+                "--experiment-name",
+                "candidate",
+                "--model",
+                "model-a",
+                "--admin-url",
+                "http://127.0.0.1:9090",
+                "--password",
+                "secret",
             ],
             vec![
                 "sbproxy",
                 "ai",
                 "prompt",
                 "select",
+                "--origin",
+                "api.local",
                 "--name",
                 "support",
-                "--versions",
-                "prompts.json",
                 "--cohort",
                 "customer-1",
-                "--salt",
-                "rollout-1",
+                "--admin-url",
+                "http://127.0.0.1:9090",
+                "--password",
+                "secret",
             ],
         ] {
             Cli::try_parse_from(arguments).expect("shipping AI CLI seam must parse");
@@ -16407,89 +16706,209 @@ origins:
     }
 
     #[test]
-    fn supported_ai_cli_surfaces_execute_validated_files() {
-        let dir = std::env::temp_dir().join(format!(
-            "sbproxy-ai-tools-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+    fn evaluation_dataset_version_is_distinct_from_global_version_flag() {
+        let cli = Cli::try_parse_from([
+            "sbproxy",
+            "ai",
+            "evaluate",
+            "--origin",
+            "api.local",
+            "--dataset",
+            "support",
+            "--version",
+            "2",
+            "--responses",
+            "responses.json",
+            "--experiment-id",
+            "run-1",
+            "--experiment-name",
+            "candidate",
+            "--model",
+            "model-a",
+            "--admin-url",
+            "http://127.0.0.1:9090",
+            "--password",
+            "secret",
+        ])
+        .expect("evaluation dataset version must parse without selecting CLI version output");
 
-        let workflow_path = dir.join("workflow.yml");
-        std::fs::write(
-            &workflow_path,
-            r#"name: support
-initial_state: start
-max_steps: 2
-states:
-  - name: start
-    action: classify
-    transitions:
-      done: finish
-  - name: finish
-    action: answer
-    transitions: {}
-"#,
+        assert!(!cli.version);
+        let Some(Cmd::Ai(AiCmd {
+            sub: AiSub::Evaluate(args),
+        })) = cli.cmd
+        else {
+            panic!("expected ai evaluate command");
+        };
+        assert_eq!(args.version, 2);
+    }
+
+    #[test]
+    fn toolkit_cli_has_no_agent_token_or_inline_secret_option() {
+        for forbidden in ["--agent-token", "--shared-secret", "--judge-api-key"] {
+            let parsed = Cli::try_parse_from([
+                "sbproxy",
+                "ai",
+                "workflow",
+                "run",
+                "--origin",
+                "api.local",
+                "--workflow",
+                "support",
+                "--input",
+                "input.json",
+                "--admin-url",
+                "http://127.0.0.1:9090",
+                "--password",
+                "secret",
+                forbidden,
+                "private-value",
+            ]);
+            assert!(parsed.is_err(), "forbidden credential option {forbidden}");
+        }
+    }
+
+    #[test]
+    fn toolkit_cli_bounds_the_final_aggregate_admin_request() {
+        let small = serde_json::json!({"responses": ["bounded"]});
+        validate_ai_toolkit_admin_body("ai evaluate", Some(&small))
+            .expect("small aggregate is admitted");
+
+        let oversized = serde_json::json!({
+            "responses": ["x".repeat(MAX_AI_TOOLKIT_DOCUMENT_BYTES)]
+        });
+        let error = validate_ai_toolkit_admin_body("ai evaluate", Some(&oversized))
+            .expect_err("envelope pushes request over the shared cap");
+        assert!(error.to_string().contains("aggregate limit"));
+    }
+
+    #[test]
+    fn bounded_admin_json_accepts_exact_limit_and_refuses_the_next_byte() {
+        let exact = br#"{"ok":true}"#;
+        let value = read_bounded_admin_json(std::io::Cursor::new(exact), exact.len(), "AI toolkit")
+            .expect("an exact-limit admin response is admitted");
+        assert_eq!(value, serde_json::json!({"ok": true}));
+
+        let mut oversized = exact.to_vec();
+        oversized.push(b' ');
+        let error =
+            read_bounded_admin_json(std::io::Cursor::new(oversized), exact.len(), "AI toolkit")
+                .expect_err("one byte over the admin response limit is refused");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "AI toolkit admin response exceeds the {} byte limit",
+                exact.len()
+            )
+        );
+    }
+
+    #[test]
+    fn toolkit_cli_refuses_an_oversized_response_from_the_selected_admin_url() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind admin fixture");
+        let address = listener.local_addr().expect("read admin fixture address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept toolkit request");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("bound fixture request read");
+            let mut request = Vec::new();
+            let mut scratch = [0_u8; 1024];
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let read = stream.read(&mut scratch).expect("read toolkit request");
+                assert!(read > 0, "toolkit client closed before request headers");
+                request.extend_from_slice(&scratch[..read]);
+            }
+
+            let body = format!(
+                r#"{{"padding":"{}"}}"#,
+                "x".repeat(MAX_AI_TOOLKIT_ADMIN_RESPONSE_BYTES)
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .expect("write oversized response headers");
+            let _ = stream.write_all(body.as_bytes());
+        });
+        let admin = ModelsAdminArgs {
+            admin_url: Some(format!("http://{address}")),
+            username: Some("admin".to_string()),
+            password: Some("private-test-password".to_string()),
+        };
+
+        let error = handle_ai_toolkit_admin(
+            "ai workflow discover",
+            &admin,
+            reqwest::Method::GET,
+            "/admin/ai-toolkit/agents?origin=api.local",
+            None,
         )
-        .unwrap();
+        .expect_err("the stock toolkit CLI must cap an arbitrary admin response");
+        server.join().expect("admin fixture exits");
         assert_eq!(
-            handle_workflow_validate(&WorkflowValidateArgs {
-                path: workflow_path.clone(),
-            })
-            .unwrap(),
-            0
+            error.to_string(),
+            format!(
+                "AI toolkit admin response exceeds the {MAX_AI_TOOLKIT_ADMIN_RESPONSE_BYTES} byte limit"
+            )
         );
+        assert!(!error.to_string().contains("private-test-password"));
+    }
+
+    #[test]
+    fn bounded_cli_file_accepts_exact_limit_and_refuses_the_next_byte() {
+        let path = temp_config("abcd");
         assert_eq!(
-            handle_workflow_run(&WorkflowRunArgs {
-                path: workflow_path,
-                outcomes: vec!["done".to_string(), "complete".to_string()],
-            })
-            .unwrap(),
-            0
+            read_bounded_cli_file(&path, 4, "test input").expect("exact-limit file is admitted"),
+            b"abcd"
         );
 
-        let dataset = dir.join("dataset.json");
-        let responses = dir.join("responses.json");
-        std::fs::write(
-            &dataset,
-            r#"{"name":"support","version":2,"entries":[{"input":"q","expected_output":"yes","metadata":null}]}"#,
-        )
-        .unwrap();
-        std::fs::write(&responses, r#"["yes"]"#).unwrap();
+        std::fs::write(&path, b"abcde").expect("grow fixture by one byte");
+        let error = read_bounded_cli_file(&path, 4, "test input")
+            .expect_err("one byte over the file limit is refused");
         assert_eq!(
-            handle_ai_evaluate(&EvaluateArgs {
-                dataset,
-                responses,
-                required_keywords: vec!["yes".to_string()],
-                json_schema: None,
-                min_bytes: 1,
-                max_bytes: 16,
-            })
-            .unwrap(),
-            0
+            error.to_string(),
+            format!("test input {} exceeds the 4 byte limit", path.display())
         );
+        let _ = std::fs::remove_file(path);
+    }
 
-        let versions = dir.join("prompts.json");
-        std::fs::write(
-            &versions,
-            r#"[{"name":"support","version":1,"content":"v1","weight":90.0},{"name":"support","version":2,"content":"v2","weight":10.0}]"#,
-        )
-        .unwrap();
+    #[cfg(unix)]
+    #[test]
+    fn bounded_cli_file_reader_keeps_the_opened_descriptor_after_replacement() {
+        let path = temp_config("original");
+        let opened = std::fs::File::open(&path).expect("open original descriptor");
+        let replacement = temp_config("replacement");
+        std::fs::rename(&replacement, &path).expect("replace path after opening descriptor");
+
+        let bytes = read_bounded_cli_open_file(opened, &path, 32, "test input")
+            .expect("opened descriptor remains authoritative");
+        assert_eq!(bytes, b"original");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn bounded_cli_file_reader_refuses_growth_after_open() {
+        use std::io::Write as _;
+
+        let path = temp_config("abcd");
+        let opened = std::fs::File::open(&path).expect("open bounded descriptor");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open fixture for growth")
+            .write_all(b"e")
+            .expect("grow fixture after reader opened");
+
+        let error = read_bounded_cli_open_file(opened, &path, 4, "test input")
+            .expect_err("post-open growth is still bounded");
         assert_eq!(
-            handle_prompt_select(&PromptSelectArgs {
-                name: "support".to_string(),
-                versions,
-                cohort: "customer-1".to_string(),
-                salt: "rollout-1".to_string(),
-            })
-            .unwrap(),
-            0
+            error.to_string(),
+            format!("test input {} exceeds the 4 byte limit", path.display())
         );
-
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

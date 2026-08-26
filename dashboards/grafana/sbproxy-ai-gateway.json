@@ -58,7 +58,7 @@
     "to": "now"
   },
   "refresh": "10s",
-  "version": 2,
+  "version": 3,
   "schemaVersion": 39,
   "panels": [
     {
@@ -2403,6 +2403,174 @@
         }
       ],
       "description": "Authenticated admin chargeback export refusals on the request-shape and page/response-admission boundary. A sustained `json / response_too_large` rate means callers are asking for pages larger than the configured byte budget; `invalid_cursor`, `invalid_limit`, and `unsupported_schema_version` isolate caller misuse from genuine exporter pressure."
+    },
+    {
+      "id": 41,
+      "title": "AI Workflow Operations",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 173
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "noValue": "No governed workflow operation has been recorded"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(sbproxy_ai_toolkit_operations_total{capability=\"workflow\"}[5m]))",
+          "legendFormat": "{{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Authenticated live workflow operations by closed terminal outcome. `success` is a completed bounded run; `invalid`, `not_found`, and `unauthorized` are caller/configuration refusals; `egress_refused` and `timeout` isolate governed agent transport; byte-limit and `internal` outcomes expose service pressure without putting workflow names, agent endpoints, secrets, or run IDs in metric labels."
+    },
+    {
+      "id": 42,
+      "title": "AI Evaluation Operations",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 173
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "noValue": "No governed evaluation operation has been recorded"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(sbproxy_ai_toolkit_operations_total{capability=\"evaluation\"}[5m]))",
+          "legendFormat": "{{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Authenticated evaluation-run operations by closed terminal outcome. `egress_refused` and `timeout` isolate governed judge transport from invalid datasets and missing versions. Dataset names, experiment IDs, judge endpoints, response content, credentials, and secret references never become metric labels."
+    },
+    {
+      "id": 43,
+      "title": "AI Prompt Rollout Selections",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 181
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "noValue": "No live weighted prompt selection has been recorded"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(sbproxy_ai_toolkit_operations_total{capability=\"prompt_rollout\"}[5m]))",
+          "legendFormat": "{{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "Concrete weighted prompt-version selections made before the existing renderer on real AI requests. `success` means the selected version reached normal rendering; invalid or missing rollout state stays visible without putting prompt names, prompt content, raw cohort keys, or request IDs in metric labels."
     }
   ],
   "templating": {

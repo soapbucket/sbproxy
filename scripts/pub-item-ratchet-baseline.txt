@@ -694,3 +694,25 @@ same-file-only constants (`DEFAULT_IO_TIMEOUT` and
 The remaining six additions are required typed errors/configuration or
 documented query surfaces: `PromptVersionError`, both classifier hook config
 types, `ClassifierIntentHook`, and the two chargeback snapshot helpers.
+
+2026-08-25 (WOR-2661 Group D, live toolkit product seams): tests-only
+322 -> 314 and unreferenced 1447 -> 1462 on the D tree. Eight sbproxy-ai
+items gained live production callers through the toolkit runtime and left
+their buckets: agent discovery (`find_by_capability`, `list_agents`), the
+evaluation dataset builder (`with_expected`), and five prompt-rollout
+surfaces (`PromptSelectionError`, `replace_versions`,
+`select_for_cohort_typed`, `list_versions`, `list_names`), plus
+`PromptError` in `prompts.rs`. The additions are: ten `AiToolkit*Config`
+structs in `sbproxy-config/src/types.rs`, which are pub because they are
+field types of the pub config tree and are constructed by serde and the
+schema generator rather than by name; `AiToolkitEventDataError` in
+`sbproxy-observe/src/events.rs`, returned by the pub bounded-event
+constructor; and `WeightedPromptStore::{add_version,select_for_cohort}`,
+which lost their last outside-file callers when the toolkit switched the
+CLI and request path to `replace_versions` and `select_for_cohort_typed`.
+Both stay pub deliberately: their optimistic-concurrency and selection
+contracts are pinned by dedicated in-file tests, and narrowing them to
+pub(crate) would leave items whose only callers are cfg(test) code, which
+`-D warnings` reports as dead code (the #757 shape). The avoidable
+same-file constant `AI_TOOLKIT_EVENT_ID_MAX_BYTES` was narrowed to
+pub(crate) before recording this result.

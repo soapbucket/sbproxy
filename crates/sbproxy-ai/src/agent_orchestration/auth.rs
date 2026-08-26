@@ -33,7 +33,7 @@ pub fn generate_agent_token(agent_id: &str, secret: &str) -> String {
 /// digest length already reveals.
 pub fn verify_agent_token(agent_id: &str, token: &str, secret: &str) -> bool {
     use subtle::ConstantTimeEq as _;
-    let expected = generate_agent_token(agent_id, secret);
+    let expected = zeroize::Zeroizing::new(generate_agent_token(agent_id, secret));
     let expected = expected.as_bytes();
     let actual = token.as_bytes();
     expected.len() == actual.len() && bool::from(expected.ct_eq(actual))

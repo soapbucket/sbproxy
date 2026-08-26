@@ -5008,6 +5008,10 @@ fn arm_egress_gates_from_config(compiled: &sbproxy_config::CompiledConfig) {
         compiled.egress.ai_providers.clone(),
     );
     arm(
+        &[EgressPurpose::AgentOrchestration],
+        compiled.egress.agent_orchestration.clone(),
+    );
+    arm(
         &[EgressPurpose::ClassifierHook],
         compiled.egress.classifier_hooks.clone(),
     );
@@ -7309,6 +7313,9 @@ egress:
   ai_providers:
     mode: deny_by_default
     hosts: ["api.openai.com"]
+  agent_orchestration:
+    mode: deny_by_default
+    hosts: ["agents.internal"]
   classifier_hooks:
     mode: deny_by_default
     hosts: ["classifier.internal"]
@@ -7325,6 +7332,7 @@ egress:
         let compiled = sbproxy_config::compile_config(yaml).expect("config compiles");
         let armed: Vec<sbproxy_security::egress::EgressPurpose> = [
             compiled.egress.ai_providers.as_ref(),
+            compiled.egress.agent_orchestration.as_ref(),
             compiled.egress.classifier_hooks.as_ref(),
             compiled.egress.usage_sinks.as_ref(),
             compiled.egress.model_artifacts.as_ref(),
