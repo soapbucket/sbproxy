@@ -3,7 +3,7 @@
 //!
 //! Maintains multiple immutable versions of a prompt under one name, retrieves
 //! the latest version, and performs stable weighted cohort selection for
-//! gradual rollouts and A/B experiments. [`WeightedPromptStore`] is the
+//! gradual rollouts and A/B experiments. [`WeightedPromptStore`](crate::prompt_versioning::WeightedPromptStore) is the
 //! self-contained in-memory selection primitive and performs no template
 //! rendering. The production proxy builds it from
 //! `proxy.ai_toolkit.prompt_rollouts`, publishes it with the compiled pipeline
