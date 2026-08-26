@@ -6568,6 +6568,7 @@ dependencies = [
  "tracing",
  "url",
  "yaml_serde",
+ "zeroize",
 ]
 
 [[package]]
