@@ -552,22 +552,22 @@ impl<'a> WireRequest<'a> {
         }
     }
 
-    fn with_admin_token(mut self, token: &'a str) -> Self {
+    fn authorized_by(mut self, token: &'a str) -> Self {
         self.admin_token = Some(token);
         self
     }
 
-    fn with_tenant(mut self, tenant: &'a str) -> Self {
+    fn for_tenant(mut self, tenant: &'a str) -> Self {
         self.tenant = Some(tenant);
         self
     }
 
-    fn with_text(mut self, text: &'a str) -> Self {
+    fn carrying_text(mut self, text: &'a str) -> Self {
         self.text = Some(text);
         self
     }
 
-    fn with_config(mut self, config: TenantConfig<'a>) -> Self {
+    fn carrying_config(mut self, config: TenantConfig<'a>) -> Self {
         self.config = Some(config);
         self
     }
@@ -754,7 +754,7 @@ async fn shipped_binary_uses_production_http_tcp_and_grpc_startup_owners() {
     assert!(!public_version.version.is_empty());
 
     let admin_list: AdminResponse =
-        wire_exchange(admin, &WireRequest::new("list").with_admin_token("secret")).await;
+        wire_exchange(admin, &WireRequest::new("list").authorized_by("secret")).await;
     assert!(admin_list.ok);
 
     let mut grpc_client = tokio::time::timeout(
@@ -838,9 +838,9 @@ async fn shipped_binary_bounds_public_classify_with_its_configured_inference_dea
     let register: AdminResponse = wire_exchange(
         admin,
         &WireRequest::new("register")
-            .with_admin_token("secret")
-            .with_tenant("tenant.example")
-            .with_config(TenantConfig {
+            .authorized_by("secret")
+            .for_tenant("tenant.example")
+            .carrying_config(TenantConfig {
                 labels: (0..64)
                     .map(|index| TenantLabel {
                         name: "greeting",
@@ -857,8 +857,8 @@ async fn shipped_binary_bounds_public_classify_with_its_configured_inference_dea
     let refusal: AdminResponse = wire_exchange(
         public,
         &WireRequest::new("classify")
-            .with_tenant("tenant.example")
-            .with_text(&text),
+            .for_tenant("tenant.example")
+            .carrying_text(&text),
     )
     .await;
     assert!(
