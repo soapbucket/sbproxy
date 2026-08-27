@@ -165,12 +165,6 @@ pub struct ShadowEvalContext {
 }
 
 impl ShadowEvalContext {
-    /// Whether a target of this request should keep its response text.
-    #[must_use]
-    pub fn retains_responses(&self) -> bool {
-        self.retention.is_some()
-    }
-
     /// The primary id, when this request is being paired.
     #[must_use]
     pub fn request_id(&self) -> Option<&str> {
@@ -594,7 +588,7 @@ impl ShadowPairLedger {
 
     /// Whether any request has ever armed pairing on this ledger.
     #[must_use]
-    pub fn is_armed(&self) -> bool {
+    pub(crate) fn is_armed(&self) -> bool {
         self.armed.load(Ordering::Relaxed)
     }
 }
@@ -1124,7 +1118,10 @@ mod tests {
     #[test]
     fn a_default_eval_context_retains_nothing() {
         let context = ShadowEvalContext::default();
-        assert!(!context.retains_responses());
+        assert!(
+            context.retention.is_none(),
+            "no sink means the target's body is never kept"
+        );
         assert!(context.request_id().is_none());
     }
 }

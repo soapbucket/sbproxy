@@ -716,3 +716,41 @@ pub(crate) would leave items whose only callers are cfg(test) code, which
 `-D warnings` reports as dead code (the #757 shape). The avoidable
 same-file constant `AI_TOOLKIT_EVENT_ID_MAX_BYTES` was narrowed to
 pub(crate) before recording this result.
+
+2026-08-27 (WOR-2658 / WOR-2654, the shadow-eval comparison surface):
+unreferenced 1462 -> 1478, tests-only unchanged at 314. Two avoidable
+items were removed before recording this: `ShadowEvalContext::
+retains_responses` was deleted rather than narrowed, since the public
+field it wrapped says the same thing, and `ShadowPairLedger::is_armed`
+was narrowed to pub(crate) because `record_primary` in the same crate
+reads it. `TargetSummary` was already reachable from `sbproxy-core` and
+is now named there explicitly so the scan can see it.
+
+The additions fall in two groups, and both were tried as pub(crate)
+first.
+
+Four are the nested blocks of the `GET /api/ai/shadow/report` response:
+`TargetProvenance`, `TargetCost`, `TargetLatency`, and `TargetErrors` in
+`sbproxy-ai/src/shadow_eval.rs`. They are pub because they are field
+types of the pub `TargetSummary`, which `sbproxy-core`'s admin handler
+returns. Nothing names them in Rust because nothing reads them in Rust:
+they exist to give that response its shape, and their consumers are the
+JSON an operator reads and the e2e that asserts on it
+(`e2e/tests/sota_gateway_integration.rs::
+the_shadow_report_leads_with_provenance_and_names_every_target`).
+Narrowing them would leave a pub struct whose fields the crate returning
+it cannot reach.
+
+The rest are the batch judge's planning API in
+`sbproxy-ai/src/shadow_judge.rs`: `JUDGE_CALLS_PER_PAIR`, `Divergence`,
+`DivergenceKind`, `JudgeCandidate`, `classify_pair`, `JudgeAdmission`,
+`JudgeSpendSnapshot`, `JudgeBudget`, `JudgePair`, `PairPlan`,
+`JudgePlan`, and `plan_batch`. These have no production caller yet by
+design: the deterministic divergence pre-filter and the hard spend cap
+ship now, and the judge prompt and scoring loop are a scoped follow-up
+recorded in the shadow-eval section of `docs/ai-gateway.md`. Narrowing
+them to pub(crate) was tried and produced eleven `never used` errors
+under `-D warnings`, which is the #757 shape the 2026-08-25 entry above
+describes: an item whose only callers are cfg(test) code is dead code.
+They stay pub until the scorer calls them, and their contracts are
+pinned by in-file tests in the meantime.

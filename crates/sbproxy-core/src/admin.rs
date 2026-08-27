@@ -5603,7 +5603,8 @@ pub fn handle_admin_request(
                 }
             },
         };
-        let targets = sbproxy_ai::shadow_eval::report_with_judge(
+        let targets: Vec<sbproxy_ai::shadow_eval::TargetSummary> =
+            sbproxy_ai::shadow_eval::report_with_judge(
             std::time::Duration::from_secs(window_secs),
             &sbproxy_ai::shadow_judge::agreement_for,
         );
