@@ -1423,10 +1423,14 @@ async fn schema_rejections_happen_on_the_correct_side_of_transport() {
 
 #[tokio::test]
 async fn absolute_deadline_releases_the_only_workflow_permit_for_recovery() {
+    // Budgets are sized for a loaded 2-vCPU runner: the slow reply is 5x the
+    // 300 ms workflow deadline, and the recovery attempt has to finish one
+    // loopback round trip inside that same deadline. A 50 ms deadline missed
+    // on CI twice in a row while passing locally.
     let success = br#"{"outcome":"done","output":{"ok":true}}"#.to_vec();
     let (address, accepted, auth_ok, server) = loopback_server(vec![
         TestReply {
-            delay: Duration::from_millis(250),
+            delay: Duration::from_millis(1500),
             body: success.clone(),
         },
         TestReply {
@@ -1441,7 +1445,7 @@ async fn absolute_deadline_releases_the_only_workflow_permit_for_recovery() {
         json!({"type":"object"}),
         json!({"type":"object","required":["ok"]}),
         1024,
-        50,
+        300,
         1,
     );
 
@@ -1450,7 +1454,7 @@ async fn absolute_deadline_releases_the_only_workflow_permit_for_recovery() {
         .run_workflow(workflow_request(json!({"attempt":1})))
         .await
         .expect_err("slow response times out");
-    assert!(started.elapsed() < Duration::from_millis(200));
+    assert!(started.elapsed() < Duration::from_millis(1200));
     assert!(matches!(
         first,
         ToolkitError::Deadline {
@@ -1459,7 +1463,7 @@ async fn absolute_deadline_releases_the_only_workflow_permit_for_recovery() {
     ));
 
     let second = tokio::time::timeout(
-        Duration::from_secs(1),
+        Duration::from_secs(5),
         runtime.run_workflow(workflow_request(json!({"attempt":2}))),
     )
     .await
