@@ -5748,17 +5748,17 @@ mod tests {
             AdminAuth::from_json(br#"{"tokens":[{"token":"secret","tenants":["*"]}]}"#).unwrap(),
         );
         // The nesting rule forbids a connection deadline under the frame
-        // deadline, so the two are equal here: five exchanges 400ms apart
-        // stay inside every read and frame window, and run to roughly twice
-        // the 1s a fixed accept-to-close deadline would have allowed.
+        // deadline, so the two are equal here: five exchanges 250ms apart sit
+        // at half the per-read window, and run to twice the 600ms a fixed
+        // accept-to-close deadline would have allowed.
         let pair = spawn_production_listener_pair(
             registry,
             auth,
             TcpLimits {
                 max_connections: 8,
-                io_timeout: Duration::from_millis(800),
-                frame_timeout: Duration::from_millis(1000),
-                connection_timeout: Duration::from_millis(1000),
+                io_timeout: Duration::from_millis(500),
+                frame_timeout: Duration::from_millis(600),
+                connection_timeout: Duration::from_millis(600),
             },
             Arc::new(TcpTestControl::default()),
             None,
@@ -5783,7 +5783,7 @@ mod tests {
             let listed: AdminResponse =
                 rmp_serde::from_slice(&wire_exchange(&mut admin, &list).await).unwrap();
             assert!(listed.ok, "admin round {round} must still be answered");
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
 
         // Progress is what refreshes it: a socket that answers nothing is

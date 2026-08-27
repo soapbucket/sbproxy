@@ -1887,8 +1887,26 @@ mod tests {
         String::from_utf8_lossy(&response).into_owned()
     }
 
+    /// Connect, send, and read whatever the listener says before it closes.
+    ///
+    /// A saturated listener accepts and drops, and on a busy machine that
+    /// drop can land before `connect` returns, which the platform reports as
+    /// a reset rather than a connected socket. That is the same refusal the
+    /// caller is measuring, so it reads as the empty response it is, instead
+    /// of failing the test on load.
     async fn listener_request(address: std::net::SocketAddr, request: Vec<u8>) -> String {
-        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut stream = match tokio::net::TcpStream::connect(address).await {
+            Ok(stream) => stream,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                return String::new();
+            }
+            Err(error) => panic!("HTTP client connect failed: {error}"),
+        };
         let _ = stream.write_all(&request).await;
         let _ = stream.shutdown().await;
         read_http_connection_to_end(&mut stream).await
