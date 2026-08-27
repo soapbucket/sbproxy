@@ -27,8 +27,8 @@
 //! patterns.
 
 use crate::config::{ClassificationConfig, LabelConfig, NormalizationConfig, NormalizationRule};
-use crate::heuristic::Classifier;
-use crate::normalize::Normalizer;
+use crate::heuristic::{Classifier, CompiledLabel};
+use crate::normalize::{CompiledRule, Normalizer};
 use crate::protocol::{AdminResponse, TenantConfig, TenantInfo, TenantPageResponse};
 
 use regex::RegexBuilder;
@@ -45,8 +45,8 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::{debug, info};
 
-const REGEX_SIZE_LIMIT: usize = 10 * 1024 * 1024;
 const MAX_PATTERN_LENGTH: usize = 4096;
+const MAX_TENANT_ID_BYTES: usize = 128;
 const DEFAULT_MAX_TENANTS: usize = 64;
 const DEFAULT_MAX_PATTERNS_PER_TENANT: usize = 64;
 const DEFAULT_MAX_NORMALIZATION_RULES_PER_TENANT: usize = 64;
@@ -59,6 +59,20 @@ const DEFAULT_MAX_HTTP_LIST_RESPONSE_BYTES: usize = 256 * 1024;
 const DEFAULT_MAX_COMPILED_PROGRAM_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_CLASSIFIER_PROGRAM_BYTES: usize = 48 * 1024;
 const DEFAULT_ENABLED_NORMALIZATION_RULE_BYTES: usize = 64 * 1024;
+
+/// Per-pattern compiled-program ceiling handed to the regex builder.
+///
+/// This is the same number [`CompiledProgramWeights::reservation_bytes`]
+/// charges per classifier pattern, and that identity is the whole point: a
+/// builder limit above the charged weight makes
+/// `DEFAULT_MAX_COMPILED_PROGRAM_BYTES` a name rather than a bound. A 10 MiB
+/// builder limit against a 48 KiB charge let one admitted pattern hold 213
+/// times what the budget thought it had reserved.
+const CLASSIFIER_PATTERN_SIZE_LIMIT: usize = DEFAULT_CLASSIFIER_PROGRAM_BYTES;
+
+/// Per-rule compiled-program ceiling handed to the regex builder, matching
+/// the weight charged per enabled normalization rule for the same reason.
+const NORMALIZATION_RULE_SIZE_LIMIT: usize = DEFAULT_ENABLED_NORMALIZATION_RULE_BYTES;
 
 /// Internal config used to build a [`Tenant`] from the wire-protocol
 /// [`TenantConfig`].
@@ -952,19 +966,15 @@ impl TenantCompiler {
         &self,
         build: &TenantBuildConfig,
     ) -> Result<CompiledTenantArtifacts, String> {
-        validate_enabled_regexes(build, self.probe.as_deref())?;
+        let (compiled_labels, compiled_rules) =
+            compile_enabled_regexes(build, self.probe.as_deref())?;
 
         let classifier_patterns = build
             .labels
             .iter()
             .map(|label| label.patterns.len())
             .sum::<usize>();
-        let enabled_normalization_rules = build
-            .normalization
-            .rules
-            .iter()
-            .filter(|rule| rule.enabled)
-            .count();
+        let enabled_normalization_rules = compiled_rules.len();
 
         if let Some(probe) = &self.probe {
             probe.record_started();
@@ -972,14 +982,18 @@ impl TenantCompiler {
             probe.add_enabled_normalizer_programs(enabled_normalization_rules);
         }
 
-        let classifier = Classifier::from_labels(
-            &build.labels,
+        let classifier = Classifier::from_compiled(
+            compiled_labels,
             build.classification.confidence_threshold,
             &build.classification.default_label,
             build.classification.default_boost,
         );
         let label_names = classifier.label_names();
-        let normalizer = Normalizer::from_config(&build.normalization);
+        let normalizer = Normalizer::from_compiled(
+            build.normalization.unicode_nfkc,
+            build.normalization.trim,
+            compiled_rules,
+        );
 
         if let Some(probe) = &self.probe {
             probe.record_completed();
@@ -1198,7 +1212,10 @@ impl Registry {
         let mut tenants = self.tenants.write().unwrap_or_else(|e| e.into_inner());
         let existed = tenants.remove(tenant_id).is_some();
         if existed {
-            info!(tenant = %tenant_id, "deleted tenant");
+            info!(
+                tenant = %crate::tcp::sanitize(tenant_id, MAX_TENANT_ID_BYTES),
+                "deleted tenant"
+            );
         }
         existed
     }
@@ -1372,9 +1389,7 @@ impl Registry {
         tenant_id: &str,
         tenant_config: &TenantConfig,
     ) -> Result<PendingTenantRegistration, String> {
-        if tenant_id.is_empty() {
-            return Err("tenant id must not be empty".to_string());
-        }
+        validate_tenant_id(tenant_id)?;
         let (classifier_patterns, enabled_normalization_rules) =
             self.validate_config_shape(tenant_config)?;
         let (slot_reservation, slot_was_new, pending_slot_guard) = {
@@ -1449,7 +1464,7 @@ impl Registry {
             }
         }
         info!(
-            tenant = %tenant_id,
+            tenant = %crate::tcp::sanitize(tenant_id, MAX_TENANT_ID_BYTES),
             labels = compiled.label_names.len(),
             "registered tenant"
         );
@@ -1789,11 +1804,21 @@ fn estimated_admin_response_bytes(
     Ok(total)
 }
 
-fn validate_enabled_regexes(
+/// Compile every label pattern and every enabled normalization rule exactly
+/// once, under the per-pattern ceilings the compiled-program budget charges.
+///
+/// Returns the programs rather than dropping them: this used to validate and
+/// throw the results away, leaving `Classifier::from_labels` and
+/// `Normalizer::from_config` to build the identical set a second time, which
+/// doubled both peak compile memory and registration latency for every
+/// tenant.
+fn compile_enabled_regexes(
     build: &TenantBuildConfig,
     probe: Option<&TenantCompileProbe>,
-) -> Result<(), String> {
+) -> Result<(Vec<CompiledLabel>, Vec<CompiledRule>), String> {
+    let mut labels = Vec::with_capacity(build.labels.len());
     for label in &build.labels {
+        let mut regexes = Vec::with_capacity(label.patterns.len());
         for pattern in &label.patterns {
             if pattern.len() > MAX_PATTERN_LENGTH {
                 if let Some(probe) = probe {
@@ -1804,13 +1829,23 @@ fn validate_enabled_regexes(
                     label.name, MAX_PATTERN_LENGTH
                 ));
             }
-            RegexBuilder::new(pattern)
-                .size_limit(REGEX_SIZE_LIMIT)
-                .build()
-                .map_err(|error| format!("label '{}' has invalid regex: {error}", label.name))?;
+            regexes.push(
+                RegexBuilder::new(pattern)
+                    .size_limit(CLASSIFIER_PATTERN_SIZE_LIMIT)
+                    .build()
+                    .map_err(|error| {
+                        format!("label '{}' has invalid regex: {error}", label.name)
+                    })?,
+            );
         }
+        labels.push(CompiledLabel::new(
+            label.name.clone(),
+            label.weight,
+            regexes,
+        ));
     }
 
+    let mut rules = Vec::new();
     for rule in build.normalization.rules.iter().filter(|rule| rule.enabled) {
         if rule.pattern.len() > MAX_PATTERN_LENGTH {
             if let Some(probe) = probe {
@@ -1821,8 +1856,8 @@ fn validate_enabled_regexes(
                 rule.name, MAX_PATTERN_LENGTH
             ));
         }
-        RegexBuilder::new(&rule.pattern)
-            .size_limit(REGEX_SIZE_LIMIT)
+        let regex = RegexBuilder::new(&rule.pattern)
+            .size_limit(NORMALIZATION_RULE_SIZE_LIMIT)
             .build()
             .map_err(|error| {
                 format!(
@@ -1830,8 +1865,36 @@ fn validate_enabled_regexes(
                     rule.name
                 )
             })?;
+        rules.push(CompiledRule::new(regex, rule.replace.clone()));
     }
 
+    Ok((labels, rules))
+}
+
+/// Bound and character-check a caller-supplied tenant id at registration.
+///
+/// Nothing downstream can recover from an id the paging budget cannot carry:
+/// a single oversized id makes every `list` page containing it exceed the
+/// response budget, and because a cursor is only produced on a successful
+/// page, enumeration never gets past it. The charset matches the HTTP
+/// cursor's, so every registered id can round-trip as a `/tenants` cursor.
+pub(crate) fn validate_tenant_id(tenant_id: &str) -> Result<(), String> {
+    if tenant_id.is_empty() {
+        return Err("tenant id must not be empty".to_string());
+    }
+    if tenant_id.len() > MAX_TENANT_ID_BYTES {
+        return Err(format!(
+            "tenant id exceeds the {MAX_TENANT_ID_BYTES}-byte limit"
+        ));
+    }
+    if !tenant_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(
+            "tenant id may contain only ASCII letters, digits, '.', '_', and '-'".to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -2125,5 +2188,104 @@ mod tests {
     #[test]
     fn http_response_budget_admission_is_exact_and_precedes_serialization() {
         assert_boundary_response_admission(TenantPageBoundary::Http);
+    }
+
+    /// Nothing used to bound or character-check the tenant id itself, while
+    /// the list path budgets the page it has to serialize. One 300 KiB id
+    /// therefore broke `list` and `GET /tenants` from that tenant onward,
+    /// with no cursor to page past it, until the process restarted.
+    #[test]
+    fn oversized_or_out_of_charset_tenant_ids_are_refused_at_registration() {
+        let registry = Registry::new_empty();
+        let config = sample_config();
+
+        let oversized = "a".repeat(MAX_TENANT_ID_BYTES + 1);
+        let error = registry
+            .register(&oversized, &config)
+            .expect_err("an id past the page budget must never enter the map");
+        assert!(error.contains("tenant id exceeds"), "unexpected: {error}");
+
+        for (case, id) in [
+            ("newline", "tenant\n.example"),
+            ("space", "tenant .example"),
+            ("quote", "tenant\"example"),
+            ("non-ascii", "tenant\u{00e9}.example"),
+        ] {
+            let error = registry.register(id, &config).expect_err(case);
+            assert!(
+                error.contains("tenant id may contain only"),
+                "{case}: unexpected refusal: {error}"
+            );
+        }
+
+        assert!(registry.snapshot_ids().is_empty());
+        // The charset is the HTTP cursor's, so a legal id round-trips.
+        registry
+            .register("tenant-01.example", &config)
+            .expect("an in-charset id still registers");
+    }
+
+    /// The compiled-program budget charged 48 KiB per classifier pattern
+    /// while the regex builder allowed each one 10 MiB, so the 32 MiB process
+    /// budget was a name rather than a bound: ~682 admitted patterns could
+    /// hold ~6.8 GiB. The builder ceiling is now the charged weight.
+    #[test]
+    fn a_pattern_compiling_past_its_charged_weight_is_refused() {
+        assert_eq!(
+            CLASSIFIER_PATTERN_SIZE_LIMIT,
+            DEFAULT_CLASSIFIER_PROGRAM_BYTES
+        );
+        assert_eq!(
+            NORMALIZATION_RULE_SIZE_LIMIT,
+            DEFAULT_ENABLED_NORMALIZATION_RULE_BYTES
+        );
+
+        // Nested counted repetition well inside MAX_PATTERN_LENGTH whose
+        // compiled program is far larger than the charged per-pattern weight.
+        let heavy = format!("(?:{}){{200}}", "[0-9a-z]{200}");
+        assert!(heavy.len() < MAX_PATTERN_LENGTH);
+        assert!(
+            RegexBuilder::new(&heavy)
+                .size_limit(CLASSIFIER_PATTERN_SIZE_LIMIT)
+                .build()
+                .is_err(),
+            "the charged per-pattern weight must be the builder's ceiling too"
+        );
+
+        let registry = Registry::new_empty();
+        let error = registry
+            .register(
+                "tenant-heavy.example",
+                &TenantConfig {
+                    labels: vec![TenantLabel {
+                        name: "heavy".to_string(),
+                        patterns: vec![heavy],
+                        weight: 1.0,
+                    }],
+                    classification: None,
+                    normalization: None,
+                },
+            )
+            .expect_err("a pattern past its charged weight must be refused");
+        assert!(error.contains("invalid regex"), "unexpected: {error}");
+    }
+
+    /// Both tenant-id log sinks run the caller-supplied id through the
+    /// shared `sanitize` walk. They took it verbatim, on a level that
+    /// survives `release_max_level_info`, so an id carrying a newline forged
+    /// log records into whatever ships the operator's log to a SIEM.
+    #[test]
+    fn tenant_id_log_sinks_sanitize_before_writing() {
+        let source = include_str!("registry.rs");
+        for marker in ["\"registered tenant\"", "\"deleted tenant\""] {
+            let at = source
+                .find(marker)
+                .unwrap_or_else(|| panic!("{marker} log site is present"));
+            let statement = &source[at.saturating_sub(200)..at];
+            assert!(
+                statement.contains("crate::tcp::sanitize(tenant_id"),
+                "{marker} must sanitize its tenant id before logging it"
+            );
+        }
     }
 }

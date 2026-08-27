@@ -19,21 +19,50 @@
 //! `MAX_PATTERN_LENGTH` are rejected. Rust's `regex` crate has no
 //! backtracking, so ReDoS is not a concern.
 
+#[cfg(test)]
 use crate::config::NormalizationConfig;
-use regex::{Regex, RegexBuilder};
+use regex::Regex;
+#[cfg(test)]
+use regex::RegexBuilder;
+#[cfg(test)]
 use tracing::warn;
 use unicode_normalization::UnicodeNormalization;
 
 /// Max compiled regex size in bytes.
+///
+/// Production never compiles here: `crate::registry` owns the one compile of
+/// every enabled rule, under the per-rule ceiling it also charges to the
+/// process-wide compiled-program budget.
+#[cfg(test)]
 const REGEX_SIZE_LIMIT: usize = 10 * 1024 * 1024;
 
 /// Max pattern string length.
+#[cfg(test)]
 const MAX_PATTERN_LENGTH: usize = 4096;
 
+/// Ceiling on the pipeline's output.
+///
+/// The input is already capped by the transport, but a rule whose
+/// replacement is longer than what it matches grows the text once per pass,
+/// and up to 64 enabled rules run in sequence. Without a ceiling a 1 MiB
+/// body can multiply into gigabytes before anything downstream sees it, and
+/// a response over 4 GiB wraps the frame's `u32` length prefix. The
+/// pipeline refuses instead.
+pub(crate) const MAX_NORMALIZED_BYTES: usize = 4 * 1024 * 1024;
+
 /// Compiled normalization rule ready for fast execution.
-struct CompiledRule {
+pub(crate) struct CompiledRule {
     regex: Regex,
     replace: String,
+}
+
+impl CompiledRule {
+    /// Wrap an already-compiled rule. The only production constructor:
+    /// `crate::registry::compile_enabled_regexes` compiles each enabled rule
+    /// once, under the charged per-rule ceiling, and hands the program here.
+    pub(crate) fn new(regex: Regex, replace: String) -> Self {
+        Self { regex, replace }
+    }
 }
 
 /// Pre-compiled normalization pipeline. Built once from config, reused per
@@ -45,8 +74,22 @@ pub struct Normalizer {
 }
 
 impl Normalizer {
-    /// Build a normalizer from config, compiling all regex patterns upfront.
-    pub fn from_config(config: &NormalizationConfig) -> Self {
+    /// Assemble a normalizer from already-compiled rules.
+    pub(crate) fn from_compiled(unicode_nfkc: bool, trim: bool, rules: Vec<CompiledRule>) -> Self {
+        Self {
+            unicode_nfkc,
+            trim,
+            rules,
+        }
+    }
+
+    /// Build a normalizer from config, compiling all regex patterns here.
+    ///
+    /// Test-only: production compiles once in `crate::registry` and calls
+    /// [`Normalizer::from_compiled`], so a registered tenant never pays for
+    /// two compiles of the same rule set.
+    #[cfg(test)]
+    fn from_config(config: &NormalizationConfig) -> Self {
         let rules = config
             .rules
             .iter()
@@ -74,34 +117,46 @@ impl Normalizer {
             })
             .collect();
 
-        Self {
-            unicode_nfkc: config.unicode_nfkc,
-            trim: config.trim,
-            rules,
-        }
+        Self::from_compiled(config.unicode_nfkc, config.trim, rules)
     }
 
     /// Apply the full normalization pipeline to input text.
-    pub fn normalize(&self, text: &str) -> String {
+    ///
+    /// Refuses rather than returning a body larger than
+    /// [`MAX_NORMALIZED_BYTES`]. Each pass is checked, not just the final
+    /// result: a growing rule set multiplies pass over pass, so waiting for
+    /// the end means allocating everything the ceiling exists to refuse.
+    pub fn normalize(&self, text: &str) -> Result<String, String> {
         let mut result = if self.unicode_nfkc {
             text.nfkc().collect::<String>()
         } else {
             text.to_string()
         };
+        check_normalized_len(result.len())?;
 
         for rule in &self.rules {
             result = rule
                 .regex
                 .replace_all(&result, rule.replace.as_str())
                 .into_owned();
+            check_normalized_len(result.len())?;
         }
 
         if self.trim {
             result = result.trim().to_string();
         }
 
-        result
+        Ok(result)
     }
+}
+
+fn check_normalized_len(len: usize) -> Result<(), String> {
+    if len > MAX_NORMALIZED_BYTES {
+        return Err(format!(
+            "normalized text exceeds the {MAX_NORMALIZED_BYTES}-byte pipeline budget"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -153,7 +208,8 @@ mod tests {
     fn url_is_replaced() {
         let n = test_normalizer();
         assert_eq!(
-            n.normalize("check https://example.com/foo please"),
+            n.normalize("check https://example.com/foo please")
+                .expect("test input stays inside the normalization budget"),
             "check <URL> please"
         );
     }
@@ -162,7 +218,8 @@ mod tests {
     fn email_is_replaced() {
         let n = test_normalizer();
         assert_eq!(
-            n.normalize("contact user@example.com for info"),
+            n.normalize("contact user@example.com for info")
+                .expect("test input stays inside the normalization budget"),
             "contact <EMAIL> for info"
         );
     }
@@ -170,19 +227,31 @@ mod tests {
     #[test]
     fn whitespace_collapses() {
         let n = test_normalizer();
-        assert_eq!(n.normalize("hello    world\n\nfoo"), "hello world foo");
+        assert_eq!(
+            n.normalize("hello    world\n\nfoo")
+                .expect("test input stays inside the normalization budget"),
+            "hello world foo"
+        );
     }
 
     #[test]
     fn repeated_punctuation_collapses() {
         let n = test_normalizer();
-        assert_eq!(n.normalize("what???!!!"), "what!");
+        assert_eq!(
+            n.normalize("what???!!!")
+                .expect("test input stays inside the normalization budget"),
+            "what!"
+        );
     }
 
     #[test]
     fn disabled_rule_is_skipped() {
         let n = test_normalizer();
-        assert_eq!(n.normalize("foo bar"), "foo bar");
+        assert_eq!(
+            n.normalize("foo bar")
+                .expect("test input stays inside the normalization budget"),
+            "foo bar"
+        );
     }
 
     #[test]
@@ -253,10 +322,40 @@ mod tests {
             ],
         };
         let n = Normalizer::from_config(&config);
-        let out = n.normalize("email me at a@b.com, card 4111 1111 1111 1111, call 555-123-4567");
+        let out = n
+            .normalize("email me at a@b.com, card 4111 1111 1111 1111, call 555-123-4567")
+            .expect("test input stays inside the normalization budget");
         assert!(out.contains("<EMAIL>"));
         assert!(out.contains("<CARD>"));
         assert!(out.contains("<PHONE>"));
         assert!(!out.contains("a@b.com"));
+    }
+
+    #[test]
+    fn growing_rules_refuse_past_the_normalized_output_ceiling() {
+        // A rule whose replacement is longer than what it matches multiplies
+        // the body once per pass. Sixty-four of them turn a small input into
+        // a response no `u32` frame prefix can describe, so the pipeline
+        // refuses instead of returning the grown string.
+        let config = NormalizationConfig {
+            unicode_nfkc: false,
+            trim: false,
+            rules: (0..64)
+                .map(|index| NormalizationRule {
+                    name: format!("grow-{index}"),
+                    pattern: "a".to_string(),
+                    replace: "aa".to_string(),
+                    enabled: true,
+                })
+                .collect(),
+        };
+        let normalizer = Normalizer::from_config(&config);
+        let error = normalizer
+            .normalize(&"a".repeat(1024))
+            .expect_err("a multiplying rule set must be refused, not returned");
+        assert!(
+            error.contains("normalized text exceeds"),
+            "unexpected refusal: {error}"
+        );
     }
 }

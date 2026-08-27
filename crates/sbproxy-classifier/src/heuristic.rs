@@ -22,24 +22,47 @@
 //! prevents memory exhaustion from pathological patterns. Patterns longer
 //! than `MAX_PATTERN_LENGTH` bytes are rejected outright.
 
+#[cfg(test)]
 use crate::config::LabelConfig;
 use crate::protocol::Label;
-use regex::{Regex, RegexBuilder};
+use regex::Regex;
+#[cfg(test)]
+use regex::RegexBuilder;
+#[cfg(test)]
 use tracing::warn;
 
 /// Max compiled regex size in bytes (10MB). Prevents memory exhaustion from
 /// adversarial patterns. Rust's regex crate uses NFA (no backtracking), so
 /// ReDoS CPU attacks are not possible, but memory can still be exhausted.
+///
+/// Production never compiles here: `crate::registry` owns the one compile of
+/// every tenant pattern, under the per-pattern ceiling it also charges to the
+/// process-wide compiled-program budget.
+#[cfg(test)]
 const REGEX_SIZE_LIMIT: usize = 10 * 1024 * 1024;
 
 /// Max pattern string length before it is rejected outright.
+#[cfg(test)]
 const MAX_PATTERN_LENGTH: usize = 4096;
 
 /// Compiled label with pre-built regex patterns.
-struct CompiledLabel {
+pub(crate) struct CompiledLabel {
     name: String,
     weight: f64,
     regexes: Vec<Regex>,
+}
+
+impl CompiledLabel {
+    /// Wrap already-compiled patterns. The only production constructor:
+    /// `crate::registry::compile_enabled_regexes` compiles each pattern once,
+    /// under the charged per-pattern ceiling, and hands the programs here.
+    pub(crate) fn new(name: String, weight: f64, regexes: Vec<Regex>) -> Self {
+        Self {
+            name,
+            weight,
+            regexes,
+        }
+    }
 }
 
 /// A compiled, per-tenant heuristic classifier.
@@ -51,9 +74,29 @@ pub struct Classifier {
 }
 
 impl Classifier {
+    /// Assemble a classifier from already-compiled labels.
+    pub(crate) fn from_compiled(
+        labels: Vec<CompiledLabel>,
+        confidence_threshold: f64,
+        default_label: &str,
+        default_boost: f64,
+    ) -> Self {
+        Self {
+            labels,
+            confidence_threshold,
+            default_label: default_label.to_string(),
+            default_boost,
+        }
+    }
+
     /// Create a heuristic classifier from label configs and classification
-    /// params.
-    pub fn from_labels(
+    /// params, compiling every pattern here.
+    ///
+    /// Test-only: production compiles once in `crate::registry` and calls
+    /// [`Classifier::from_compiled`], so a registered tenant never pays for
+    /// two compiles of the same pattern set.
+    #[cfg(test)]
+    fn from_labels(
         label_configs: &[LabelConfig],
         confidence_threshold: f64,
         default_label: &str,
@@ -88,12 +131,7 @@ impl Classifier {
             })
             .collect();
 
-        Self {
-            labels,
-            confidence_threshold,
-            default_label: default_label.to_string(),
-            default_boost,
-        }
+        Self::from_compiled(labels, confidence_threshold, default_label, default_boost)
     }
 
     /// Returns the label names this classifier knows about.
