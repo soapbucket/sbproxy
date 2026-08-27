@@ -1,5 +1,5 @@
 # Observability
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-27*
 
 SBproxy ships metrics, logs, and traces from one process. This guide covers the Wave 1 substrate: the SLO catalog, the metric label budget, the log schema and redaction policy, the trace propagation contract, the health endpoints, the dashboards, and the reference Compose stack you can boot in one command.
 
@@ -1087,7 +1087,7 @@ The AI request span (`ai.request`) follows the OpenTelemetry GenAI semantic conv
 | Derived USD cost | `sbproxy.ai.cost_usd_micros`, `gen_ai.usage.cost` | `llm.usage.total_cost` |
 | Pricing catalog revision | `sbproxy.ai.pricing_version` | n/a |
 | Content (opt-in) | role-aware `gen_ai.*.message` span events | `input.value`, `output.value`, `llm.input_messages.*`, `llm.output_messages.*` |
-| Failure | `otel.status_code = ERROR` plus `error.type` (`guardrail_blocked`, `rate_limited`, `content_filter`, `budget_exceeded`, `invalid_request`, `upstream_5xx`, `timeout`; generic dispatch failures use `provider_error`) | n/a |
+| Failure | `otel.status_code = ERROR` plus `error.type` (`guardrail_blocked`, `rate_limited`, `content_filter`, `budget_exceeded`, `invalid_request`, `upstream_5xx`, `timeout`, `client_disconnected`; generic dispatch failures use `provider_error`) | n/a |
 | Tenant | `sbproxy.tenant_id` | n/a |
 | Run identity | `sbproxy.run.id_source`, `sbproxy.a2a.task_id`, `sbproxy.a2a.caller_agent_id`, `sbproxy.a2a.identity_verified` | `session.id`, `graph.node.id`, `graph.node.parent_id` |
 
@@ -1350,7 +1350,7 @@ events:
 
 `gen_ai.operation.name` carries the OTel GenAI operation vocabulary, derived from the classified surface: `chat` (chat completions, Anthropic Messages, OpenAI Responses, realtime), `embeddings`, `image_generation` (generations, edits, variations), and `audio` (transcription, translation, speech). Control-plane surfaces such as `models` or `files` are not generation operations and pass their surface label through unchanged. The finer-grained endpoint identity always rides on `sbproxy.ai.surface`.
 
-On a blocked or failed generation, `otel.status_code = ERROR` and `error.type` is one of `guardrail_blocked`, `rate_limited`, `content_filter`, `budget_exceeded`, `invalid_request`, `upstream_5xx`, or `timeout`; generic dispatch failures use `provider_error`. Phoenix, Langfuse, Datadog, Honeycomb, Jaeger, and Tempo all preserve those attributes. The difference is presentation: Phoenix and Langfuse render a generation view, while the generic trace backends expose the same fields as searchable attributes.
+On a blocked or failed generation, `otel.status_code = ERROR` and `error.type` is one of `guardrail_blocked`, `rate_limited`, `content_filter`, `budget_exceeded`, `invalid_request`, `upstream_5xx`, `timeout`, or `client_disconnected`; generic dispatch failures use `provider_error`. `client_disconnected` marks a call the gateway abandoned because the caller's connection broke, and it is deliberately its own value rather than a `provider_error`: the provider did nothing wrong, and a reliability panel that folded the two together would blame it for callers who left. Phoenix, Langfuse, Datadog, Honeycomb, Jaeger, and Tempo all preserve those attributes. The difference is presentation: Phoenix and Langfuse render a generation view, while the generic trace backends expose the same fields as searchable attributes.
 
 ### Sampling
 

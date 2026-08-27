@@ -913,7 +913,17 @@ pub(super) fn websocket_teardown_response(
     })
 }
 
-fn downstream_half_closed(session: &Session) -> bool {
+/// Whether the client has shut down its write half of an HTTP/1
+/// connection.
+///
+/// Reports Pingora's `half_closed` flag, which is set by the session's
+/// own body and idle reads and by nothing else. `pub(super)` because the
+/// AI dispatcher's downstream watch (WOR-2690) has to prove it does not
+/// set that flag: doing so would silently reprice the receipt of every
+/// failed AI request from a half-closing client, through the
+/// `downstream_half_closed && delivery_failed` arm of
+/// [`client_disconnected`] below.
+pub(super) fn downstream_half_closed(session: &Session) -> bool {
     match session.as_downstream() {
         pingora_core::protocols::http::ServerSession::H1(session) => session.is_half_closed(),
         _ => false,
@@ -1022,7 +1032,16 @@ async fn lingering_drain_downstream_body(session: &mut Session, ctx: &RequestCon
     }
 }
 
-fn client_disconnected(
+/// Whether this request's failure was the client going away, which is
+/// the one question the receipt's `client_disconnected` outcome asks.
+///
+/// `pub(super)` rather than private because the AI dispatcher's
+/// cancellation path (WOR-2690) is answerable only against this
+/// function: it abandons a paid provider call by returning a
+/// `Downstream`-sourced error, and "does that error price as a
+/// disconnect" is a claim about this classifier rather than about the
+/// dispatcher.
+pub(super) fn client_disconnected(
     error_source: Option<pingora_error::ErrorSource>,
     downstream_half_closed: bool,
 ) -> bool {
@@ -1040,6 +1059,33 @@ fn client_disconnected(
     let delivery_failed = error_source.is_some();
     error_source.is_some_and(|source| source == pingora_error::ErrorSource::Downstream)
         || (downstream_half_closed && delivery_failed)
+}
+
+/// Whether the origin's `on_error` fallback should run for this failure.
+///
+/// The whole condition, not half of it, so that the call site in
+/// [`ProxyHttp::fail_to_proxy`] is a call and nothing else and this
+/// function is the thing a test can hold to account.
+///
+/// `on_error` is the operator's answer to "the upstream broke, serve
+/// this instead", and it is worth running for every failure with a
+/// caller still on the line. The one exception is a request the AI
+/// dispatcher cancelled itself because that caller's connection was
+/// already gone (WOR-2690): there is nobody to serve, and on an
+/// `ai_proxy` fallback the substitute action is a second paid provider
+/// call, which hands straight back the spend the cancellation saved.
+///
+/// Keyed on the request's own cancellation marker rather than on the
+/// error's `ErrorSource`. Pingora stamps `Downstream` on request
+/// sanitization failures too, for instance a `Connection` header
+/// nominating a protected field (`proxy_h1.rs`'s
+/// `sanitize_h1_upstream_request`), and that caller is alive, reading,
+/// and entitled to the fallback it configured.
+fn on_error_fallback_applies(
+    fallback: &crate::pipeline::CompiledFallback,
+    ctx: &RequestContext,
+) -> bool {
+    fallback.on_error && !ctx.ai_upstream_cancelled_on_client_disconnect
 }
 
 fn should_record_proxy_request_metrics(path: &str) -> bool {
@@ -8544,7 +8590,7 @@ impl ProxyHttp for SbProxy {
         if let Some(origin_idx) = ctx.origin_idx {
             let pipeline = ctx.pipeline.clone();
             if let Some(fallback) = &pipeline.fallbacks[origin_idx] {
-                if fallback.on_error {
+                if on_error_fallback_applies(fallback, ctx) {
                     debug!(
                         hostname = %ctx.hostname,
                         error = %e,
@@ -10542,6 +10588,68 @@ origins:
             Some(pingora_error::ErrorSource::Upstream),
             false
         ));
+    }
+
+    /// The seam, not the fragment: this is the whole condition
+    /// `fail_to_proxy` now evaluates before serving `fallback.on_error`,
+    /// so inverting either half of it fails here.
+    #[test]
+    fn the_on_error_fallback_declines_only_a_cancelled_client_disconnect() {
+        fn fallback(on_error: bool) -> crate::pipeline::CompiledFallback {
+            crate::pipeline::CompiledFallback {
+                on_error,
+                on_status: Vec::new(),
+                add_debug_header: false,
+                action: sbproxy_modules::Action::Noop,
+            }
+        }
+
+        let mut ctx = RequestContext::new();
+        assert!(
+            on_error_fallback_applies(&fallback(true), &ctx),
+            "an ordinary upstream failure still serves the configured fallback"
+        );
+        assert!(
+            !on_error_fallback_applies(&fallback(false), &ctx),
+            "an origin that did not ask for on_error still gets none"
+        );
+
+        // WOR-2690: the AI dispatcher cancels a provider call when the
+        // client's connection is gone. Serving a fallback action to a
+        // caller who left cannot deliver anything, and on an `ai_proxy`
+        // fallback that action is a second paid provider call, which
+        // hands straight back the spend the cancellation saved.
+        ctx.ai_upstream_cancelled_on_client_disconnect = true;
+        assert!(
+            !on_error_fallback_applies(&fallback(true), &ctx),
+            "a cancelled client disconnect has nobody left to answer"
+        );
+    }
+
+    /// The narrowing has to stay narrow. Pingora stamps `Downstream` on
+    /// request sanitization failures, where the caller is alive and
+    /// reading, and an earlier revision of this guard keyed on that
+    /// source and silently took those callers' fallback away.
+    #[test]
+    fn a_live_client_keeps_its_fallback_on_a_downstream_sourced_failure() {
+        let sanitization_failure = Error::new_down(ErrorType::InvalidHTTPHeader);
+        assert_eq!(
+            *sanitization_failure.esource(),
+            pingora_error::ErrorSource::Downstream,
+            "the fixture has to be the shape the old guard misread"
+        );
+
+        let ctx = RequestContext::new();
+        let fallback = crate::pipeline::CompiledFallback {
+            on_error: true,
+            on_status: Vec::new(),
+            add_debug_header: false,
+            action: sbproxy_modules::Action::Noop,
+        };
+        assert!(
+            on_error_fallback_applies(&fallback, &ctx),
+            "a malformed request header must not cost a live caller its fallback"
+        );
     }
 
     #[test]

@@ -716,3 +716,9 @@ pub(crate) would leave items whose only callers are cfg(test) code, which
 `-D warnings` reports as dead code (the #757 shape). The avoidable
 same-file constant `AI_TOOLKIT_EVENT_ID_MAX_BYTES` was narrowed to
 pub(crate) before recording this result.
+
+2026-08-27 (WOR-2690): unreferenced baseline 1462 -> 1461. Ground gained,
+not given. `pipeline::CompiledFallback` had only ever been named inside
+`pipeline.rs`; the AI client-disconnect work moved `fail_to_proxy`'s
+`on_error` condition into a named function that takes one, so the type is
+now referenced from `server/proxy_http.rs` and leaves the bucket.

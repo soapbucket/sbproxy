@@ -1,6 +1,6 @@
 # Attested metering
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-27*
 
 ![A metered request cuts a signed receipt, the chain verifies, one tampered entry on disk breaks it, and the verifier names the broken sequence number](assets/metering-verify.gif)
 
@@ -192,6 +192,8 @@ The price is one `fsync` per metered call, which is the ledger's throughput ceil
 ### `billable`: the outcome table
 
 Every metered call's receipt names exactly one of eight outcomes: `delivered`, `client_disconnected`, `origin_4xx`, `origin_5xx`, `policy_blocked`, `rate_limited`, `cache_hit`, `retry`. The table gives the billing answer for each: `yes` bills every unit the call produced, `no` bills nothing, `partial` bills the work performed before a cut, and `collapse` folds every attempt at one unit of work into the invoice line its claim names, so a flaky origin costs the buyer once rather than once per attempt. Extra origin or provider attempts are recorded as `retry` under the same claim id; the receipt for a successful retry still names `delivered`, which is what keeps that sale billable when `retry` is `collapse`.
+
+`client_disconnected` is written when delivery of a finished response to a proxied origin failed, and when an AI request was cancelled mid-generation because the caller's connection broke; see [ai-gateway.md](ai-gateway.md#when-a-broken-connection-stops-the-meter). The units on that second receipt are whatever the provider had reported, which for a call abandoned before its response header is none, so `partial` and `yes` bill the same nothing there. One AI case is not covered yet. A response that finished generating and then failed to reach a caller who had already left is not attributed to that caller, so it prices as `delivered` or `origin_5xx` rather than `client_disconnected`. Fixing that is a planned follow-up in the shared relay code.
 
 All eight answers are required and none is defaulted, on purpose. An unstated billing rule still runs; it just runs as whatever the code happened to do, and nobody discovers what that was until a buyer asks. An outcome the table says is free still gets a receipt, with an empty units list: "not billed, because the table says origin_5xx is free" is exactly the evidence a dispute needs, and an omitted receipt would be indistinguishable from a call that never happened.
 

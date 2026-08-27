@@ -3393,10 +3393,17 @@ pub fn record_projection_render_failure(projection: &str) {
 }
 
 /// Count an AI provider attempt during failover/selection on
-/// `sbproxy_ai_provider_attempts_total{provider, outcome}`. `outcome`
-/// is a closed string (`success` / `error`). Gives operators the
-/// per-provider load distribution and failure rate that a bare
-/// "failover happened" signal cannot (WOR-1103).
+/// `sbproxy_ai_provider_attempts_total{provider, outcome}`. Gives
+/// operators the per-provider load distribution and failure rate that a
+/// bare "failover happened" signal cannot (WOR-1103).
+///
+/// `outcome` is a closed string: `success`, `error`, and
+/// `client_disconnected` for a call the gateway abandoned because the
+/// caller's connection was gone (WOR-2690). Keep it closed and keep this
+/// list current: the registry row declares label *names* only, so this
+/// comment is the only place the value set is written down, and a
+/// dashboard that selects one value silently loses traffic to a new one
+/// nobody recorded here.
 pub fn record_provider_attempt(provider: &str, outcome: &'static str) {
     use prometheus::{register_int_counter_vec, IntCounterVec};
     use std::sync::OnceLock;
