@@ -636,14 +636,6 @@ async fn resolve_impersonation_ticket(
     })
 }
 
-/// Whether the request already declares more body than the body-matching
-/// cap will hold (WOR-2306).
-///
-/// Checked before any buffering is armed, so a large upload is never
-/// partially retained just to be refused by the matcher afterwards. A
-/// request with no `Content-Length`, or an unparseable one, is not
-/// "exceeding" anything knowable here; a chunked body that overruns is
-/// caught by the read loop instead, and both end the same way.
 /// Hand back the buffering slot and take a waiter slot, for a request
 /// that has finished buffering and is about to park on somebody else's
 /// response (WOR-2609).
@@ -671,6 +663,14 @@ fn enter_idempotency_wait_slot(
     waiter
 }
 
+/// Whether the request already declares more body than the body-matching
+/// cap will hold (WOR-2306).
+///
+/// Checked before any buffering is armed, so a large upload is never
+/// partially retained just to be refused by the matcher afterwards. A
+/// request with no `Content-Length`, or an unparseable one, is not
+/// "exceeding" anything knowable here; a chunked body that overruns is
+/// caught by the read loop instead, and both end the same way.
 fn declared_body_exceeds_cap(session: &Session, cap: usize) -> bool {
     session
         .req_header()
@@ -4043,6 +4043,14 @@ pub(super) async fn request_filter(
                             // which is already at the worker's stack
                             // budget on the AI path; an inline future
                             // here grows every caller's state machine.
+                            // Whether this request parked on somebody
+                            // else's claim. It decides which outcome
+                            // the replay below records (`coalesced`
+                            // rather than `hit`) and whether the 409
+                            // needs one recorded at all: a wait that
+                            // ran out has already counted itself under
+                            // `wait_timeout` or `abandoned`.
+                            let mut waited = false;
                             let resolved = match already_stored {
                                 Some(stored) => Some(stored),
                                 None => {
@@ -4065,6 +4073,7 @@ pub(super) async fn request_filter(
                                         &idem.wait_permits,
                                     ) {
                                         Some(wait_permit) => {
+                                            waited = true;
                                             let resolved = Box::pin(
                                                 sbproxy_middleware::idempotency::await_completion(
                                                     &idem.cache,
@@ -4084,11 +4093,27 @@ pub(super) async fn request_filter(
                                     }
                                 }
                             };
+                            // The streaming proxy path resolves an
+                            // overlap here rather than through
+                            // `check_request`, so until WOR-2606 it
+                            // recorded `miss` or `takeover` from the
+                            // claim and nothing else, ever. Every
+                            // dashboard built on the documented
+                            // outcome set therefore read a near-100%
+                            // miss rate for all proxied traffic and a
+                            // denominator that was not the request
+                            // count. Each arm below records exactly the
+                            // value the reference says it does.
+                            let backend = idem.cache.backend_label();
                             let (body, marker) = match resolved {
                                 Some(cached_resp) if cached_resp.request_body_hash == body_hash => {
                                     // Replay. The shared helper also
                                     // serves GraphQL hits that must wait
                                     // until final-request validation.
+                                    sbproxy_observe::metrics::record_idempotency_cache_result(
+                                        backend,
+                                        if waited { "coalesced" } else { "hit" },
+                                    );
                                     let status =
                                         send_idempotency_cache_hit(session, cached_resp).await?;
                                     ctx.response_status = Some(status);
@@ -4097,18 +4122,38 @@ pub(super) async fn request_filter(
                                 // Body conflict: same key, different
                                 // body. 409 per
                                 // draft-ietf-httpapi-idempotency-key-header.
-                                Some(_) => (
-                                    sbproxy_middleware::idempotency::conflict_response(),
-                                    "CONFLICT",
-                                ),
+                                Some(_) => {
+                                    sbproxy_observe::metrics::record_idempotency_cache_result(
+                                        backend, "conflict",
+                                    );
+                                    (
+                                        sbproxy_middleware::idempotency::conflict_response(),
+                                        "CONFLICT",
+                                    )
+                                }
                                 // The holder is still working, or died
                                 // without publishing. 409 per
                                 // draft-ietf-httpapi-idempotency-key-header:
                                 // the client retries with the same key.
-                                None => (
-                                    sbproxy_middleware::idempotency::in_flight_response(),
-                                    "IN-FLIGHT",
-                                ),
+                                None => {
+                                    // A request that waited has already
+                                    // been counted by the wait itself.
+                                    // One that never got a waiter slot
+                                    // has not, and it is the other
+                                    // population `in_flight` names: a
+                                    // live claim found by a request
+                                    // that could not wait for it.
+                                    if !waited {
+                                        sbproxy_observe::metrics::record_idempotency_cache_result(
+                                            backend,
+                                            "in_flight",
+                                        );
+                                    }
+                                    (
+                                        sbproxy_middleware::idempotency::in_flight_response(),
+                                        "IN-FLIGHT",
+                                    )
+                                }
                             };
                             let (status, content_type, body) = body;
                             let status_u16 = status.as_u16();

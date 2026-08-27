@@ -452,12 +452,21 @@ impl IdempotencyCache for KvIdempotencyCache {
             let now = now_unix();
             let current = match self.store.get(storage_key.as_bytes()) {
                 Ok(current) => current,
+                // A read failure is transient for the same reasons the
+                // write failure below is, and used to be treated as
+                // final one branch earlier: it handed out an unfenced
+                // claim on the spot, so every concurrent request on one
+                // key during a failover blip got one and every one of
+                // them reached the upstream. That is the stampede this
+                // module exists to prevent, on the single event most
+                // likely to produce a burst of retries. Take another
+                // turn instead.
                 Err(_) => {
                     sbproxy_observe::metrics::record_idempotency_cache_result(
                         self.backend_label(),
                         "error",
                     );
-                    return self.unfenced_claim();
+                    continue;
                 }
             };
             match current.as_deref().and_then(parse_entry) {

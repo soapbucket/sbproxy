@@ -1298,15 +1298,6 @@ fn verify_graphql_inbound_body_binding(
     verified
 }
 
-/// Engage idempotency only after GraphQL validation has established the final
-/// authoritative request body.
-///
-/// The ordinary path probes in `request_filter` so cache hits avoid policies
-/// and upstream selection. Validated GraphQL requests cannot safely do that:
-/// request modifiers do not produce the final method, headers, and body until
-/// `upstream_request_filter`. This late path preserves the cached response
-/// payload and conflict semantics while ensuring an older entry never bypasses
-/// the current validation rules.
 /// Everything `response_body_filter` has in hand when a claimed
 /// request's response ends, each part `None` when that part was never
 /// captured (WOR-2609).
@@ -1393,7 +1384,22 @@ pub(crate) fn publish_captured_idempotent_response(
     IdempotencyPublish::Published
 }
 
-fn engage_validated_graphql_idempotency(
+/// Engage idempotency only after GraphQL validation has established the final
+/// authoritative request body.
+///
+/// The ordinary path probes in `request_filter` so cache hits avoid policies
+/// and upstream selection. Validated GraphQL requests cannot safely do that:
+/// request modifiers do not produce the final method, headers, and body until
+/// `upstream_request_filter`. This late path preserves the cached response
+/// payload and conflict semantics while ensuring an older entry never bypasses
+/// the current validation rules.
+///
+/// Async because the claim itself is: a shared backend answers it over
+/// the network, and a proxy worker that blocks on one stops serving
+/// every other connection assigned to it (WOR-2606). What this path
+/// still cannot do is *wait* for a key another request holds, because
+/// the body is already committed and there is nowhere to re-send it.
+async fn engage_validated_graphql_idempotency(
     request_headers: &http::HeaderMap,
     method: &http::Method,
     authoritative_body: &[u8],
@@ -1437,17 +1443,25 @@ fn engage_validated_graphql_idempotency(
 
     let body_hash = sbproxy_middleware::idempotency::hash_body(authoritative_body);
     // WOR-2609: this path runs in `upstream_request_filter`, which has
-    // no await point of its own and has already committed the body, so
-    // it cannot wait for a key another request holds the way the
-    // ordinary path does. It answers the 409 that
+    // already committed the body, so it cannot wait for a key another
+    // request holds the way the ordinary path does: there is nowhere to
+    // re-send what has already gone out. It answers the 409 that
     // draft-ietf-httpapi-idempotency-key-header names as the floor, and
     // the client's retry resolves normally once the holder publishes.
-    match sbproxy_middleware::idempotency::claim(
+    //
+    // The claim itself does go off the worker, through `claim_async`
+    // like every other call site. This one was missed in the first fix
+    // round, which left the one path that skipped the seam running up
+    // to six Redis round trips inside a Pingora worker while
+    // `blocks_on_io`'s own rustdoc said the request path did not.
+    match Box::pin(sbproxy_middleware::idempotency::claim_async(
         &idem.cache,
         &workspace,
         &key,
         idem.claim_lease_secs,
-    ) {
+    ))
+    .await
+    {
         sbproxy_middleware::idempotency::ClaimState::Completed(cached) => {
             ctx.idempotency_permit = None;
             if cached.request_body_hash == body_hash {
@@ -1465,6 +1479,18 @@ fn engage_validated_graphql_idempotency(
         }
         sbproxy_middleware::idempotency::ClaimState::InFlight { .. } => {
             ctx.idempotency_permit = None;
+            // The only place `in_flight` is recorded, and the only
+            // place the value's documented meaning occurs: a live claim
+            // found on a path that cannot wait. Every other overlap
+            // waits first and lands on `coalesced`, `wait_timeout` or
+            // `abandoned`. The value was declared in the metric's
+            // rustdoc and in the configuration reference and recorded
+            // nowhere, so an operator alerting on it got a series that
+            // never appeared.
+            sbproxy_observe::metrics::record_idempotency_cache_result(
+                idem.cache.backend_label(),
+                "in_flight",
+            );
             let (status, content_type, body) =
                 sbproxy_middleware::idempotency::in_flight_response();
             ctx.validator_failed = Some((
@@ -4467,12 +4493,14 @@ impl ProxyHttp for SbProxy {
                 .graphql_validated_request_body
                 .clone()
                 .unwrap_or_default();
-            if engage_validated_graphql_idempotency(
+            if Box::pin(engage_validated_graphql_idempotency(
                 &session.req_header().headers,
                 &upstream_request.method,
                 &authoritative_body,
                 ctx,
-            ) {
+            ))
+            .await
+            {
                 return Err(pingora_error::Error::explain(
                     pingora_error::ErrorType::InternalError,
                     "validated GraphQL idempotency response",

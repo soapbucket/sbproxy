@@ -525,6 +525,25 @@ pub fn claim(
 /// connection assigned to it. A backend that answers `false` to
 /// [`IdempotencyCache::blocks_on_io`] runs inline, because a scheduler
 /// hop costs more than the mutex it would be hopping around.
+///
+/// # Why the handle is built inside the closure
+///
+/// The obvious shape, awaiting a [`TryClaim`] and attaching the handle
+/// afterwards, leaks a claim on cancellation. Dropping a
+/// `spawn_blocking` `JoinHandle` detaches the task rather than
+/// cancelling it: the closure still runs and still writes the claim
+/// row, and the handle that would have released it is never
+/// constructed, because construction was on the far side of an await
+/// this request no longer reaches. The key then answers 409 for the
+/// full lease. The client that fires this is the one that timed out
+/// and disconnected, which is exactly the client whose immediate retry
+/// meets the orphan.
+///
+/// The synchronous [`claim`] has no such window: the row and the
+/// handle are created in one uninterruptible step. Building the handle
+/// inside the closure restores that property across the await. A
+/// dropped `JoinHandle` now drops an [`IdempotencyClaim`], and its
+/// destructor releases the key.
 pub async fn claim_async(
     cache: &Arc<dyn IdempotencyCache>,
     workspace_id: &str,
@@ -540,23 +559,24 @@ pub async fn claim_async(
             cache.try_claim(workspace_id, key, lease),
         );
     }
-    let taken = {
-        let cache = Arc::clone(cache);
-        let workspace_id = workspace_id.to_string();
-        let key = key.to_string();
-        match tokio::task::spawn_blocking(move || cache.try_claim(&workspace_id, &key, lease)).await
-        {
-            Ok(taken) => taken,
-            // The blocking pool is gone or the task panicked. Report
-            // the key as held rather than handing out a claim nothing
-            // wrote: an unowned claim would publish over whatever the
-            // real owner produces.
-            Err(_) => TryClaim::InFlight {
-                lease_expires_at_unix: now_unix().saturating_add(lease),
-            },
-        }
-    };
-    finish_claim(cache, workspace_id, key, taken)
+    let owned = Arc::clone(cache);
+    let owned_workspace = workspace_id.to_string();
+    let owned_key = key.to_string();
+    match tokio::task::spawn_blocking(move || {
+        let taken = owned.try_claim(&owned_workspace, &owned_key, lease);
+        finish_claim(&owned, &owned_workspace, &owned_key, taken)
+    })
+    .await
+    {
+        Ok(state) => state,
+        // The blocking pool is gone or the task panicked. Report the
+        // key as held rather than handing out a claim nothing wrote:
+        // an unowned claim would publish over whatever the real owner
+        // produces.
+        Err(_) => ClaimState::InFlight {
+            lease_expires_at_unix: now_unix().saturating_add(lease),
+        },
+    }
 }
 
 /// Zero means "the caller did not choose", not "expire immediately".
@@ -2041,5 +2061,195 @@ mod tests {
             claim(&cache, "ws", "abandoned", 60),
             ClaimState::Claimed(_)
         ));
+    }
+
+    /// A store whose reads fail the first `n` times and are healthy
+    /// after. A Redis failover blip looks exactly like this to a
+    /// caller: the connection drops, the command times out, and the
+    /// next attempt a moment later succeeds.
+    struct FlakyReadStore {
+        inner: sbproxy_platform::storage::MemoryKVStore,
+        failures_left: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FlakyReadStore {
+        fn new(failures: usize) -> Self {
+            Self {
+                inner: sbproxy_platform::storage::MemoryKVStore::new(0),
+                failures_left: std::sync::atomic::AtomicUsize::new(failures),
+            }
+        }
+    }
+
+    impl KVStore for FlakyReadStore {
+        fn get(&self, key: &[u8]) -> anyhow::Result<Option<bytes::Bytes>> {
+            if self
+                .failures_left
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                anyhow::bail!("transient: connection reset by peer");
+            }
+            self.inner.get(key)
+        }
+        fn put(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+            self.inner.put(key, value)
+        }
+        fn delete(&self, key: &[u8]) -> anyhow::Result<()> {
+            self.inner.delete(key)
+        }
+        fn scan_prefix(&self, prefix: &[u8]) -> anyhow::Result<Vec<(bytes::Bytes, bytes::Bytes)>> {
+            self.inner.scan_prefix(prefix)
+        }
+        fn put_with_ttl(&self, key: &[u8], value: &[u8], ttl: u64) -> anyhow::Result<()> {
+            self.inner.put_with_ttl(key, value, ttl)
+        }
+        fn compare_and_swap_with_ttl(
+            &self,
+            key: &[u8],
+            expected: &[u8],
+            value: &[u8],
+            ttl: u64,
+        ) -> anyhow::Result<bool> {
+            self.inner
+                .compare_and_swap_with_ttl(key, expected, value, ttl)
+        }
+        fn put_if_absent_with_ttl(
+            &self,
+            key: &[u8],
+            value: &[u8],
+            ttl: u64,
+        ) -> anyhow::Result<bool> {
+            self.inner.put_if_absent_with_ttl(key, value, ttl)
+        }
+        fn supports_atomic_create(&self) -> bool {
+            true
+        }
+    }
+
+    /// A store that takes its time creating a key, so a test can cancel
+    /// a claim while the write is in flight.
+    struct SlowCreateStore {
+        inner: sbproxy_platform::storage::MemoryKVStore,
+    }
+
+    impl KVStore for SlowCreateStore {
+        fn get(&self, key: &[u8]) -> anyhow::Result<Option<bytes::Bytes>> {
+            self.inner.get(key)
+        }
+        fn put(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+            self.inner.put(key, value)
+        }
+        fn delete(&self, key: &[u8]) -> anyhow::Result<()> {
+            self.inner.delete(key)
+        }
+        fn scan_prefix(&self, prefix: &[u8]) -> anyhow::Result<Vec<(bytes::Bytes, bytes::Bytes)>> {
+            self.inner.scan_prefix(prefix)
+        }
+        fn put_with_ttl(&self, key: &[u8], value: &[u8], ttl: u64) -> anyhow::Result<()> {
+            self.inner.put_with_ttl(key, value, ttl)
+        }
+        fn compare_and_swap_with_ttl(
+            &self,
+            key: &[u8],
+            expected: &[u8],
+            value: &[u8],
+            ttl: u64,
+        ) -> anyhow::Result<bool> {
+            self.inner
+                .compare_and_swap_with_ttl(key, expected, value, ttl)
+        }
+        fn put_if_absent_with_ttl(
+            &self,
+            key: &[u8],
+            value: &[u8],
+            ttl: u64,
+        ) -> anyhow::Result<bool> {
+            // Long enough that the caller below is cancelled while this
+            // is still running, short enough not to slow the suite.
+            std::thread::sleep(Duration::from_millis(300));
+            self.inner.put_if_absent_with_ttl(key, value, ttl)
+        }
+        fn supports_atomic_create(&self) -> bool {
+            true
+        }
+    }
+
+    /// A store failure on the *read* half of the claim is transient for
+    /// exactly the reasons the write half's comment argues at length,
+    /// and it used to be treated as final one branch earlier: it handed
+    /// out an unfenced claim on the spot.
+    ///
+    /// An unfenced claim writes nothing, so during a failover blip every
+    /// concurrent request on one key got one and every one of them
+    /// reached the upstream. That is the stampede the module exists to
+    /// prevent, on the single event most likely to produce a burst of
+    /// retries.
+    #[tokio::test]
+    async fn a_transient_read_failure_still_produces_a_fenced_claim() {
+        let store: Arc<dyn KVStore> = Arc::new(FlakyReadStore::new(1));
+        let cache = KvIdempotencyCache::new(Arc::clone(&store), DEFAULT_TTL_SECS, "t", "o");
+        let storage_key = cache.build_key("ws", "k");
+
+        match cache.try_claim("ws", "k", 60) {
+            TryClaim::Claimed { .. } => {}
+            other => panic!("a transient read failure must not lose the claim, got {other:?}"),
+        }
+        assert!(
+            store.get(storage_key.as_bytes()).unwrap().is_some(),
+            "the claim was unfenced: nothing was written, so every concurrent request \
+             on this key would get one too"
+        );
+
+        // And the fence it wrote actually holds: a second caller sees
+        // the live claim rather than taking the key as well.
+        match cache.try_claim("ws", "k", 60) {
+            TryClaim::InFlight { .. } => {}
+            other => panic!("the second caller must find the key held, got {other:?}"),
+        }
+    }
+
+    /// Cancelling a claim must not orphan the key.
+    ///
+    /// Dropping a `spawn_blocking` `JoinHandle` detaches the task
+    /// rather than cancelling it, so the closure still runs and still
+    /// writes the claim row. When the RAII handle was built after the
+    /// await, on the caller's side, a cancelled request left that row
+    /// held for the whole lease with nothing able to release it. The
+    /// client that hits this is the one that timed out and
+    /// disconnected, which is precisely the client whose immediate
+    /// retry then meets its own orphan and gets 409.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_claim_does_not_orphan_the_key() {
+        let store: Arc<dyn KVStore> = Arc::new(SlowCreateStore {
+            inner: sbproxy_platform::storage::MemoryKVStore::new(0),
+        });
+        let cache: Arc<dyn IdempotencyCache> = Arc::new(KvIdempotencyCache::new(
+            store,
+            DEFAULT_TTL_SECS,
+            "tenant",
+            "origin",
+        ));
+
+        // Cancel while the create is still in the store. The lease is
+        // sixty seconds, so a leaked row is not going to time out
+        // inside this test.
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(50),
+            claim_async(&cache, "ws", "cancelled", 60),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the claim finished before it could be cancelled, so this test proves nothing"
+        );
+
+        // The detached write lands, and the handle that came with it
+        // releases the key.
+        settle_release(&cache, "ws", "cancelled").await;
+        assert!(
+            matches!(claim(&cache, "ws", "cancelled", 60), ClaimState::Claimed(_)),
+            "the cancelled request orphaned its key for the whole lease"
+        );
     }
 }
