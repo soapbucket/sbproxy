@@ -1,6 +1,6 @@
 # Secret Backends
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-27*
 
 SBproxy resolves every secret-bearing config value through one reference grammar, checked by one function. A provider credential under `credentials:`, a `source:` block's `credential` field, the `pepper` and `master_key` under `key_management.crypto`, and the value each provider URI on this page resolves to are all meant to go through that same grammar, in the same order, with the same failure behavior. There is nothing field-specific to learn: a form that works in one secret-bearing field works in all of them.
 
@@ -49,6 +49,16 @@ Four shapes make up the current vocabulary. Anything that does not match one of 
 See [`examples/vault-reference/`](../examples/vault-reference/) for a
 complete working config showing every scheme above alongside `${ENV}`.
 
+### Where These Forms Are Refused
+
+Two of the four read the proxy host directly: `env:NAME` (and its `${VAR_NAME}` and legacy `vault://env/NAME` spellings) reads the process environment, and `file:PATH` reads the filesystem. Config text the operator did not write is not allowed to use them, because the party that wrote that text is not the party that owns the host it compiles on:
+
+* A **config-authority bundle** may not carry one, at publish and again at the subscriber.
+* A **git-sourced document** may not carry one when its `source:` block sets `confine: true`. That is off by default, so an ordinary GitOps repository keeps writing `env:` and `file:` as documented here; see [Config source (GitOps)](configuration.md#config-source-gitops).
+* An **extension bundle manifest** may not supply one for its own config vars, and there the provider URIs are refused too, because guest code reads its config.
+
+A provider URI resolves in all but the last case, because it can only reach a backend the operator declared under `proxy.secrets.backends`. The full rule, and what it does not cover, is in [Confined fragments](configuration.md#confined-fragments).
+
 ### Deprecated Forms
 
 Two older shapes still work, each logging a one-time warning, and neither is what to write in new config:
@@ -69,7 +79,7 @@ The Go-era `secret:<name>` colon form (no `//`) is gone. It is not a fallback an
 > **Implementation note.** The vocabulary above is transcribed from `crates/sbproxy-vault/src/resolver.rs`'s `SecretResolver::resolve`, the target every secret-bearing field is meant to route through. Most already do: provider credentials, the `source:` block's `credential` field, and at-rest key material under `key_management.crypto` all resolve through it. Two call sites are narrower today, for different reasons:
 >
 > * A backend's own construction fields (a Vault `auth.token`, AWS static keys, and similar, in the `proxy.secrets.backends:` entries below) only expand whole-value `${VAR}` and fall back to the literal string on a missing variable instead of erroring. This is a bootstrapping constraint, not a migration gap: these values configure the backend that `SecretResolver` will use, so they cannot depend on it existing yet.
-> * `proxy.cluster.security.shared_key` accepts only `env:NAME`, `file:PATH`, or an inline value of at least 16 bytes, and rejects every provider URI scheme outright, including `vault://`. This one is deliberate: a provider URI is long enough to clear the inline-entropy floor, so accepting it as a literal would silently install a well-known string, published in a doc like this one, as the cluster's shared key.
+> * `proxy.cluster.security.shared_key` accepts only `env:NAME`, `file:PATH`, or an inline value of at least 16 bytes, and rejects every provider URI scheme outright, including `vault://`. Those two forms are also the two a confined document may not carry, so a clustered node whose config comes from a `source:` block with `confine: true` has to keep this key in its local pointer file. This one is deliberate: a provider URI is long enough to clear the inline-entropy floor, so accepting it as a literal would silently install a well-known string, published in a doc like this one, as the cluster's shared key.
 >
 > If you find some other field silently accepting a different syntax than what is documented here, treat that as a bug worth filing rather than a feature of that field.
 

