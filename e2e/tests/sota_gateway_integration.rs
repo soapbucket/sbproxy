@@ -68,6 +68,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use hmac::digest::KeyInit as _;
 use hmac::{Hmac, Mac};
 use sbproxy_e2e::{proxy_binary_path, ProxyHarness};
 use serde_json::{json, Value};

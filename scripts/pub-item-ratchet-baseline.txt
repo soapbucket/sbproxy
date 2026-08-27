@@ -722,8 +722,8 @@ unreferenced 1462 -> 1478, tests-only unchanged at 314. Two avoidable
 items were removed before recording this: `ShadowEvalContext::
 retains_responses` was deleted rather than narrowed, since the public
 field it wrapped says the same thing, and `ShadowPairLedger::is_armed`
-was narrowed to pub(crate) because `record_primary` in the same crate
-reads it. `TargetSummary` was already reachable from `sbproxy-core` and
+was removed, since its only reader was a test and the behavior it
+described is asserted through the report instead. `TargetSummary` was already reachable from `sbproxy-core` and
 is now named there explicitly so the scan can see it.
 
 The additions fall in two groups, and both were tried as pub(crate)

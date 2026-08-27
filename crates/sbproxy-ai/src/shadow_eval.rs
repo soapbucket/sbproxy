@@ -586,11 +586,6 @@ impl ShadowPairLedger {
         }
     }
 
-    /// Whether any request has ever armed pairing on this ledger.
-    #[must_use]
-    pub(crate) fn is_armed(&self) -> bool {
-        self.armed.load(Ordering::Relaxed)
-    }
 }
 
 #[derive(Default)]
@@ -1102,15 +1097,28 @@ mod tests {
     }
 
     /// The end-of-request hook calls `record_primary` on every AI
-    /// request. A ledger nothing ever armed must not make that a lock
-    /// and a scan.
+    /// request, so a ledger nothing ever armed must not make that a
+    /// lock and a scan. Asserted through the report rather than through
+    /// the flag, because the flag is an optimization and the behavior
+    /// is the contract.
     #[test]
     fn an_unarmed_ledger_short_circuits_the_primary_hook() {
         let ledger = ShadowPairLedger::default();
-        assert!(!ledger.is_armed());
         ledger.record_primary("req-unarmed", primary(0.01, 10));
+        assert!(
+            ledger.report(Duration::from_secs(60), &no_judge).is_empty(),
+            "a primary leg with no armed slot records nothing"
+        );
         ledger.open("req-armed", &legs(&["t"], 1.0));
-        assert!(ledger.is_armed(), "one open arms it for the process");
+        ledger.record_primary("req-armed", primary(0.02, 20));
+        ledger.record_shadow("req-armed", "t", ran(0.01, 10, Some("stop")));
+        assert_eq!(
+            ledger.report(Duration::from_secs(60), &no_judge)[0]
+                .provenance
+                .pairs_retained,
+            1,
+            "and one open arms the ledger for the rest of the process"
+        );
     }
 
     /// A default context keeps nothing, which is the posture a request
