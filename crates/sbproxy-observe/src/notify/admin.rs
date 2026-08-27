@@ -11,7 +11,7 @@
 
 use serde::Deserialize;
 
-use super::{Notifier, NotifierSummary, NotifyError};
+use super::{Notifier, NotifierSummary, NotifyError, MAX_DEADLETTER_PAGE};
 
 /// The route prefix this surface claims.
 pub const ADMIN_PREFIX: &str = "/admin/notifications";
@@ -60,6 +60,11 @@ impl AdminResponse {
 struct CreateBody {
     url: String,
     event_types: Vec<String>,
+    /// Opt in to a wildcard that reaches the per-request lifecycle events.
+    /// Defaults to false, so `["*"]` is refused rather than turning on one
+    /// webhook delivery per proxied request.
+    #[serde(default)]
+    allow_firehose: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -71,7 +76,42 @@ struct UpdateBody {
     event_types: Option<Vec<String>>,
     #[serde(default)]
     active: Option<bool>,
+    #[serde(default)]
+    allow_firehose: Option<bool>,
 }
+
+/// Read `limit` and `after` off a query string.
+///
+/// A malformed `limit` is clamped rather than refused: the caller asked for
+/// a page and a page is what a listing can always give.
+fn page_params(query: &str) -> (Option<String>, usize) {
+    let mut after = None;
+    let mut limit = DEFAULT_DEADLETTER_PAGE;
+    for pair in query.split('&') {
+        match pair.split_once('=') {
+            Some(("after", value)) if !value.is_empty() => after = Some(sanitize_id(value)),
+            Some(("limit", value)) => {
+                if let Ok(parsed) = value.parse::<usize>() {
+                    limit = parsed.clamp(1, MAX_DEADLETTER_PAGE);
+                }
+            }
+            _ => {}
+        }
+    }
+    (after, limit)
+}
+
+/// Bound a caller-supplied cursor to the shape a delivery id has.
+fn sanitize_id(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '_')
+        .take(64)
+        .collect()
+}
+
+/// Deadletters returned when the caller names no `limit`.
+const DEFAULT_DEADLETTER_PAGE: usize = 50;
 
 fn sanitize(value: &str) -> String {
     value
@@ -126,7 +166,10 @@ pub async fn dispatch(
     path: &str,
     body: Option<&[u8]>,
 ) -> Option<AdminResponse> {
-    let path_only = path.split('?').next().unwrap_or(path);
+    let (path_only, query) = match path.split_once('?') {
+        Some((head, tail)) => (head, tail),
+        None => (path, ""),
+    };
     let rest = path_only.strip_prefix(ADMIN_PREFIX)?;
 
     Some(match (method, rest) {
@@ -144,7 +187,7 @@ pub async fn dispatch(
                 Err(response) => return Some(response),
             };
             match notifier
-                .create_subscription(parsed.url, parsed.event_types)
+                .create_subscription(parsed.url, parsed.event_types, parsed.allow_firehose)
                 .await
             {
                 // The secret is in this response and nowhere else. A
@@ -157,10 +200,18 @@ pub async fn dispatch(
                 Err(error) => AdminResponse::from_refusal(&error),
             }
         }
-        ("GET", "/deadletters") => match notifier.list_deadletters().await {
-            Ok(items) => AdminResponse::encode(200, &serde_json::json!({"items": items})),
-            Err(error) => AdminResponse::from_refusal(&error),
-        },
+        ("GET", "/deadletters") => {
+            let (after, limit) = page_params(query);
+            match notifier.page_deadletters(after.as_deref(), limit).await {
+                // `next` is the cursor to pass back as `?after=`, and is
+                // absent on the last page. The records carry no event body:
+                // read one with `GET /deadletters/{id}`.
+                Ok((items, next)) => {
+                    AdminResponse::encode(200, &serde_json::json!({"items": items, "next": next}))
+                }
+                Err(error) => AdminResponse::from_refusal(&error),
+            }
+        }
         (method, rest) if rest.starts_with("/deadletters/") => {
             let tail = rest.trim_start_matches("/deadletters/");
             match (method, tail.split_once('/')) {
@@ -170,6 +221,29 @@ pub async fn dispatch(
                             202,
                             &serde_json::json!({"event_id": event_id, "replayed": true}),
                         ),
+                        // A full queue answers 429 with `replayed: false`,
+                        // and the record is still there. A drain loop that
+                        // reads the flag backs off instead of shredding the
+                        // queue it is draining.
+                        Err(error @ NotifyError::QueueFull) => AdminResponse::json(
+                            error.http_status(),
+                            serde_json::json!({
+                                "error": error.to_string(),
+                                "code": error.outcome(),
+                                "replayed": false,
+                            })
+                            .to_string(),
+                        ),
+                        Err(error) => AdminResponse::from_refusal(&error),
+                    }
+                }
+                ("GET", None) if !tail.is_empty() => match notifier.get_deadletter(tail).await {
+                    Ok(record) => AdminResponse::encode(200, &record),
+                    Err(error) => AdminResponse::from_refusal(&error),
+                },
+                ("DELETE", None) if !tail.is_empty() => {
+                    match notifier.delete_deadletter(tail).await {
+                        Ok(()) => AdminResponse::encode(200, &serde_json::json!({"deleted": true})),
                         Err(error) => AdminResponse::from_refusal(&error),
                     }
                 }
@@ -201,6 +275,7 @@ pub async fn dispatch(
                             parsed.url,
                             parsed.event_types,
                             parsed.active,
+                            parsed.allow_firehose,
                         )
                         .await
                     {

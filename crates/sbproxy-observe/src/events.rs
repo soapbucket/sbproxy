@@ -462,7 +462,9 @@ impl AiPromptRolloutSelectedData {
 pub struct AgentRegistrationDecidedData {
     /// The minted agent slug the decision applies to.
     pub agent_id: String,
-    /// What happened: `submitted`, `approved`, `rejected`, or `revoked`.
+    /// What happened: `submitted`, `approve`, `reject`, or `revoke`. The
+    /// three decisions carry the verb the admin route was called with, not
+    /// the past tense; `state` below carries the result.
     pub decision: String,
     /// The registration's state after the decision.
     pub state: String,
@@ -592,10 +594,10 @@ pub enum EventType {
     AiPromptRolloutSelected,
     /// Event name `agent_registration_decided`. A self-registered agent
     /// entered the owner-approval queue, or an operator approved, rejected,
-    /// or revoked one (WOR-2664). Its payload is the agent id, the decision,
-    /// the resulting state, and the acting operator when an admin session
-    /// resolved one; never a minted secret, a registration access token, or
-    /// a credential hash.
+    /// or revoked one (WOR-2664). Its payload is the agent id, the decision
+    /// (`submitted`, `approve`, `reject`, or `revoke`), the resulting state,
+    /// and the acting operator when an admin session resolved one; never a
+    /// minted secret, a registration access token, or a credential hash.
     AgentRegistrationDecided,
 }
 

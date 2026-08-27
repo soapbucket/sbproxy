@@ -72,19 +72,36 @@
 pub mod admin;
 mod store;
 
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use chrono::Utc;
 use serde::Serialize;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use sbproxy_platform::storage::PersistentKv;
 
 use crate::events::ProxyEvent;
 use store::{DeadLetter, NotifyStore, Subscription};
 
-pub use store::{SubscriptionView, MAX_DEADLETTERS, MAX_EVENT_TYPE_FILTERS, MAX_URL_BYTES};
+pub use store::{
+    DeadLetterSummary, SubscriptionView, MAX_DEADLETTERS, MAX_EVENT_TYPE_FILTERS, MAX_URL_BYTES,
+    PER_REQUEST_EVENT_TYPES,
+};
+
+/// How many deliveries the worker keeps in flight at once.
+///
+/// The worker used to await one event's whole fan-out before receiving the
+/// next, so a subscription whose receiver timed out cost every other
+/// subscription up to twenty seconds per event: one customer's outage
+/// throttled every other customer's feed. Deliveries are spawned instead,
+/// bounded by this, so a stalled receiver holds one permit rather than the
+/// queue.
+const MAX_IN_FLIGHT_DELIVERIES: usize = 64;
+
+/// Most deadletters one listing page returns.
+pub const MAX_DEADLETTER_PAGE: usize = 100;
 
 /// How many attempts one delivery gets before it is deadlettered.
 pub const MAX_ATTEMPTS: u32 = 3;
@@ -93,6 +110,9 @@ pub const MAX_ATTEMPTS: u32 = 3;
 /// top, so a receiver coming back up is not hit by every pending delivery on
 /// the same millisecond.
 const BACKOFF: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(4)];
+
+/// Backoff used if the attempt budget is ever raised past [`BACKOFF`].
+const LAST_BACKOFF: Duration = Duration::from_secs(4);
 
 /// Per-attempt HTTP timeout.
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -129,6 +149,14 @@ pub enum NotifyError {
     /// No subscription or deadletter under that id.
     #[error("no record {0}")]
     NotFound(String),
+    /// The delivery queue is full, so a replay would have been discarded.
+    ///
+    /// The record is kept. This exists because the alternative, deleting
+    /// the durable record and then dropping the delivery, destroys the one
+    /// durable structure this feature provides, and does it fastest under
+    /// exactly the drain the documentation recommends.
+    #[error("the delivery queue is full; this deadletter was kept, retry once it drains")]
+    QueueFull,
     /// The embedded store failed.
     #[error("notifier backend: {0}")]
     Backend(String),
@@ -140,6 +168,7 @@ impl NotifyError {
         match self {
             Self::Invalid { .. } => "invalid",
             Self::NotFound(_) => "not_found",
+            Self::QueueFull => "queue_full",
             Self::Backend(_) => "error",
         }
     }
@@ -149,6 +178,9 @@ impl NotifyError {
         match self {
             Self::Invalid { .. } => 400,
             Self::NotFound(_) => 404,
+            // 429 rather than 503: the notifier is working, and the caller
+            // draining the queue is the one being asked to slow down.
+            Self::QueueFull => 429,
             Self::Backend(_) => 500,
         }
     }
@@ -221,12 +253,18 @@ struct QueuedDelivery {
 
 /// The notifier: a subscription set, a bounded queue, and a worker.
 pub struct Notifier {
-    tx: Option<SyncSender<QueuedDelivery>>,
+    tx: Option<Sender<QueuedDelivery>>,
     handle: Option<std::thread::JoinHandle<()>>,
     store: Arc<NotifyStore>,
     /// Snapshot the publish path tests filters against without touching the
     /// store, refreshed whenever a subscription changes.
-    subscriptions: arc_swap::ArcSwap<Vec<Subscription>>,
+    ///
+    /// Shared with the worker rather than copied to it. The worker used to
+    /// re-read and re-parse every subscription out of redb on every single
+    /// event, on the critical path of every delivery, because it had no
+    /// other way to hear about an admin mutation. A mutation now publishes
+    /// here and the worker just loads.
+    subscriptions: Arc<arc_swap::ArcSwap<Vec<Subscription>>>,
 }
 
 impl std::fmt::Debug for Notifier {
@@ -250,13 +288,23 @@ impl Notifier {
         queue_capacity: usize,
         transport: Arc<dyn DeliveryTransport>,
     ) -> Result<Self> {
-        let store = Arc::new(NotifyStore::new(store)?);
-        let loaded = store.list_subscriptions().await?;
-        let subscriptions = arc_swap::ArcSwap::from_pointee(loaded);
+        Self::start_with_transport_and_capacity(store, queue_capacity, transport, MAX_DEADLETTERS)
+            .await
+    }
 
-        let (tx, rx) = sync_channel(queue_capacity.max(1));
+    pub(crate) async fn start_with_transport_and_capacity(
+        store: Arc<dyn PersistentKv>,
+        queue_capacity: usize,
+        transport: Arc<dyn DeliveryTransport>,
+        deadletter_capacity: usize,
+    ) -> Result<Self> {
+        let store = Arc::new(NotifyStore::open_with_capacity(store, deadletter_capacity).await?);
+        let loaded = store.list_subscriptions().await?;
+        let subscriptions = Arc::new(arc_swap::ArcSwap::from_pointee(loaded));
+
+        let (tx, rx) = channel(queue_capacity.max(1));
         let worker_store = Arc::clone(&store);
-        let snapshot = arc_swap::ArcSwap::from(subscriptions.load_full());
+        let snapshot = Arc::clone(&subscriptions);
         let handle = std::thread::Builder::new()
             .name("sbproxy-notify".to_string())
             .spawn(move || run_worker(rx, worker_store, transport, snapshot))
@@ -269,6 +317,13 @@ impl Notifier {
             subscriptions,
         };
         metrics::set_subscriptions(notifier.subscriptions.load().len() as i64);
+        // Both collections, both at boot. `docs/notifications.md` tells
+        // alert authors that a configured notifier publishes both at zero,
+        // so no data means it is not configured; publishing only the
+        // subscription count made that sentence false for a proxy that
+        // restarted holding a full deadletter queue, and an alert of the
+        // form `deadletters > 100` saw no series and stayed green.
+        metrics::set_deadletters(notifier.store.deadletter_count() as i64);
         Ok(notifier)
     }
 
@@ -286,22 +341,38 @@ impl Notifier {
 
     /// Hand an event to the worker under a fresh event id. Never blocks; a
     /// full queue drops.
+    ///
+    /// The drop is what the request path wants: a proxy that waited on a
+    /// customer's webhook endpoint is a proxy that customer can stall. It
+    /// is counted under `outcome="dropped"` so a queue running at its bound
+    /// is visible rather than silently lossy.
     pub fn offer(&self, event: ProxyEvent) {
-        self.offer_delivery(QueuedDelivery {
+        let _ = self.offer_delivery(QueuedDelivery {
             event_id: store::mint_event_id(),
             event,
         });
     }
 
-    fn offer_delivery(&self, delivery: QueuedDelivery) {
+    /// Offer a delivery, reporting whether it was taken.
+    ///
+    /// Fallible on purpose, unlike the publish path above. A replay has a
+    /// durable record standing behind it, and a caller that deleted that
+    /// record on the strength of an infallible offer would destroy it.
+    fn offer_delivery(&self, delivery: QueuedDelivery) -> Result<()> {
         let Some(tx) = self.tx.as_ref() else {
             metrics::record_delivery("worker_stopped");
-            return;
+            return Err(NotifyError::QueueFull);
         };
         match tx.try_send(delivery) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => metrics::record_delivery("dropped"),
-            Err(TrySendError::Disconnected(_)) => metrics::record_delivery("worker_stopped"),
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                metrics::record_delivery("dropped");
+                Err(NotifyError::QueueFull)
+            }
+            Err(TrySendError::Closed(_)) => {
+                metrics::record_delivery("worker_stopped");
+                Err(NotifyError::QueueFull)
+            }
         }
     }
 
@@ -339,8 +410,9 @@ impl Notifier {
         &self,
         url: String,
         event_types: Vec<String>,
+        allow_firehose: bool,
     ) -> Result<(SubscriptionView, String)> {
-        store::validate_subscription(&url, &event_types)?;
+        store::validate_subscription(&url, &event_types, allow_firehose)?;
         let (signing_key_id, signing_secret) = store::mint_signing_key();
         let now = Utc::now();
         let record = Subscription {
@@ -350,6 +422,7 @@ impl Notifier {
             signing_key_id,
             signing_secret: signing_secret.clone(),
             active: true,
+            allow_firehose,
             created_at: now,
             updated_at: now,
         };
@@ -367,6 +440,7 @@ impl Notifier {
         url: Option<String>,
         event_types: Option<Vec<String>>,
         active: Option<bool>,
+        allow_firehose: Option<bool>,
     ) -> Result<SubscriptionView> {
         let mut record = self.store.get_subscription(id).await?;
         if let Some(url) = url {
@@ -378,7 +452,13 @@ impl Notifier {
         if let Some(active) = active {
             record.active = active;
         }
-        store::validate_subscription(&record.url, &record.event_types)?;
+        if let Some(allow_firehose) = allow_firehose {
+            record.allow_firehose = allow_firehose;
+        }
+        // Re-validated against the merged record, so clearing the flag on a
+        // subscription that still names a wildcard is refused rather than
+        // leaving a firehose nothing declared.
+        store::validate_subscription(&record.url, &record.event_types, record.allow_firehose)?;
         record.updated_at = Utc::now();
         self.store.put_subscription(&record).await?;
         self.reload().await?;
@@ -413,30 +493,69 @@ impl Notifier {
         Ok(())
     }
 
-    /// Every deadlettered delivery, oldest first.
-    pub async fn list_deadletters(&self) -> Result<Vec<DeadLetter>> {
-        self.store.list_deadletters().await
+    /// One page of deadletters, oldest first, without their event bodies.
+    ///
+    /// Paged rather than whole: the queue holds up to [`MAX_DEADLETTERS`]
+    /// records each carrying a request-envelope-sized event, and the
+    /// console fetches this on mount and after every action.
+    pub async fn page_deadletters(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<DeadLetterSummary>, Option<String>)> {
+        self.store
+            .page_deadletters(after, limit.clamp(1, MAX_DEADLETTER_PAGE))
+            .await
     }
 
-    /// Re-offer a deadlettered delivery to the worker and drop the record.
+    /// One deadlettered delivery, with its event body.
+    pub async fn get_deadletter(&self, delivery_id: &str) -> Result<DeadLetter> {
+        self.store.get_deadletter(delivery_id).await
+    }
+
+    /// Drop a deadlettered delivery without replaying it.
     ///
-    /// The record goes before the retry rather than after: keeping it until
-    /// the replay succeeded means a replay that fails again writes a second
-    /// record for the same event, and an operator draining a queue would
-    /// watch it refuse to shrink. The re-offered delivery carries the same
-    /// `event_id`, so a receiver that already processed it recognizes the
-    /// duplicate.
+    /// The way a record whose stored event will not deserialize leaves the
+    /// queue. Without this it could not: [`Self::replay`] refuses it before
+    /// the delete, so it would sit there until eviction pushed it out.
+    pub async fn delete_deadletter(&self, delivery_id: &str) -> Result<()> {
+        self.store.get_deadletter(delivery_id).await?;
+        self.store.delete_deadletter(delivery_id).await?;
+        metrics::set_deadletters(self.store.deadletter_count() as i64);
+        metrics::record_admin("discard");
+        Ok(())
+    }
+
+    /// Re-offer a deadlettered delivery to the worker, dropping the record
+    /// only once the worker has taken it.
+    ///
+    /// The order is load bearing. Deleting first and then offering means a
+    /// full queue destroys the durable record and discards the delivery,
+    /// and the drain `docs/notifications.md` recommends is exactly the
+    /// thing that fills the queue: an `xargs` loop issues admin calls in
+    /// milliseconds while the worker spends up to twenty seconds per
+    /// delivery against a receiver that may still be flaky. A queue that
+    /// answers `429` instead makes that loop back off.
+    ///
+    /// The cost of this order is the case the old comment worried about: a
+    /// replay that is taken and then fails again writes a fresh record, so
+    /// an operator draining a queue against a receiver that is still down
+    /// sees it refill. That is one record per drain pass, and it is
+    /// recoverable. The other order loses the record for good.
+    ///
+    /// The re-offered delivery carries the same `event_id`, so a receiver
+    /// that already processed it recognizes the duplicate.
     pub async fn replay(&self, delivery_id: &str) -> Result<String> {
         let record = self.store.get_deadletter(delivery_id).await?;
         let event: ProxyEvent = serde_json::from_value(record.event.clone())
             .map_err(|error| NotifyError::Backend(format!("deadletter is unreadable: {error}")))?;
-        self.store.delete_deadletter(delivery_id).await?;
-        metrics::set_deadletters(self.store.list_deadletters().await?.len() as i64);
         let event_id = record.event_id.clone();
         self.offer_delivery(QueuedDelivery {
             event_id: event_id.clone(),
             event,
-        });
+        })?;
+        self.store.delete_deadletter(delivery_id).await?;
+        metrics::set_deadletters(self.store.deadletter_count() as i64);
         metrics::record_admin("replay");
         Ok(event_id)
     }
@@ -444,12 +563,11 @@ impl Notifier {
     /// How many subscriptions and deadletters there are, for the console.
     pub async fn summary(&self) -> Result<NotifierSummary> {
         let subscriptions = self.store.list_subscriptions().await?;
-        let deadletters = self.store.list_deadletters().await?;
         Ok(NotifierSummary {
             subscriptions: subscriptions.len(),
             active_subscriptions: subscriptions.iter().filter(|s| s.active).count(),
-            deadletters: deadletters.len(),
-            deadletter_capacity: MAX_DEADLETTERS,
+            deadletters: self.store.deadletter_count(),
+            deadletter_capacity: self.store.deadletter_capacity(),
             max_attempts: MAX_ATTEMPTS,
         })
     }
@@ -516,11 +634,21 @@ pub fn offer(event: ProxyEvent) {
 
 // --- the worker ---
 
+/// Drain the queue, fanning every event out to the subscriptions that
+/// selected it.
+///
+/// Deliveries are spawned rather than awaited in place, bounded by
+/// [`MAX_IN_FLIGHT_DELIVERIES`]. The version this replaces awaited one
+/// event's whole fan-out before receiving the next, so a subscription whose
+/// receiver timed out cost `3 * DELIVERY_TIMEOUT` per event and every other
+/// customer's feed slowed to that rate: a cross-customer blast radius from
+/// one tenant's outage, in a feature whose whole purpose is telling several
+/// customers apart.
 fn run_worker(
-    rx: Receiver<QueuedDelivery>,
+    mut rx: Receiver<QueuedDelivery>,
     store: Arc<NotifyStore>,
     transport: Arc<dyn DeliveryTransport>,
-    subscriptions: arc_swap::ArcSwap<Vec<Subscription>>,
+    subscriptions: Arc<arc_swap::ArcSwap<Vec<Subscription>>>,
 ) {
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -529,36 +657,49 @@ fn run_worker(
         tracing::error!(target: "notify", "notifier runtime would not build; no delivery will happen");
         return;
     };
-    while let Ok(delivery) = rx.recv() {
-        let event = &delivery.event;
-        // Re-read the store rather than trusting the snapshot taken at
-        // start: an admin mutation between two events has to take effect on
-        // the second one, and the worker owns no channel to hear about it.
-        if let Ok(current) = runtime.block_on(store.list_subscriptions()) {
-            subscriptions.store(Arc::new(current));
-        }
-        let matches: Vec<Subscription> = subscriptions
-            .load()
-            .iter()
-            .filter(|s| s.active && s.selects(event.event_type.as_str()))
-            .cloned()
-            .collect();
-        if matches.is_empty() {
-            continue;
-        }
-        runtime.block_on(async {
-            let mut set = tokio::task::JoinSet::new();
+    runtime.block_on(async move {
+        let permits = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_DELIVERIES));
+        let mut inflight = tokio::task::JoinSet::new();
+        while let Some(delivery) = rx.recv().await {
+            // The snapshot is published by every admin mutation, so this is
+            // an atomic load rather than the full redb read and JSON parse
+            // of every subscription this used to do per event.
+            let matches: Vec<Subscription> = subscriptions
+                .load()
+                .iter()
+                .filter(|s| s.active && s.selects(delivery.event.event_type.as_str()))
+                .cloned()
+                .collect();
+            // Reap whatever finished while we were waiting, so the set does
+            // not grow with the number of events the process has seen.
+            while inflight.try_join_next().is_some() {}
             for subscription in matches {
+                // The permit is taken before the spawn, not inside it, so
+                // the number of live delivery tasks is bounded by the
+                // semaphore rather than by how fast events arrive. Taking
+                // it inside would let a stalled receiver accumulate one
+                // parked task per event forever. Blocking here instead
+                // pushes back onto the queue, where a full queue is a
+                // counted drop the operator can see.
+                let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
+                    // Nothing closes this semaphore; if that ever changes,
+                    // stopping is the right answer rather than an
+                    // unbounded spawn loop.
+                    break;
+                };
                 let transport = Arc::clone(&transport);
                 let store = Arc::clone(&store);
                 let delivery = delivery.clone();
-                set.spawn(async move {
+                inflight.spawn(async move {
+                    let _permit = permit;
                     deliver_with_retries(&*transport, &store, &subscription, &delivery).await;
                 });
             }
-            while set.join_next().await.is_some() {}
-        });
-    }
+        }
+        // The sender is gone, so drain what is still in flight rather than
+        // dropping the runtime out from under it.
+        while inflight.join_next().await.is_some() {}
+    });
 }
 
 /// Attempt one delivery up to [`MAX_ATTEMPTS`] times, then deadletter it.
@@ -588,6 +729,12 @@ async fn deliver_with_retries(
         status: None,
         reason: "not_attempted",
     };
+    // The real count, not the budget. A permanent refusal breaks out after
+    // one attempt, and writing `MAX_ATTEMPTS` on that record told an
+    // operator triaging a mixed queue that a receiver answering `400`
+    // instantly had been retried three times, which is the first question
+    // they would ask and the one the record got wrong.
+    let mut attempts_made: u32 = 0;
     for attempt in 1..=MAX_ATTEMPTS {
         let timestamp = Utc::now().timestamp();
         let mut headers = vec![
@@ -620,6 +767,7 @@ async fn deliver_with_retries(
         last = transport
             .attempt(&subscription.url, headers, body.clone())
             .await;
+        attempts_made = attempt;
         match &last {
             AttemptOutcome::Delivered { .. } => {
                 metrics::record_delivery("delivered");
@@ -641,7 +789,16 @@ async fn deliver_with_retries(
             AttemptOutcome::Retryable { reason, .. } => {
                 metrics::record_delivery("retried");
                 if attempt < MAX_ATTEMPTS {
-                    tokio::time::sleep(jittered(BACKOFF[(attempt - 1) as usize])).await;
+                    // Indexed defensively rather than on the invariant
+                    // `MAX_ATTEMPTS == BACKOFF.len() + 1`, which nothing
+                    // enforces: raising the attempt budget without
+                    // extending the table would otherwise be an
+                    // out-of-bounds panic inside a delivery task.
+                    let backoff = BACKOFF
+                        .get((attempt - 1) as usize)
+                        .copied()
+                        .unwrap_or(LAST_BACKOFF);
+                    tokio::time::sleep(jittered(backoff)).await;
                 } else {
                     tracing::warn!(
                         target: "notify",
@@ -666,7 +823,7 @@ async fn deliver_with_retries(
         subscription_id: subscription.subscription_id.clone(),
         event_id: delivery.event_id.clone(),
         event_type: event.event_type.as_str().to_string(),
-        attempts: MAX_ATTEMPTS,
+        attempts: attempts_made,
         last_status: status,
         last_reason: reason.to_string(),
         moved_at: Utc::now(),
@@ -687,9 +844,7 @@ async fn deliver_with_retries(
                 );
                 metrics::record_delivery_by("deadletter_evicted", evicted as u64);
             }
-            if let Ok(all) = store.list_deadletters().await {
-                metrics::set_deadletters(all.len() as i64);
-            }
+            metrics::set_deadletters(store.deadletter_count() as i64);
         }
         Err(error) => {
             tracing::error!(
@@ -818,12 +973,15 @@ impl DeliveryTransport for GovernedTransport {
 pub(crate) mod metrics {
     //! The two families the notifier emits.
     //!
-    //! `outcome` is a closed set: `delivered`, `retried`, `dropped`,
-    //! `deadlettered`, `deadletter_evicted`, `deadletter_failed`,
-    //! `serialize_error`, `worker_stopped`. Nothing is labeled by
-    //! subscription id or destination: both are operator-supplied and
-    //! unbounded, and a per-destination series set grows with the customer
-    //! list rather than with the system.
+    //! `outcome` is a closed set. Deliveries: `delivered`, `retried`,
+    //! `dropped`, `deadlettered`, `deadletter_evicted`, `deadletter_failed`,
+    //! `serialize_error`, `worker_stopped`. Admin mutations, on the same
+    //! family so one panel covers "what is this subsystem doing":
+    //! `create`, `update`, `rotate`, `delete`, `replay`, `discard`.
+    //!
+    //! Nothing is labeled by subscription id or destination: both are
+    //! operator-supplied and unbounded, and a per-destination series set
+    //! grows with the customer list rather than with the system.
 
     use std::sync::LazyLock;
 

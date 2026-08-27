@@ -58,6 +58,11 @@ pub(super) struct Subscription {
     pub(super) signing_key_id: String,
     pub(super) signing_secret: String,
     pub(super) active: bool,
+    /// Whether this subscription may name a wildcard that reaches the
+    /// per-request lifecycle events. Defaults to false, including for
+    /// records written before the field existed.
+    #[serde(default)]
+    pub(super) allow_firehose: bool,
     pub(super) created_at: DateTime<Utc>,
     pub(super) updated_at: DateTime<Utc>,
 }
@@ -72,6 +77,7 @@ impl std::fmt::Debug for Subscription {
             .field("signing_key_id", &self.signing_key_id)
             .field("signing_secret", &"<redacted>")
             .field("active", &self.active)
+            .field("allow_firehose", &self.allow_firehose)
             .finish()
     }
 }
@@ -79,22 +85,43 @@ impl std::fmt::Debug for Subscription {
 impl Subscription {
     /// Whether this subscription asked for `event_type`.
     ///
-    /// `*` selects everything. A prefix filter ending in `.*` selects a
-    /// family (`key.*`). Anything else is an exact match, so a typo selects
+    /// `*` selects everything, and is refused at validation unless the
+    /// subscription set `allow_firehose`. A filter ending in `_*` selects a
+    /// family (`key_*`). Anything else is an exact match, so a typo selects
     /// nothing rather than everything, which is the safe direction for a
     /// filter that decides what leaves the network.
+    ///
+    /// The family form keeps its `_` in the prefix on purpose. The event
+    /// vocabulary is `key_minted`, `key_revoked`, `request_completed` and so
+    /// on, with `_` as the separator, so `key_*` has to mean "the `key`
+    /// family" and not "anything starting with the letters k-e-y". An
+    /// unanchored prefix would quietly hand a customer subscribed to
+    /// `key_*` a future `keyless_auth_denied`, with no config change on
+    /// either side.
     pub(super) fn selects(&self, event_type: &str) -> bool {
         self.event_types.iter().any(|filter| {
             if filter == "*" {
                 return true;
             }
-            match filter.strip_suffix(".*") {
+            match filter.strip_suffix('*') {
+                // The prefix still carries the trailing `_`, so the match
+                // is anchored on the separator.
                 Some(prefix) => event_type.starts_with(prefix),
                 None => filter == event_type,
             }
         })
     }
 }
+
+/// The event types published once per terminating request.
+///
+/// A webhook per request is not a shape this worker can serve: one
+/// subscription at 500 rps needs 500 HTTP POSTs a second, and the delivery
+/// budget alone is three attempts across up to fifteen seconds. Selecting
+/// one of these is a deliberate act, so a wildcard cannot reach them by
+/// accident. See [`validate_subscription`].
+pub const PER_REQUEST_EVENT_TYPES: [&str; 3] =
+    ["request_started", "request_completed", "request_error"];
 
 /// What every read path returns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +139,9 @@ pub struct SubscriptionView {
     /// Whether the notifier delivers to it. An inactive subscription is
     /// kept, not deleted, so a paused receiver keeps its filters and its id.
     pub active: bool,
+    /// Whether this subscription was allowed to name a wildcard that
+    /// reaches the per-request lifecycle events.
+    pub allow_firehose: bool,
     /// When it was created.
     pub created_at: DateTime<Utc>,
     /// When it last changed.
@@ -126,6 +156,7 @@ impl From<&Subscription> for SubscriptionView {
             event_types: record.event_types.clone(),
             signing_key_id: record.signing_key_id.clone(),
             active: record.active,
+            allow_firehose: record.allow_firehose,
             created_at: record.created_at,
             updated_at: record.updated_at,
         }
@@ -160,23 +191,106 @@ pub struct DeadLetter {
     pub event: serde_json::Value,
 }
 
+/// One deadletter without its event body, for the paged listing.
+///
+/// The body is the largest part of the record and the listing has no use
+/// for it: an operator triaging the queue reads the type, the reason, and
+/// the age, and the single-record route serves the body of the one they
+/// open.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct DeadLetterSummary {
+    /// Per-record identifier, and the handle the replay route takes.
+    pub delivery_id: String,
+    /// Which subscription the delivery was for.
+    pub subscription_id: String,
+    /// The event's stable id, unchanged across every attempt.
+    pub event_id: String,
+    /// The event's type.
+    pub event_type: String,
+    /// How many attempts were made before this record was written.
+    pub attempts: u32,
+    /// The last HTTP status, when the receiver answered at all.
+    pub last_status: Option<u16>,
+    /// A bounded, closed-vocabulary reason for the last failure.
+    pub last_reason: String,
+    /// When the record was written.
+    pub moved_at: DateTime<Utc>,
+}
+
+impl From<&DeadLetter> for DeadLetterSummary {
+    fn from(record: &DeadLetter) -> Self {
+        Self {
+            delivery_id: record.delivery_id.clone(),
+            subscription_id: record.subscription_id.clone(),
+            event_id: record.event_id.clone(),
+            event_type: record.event_type.clone(),
+            attempts: record.attempts,
+            last_status: record.last_status,
+            last_reason: record.last_reason.clone(),
+            moved_at: record.moved_at,
+        }
+    }
+}
+
 /// Subscriptions and deadletters over one embedded store.
 pub(super) struct NotifyStore {
     store: Arc<dyn PersistentKv>,
     subscriptions: KvNamespace,
     deadletters: KvNamespace,
+    /// Delivery ids in the order they were written, oldest first.
+    ///
+    /// Deciding whether to evict used to mean listing and JSON-parsing
+    /// every stored deadletter, each carrying a full event body, on every
+    /// write, and the caller then listed them a second time to set the
+    /// gauge. Near the 10,000 cap that is two full-table reads and 20,000
+    /// parses per deadlettered delivery, on the one thread every other
+    /// subscription's delivery is queued behind. This is the same
+    /// information as a list of keys, seeded once at open.
+    ///
+    /// Delivery ids are `dlv_<ULID>`, and ULIDs sort lexicographically by
+    /// mint time, so the store's own key order is already oldest-first and
+    /// the seed does not have to parse a record to get it right.
+    order: parking_lot::Mutex<std::collections::VecDeque<String>>,
+    /// Bound on [`Self::order`], injectable so the eviction arithmetic and
+    /// the drop path are testable without writing ten thousand records.
+    capacity: usize,
 }
 
 impl NotifyStore {
-    pub(super) fn new(store: Arc<dyn PersistentKv>) -> Result<Self> {
+    pub(super) async fn open_with_capacity(
+        store: Arc<dyn PersistentKv>,
+        capacity: usize,
+    ) -> Result<Self> {
         let namespace = |name: &str| {
             KvNamespace::new(name).map_err(|error| NotifyError::Backend(error.to_string()))
         };
+        let deadletters = namespace(DEADLETTERS)?;
+        let mut keys: Vec<String> = store
+            .list(&deadletters)
+            .await
+            .map_err(|error| NotifyError::Backend(error.to_string()))?
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        keys.sort();
         Ok(Self {
             store,
             subscriptions: namespace(SUBSCRIPTIONS)?,
-            deadletters: namespace(DEADLETTERS)?,
+            deadletters,
+            order: parking_lot::Mutex::new(keys.into()),
+            capacity: capacity.max(1),
         })
+    }
+
+    /// How many deadletters are stored, without reading the store.
+    pub(super) fn deadletter_count(&self) -> usize {
+        self.order.lock().len()
+    }
+
+    /// The cap past which the oldest deadletter is dropped.
+    pub(super) fn deadletter_capacity(&self) -> usize {
+        self.capacity
     }
 
     /// Every subscription, in id order.
@@ -229,23 +343,6 @@ impl NotifyStore {
             .map_err(|error| NotifyError::Backend(error.to_string()))
     }
 
-    /// Every deadletter, oldest first.
-    pub(super) async fn list_deadletters(&self) -> Result<Vec<DeadLetter>> {
-        let stored = self
-            .store
-            .list(&self.deadletters)
-            .await
-            .map_err(|error| NotifyError::Backend(error.to_string()))?;
-        let mut out: Vec<DeadLetter> = Vec::with_capacity(stored.len());
-        for (_, entry) in stored {
-            out.push(serde_json::from_slice(&entry.value).map_err(|error| {
-                NotifyError::Backend(format!("stored deadletter is unreadable: {error}"))
-            })?);
-        }
-        out.sort_by_key(|record| record.moved_at);
-        Ok(out)
-    }
-
     pub(super) async fn get_deadletter(&self, delivery_id: &str) -> Result<DeadLetter> {
         let entry = self
             .store
@@ -261,16 +358,23 @@ impl NotifyStore {
     /// Write a deadletter, evicting the oldest record when the queue is at
     /// its cap. Returns how many records were evicted to make room.
     pub(super) async fn put_deadletter(&self, record: &DeadLetter) -> Result<usize> {
-        let existing = self.list_deadletters().await?;
+        // Chosen before the write, from the in-memory order, so the cost
+        // of one deadletter is one delete per evicted record plus one put
+        // rather than a full-table read and parse.
+        let stale: Vec<String> = {
+            let order = self.order.lock();
+            // `>=` rather than `>`: the write below adds one, so a queue
+            // already at the cap has to give up a record before it lands.
+            order
+                .iter()
+                .take(order.len().saturating_sub(self.capacity - 1))
+                .cloned()
+                .collect()
+        };
         let mut evicted = 0;
-        // `>=` rather than `>`: the write below adds one, so a queue
-        // already at the cap has to give up a record before it lands.
-        for stale in existing
-            .iter()
-            .take(existing.len().saturating_sub(MAX_DEADLETTERS - 1))
-        {
+        for delivery_id in &stale {
             self.store
-                .delete(&self.deadletters, &stale.delivery_id)
+                .delete(&self.deadletters, delivery_id)
                 .await
                 .map_err(|error| NotifyError::Backend(error.to_string()))?;
             evicted += 1;
@@ -282,7 +386,49 @@ impl NotifyStore {
             .put(&self.deadletters, &record.delivery_id, &bytes)
             .await
             .map_err(|error| NotifyError::Backend(error.to_string()))?;
+        {
+            let mut order = self.order.lock();
+            for delivery_id in &stale {
+                order.retain(|id| id != delivery_id);
+            }
+            order.push_back(record.delivery_id.clone());
+        }
         Ok(evicted)
+    }
+
+    /// One page of deadletters, oldest first, without their event bodies.
+    ///
+    /// Paged because the whole queue is up to [`MAX_DEADLETTERS`] records
+    /// each carrying a request-envelope-sized event, and the console
+    /// fetches this on mount and after every action. The bodies are not in
+    /// the summary for the same reason: a replay does not need them at the
+    /// caller, and the single-record route serves the one an operator is
+    /// actually looking at.
+    pub(super) async fn page_deadletters(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<DeadLetterSummary>, Option<String>)> {
+        let page: Vec<String> = {
+            let order = self.order.lock();
+            order
+                .iter()
+                .skip_while(|id| after.is_some_and(|cursor| id.as_str() <= cursor))
+                .take(limit + 1)
+                .cloned()
+                .collect()
+        };
+        let more = page.len() > limit;
+        let mut out = Vec::with_capacity(page.len().min(limit));
+        for delivery_id in page.iter().take(limit) {
+            // A record the order knows about but the store does not is a
+            // concurrent delete, not an error worth failing a listing over.
+            if let Ok(record) = self.get_deadletter(delivery_id).await {
+                out.push(DeadLetterSummary::from(&record));
+            }
+        }
+        let cursor = more.then(|| out.last().map(|last| last.delivery_id.clone()));
+        Ok((out, cursor.flatten()))
     }
 
     pub(super) async fn delete_deadletter(&self, delivery_id: &str) -> Result<()> {
@@ -290,7 +436,9 @@ impl NotifyStore {
             .delete(&self.deadletters, delivery_id)
             .await
             .map(|_| ())
-            .map_err(|error| NotifyError::Backend(error.to_string()))
+            .map_err(|error| NotifyError::Backend(error.to_string()))?;
+        self.order.lock().retain(|id| id != delivery_id);
+        Ok(())
     }
 }
 
@@ -323,7 +471,16 @@ pub(super) fn mint_signing_key() -> (String, String) {
 }
 
 /// Validate a destination and a filter list before anything is stored.
-pub(super) fn validate_subscription(url: &str, event_types: &[String]) -> Result<()> {
+///
+/// `allow_firehose` is the switch on two refusals rather than one setting:
+/// a wildcard that reaches the per-request lifecycle events is a webhook
+/// per request, which this worker cannot serve, so it is refused unless the
+/// operator said so in the same call.
+pub(super) fn validate_subscription(
+    url: &str,
+    event_types: &[String],
+    allow_firehose: bool,
+) -> Result<()> {
     if url.is_empty() || url.len() > MAX_URL_BYTES {
         return Err(NotifyError::Invalid {
             field: "url",
@@ -343,10 +500,17 @@ pub(super) fn validate_subscription(url: &str, event_types: &[String]) -> Result
         });
     }
     for filter in event_types {
-        let candidate = filter.strip_suffix(".*").unwrap_or(filter);
         if filter == "*" {
+            if !allow_firehose {
+                return Err(NotifyError::Invalid {
+                    field: "event_types",
+                    detail: "\"*\" selects the per-request lifecycle events too, which is one                              webhook delivery per request; name the events you want, or set                              allow_firehose: true to say you meant it"
+                        .into(),
+                });
+            }
             continue;
         }
+        let candidate = filter.strip_suffix('*').unwrap_or(filter);
         if candidate.is_empty()
             || !candidate
                 .bytes()
@@ -355,12 +519,29 @@ pub(super) fn validate_subscription(url: &str, event_types: &[String]) -> Result
             return Err(NotifyError::Invalid {
                 field: "event_types",
                 detail: format!(
-                    "{:?} is not an event name, a family prefix like key.*, or *",
+                    "{:?} is not an event name, a family prefix like key_*, or *",
                     filter
                         .chars()
                         .filter(|c| !c.is_control())
                         .take(64)
                         .collect::<String>()
+                ),
+            });
+        }
+        // A family prefix that would sweep in a per-request lifecycle
+        // event is the same firehose `*` is, just spelled differently.
+        // Naming one of the three exactly is not: that is the operator
+        // picking it, and the set is bounded by what they typed.
+        if filter.ends_with('*')
+            && !allow_firehose
+            && PER_REQUEST_EVENT_TYPES
+                .iter()
+                .any(|event| event.starts_with(candidate))
+        {
+            return Err(NotifyError::Invalid {
+                field: "event_types",
+                detail: format!(
+                    "{candidate:?}* selects a per-request lifecycle event, which is one                      webhook delivery per request; name the events you want, or set                      allow_firehose: true to say you meant it"
                 ),
             });
         }
@@ -372,6 +553,8 @@ pub(super) fn validate_subscription(url: &str, event_types: &[String]) -> Result
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     fn subscription(filters: &[&str]) -> Subscription {
         Subscription {
             subscription_id: "sub_1".into(),
@@ -380,8 +563,33 @@ mod tests {
             signing_key_id: "k_1".into(),
             signing_secret: "secret".into(),
             active: true,
+            allow_firehose: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+        }
+    }
+
+    fn temp_path() -> String {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "{}/sbproxy_notify_store_test_{}_{}.redb",
+            std::env::temp_dir().display(),
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    fn deadletter(n: usize) -> DeadLetter {
+        DeadLetter {
+            delivery_id: format!("dlv_{n:04}"),
+            subscription_id: "sub_1".into(),
+            event_id: format!("evt_{n:04}"),
+            event_type: "key_minted".into(),
+            attempts: 3,
+            last_status: Some(500),
+            last_reason: "http_error".into(),
+            moved_at: Utc::now(),
+            event: serde_json::json!({"filler": "x".repeat(64)}),
         }
     }
 
@@ -405,11 +613,20 @@ mod tests {
         assert!(!subscription(&["key_mintedd"]).selects("key_minted"));
     }
 
+    /// The vocabulary is `key_minted`, `key_revoked`, and so on: nothing
+    /// in it contains a dot. The family form therefore has to anchor on
+    /// `_`, or a customer subscribed to the key family starts receiving a
+    /// future `keyless_auth_denied` with no config change on either side.
     #[test]
-    fn a_wildcard_family_selects_its_prefix_only() {
-        let family = subscription(&["key.*"]);
-        assert!(family.selects("key.minted"));
-        assert!(!family.selects("policy.denied"));
+    fn a_wildcard_family_anchors_on_the_event_name_separator() {
+        let family = subscription(&["key_*"]);
+        assert!(family.selects("key_minted"));
+        assert!(family.selects("key_revoked"));
+        assert!(!family.selects("policy_denied"));
+        assert!(
+            !family.selects("keyless_auth_denied"),
+            "an unanchored prefix would hand this to the key family"
+        );
     }
 
     #[test]
@@ -421,15 +638,96 @@ mod tests {
 
     #[test]
     fn validation_refuses_the_shapes_the_docs_forbid() {
-        assert!(validate_subscription("https://a.example/h", &["*".into()]).is_ok());
-        assert!(validate_subscription("ftp://a.example/h", &["*".into()]).is_err());
-        assert!(validate_subscription("https://a.example/h", &[]).is_err());
-        assert!(validate_subscription("", &["*".into()]).is_err());
-        assert!(validate_subscription("https://a.example/h", &["Key Minted".into()]).is_err());
+        assert!(validate_subscription("https://a.example/h", &["*".into()], true).is_ok());
+        assert!(validate_subscription("ftp://a.example/h", &["*".into()], true).is_err());
+        assert!(validate_subscription("https://a.example/h", &[], true).is_err());
+        assert!(validate_subscription("", &["*".into()], true).is_err());
+        assert!(
+            validate_subscription("https://a.example/h", &["Key Minted".into()], false).is_err()
+        );
         // A control character in a filter cannot forge a line in the error.
-        let refusal = validate_subscription("https://a.example/h", &["a\nb".into()])
+        let refusal = validate_subscription("https://a.example/h", &["a\nb".into()], false)
             .expect_err("control characters are refused");
         assert!(!refusal.to_string().contains('\n'));
+    }
+
+    /// The console shipped this form pre-filled with `*`, so the shortest
+    /// path through the page was: paste a URL, click subscribe, and receive
+    /// one webhook delivery per proxied request from a worker that cannot
+    /// serve them. A wildcard now has to be said out loud.
+    #[test]
+    fn a_wildcard_reaching_the_per_request_events_needs_the_operator_to_say_so() {
+        let refusal = validate_subscription("https://a.example/h", &["*".into()], false)
+            .expect_err("a bare wildcard is a firehose");
+        assert!(refusal.to_string().contains("allow_firehose"), "{refusal}");
+
+        // Spelled as a family rather than as `*`, and refused the same way.
+        assert!(
+            validate_subscription("https://a.example/h", &["request_*".into()], false).is_err()
+        );
+        assert!(validate_subscription("https://a.example/h", &["request_*".into()], true).is_ok());
+
+        // A family that reaches none of them is unaffected.
+        assert!(validate_subscription("https://a.example/h", &["key_*".into()], false).is_ok());
+
+        // And naming one exactly is the operator picking it, which is the
+        // case the flag is not for.
+        assert!(
+            validate_subscription("https://a.example/h", &["request_error".into()], false).is_ok()
+        );
+    }
+
+    /// Neither loss path had a test: the eviction arithmetic that drops the
+    /// oldest record at the cap, and the count the gauge and the summary
+    /// both read. `MAX_DEADLETTERS` is 10,000, so the cap is injectable
+    /// rather than reached by writing ten thousand records.
+    #[tokio::test]
+    async fn the_deadletter_queue_evicts_the_oldest_at_its_cap_and_counts_what_it_holds() {
+        let path = temp_path();
+        let backing = std::sync::Arc::new(
+            sbproxy_platform::storage::EmbeddedKvStore::open(&path, "notifications").expect("open"),
+        );
+        let store = NotifyStore::open_with_capacity(backing.clone(), 3)
+            .await
+            .expect("store");
+
+        for n in 0..3 {
+            assert_eq!(store.put_deadletter(&deadletter(n)).await.expect("put"), 0);
+        }
+        assert_eq!(store.deadletter_count(), 3);
+
+        // The fourth costs the first.
+        assert_eq!(store.put_deadletter(&deadletter(3)).await.expect("put"), 1);
+        assert_eq!(store.deadletter_count(), 3);
+        assert!(store.get_deadletter("dlv_0000").await.is_err());
+        assert!(store.get_deadletter("dlv_0003").await.is_ok());
+
+        // The page is oldest first, bounded, and carries no event body.
+        let (page, cursor) = store.page_deadletters(None, 2).await.expect("page");
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].delivery_id, "dlv_0001");
+        assert_eq!(cursor.as_deref(), Some("dlv_0002"));
+        let (rest, done) = store
+            .page_deadletters(cursor.as_deref(), 2)
+            .await
+            .expect("page");
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].delivery_id, "dlv_0003");
+        assert!(done.is_none());
+        assert!(!serde_json::to_string(&page)
+            .expect("json")
+            .contains("filler"));
+
+        // A restart re-seeds the order from the store rather than starting
+        // empty and reporting a drained queue.
+        drop(store);
+        let reopened = NotifyStore::open_with_capacity(backing, 3)
+            .await
+            .expect("reopen");
+        assert_eq!(reopened.deadletter_count(), 3);
+
+        drop(reopened);
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

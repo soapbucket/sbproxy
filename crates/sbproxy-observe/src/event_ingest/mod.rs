@@ -258,9 +258,19 @@ pub struct Watermark {
     /// Which destination the checkpoint is for, so a deployment that
     /// switches targets does not read the old one's position as its own.
     pub target: String,
-    /// The last delivered event's request id.
+    /// The request id of the newest event in the last delivered batch, by
+    /// timestamp. Ties break on the id, so the pair is stable.
     pub last_request_id: String,
-    /// The last delivered event's timestamp, in Unix epoch milliseconds.
+    /// The newest timestamp in the last delivered batch, in Unix epoch
+    /// milliseconds.
+    ///
+    /// The batch maximum rather than the last element. `timestamp_ms` is
+    /// request *start*, and a `request_completed` for a request that began
+    /// thirty seconds ago is emitted after one that began a moment ago, so
+    /// queue order is not time order. Storing the last element made the
+    /// checkpoint go backwards across batches, and an operator running
+    /// `WHERE timestamp_ms > :last_timestamp_ms` against their warehouse
+    /// then re-read rows they had already reconciled.
     pub last_timestamp_ms: u64,
     /// How many events this store has seen delivered, across restarts.
     pub delivered_total: u64,
@@ -354,6 +364,9 @@ struct WatermarkStore {
     namespace: KvNamespace,
     target: &'static str,
     delivered_total: u64,
+    /// Newest timestamp published so far, so the stored position never
+    /// moves backwards.
+    last_timestamp_ms: u64,
 }
 
 impl WatermarkStore {
@@ -363,6 +376,7 @@ impl WatermarkStore {
             namespace: KvNamespace::new(WATERMARK_NAMESPACE)?,
             target,
             delivered_total: 0,
+            last_timestamp_ms: 0,
         })
     }
 
@@ -381,15 +395,39 @@ impl WatermarkStore {
             return None;
         }
         self.delivered_total = watermark.delivered_total;
+        self.last_timestamp_ms = watermark.last_timestamp_ms;
         Some(watermark)
     }
 
-    async fn advance(&mut self, last: &RequestEvent, count: u64) {
+    /// Record the newest event in `batch`, not its last.
+    ///
+    /// The checkpoint is documented as a position an operator reconciles
+    /// against, which only means anything if it moves forward.
+    async fn advance(&mut self, batch: &[RequestEvent], count: u64) {
+        let Some(newest) = batch
+            .iter()
+            .max_by(|left, right| {
+                left.timestamp_ms
+                    .cmp(&right.timestamp_ms)
+                    .then_with(|| left.request_id.cmp(&right.request_id))
+            })
+            .filter(|newest| {
+                newest.timestamp_ms >= self.last_timestamp_ms || self.last_timestamp_ms == 0
+            })
+        else {
+            // Every event in this batch started before the checkpoint. The
+            // batch was delivered, so the count moves; the position does
+            // not, because moving it backwards is the failure this exists
+            // to prevent.
+            self.delivered_total = self.delivered_total.saturating_add(count);
+            return;
+        };
         self.delivered_total = self.delivered_total.saturating_add(count);
+        self.last_timestamp_ms = newest.timestamp_ms;
         let watermark = Watermark {
             target: self.target.to_string(),
-            last_request_id: last.request_id.to_string(),
-            last_timestamp_ms: last.timestamp_ms,
+            last_request_id: newest.request_id.to_string(),
+            last_timestamp_ms: newest.timestamp_ms,
             delivered_total: self.delivered_total,
         };
         let Ok(bytes) = serde_json::to_vec(&watermark) else {
@@ -453,11 +491,24 @@ fn run_worker(
 
     let label = target.label();
     let mut nats: Option<NatsConnection> = None;
-    let http = reqwest::Client::builder()
+    let http = match reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(NETWORK_TIMEOUT)
         .build()
-        .ok();
+    {
+        Ok(client) => Some(client),
+        Err(error) => {
+            // Without this every ClickHouse batch is an `error` tick with
+            // no line anywhere saying why, which is a destination that
+            // never works and never explains itself.
+            tracing::error!(
+                target: "event_ingest",
+                error = %error,
+                "the event ingest http client would not build; no batch will reach clickhouse"
+            );
+            None
+        }
+    };
 
     loop {
         let batch = drain_batch(&rx);
@@ -498,8 +549,8 @@ fn run_worker(
         };
         if delivered {
             metrics::record_ingest_by(label, "published", count);
-            if let (Some(store), Some(last)) = (watermark.as_mut(), batch.last()) {
-                runtime.block_on(store.advance(last, count));
+            if let Some(store) = watermark.as_mut() {
+                runtime.block_on(store.advance(&batch, count));
             }
         } else {
             metrics::record_ingest_by(label, "error", count);
@@ -509,10 +560,32 @@ fn run_worker(
 
 // --- NATS ---
 
+/// What the server told us about itself in its `INFO` line.
+///
+/// Two fields, both of which a client library would have handled and this
+/// one did not: the payload ceiling, and whether the server expects a TLS
+/// handshake before anything else.
+#[derive(Debug, Default, Deserialize)]
+struct NatsServerInfo {
+    #[serde(default)]
+    max_payload: Option<usize>,
+    #[serde(default)]
+    tls_required: Option<bool>,
+}
+
+/// Payload ceiling assumed when the server's `INFO` does not name one.
+/// NATS's own default is 1 MiB.
+const NATS_DEFAULT_MAX_PAYLOAD: usize = 1024 * 1024;
+
 /// One live NATS connection, in the core text protocol.
 struct NatsConnection {
     stream: tokio::net::TcpStream,
     buffer: Vec<u8>,
+    /// Largest payload this server accepts. A `PUB` past it is answered
+    /// `-ERR 'Maximum Payload Violation'` and the connection is closed, so
+    /// one oversized event would otherwise take its whole 256-event batch
+    /// with it, repeatedly, for as long as such events arrive.
+    max_payload: usize,
 }
 
 impl NatsConnection {
@@ -532,11 +605,32 @@ impl NatsConnection {
         let mut connection = Self {
             stream,
             buffer: Vec::with_capacity(1024),
+            max_payload: NATS_DEFAULT_MAX_PAYLOAD,
         };
 
         let info = connection.read_line().await?;
-        if !info.starts_with("INFO") {
+        let Some(payload) = info.strip_prefix("INFO ") else {
             anyhow::bail!("nats server did not greet with INFO");
+        };
+        // A greeting this client cannot parse is not a reason to refuse the
+        // connection; it is a reason to keep NATS's own documented default.
+        let parsed: NatsServerInfo = serde_json::from_str(payload.trim()).unwrap_or_default();
+        connection.max_payload = parsed.max_payload.unwrap_or(NATS_DEFAULT_MAX_PAYLOAD);
+
+        // A broker configured with TLS advertises `tls_required` and expects
+        // a handshake next. This client speaks plain TCP, and the `CONNECT`
+        // below carries the operator's vault-resolved token: writing it into
+        // a socket the server is about to fail the handshake on would put
+        // the credential on the wire in the clear, and do it again on every
+        // batch, since each batch redials. Refusing is the only honest
+        // answer until this speaks TLS.
+        if parsed.tls_required.unwrap_or(false) {
+            anyhow::bail!(
+                "the nats broker requires TLS and this client speaks the core protocol over \
+                 plain TCP; the authentication token would cross the network unencrypted, so \
+                 the connection was refused. Front the broker with a TLS terminator on a \
+                 trusted segment, or turn off tls_required for this listener"
+            );
         }
 
         // `verbose: false` turns off the per-command `+OK`, which would
@@ -599,7 +693,12 @@ impl NatsConnection {
                     self.stream.write_all(b"PONG\r\n").await?;
                     self.stream.flush().await?;
                 }
-                "-ERR" => anyhow::bail!("nats server refused the connection"),
+                // The server's own text, bounded and stripped of anything
+                // that could forge a log line. A bad token, a permissions
+                // violation, and a payload violation are three different
+                // operator actions and collapsing them to one string made
+                // the log useless for all three.
+                "-ERR" => anyhow::bail!("nats server refused: {}", sanitize_server_text(&line)),
                 // `INFO`, `+OK`, and anything else are informational here.
                 _ => {}
             }
@@ -617,17 +716,39 @@ impl NatsConnection {
         use tokio::io::AsyncWriteExt;
 
         let mut out = Vec::with_capacity(messages.len() * 512);
+        let mut oversize = 0u64;
         for (subject, payload) in messages {
+            // Skipped rather than written. A `PUB` past the server's
+            // ceiling is answered `-ERR` and the connection is closed, so
+            // one event with a large `properties` map would otherwise cost
+            // the 255 healthy events sharing its batch, every time.
+            if payload.len() > self.max_payload {
+                oversize += 1;
+                continue;
+            }
             write!(out, "PUB {subject} {}\r\n", payload.len())?;
             out.extend_from_slice(payload);
             out.extend_from_slice(b"\r\n");
+        }
+        if oversize > 0 {
+            metrics::record_ingest_by("nats", "oversize", oversize);
+            tracing::warn!(
+                target: "event_ingest",
+                count = oversize,
+                max_payload = self.max_payload,
+                "request events were larger than the broker's max_payload and were skipped"
+            );
         }
         out.extend_from_slice(b"PING\r\n");
         tokio::time::timeout(NETWORK_TIMEOUT, self.stream.write_all(&out))
             .await
             .map_err(|_| anyhow::anyhow!("nats write timed out"))??;
         self.stream.flush().await?;
-        self.expect_pong().await
+        // Past this point the server has the publishes. Anything that fails
+        // now is a missing acknowledgement, and the caller must not resend.
+        self.expect_pong()
+            .await
+            .map_err(|error| anyhow::Error::new(PublishPhase).context(error.to_string()))
     }
 }
 
@@ -665,11 +786,26 @@ async fn publish_to_nats(
     // Two passes: use the live connection, and on failure drop it, redial
     // once, and try again. A broker restart is normal and should cost one
     // reconnect rather than a batch.
+    //
+    // The retry is deliberately narrower than "any failure". A `write_all`
+    // that completed means the server has the publishes, and NATS processes
+    // commands in order, so a flush or `PONG` that then times out is a lost
+    // acknowledgement rather than a lost batch. Resending it is how 256
+    // events become 512 rows in a warehouse, which is what
+    // `docs/event-ingest.md` promises cannot happen.
+    let mut dialed = false;
     for attempt in 0..2 {
         if connection.is_none() {
             match NatsConnection::connect(address, token).await {
                 Ok(fresh) => {
-                    metrics::record_ingest("nats", "reconnected");
+                    // The first dial of the process is not a reconnect. The
+                    // docs read a steady rate on this series as a broker
+                    // cycling, which every boot would otherwise start one
+                    // high.
+                    if dialed {
+                        metrics::record_ingest("nats", "reconnected");
+                    }
+                    dialed = true;
                     *connection = Some(fresh);
                 }
                 Err(error) => {
@@ -691,7 +827,24 @@ async fn publish_to_nats(
         match live.publish_batch(&messages).await {
             Ok(()) => return true,
             Err(error) => {
+                let written = error.downcast_ref::<PublishPhase>().is_some();
                 *connection = None;
+                if written {
+                    // The server took the publishes and the acknowledgement
+                    // is what went missing. Counted as delivered rather than
+                    // resent: at-most-once is the guarantee on the page, and
+                    // a resend here is the one thing that would break it.
+                    tracing::warn!(
+                        target: "event_ingest",
+                        address = %address,
+                        error = %error,
+                        count = batch.len(),
+                        "the nats broker accepted a batch but its acknowledgement did not \
+                         arrive; the batch was not resent, so it is delivered unless the \
+                         broker dropped it"
+                    );
+                    return true;
+                }
                 if attempt == 1 {
                     tracing::warn!(
                         target: "event_ingest",
@@ -706,6 +859,23 @@ async fn publish_to_nats(
         }
     }
     false
+}
+
+/// Marks an error raised after the publishes were already on the wire.
+///
+/// Carried as a downcastable cause rather than a variant so the existing
+/// `anyhow` chain keeps its messages: the only question the caller asks is
+/// whether resending would duplicate.
+#[derive(Debug, thiserror::Error)]
+#[error("the batch was written before this failure")]
+struct PublishPhase;
+
+/// Bound and strip a line the server sent before it reaches a log.
+fn sanitize_server_text(line: &str) -> String {
+    line.chars()
+        .filter(|character| !character.is_control())
+        .take(200)
+        .collect()
 }
 
 // --- ClickHouse ---
@@ -788,9 +958,18 @@ async fn insert_into_clickhouse(
     match governed.send(request).await {
         Ok(response) if (200u16..300).contains(&response.status) => true,
         Ok(response) => {
+            // The body is where ClickHouse says `Code: 60 ... Table
+            // db.events does not exist` or `Code: 117 ... Unknown field`,
+            // which is the difference between a table to create and a
+            // schema to fix. A bare status code is neither. Bounded and
+            // stripped of control characters so a warehouse cannot forge a
+            // log line.
             tracing::warn!(
                 target: "event_ingest",
                 status = response.status,
+                database = %database,
+                table = %table,
+                detail = %sanitize_server_text(&String::from_utf8_lossy(&response.body)),
                 count = batch.len(),
                 "clickhouse refused an insert; the batch was dropped"
             );
@@ -824,10 +1003,16 @@ pub(crate) mod metrics {
     //! The one family the ingest sinks emit.
     //!
     //! `target` is `nats` or `clickhouse`; `outcome` is `published`,
-    //! `dropped`, `error`, `reconnected`, or `worker_stopped`. Both closed
-    //! sets fixed at compile time. Nothing is labeled by workspace,
-    //! subject, or table: the first is unbounded and the other two are
-    //! derived from it.
+    //! `dropped`, `error`, `oversize`, `reconnected`, or `worker_stopped`.
+    //! Both closed sets fixed at compile time. Nothing is labeled by
+    //! workspace, subject, or table: the first is unbounded and the other
+    //! two are derived from it.
+    //!
+    //! `reconnected` counts redials, not the process's first dial, so a
+    //! steady rate on it means a broker cycling and a boot does not read as
+    //! one. `oversize` counts events skipped for exceeding the broker's
+    //! advertised `max_payload`; they are not retried and not counted as
+    //! `published`.
 
     use std::sync::LazyLock;
 
@@ -873,6 +1058,7 @@ pub(crate) mod metrics {
         #[test]
         fn every_recorder_matches_the_declared_label_arity() {
             record_ingest("nats", "reconnected");
+            record_ingest_by("nats", "oversize", 1);
             record_ingest_by("clickhouse", "published", 5);
             assert_eq!(
                 EVENT_INGEST_EVENTS
