@@ -2525,13 +2525,13 @@ names are quoted and spreadsheet-formula prefixes are neutralized.
 
 Both endpoints are process-local and read-only. They do not claim durable
 or cross-replica totals. Use the JSON retention counters and the
-`sbproxy_ai_chargeback_entries_evicted_total` /
-`sbproxy_ai_chargeback_rollups_collapsed_total{dimension}` metrics to tell
-when raw history or named rollup cardinality exceeded its configured
-window. `sbproxy_ai_chargeback_refusals_total{reason}` counts rows the
-tracker refused before exact accounting could commit,
-`sbproxy_ai_chargeback_incomplete_total{reason}` records the bounded set
-of completeness poisons that occurred on the live path, and
+`sbproxy_ai_chargeback_entries_evicted_total{origin}` /
+`sbproxy_ai_chargeback_rollups_collapsed_total{dimension,origin}` metrics
+to tell when raw history or named rollup cardinality exceeded its
+configured window. `sbproxy_ai_chargeback_refusals_total{reason,origin}`
+counts rows the tracker refused before exact accounting could commit,
+`sbproxy_ai_chargeback_incomplete_total{reason,origin}` records the
+bounded set of completeness poisons that occurred on the live path, and
 `sbproxy_admin_chargeback_export_refusals_total{format,reason}` counts
 request-shape and response-budget refusals on this authenticated admin
 boundary. An oversized JSON or CSV export is refused as

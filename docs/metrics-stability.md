@@ -112,10 +112,10 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_ai_compression_tokens_total` | Counter | `stable` | `beta` | `tenant_id`, `api_key_id`, `lever`, `direction` | SBproxy model-aware token estimates before and after an applied AI context compression lever. |
 | `sbproxy_ai_compression_value_cost_saved_micros_total` | Counter | `stable` | `beta` | `tenant_id`, `origin`, `model`, `lever`, `token_count_precision` | Gross known-price target-model input cost avoided by successful AI context compression, in micro-USD. |
 | `sbproxy_ai_compression_value_tokens_saved_total` | Counter | `stable` | `beta` | `tenant_id`, `origin`, `model`, `lever`, `token_count_precision` | Estimated target-model input tokens avoided by successful AI context compression. |
-| `sbproxy_ai_chargeback_entries_evicted_total` | Counter | `stable` | `beta` | none | Raw chargeback entries evicted from bounded in-memory retention. |
-| `sbproxy_ai_chargeback_rollups_collapsed_total` | Counter | `stable` | `beta` | `dimension` | Chargeback events folded into a bounded overflow rollup by workspace or team dimension. |
-| `sbproxy_ai_chargeback_refusals_total` | Counter | `stable` | `beta` | `reason` | Chargeback rows refused before exact accounting could commit, by closed reason. |
-| `sbproxy_ai_chargeback_incomplete_total` | Counter | `stable` | `beta` | `reason` | Chargeback incompleteness causes observed on the live record and retention path. |
+| `sbproxy_ai_chargeback_entries_evicted_total` | Counter | `stable` | `beta` | `origin` | Raw chargeback entries evicted from bounded in-memory retention, by owning origin. |
+| `sbproxy_ai_chargeback_rollups_collapsed_total` | Counter | `stable` | `beta` | `dimension`, `origin` | Chargeback events folded into a bounded overflow rollup by workspace or team dimension, by owning origin. |
+| `sbproxy_ai_chargeback_refusals_total` | Counter | `stable` | `beta` | `reason`, `origin` | Chargeback rows refused before exact accounting could commit, by closed reason and owning origin. |
+| `sbproxy_ai_chargeback_incomplete_total` | Counter | `stable` | `beta` | `reason`, `origin` | Chargeback incompleteness causes observed on the live record and retention path, by owning origin. |
 | `sbproxy_ai_context_poisoning_findings_total` | Counter | `stable` | `beta` | `rule_id`, `action` | Context-poisoning guardrail findings. |
 | `sbproxy_ai_context_poisoning_blocked_total` | Counter | `stable` | `beta` | none | Requests blocked by the context-poisoning guardrail (a finding whose configured action is deny). |
 | `sbproxy_ai_cost_dollars_attributed_total` | Counter | `stable` | `stable` | `origin`, `provider`, `model`, `surface`, `project`, `feature`, `team`, `agent_type`, `environment`, `tenant_id`, `api_key_id`, `agent_id` | AI cost in USD, partitioned by attribution tag. |

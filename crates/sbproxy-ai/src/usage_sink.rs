@@ -1430,6 +1430,16 @@ impl UsageSinkConfig {
     /// `JsonlFile`, `Ledger`, and `Otel` never reach the network, so
     /// there is nothing here for an authorizer to gate.
     pub fn build(&self) -> std::sync::Arc<dyn UsageSink> {
+        self.build_for_origin(crate::billing::chargeback::UNATTRIBUTED)
+    }
+
+    /// Build the runtime sink, naming the compiled origin that owns it.
+    ///
+    /// Only the chargeback sink reads `origin` today: its tracker is the
+    /// one sink that accumulates finance state whose invalidation is
+    /// permanent, so its warnings and counters have to say which origin's
+    /// bill is affected.
+    fn build_for_origin(&self, origin: &str) -> std::sync::Arc<dyn UsageSink> {
         let egress = configured_gate(EgressPurpose::UsageSink);
         match self {
             UsageSinkConfig::JsonlFile { path } => std::sync::Arc::new(JsonlFileSink::new(path)),
@@ -1475,11 +1485,14 @@ impl UsageSinkConfig {
                 max_entries,
                 max_workspaces,
                 max_teams,
-            } => std::sync::Arc::new(crate::billing::ChargebackTracker::with_limits(
-                *max_entries,
-                *max_workspaces,
-                *max_teams,
-            )),
+            } => std::sync::Arc::new(
+                crate::billing::ChargebackTracker::with_limits(
+                    *max_entries,
+                    *max_workspaces,
+                    *max_teams,
+                )
+                .with_origin(origin),
+            ),
             UsageSinkConfig::S3 { bucket, prefix } => {
                 let mut sink = ObjectStoreSink::s3(bucket, prefix);
                 if let Some(authorizer) = &egress {
@@ -1508,7 +1521,23 @@ fn default_chargeback_max_dimensions() -> usize {
 
 /// Build the runtime sinks for a list of configs.
 pub fn build_sinks(configs: &[UsageSinkConfig]) -> Vec<std::sync::Arc<dyn UsageSink>> {
-    configs.iter().map(UsageSinkConfig::build).collect()
+    build_sinks_for_origin(configs, crate::billing::chargeback::UNATTRIBUTED)
+}
+
+/// Build the runtime sinks for a list of configs, naming the compiled
+/// origin that owns them.
+///
+/// Prefer this wherever the caller knows its origin. `build_sinks` is the
+/// same thing with the origin left unattributed, which costs the operator
+/// the ability to tell whose chargeback data went incomplete.
+pub fn build_sinks_for_origin(
+    configs: &[UsageSinkConfig],
+    origin: &str,
+) -> Vec<std::sync::Arc<dyn UsageSink>> {
+    configs
+        .iter()
+        .map(|config| config.build_for_origin(origin))
+        .collect()
 }
 
 #[cfg(test)]

@@ -716,3 +716,19 @@ pub(crate) would leave items whose only callers are cfg(test) code, which
 `-D warnings` reports as dead code (the #757 shape). The avoidable
 same-file constant `AI_TOOLKIT_EVENT_ID_MAX_BYTES` was narrowed to
 pub(crate) before recording this result.
+
+2026-08-26 (WOR-2661 adversarial-review fixes, chargeback origin
+attribution): unreferenced 1462 -> 1463. The one addition is
+`AiHandlerConfig::attribute_origin` in `sbproxy-ai/src/handler.rs`. A
+chargeback refusal permanently marks one origin's billing tracker
+incomplete and warns exactly once for the life of the process, and the
+tracker had no identity at all, so the operator of a deployment running
+several `ai_proxy` origins could not tell whose finance data had gone
+bad. The origin now reaches both operator-facing warnings and all four
+`sbproxy_ai_chargeback_*` counters, and `attribute_origin` is the seam
+the host names it through. It is public before its caller exists: the
+compiled origin is paired with its `ai_proxy` action in
+`sbproxy-core`'s pipeline, which is outside this change's tree, so the
+one-line call lands with the host wiring rather than here. Narrowing it
+to pub(crate) would make the host wiring impossible, and deleting it
+would leave the counters permanently unattributed.

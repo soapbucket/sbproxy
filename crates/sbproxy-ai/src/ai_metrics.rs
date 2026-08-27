@@ -310,7 +310,7 @@ static AI_QUALITY_ROUTING_DECISIONS: LazyLock<CounterVec> = LazyLock::new(|| {
 /// unbounded metric series.
 pub fn record_quality_routing_decision(outcome: &str) {
     let outcome = match outcome {
-        "selected" | "hook_unavailable" | "target_ineligible" => outcome,
+        "selected" | "hook_unavailable" | "target_ineligible" | "prompt_too_large" => outcome,
         _ => "unknown",
     };
     AI_QUALITY_ROUTING_DECISIONS
@@ -2918,10 +2918,20 @@ impl ChargebackIncompleteReason {
 }
 
 /// Raw chargeback rows evicted from bounded in-memory retention.
-static AI_CHARGEBACK_ENTRIES_EVICTED: LazyLock<Option<Counter>> = LazyLock::new(|| {
-    match register_counter!(
-        "sbproxy_ai_chargeback_entries_evicted_total",
-        "Raw chargeback entries evicted from bounded in-memory retention"
+///
+/// `origin` is the compiled origin whose `type: chargeback` sink owns the
+/// tracker. A deployment runs one tracker per such origin, and every
+/// counter in this family is otherwise unattributable: the operator can
+/// see that finance data went incomplete but not whose. Cardinality is the
+/// configured origin roster, the same bound
+/// `sbproxy_egress_refused_total{origin}` already carries.
+static AI_CHARGEBACK_ENTRIES_EVICTED: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
+    match register_counter_vec!(
+        Opts::new(
+            "sbproxy_ai_chargeback_entries_evicted_total",
+            "Raw chargeback entries evicted from bounded in-memory retention, by owning origin"
+        ),
+        &["origin"]
     ) {
         Ok(counter) => Some(counter),
         Err(error) => {
@@ -2940,9 +2950,9 @@ static AI_CHARGEBACK_ROLLUPS_COLLAPSED: LazyLock<Option<CounterVec>> = LazyLock:
     match register_counter_vec!(
         Opts::new(
             "sbproxy_ai_chargeback_rollups_collapsed_total",
-            "Chargeback events folded into an overflow rollup by dimension"
+            "Chargeback events folded into an overflow rollup by dimension and owning origin"
         ),
-        &["dimension"]
+        &["dimension", "origin"]
     ) {
         Ok(counter) => Some(counter),
         Err(error) => {
@@ -2961,9 +2971,9 @@ static AI_CHARGEBACK_REFUSALS: LazyLock<Option<CounterVec>> = LazyLock::new(|| {
     match register_counter_vec!(
         Opts::new(
             "sbproxy_ai_chargeback_refusals_total",
-            "Chargeback rows refused before exact accounting could commit, by closed reason"
+            "Chargeback rows refused before exact accounting could commit, by closed reason and owning origin"
         ),
-        &["reason"]
+        &["reason", "origin"]
     ) {
         Ok(counter) => Some(counter),
         Err(error) => {
@@ -2982,9 +2992,9 @@ static AI_CHARGEBACK_INCOMPLETE: LazyLock<Option<CounterVec>> = LazyLock::new(||
     match register_counter_vec!(
         Opts::new(
             "sbproxy_ai_chargeback_incomplete_total",
-            "Chargeback incompleteness causes observed on the live record and retention path"
+            "Chargeback incompleteness causes observed on the live record and retention path, by owning origin"
         ),
-        &["reason"]
+        &["reason", "origin"]
     ) {
         Ok(counter) => Some(counter),
         Err(error) => {
@@ -2998,21 +3008,26 @@ static AI_CHARGEBACK_INCOMPLETE: LazyLock<Option<CounterVec>> = LazyLock::new(||
     }
 });
 
-pub(crate) fn record_chargeback_entry_evicted() {
+pub(crate) fn record_chargeback_entry_evicted(origin: &str) {
     if let Some(counter) = AI_CHARGEBACK_ENTRIES_EVICTED.as_ref() {
-        counter.inc();
+        counter.with_label_values(&[origin]).inc();
     }
 }
 
-pub(crate) fn record_chargeback_rollup_collapsed(dimension: &'static str) {
+pub(crate) fn record_chargeback_rollup_collapsed(dimension: &'static str, origin: &str) {
     debug_assert!(matches!(dimension, "workspace" | "team"));
     if let Some(counter) = AI_CHARGEBACK_ROLLUPS_COLLAPSED.as_ref() {
-        counter.with_label_values(&[dimension]).inc();
+        counter.with_label_values(&[dimension, origin]).inc();
     }
 }
 
 /// Count one chargeback record refusal on
-/// `sbproxy_ai_chargeback_refusals_total{reason}`.
+/// `sbproxy_ai_chargeback_refusals_total{reason,origin}`.
+///
+/// `origin` names the compiled origin whose `type: chargeback` sink owns
+/// the tracker, so an operator running several `ai_proxy` origins can tell
+/// whose finance data went incomplete. It is bounded by the configured
+/// origin roster.
 ///
 /// The `reason` label is derived from the closed
 /// [`crate::billing::chargeback::ChargebackRecordError`] vocabulary. The
@@ -3025,10 +3040,13 @@ pub(crate) fn record_chargeback_rollup_collapsed(dimension: &'static str) {
 /// `workspace_cost_overflow`, `team_recorded_entries_overflow`,
 /// `team_request_count_overflow`,
 /// `team_tokens_overflow`, and `team_cost_overflow`.
-pub fn record_chargeback_refusal(error: crate::billing::chargeback::ChargebackRecordError) {
+pub fn record_chargeback_refusal(
+    error: crate::billing::chargeback::ChargebackRecordError,
+    origin: &str,
+) {
     let reason = chargeback_refusal_reason(error);
     if let Some(counter) = AI_CHARGEBACK_REFUSALS.as_ref() {
-        counter.with_label_values(&[reason]).inc();
+        counter.with_label_values(&[reason, origin]).inc();
     }
 }
 
@@ -3094,13 +3112,16 @@ fn chargeback_refusal_reason(
 }
 
 /// Count one chargeback incompleteness observation on
-/// `sbproxy_ai_chargeback_incomplete_total{reason}`.
+/// `sbproxy_ai_chargeback_incomplete_total{reason,origin}`.
 ///
 /// Wire this at the transition that makes a tracker incomplete, not at
-/// every later read of an already-incomplete snapshot.
-pub fn record_chargeback_incomplete(reason: ChargebackIncompleteReason) {
+/// every later read of an already-incomplete snapshot. `origin` names the
+/// compiled origin whose sink owns the tracker; incompleteness is sticky,
+/// so an unattributed count says a bill will be refused without saying
+/// whose.
+pub fn record_chargeback_incomplete(reason: ChargebackIncompleteReason, origin: &str) {
     if let Some(counter) = AI_CHARGEBACK_INCOMPLETE.as_ref() {
-        counter.with_label_values(&[reason.as_str()]).inc();
+        counter.with_label_values(&[reason.as_str(), origin]).inc();
     }
 }
 

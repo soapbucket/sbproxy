@@ -54,13 +54,18 @@ state into a 512 KiB capped response buffer; CSV never snapshots the raw
 entry window. An export that exceeds the cap returns `413`. Retry an
 oversized JSON page with a smaller `limit`; for an oversized CSV export,
 use the paged JSON route. Prometheus exports the process totals as
-`sbproxy_ai_chargeback_entries_evicted_total` and
-`sbproxy_ai_chargeback_rollups_collapsed_total{dimension="workspace"|"team"}`,
+`sbproxy_ai_chargeback_entries_evicted_total{origin}` and
+`sbproxy_ai_chargeback_rollups_collapsed_total{dimension="workspace"|"team",origin}`,
 the closed refusal counter
-`sbproxy_ai_chargeback_refusals_total{reason}`, the sticky completeness
-counter `sbproxy_ai_chargeback_incomplete_total{reason}`, and the admin
+`sbproxy_ai_chargeback_refusals_total{reason,origin}`, the sticky
+completeness counter
+`sbproxy_ai_chargeback_incomplete_total{reason,origin}`, and the admin
 boundary refusal counter
-`sbproxy_admin_chargeback_export_refusals_total{format,reason}`.
+`sbproxy_admin_chargeback_export_refusals_total{format,reason}`. `origin`
+names the compiled origin whose sink owns the tracker, so a deployment
+running several `ai_proxy` origins can tell whose finance data went
+incomplete without reconstructing it from the admin route. Its
+cardinality is the configured origin roster.
 
 An embedding can also construct a tracker directly when it needs a typed
 handle:

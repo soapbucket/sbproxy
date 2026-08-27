@@ -840,8 +840,8 @@ pub const METRICS: &[MetricCapability] = &[
         support: SupportLevel::Stable,
         compat: CompatTier::Beta,
         registry: Registry::Default,
-        labels: &[],
-        description: "Raw chargeback entries evicted from bounded in-memory retention.",
+        labels: &["origin"],
+        description: "Raw chargeback entries evicted from bounded in-memory retention, by owning origin.",
         dead_reason: None,
     },
     MetricCapability {
@@ -851,8 +851,8 @@ pub const METRICS: &[MetricCapability] = &[
         support: SupportLevel::Stable,
         compat: CompatTier::Beta,
         registry: Registry::Default,
-        labels: &["dimension"],
-        description: "Chargeback events folded into a bounded overflow rollup by workspace or team dimension.",
+        labels: &["dimension", "origin"],
+        description: "Chargeback events folded into a bounded overflow rollup by workspace or team dimension, by owning origin.",
         dead_reason: None,
     },
     MetricCapability {
@@ -862,8 +862,8 @@ pub const METRICS: &[MetricCapability] = &[
         support: SupportLevel::Stable,
         compat: CompatTier::Beta,
         registry: Registry::Default,
-        labels: &["reason"],
-        description: "Chargeback rows refused before exact accounting could commit, by closed reason.",
+        labels: &["reason", "origin"],
+        description: "Chargeback rows refused before exact accounting could commit, by closed reason and owning origin.",
         dead_reason: None,
     },
     MetricCapability {
@@ -873,8 +873,8 @@ pub const METRICS: &[MetricCapability] = &[
         support: SupportLevel::Stable,
         compat: CompatTier::Beta,
         registry: Registry::Default,
-        labels: &["reason"],
-        description: "Chargeback incompleteness causes observed on the live record and retention path.",
+        labels: &["reason", "origin"],
+        description: "Chargeback incompleteness causes observed on the live record and retention path, by owning origin.",
         dead_reason: None,
     },
     MetricCapability {

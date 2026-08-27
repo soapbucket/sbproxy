@@ -627,6 +627,13 @@ pub struct ChargebackTracker {
     max_entries: usize,
     max_workspaces: usize,
     max_teams: usize,
+    /// Compiled origin whose `type: chargeback` sink owns this tracker.
+    ///
+    /// A deployment runs one tracker per such origin, and incompleteness is
+    /// sticky: without this, the one warning and the four counters an
+    /// invalidation produces say a bill will be refused forever without
+    /// saying whose. [`UNATTRIBUTED`] until a host names the origin.
+    origin: String,
     state: Mutex<ChargebackState>,
 }
 
@@ -656,8 +663,35 @@ impl ChargebackTracker {
             max_entries: max_entries.max(1),
             max_workspaces: max_workspaces.max(1),
             max_teams: max_teams.max(1),
+            origin: UNATTRIBUTED.to_string(),
             state: Mutex::new(ChargebackState::default()),
         }
+    }
+
+    /// Name the compiled origin that owns this tracker.
+    ///
+    /// The label reaches the two operator-facing warnings and all four
+    /// chargeback counters, so an operator running several `ai_proxy`
+    /// origins can tell which one's finance data went incomplete rather
+    /// than reconstructing it from `GET /admin/ai-chargeback` after the
+    /// fact. The origin name is a config-bounded value, so the label
+    /// cardinality is the operator's origin roster. An empty or
+    /// over-long name falls back to [`UNATTRIBUTED`] rather than
+    /// truncating into a collision.
+    #[must_use]
+    pub fn with_origin(mut self, origin: &str) -> Self {
+        self.origin = if origin.is_empty() || origin.len() > MAX_DIMENSION_BYTES {
+            UNATTRIBUTED.to_string()
+        } else {
+            origin.to_string()
+        };
+        self
+    }
+
+    /// The compiled origin this tracker's finance data belongs to.
+    #[must_use]
+    pub fn origin(&self) -> &str {
+        &self.origin
     }
 
     /// Append a chargeback entry directly, bypassing the [`UsageSink`]
@@ -898,27 +932,28 @@ impl ChargebackTracker {
         drop(state);
         if entry_evicted {
             self.publish_finance_metric(|| {
-                crate::ai_metrics::record_chargeback_entry_evicted();
+                crate::ai_metrics::record_chargeback_entry_evicted(&self.origin);
             });
         }
         if workspace_collapsed {
             self.publish_finance_metric(|| {
-                crate::ai_metrics::record_chargeback_rollup_collapsed("workspace");
+                crate::ai_metrics::record_chargeback_rollup_collapsed("workspace", &self.origin);
             });
         }
         if team_collapsed {
             self.publish_finance_metric(|| {
-                crate::ai_metrics::record_chargeback_rollup_collapsed("team");
+                crate::ai_metrics::record_chargeback_rollup_collapsed("team", &self.origin);
             });
         }
         if first_watermark_poison {
             self.publish_finance_metric(|| {
                 crate::ai_metrics::record_chargeback_incomplete(
                     crate::ai_metrics::ChargebackIncompleteReason::EvictionWatermarkPoisoned,
+                    &self.origin,
                 );
             });
         }
-        signal_first_watermark_poison(first_watermark_poison);
+        signal_first_watermark_poison(first_watermark_poison, &self.origin);
         Ok(())
     }
 
@@ -931,15 +966,18 @@ impl ChargebackTracker {
     }
 
     fn publish_refusal(&self, outcome: RefusalOutcome, error: ChargebackRecordError) {
-        self.publish_finance_metric(|| crate::ai_metrics::record_chargeback_refusal(error));
+        self.publish_finance_metric(|| {
+            crate::ai_metrics::record_chargeback_refusal(error, &self.origin);
+        });
         if outcome.became_incomplete {
             self.publish_finance_metric(|| {
                 crate::ai_metrics::record_chargeback_incomplete(
                     crate::ai_metrics::ChargebackIncompleteReason::RefusedRow,
+                    &self.origin,
                 );
             });
         }
-        signal_first_refusal(outcome.first_occurrence, error);
+        signal_first_refusal(outcome.first_occurrence, error, &self.origin);
     }
 
     fn publish_finance_metric(&self, publish: impl FnOnce()) {
@@ -986,23 +1024,28 @@ fn refuse_locked(state: &mut ChargebackState, error: ChargebackRecordError) -> R
     }
 }
 
-fn signal_first_refusal(first_occurrence: bool, error: ChargebackRecordError) {
+fn signal_first_refusal(first_occurrence: bool, error: ChargebackRecordError, origin: &str) {
     if first_occurrence {
+        // One warning per tracker for the life of the process, so it has to
+        // carry the origin: the operator otherwise learns that some
+        // origin's bill will be refused forever without learning whose.
         tracing::warn!(
             target: "sbproxy_ai::billing::chargeback",
             code = "chargeback_row_refused",
             reason = ?error,
+            origin = %origin,
             "chargeback usage row refused"
         );
     }
 }
 
-fn signal_first_watermark_poison(first_occurrence: bool) {
+fn signal_first_watermark_poison(first_occurrence: bool, origin: &str) {
     if first_occurrence {
         tracing::warn!(
             target: "sbproxy_ai::billing::chargeback",
             code = "chargeback_eviction_watermark_poisoned",
             reason = "eviction_watermark_poisoned",
+            origin = %origin,
             "chargeback eviction watermark poisoned"
         );
     }
@@ -3047,7 +3090,10 @@ mod tests {
     #[test]
     fn group_f_evicting_a_raw_entry_increments_the_eviction_counter() {
         fn evicted_total() -> u64 {
-            counter_total("sbproxy_ai_chargeback_entries_evicted_total", &[])
+            counter_total(
+                "sbproxy_ai_chargeback_entries_evicted_total",
+                &[("origin", UNATTRIBUTED)],
+            )
         }
 
         let tracker = ChargebackTracker::with_limits(1, 4, 4);
@@ -3709,16 +3755,85 @@ mod tests {
         assert!(!rendered.contains("7.25"));
     }
 
+    /// WOR-2661: a refusal permanently marks one origin's tracker
+    /// incomplete, `generate_bill_from_snapshot` then refuses that
+    /// origin's every future period, and the warning fires exactly once
+    /// for the life of the process. A deployment runs one tracker per
+    /// `ai_proxy` origin, so without the origin on the warning and on the
+    /// counters an operator learns that some bill will be refused forever
+    /// without learning whose.
+    #[test]
+    fn an_invalidating_refusal_names_the_origin_whose_billing_it_poisoned() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        const ORIGIN: &str = "ai-chargeback-attribution.example";
+        let tracker =
+            std::sync::Arc::new(ChargebackTracker::with_limits(8, 8, 8).with_origin(ORIGIN));
+        assert_eq!(tracker.origin(), ORIGIN);
+
+        let refusals_before = counter_total(
+            "sbproxy_ai_chargeback_refusals_total",
+            &[("reason", "invalid_cost"), ("origin", ORIGIN)],
+        );
+        let incomplete_before = counter_total(
+            "sbproxy_ai_chargeback_incomplete_total",
+            &[("reason", "refused_row"), ("origin", ORIGIN)],
+        );
+
+        let signals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let layer = ChargebackRefusalSignalLayer {
+            tracker: std::sync::Arc::clone(&tracker),
+            signals: std::sync::Arc::clone(&signals),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            assert_eq!(
+                tracker.try_record(Some("workspace-a"), entry("team-a", -1.0)),
+                Err(ChargebackRecordError::InvalidCost)
+            );
+        });
+
+        let rendered = signals
+            .lock()
+            .expect("chargeback refusal signal capture mutex poisoned")
+            .iter()
+            .flat_map(|signal| signal.rendered_fields.iter())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            rendered.contains(&format!("origin={ORIGIN}")),
+            "the one refusal warning must name its origin: {rendered}"
+        );
+
+        assert_eq!(
+            counter_total(
+                "sbproxy_ai_chargeback_refusals_total",
+                &[("reason", "invalid_cost"), ("origin", ORIGIN)]
+            ),
+            refusals_before + 1,
+            "the refusal counter must be attributable to one origin"
+        );
+        assert_eq!(
+            counter_total(
+                "sbproxy_ai_chargeback_incomplete_total",
+                &[("reason", "refused_row"), ("origin", ORIGIN)]
+            ),
+            incomplete_before + 1,
+            "the sticky-incompleteness counter must name the origin it invalidated"
+        );
+    }
+
     #[test]
     fn group_f_live_refusal_metrics_count_each_refusal_but_only_the_first_incomplete_transition() {
         let tracker = ChargebackTracker::with_limits(8, 8, 8);
         let refusal_before = counter_total(
             "sbproxy_ai_chargeback_refusals_total",
-            &[("reason", "invalid_cost")],
+            &[("reason", "invalid_cost"), ("origin", UNATTRIBUTED)],
         );
         let incomplete_before = counter_total(
             "sbproxy_ai_chargeback_incomplete_total",
-            &[("reason", "refused_row")],
+            &[("reason", "refused_row"), ("origin", UNATTRIBUTED)],
         );
 
         assert_eq!(
@@ -3733,14 +3848,14 @@ mod tests {
         assert_eq!(
             counter_total(
                 "sbproxy_ai_chargeback_refusals_total",
-                &[("reason", "invalid_cost")]
+                &[("reason", "invalid_cost"), ("origin", UNATTRIBUTED)]
             ),
             refusal_before + 2
         );
         assert_eq!(
             counter_total(
                 "sbproxy_ai_chargeback_incomplete_total",
-                &[("reason", "refused_row")]
+                &[("reason", "refused_row"), ("origin", UNATTRIBUTED)]
             ),
             incomplete_before + 1
         );
@@ -3826,7 +3941,10 @@ mod tests {
         }
         let before = counter_total(
             "sbproxy_ai_chargeback_incomplete_total",
-            &[("reason", "eviction_watermark_poisoned")],
+            &[
+                ("reason", "eviction_watermark_poisoned"),
+                ("origin", UNATTRIBUTED),
+            ],
         );
 
         assert_eq!(
@@ -3853,7 +3971,10 @@ mod tests {
         assert_eq!(
             counter_total(
                 "sbproxy_ai_chargeback_incomplete_total",
-                &[("reason", "eviction_watermark_poisoned")]
+                &[
+                    ("reason", "eviction_watermark_poisoned"),
+                    ("origin", UNATTRIBUTED)
+                ]
             ),
             before + 1
         );

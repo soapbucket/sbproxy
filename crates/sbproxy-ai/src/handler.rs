@@ -417,6 +417,13 @@ pub struct AiHandlerConfig {
     /// shared across requests for the lifetime of this per-origin config.
     #[serde(skip)]
     pub(crate) usage_sinks_built: OnceLock<Vec<std::sync::Arc<dyn crate::usage_sink::UsageSink>>>,
+    /// Compiled origin that owns this handler, named by the host before the
+    /// first request. Not a config key: the value is the compiled origin
+    /// identity, never operator-written. Sinks that accumulate per-origin
+    /// finance state read it so their operator-facing signals can say
+    /// whose data they are about.
+    #[serde(skip)]
+    pub(crate) origin_id: OnceLock<String>,
     /// Lazy-compiled AI policy plane (WOR-1542). `None` inside the OnceLock
     /// means no policy is configured or it failed to compile; the request
     /// path treats both as "no policy".
@@ -523,13 +530,30 @@ impl AiHandlerConfig {
             .as_ref()
     }
 
+    /// Name the compiled origin that owns this handler.
+    ///
+    /// Call this once, when the pipeline pairs a compiled origin with its
+    /// `ai_proxy` action and before the first request builds the sinks.
+    /// A second call is ignored, so a reload cannot re-label a tracker
+    /// that is already accumulating. Without it the chargeback sink's
+    /// warnings and counters are unattributable across a deployment that
+    /// runs several `ai_proxy` origins.
+    pub fn attribute_origin(&self, origin: &str) {
+        let _ = self.origin_id.set(origin.to_string());
+    }
+
     /// Return the shared usage sinks for this handler, building them once.
     /// Empty when none are configured. Sinks are best-effort and never fail a
     /// request.
     pub fn usage_sinks(&self) -> &[std::sync::Arc<dyn crate::usage_sink::UsageSink>] {
         self.usage_sinks_built
             .get_or_init(|| {
-                let mut sinks = crate::usage_sink::build_sinks(&self.usage_sinks);
+                let origin = self
+                    .origin_id
+                    .get()
+                    .map_or(crate::billing::chargeback::UNATTRIBUTED, String::as_str);
+                let mut sinks =
+                    crate::usage_sink::build_sinks_for_origin(&self.usage_sinks, origin);
                 // WOR-1913: a served model that declares a `reference:` cloud
                 // price gets a value recorder that prices each of its
                 // completions at that reference, so the admin value route and
@@ -3159,6 +3183,7 @@ mod tests {
             router: OnceLock::new(),
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
+            origin_id: OnceLock::new(),
             ai_policy: None,
             ai_routing_policy: None,
             model_prices: std::collections::HashMap::new(),
@@ -3215,6 +3240,7 @@ mod tests {
             router: OnceLock::new(),
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
+            origin_id: OnceLock::new(),
             ai_policy: None,
             ai_routing_policy: None,
             model_prices: std::collections::HashMap::new(),
@@ -3271,6 +3297,7 @@ mod tests {
             router: OnceLock::new(),
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
+            origin_id: OnceLock::new(),
             ai_policy: None,
             ai_routing_policy: None,
             model_prices: std::collections::HashMap::new(),
@@ -3328,6 +3355,7 @@ mod tests {
             router: OnceLock::new(),
             usage_sinks: vec![],
             usage_sinks_built: OnceLock::new(),
+            origin_id: OnceLock::new(),
             ai_policy: None,
             ai_routing_policy: None,
             model_prices: std::collections::HashMap::new(),
