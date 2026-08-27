@@ -69,6 +69,7 @@
         "device_parser_file": null,
         "synthetic_probe": null,
         "agent_registry": null,
+        "notifications": null,
         "scripting": {
           "lua": {
             "sandbox": {
@@ -815,6 +816,18 @@
           "anyOf": [
             {
               "$ref": "#/definitions/AgentRegistryConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "notifications": {
+          "description": "Optional outbound webhook notifications: many subscriptions, each with its own filter and signing key, bounded retries, and a durable deadletter queue with replay. Disabled by default. State lives in one embedded redb file named by `store_path`.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/NotificationsConfig"
             },
             {
               "type": "null"
@@ -6850,6 +6863,32 @@
           "default": 2592000,
           "type": "integer",
           "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "NotificationsConfig": {
+      "description": "Outbound webhook notifications.\n\nDistinct from `events:`, which is one collector for the SIEM feed. This is the customer-facing side: several destinations, each with its own event-type filter and its own signing key, managed at runtime through the admin API rather than by editing this file.",
+      "type": "object",
+      "required": [
+        "store_path"
+      ],
+      "properties": {
+        "enabled": {
+          "description": "Master switch. Disabled by default, so a config that names the block without turning it on opens no store file.",
+          "default": false,
+          "type": "boolean"
+        },
+        "store_path": {
+          "description": "Path to the embedded store file holding the subscriptions and the deadletter queue. Created owner-only.\n\nThe file holds live HMAC signing secrets, which unlike an inbound API key cannot be stored as a one-way hash: the notifier has to re-derive a signature on every delivery. Put it on the volume you already trust with the rest of your configuration.",
+          "type": "string"
+        },
+        "queue_capacity": {
+          "description": "Bound on the hand-off queue between the request path and the delivery worker. A full queue drops the incoming event and counts the drop rather than making a request wait on a customer's endpoint.",
+          "default": 4096,
+          "type": "integer",
+          "format": "uint",
           "minimum": 0.0
         }
       },

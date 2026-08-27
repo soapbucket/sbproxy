@@ -1,0 +1,4 @@
+{
+  "type": "added",
+  "message": "Added `proxy.notifications`: outbound webhook subscriptions with per-subscription event filters and signing keys, three backed-off delivery attempts, and a durable deadletter queue with replay, all on one embedded store. Manage them from the new Notifications page in the admin console."
+}

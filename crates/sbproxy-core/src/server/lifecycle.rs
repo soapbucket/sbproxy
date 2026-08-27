@@ -3377,6 +3377,24 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
             admin_state_inner = admin_state_inner.with_agent_registry(registry);
         }
 
+        // WOR-2669: the outbound notifier. Fail-loud for the same reason
+        // the agent registry is: a notifier that could not open its store
+        // would report an empty subscription list, and an operator reading
+        // "no subscriptions" cannot tell that from a broken store.
+        if let Some(notify_cfg) = server_config
+            .notifications
+            .as_ref()
+            .filter(|cfg| cfg.enabled)
+        {
+            let notifier = build_notifier(notify_cfg)?;
+            if !sbproxy_observe::notify::install(std::sync::Arc::clone(&notifier)) {
+                tracing::warn!(
+                    "a notifier was already installed in this process; the newly configured one will not receive events"
+                );
+            }
+            admin_state_inner = admin_state_inner.with_notifier(notifier);
+        }
+
         // WOR-27: register the synthetic-pipeline probe and spawn its
         // driver loop when the operator opted in. Registration runs
         // sync; the driver loop calls `tokio::spawn` and therefore
@@ -8049,4 +8067,35 @@ fn build_agent_registry(
         "agent registry opened"
     );
     Ok(registry)
+}
+
+/// Open the notifier's embedded store and start its delivery worker.
+///
+/// `open_shared` for the same reason the agent registry uses it: a config
+/// reload builds a candidate generation while the live one still holds the
+/// file, and redb locks it exclusively.
+fn build_notifier(
+    cfg: &sbproxy_config::NotificationsConfig,
+) -> anyhow::Result<std::sync::Arc<sbproxy_observe::notify::Notifier>> {
+    use sbproxy_platform::storage::EmbeddedKvStore;
+
+    let store = EmbeddedKvStore::open_shared(&cfg.store_path, "notifications").map_err(|e| {
+        anyhow::anyhow!("notifications.store_path {}: {e}", cfg.store_path.display())
+    })?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("notifier boot runtime: {e}"))?;
+    let notifier = runtime
+        .block_on(sbproxy_observe::notify::Notifier::start(
+            store,
+            cfg.queue_capacity,
+        ))
+        .map_err(|e| anyhow::anyhow!("notifications: {e}"))?;
+    tracing::info!(
+        path = %cfg.store_path.display(),
+        queue_capacity = cfg.queue_capacity,
+        "outbound notifier opened"
+    );
+    Ok(std::sync::Arc::new(notifier))
 }

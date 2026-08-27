@@ -1103,6 +1103,118 @@
         }
       ],
       "description": "Two different problems on one axis, kept apart by the outcome label. An error is a fault: the redb transaction failed, or a record could not be decoded, and the subsystem above it did not get the write it asked for. A refusal is the bounded in-memory store working as designed, turning away a write because it is at its entry cap; a sustained refusal rate means a dedup window is too small for the traffic, not that the store is broken. Evictions are the TTL sweep reclaiming expired entries and are healthy at any rate."
+    },
+    {
+      "id": 15,
+      "title": "Outbound Notification Deliveries",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 45
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "min": 0,
+          "noValue": "No notifier is configured on any scraped process. Configure proxy.notifications to populate this."
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(sbproxy_notify_deliveries_total{outcome=~\"delivered|retried|deadlettered|dropped\"}[5m]))",
+          "legendFormat": "{{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "What the outbound notifier did with each delivery. delivered is a receiver that answered 2xx. retried is an attempt that failed and will be tried again, so a low steady rate is a flaky receiver rather than a broken one. deadlettered is a delivery that used its whole attempt budget and is now waiting for a replay: alert on this, because it is the only outcome that needs a human. dropped is the hand-off queue at capacity, which means the request path outran the delivery worker and events were discarded rather than made to wait."
+    },
+    {
+      "id": 16,
+      "title": "Notifier Subscriptions and Deadletter Depth",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 45
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "min": 0,
+          "noValue": "No notifier is configured on any scraped process."
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (collection) (sbproxy_notify_queue)",
+          "legendFormat": "{{collection}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "How many webhook subscriptions are configured, and how many deliveries are sitting in the deadletter queue waiting for a replay. The deadletter series is bounded: past its capacity the oldest record is dropped and the drop is counted under outcome=\"deadletter_evicted\" on the panel to the left, so a queue pinned at its ceiling is losing history rather than holding it. A configured notifier publishes both series at zero on boot, so No data means it is not configured rather than that there is nothing to send."
     }
   ],
   "templating": {

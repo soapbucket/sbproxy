@@ -241,6 +241,29 @@ to see one was a curl against the admin API.
 See [agent-registry.md](agent-registry.md) for the config block and the feed
 verification chain.
 
+## Notifications (`/notifications`)
+
+Outbound webhook subscriptions, and the deliveries that ran out of attempts.
+The deadletter queue is the reason this page exists: a delivery that used
+its whole attempt budget is the one outcome that needs a human.
+
+- **Shows:** `GET /admin/notifications` for the four counts,
+  `GET /admin/notifications/subscriptions`, and
+  `GET /admin/notifications/deadletters`.
+- **Mutations:** `POST /admin/notifications/subscriptions` (create, which is
+  the only response that ever carries the signing secret; the page shows it
+  in a dismissible banner and does not store it),
+  `PATCH .../subscriptions/{id}` (pause, resume, repoint),
+  `POST .../subscriptions/{id}/rotate`, `DELETE .../subscriptions/{id}`, and
+  `POST /admin/notifications/deadletters/{delivery_id}/replay`.
+- **Empty/error notes:** every route answers `404` when
+  `proxy.notifications` is absent or disabled, and the page renders that as
+  "not configured" rather than as an error. An empty deadletter queue is the
+  healthy state, not a missing feature.
+
+See [notifications.md](notifications.md) for the delivery contract, the
+signature construction, and why the retry budget stops at three attempts.
+
 ## Credentials (`/credentials`)
 
 ![The Credentials page: provider secrets as metadata rows with lifecycle actions](assets/admin-credentials.png)

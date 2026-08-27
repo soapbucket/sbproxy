@@ -58,6 +58,7 @@ pub mod meter_metrics;
 pub mod metric_registry;
 /// Prometheus metrics registry, helpers, and per-origin recorders.
 pub mod metrics;
+pub mod notify;
 pub mod otel;
 /// WOR-1046 OTLP-logs sink output. Wraps `opentelemetry_otlp::LogExporter`
 /// behind the [`sink_dispatcher::SinkOutput`] trait so the dispatcher

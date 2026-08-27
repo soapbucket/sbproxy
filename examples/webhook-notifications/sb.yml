@@ -1,0 +1,110 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Outbound webhook subscriptions: telling your customers what happened.
+#
+# `events:` sends one collector the whole typed event feed, once, with no
+# retry. That is the right shape for a SIEM and the wrong shape for a
+# customer, who wants their own filter, their own signing key, and a second
+# attempt when their endpoint restarts. This is that second thing.
+#
+# Both halves carry the same typed events. See docs/events.md for the list
+# and docs/notifications.md for the delivery contract.
+#
+# Setup:
+#   export SBPROXY_KEY_PEPPER=a-long-random-server-pepper
+#   export SBPROXY_KEY_MASTER=a-long-random-master-key
+#   make run CONFIG=examples/webhook-notifications/sb.yml
+#
+# Nothing is subscribed yet:
+#   curl -s -u admin:admin http://127.0.0.1:9090/admin/notifications | jq
+#   {
+#     "subscriptions": 0,
+#     "active_subscriptions": 0,
+#     "deadletters": 0,
+#     "deadletter_capacity": 10000,
+#     "max_attempts": 3
+#   }
+#
+# Subscribe a receiver to the key lifecycle. The signing secret comes back
+# exactly once; store it on the receiver and never ask for it again.
+#   curl -s -u admin:admin -X POST \
+#     http://127.0.0.1:9090/admin/notifications/subscriptions \
+#     -H 'Content-Type: application/json' \
+#     -d '{"url":"https://customer.example.com/hooks/sbproxy",
+#          "event_types":["key_minted","key_revoked","key_rotated"]}' | jq
+#
+# A filter is `*`, a family prefix like `key.*`, or an exact event name.
+# A name that matches nothing selects nothing rather than everything, so a
+# typo is a receiver that goes quiet rather than one that gets everything.
+#
+# List them. No secret comes back from any read path:
+#   curl -s -u admin:admin \
+#     http://127.0.0.1:9090/admin/notifications/subscriptions | jq
+#
+# Pause one without losing its id or its filters:
+#   curl -s -u admin:admin -X PATCH \
+#     http://127.0.0.1:9090/admin/notifications/subscriptions/$SUB \
+#     -H 'Content-Type: application/json' -d '{"active":false}' | jq
+#
+# Mint a key and watch the delivery. The receiver gets one POST carrying
+# X-Sbproxy-Event-Id (stable across every attempt and every replay),
+# X-Sbproxy-Delivery-Id (fresh per attempt), and an HMAC-SHA256 signature
+# over `<timestamp>.<body>`:
+#   curl -s -u admin:admin -X POST http://127.0.0.1:9090/admin/keys \
+#     -H 'Content-Type: application/json' -d '{"name":"demo"}' | jq
+#
+# When the receiver is down, three attempts are made a second or so apart
+# and the delivery lands in the deadletter queue rather than being lost:
+#   curl -s -u admin:admin \
+#     http://127.0.0.1:9090/admin/notifications/deadletters | jq
+#
+# Replay it once the receiver is healthy. The replay re-sends under the
+# original event id, so a receiver that stores seen ids recognizes it:
+#   curl -s -u admin:admin -X POST \
+#     http://127.0.0.1:9090/admin/notifications/deadletters/$DELIVERY/replay | jq
+#
+# A nightly drain is four lines of shell, which is the point of stopping the
+# retry budget at three attempts rather than at three days:
+#   curl -s -u admin:admin http://127.0.0.1:9090/admin/notifications/deadletters \
+#     | jq -r '.items[].delivery_id' \
+#     | xargs -I{} curl -s -u admin:admin -X POST \
+#         http://127.0.0.1:9090/admin/notifications/deadletters/{}/replay
+
+proxy:
+  http_bind_port: 8080
+
+  admin:
+    enabled: true
+    port: 9090
+    username: admin
+    password: admin
+
+  # The key plane, so the walkthrough above has a real event to deliver.
+  key_management:
+    enabled: true
+    store:
+      backend: embedded
+      path: /tmp/sbproxy-webhook-notifications-keys.redb
+    crypto:
+      pepper: env:SBPROXY_KEY_PEPPER
+      master_key: env:SBPROXY_KEY_MASTER
+
+  notifications:
+    enabled: true
+    # Subscriptions and the deadletter queue. Created owner-only. It also
+    # holds live HMAC signing secrets, which cannot be hashed because a
+    # signature has to be re-derived on every delivery, so put it on the
+    # volume you already trust with your config.
+    store_path: /tmp/sbproxy-webhook-notifications.redb
+    # The hand-off queue between the request path and the delivery worker.
+    # A full queue drops the incoming event and counts the drop rather than
+    # making a request wait on somebody else's endpoint.
+    queue_capacity: 4096
+
+origins:
+  "test.sbproxy.dev":
+    action:
+      type: static
+      status: 200
+      content_type: text/plain
+      body: |
+        ok

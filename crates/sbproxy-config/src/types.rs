@@ -1908,6 +1908,12 @@ pub struct ProxyServerConfig {
     /// `store_path`; nothing here needs a database or a sidecar.
     #[serde(default)]
     pub agent_registry: Option<AgentRegistryConfig>,
+    /// Optional outbound webhook notifications: many subscriptions, each
+    /// with its own filter and signing key, bounded retries, and a durable
+    /// deadletter queue with replay. Disabled by default. State lives in
+    /// one embedded redb file named by `store_path`.
+    #[serde(default)]
+    pub notifications: Option<NotificationsConfig>,
     /// Scripting runtime limits. Today this block carries the Lua
     /// sandbox knobs (execution-time budget, memory budget, pattern
     /// API gating); other languages (CEL, JavaScript, WebAssembly)
@@ -2623,6 +2629,7 @@ impl Default for ProxyServerConfig {
             mtls: None,
             synthetic_probe: None,
             agent_registry: None,
+            notifications: None,
             scripting: ScriptingConfig::default(),
             extensions: HashMap::new(),
             http_client_timeouts: HttpClientTimeoutsConfig::default(),
@@ -5226,6 +5233,48 @@ impl Default for AgentRegistryConfig {
             rotation_grace_secs: default_agent_registry_rotation_grace_secs(),
         }
     }
+}
+
+/// Outbound webhook notifications.
+///
+/// Distinct from `events:`, which is one collector for the SIEM feed. This
+/// is the customer-facing side: several destinations, each with its own
+/// event-type filter and its own signing key, managed at runtime through
+/// the admin API rather than by editing this file.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationsConfig {
+    /// Master switch. Disabled by default, so a config that names the block
+    /// without turning it on opens no store file.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to the embedded store file holding the subscriptions and the
+    /// deadletter queue. Created owner-only.
+    ///
+    /// The file holds live HMAC signing secrets, which unlike an inbound
+    /// API key cannot be stored as a one-way hash: the notifier has to
+    /// re-derive a signature on every delivery. Put it on the volume you
+    /// already trust with the rest of your configuration.
+    pub store_path: std::path::PathBuf,
+    /// Bound on the hand-off queue between the request path and the
+    /// delivery worker. A full queue drops the incoming event and counts
+    /// the drop rather than making a request wait on a customer's endpoint.
+    #[serde(default = "default_notifications_queue_capacity")]
+    pub queue_capacity: usize,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            store_path: std::path::PathBuf::from("notifications.redb"),
+            queue_capacity: default_notifications_queue_capacity(),
+        }
+    }
+}
+
+fn default_notifications_queue_capacity() -> usize {
+    4_096
 }
 
 fn default_agent_registry_duplicate_window_secs() -> u64 {

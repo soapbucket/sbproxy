@@ -812,6 +812,10 @@ pub struct AdminState {
     /// route under `/admin/agent-registry` answers 404 rather than
     /// pretending an empty registry exists.
     pub agent_registry: Option<Arc<sbproxy_agent_registry::AgentRegistry>>,
+    /// WOR-2669: the outbound notifier, when the operator configured one.
+    /// `None` means `notifications:` is absent or disabled, and every route
+    /// under `/admin/notifications` answers 404.
+    pub notifier: Option<Arc<sbproxy_observe::notify::Notifier>>,
     /// Pepper for hashing/verifying `AdminOperator.password_hash`.
     /// Defaults to [`crate::key_plane::default_admin_operator_pepper`] so
     /// operator login works with no `key_management:` block at all; the
@@ -838,6 +842,7 @@ impl AdminState {
             health_registry: sbproxy_observe::default_registry_optional(None, None),
             prompt_persistence: None,
             agent_registry: None,
+            notifier: None,
             session_signer: crate::admin_session::SessionSigner::random(),
             revoked_sessions: Mutex::new(std::collections::HashSet::new()),
             log_events: tokio::sync::broadcast::channel(256).0,
@@ -1006,6 +1011,17 @@ impl AdminState {
         registry: Arc<sbproxy_agent_registry::AgentRegistry>,
     ) -> Self {
         self.agent_registry = Some(registry);
+        self
+    }
+
+    /// Attach a configured outbound notifier.
+    ///
+    /// The binary opts in from `notifications:`; leaving it out is what
+    /// makes the routes 404 rather than answering for a notifier with no
+    /// store behind it.
+    #[must_use]
+    pub fn with_notifier(mut self, notifier: Arc<sbproxy_observe::notify::Notifier>) -> Self {
+        self.notifier = Some(notifier);
         self
     }
 
@@ -6953,6 +6969,61 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
         }
     }
 
+    // WOR-2669: the outbound notifier, dispatched here for the same reason
+    // the agent registry is. Same explicit authentication gate, and for the
+    // same reason: an unauthenticated caller must not learn whether a
+    // notifier is configured.
+    if path
+        .split('?')
+        .next()
+        .unwrap_or(path)
+        .starts_with(sbproxy_observe::notify::admin::ADMIN_PREFIX)
+    {
+        if principal.is_none() {
+            let _ = write_admin_response_headed(
+                sock,
+                401,
+                "application/json",
+                br#"{"error":"unauthorized"}"#,
+                &cors,
+                challenge,
+            )
+            .await;
+            return;
+        }
+        let Some(notifier) = state.notifier.as_ref() else {
+            let _ = write_admin_response_headed(
+                sock,
+                404,
+                "application/json",
+                br#"{"error":"notifications is not configured on this proxy"}"#,
+                &cors,
+                challenge,
+            )
+            .await;
+            return;
+        };
+        if let Some(response) = sbproxy_observe::notify::admin::dispatch(
+            notifier.as_ref(),
+            method,
+            path,
+            body_owned.as_deref().map(str::as_bytes),
+        )
+        .await
+        {
+            let _ = write_admin_response_headed(
+                sock,
+                response.status,
+                response.content_type,
+                response.body.as_bytes(),
+                &cors,
+                challenge,
+            )
+            .await;
+            return;
+        }
+    }
+
     // Compression session state is external and asynchronous. Dispatch it
     // here, after principal/CSRF resolution and before the generic GET path,
     // so content inspection can enforce Admin-only, opt-in, audit-first
@@ -7968,6 +8039,38 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// WOR-2669: the notifier's routes run before `handle_admin_request`
+    /// and therefore before that function's own authentication gate, so
+    /// the gate has to be here. Coverage of the notifier's dispatcher
+    /// proves nothing about that.
+    #[tokio::test]
+    async fn the_notifications_route_refuses_an_unauthenticated_caller_before_saying_whether_it_exists(
+    ) {
+        let response = admin_connection_roundtrip(
+            std::sync::Arc::new(make_state()),
+            "10.0.0.44",
+            "GET /admin/notifications HTTP/1.1\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn the_notifications_route_is_404_when_no_notifier_is_configured() {
+        let auth = synthesize_basic("admin", "secret");
+        let response = admin_connection_roundtrip(
+            std::sync::Arc::new(make_state()),
+            "10.0.0.45",
+            &format!("GET /admin/notifications HTTP/1.1\r\nAuthorization: {auth}\r\n\r\n"),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+        assert!(
+            response.contains("notifications is not configured"),
+            "the 404 has to say why: {response}"
+        );
     }
 
     #[tokio::test]

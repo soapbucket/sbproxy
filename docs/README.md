@@ -186,7 +186,8 @@ Point a framework you already run at the gateway: chat completions through the O
 - [audit-log.md](audit-log.md) - tamper-evident audit log of admin actions.
 - [observability.md](observability.md) - metrics, logs, traces, and the bundled dashboards.
 - [clickhouse-attribution.md](clickhouse-attribution.md) - access-log schema, pre-aggregations, and sample attribution queries.
-- [events.md](events.md) - the twenty-two typed events, the `events:` file and webhook sinks, decision-audit, and how the pieces fit into a SIEM integration.
+- [events.md](events.md) - the twenty-three typed events, the `events:` file and webhook sinks, decision-audit, and how the pieces fit into a SIEM integration.
+- [notifications.md](notifications.md) - outbound webhook subscriptions for the customer-facing side of the same events: many destinations with their own filters and signing keys, bounded retries, and a deadletter queue with replay.
 - [metrics-stability.md](metrics-stability.md) - Prometheus metric naming and stability.
 - [decision-records.md](decision-records.md) - what a SIEM consumer may rely on from the decision-audit feed.
 - [operator-runbook.md](operator-runbook.md) - the `runbook_id` index every paging alert resolves through, a response section per id, plus dashboard triage and rollback actions.

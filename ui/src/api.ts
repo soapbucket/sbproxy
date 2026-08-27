@@ -2566,6 +2566,39 @@ export interface AgentRegistrySummary {
   bootstrap_keys: number;
 }
 
+/** One webhook subscription. The signing secret is never here: the
+ *  server's read shape has nowhere to put one. */
+export interface NotifySubscription {
+  subscription_id: string;
+  url: string;
+  event_types: string[];
+  signing_key_id: string;
+  active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+/** One delivery that ran out of attempts. */
+export interface NotifyDeadLetter {
+  delivery_id: string;
+  subscription_id: string;
+  event_id: string;
+  event_type: string;
+  attempts: number;
+  last_status: number | null;
+  last_reason: string;
+  moved_at: string;
+}
+
+/** `GET /admin/notifications`. */
+export interface NotifierSummary {
+  subscriptions: number;
+  active_subscriptions: number;
+  deadletters: number;
+  deadletter_capacity: number;
+  max_attempts: number;
+}
+
 /** A configured RBAC operator, as reported by `/api/operators`. Never
  *  carries a password_hash. Config-only: managed by editing
  *  `proxy.admin.operators` and reloading, not through this API. */
@@ -3092,6 +3125,43 @@ export const api = {
       "POST",
       `/admin/agent-registry/registrations/${encodeURIComponent(agentId)}/${decision}`,
       reason ? { reason } : {},
+    ),
+
+  // Outbound webhook notifications (WOR-2669). 404 when
+  // `proxy.notifications` is absent or disabled.
+  notifySummary: () => getJson<NotifierSummary>("/admin/notifications"),
+  notifySubscriptions: () =>
+    getJson<{ items: NotifySubscription[] }>("/admin/notifications/subscriptions"),
+  // The signing secret is in this response and in no other. The view shows
+  // it once and does not store it.
+  notifyCreateSubscription: (url: string, eventTypes: string[]) =>
+    sendJson<{ subscription: NotifySubscription; signing_secret: string }>(
+      "POST",
+      "/admin/notifications/subscriptions",
+      { url, event_types: eventTypes },
+    ),
+  notifySetActive: (subscriptionId: string, active: boolean) =>
+    sendJson<NotifySubscription>(
+      "PATCH",
+      `/admin/notifications/subscriptions/${encodeURIComponent(subscriptionId)}`,
+      { active },
+    ),
+  notifyRotate: (subscriptionId: string) =>
+    sendJson<{ subscription: NotifySubscription; signing_secret: string }>(
+      "POST",
+      `/admin/notifications/subscriptions/${encodeURIComponent(subscriptionId)}/rotate`,
+    ),
+  notifyDeleteSubscription: (subscriptionId: string) =>
+    sendJson<{ deleted: boolean }>(
+      "DELETE",
+      `/admin/notifications/subscriptions/${encodeURIComponent(subscriptionId)}`,
+    ),
+  notifyDeadletters: () =>
+    getJson<{ items: NotifyDeadLetter[] }>("/admin/notifications/deadletters"),
+  notifyReplay: (deliveryId: string) =>
+    sendJson<{ event_id: string; replayed: boolean }>(
+      "POST",
+      `/admin/notifications/deadletters/${encodeURIComponent(deliveryId)}/replay`,
     ),
 
   // Attested metering (WOR-2131). All three are tenant-scoped server-side
