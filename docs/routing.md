@@ -185,6 +185,8 @@ complete working config.
 
 `fallback_origin` swaps in a backup action (static, redirect, mock, proxy, anything) when the primary errors (`on_error: true`) or returns a listed status (`on_status: [502, 503, 504]`). It runs only the fallback action, not the origin's own auth/policies/transforms; point it at another `proxy` origin if you need the full chain. See [Fallback origin](configuration.md#fallback-origin); runnable at [`examples/fallback-origin/`](../examples/fallback-origin/).
 
+`on_error` has exactly one exception, and it is narrow: an AI request the gateway cancelled itself because the caller's connection broke mid-generation does not run the fallback. The fallback exists to give a waiting caller something rather than a 502, and that request has no waiting caller; on an `ai_proxy` fallback it would also dispatch a second paid provider call for someone who is already gone. Every other failure serves the fallback as it always did, including failures the proxy attributes to the client, such as a request whose `Connection` header nominates a protected field. See [ai-gateway.md](ai-gateway.md#when-a-broken-connection-stops-the-meter).
+
 ### What a fallback response carries
 
 A fallback response is built from nothing rather than edited over the primary's, so no header the primary set can appear on it. That is the point, and it is also why the set of headers the gateway puts back has to be stated rather than assumed.
