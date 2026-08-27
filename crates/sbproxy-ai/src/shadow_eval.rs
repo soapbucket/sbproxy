@@ -585,7 +585,6 @@ impl ShadowPairLedger {
             slots.clear();
         }
     }
-
 }
 
 #[derive(Default)]
