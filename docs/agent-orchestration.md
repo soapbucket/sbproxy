@@ -1,6 +1,6 @@
 # Agent orchestration
 
-*Last modified: 2026-08-25*
+*Last modified: 2026-08-26*
 
 SBproxy's AI toolkit runs bounded, finite-state workflows against an
 operator-declared agent registry. Agents, workflows, schemas, limits, secrets,
@@ -162,6 +162,12 @@ concurrency, per-run deadlines, and retained redacted operation summaries.
 Limits are checked before publication or before a body exceeding a boundary is
 materialized. Concurrency is fail-fast; a saturated runtime does not grow an
 unbounded waiting queue.
+
+Those bounds belong to the runtime this page documents. The lower-level
+`sbproxy_ai::agent_orchestration::AgentRegistry` an embedder can call
+directly is an offline building block with no cap, no eviction, and no
+tenant keying. Reach for the runtime above on any path a request can
+drive.
 
 ## What operators can observe
 

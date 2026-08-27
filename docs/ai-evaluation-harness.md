@@ -1,6 +1,6 @@
 # AI evaluation harness
 
-*Last modified: 2026-08-25*
+*Last modified: 2026-08-26*
 
 SBproxy's AI toolkit registers immutable, explicitly versioned datasets and
 evaluates already-recorded candidate responses through the authenticated admin
@@ -178,6 +178,13 @@ Request bytes, response bytes, dataset counts and versions, entries per
 dataset, cases per run, metric count, judge criteria, concurrent evaluations,
 and retained summaries are all bounded. Saturation fails fast. A validation or
 limit error leaves the prior registered state unchanged.
+
+Those bounds belong to the runtime this page documents. The lower-level
+`sbproxy_ai::evaluation` primitives an embedder can call directly
+(`DatasetStore`, `ExperimentStore`, `PromptScorer`) are offline building
+blocks with no cap and no eviction: they retain everything they are handed,
+including prompt text verbatim. Reach for the runtime above on any path a
+request can drive.
 
 ## Observability
 
