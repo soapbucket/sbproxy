@@ -1326,7 +1326,7 @@ fn object_store_object_key(prefix: &str, event: &LlmUsageEvent) -> String {
 
 /// Declarative config for a usage sink, parsed from the action's
 /// `usage_sinks` list.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UsageSinkConfig {
     /// Append events to a JSONL file.
@@ -1415,6 +1415,71 @@ pub enum UsageSinkConfig {
         #[serde(default)]
         prefix: String,
     },
+}
+
+/// Redacted `Debug` (WOR-2606). The config-side twin of `LangfuseSink`
+/// and `DatadogSink`, redacted in the same round and in this same file
+/// while this enum kept the derive: the same write credentials were
+/// protected once constructed and printed when loaded.
+///
+/// `Ledger`'s `signing_seed_hex` is the third: it signs the hash chain
+/// that makes the usage ledger verifiable, so reading it lets an
+/// attacker forge entries the verifier accepts. The Langfuse public
+/// key, the Datadog site and service, and every bucket and path stay.
+impl std::fmt::Debug for UsageSinkConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::JsonlFile { path } => f.debug_struct("JsonlFile").field("path", path).finish(),
+            Self::Webhook { url } => f.debug_struct("Webhook").field("url", url).finish(),
+            Self::Ledger {
+                path,
+                signing_seed_hex,
+                ..
+            } => f
+                .debug_struct("Ledger")
+                .field("path", path)
+                .field(
+                    "signing_seed_hex",
+                    &signing_seed_hex.as_ref().map(|_| "[REDACTED]"),
+                )
+                .finish_non_exhaustive(),
+            Self::Langfuse {
+                host, public_key, ..
+            } => f
+                .debug_struct("Langfuse")
+                .field("host", host)
+                .field("public_key", public_key)
+                .field("secret_key", &"[REDACTED]")
+                .finish(),
+            Self::Datadog { site, service, .. } => f
+                .debug_struct("Datadog")
+                .field("api_key", &"[REDACTED]")
+                .field("site", site)
+                .field("service", service)
+                .finish(),
+            Self::Otel => f.write_str("Otel"),
+            Self::Chargeback {
+                max_entries,
+                max_workspaces,
+                max_teams,
+            } => f
+                .debug_struct("Chargeback")
+                .field("max_entries", max_entries)
+                .field("max_workspaces", max_workspaces)
+                .field("max_teams", max_teams)
+                .finish(),
+            Self::S3 { bucket, prefix } => f
+                .debug_struct("S3")
+                .field("bucket", bucket)
+                .field("prefix", prefix)
+                .finish(),
+            Self::Gcs { bucket, prefix } => f
+                .debug_struct("Gcs")
+                .field("bucket", bucket)
+                .field("prefix", prefix)
+                .finish(),
+        }
+    }
 }
 
 impl UsageSinkConfig {
@@ -2588,6 +2653,77 @@ mod tests {
         assert!(
             rendered.contains("sbproxy"),
             "the service tag must survive: {rendered}"
+        );
+    }
+
+    /// The config-side twin of the two sinks above, pinned (WOR-2606).
+    ///
+    /// `LangfuseSink` and `DatadogSink` were redacted in the same round
+    /// and in this same file while the enum an operator's YAML parses
+    /// into kept the derive, so the same write credentials were
+    /// protected once constructed and printed when loaded. A config-load
+    /// diagnostic is the likelier of the two to reach a log.
+    #[test]
+    fn debug_never_renders_a_usage_sink_config_credential() {
+        const SENTINEL: &str = "SENTINEL-SINKCFG-8b02";
+
+        let langfuse = UsageSinkConfig::Langfuse {
+            host: "https://cloud.langfuse.com".to_string(),
+            public_key: "pk-public".to_string(),
+            secret_key: SENTINEL.to_string(),
+        };
+        let rendered = format!("{langfuse:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the Langfuse secret key reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("pk-public"),
+            "the public key must survive so the project is nameable: {rendered}"
+        );
+
+        let datadog = UsageSinkConfig::Datadog {
+            api_key: SENTINEL.to_string(),
+            site: "datadoghq.eu".to_string(),
+            service: Some("sbproxy".to_string()),
+        };
+        let rendered = format!("{datadog:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the Datadog API key reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("datadoghq.eu"),
+            "the site must survive: it names which intake failed: {rendered}"
+        );
+
+        // The third one, and the one that is easy to miss: this seed
+        // signs the hash chain that makes the ledger verifiable, so
+        // reading it forges entries the verifier accepts.
+        let ledger = UsageSinkConfig::Ledger {
+            path: "/var/lib/sbproxy/usage.jsonl".to_string(),
+            signing_seed_hex: Some(SENTINEL.to_string()),
+        };
+        let rendered = format!("{ledger:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the ledger signing seed reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("/var/lib/sbproxy/usage.jsonl"),
+            "the ledger path must survive: {rendered}"
+        );
+
+        // The unsigned ledger renders an absence rather than a marker,
+        // because whether signing is on is what explains an unverifiable
+        // chain.
+        let unsigned = UsageSinkConfig::Ledger {
+            path: "/var/lib/sbproxy/usage.jsonl".to_string(),
+            signing_seed_hex: None,
+        };
+        assert!(
+            format!("{unsigned:?}").contains("None"),
+            "an unsigned ledger must read as unsigned: {unsigned:?}"
         );
     }
 }

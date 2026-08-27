@@ -20,7 +20,7 @@ use sbproxy_config::types::{KeyInboundConfig, NativeKeyPolicyConfig};
 pub const MAX_VALUES_PER_HEADER: usize = 8;
 
 /// What the sweep found.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum SweepOutcome {
     /// No candidate header carried a well-shaped token. The caller falls
     /// through to the origin's configured auth provider.
@@ -37,6 +37,30 @@ pub enum SweepOutcome {
     /// Two candidate headers carried different well-shaped tokens. The caller
     /// denies rather than letting configuration order silently pick one.
     Ambiguous,
+}
+
+/// Redacted `Debug` (WOR-2606). `Found.token` is the inbound credential
+/// the caller presented, lifted verbatim out of the request header, and
+/// this enum is what an ambiguous-or-rejected sweep formats. Same class
+/// as `ApiKeyEntry` and `BearerToken`, which were redacted in the first
+/// sweep; this one is the value in flight rather than the value
+/// configured.
+///
+/// The header name stays. It is what says *which* header the proxy read
+/// a key out of, which is the whole diagnosis when a client sends two,
+/// and it is not a credential.
+impl std::fmt::Debug for SweepOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => f.write_str("None"),
+            Self::Found { header, .. } => f
+                .debug_struct("Found")
+                .field("header", header)
+                .field("token", &"[REDACTED]")
+                .finish(),
+            Self::Ambiguous => f.write_str("Ambiguous"),
+        }
+    }
 }
 
 /// One non-empty credential presented through a configured inbound carrier.
@@ -730,5 +754,32 @@ mod tests {
         assert_eq!(effective.key_id, record.key_id);
         assert_eq!(effective.max_requests_per_minute, Some(12));
         assert_eq!(effective.require_pii_redaction, ["email"]);
+    }
+
+    /// The swept inbound token, pinned (WOR-2606).
+    ///
+    /// `Found.token` is the credential the caller presented, lifted
+    /// verbatim out of a request header, and an ambiguous or rejected
+    /// sweep is what formats this.
+    #[test]
+    fn debug_never_renders_the_swept_inbound_token() {
+        const SENTINEL: &str = "SENTINEL-INBOUND-9a04";
+
+        let found = SweepOutcome::Found {
+            header: "authorization".to_string(),
+            token: SENTINEL.to_string(),
+        };
+        let rendered = format!("{found:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the presented inbound token reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("authorization"),
+            "the header name must survive: which header the key came from is the \
+             whole diagnosis when a client sends two: {rendered}"
+        );
+        assert_eq!(format!("{:?}", SweepOutcome::None), "None");
+        assert_eq!(format!("{:?}", SweepOutcome::Ambiguous), "Ambiguous");
     }
 }

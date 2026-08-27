@@ -468,18 +468,34 @@ the request is rejected. Peppered hashes still print: they are what
 correlates a mint with the record it produced, and they are not
 credentials.
 
-It covers every credential SBproxy holds, not only the ones a secret
-backend supplies. The same redaction applies to the keys a caller
-presents inbound (API keys, bearer tokens, Basic and Digest passwords,
-the JWT HMAC secret), to the credentials SBproxy presents upstream (an
-AI provider's API key, an OAuth client secret, a vault-resolved bearer
-token, a usage sink's write key), to the session material the proxy
-issues itself (the OIDC client and cookie secrets, a stored refresh
-token, the admin session signing key), and to the keys whose disclosure
-forges what they sign (the CSRF token key, the crawl ledger's HMAC key,
-a mesh enrollment token). The operator-facing config types are covered
-alongside their runtime twins, because a config-load diagnostic is the
-likelier of the two to reach a log.
+It reaches past the ones a secret backend supplies. The same redaction
+applies to the keys a caller presents inbound (API keys, bearer tokens,
+Basic and Digest passwords, the JWT HMAC secret, and the token the
+inbound sweep lifts out of a request header), to the credentials SBproxy
+presents upstream (an AI provider's API key, an embedding or vector
+store key, an OAuth client secret, a vault-resolved bearer token, a
+usage sink's write key, a Stripe secret key, a Consul ACL token), to the
+session material the proxy issues itself (the OIDC client and cookie
+secrets, a stored refresh token, the admin session signing key, the
+admin Basic-auth password), and to the keys whose disclosure forges what
+they sign (the CSRF token key, the crawl ledger's HMAC key, a mesh
+enrollment token, the usage ledger's signing seed, the event and alert
+webhook HMAC keys, the Web Bot Auth directory seed, the OLP signing key
+and content-key seed).
+
+Config types are covered alongside their runtime twins, in both
+directions. A twin protected on one side only is not protected: the same
+value is redacted where it is used and printed where it is loaded, and a
+config-load diagnostic is the likelier of the two to reach a log. Four
+config types were derived while their runtime halves were redacted, and
+five runtime types were derived while their config halves were; both
+sets are closed.
+
+What this is *not* is a claim that no credential-bearing type anywhere
+in the tree is still derived. That claim would need something that
+derives the list from the code, and nothing does, for the reason the
+next paragraph gives. What is true is that every type on the registry is
+enforced, and that adding a type means adding its line.
 
 Two shapes are deliberate rather than incidental. An `Option` field
 renders as present-but-redacted or as absent, because "no credential
@@ -494,10 +510,19 @@ The set is enforced rather than remembered.
 `scripts/secret-debug-registry.txt` lists every protected type, and a
 CI guard refuses a tree where one of them has regained a derived
 `Debug`, lost its redacting implementation, or lost the test that
-pushes a sentinel through it. What the guard cannot see, and this is
-worth knowing rather than assuming: a *new* credential-bearing type
-that never gets a registry line. Adding the line is part of adding the
-type.
+pushes a sentinel through it.
+
+What the guard cannot see, worth knowing rather than assuming, is three
+things. A *new* credential-bearing type that never gets a registry
+line: nothing derives the list from the code, because "this field holds
+a credential" is a judgment about meaning rather than a pattern, and a
+scan that flags `max_tokens` alongside `api_key` stops being read.
+Whether an implementation still redacts, as opposed to still existing:
+that is what the pinning test is for, which is why the guard demands one
+and why the test asserts a sentinel is absent rather than asserting a
+type name. And whether that test still asserts anything, since the guard
+checks the function exists rather than what it does. The script's own
+header says all three in the same words.
 
 ## Related Reading
 

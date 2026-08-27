@@ -53,7 +53,7 @@ struct ModelEntry {
 
 /// The `litellm_params` of a model entry. Known keys are mapped; the rest are
 /// captured in `extra` so they can be surfaced as warnings.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 struct LitellmParams {
     model: Option<String>,
     api_key: Option<String>,
@@ -69,6 +69,31 @@ struct LitellmParams {
     budget_duration: Option<String>,
     #[serde(flatten)]
     extra: BTreeMap<String, serde_yaml::Value>,
+}
+
+/// Redacted `Debug` (WOR-2606). The imported LiteLLM config carries the
+/// upstream provider key verbatim, and an import that fails to parse is
+/// exactly what formats this. Crate-private, which narrows the blast
+/// radius without closing it.
+///
+/// `extra` is operator-authored passthrough whose keys are not known
+/// ahead of time, so only its key names are printed: one of them may
+/// be another provider's credential.
+impl std::fmt::Debug for LitellmParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LitellmParams")
+            .field("model", &self.model)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("api_base", &self.api_base)
+            .field("api_version", &self.api_version)
+            .field("organization", &self.organization)
+            .field("weight", &self.weight)
+            .field(
+                "extra",
+                &self.extra.keys().map(String::as_str).collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 /// LiteLLM `router_settings`.
@@ -1156,6 +1181,47 @@ litellm_settings:
             paths.len() >= 7,
             "expected >=7 corpus fixtures under {dir}, found {}",
             paths.len()
+        );
+    }
+
+    /// The imported LiteLLM provider key, pinned (WOR-2606).
+    ///
+    /// An import that fails to parse is exactly what formats this, and
+    /// the value in `api_key` is the operator's upstream credential
+    /// verbatim. `extra` is passthrough whose keys are not known ahead
+    /// of time, so one of its values may be another provider's
+    /// credential; only the names print.
+    #[test]
+    fn debug_never_renders_an_imported_litellm_credential() {
+        const SENTINEL: &str = "SENTINEL-LITELLM-2d94";
+
+        let mut extra = BTreeMap::new();
+        extra.insert(
+            "aws_secret_access_key".to_string(),
+            serde_yaml::Value::String(SENTINEL.to_string()),
+        );
+
+        let params = LitellmParams {
+            model: Some("openai/gpt-4o".to_string()),
+            api_key: Some(SENTINEL.to_string()),
+            api_base: Some("https://api.openai.com/v1".to_string()),
+            organization: Some("org-1".to_string()),
+            extra,
+            ..LitellmParams::default()
+        };
+        let rendered = format!("{params:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "an imported credential reached Debug through api_key or extra: {rendered}"
+        );
+        assert!(
+            rendered.contains("openai/gpt-4o") && rendered.contains("org-1"),
+            "the model and organization must survive: they name the entry: {rendered}"
+        );
+        assert!(
+            rendered.contains("aws_secret_access_key"),
+            "the extra key names must survive: which keys were passed through is \
+             the useful half for an import diagnostic: {rendered}"
         );
     }
 }

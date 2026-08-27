@@ -684,7 +684,7 @@ pub enum RequestEventSinkKind {
 /// alternative is a slow SIEM adding latency to every denied request.
 ///
 /// Shutdown does not flush; see `docs/events.md`.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EventsConfig {
     /// Which backend receives each selected event.
@@ -746,6 +746,27 @@ pub struct EventsConfig {
     /// configured.
     #[serde(default)]
     pub queue_capacity: Option<usize>,
+}
+
+/// Redacted `Debug` (WOR-2606). `signing_secret` is the HMAC key the
+/// webhook receiver verifies, so reading it lets an attacker forge an
+/// event feed the operator's downstream trusts. The config-side twin of
+/// `EventSinkTarget::Webhook`, redacted in the same round.
+impl std::fmt::Debug for EventsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventsConfig")
+            .field("sink", &self.sink)
+            .field("path", &self.path)
+            .field("url", &self.url)
+            .field(
+                "signing_secret",
+                &self.signing_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("types", &self.types)
+            .field("fail_closed", &self.fail_closed)
+            .field("queue_capacity", &self.queue_capacity)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Accepted `events.sink` values.
@@ -4730,7 +4751,7 @@ pub struct KeySeedConfig {
 }
 
 /// A seeded inbound virtual key.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SeedKeyConfig {
     /// Stable public id and token prefix.
@@ -4827,8 +4848,32 @@ pub struct SeedKeyConfig {
     pub expires_at: Option<String>,
 }
 
+/// Redacted `Debug` (WOR-2606). `secret` is the plaintext inbound key
+/// an operator seeds, hashed at boot: whoever reads it authenticates as
+/// this key for as long as it exists.
+///
+/// `secret_hash` deliberately stays. It is the precomputed HMAC an
+/// operator supplies instead of the plaintext, the proxy compares a
+/// presented key's hash against it, and knowing a hash does not produce
+/// its preimage. It is also the identifier that says *which* seeded key
+/// a config-load error is about.
+///
+/// Curated and `finish_non_exhaustive`, so a credential-shaped field
+/// added to this block later is absent from the output rather than
+/// printed.
+impl std::fmt::Debug for SeedKeyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SeedKeyConfig")
+            .field("key_id", &self.key_id)
+            .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
+            .field("secret_hash", &self.secret_hash)
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A seeded upstream credential.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SeedCredentialConfig {
     /// Stable id.
@@ -4853,6 +4898,23 @@ pub struct SeedCredentialConfig {
     /// Owning tenant.
     #[serde(default)]
     pub tenant: Option<String>,
+}
+
+/// Redacted `Debug` (WOR-2606). `secret` is the upstream credential
+/// this seeded entry presents. `vault_ref` stays: it names where the
+/// real value comes from and is not itself one.
+impl std::fmt::Debug for SeedCredentialConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SeedCredentialConfig")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("provider", &self.provider)
+            .field("kind", &self.kind)
+            .field("vault_ref", &self.vault_ref)
+            .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
+            .field("tenant", &self.tenant)
+            .finish_non_exhaustive()
+    }
 }
 
 // --- Scripting engine sandbox config (WOR-594 + WOR-595) ---
@@ -7547,7 +7609,7 @@ pub struct ObservabilityTelemetryConfig {
 }
 
 /// Configuration for a single alert notification channel.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AlertChannelConfig {
     /// Channel type: `"webhook"`, `"slack"`, `"pagerduty"`, or `"log"`.
@@ -7563,6 +7625,31 @@ pub struct AlertChannelConfig {
     /// `channel_type == "pagerduty"`). Accepts secret references.
     #[serde(default)]
     pub routing_key: Option<String>,
+}
+
+/// Redacted `Debug` (WOR-2606). Two carriers, and the second is the
+/// one that is easy to miss. `routing_key` is the PagerDuty integration
+/// key and its own field doc says it accepts secret references, so
+/// after resolution it holds the credential. `headers` is
+/// operator-authored and is where an `Authorization:` value goes when a
+/// channel needs one, which makes every value in it a possible
+/// credential; the *names* stay, because which headers are configured
+/// is the useful half of that map for a diagnostic.
+impl std::fmt::Debug for AlertChannelConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AlertChannelConfig")
+            .field("channel_type", &self.channel_type)
+            .field("url", &self.url)
+            .field(
+                "headers",
+                &self.headers.keys().map(String::as_str).collect::<Vec<_>>(),
+            )
+            .field(
+                "routing_key",
+                &self.routing_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 // --- HTTP/3 Config ---
@@ -8127,7 +8214,7 @@ pub enum CredentialPolicy {
 /// Schema-only mirror of the deferred outbound credential enum. Runtime
 /// parsing remains in `sbproxy-modules`; this keeps generated editor tooling
 /// precise without introducing a crate dependency cycle.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[allow(dead_code)]
 enum OutboundCredentialSchema {
@@ -8169,6 +8256,46 @@ enum OutboundCredentialSchema {
         #[serde(default)]
         dpop: Option<OutboundDpopSchema>,
     },
+}
+
+/// Redacted `Debug` (WOR-2606). The authored-config shim for the three
+/// outbound credential shapes that `sbproxy_modules` redacts at
+/// runtime. Crate-private, which narrows the blast radius but does not
+/// close it: a `{:?}` inside this crate prints the same values, and
+/// this is the side a config-load diagnostic formats.
+impl std::fmt::Debug for OutboundCredentialSchema {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TokenExchange {
+                token_endpoint,
+                audience,
+                client_id,
+                ..
+            } => f
+                .debug_struct("TokenExchange")
+                .field("token_endpoint", token_endpoint)
+                .field("audience", audience)
+                .field("client_id", client_id)
+                .field("client_secret", &"[REDACTED]")
+                .finish_non_exhaustive(),
+            Self::ClientCredentials {
+                token_endpoint,
+                client_id,
+                ..
+            } => f
+                .debug_struct("ClientCredentials")
+                .field("token_endpoint", token_endpoint)
+                .field("client_id", client_id)
+                .field("client_secret", &"[REDACTED]")
+                .finish_non_exhaustive(),
+            Self::VaultSecret { header, scheme, .. } => f
+                .debug_struct("VaultSecret")
+                .field("secret", &"[REDACTED]")
+                .field("header", header)
+                .field("scheme", scheme)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 fn default_outbound_act_depth() -> usize {
@@ -9654,7 +9781,7 @@ impl std::fmt::Debug for HashiCorpBackendAuth {
 }
 
 /// Authentication for an `aws` secret backend (WOR-1767).
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[serde(deny_unknown_fields)]
 pub enum AwsBackendAuth {
@@ -9681,6 +9808,49 @@ pub enum AwsBackendAuth {
         #[serde(default)]
         session_name: Option<String>,
     },
+}
+
+/// Redacted `Debug` (WOR-2606). The config-side twin of
+/// `sbproxy_vault::AwsAuth`, which has been redacted since the first
+/// half of WOR-2640 while this one kept the derive: the same secret
+/// access key and session token were protected at runtime and printed
+/// at config load, and the load-time diagnostic is the likelier of the
+/// two to reach a log.
+///
+/// The access key id, the role ARN, the external id and the session
+/// name all stay. None authenticates anything on its own and each is
+/// what tells one misconfigured backend from another. Presence rather
+/// than a flat marker for the session token, because whether one was
+/// supplied is what explains a 403.
+impl std::fmt::Debug for AwsBackendAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StaticKeys {
+                access_key_id,
+                session_token,
+                ..
+            } => f
+                .debug_struct("StaticKeys")
+                .field("access_key_id", access_key_id)
+                .field("secret_access_key", &"[REDACTED]")
+                .field(
+                    "session_token",
+                    &session_token.as_ref().map(|_| "[REDACTED]"),
+                )
+                .finish(),
+            Self::DefaultChain => f.write_str("DefaultChain"),
+            Self::AssumedRole {
+                role_arn,
+                external_id,
+                session_name,
+            } => f
+                .debug_struct("AssumedRole")
+                .field("role_arn", role_arn)
+                .field("external_id", external_id)
+                .field("session_name", session_name)
+                .finish(),
+        }
+    }
 }
 
 /// Authentication for a `gcp` secret backend (WOR-1767). Externally tagged
@@ -9791,7 +9961,7 @@ pub enum K8sBackendAuth {
 ///
 /// The OSS resolver consumes the `hashicorp` variant in
 /// [`SecretsConfig::backends`], not this compatibility block.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HashiCorpSecretsConfig {
     /// Vault server address (e.g. `"https://vault.example.com:8200"`).
@@ -9802,6 +9972,19 @@ pub struct HashiCorpSecretsConfig {
     /// KV secrets engine mount path. Defaults to `"secret"`.
     #[serde(default = "default_mount")]
     pub mount: String,
+}
+
+/// Redacted `Debug` (WOR-2606). A second Vault client token beside the
+/// `HashiCorpBackendAuth` already registered, in the legacy
+/// compatibility block. Same value, same reach, same rule.
+impl std::fmt::Debug for HashiCorpSecretsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HashiCorpSecretsConfig")
+            .field("addr", &self.addr)
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .field("mount", &self.mount)
+            .finish()
+    }
 }
 
 /// Secret-rotation behavior for credentials the proxy resolves from a
@@ -10279,7 +10462,7 @@ pub struct IdempotencyConfig {
     /// the lease still caches its response.
     ///
     /// Zero is refused at config-validate time rather than silently
-    /// normalised, because a zero lease expires the instant it is taken
+    /// normalized, because a zero lease expires the instant it is taken
     /// and would turn single-flight off without saying so.
     #[serde(default)]
     pub claim_lease_secs: Option<u64>,
@@ -12326,7 +12509,7 @@ fn default_signature_clock_skew_seconds() -> u64 {
 /// Operators who do not configure this block expose neither
 /// endpoint; requests to those paths fall through to the upstream
 /// proxy (or return 404 if no route matches).
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WebBotAuthPublishConfig {
     /// Whether the publish endpoints are enabled.
@@ -12365,11 +12548,35 @@ pub struct WebBotAuthPublishConfig {
     pub signing_key_hex: Option<String>,
 }
 
+/// Redacted `Debug` (WOR-2606). `signing_key_hex` is a 32-byte Ed25519
+/// *private* seed. Anything that reads it signs directory and agent
+/// card responses that every Web Bot Auth verifier will accept as this
+/// operator's, which is the whole trust loop the block exists to close.
+///
+/// The key id, the *public* key, the agent name and the directory URL
+/// all stay: they are published on purpose, and they are what names the
+/// deployment a diagnostic is about.
+impl std::fmt::Debug for WebBotAuthPublishConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebBotAuthPublishConfig")
+            .field("enabled", &self.enabled)
+            .field("key_id", &self.key_id)
+            .field("public_key_hex", &self.public_key_hex)
+            .field("agent_name", &self.agent_name)
+            .field("directory_url", &self.directory_url)
+            .field("description", &self.description)
+            .field("contact_url", &self.contact_url)
+            .field(
+                "signing_key_hex",
+                &self.signing_key_hex.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
 /// `/introspect` (RFC 7662) is deferred to a follow-up PR because
 /// it requires a revocation / nonce store.
-#[derive(
-    Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq, schemars::JsonSchema,
-)]
+#[derive(Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OlpConfig {
     /// Master toggle. When false the well-known endpoints 404.
@@ -12410,6 +12617,35 @@ pub struct OlpConfig {
     /// `/.well-known/olp/revoke` (RFC 7009) 404'd. Set to enable.
     #[serde(default)]
     pub introspect: Option<OlpIntrospectConfig>,
+}
+
+/// Redacted `Debug` (WOR-2606). Two seeds. `signing_key` is a
+/// hex-encoded 32-byte Ed25519 seed resolved from a secret store at
+/// config load, and every license token the proxy mints is signed with
+/// it: reading it mints tokens the verifier accepts. `content_key_seed`
+/// is the HKDF input every per-token AES-256-GCM content key is derived
+/// from, so reading it decrypts every EMS payload the deployment has
+/// ever issued a token for, past ones included.
+///
+/// The `kid`, the issuer, and the default scope all stay: they are
+/// advertised in the JWS header and the well-known document and they
+/// name the deployment a load error is about. Curated and
+/// `finish_non_exhaustive`, so a key-shaped field added to this block
+/// later is absent rather than printed.
+impl std::fmt::Debug for OlpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OlpConfig")
+            .field("enabled", &self.enabled)
+            .field("signing_key", &"[REDACTED]")
+            .field("key_id", &self.key_id)
+            .field("issuer", &self.issuer)
+            .field("default_scope", &self.default_scope)
+            .field(
+                "content_key_seed",
+                &self.content_key_seed.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 /// WOR-808 PR9: RFC 7662 OAuth Token Introspection + RFC 7009 Token
@@ -13823,6 +14059,218 @@ mod decision_audit_scope_tests {
         assert!(
             !format!("{toolkit:?}").contains(SENTINEL),
             "the toolkit shared secret reached Debug: {toolkit:?}"
+        );
+    }
+
+    /// WOR-2606: the config-side twins the first sweep did not reach.
+    ///
+    /// Each of these was derived while the value it carries was already
+    /// protected somewhere else, or is a signing key whose only reader
+    /// is a config-load diagnostic. The rule is the one the first sweep
+    /// used: the credential goes, the identifier that names what failed
+    /// stays.
+    #[test]
+    fn debug_never_renders_a_remaining_config_side_credential() {
+        const SENTINEL: &str = "SENTINEL-TWIN-3b7e";
+
+        // The HMAC key a webhook receiver verifies. Reading it forges an
+        // event feed the operator's downstream trusts.
+        let events = EventsConfig {
+            sink: EventSinkKind::Webhook,
+            url: Some("https://siem.example.test/ingest".to_string()),
+            signing_secret: Some(SENTINEL.to_string()),
+            fail_closed: vec!["auth.denied".to_string()],
+            ..EventsConfig::default()
+        };
+        let rendered = format!("{events:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the event webhook signing secret reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("siem.example.test"),
+            "the destination must survive: it names which sink failed: {rendered}"
+        );
+
+        // The plaintext inbound key an operator seeds. Whoever reads it
+        // authenticates as this key for as long as it exists.
+        let seed_key: SeedKeyConfig = serde_json::from_value(serde_json::json!({
+            "key_id": "sb-key-1",
+            "secret": SENTINEL,
+            "secret_hash": "sha256:abcdef",
+            "name": "billing service",
+        }))
+        .expect("seed key fixture parses");
+        let rendered = format!("{seed_key:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the seeded inbound key reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("sb-key-1") && rendered.contains("sha256:abcdef"),
+            "the key id and the precomputed hash must survive: the hash is what \
+             says which seeded key a load error is about, and a hash is not its \
+             own preimage: {rendered}"
+        );
+
+        let seed_credential = SeedCredentialConfig {
+            id: "cred-1".to_string(),
+            name: Some("openai prod".to_string()),
+            provider: Some("openai".to_string()),
+            kind: Some("api_key".to_string()),
+            vault_ref: Some("vault:kv/openai#key".to_string()),
+            secret: Some(SENTINEL.to_string()),
+            tenant: Some("acme".to_string()),
+        };
+        let rendered = format!("{seed_credential:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the seeded upstream credential reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("vault:kv/openai#key") && rendered.contains("acme"),
+            "the vault reference and tenant must survive: a reference names where \
+             the real value comes from and is not one: {rendered}"
+        );
+
+        // Two carriers, and the second is the one that is easy to miss.
+        // `headers` is where an `Authorization:` value goes.
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), SENTINEL.to_string());
+        let channel = AlertChannelConfig {
+            channel_type: "pagerduty".to_string(),
+            url: Some("https://events.pagerduty.com/v2/enqueue".to_string()),
+            headers,
+            routing_key: Some(SENTINEL.to_string()),
+        };
+        let rendered = format!("{channel:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "an alert channel credential reached Debug through routing_key or \
+             headers: {rendered}"
+        );
+        assert!(
+            rendered.contains("Authorization") && rendered.contains("pagerduty"),
+            "the header names and the channel type must survive: which headers are \
+             configured is the useful half of that map: {rendered}"
+        );
+
+        // The authored-config shim for the three outbound credential
+        // shapes `sbproxy_modules` redacts at runtime.
+        for shim in [
+            OutboundCredentialSchema::TokenExchange {
+                token_endpoint: "https://idp.example.test/token".to_string(),
+                audience: "https://api.example.test".to_string(),
+                scope: None,
+                subject_token_issuers: Vec::new(),
+                allowed_audiences: Vec::new(),
+                act_depth_cap: 4,
+                client_id: Some("client-1".to_string()),
+                client_secret: Some(SENTINEL.to_string()),
+                dpop: None,
+            },
+            OutboundCredentialSchema::ClientCredentials {
+                token_endpoint: "https://idp.example.test/token".to_string(),
+                client_id: "client-1".to_string(),
+                client_secret: SENTINEL.to_string(),
+                scope: None,
+                audience: None,
+                dpop: None,
+            },
+            OutboundCredentialSchema::VaultSecret {
+                secret: SENTINEL.to_string(),
+                header: "authorization".to_string(),
+                scheme: "Bearer".to_string(),
+                dpop: None,
+            },
+        ] {
+            assert!(
+                !format!("{shim:?}").contains(SENTINEL),
+                "an outbound credential shim reached Debug: {shim:?}"
+            );
+        }
+
+        // The twin of `sbproxy_vault::AwsAuth`, protected since the
+        // first half of WOR-2640 while this one kept the derive.
+        let aws = AwsBackendAuth::StaticKeys {
+            access_key_id: "AKIAEXAMPLE".to_string(),
+            secret_access_key: SENTINEL.to_string(),
+            session_token: Some(SENTINEL.to_string()),
+        };
+        let rendered = format!("{aws:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the AWS secret key or session token reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("AKIAEXAMPLE"),
+            "the access key id must survive: it authenticates nothing alone and \
+             tells one misconfigured backend from another: {rendered}"
+        );
+        assert!(
+            format!("{:?}", AwsBackendAuth::DefaultChain).contains("DefaultChain"),
+            "the credential-free variant must still name itself"
+        );
+
+        // A second Vault client token, in the legacy compatibility block.
+        let hashicorp = HashiCorpSecretsConfig {
+            addr: "https://vault.example.test:8200".to_string(),
+            token: Some(SENTINEL.to_string()),
+            mount: "secret".to_string(),
+        };
+        let rendered = format!("{hashicorp:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the legacy Vault token reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("vault.example.test:8200"),
+            "the Vault address must survive: {rendered}"
+        );
+
+        // A 32-byte Ed25519 private seed. Reading it signs directory and
+        // agent card responses every verifier accepts as this operator's.
+        let publish = WebBotAuthPublishConfig {
+            enabled: true,
+            key_id: "kid-1".to_string(),
+            public_key_hex: "aa".repeat(32),
+            agent_name: "acme-agent".to_string(),
+            directory_url: "https://acme.example.test/.well-known".to_string(),
+            description: None,
+            contact_url: None,
+            signing_key_hex: Some(SENTINEL.to_string()),
+        };
+        let rendered = format!("{publish:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the Web Bot Auth signing seed reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("kid-1") && rendered.contains(&"aa".repeat(32)),
+            "the key id and the public key must survive: both are published on \
+             purpose and they name the deployment: {rendered}"
+        );
+
+        // Two seeds in one block. The signing key mints tokens; the
+        // content-key seed derives every EMS payload key ever issued.
+        let olp: OlpConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "signing_key": SENTINEL,
+            "key_id": "olp-kid-1",
+            "issuer": "https://api.example.test",
+            "content_key_seed": SENTINEL,
+        }))
+        .expect("olp fixture parses");
+        let rendered = format!("{olp:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "an OLP seed reached Debug through signing_key or content_key_seed: \
+             {rendered}"
+        );
+        assert!(
+            rendered.contains("olp-kid-1") && rendered.contains("api.example.test"),
+            "the kid and issuer must survive: both are advertised in the JWS \
+             header and the well-known document: {rendered}"
         );
     }
 }

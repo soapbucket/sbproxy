@@ -185,7 +185,7 @@ pub enum RagDistanceMetric {
 }
 
 /// Embedding provider used to vectorize the retrieval query.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Clone, Deserialize, JsonSchema)]
 #[serde(tag = "provider", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RagEmbeddingConfig {
     /// OpenAI embeddings API.
@@ -282,8 +282,70 @@ pub enum RagEmbeddingConfig {
     },
 }
 
+/// Redacted `Debug` (WOR-2606). Every variant holds the credential the
+/// embedder presents upstream, billed to the operator's account, and
+/// `Vertex`'s `access_token` is a live OAuth bearer rather than a
+/// long-lived key. An embedding call that fails is what formats this.
+///
+/// The base URL, the model, and the dimensionality all stay: they are
+/// what tells one misconfigured embedder from another and none is a
+/// credential.
+impl std::fmt::Debug for RagEmbeddingConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Openai {
+                base_url, model, ..
+            } => f
+                .debug_struct("Openai")
+                .field("api_key", &"[REDACTED]")
+                .field("base_url", base_url)
+                .field("model", model)
+                .finish_non_exhaustive(),
+            Self::Compatible {
+                base_url,
+                model,
+                api_key,
+                auth_header,
+                ..
+            } => f
+                .debug_struct("Compatible")
+                .field("base_url", base_url)
+                .field("model", model)
+                .field("api_key", &api_key.as_ref().map(|_| "[REDACTED]"))
+                .field("auth_header", auth_header)
+                .finish_non_exhaustive(),
+            Self::Cohere {
+                base_url, model, ..
+            } => f
+                .debug_struct("Cohere")
+                .field("api_key", &"[REDACTED]")
+                .field("base_url", base_url)
+                .field("model", model)
+                .finish_non_exhaustive(),
+            Self::Bedrock { region, model, .. } => f
+                .debug_struct("Bedrock")
+                .field("api_key", &"[REDACTED]")
+                .field("region", region)
+                .field("model", model)
+                .finish_non_exhaustive(),
+            Self::Vertex {
+                project_id,
+                location,
+                model,
+                ..
+            } => f
+                .debug_struct("Vertex")
+                .field("access_token", &"[REDACTED]")
+                .field("project_id", project_id)
+                .field("location", location)
+                .field("model", model)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
 /// Vector store queried for tenant-scoped context.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Clone, Deserialize, JsonSchema)]
 #[serde(tag = "provider", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RagVectorStoreConfig {
     /// Chroma over its v2 HTTP API.
@@ -383,6 +445,80 @@ pub enum RagVectorStoreConfig {
         #[serde(default)]
         allow_private_url: bool,
     },
+}
+
+/// Redacted `Debug` (WOR-2606). Four API keys and one Redis ACL
+/// password, each of which reads and writes the vector store holding
+/// whatever the operator indexed. The endpoint, the collection and the
+/// username stay: they name which store a failed query went to.
+///
+/// The Redis arm's `url` goes through
+/// [`sbproxy_security::url_redact::redacted_url`] rather than printing
+/// verbatim. `redis://user:password@host` is the exact shape WOR-2640
+/// names, and this variant carries a separate `password` field: a
+/// redaction that covered the field and not the DSN beside it would be
+/// narrower than it reads.
+impl std::fmt::Debug for RagVectorStoreConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Chroma {
+                base_url,
+                database,
+                collection_id,
+                api_key,
+                ..
+            } => f
+                .debug_struct("Chroma")
+                .field("base_url", base_url)
+                .field("database", database)
+                .field("collection_id", collection_id)
+                .field("api_key", &api_key.as_ref().map(|_| "[REDACTED]"))
+                .finish_non_exhaustive(),
+            Self::Pinecone {
+                host, namespace, ..
+            } => f
+                .debug_struct("Pinecone")
+                .field("host", host)
+                .field("api_key", &"[REDACTED]")
+                .field("namespace", namespace)
+                .finish_non_exhaustive(),
+            Self::Qdrant {
+                base_url,
+                collection,
+                api_key,
+                ..
+            } => f
+                .debug_struct("Qdrant")
+                .field("base_url", base_url)
+                .field("collection", collection)
+                .field("api_key", &api_key.as_ref().map(|_| "[REDACTED]"))
+                .finish_non_exhaustive(),
+            Self::Redis {
+                url,
+                username,
+                password,
+                index,
+                ..
+            } => f
+                .debug_struct("Redis")
+                .field("url", &sbproxy_security::url_redact::redacted_url(url))
+                .field("username", username)
+                .field("password", &password.as_ref().map(|_| "[REDACTED]"))
+                .field("index", index)
+                .finish_non_exhaustive(),
+            Self::Weaviate {
+                base_url,
+                collection,
+                api_key,
+                ..
+            } => f
+                .debug_struct("Weaviate")
+                .field("base_url", base_url)
+                .field("collection", collection)
+                .field("api_key", &api_key.as_ref().map(|_| "[REDACTED]"))
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// Tenant and static metadata filters applied to every vector lookup.
@@ -1691,6 +1827,170 @@ mod tests {
                 max_age_secs: 120,
                 max_entries: 4,
             }
+        );
+    }
+
+    /// The retrieval credentials, pinned (WOR-2606).
+    ///
+    /// Both enums are parsed straight out of an `action:` block and
+    /// formatted by every construction-time diagnostic, so a derived
+    /// `Debug` printed the operator's embedding key and their vector
+    /// store's key in full.
+    #[test]
+    fn debug_never_renders_a_retrieval_credential() {
+        const SENTINEL: &str = "SENTINEL-RAG-4c71";
+
+        let openai = RagEmbeddingConfig::Openai {
+            api_key: SENTINEL.to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            model: "text-embedding-3-small".to_string(),
+            dimensions: None,
+            allow_private_url: false,
+        };
+        let rendered = format!("{openai:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the embedding API key reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("text-embedding-3-small"),
+            "the model must survive: it names which embedder failed: {rendered}"
+        );
+
+        let vertex = RagEmbeddingConfig::Vertex {
+            access_token: SENTINEL.to_string(),
+            project_id: "proj-1".to_string(),
+            location: "us-central1".to_string(),
+            model: "text-embedding-004".to_string(),
+            output_dimensionality: None,
+            endpoint_override: None,
+            allow_private_url: false,
+        };
+        let rendered = format!("{vertex:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the Vertex access token reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("proj-1"),
+            "the project id must survive: {rendered}"
+        );
+
+        let compatible = RagEmbeddingConfig::Compatible {
+            base_url: "http://127.0.0.1:8080/v1".to_string(),
+            model: "bge-small".to_string(),
+            api_key: Some(SENTINEL.to_string()),
+            dimensions: None,
+            auth_header: "authorization".to_string(),
+            auth_prefix: "Bearer ".to_string(),
+            allow_private_url: true,
+        };
+        assert!(
+            !format!("{compatible:?}").contains(SENTINEL),
+            "the compatible-endpoint key reached Debug: {compatible:?}"
+        );
+
+        let cohere = RagEmbeddingConfig::Cohere {
+            api_key: SENTINEL.to_string(),
+            base_url: "https://api.cohere.com".to_string(),
+            model: "embed-english-v3.0".to_string(),
+            output_dimension: None,
+            allow_private_url: false,
+        };
+        assert!(
+            !format!("{cohere:?}").contains(SENTINEL),
+            "the Cohere key reached Debug: {cohere:?}"
+        );
+
+        let bedrock = RagEmbeddingConfig::Bedrock {
+            api_key: SENTINEL.to_string(),
+            region: "us-east-1".to_string(),
+            model: "amazon.titan-embed-text-v2:0".to_string(),
+            dimensions: 1024,
+            endpoint_override: None,
+            allow_private_url: false,
+        };
+        let rendered = format!("{bedrock:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the Bedrock key reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("us-east-1"),
+            "the region must survive: {rendered}"
+        );
+
+        let pinecone = RagVectorStoreConfig::Pinecone {
+            host: "https://idx-1.svc.pinecone.io".to_string(),
+            api_key: SENTINEL.to_string(),
+            namespace: Some("tenant-a".to_string()),
+            content_field: "text".to_string(),
+            distance_metric: RagDistanceMetric::default(),
+            allow_private_url: false,
+        };
+        let rendered = format!("{pinecone:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the Pinecone key reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("tenant-a"),
+            "the namespace must survive: it scopes what was queried: {rendered}"
+        );
+
+        for store in [
+            RagVectorStoreConfig::Chroma {
+                base_url: "https://chroma.internal".to_string(),
+                database_tenant: "default_tenant".to_string(),
+                database: "default_database".to_string(),
+                collection_id: "col-1".to_string(),
+                api_key: Some(SENTINEL.to_string()),
+                distance_metric: RagDistanceMetric::default(),
+                allow_private_url: false,
+            },
+            RagVectorStoreConfig::Qdrant {
+                base_url: "https://qdrant.internal".to_string(),
+                collection: "col-1".to_string(),
+                api_key: Some(SENTINEL.to_string()),
+                content_field: "text".to_string(),
+                distance_metric: RagDistanceMetric::default(),
+                allow_private_url: false,
+            },
+            RagVectorStoreConfig::Weaviate {
+                base_url: "https://weaviate.internal".to_string(),
+                collection: "Col".to_string(),
+                api_key: Some(SENTINEL.to_string()),
+                content_field: "text".to_string(),
+                distance_metric: RagDistanceMetric::default(),
+                allow_private_url: false,
+            },
+        ] {
+            assert!(
+                !format!("{store:?}").contains(SENTINEL),
+                "a vector store key reached Debug: {store:?}"
+            );
+        }
+
+        // The DSN half. `password` is redacted as a field and the same
+        // value is also legal inside `url`, so both have to go.
+        let redis = RagVectorStoreConfig::Redis {
+            url: format!("redis://acl-user:{SENTINEL}@vectors.internal:6379/0"),
+            username: Some("acl-user".to_string()),
+            password: Some(SENTINEL.to_string()),
+            index: "idx".to_string(),
+            vector_field: "embedding".to_string(),
+            content_field: "text".to_string(),
+            distance_metric: RagDistanceMetric::default(),
+            allow_private_url: false,
+        };
+        let rendered = format!("{redis:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the Redis ACL password reached Debug through the field or the DSN: {rendered}"
+        );
+        assert!(
+            rendered.contains("vectors.internal:6379") && rendered.contains("acl-user"),
+            "the host and the ACL username must survive: they name the store: {rendered}"
         );
     }
 }

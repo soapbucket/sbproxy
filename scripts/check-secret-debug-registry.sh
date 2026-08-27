@@ -36,14 +36,36 @@
 #
 # # What this cannot see
 #
-# A *new* secret-bearing type that never gets a line. Nothing derives
-# the list from the code, because "this field holds a credential" is a
-# judgment about meaning rather than a pattern: `Challenge.token` and
-# `max_tokens` and `tokens_per_minute` all match every field-name
-# heuristic worth writing, and a guard whose output is mostly false
-# positives stops being read. Adding the line is part of adding the
-# type, the same way adding a metric means adding it to the metric
-# registry.
+# Three things, stated in full because a guard trusted past its detector
+# is worse than no guard.
+#
+# 1. A *new* secret-bearing type that never gets a line. Nothing derives
+#    the list from the code, because "this field holds a credential" is
+#    a judgment about meaning rather than a pattern: `Challenge.token`
+#    and `max_tokens` and `tokens_per_minute` all match every field-name
+#    heuristic worth writing, and a guard whose output is mostly false
+#    positives stops being read. Adding the line is part of adding the
+#    type, the same way adding a metric means adding it to the metric
+#    registry.
+#
+# 2. Whether the impl still *redacts*. Rule 2 checks that an
+#    `impl std::fmt::Debug` exists, not what it prints. An impl edited
+#    to add `.field("api_key", &self.api_key)` passes here and is caught
+#    only by the pinning test, which is why rule 3 exists and why the
+#    test has to assert the sentinel is absent rather than assert the
+#    type name.
+#
+# 3. Whether the pinning test still asserts anything. Rule 3 checks that
+#    a function with that name exists. A test emptied to `{}` passes
+#    here. Two tests in `auth/mod.rs` had exactly that shape, asserting
+#    only the variant name, and had to be repaired by hand in the round
+#    that added this script.
+#
+# Rules 1 through 3 do compose against the realistic single-line
+# regression, because a derived and a hand-written `Debug` cannot
+# coexist: putting the derive back means deleting the impl, and either
+# half alone goes red. They do not compose against an impl edited to
+# print more.
 #
 # # Usage
 #
@@ -61,12 +83,43 @@ REGISTRY="$ROOT_DIR/scripts/secret-debug-registry.txt"
 # above the declaration, walking back over doc comments and other
 # attributes, so a `#[derive(Debug)]` on an unrelated item earlier in
 # the file is not read as this type's.
+#
+# Two shapes the first version of this missed, both of them ordinary
+# rather than adversarial (WOR-2606). rustfmt wraps a derive list that
+# does not fit in one line, and every line after the first looked to the
+# old scanner like an ordinary line, which reset the block; so the
+# accumulator now follows the attribute's parentheses across lines. And
+# an ordinary `//` comment between the derive and the declaration reset
+# it the same way a doc comment did not, so both kinds of comment are
+# now skipped rather than only `///`.
 derives_debug() {
   local file="$1" type="$2"
   awk -v want="$type" '
+    function paren_delta(s,   i, c, n) {
+      n = 0
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (c == "(") { n++ } else if (c == ")") { n-- }
+      }
+      return n
+    }
+    # Continuation of an attribute whose parentheses have not closed.
+    depth > 0 {
+      block = block "\n" $0
+      depth += paren_delta($0)
+      if (depth < 0) { depth = 0 }
+      next
+    }
     # Remember the most recent contiguous attribute/doc block.
-    /^[[:space:]]*#\[/ { block = block "\n" $0; next }
-    /^[[:space:]]*\/\/\// { next }
+    /^[[:space:]]*#\[/ {
+      block = block "\n" $0
+      depth += paren_delta($0)
+      if (depth < 0) { depth = 0 }
+      next
+    }
+    # A comment of either kind sits between an attribute and the item it
+    # applies to without separating them.
+    /^[[:space:]]*\/\// { next }
     /^[[:space:]]*$/ { block = ""; next }
     {
       if ($0 ~ ("^(pub(\\([^)]*\\))? )?(struct|enum|union) " want "([ <({]|$)")) {
@@ -255,8 +308,53 @@ EOF
     >"$scratch/registry.txt"
   expect "a trailing Debug in the derive is refused" 1 run_check "$scratch" "$scratch/registry.txt"
 
+  # rustfmt wraps a derive list that does not fit on one line, and the
+  # `Debug` then sits on a line of its own.
+  cat >"$scratch/crates/demo/src/derived_wrapped.rs" <<'EOF'
+#[derive(
+    Clone, Deserialize, Serialize, PartialEq, Eq, Debug, schemars::JsonSchema,
+)]
+#[serde(deny_unknown_fields)]
+pub struct Creds {
+    pub secret: String,
+}
+
+impl std::fmt::Debug for Creds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Creds").finish()
+    }
+}
+
+fn debug_never_renders_the_secret() {}
+EOF
+  printf 'crates/demo/src/derived_wrapped.rs | Creds | debug_never_renders_the_secret\n' \
+    >"$scratch/registry.txt"
+  expect "a rustfmt-wrapped derive is refused" 1 run_check "$scratch" "$scratch/registry.txt"
+
+  # An ordinary `//` comment between the derive and the declaration does
+  # not separate them, and must not hide the derive.
+  cat >"$scratch/crates/demo/src/derived_commented.rs" <<'EOF'
+#[derive(Debug, Clone)]
+// Kept for the admin JSON dump; see WOR-0000.
+pub struct Creds {
+    pub secret: String,
+}
+
+impl std::fmt::Debug for Creds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Creds").finish()
+    }
+}
+
+fn debug_never_renders_the_secret() {}
+EOF
+  printf 'crates/demo/src/derived_commented.rs | Creds | debug_never_renders_the_secret\n' \
+    >"$scratch/registry.txt"
+  expect "a comment between the derive and the item does not hide it" 1 \
+    run_check "$scratch" "$scratch/registry.txt"
+
   # A `Debug` derive on an unrelated earlier item is not this type's.
-  cat >"$scratch/crates/demo/src/neighbour.rs" <<'EOF'
+  cat >"$scratch/crates/demo/src/neighboring.rs" <<'EOF'
 #[derive(Debug, Clone)]
 pub struct Unrelated {
     pub label: String,
@@ -275,9 +373,9 @@ impl std::fmt::Debug for Creds {
 
 fn debug_never_renders_the_secret() {}
 EOF
-  printf 'crates/demo/src/neighbour.rs | Creds | debug_never_renders_the_secret\n' \
+  printf 'crates/demo/src/neighboring.rs | Creds | debug_never_renders_the_secret\n' \
     >"$scratch/registry.txt"
-  expect "a neighbour's derive is not attributed" 0 run_check "$scratch" "$scratch/registry.txt"
+  expect "a neighboring derive is not attributed" 0 run_check "$scratch" "$scratch/registry.txt"
 
   # 2. The impl is deleted.
   cat >"$scratch/crates/demo/src/noimpl.rs" <<'EOF'
@@ -344,7 +442,7 @@ EOF
     echo "self-test failed: the detector is narrower than the enforcer" >&2
     return 1
   fi
-  echo "self-test passed: 10 fixtures"
+  echo "self-test passed: 12 fixtures"
   return 0
 }
 
