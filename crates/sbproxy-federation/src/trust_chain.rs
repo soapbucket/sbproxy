@@ -126,15 +126,22 @@ pub struct ResolvedTrustChain {
 }
 
 impl ResolvedTrustChain {
-    /// The leaf statement (always present; a chain with zero
-    /// statements would have been rejected during resolution).
-    pub fn leaf(&self) -> &EntityStatement {
-        &self.statements[0]
+    /// The leaf statement, or `None` for an empty chain.
+    ///
+    /// [`TrustChainResolver::resolve`] never returns an empty chain, so
+    /// a caller that only ever handles resolved chains can treat the
+    /// `None` as dead. It is still an `Option` because `statements` is
+    /// a public field: a `ResolvedTrustChain` built by hand, or one
+    /// deserialized from a peer, can be empty, and answering that with
+    /// a panic would let a caller's own mistake take the process down.
+    pub fn leaf(&self) -> Option<&EntityStatement> {
+        self.statements.first()
     }
 
-    /// The anchor statement (always present).
-    pub fn anchor(&self) -> &EntityStatement {
-        self.statements.last().expect("non-empty chain")
+    /// The anchor statement, or `None` for an empty chain. Same
+    /// reasoning as [`Self::leaf`].
+    pub fn anchor(&self) -> Option<&EntityStatement> {
+        self.statements.last()
     }
 
     /// Convenience iterator over the metadata-policy claims along
@@ -517,8 +524,22 @@ mod tests {
         let resolved = resolver.resolve(&chain).expect("resolve");
         assert_eq!(resolved.statements.len(), 3);
         assert_eq!(resolved.trust_anchor_id, "https://anchor.example");
-        assert_eq!(resolved.leaf().claims.iss, "https://leaf.example");
-        assert_eq!(resolved.anchor().claims.iss, "https://anchor.example");
+        assert_eq!(
+            resolved
+                .leaf()
+                .expect("resolved chain has a leaf")
+                .claims
+                .iss,
+            "https://leaf.example"
+        );
+        assert_eq!(
+            resolved
+                .anchor()
+                .expect("resolved chain has an anchor")
+                .claims
+                .iss,
+            "https://anchor.example"
+        );
     }
 
     /// Empty chain is a config error, surfaces as the typed variant
