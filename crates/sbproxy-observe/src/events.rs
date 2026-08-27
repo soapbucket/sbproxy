@@ -1177,6 +1177,23 @@ mod tests {
             (AiToolkitEventOutcome::Internal, "internal"),
         ];
         for (outcome, expected) in outcomes {
+            // Exhaustive on purpose. The list above is hand written, so a
+            // new variant would otherwise ship with nothing pinning its
+            // wire label; this arm stops compiling instead.
+            let wire = match outcome {
+                AiToolkitEventOutcome::Success => "success",
+                AiToolkitEventOutcome::Invalid => "invalid",
+                AiToolkitEventOutcome::Unauthorized => "unauthorized",
+                AiToolkitEventOutcome::NotFound => "not_found",
+                AiToolkitEventOutcome::EgressRefused => "egress_refused",
+                AiToolkitEventOutcome::Timeout => "timeout",
+                AiToolkitEventOutcome::BodyTooLarge => "body_too_large",
+                AiToolkitEventOutcome::ResponseTooLarge => "response_too_large",
+                AiToolkitEventOutcome::Busy => "busy",
+                AiToolkitEventOutcome::AgentFailed => "agent_failed",
+                AiToolkitEventOutcome::Internal => "internal",
+            };
+            assert_eq!(wire, expected);
             assert_eq!(outcome.as_str(), expected);
             assert_eq!(serde_json::to_value(outcome).expect("serialize"), expected);
         }
