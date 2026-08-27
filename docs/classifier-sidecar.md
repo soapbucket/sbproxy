@@ -355,10 +355,26 @@ Running connections and every deadline must be at least one; the inference
 queue alone may be zero. `--tcp-frame-timeout-ms` must be at least
 `--tcp-io-timeout-ms`, and `--tcp-connection-timeout-ms` at least
 `--tcp-frame-timeout-ms`. The TCP connection limit applies independently to
-the public and optional admin listeners, while both listeners share the same
-16 MiB in-flight frame-byte budget. Each frame remains capped at 4 MiB, and
-the process acquires its share of the aggregate budget before allocating the
-caller-declared body. A client that exhausts that budget is disconnected.
+the public and optional admin listeners.
+
+The two listeners draw on one 16 MiB in-flight frame-byte budget, but not
+symmetrically. The public listener may hold at most 12 MiB of it at once; the
+remaining 4 MiB, one full-size frame, is reserved for the admin listener and
+the public listener can never take it. Admin frames draw on the whole budget,
+so a quiet public listener costs the admin path nothing.
+
+The reserve exists because the public listener needs no credential. Without
+it, four unauthenticated sockets that each declare a 4 MiB frame pin the
+entire budget, and every admin `register`, `delete`, and `list` frame is
+refused with an exhausted-budget close. The whole-frame deadline above bounds
+any one such hold, but not the lockout: a client that reconnects the moment
+its frame expires takes the budget straight back, so the operator stays locked
+out for all but a sliver of each cycle. The reserve is what keeps the registry
+reachable.
+
+Each frame remains capped at 4 MiB, and the process acquires its share of the
+budget before allocating the caller-declared body. A client that exhausts the
+share available to it is disconnected.
 
 The three deadlines nest, and they nest for a reason. `--tcp-io-timeout-ms`
 bounds one `read()`, `--tcp-frame-timeout-ms` bounds the length prefix plus
@@ -394,6 +410,8 @@ Other rich-sidecar refusal limits are fixed:
 | TCP text in one `classify`, `quality_score`, `intent_detect`, or `content_type_detect` frame | 1 MiB |
 | TCP `streaming_safety` frame | 1 MiB of token text, 64 rules, 64 KiB aggregate rule text |
 | TCP MessagePack frame | 4 MiB per frame; 16 MiB in flight process-wide |
+| TCP in-flight frame bytes, public listener | 12 MiB, the process budget less the admin reserve |
+| TCP in-flight frame bytes, admin reserve | 4 MiB, one full-size frame, never available to the public listener |
 | Normalization output | 4 MiB after every rule has run |
 | Tenant id | 128 bytes, `[A-Za-z0-9._-]` only |
 | Tenant registry | 64 tenants |

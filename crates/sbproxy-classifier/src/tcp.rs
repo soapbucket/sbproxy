@@ -40,6 +40,21 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_IN_FLIGHT_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
+/// Bytes of the in-flight frame budget the public listener may never take.
+///
+/// One full-size admin frame. The public listener needs no credential at all,
+/// so without a reserve four unauthenticated sockets can declare 4 MiB each
+/// and pin the whole budget; every admin `register`, `delete`, and `list`
+/// frame then fails admission and the operator is locked out of the registry.
+/// A whole-frame deadline bounds one such hold, but a client that reconnects
+/// the moment its frame expires takes the budget straight back, so the
+/// lockout survives the deadline. This does not.
+const ADMIN_FRAME_RESERVE_BYTES: usize = MAX_FRAME_BYTES;
+
+/// The most the public listener may hold at once. Admin frames draw on the
+/// full budget, so a quiet public listener costs the admin path nothing.
+const PUBLIC_IN_FLIGHT_FRAME_BYTES: usize = MAX_IN_FLIGHT_FRAME_BYTES - ADMIN_FRAME_RESERVE_BYTES;
+
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct FrameAllocationProbe {
@@ -143,9 +158,16 @@ enum BudgetedFrameError {
     BudgetExhausted,
 }
 
+/// The permits one resident frame holds: always one against the process-wide
+/// budget, and for a public frame one against the public sub-cap as well.
+struct FramePermits {
+    _total: tokio::sync::OwnedSemaphorePermit,
+    _public: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
 struct BudgetedFrame {
     bytes: Vec<u8>,
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    _permits: FramePermits,
     #[cfg(test)]
     _observation: Option<FrameAllocationObservation>,
 }
@@ -153,12 +175,21 @@ struct BudgetedFrame {
 impl BudgetedFrame {
     #[cfg(test)]
     fn try_new(
-        budget: Arc<tokio::sync::Semaphore>,
+        budget: &FrameBudget,
+        mode: TransportMode,
         bytes: usize,
         #[cfg(test)] allocation_probe: Option<&Arc<FrameAllocationProbe>>,
     ) -> Result<Self, BudgetedFrameError> {
         let permits = u32::try_from(bytes).map_err(|_| BudgetedFrameError::LengthOverflow)?;
-        let permit = budget
+        let public = match mode {
+            TransportMode::Public => Some(
+                Arc::clone(&budget.public)
+                    .try_acquire_many_owned(permits)
+                    .map_err(|_| BudgetedFrameError::BudgetExhausted)?,
+            ),
+            TransportMode::Admin => None,
+        };
+        let total = Arc::clone(&budget.total)
             .try_acquire_many_owned(permits)
             .map_err(|_| BudgetedFrameError::BudgetExhausted)?;
         let payload = vec![0u8; bytes];
@@ -166,7 +197,10 @@ impl BudgetedFrame {
         let observation = allocation_probe.map(|probe| probe.observe(bytes));
         Ok(Self {
             bytes: payload,
-            _permit: permit,
+            _permits: FramePermits {
+                _total: total,
+                _public: public,
+            },
             #[cfg(test)]
             _observation: observation,
         })
@@ -248,12 +282,61 @@ impl TcpLimits {
         if self.connection_timeout < self.frame_timeout {
             anyhow::bail!("TCP connection_timeout must be at least frame_timeout");
         }
+        FrameBudget::validate()?;
         Ok(())
     }
 }
 
-pub(crate) fn frame_budget() -> Arc<tokio::sync::Semaphore> {
-    Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_FRAME_BYTES))
+/// The process-wide in-flight frame budget, plus the sub-cap that keeps the
+/// public listener out of the admin reserve.
+///
+/// Two semaphores rather than one because the two questions are different:
+/// `total` is how many payload bytes may be resident at once, and `public` is
+/// how much of that an unauthenticated caller may account for. A public frame
+/// takes a permit from both; an admin frame takes one from `total` only, so it
+/// can still be admitted while the public cap is fully drawn.
+#[derive(Clone)]
+pub(crate) struct FrameBudget {
+    total: Arc<tokio::sync::Semaphore>,
+    public: Arc<tokio::sync::Semaphore>,
+}
+
+impl FrameBudget {
+    /// Refuse a reserve that cannot do its job before anything binds.
+    ///
+    /// A reserve below one maximum frame guarantees nothing (the one admin
+    /// frame it exists to admit would not fit), and a reserve at or above the
+    /// whole budget leaves the public listener nothing at all. Both are
+    /// arithmetic on constants today, but the check is the thing that has to
+    /// stay true if either number is ever tuned.
+    fn validate() -> anyhow::Result<()> {
+        if ADMIN_FRAME_RESERVE_BYTES < MAX_FRAME_BYTES {
+            anyhow::bail!(
+                "TCP admin frame reserve must be at least one maximum frame ({MAX_FRAME_BYTES} bytes)"
+            );
+        }
+        if ADMIN_FRAME_RESERVE_BYTES >= MAX_IN_FLIGHT_FRAME_BYTES {
+            anyhow::bail!(
+                "TCP admin frame reserve must leave the public listener part of the {MAX_IN_FLIGHT_FRAME_BYTES}-byte budget"
+            );
+        }
+        if PUBLIC_IN_FLIGHT_FRAME_BYTES < MAX_FRAME_BYTES {
+            anyhow::bail!(
+                "TCP public frame budget must admit at least one maximum frame ({MAX_FRAME_BYTES} bytes)"
+            );
+        }
+        if u32::try_from(MAX_IN_FLIGHT_FRAME_BYTES).is_err() {
+            anyhow::bail!("TCP in-flight frame budget must fit a semaphore permit count");
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn frame_budget() -> FrameBudget {
+    FrameBudget {
+        total: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_FRAME_BYTES)),
+        public: Arc::new(tokio::sync::Semaphore::new(PUBLIC_IN_FLIGHT_FRAME_BYTES)),
+    }
 }
 
 impl Default for TcpLimits {
@@ -325,7 +408,7 @@ async fn serve_on(
     mode: TransportMode,
     auth: Option<Arc<AdminAuth>>,
     limits: TcpLimits,
-    frame_budget: Arc<tokio::sync::Semaphore>,
+    frame_budget: FrameBudget,
     #[cfg(test)] allocation_probe: Option<Arc<FrameAllocationProbe>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     limits.validate()?;
@@ -356,7 +439,7 @@ async fn serve_on(
 
         let registry = Arc::clone(&registry);
         let auth = auth.clone();
-        let frame_budget = Arc::clone(&frame_budget);
+        let frame_budget = frame_budget.clone();
         #[cfg(test)]
         let allocation_probe = allocation_probe.clone();
         tokio::spawn(async move {
@@ -386,7 +469,7 @@ async fn handle_connection(
     mode: TransportMode,
     auth: Option<&AdminAuth>,
     limits: TcpLimits,
-    frame_budget: Arc<tokio::sync::Semaphore>,
+    frame_budget: FrameBudget,
     #[cfg(test)] allocation_probe: Option<Arc<FrameAllocationProbe>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut len_buf = [0u8; 4];
@@ -414,7 +497,8 @@ async fn handle_connection(
             probe.observe_declared_frame();
         }
         let mut payload = match BudgetedFrame::try_new(
-            Arc::clone(&frame_budget),
+            &frame_budget,
+            mode,
             msg_len,
             #[cfg(test)]
             allocation_probe.as_ref(),
@@ -830,39 +914,66 @@ fn handle_content_type_detect(
     )?)
 }
 
-#[repr(transparent)]
-struct FrameAllocationLease(tokio::sync::OwnedSemaphorePermit);
+struct FrameAllocationLease {
+    total: tokio::sync::OwnedSemaphorePermit,
+    public: Option<tokio::sync::OwnedSemaphorePermit>,
+}
 
 impl FrameAllocationLease {
+    /// Take the budget for one declared frame, or refuse.
+    ///
+    /// A public frame must fit under both the public sub-cap and the
+    /// process-wide budget; an admin frame only has to fit the latter, which
+    /// is what lets `register` / `delete` / `list` proceed while the public
+    /// listener holds everything it is allowed to. The sub-cap is taken first
+    /// so a public frame that fails the process-wide check returns it on the
+    /// early exit rather than parking it until the connection ends.
     pub fn try_acquire(
-        budget: Arc<tokio::sync::Semaphore>,
+        budget: &FrameBudget,
+        mode: TransportMode,
         bytes: usize,
     ) -> Result<Self, BudgetedFrameError> {
         let permits = u32::try_from(bytes).map_err(|_| BudgetedFrameError::LengthOverflow)?;
-        let permit = Arc::clone(&budget)
+        let public = match mode {
+            TransportMode::Public => Some(
+                Arc::clone(&budget.public)
+                    .try_acquire_many_owned(permits)
+                    .map_err(|_| BudgetedFrameError::BudgetExhausted)?,
+            ),
+            TransportMode::Admin => None,
+        };
+        let total = Arc::clone(&budget.total)
             .try_acquire_many_owned(permits)
             .map_err(|_| BudgetedFrameError::BudgetExhausted)?;
         #[cfg(test)]
-        frame_probe_enter_live_lease(permit.num_permits(), &budget);
-        Ok(Self(permit))
+        frame_probe_enter_live_lease(total.num_permits(), &budget.total);
+        Ok(Self { total, public })
     }
 
     fn bytes(&self) -> usize {
-        self.0.num_permits()
+        self.total.num_permits()
     }
 
-    fn into_permit(self) -> tokio::sync::OwnedSemaphorePermit {
+    fn into_permits(self) -> FramePermits {
         #[cfg(test)]
         {
             let lease = std::mem::ManuallyDrop::new(self);
             frame_probe_exit_live_lease(lease.bytes());
-            // SAFETY: `lease` is not dropped after this read, so the permit
+            // SAFETY: `lease` is not dropped after these reads, so each permit
             // is moved out exactly once.
-            unsafe { std::ptr::read(&lease.0) }
+            unsafe {
+                FramePermits {
+                    _total: std::ptr::read(&lease.total),
+                    _public: std::ptr::read(&lease.public),
+                }
+            }
         }
         #[cfg(not(test))]
         {
-            self.0
+            FramePermits {
+                _total: self.total,
+                _public: self.public,
+            }
         }
     }
 }
@@ -891,7 +1002,7 @@ impl BudgetedFrame {
         let observation = allocation_probe.map(|probe| probe.observe(bytes));
         Self {
             bytes: payload,
-            _permit: lease.into_permit(),
+            _permits: lease.into_permits(),
             #[cfg(test)]
             _observation: observation,
         }
@@ -1602,7 +1713,7 @@ struct TcpListenerAssembly {
     auth: Option<Arc<AdminAuth>>,
     limits: TcpLimits,
     public_work_limits: Option<PublicWorkLimits>,
-    frame_budget: Arc<tokio::sync::Semaphore>,
+    frame_budget: FrameBudget,
     shutdown: Arc<TcpListenerCleanupProbe>,
     #[cfg(test)]
     controls: Arc<TcpTestControl>,
@@ -1815,7 +1926,7 @@ impl TcpListenerAssembly {
                         #[cfg(test)]
                         controls.connection_started(TransportMode::Public);
                         let registry = Arc::clone(&self.registry);
-                        let frame_budget = Arc::clone(&self.frame_budget);
+                        let frame_budget = self.frame_budget.clone();
                         #[cfg(test)]
                         let probe = self.allocation_probe.clone();
                         #[cfg(test)]
@@ -1894,7 +2005,7 @@ impl TcpListenerAssembly {
                         #[cfg(test)]
                         controls.connection_started(TransportMode::Admin);
                         let registry = Arc::clone(&self.registry);
-                        let frame_budget = Arc::clone(&self.frame_budget);
+                        let frame_budget = self.frame_budget.clone();
                         #[cfg(test)]
                         let probe = self.allocation_probe.clone();
                         #[cfg(test)]
@@ -2261,7 +2372,7 @@ struct ListenerResources<'a> {
     registry: &'a Registry,
     auth: Option<&'a AdminAuth>,
     limits: TcpLimits,
-    frame_budget: Arc<tokio::sync::Semaphore>,
+    frame_budget: FrameBudget,
     public_executor: Option<Arc<crate::admission::BlockingWorkExecutor>>,
     shutdown: Option<Arc<TcpListenerCleanupProbe>>,
 }
@@ -2393,7 +2504,7 @@ async fn handle_production_connection(
         if let Some(probe) = &allocation_probe {
             probe.observe_declared_frame();
         }
-        let lease = match FrameAllocationLease::try_acquire(Arc::clone(&frame_budget), msg_len) {
+        let lease = match FrameAllocationLease::try_acquire(&frame_budget, mode, msg_len) {
             Ok(lease) => lease,
             Err(BudgetedFrameError::LengthOverflow | BudgetedFrameError::BudgetExhausted) => {
                 crate::metrics::begin_outcome(
@@ -3741,6 +3852,136 @@ mod tests {
         assert_eq!(registry.tenant_count(), 0);
     }
 
+    /// A saturated public listener cannot lock the operator out of the
+    /// registry.
+    ///
+    /// The public listener needs no credential, so four unauthenticated
+    /// sockets declaring 4 MiB each used to pin the whole shared 16 MiB
+    /// budget, and every admin `register` / `delete` / `list` frame was then
+    /// refused with `BudgetExhausted` and the connection closed with no
+    /// response at all. The whole-frame deadline bounds one such hold but not
+    /// the lockout: a client that reconnects the moment its frame expires
+    /// takes the budget straight back, so the operator stays locked out for
+    /// all but a sliver of each cycle. The reserve is what actually fixes it,
+    /// and the second round below is that reconnect cycle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_saturated_public_listener_cannot_starve_the_admin_frame_reserve() {
+        // The public share, plus the one frame that used to reach past it into
+        // the reserve. Pre-reserve all four take a lease and the budget is
+        // gone; with the reserve the fourth is refused and 4 MiB stays free
+        // for the admin listener.
+        const PUBLIC_SLOTS: usize = PUBLIC_IN_FLIGHT_FRAME_BYTES / MAX_FRAME_BYTES;
+
+        let registry = Arc::new(Registry::new_empty());
+        let auth = Arc::new(
+            AdminAuth::from_json(br#"{"tokens":[{"token":"secret","tenants":["*"]}]}"#).unwrap(),
+        );
+        let probe = FrameAllocationProbe::acquire_unique().await;
+        let pair = spawn_production_listener_pair(
+            registry,
+            auth,
+            TcpLimits {
+                max_connections: DEFAULT_MAX_CONNECTIONS,
+                // Long enough that nothing here expires on its own: the point
+                // is what the reserve guarantees while the holds are live.
+                io_timeout: Duration::from_secs(60),
+                frame_timeout: Duration::from_secs(120),
+                connection_timeout: Duration::from_secs(240),
+            },
+            Arc::new(TcpTestControl::default()),
+            Some(Arc::clone(&probe)),
+        )
+        .await;
+
+        // Header-only 4 MiB frames: each takes its lease and then never sends
+        // a body, which is the cheapest way to pin the budget.
+        async fn pin_public_budget(
+            address: std::net::SocketAddr,
+            sockets: usize,
+            round: &'static str,
+        ) -> Vec<TcpStream> {
+            let mut held = Vec::with_capacity(sockets);
+            for _ in 0..sockets {
+                let mut stream = bounded_tcp_connect(address, round).await;
+                tokio::time::timeout(
+                    Duration::from_secs(3),
+                    stream.write_all(&(MAX_FRAME_BYTES as u32).to_be_bytes()),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("{round}: pinning header write is bounded"))
+                .unwrap();
+                held.push(stream);
+            }
+            held
+        }
+
+        let mut config = msg("register");
+        config.tenant = Some("tenant-reserve.example".to_string());
+        config.admin_token = Some("secret".to_string());
+        config.config = Some(sample_tenant_config());
+        let mut list = msg("list");
+        list.admin_token = Some("secret".to_string());
+
+        for round in ["first round", "reconnect round"] {
+            let held = pin_public_budget(pair.public_address, PUBLIC_SLOTS + 1, round).await;
+            // Only that the public leases are resident, deliberately not that
+            // they stopped at the share: without the reserve they run to the
+            // whole budget, and the admin exchange below is what has to fail
+            // in that case, not this wait.
+            probe
+                .wait_for_live_bytes(Duration::from_secs(3), |live| {
+                    live >= PUBLIC_IN_FLIGHT_FRAME_BYTES
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{round}: the public share becomes resident: {error}")
+                });
+
+            // With the public share fully drawn, both admin commands still
+            // complete. This is the assertion one shared budget could not
+            // make: without the reserve these frames were refused and the
+            // connection closed with no response at all.
+            let mut register_stream = bounded_tcp_connect(pair.admin_address, round).await;
+            let registered: AdminResponse =
+                rmp_serde::from_slice(&wire_exchange(&mut register_stream, &config).await)
+                    .unwrap_or_else(|error| {
+                        panic!("{round}: register must answer while public is saturated: {error}")
+                    });
+            assert!(registered.ok, "{round}: register must succeed");
+
+            let mut list_stream = bounded_tcp_connect(pair.admin_address, round).await;
+            let listed: AdminResponse =
+                rmp_serde::from_slice(&wire_exchange(&mut list_stream, &list).await)
+                    .unwrap_or_else(|error| {
+                        panic!("{round}: list must answer while public is saturated: {error}")
+                    });
+            assert!(listed.ok, "{round}: list must succeed");
+            assert_eq!(
+                listed.tenants.map(|tenants| tenants.len()),
+                Some(1),
+                "{round}: list must return the registered tenant"
+            );
+
+            assert_eq!(
+                probe.live_bytes(),
+                PUBLIC_IN_FLIGHT_FRAME_BYTES,
+                "{round}: the public listener may hold its share and no more, so the admin reserve is still whole"
+            );
+
+            drop(register_stream);
+            drop(list_stream);
+            // Dropping the holders is the client hanging up and reconnecting,
+            // which is exactly what defeats a deadline-only fix.
+            drop(held);
+            probe
+                .wait_for_live_bytes(Duration::from_secs(3), |live| live == 0)
+                .await
+                .unwrap_or_else(|error| panic!("{round}: holders release their leases: {error}"));
+        }
+
+        pair.stop().await;
+    }
+
     #[tokio::test]
     async fn public_and_admin_listeners_share_one_sixteen_mib_frame_owner_and_recover() {
         use crate::metrics::{
@@ -3753,10 +3994,12 @@ mod tests {
         // consumed by value at the only Vec allocation boundary and retained
         // by BudgetedFrame.  Moving `vec![0; bytes]` before either function
         // cannot satisfy these signatures or the allocator-boundary probe.
-        type FrameLeaseFactory = fn(
-            Arc<tokio::sync::Semaphore>,
-            usize,
-        ) -> Result<FrameAllocationLease, BudgetedFrameError>;
+        type FrameLeaseFactory =
+            for<'budget> fn(
+                &'budget FrameBudget,
+                TransportMode,
+                usize,
+            ) -> Result<FrameAllocationLease, BudgetedFrameError>;
         type BudgetedFrameAllocator =
             fn(FrameAllocationLease, Option<&Arc<FrameAllocationProbe>>) -> BudgetedFrame;
         let _frame_lease_factory: FrameLeaseFactory = FrameAllocationLease::try_acquire;
@@ -3765,8 +4008,9 @@ mod tests {
         let _ = <FrameAllocationLease as AmbiguousIfFrameLeaseDefault<_>>::assert_not_default;
         assert_eq!(
             std::mem::size_of::<FrameAllocationLease>(),
-            std::mem::size_of::<tokio::sync::OwnedSemaphorePermit>(),
-            "an admission lease cannot hide a Vec, Box, or other payload owner"
+            std::mem::size_of::<tokio::sync::OwnedSemaphorePermit>()
+                + std::mem::size_of::<Option<tokio::sync::OwnedSemaphorePermit>>(),
+            "an admission lease holds its two budget permits and cannot hide a Vec, Box, or other payload owner"
         );
         assert_eq!(
             std::mem::align_of::<FrameAllocationLease>(),
@@ -6480,7 +6724,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_listener_caps_simultaneous_header_only_max_frames_at_16_mib() {
+    async fn public_listener_caps_simultaneous_header_only_max_frames_at_its_reserved_share() {
         let limits = TcpLimits {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             io_timeout: Duration::from_secs(5),
@@ -6505,11 +6749,14 @@ mod tests {
             Some(Arc::clone(&allocation_probe)),
         ));
 
-        // Four maximum frames consume the proposed 16 MiB process budget.
-        // A fifth header must be refused before its 4 MiB body allocation,
-        // even though all five connections fit under the connection ceiling.
+        // The public listener's share is the process budget minus the admin
+        // reserve, so three maximum frames fill it. Every further header must
+        // be refused before its 4 MiB body allocation, even though all the
+        // connections fit under the connection ceiling, and the reserve stays
+        // untouched for the admin listener.
+        const PUBLIC_SLOTS: usize = PUBLIC_IN_FLIGHT_FRAME_BYTES / MAX_FRAME_BYTES;
         let mut clients = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..PUBLIC_SLOTS + 2 {
             let mut client =
                 tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(address))
                     .await
@@ -6539,17 +6786,22 @@ mod tests {
         server.abort();
         let _ = server.await;
         assert_eq!(
-            declared_frames, 5,
-            "all five maximum frame headers must reach the public framing boundary"
+            declared_frames,
+            PUBLIC_SLOTS + 2,
+            "every maximum frame header must reach the public framing boundary"
         );
         assert_eq!(
-            allocations, 4,
-            "only the four leased frames may call the payload allocator"
+            allocations, PUBLIC_SLOTS,
+            "only the leased frames may call the payload allocator"
         );
         assert_eq!(
-            peak_bytes,
-            16 * 1024 * 1024,
-            "the allocator-coupled observation must stay behind the aggregate lease"
+            peak_bytes, PUBLIC_IN_FLIGHT_FRAME_BYTES,
+            "the public listener may never allocate into the admin reserve"
+        );
+        assert_eq!(
+            PUBLIC_IN_FLIGHT_FRAME_BYTES + ADMIN_FRAME_RESERVE_BYTES,
+            MAX_IN_FLIGHT_FRAME_BYTES,
+            "the public share and the reserve must account for the whole budget"
         );
     }
 
