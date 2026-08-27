@@ -6422,7 +6422,80 @@
           "additionalProperties": false
         },
         {
-          "description": "Catch-all for backends registered out-of-tree (e.g. an `s3` backend). The in-tree pipeline ignores these with a warning; an out-of-tree startup hook intercepts the variant before the warning fires.",
+          "description": "WOR-2673: object storage. One variant covers S3, Google Cloud Storage, Azure Blob Storage, and a local directory, because they all reach the proxy through the same `object_store` trait. The field names are the `storage` action's, so an operator who has configured that already knows this.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "object_store"
+              ]
+            },
+            "backend": {
+              "description": "`s3`, `gcs`, `azure`, or `local`.",
+              "default": "s3",
+              "type": "string"
+            },
+            "bucket": {
+              "description": "Bucket name, or the container name on Azure. Required for every backend but `local`.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "description": "Root directory for the `local` backend. Required there and refused elsewhere.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "region": {
+              "description": "Region, for `s3`. Falls back to the provider's own environment discovery (`AWS_REGION`) when omitted.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "endpoint": {
+              "description": "Endpoint override, for `s3`. Set this for MinIO, Cloudflare R2, Backblaze B2, or any other S3-compatible store.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "prefix": {
+              "description": "Key prefix inside the bucket. Defaults to `sbproxy/reserve/`, so the reserve can share a bucket without colliding with anything else in it.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "encryption": {
+              "description": "Optional at-rest sealing, applied before an entry leaves the process. Absent or `enabled: false` writes payloads as the cache produced them.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CacheReserveEncryptionConfig"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Catch-all for backends registered out-of-tree. The in-tree pipeline ignores these with a warning; an out-of-tree startup hook intercepts the variant before the warning fires.",
           "type": "object",
           "required": [
             "type"
@@ -6438,6 +6511,34 @@
           "additionalProperties": false
         }
       ]
+    },
+    "CacheReserveEncryptionConfig": {
+      "description": "At-rest sealing for the object-storage cache reserve (WOR-2673).\n\nThe same reference syntax, the same rotation shape, and the same no-plaintext-fallback rule as [`ResponseCacheEncryptionConfig`]: a key that is missing, unresolvable, or shorter than 16 bytes aborts startup rather than being used verbatim or silently skipped.\n\nDerived under its own HKDF purpose, so pointing this and the response cache at one operator secret still yields two unrelated keys.\n\nThis is deliberately not a cloud KMS integration. A KMS call to unwrap a data key would put a network round trip on the read path of a tier whose purpose is to be cheaper than the origin, and would make a reachable KMS a hard requirement for reading the cache at all. Bucket-level SSE-KMS is configured on the bucket and composes with this setting rather than competing with it.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Master switch. Defaults to `false`.",
+          "default": false,
+          "type": "boolean"
+        },
+        "key": {
+          "description": "Secret reference for the active key, used to seal new entries and to open entries sealed under it. Required when `enabled` is `true`.\n\nResolved like every other config secret: a provider URI (`secret://backend/name`, `vault://...`), a `file:/path` reference, or a whole-value `${ENV_VAR}`. The resolved value should be 32 random bytes (base64 or hex encoded), not a passphrase.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "previous_keys": {
+          "description": "Retired keys, used only to open entries sealed before a rotation. Same reference syntax as [`Self::key`].\n\nTo rotate: move the current `key` into this list and name the new one as `key`. Entries reseal under the active key as they are rewritten; entries whose key leaves this list stop opening and are treated as misses.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
     },
     "ResponseCacheStoreConfig": {
       "description": "Top-level selection of the response cache's backing store.\n\nThe response cache is process-wide: `CompiledPipeline` builds one store and every origin whose `response_cache.enabled` is true shares it. Origins do not collide because the cache key already includes workspace, hostname, method, path, canonical query, and the Vary fingerprint.\n\nYAML key: `proxy.response_cache_store`.",

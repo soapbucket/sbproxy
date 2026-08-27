@@ -1994,6 +1994,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_cache_reserve_errors_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_cache_reserve_error"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &["origin", "operation"],
+        description: "Cache Reserve operations the backend refused, by operation; the reserve is best-effort, so this is the only signal a failing cold tier gives.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_cache_reserve_hits_total",
         kind: MetricKind::Counter,
         writer: Writer::Field("cache_reserve_hits"),

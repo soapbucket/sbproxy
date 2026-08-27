@@ -1,0 +1,4 @@
+{
+  "type": "added",
+  "message": "Cache Reserve gains an object-storage backend: S3, Google Cloud Storage, Azure Blob, or a local directory, with optional AES-256-GCM sealing before an entry leaves the process. A new `sbproxy_cache_reserve_errors_total` counter makes a failing cold tier visible, since every reserve error is swallowed on the request path by design."
+}

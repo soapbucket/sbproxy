@@ -386,12 +386,29 @@ const cacheReserve = computed(() => {
     ["writes", "sbproxy_cache_reserve_writes_total"],
     ["evictions", "sbproxy_cache_reserve_evictions_total"],
   ] as const;
-  return items
+  const rows: { key: string; value: number; color?: string }[] = items
     .map(([key, name]) => {
       const f = findFamily(families.value, name);
-      return { key, value: f ? sumSamples(f) : 0 };
+      return { key: key as string, value: f ? sumSamples(f) : 0 };
     })
     .filter((item) => item.value > 0);
+  /* WOR-2673: reserve errors are swallowed on the request path by
+   * design, so the request is served either way and this card is where
+   * a failing cold tier becomes visible at all. Broken out by
+   * operation, because a failing `put` against a healthy `get` is
+   * usually expired write credentials rather than an unreachable
+   * store. */
+  for (const row of groupByLabel(
+    findFamily(families.value, "sbproxy_cache_reserve_errors_total"),
+    "operation",
+  )) {
+    rows.push({
+      key: `errors / ${row.key}`,
+      value: row.value,
+      color: "var(--sb-err)",
+    });
+  }
+  return rows;
 });
 
 // Token throughput (avg tok/s) per model, the standard local-model

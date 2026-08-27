@@ -4525,6 +4525,10 @@ pub(super) async fn request_filter(
                                     .inc();
                             }
                             Err(e) => {
+                                sbproxy_observe::metrics::record_cache_reserve_error(
+                                    invalidate_origin.as_str(),
+                                    "delete",
+                                );
                                 tracing::warn!(
                                     error = %e,
                                     "cache reserve delete failed on mutation"
@@ -4967,6 +4971,16 @@ pub(super) async fn request_filter(
                                         .inc();
                                 }
                                 Err(e) => {
+                                    // WOR-2673: counted as well as
+                                    // logged. The request proceeds
+                                    // either way, so without a counter
+                                    // a reserve failing every read
+                                    // reads as a cold cache rather than
+                                    // as a broken tier.
+                                    sbproxy_observe::metrics::record_cache_reserve_error(
+                                        lookup_origin.as_str(),
+                                        "get",
+                                    );
                                     warn!(
                                         error = %e,
                                         "cache reserve lookup failed; bypassing reserve"

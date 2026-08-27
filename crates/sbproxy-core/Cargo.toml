@@ -158,6 +158,10 @@ sbproxy-billing = { workspace = true, optional = true }
 # for serve: providers) as a process-global built at dispatch time.
 sbproxy-model-host.workspace = true
 sbproxy-cache.workspace = true
+# WOR-2673: builds the object-storage cache-reserve client from config.
+# Already in this crate's dependency graph through sbproxy-modules' storage
+# action, so naming it here adds no new external crate.
+object_store = { workspace = true }
 sbproxy-platform.workspace = true
 sbproxy-openapi.workspace = true
 sbproxy-security.workspace = true

@@ -805,6 +805,7 @@ impl ReserveAdmission {
 /// rather than failing the whole config load.
 fn build_cache_reserve(
     cfg: &Option<sbproxy_config::CacheReserveConfig>,
+    validating: bool,
 ) -> (
     Option<Arc<dyn CacheReserveBackend>>,
     Option<ReserveAdmission>,
@@ -844,6 +845,37 @@ fn build_cache_reserve(
                 None
             }
         },
+        // WOR-2673: object storage. `sbproxy validate` stops at the
+        // shape: building the provider client reads credentials from the
+        // environment and resolving a sealing key reads files and dials
+        // secret backends, neither of which validation does.
+        sbproxy_config::CacheReserveBackendConfig::ObjectStore {
+            backend,
+            bucket,
+            path,
+            region,
+            endpoint,
+            prefix,
+            encryption,
+        } => {
+            if validating {
+                None
+            } else {
+                match build_object_store_reserve(
+                    backend, bucket, path, region, endpoint, prefix, encryption,
+                ) {
+                    Ok(reserve) => Some(Arc::new(reserve)),
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            backend = %backend,
+                            "cache_reserve object-store backend init failed; reserve disabled"
+                        );
+                        None
+                    }
+                }
+            }
+        }
         sbproxy_config::CacheReserveBackendConfig::Other => {
             tracing::warn!(
                 "cache_reserve backend type is unknown; a pipeline lifecycle hook may attach an implementation"
@@ -856,6 +888,140 @@ fn build_cache_reserve(
     } else {
         (None, None)
     }
+}
+
+/// Build the object-storage cache reserve from its config block
+/// (WOR-2673).
+///
+/// The provider clients come from `object_store`'s own `from_env`
+/// builders, the same credential discovery the `storage` action uses, so
+/// an operator configures `AWS_*`, `GOOGLE_*`, or `AZURE_*` once and
+/// both surfaces pick it up. A missing bucket, a `path` on a cloud
+/// backend, or an unresolvable sealing key is an error rather than a
+/// silently degraded reserve: an operator who asked for encryption and
+/// did not get it would be writing cache entries in the clear to a
+/// bucket, believing otherwise.
+#[allow(clippy::too_many_arguments)]
+fn build_object_store_reserve(
+    backend: &str,
+    bucket: &Option<String>,
+    path: &Option<String>,
+    region: &Option<String>,
+    endpoint: &Option<String>,
+    prefix: &Option<String>,
+    encryption: &Option<sbproxy_config::CacheReserveEncryptionConfig>,
+) -> anyhow::Result<sbproxy_cache::ObjectStoreReserve> {
+    use anyhow::Context as _;
+
+    let store: Arc<dyn object_store::ObjectStore> = match backend {
+        "local" => {
+            let path = path.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("cache_reserve local backend requires a 'path' field")
+            })?;
+            std::fs::create_dir_all(path)
+                .with_context(|| format!("create cache_reserve path '{path}'"))?;
+            let root = std::fs::canonicalize(path)
+                .with_context(|| format!("canonicalize cache_reserve path '{path}'"))?;
+            Arc::new(object_store::local::LocalFileSystem::new_with_prefix(
+                &root,
+            )?)
+        }
+        "s3" => {
+            let bucket = bucket.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("cache_reserve s3 backend requires a 'bucket' field")
+            })?;
+            let mut builder =
+                object_store::aws::AmazonS3Builder::from_env().with_bucket_name(bucket);
+            if let Some(region) = region.as_deref() {
+                builder = builder.with_region(region);
+            }
+            if let Some(endpoint) = endpoint.as_deref() {
+                builder = builder.with_endpoint(endpoint);
+            }
+            Arc::new(builder.build()?)
+        }
+        "gcs" => {
+            let bucket = bucket.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("cache_reserve gcs backend requires a 'bucket' field")
+            })?;
+            Arc::new(
+                object_store::gcp::GoogleCloudStorageBuilder::from_env()
+                    .with_bucket_name(bucket)
+                    .build()?,
+            )
+        }
+        "azure" => {
+            let container = bucket.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cache_reserve azure backend requires a 'bucket' field (the container name)"
+                )
+            })?;
+            Arc::new(
+                object_store::azure::MicrosoftAzureBuilder::from_env()
+                    .with_container_name(container)
+                    .build()?,
+            )
+        }
+        other => anyhow::bail!(
+            "unsupported cache_reserve object-store backend '{other}'; expected one of \
+             s3, gcs, azure, local"
+        ),
+    };
+
+    let keys = match encryption.as_ref().filter(|enc| enc.enabled) {
+        None => None,
+        Some(enc) => {
+            let reference = enc.key.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cache_reserve.backend.encryption.enabled is true but no `key` is set; \
+                     name the secret that seals reserve entries"
+                )
+            })?;
+            let active =
+                resolve_at_rest_key_material(reference, "cache_reserve.backend.encryption")
+                    .context("cache_reserve.backend.encryption.key")?;
+            let mut retired = Vec::with_capacity(enc.previous_keys.len());
+            for (index, reference) in enc.previous_keys.iter().enumerate() {
+                retired.push(
+                    resolve_at_rest_key_material(reference, "cache_reserve.backend.encryption")
+                        .with_context(|| {
+                            format!("cache_reserve.backend.encryption.previous_keys[{index}]")
+                        })?,
+                );
+            }
+            Some(Arc::new(reserve_key_ring(active, retired)?))
+        }
+    };
+
+    Ok(sbproxy_cache::ObjectStoreReserve::new(
+        store,
+        backend,
+        prefix
+            .clone()
+            .unwrap_or_else(|| sbproxy_config::DEFAULT_RESERVE_OBJECT_PREFIX.to_string()),
+        keys,
+    ))
+}
+
+/// Build the reserve's key ring from resolved material.
+///
+/// Its own function rather than `sbproxy_cache::cache_key_ring` because
+/// the two surfaces use different seal schemes on purpose: a
+/// response-cache record must not open as a reserve record even when
+/// both derive from one operator secret.
+fn reserve_key_ring(
+    active: Vec<u8>,
+    previous: Vec<Vec<u8>>,
+) -> anyhow::Result<sbproxy_security::sealed_record::SealKeyRing> {
+    use sbproxy_security::sealed_record::{SealKey, SealKeyRing};
+
+    let scheme = sbproxy_cache::reserve::SBCR_SCHEME;
+    let active = SealKey::new(scheme, active)?;
+    let previous = previous
+        .into_iter()
+        .map(|material| SealKey::new(scheme, material))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    SealKeyRing::new(scheme, active, previous)
 }
 
 /// Resolve an at-rest encryption key reference to raw key material.
@@ -2833,8 +2999,10 @@ impl CompiledPipeline {
         // unknown or extension-provided backends drop through to `None` with a
         // warning so a pipeline lifecycle hook can swap in its own
         // implementation post-compile.
-        let (cache_reserve, cache_reserve_admission) =
-            build_cache_reserve(&config.server.cache_reserve);
+        let (cache_reserve, cache_reserve_admission) = build_cache_reserve(
+            &config.server.cache_reserve,
+            matches!(mode, PipelineConstructionMode::Validation),
+        );
 
         // Pre-parse trusted_proxies CIDRs once at compile time so the
         // request path can do a constant-time membership check. An
@@ -4685,6 +4853,159 @@ origins:
         let message = error.to_string();
         assert!(message.contains("fallback"), "{message}");
         assert!(message.contains("mcp"), "{message}");
+    }
+}
+
+/// WOR-2673: the object-storage cache reserve, tested at the seam that
+/// turns config into a backend.
+///
+/// `ObjectStoreReserve`'s own behavior is covered in `sbproxy-cache`
+/// against an in-memory object store. What can only be checked here is
+/// the wiring: that a `type: object_store` block actually produces a
+/// backend, that `sbproxy validate` does not build one, and that a block
+/// asking for encryption without a key refuses rather than quietly
+/// writing entries in the clear.
+#[cfg(test)]
+mod object_store_reserve_tests {
+    use super::*;
+
+    fn reserve_config(
+        backend: sbproxy_config::CacheReserveBackendConfig,
+    ) -> Option<sbproxy_config::CacheReserveConfig> {
+        Some(sbproxy_config::CacheReserveConfig {
+            enabled: true,
+            backend: Some(backend),
+            ..Default::default()
+        })
+    }
+
+    fn local_backend(
+        path: &std::path::Path,
+        encryption: Option<sbproxy_config::CacheReserveEncryptionConfig>,
+    ) -> sbproxy_config::CacheReserveBackendConfig {
+        sbproxy_config::CacheReserveBackendConfig::ObjectStore {
+            backend: "local".to_string(),
+            bucket: None,
+            path: Some(path.display().to_string()),
+            region: None,
+            endpoint: None,
+            prefix: Some("sbproxy/reserve/".to_string()),
+            encryption,
+        }
+    }
+
+    #[test]
+    fn a_local_object_store_block_builds_a_backend() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (reserve, admission) =
+            build_cache_reserve(&reserve_config(local_backend(dir.path(), None)), false);
+        assert!(
+            reserve.is_some(),
+            "a type: object_store block must produce a reserve backend"
+        );
+        assert!(admission.is_some());
+    }
+
+    #[test]
+    fn validation_does_not_build_the_backend() {
+        // Building reads credentials from the environment and resolving
+        // a sealing key reads files and dials secret backends. `sbproxy
+        // validate` does neither, so it stops at the shape.
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (reserve, admission) =
+            build_cache_reserve(&reserve_config(local_backend(dir.path(), None)), true);
+        assert!(reserve.is_none());
+        assert!(admission.is_none());
+    }
+
+    #[test]
+    fn encryption_without_a_key_disables_the_reserve_rather_than_writing_plaintext() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let encryption = sbproxy_config::CacheReserveEncryptionConfig {
+            enabled: true,
+            key: None,
+            previous_keys: Vec::new(),
+        };
+        let (reserve, _) = build_cache_reserve(
+            &reserve_config(local_backend(dir.path(), Some(encryption))),
+            false,
+        );
+        assert!(
+            reserve.is_none(),
+            "an operator who asked for encryption and gave no key must not get an \
+             unencrypted reserve"
+        );
+    }
+
+    #[test]
+    fn a_resolvable_key_produces_a_sealing_reserve() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let key_file = dir.path().join("reserve.key");
+        std::fs::write(&key_file, "0123456789abcdef0123456789abcdef").expect("write key");
+        let encryption = sbproxy_config::CacheReserveEncryptionConfig {
+            enabled: true,
+            key: Some(format!("file:{}", key_file.display())),
+            previous_keys: Vec::new(),
+        };
+        let (reserve, _) = build_cache_reserve(
+            &reserve_config(local_backend(dir.path(), Some(encryption))),
+            false,
+        );
+        assert!(reserve.is_some(), "a resolvable key must build the reserve");
+    }
+
+    #[test]
+    fn a_cloud_backend_without_a_bucket_disables_the_reserve() {
+        let backend = sbproxy_config::CacheReserveBackendConfig::ObjectStore {
+            backend: "s3".to_string(),
+            bucket: None,
+            path: None,
+            region: Some("us-east-1".to_string()),
+            endpoint: None,
+            prefix: None,
+            encryption: None,
+        };
+        let (reserve, _) = build_cache_reserve(&reserve_config(backend), false);
+        assert!(reserve.is_none());
+    }
+
+    #[test]
+    fn an_unknown_object_store_backend_disables_the_reserve() {
+        let backend = sbproxy_config::CacheReserveBackendConfig::ObjectStore {
+            backend: "ceph-direct".to_string(),
+            bucket: Some("b".to_string()),
+            path: None,
+            region: None,
+            endpoint: None,
+            prefix: None,
+            encryption: None,
+        };
+        let (reserve, _) = build_cache_reserve(&reserve_config(backend), false);
+        assert!(reserve.is_none());
+    }
+
+    /// The two surfaces may be pointed at one operator secret, and the
+    /// separation that keeps one from opening the other's records is the
+    /// HKDF purpose plus the envelope magic. Both are checked here
+    /// because a copy-paste of the response cache's scheme would compile
+    /// and pass every other test in this file.
+    #[test]
+    fn the_reserve_seals_under_its_own_scheme() {
+        let reserve_scheme = sbproxy_cache::reserve::SBCR_SCHEME;
+        let response_scheme = sbproxy_cache::store::SBRC_SCHEME;
+        assert_ne!(reserve_scheme.magic(), response_scheme.magic());
+
+        let material = vec![3u8; 32];
+        let reserve_key =
+            sbproxy_security::sealed_record::SealKey::new(reserve_scheme, material.clone())
+                .expect("reserve key");
+        let response_key = sbproxy_security::sealed_record::SealKey::new(response_scheme, material)
+            .expect("response key");
+        assert_ne!(
+            reserve_key.fingerprint_hex(),
+            response_key.fingerprint_hex(),
+            "one operator secret must derive two unrelated keys"
+        );
     }
 }
 

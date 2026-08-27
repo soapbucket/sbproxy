@@ -212,6 +212,7 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_budget_share_unavailable` | Gauge | `stable` | `beta` | none | 1 while shared budget enforcement is degraded to per-instance tracking, 0 when the shared store answered. |
 | `sbproxy_bytes_total` | Counter | `stable` | `stable` | `origin`, `direction` | Bytes transferred. |
 | `sbproxy_cache_reserve_evictions_total` | Counter | `stable` | `stable` | `origin` | Cache Reserve explicit deletions. |
+| `sbproxy_cache_reserve_errors_total` | Counter | `stable` | `beta` | `origin`, `operation` | Cache Reserve operations the backend refused, by operation; the reserve is best-effort, so this is the only signal a failing cold tier gives. |
 | `sbproxy_cache_reserve_hits_total` | Counter | `stable` | `stable` | `origin` | Cache Reserve hits served after a hot-cache miss. |
 | `sbproxy_cache_reserve_misses_total` | Counter | `stable` | `stable` | `origin` | Cache Reserve misses (hot + reserve both empty). |
 | `sbproxy_cache_reserve_writes_total` | Counter | `stable` | `stable` | `origin` | Cache Reserve writes (admitted entries). |

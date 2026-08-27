@@ -5736,13 +5736,102 @@ pub enum CacheReserveBackendConfig {
         #[serde(default)]
         key_prefix: Option<String>,
     },
-    /// Catch-all for backends registered out-of-tree (e.g. an
-    /// `s3` backend). The in-tree pipeline ignores these with a
-    /// warning; an out-of-tree startup hook intercepts the variant
-    /// before the warning fires.
+    /// WOR-2673: object storage. One variant covers S3, Google Cloud
+    /// Storage, Azure Blob Storage, and a local directory, because they
+    /// all reach the proxy through the same `object_store` trait. The
+    /// field names are the `storage` action's, so an operator who has
+    /// configured that already knows this.
+    ObjectStore {
+        /// `s3`, `gcs`, `azure`, or `local`.
+        #[serde(default = "default_reserve_object_backend")]
+        backend: String,
+        /// Bucket name, or the container name on Azure. Required for
+        /// every backend but `local`.
+        #[serde(default)]
+        bucket: Option<String>,
+        /// Root directory for the `local` backend. Required there and
+        /// refused elsewhere.
+        #[serde(default)]
+        path: Option<String>,
+        /// Region, for `s3`. Falls back to the provider's own
+        /// environment discovery (`AWS_REGION`) when omitted.
+        #[serde(default)]
+        region: Option<String>,
+        /// Endpoint override, for `s3`. Set this for MinIO, Cloudflare
+        /// R2, Backblaze B2, or any other S3-compatible store.
+        #[serde(default)]
+        endpoint: Option<String>,
+        /// Key prefix inside the bucket. Defaults to
+        /// `sbproxy/reserve/`, so the reserve can share a bucket
+        /// without colliding with anything else in it.
+        #[serde(default)]
+        prefix: Option<String>,
+        /// Optional at-rest sealing, applied before an entry leaves the
+        /// process. Absent or `enabled: false` writes payloads as the
+        /// cache produced them.
+        #[serde(default)]
+        encryption: Option<CacheReserveEncryptionConfig>,
+    },
+    /// Catch-all for backends registered out-of-tree. The in-tree
+    /// pipeline ignores these with a warning; an out-of-tree startup
+    /// hook intercepts the variant before the warning fires.
     #[serde(other)]
     Other,
 }
+
+/// At-rest sealing for the object-storage cache reserve (WOR-2673).
+///
+/// The same reference syntax, the same rotation shape, and the same
+/// no-plaintext-fallback rule as
+/// [`ResponseCacheEncryptionConfig`]: a key that is missing,
+/// unresolvable, or shorter than 16 bytes aborts startup rather than
+/// being used verbatim or silently skipped.
+///
+/// Derived under its own HKDF purpose, so pointing this and the response
+/// cache at one operator secret still yields two unrelated keys.
+///
+/// This is deliberately not a cloud KMS integration. A KMS call to
+/// unwrap a data key would put a network round trip on the read path of
+/// a tier whose purpose is to be cheaper than the origin, and would make
+/// a reachable KMS a hard requirement for reading the cache at all.
+/// Bucket-level SSE-KMS is configured on the bucket and composes with
+/// this setting rather than competing with it.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CacheReserveEncryptionConfig {
+    /// Master switch. Defaults to `false`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Secret reference for the active key, used to seal new entries and
+    /// to open entries sealed under it. Required when `enabled` is
+    /// `true`.
+    ///
+    /// Resolved like every other config secret: a provider URI
+    /// (`secret://backend/name`, `vault://...`), a `file:/path`
+    /// reference, or a whole-value `${ENV_VAR}`. The resolved value
+    /// should be 32 random bytes (base64 or hex encoded), not a
+    /// passphrase.
+    #[serde(default)]
+    pub key: Option<String>,
+
+    /// Retired keys, used only to open entries sealed before a rotation.
+    /// Same reference syntax as [`Self::key`].
+    ///
+    /// To rotate: move the current `key` into this list and name the new
+    /// one as `key`. Entries reseal under the active key as they are
+    /// rewritten; entries whose key leaves this list stop opening and
+    /// are treated as misses.
+    #[serde(default)]
+    pub previous_keys: Vec<String>,
+}
+
+fn default_reserve_object_backend() -> String {
+    "s3".to_string()
+}
+
+/// Default key prefix for the object-storage reserve.
+pub const DEFAULT_RESERVE_OBJECT_PREFIX: &str = "sbproxy/reserve/";
 
 fn default_reserve_sample_rate() -> f64 {
     0.1

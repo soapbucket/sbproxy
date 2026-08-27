@@ -1,0 +1,112 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# Cache Reserve on object storage, sealed before it leaves the process.
+#
+# The same cold tier as examples/cache-reserve/, on a backend that
+# survives the replica rather than the restart. One config block covers
+# S3, Google Cloud Storage, Azure Blob, and a local directory; this
+# example uses `local` so it runs with nothing else installed, and the
+# README shows the two-line edit that points it at MinIO or at a real
+# bucket.
+#
+# `encryption` seals each entry with AES-256-GCM before it is written,
+# binding the cache key into the associated data, so an object copied to
+# another key fails to authenticate rather than being served as that
+# key's entry. It is not a KMS integration, on purpose: see
+# docs/cache-reserve.md.
+#
+# The example reuses examples/cache-reserve/fixture.py as its upstream,
+# and the same four-request walkthrough: fetch /a, fetch it again from
+# the hot tier, fetch /b to push /a out of the one-entry hot tier, then
+# fetch /a again and watch `x-sbproxy-cache: HIT-RESERVE` with an
+# unchanged `upstream_hits`.
+#
+# Run:
+#   rm -rf /tmp/sbproxy-reserve-objects
+#   export SBPROXY_RESERVE_KEY=$(head -c 32 /dev/urandom | base64)
+#   python3 examples/cache-reserve/fixture.py &
+#   make run CONFIG=examples/cache-reserve-object-store/sb.yml
+#
+# Test:
+#   # 1. Miss. No cache header, upstream_hits 1.
+#   curl -s -D - -H 'Host: cache.local' http://127.0.0.1:8080/a
+#
+#   # 2. Hot hit. x-sbproxy-cache: HIT, upstream_hits still 1.
+#   curl -s -D - -H 'Host: cache.local' http://127.0.0.1:8080/a
+#
+#   # 3. A second path evicts /a from the one-entry hot tier.
+#   curl -s -D - -H 'Host: cache.local' http://127.0.0.1:8080/b
+#
+#   # 4. Reserve hit, out of object storage. x-sbproxy-cache: HIT-RESERVE.
+#   curl -s -D - -H 'Host: cache.local' http://127.0.0.1:8080/a
+#
+#   # The objects on disk carry no plaintext:
+#   grep -rc upstream_hits /tmp/sbproxy-reserve-objects   # 0
+
+proxy:
+  http_bind_port: 8080
+
+  # Only because the demo upstream runs on this machine: the SSRF guard
+  # refuses private upstream addresses unless allowlisted. A production
+  # config pointing at a real origin does not need this block.
+  extensions:
+    upstream:
+      allow_private_cidrs:
+        - '127.0.0.1/32'
+
+  cache_reserve:
+    enabled: true
+
+    backend:
+      type: object_store
+      # `local` writes into a directory so this example runs with
+      # nothing installed. Change these two lines to
+      #   backend: s3
+      #   bucket: your-bucket
+      # and drop `path` to run against S3, MinIO, or R2. Credentials
+      # come from the provider's own environment discovery (AWS_*,
+      # GOOGLE_*, AZURE_*), the same as the `storage` action.
+      backend: local
+      path: /tmp/sbproxy-reserve-objects
+      # Prefix inside the bucket, so the reserve can share it with
+      # anything else you keep there. The eviction sweep only ever
+      # deletes objects it can recognize as its own.
+      prefix: sbproxy/reserve/
+
+      encryption:
+        enabled: true
+        # Should be 32 random bytes, base64 or hex encoded, not a
+        # passphrase. Takes the same reference forms as every other
+        # secret in the config: ${VAR}, env:, file:, vault://. A
+        # reference nothing can resolve aborts startup rather than
+        # becoming the key.
+        key: ${SBPROXY_RESERVE_KEY}
+        # To rotate: move the current key here and name the new one
+        # above. Entries reseal as they are rewritten; entries whose
+        # key leaves this list stop opening and are treated as misses.
+        previous_keys: []
+
+    # A paid object store charges per request, so a production reserve
+    # samples. This example mirrors every write so the walkthrough is
+    # four requests rather than forty.
+    sample_rate: 1.0
+    min_ttl: 1
+    max_size_bytes: 1048576
+
+origins:
+  "cache.local":
+    action:
+      type: proxy
+      # The example ships its own upstream:
+      #   python3 examples/cache-reserve/fixture.py
+      url: http://127.0.0.1:18090
+
+    response_cache:
+      enabled: true
+      ttl_secs: 3600
+      cacheable_status: [200]
+
+      # Entries, not bytes, and deliberately absurd: one entry means the
+      # next distinct path evicts the previous one, which is what makes
+      # the reserve visible in the next curl. Real deployments leave
+      # this at 10000.
+      max_size: 1

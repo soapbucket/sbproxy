@@ -1815,6 +1815,7 @@ fn maybe_admit_to_reserve(
                     .inc();
             }
             Err(e) => {
+                sbproxy_observe::metrics::record_cache_reserve_error(origin_id.as_str(), "put");
                 tracing::warn!(error = %e, "cache reserve put failed");
             }
         }

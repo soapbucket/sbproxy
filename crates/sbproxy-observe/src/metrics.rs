@@ -606,6 +606,15 @@ pub struct ProxyMetrics {
     /// Counter `sbproxy_cache_reserve_misses_total` of reserve misses
     /// (hot cache and reserve both empty), labelled by origin.
     pub cache_reserve_misses: IntCounterVec,
+    /// WOR-2673: counter `sbproxy_cache_reserve_errors_total` of reserve
+    /// operations the backend refused, by operation.
+    ///
+    /// The reserve is best-effort, so every call site swallows its
+    /// error and serves the request anyway. That is the right behavior
+    /// and it is also why this family exists: without it, a reserve
+    /// whose bucket credentials expired reads as a cache with a poor
+    /// hit rate rather than as a tier that is failing every write.
+    pub cache_reserve_errors: Option<IntCounterVec>,
     /// Counter `sbproxy_cache_reserve_writes_total` of entries written
     /// into the reserve, labelled by origin.
     pub cache_reserve_writes: IntCounterVec,
@@ -1085,6 +1094,13 @@ impl ProxyMetrics {
         )
         .unwrap();
 
+        let cache_reserve_errors = registered_counter_vec(
+            &registry,
+            "sbproxy_cache_reserve_errors_total",
+            "Cache Reserve operations the backend refused, by operation",
+            &["origin", "operation"],
+        );
+
         let cache_reserve_evictions = IntCounterVec::new(
             Opts::new(
                 "sbproxy_cache_reserve_evictions_total",
@@ -1311,6 +1327,7 @@ impl ProxyMetrics {
             cache_reserve_hits,
             cache_reserve_misses,
             cache_reserve_writes,
+            cache_reserve_errors,
             cache_reserve_evictions,
             synthetic_probe_failures,
             mirror_state_drift,
@@ -1637,6 +1654,20 @@ pub fn record_auth(origin: &str, auth_type: &str, allowed: bool) {
         .auth_results
         .with_label_values(&[origin.as_str(), auth_type, result])
         .inc();
+}
+
+/// Record one cache-reserve operation the backend refused (WOR-2673).
+///
+/// `operation` is the closed set `put` / `get` / `delete`, naming the
+/// trait method that failed. `origin` is the config-bounded origin id,
+/// matching the other `sbproxy_cache_reserve_*` families.
+pub fn record_cache_reserve_error(origin: &str, operation: &'static str) {
+    if let Some(counter) = metrics().cache_reserve_errors.as_ref() {
+        let origin = sanitize_label("origin", origin);
+        counter
+            .with_label_values(&[origin.as_str(), operation])
+            .inc();
+    }
 }
 
 /// Record one `ext_authz` callout outcome (WOR-2667).

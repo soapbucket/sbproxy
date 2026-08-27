@@ -1,9 +1,9 @@
 # Cache Reserve
-*Last modified: 2026-08-19*
+*Last modified: 2026-08-27*
 
 Cache Reserve is a long-tail cold tier sitting under the per-origin response cache. Items evicted from the hot cache are admitted into the reserve subject to a sample rate and size threshold; on a hot miss the proxy consults the reserve before falling through to origin and promotes the entry back into the hot tier on hit.
 
-SBproxy ships three reserve backends out of the box: memory, filesystem, and redis.
+SBproxy ships four reserve backends out of the box: memory, filesystem, redis, and object storage (S3, Google Cloud Storage, Azure Blob, or a local directory).
 
 ## Configuration
 
@@ -37,8 +37,53 @@ origins:
 | `memory` | none | In-process map. For tests and ephemeral single-replica setups; nothing survives a restart. |
 | `filesystem` | `path` | One body file plus a sidecar metadata JSON per key, fanned out by SHA-256 hash. Survives restarts. |
 | `redis` | `redis_url`, optional `key_prefix` | Connection pooling via `ConnectionManager`. Entries self-evict on the server side via `PEXPIREAT`. |
+| `object_store` | `backend`, plus `bucket` (or `path` for `local`) | S3, GCS, Azure Blob, or a local directory, through one backend. Optional at-rest sealing. See below. |
 
 The pipeline ignores unknown backend types with a warning.
+
+#### object_store
+
+The backend to reach for when the long tail is larger than a Redis instance you want to pay for. One config block covers four providers, because they all reach the proxy through the same `object_store` client the `storage` action and the ACME certificate store already use, so the field names are the ones you have configured before.
+
+```yaml
+  cache_reserve:
+    enabled: true
+    backend:
+      type: object_store
+      backend: s3
+      bucket: acme-sbproxy-reserve
+      region: us-east-1
+      prefix: sbproxy/reserve/
+      encryption:
+        enabled: true
+        key: ${SBPROXY_RESERVE_KEY}
+    sample_rate: 0.05
+    min_ttl: 86400
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `backend` | string | `s3` | `s3`, `gcs`, `azure`, or `local` |
+| `bucket` | string | none | Bucket name, or the Azure container name. Required for every backend but `local` |
+| `path` | string | none | Root directory for `local`. Created at startup if absent |
+| `region` | string | none | S3 region. Falls back to `AWS_REGION` when omitted |
+| `endpoint` | string | none | S3 endpoint override. Set this for MinIO, Cloudflare R2, Backblaze B2, or any other S3-compatible store |
+| `prefix` | string | `sbproxy/reserve/` | Key prefix inside the bucket, so the reserve can share it |
+| `encryption.enabled` | bool | `false` | Seal entries before they leave the process |
+| `encryption.key` | string | none | Secret reference for the active sealing key. Required when `enabled` is `true` |
+| `encryption.previous_keys` | list | `[]` | Retired keys, used only to open entries sealed before a rotation |
+
+Credentials come from each provider's standard environment discovery (`AWS_*`, `GOOGLE_*`, `AZURE_*`), the same as the `storage` action, so an operator configures them once.
+
+**Encryption is local, and deliberately not KMS.** An entry is sealed with AES-256-GCM through the same envelope the response cache's at-rest encryption uses, under its own HKDF purpose, so pointing both at one operator secret still yields two unrelated keys. The cache key is bound into the associated data, so a sealed object copied to another key fails to authenticate rather than being served as that key's entry.
+
+Wrapping each entry's data key with a cloud KMS would put a network round trip on the read path of a tier whose whole purpose is to be cheaper than the origin, and it would make a reachable KMS a hard requirement for reading the cache at all. Bucket-level SSE-KMS is configured on the bucket and composes with this setting rather than competing with it.
+
+Three behaviors are worth knowing before you point this at a bucket:
+
+- **A reserve configured to encrypt will not serve what it did not seal.** Turning `encryption.enabled` on against a bucket holding unsealed entries treats every one of them as a miss, so the reserve refills rather than serving plaintext it cannot vouch for. The old objects stay until the eviction sweep or a lifecycle rule removes them.
+- **An entry sealed under a key the process no longer holds is a miss, not an error.** Dropping a key from `previous_keys` retires its entries; the request falls through to origin.
+- **`evict_expired` is bounded and it is not the recommended answer at scale.** Expiry lives inside the object, so the sweep reads each candidate rather than judging it from the listing, and it examines at most 1,000 objects per call. **Configure a bucket lifecycle rule** (S3 lifecycle expiration, GCS object lifecycle management, Azure blob lifecycle) on the reserve prefix for any deployment large enough for that to matter. The sweep is the answer for small reserves and for correctness after a TTL change.
 
 ### Admission filter
 
@@ -227,7 +272,7 @@ Backends should treat metadata as opaque once written: every field is round-trip
 
 ## Metrics
 
-The reserve emits four Prometheus counters via the standard `sbproxy_*` registry:
+The reserve emits five Prometheus counters via the standard `sbproxy_*` registry:
 
 | Metric | Description |
 |--------|-------------|
@@ -235,8 +280,11 @@ The reserve emits four Prometheus counters via the standard `sbproxy_*` registry
 | `sbproxy_cache_reserve_misses_total` | Hot + reserve both empty. |
 | `sbproxy_cache_reserve_writes_total` | Entries written into the reserve. |
 | `sbproxy_cache_reserve_evictions_total` | Explicit reserve deletions (invalidate-on-mutation). |
+| `sbproxy_cache_reserve_errors_total` | Reserve operations the backend refused, by `operation` (`put`, `get`, `delete`). |
 
-Each counter is labeled by `origin`. Watch the hits / (hits + misses) ratio to size the reserve appropriately and the writes counter to confirm the admission filter is actually limiting reserve I/O.
+Each counter is labeled by `origin`; the errors counter carries `operation` as well. Watch the hits / (hits + misses) ratio to size the reserve appropriately and the writes counter to confirm the admission filter is actually limiting reserve I/O.
+
+The errors counter is the one to alert on, and the reason it exists is the failure semantics below: every reserve error is swallowed and the request is served anyway, so without a counter a reserve that is failing every write is indistinguishable from a cache with a poor hit rate. A sustained non-zero `put` rate against a healthy `get` rate usually means expired write credentials or a changed bucket policy; a non-zero rate on all three means the store is unreachable. The "Cache Reserve Traffic" and "Cache Reserve Errors" panels on the `SBProxy Overview` dashboard draw all five.
 
 ## When the reserve helps
 
@@ -249,6 +297,7 @@ Each counter is labeled by `origin`. Watch the hits / (hits + misses) ratio to s
 - A failed reserve `put` is logged at `warn` level and does not fail the request. The hot tier already accepted the entry.
 - A failed reserve `get` falls through to origin. The hot tier's value, when present, is returned before the reserve is consulted, so primary hits are unaffected by reserve outages.
 - A failed reserve construction (e.g. invalid Redis URL) is logged at warn and degrades to "no reserve" rather than failing the whole config load. Plain hot-cache behavior resumes.
+- Every one of those failures increments `sbproxy_cache_reserve_errors_total`, labeled by the operation that failed. Serving the request regardless is the right behavior for a best-effort tier; being unable to tell that it is failing is not, which is what that counter fixes.
 
 ## Tuning
 
@@ -267,5 +316,6 @@ The `crates/sbproxy-cache/src/reserve/composer.rs` module also exposes a synchro
 ## See also
 
 - [`examples/cache-reserve/`](../examples/cache-reserve/) - the runnable three-state walkthrough above.
+- [`examples/cache-reserve-object-store/`](../examples/cache-reserve-object-store/) - the object-storage backend, runnable against a local directory and against MinIO.
 - [configuration.md](configuration.md#response-cache) - response cache schema.
 - `crates/sbproxy-cache/src/reserve/mod.rs` - backend trait + implementations.
