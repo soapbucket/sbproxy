@@ -65,6 +65,10 @@ impl DegradeReason {
         Self::EmptyResponse,
     ];
 
+    /// Slots in the warning window, one per reason. Derived from `ALL` so
+    /// the two cannot be resized apart.
+    const COUNT: usize = Self::ALL.len();
+
     fn as_label(self) -> &'static str {
         match self {
             Self::Connect => "connect",
@@ -76,7 +80,15 @@ impl DegradeReason {
         }
     }
 
-    fn index(self) -> usize {
+    /// This reason's slot in the window's per-reason arrays.
+    ///
+    /// Exhaustive, so a seventh variant does not compile until it is given a
+    /// slot, and the arrays are sized from `ALL` rather than hand-numbered,
+    /// so a variant added to `ALL` widens them with it. A const assertion
+    /// checks the two agree at compile time, and `admit` reads its slot with
+    /// `get`, so even a mapping that got past both refuses to log-flood
+    /// rather than panicking on the proxy's classifier path.
+    const fn index(self) -> usize {
         match self {
             Self::Connect => 0,
             Self::Timeout => 1,
@@ -97,6 +109,16 @@ impl DegradeReason {
         }
     }
 }
+
+// Every reason in `ALL` owns the slot it sits at, so `index` and the window's
+// arrays, which are sized from `ALL`, cannot drift apart.
+const _: () = {
+    let mut slot = 0;
+    while slot < DegradeReason::COUNT {
+        assert!(DegradeReason::ALL[slot].index() == slot);
+        slot += 1;
+    }
+};
 
 fn fallback_total() -> Option<&'static prometheus::IntCounterVec> {
     static FALLBACK_TOTAL: OnceLock<Option<prometheus::IntCounterVec>> = OnceLock::new();
@@ -126,8 +148,8 @@ fn fallback_total() -> Option<&'static prometheus::IntCounterVec> {
 /// degrades have been suppressed since.
 struct DegradeWindow {
     started: Instant,
-    last_logged_millis: [AtomicU64; 6],
-    suppressed: [AtomicU64; 6],
+    last_logged_millis: [AtomicU64; DegradeReason::COUNT],
+    suppressed: [AtomicU64; DegradeReason::COUNT],
 }
 
 impl DegradeWindow {
@@ -144,21 +166,31 @@ impl DegradeWindow {
     /// for when the caller should log, and `None` while the window is open.
     fn admit(&self, reason: DegradeReason) -> Option<u64> {
         let index = reason.index();
+        // The const assertion above makes a slot outside the arrays a
+        // compile error; this path still refuses to index blind, because the
+        // alternative is a panic inside every degraded classification the
+        // proxy makes. An unmapped reason logs its line instead.
+        let (Some(last_logged), Some(suppressed)) = (
+            self.last_logged_millis.get(index),
+            self.suppressed.get(index),
+        ) else {
+            return Some(1);
+        };
         let now = self.started.elapsed().as_millis() as u64;
-        let last = self.last_logged_millis[index].load(Ordering::Relaxed);
+        let last = last_logged.load(Ordering::Relaxed);
         let window = DEGRADE_WARNING_WINDOW.as_millis() as u64;
         if last != u64::MAX && now.saturating_sub(last) < window {
-            self.suppressed[index].fetch_add(1, Ordering::Relaxed);
+            suppressed.fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        if self.last_logged_millis[index]
+        if last_logged
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
         {
-            self.suppressed[index].fetch_add(1, Ordering::Relaxed);
+            suppressed.fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        Some(self.suppressed[index].swap(0, Ordering::Relaxed) + 1)
+        Some(suppressed.swap(0, Ordering::Relaxed) + 1)
     }
 
     #[cfg(test)]
@@ -352,6 +384,26 @@ mod tests {
     /// and record no metric at all, so a configured-but-unreachable sidecar
     /// at 5k rps turned the outage into the log flood that hid it, and no
     /// counter existed to alert on "we are running on the fallback".
+    /// The window's arrays are sized from `ALL` and every reason's slot
+    /// falls inside them. Hand-numbered slots against a hand-sized array
+    /// meant a seventh reason compiled and then panicked inside
+    /// `note_degrade`, which every degraded classification reaches.
+    #[test]
+    fn every_degrade_reason_owns_a_slot_inside_the_window() {
+        let window = DegradeWindow::get();
+        assert_eq!(DegradeReason::ALL.len(), window.suppressed.len());
+        assert_eq!(DegradeReason::ALL.len(), window.last_logged_millis.len());
+        for (slot, reason) in DegradeReason::ALL.iter().enumerate() {
+            assert_eq!(reason.index(), slot, "{} moved slot", reason.as_label());
+            assert!(
+                window.suppressed.get(reason.index()).is_some()
+                    && window.last_logged_millis.get(reason.index()).is_some(),
+                "{} has no slot to count into",
+                reason.as_label()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn every_degrade_counts_and_the_warning_is_windowed_by_reason() {
         DegradeWindow::get().reset();
