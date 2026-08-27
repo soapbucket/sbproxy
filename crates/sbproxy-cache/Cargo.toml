@@ -31,13 +31,14 @@ redis = { workspace = true, features = ["connection-manager"] }
 base64.workspace = true
 
 # S3 + KMS cache-reserve backend (WOR-2673): envelope-encrypted cold
-# tier for the response cache, ported from
-# sbproxy-enterprise-cache-reserve. `default-features = false` plus
-# `default-https-client` keeps the TLS stack on the hyper-rustls 0.23 /
-# rustls-webpki 0.103+ path `sbproxy-vault` already pinned for its
+# tier for the response cache. `default-features = false` plus
+# `default-https-client` keeps the TLS stack on the hyper-rustls 0.27 /
+# rustls-webpki 0.103 path `sbproxy-vault` already pinned for its
 # Secrets Manager client (see that crate's Cargo.toml); the legacy
 # `rustls` feature would instead lock the vulnerable rustls-webpki
-# 0.101.7 already tracked in this workspace's deny.toml.
+# 0.101.7 already tracked in this workspace's deny.toml. Verify with
+# `cargo tree -e features -i hyper-rustls`, which shows the 0.27 copy
+# reached through aws-smithy-http-client's `default-https-client`.
 aws-config = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
 aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }

@@ -1,6 +1,6 @@
 # SBproxy events
 
-*Last modified: 2026-08-25*
+*Last modified: 2026-08-27*
 
 SBproxy hands a SIEM three different things, and this page is the map of how they fit together: typed proxy events (the `events:` block, a closed set of twenty-two), decision-audit records (`observability.log.decision_audit`, twenty pipeline decisions normalized to OCSF), and four audit channels that write to their own tracing targets (`security_audit`, `config_audit`, `key_audit`, and the admin action ring). Two of those four, `security_audit` and `config_audit`, can additionally be hash-chained and Ed25519-signed for tamper evidence.
 
@@ -90,7 +90,7 @@ The short version, because this page is where the two channels need to be told a
 
 - **Twenty named decision points.** `auth`, `policy`, `rate_limit`, `waf`, `cache.key`, `cache.admit`, `cache.reserve.health`, `route.decide`, `ai.guardrail.input`, `ai.guardrail.output`, `ai.tool_call`, `ai.stream.event`, `ai.close`, `ai.failure`, `ai.admission`, `transform`, `action`, `log.custom_field`, `mcp.tool`, `payment.lifecycle`.
 - **Six coverage states**, because "wired or not" turned out to be the wrong question for at least four of these:
-  - *Emitted*: publishes its own record. As of this sweep that is `auth`, `cache.key`, `cache.admit`, `cache.reserve.health`, `route.decide`, `ai.guardrail.input`, `ai.guardrail.output`, `ai.tool_call`, `ai.close`, `ai.failure`, `ai.admission`, and `mcp.tool`.
+  - *Emitted*: publishes its own record. As of this sweep that is `auth`, `cache.key`, `cache.admit`, `cache.reserve.health`, `route.decide`, `ai.guardrail.input`, `ai.guardrail.output`, `ai.tool_call`, `ai.close`, `ai.failure`, `ai.admission`, and `mcp.tool`. The MCP OAuth surface publishes on two of those rather than under a name of its own: an `auth` record for every in-process broker refusal (`/authorize`, `/token`, `/register`, `/device_authorization`, `/verify`, `/par`, `/revoke`, `/introspect`) and for the resource server's 401, with `auth_type` naming the endpoint (`mcp_oauth_token`, `mcp_oauth_resource_server`), and an `mcp.tool` record for a per-operation scope refusal, with `verdict = "insufficient_scope"` and the JSON-RPC method as the tool. Both surfaces also write `sbproxy_mcp_gateway_decisions_total` and one `mcp_gateway::decision` log line per decision; see [mcp-oauth-gateway.md](mcp-oauth-gateway.md).
   - *SupersededByPolicy*: `waf` and `rate_limit` compile to policy modules, so their decisions already publish as `policy` records carrying a `policy_id`. A second emitter under their own label would double-record one decision.
   - *ConfigDependent*: `policy` always reaches the bus, but arrives as the legacy `policy_verdict_event` shape until `policy_record_format: decision` moves it onto this feed.
   - *DurableElsewhere*: `payment.lifecycle` is recorded by the settlement store, which is non-lossy by design. This queue drops records under load (a sound trade for a security decision, the wrong one for money), so publishing the same event here would offer a second, weaker answer beside an authoritative one.

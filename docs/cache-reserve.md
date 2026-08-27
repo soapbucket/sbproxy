@@ -1,5 +1,5 @@
 # Cache Reserve
-*Last modified: 2026-08-22*
+*Last modified: 2026-08-27*
 
 Cache Reserve is a long-tail cold tier sitting under the per-origin response cache. Items evicted from the hot cache are admitted into the reserve subject to a sample rate and size threshold; on a hot miss the proxy consults the reserve before falling through to origin and promotes the entry back into the hot tier on hit.
 
@@ -259,6 +259,15 @@ The reserve emits four Prometheus counters via the standard `sbproxy_*` registry
 
 Each counter is labeled by `origin`. Watch the hits / (hits + misses) ratio to size the reserve appropriately and the writes counter to confirm the admission filter is actually limiting reserve I/O.
 
+Two more report the tier's health rather than its traffic:
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `sbproxy_cache_reserve_degraded` | gauge | `backend` | `1` while the reserve is degraded, `0` while it is healthy. This is the alerting signal: a reserve that is failing every operation still serves every request, so nothing else goes red. |
+| `sbproxy_cache_reserve_health_transitions_total` | counter | `backend`, `to` | One tick per healthy-to-degraded or degraded-to-healthy edge, not one per operation. A high rate with the gauge near zero is a reserve flapping. |
+
+Each transition also publishes a `cache.reserve.health` decision-audit record (see [events.md](events.md)), so the change reaches a SIEM without a Prometheus scrape.
+
 ## When the reserve helps
 
 - **Long-tail content.** Pages that get one hit per hour drop out of an LRU primary quickly. The reserve keeps them around so the second hit still serves from cache instead of paying the origin round trip.
@@ -270,6 +279,8 @@ Each counter is labeled by `origin`. Watch the hits / (hits + misses) ratio to s
 - A failed reserve `put` is logged at `warn` level and does not fail the request. The hot tier already accepted the entry.
 - A failed reserve `get` falls through to origin. The hot tier's value, when present, is returned before the reserve is consulted, so primary hits are unaffected by reserve outages.
 - A failed reserve construction (e.g. an invalid Redis URL, or an S3 backend missing `bucket`/`region`/`kms_key_id`) is logged at warn and degrades to "no reserve" rather than failing the whole config load. Plain hot-cache behavior resumes.
+
+None of those fails a request, which is the point and also the problem: an operator has no per-request signal that the reserve stopped working. `GET /admin/cache` carries a `reserve` object with the current state, when it entered that state, when it last recovered, the operation that set it, and a bounded reason code and error string. See [admin-api-reference.md](admin-api-reference.md#get-admincache). The "Cache Reserve Backend State" tile in [`dashboards/grafana/sbproxy-mesh-storage.json`](../dashboards/grafana/sbproxy-mesh-storage.json) points there for the reason.
 
 ## Tuning
 

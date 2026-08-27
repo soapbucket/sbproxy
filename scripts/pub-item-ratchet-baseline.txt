@@ -824,8 +824,14 @@ three ported crates or in the two seams they reach:
     `S3Reserve::with_clients`, `TrustChainResolver::from_anchors`,
     `MasterKey`, `router_full_with_par`,
     `McpResourceServerProvider::{metadata_document_json, rfc6750_error_code}`,
-    `MockStorage::exists_call_count`, and the two DPoP TTL defaults in
-    `sbproxy-mcp-gateway/src/config.rs`.
+    and the two DPoP TTL defaults in `sbproxy-mcp-gateway/src/config.rs`.
+  * Named from another crate's `#[cfg(test)]` block rather than from an
+    integration test, so `pub` is still the only visibility that compiles but
+    the reason is a different one: `MockEphemeralKv::exists_call_count`, on
+    `sbproxy-storage`'s `mock` feature, read by `sbproxy-licensing`'s
+    revocation tests. An earlier revision of this file named it
+    `MockStorage::exists_call_count` and filed it under the bucket above;
+    neither the type name nor the category was right.
   * Field types of the pub config tree, constructed by serde and the schema
     generator rather than by name: `FederationSigningKeyConfig`.
   * The rest are `sbproxy-mcp-gateway`, `sbproxy-federation`, and
@@ -847,3 +853,32 @@ the CoMP bridge now names the OSS OLP wire format from outside `olp.rs`.
 branch's: #1214 lowered its own baseline 1462 -> 1461 in the same commit, and
 this merge carries that one item through. tests-only holds at 322. The unwrap
 ratchet moves separately in this merge and is described in its own commit.
+
+2026-08-27 (WOR-2661 infra cluster, review fix round): tests-only 322 -> 323.
+Net of five additions and one removal. The additions that stayed inside the
+count are `sbproxy-licensing`'s `quote_acceptance_hash`, which a CoMP buyer
+client has to be able to compute (a redeem is now bound to the quote by that
+value) and which only the crate's own e2e test names today, and
+`sbproxy-mcp-gateway`'s `DEFAULT_AUTHORIZE_REQUESTS_PER_MINUTE`, whose only
+consumers are in its own file, matching the sibling
+`DEFAULT_REVOCATION_REQUESTS_PER_MINUTE` it is paired with. Both would be
+narrower as `pub(crate)` and both would then be the odd one out in a block of
+documented, published defaults, which is the trade this line records.
+`ReqwestFederationFetcher::with_client` went the other way and was deleted: it
+had no caller anywhere, and its doc described a pin it actually bypassed.
+The other additions this round (`ssrf::canonical_ip`,
+`ssrf::validate_dialable_addrs`, `serve_entity_configuration`,
+`ServedEntityConfiguration`, `McpResourceServerProvider::with_local_jwks`,
+`JwksDocument::to_key_set`, `McpSecurityContext::in_process`,
+`metrics::record_peer_decision`, `metrics::record_broker_decision`, and the
+`proxy.federation.peer_trust` config types) are all reached from production
+code and do not touch this count.
+
+Unreferenced 1507 -> 1508 in the same round, one item:
+`ssrf::canonical_ip`. It is named from production code (both
+`sbproxy-mcp-gateway` dial guards call it) but only ever through
+`is_private_ip` and `validate_dialable_addrs` in its own file plus those two
+crate-external sites, and the scanner counts the ones inside `ssrf.rs`. It is
+public deliberately: it is the single place the workspace unwraps an
+IPv4-mapped IPv6 address, and a guard that writes its own range check has to
+be able to reach it or the mapped-address hole comes back.

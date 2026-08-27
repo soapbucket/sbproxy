@@ -1,6 +1,6 @@
 # AI gateway security coverage
 
-*Last modified: 2026-08-26*
+*Last modified: 2026-08-27*
 
 This page proves what the gateway enforces in the AI traffic path, not what a
 feature list claims: every row below points at a named test or a signal you
@@ -248,7 +248,7 @@ enforced in one clause, not a repeated grade.
 | [LLM01](#llm01-prompt-injection) | Prompt Injection | Input/output injection guardrail, double-pass RAG screening, multipart refusal on JSON-only surfaces |
 | [LLM02](#llm02-sensitive-information-disclosure) | Sensitive Information Disclosure | `pii:` body redaction, plus secret-regex and field-key redaction on every log emitter |
 | [LLM03](#llm03-excessive-agency) | Excessive Agency | Per-tool RBAC with default-deny, resolved-model gates, per-agent budgets on verified identity |
-| [LLM04](#llm04-supply-chain) | Supply Chain | Default-deny, DNS-pinned egress authorizer across thirteen purposes, with per-hop redirect re-authorization |
+| [LLM04](#llm04-supply-chain) | Supply Chain | Default-deny, DNS-pinned egress authorizer across fourteen purposes, with per-hop redirect re-authorization |
 | [LLM05](#llm05-model--data-poisoning) | Model & Data Poisoning | Out of gateway scope: risk lives with the model provider's training pipeline |
 | [LLM06](#llm06-misinformation) | Misinformation | Out of gateway scope: risk lives in the model's own generation |
 | [LLM07](#llm07-unbounded-consumption) | Unbounded Consumption | Budgets deny at the cap across seven scopes; per-instance until a shared store is present |
@@ -381,7 +381,7 @@ outbound destination it should not: a compromised registry, a redirected
 webhook, a rebound DNS answer.
 
 **What sbproxy enforces.** A default-deny, DNS-pinned egress authorizer
-covers thirteen wired purposes once armed (see [control 7](#7-egress-is-inventoried)
+covers fourteen wired purposes once armed (see [control 7](#7-egress-is-inventoried)
 above for which config surface arms which purpose; engine artifact
 downloads cannot be armed today and stay ungated). Every redirect hop is
 re-authorized as a new destination, capped at

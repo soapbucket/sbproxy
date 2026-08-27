@@ -1,0 +1,73 @@
+# yaml-language-server: $schema=../../schemas/sb-config.schema.json
+# MCP OAuth 2.1 broker and resource server in one sbproxy process.
+#
+# The broker owns the PKCE flow against an upstream authorization
+# server and mints its own RFC 9068 access tokens; the resource server
+# verifies those tokens on every MCP request, before the catalog, the
+# request body, or any upstream federation.
+#
+# The two halves are colocated on purpose: `resource_server.jwks_url`
+# is the broker's own route, so the verifier takes the key set in
+# process and never dials this proxy's own external URL, which inside a
+# pod resolves to an address the OAuth egress policy refuses.
+proxy:
+  http_bind_port: 8080
+origins:
+  "mcp.example.com":
+    action:
+      type: mcp
+      mode: gateway
+      server_info:
+        name: my-mcp
+        version: "1.0.0"
+      oauth:
+        authorization_servers:
+          - "https://mcp.example.com/mcp/oauth"
+        scopes_supported:
+          - "mcp.read"
+          - "mcp.call"
+        broker:
+          base_path: /mcp/oauth
+          external_base_url: https://mcp.example.com
+          upstream_authorization_server_url: https://idp.example.com/authorize
+          upstream_metadata_url: https://idp.example.com/.well-known/oauth-authorization-server
+          upstream_token_endpoint_url: https://idp.example.com/token
+          upstream_redirect_uri: https://mcp.example.com/mcp/oauth/callback
+          resource_uri: https://mcp.example.com/
+          allowed_redirect_uris:
+            - "https://client.example.com/callback"
+          session_ttl_secs: 600
+          # Admission ceiling on the two unauthenticated endpoints that
+          # consume session capacity. 300/min times the 600s TTL is
+          # 3000 live rows against a 4096-row store, so a stream of
+          # anonymous requests inside the limit cannot wedge new
+          # authorizations. Raise both together or that stops holding.
+          authorize_requests_per_minute: 300
+          broker_signing_key:
+            pem: "${MCP_BROKER_SIGNING_KEY_PEM}"
+            alg: ES256
+            kid: broker-2026-08
+            # Required. Without it /.well-known/jwks.json serves an
+            # empty key set while AS metadata advertises that URL as
+            # where the key is, and startup refuses the combination.
+            public_jwk:
+              kty: EC
+              crv: P-256
+              kid: broker-2026-08
+              alg: ES256
+              use: sig
+              x: DpZdjog3y9hgIyKgEPltBi5ptXKUeuRwVOAPSmoQAu4
+              y: bfVVYV9slbMcg4dvtvYbeekYtpFXsYCWcIa9RCrBmTc
+        resource_server:
+          resource_uri: https://mcp.example.com/
+          authorization_servers:
+            - "https://mcp.example.com/mcp/oauth"
+          jwks_url: https://mcp.example.com/mcp/oauth/.well-known/jwks.json
+          audience: https://mcp.example.com/
+          issuer: https://mcp.example.com/mcp/oauth
+          scopes_supported:
+            - "mcp.read"
+            - "mcp.call"
+      federated_servers:
+        - origin: test.sbproxy.dev
+          prefix: tools

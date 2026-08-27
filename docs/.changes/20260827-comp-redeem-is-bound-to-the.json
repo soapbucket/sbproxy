@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "CoMP redeem is bound to the quote it names: an expired quote stays refusable after a later quote request, and `accepted_quote_hash` is verified against the quote the publisher issued."
+}

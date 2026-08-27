@@ -2,16 +2,22 @@
 
 *Last modified: 2026-08-27*
 
-[`sbproxy-federation`](../crates/sbproxy-federation) is a standalone
-crate implementing enough of
+[`sbproxy-federation`](../crates/sbproxy-federation) implements enough of
 [OpenID Federation 1.0](https://openid.net/specs/openid-federation-1_0.html)
 for an sbproxy deployment to prove its own identity to a federated
 peer, and to verify a peer's identity by walking that peer's trust
-chain up to an anchor you configure. It ships as a library plus a
-small axum surface (a well-known route and an admin-status route),
-not as a `type:` you configure under `authentication:` on an origin
-today; see [Honest limits](#honest-limits) for exactly what that
-means.
+chain up to an anchor you configure.
+
+Both halves are configuration. `proxy.federation:` in `sb.yml` makes
+the proxy serve its own signed entity configuration on the listener you
+already run, and `proxy.federation.peer_trust:` makes it verify a
+caller's claimed entity against anchors you pin, on the request path,
+before authentication. See
+[Configuring `proxy.federation`](#configuring-proxyfederation). The
+crate is also embeddable as a library plus a small axum surface for a
+host process that wants the same machinery outside sbproxy. What it is
+still not is a `type:` under `authentication:` on an origin; see
+[Honest limits](#honest-limits) for what that costs you.
 
 If you need request-time bearer-token verification instead (a caller
 presents a JWT and you check it against an issuer's JWKS),
@@ -105,6 +111,112 @@ anchor list and the signing key at process startup; both live only in
 that process's memory and are re-supplied from your own config source
 on every restart.
 
+## Configuring `proxy.federation`
+
+The identity half. This is all it takes for the proxy to publish its own
+entity configuration at `/.well-known/openid-federation` on the listener
+it already serves:
+
+```yaml
+proxy:
+  federation:
+    enabled: true
+    entity_id: https://gateway.acme.example
+    signing_key:
+      pem_file: /etc/sbproxy/federation-signing-key.pem
+      algorithm: ES256
+      kid: fed-2026q3
+    published_jwks:
+      keys:
+        - kty: EC
+          crv: P-256
+          kid: fed-2026q3
+          alg: ES256
+          use: sig
+          x: DpZdjog3y9hgIyKgEPltBi5ptXKUeuRwVOAPSmoQAu4
+          y: bfVVYV9slbMcg4dvtvYbeekYtpFXsYCWcIa9RCrBmTc
+    lifetime_secs: 86400
+    refresh_margin_secs: 7800
+    authority_hints:
+      - https://trust-anchor.example
+```
+
+| Key | Required | What it is |
+|---|---|---|
+| `enabled` | yes | `false` (the default) leaves the well-known route unmounted. |
+| `entity_id` | yes | This entity's HTTPS URL, published as both `iss` and `sub`. Config load refuses a non-`https://` value. |
+| `signing_key.pem_file` | yes | Path to the private key, read once when the pipeline is built. |
+| `signing_key.algorithm` | yes | One of `ES256`, `ES384`, `RS256`, `RS384`, `RS512`, `PS256`, `PS384`, `PS512`, `EdDSA`. Symmetric algorithms are refused. |
+| `signing_key.kid` | yes | Stamped into the protected JWS header. It must name a key in `published_jwks`, and startup refuses the mismatch rather than serving a document every peer rejects. |
+| `published_jwks` | yes | The `{"keys": [...]}` object embedded in the statement. Must be non-empty. |
+| `lifetime_secs` | no, 3600 | How long each signed statement is good for. |
+| `refresh_margin_secs` | no, 300 | How far before expiry the cached statement is re-signed. Must be strictly less than `lifetime_secs`. |
+| `authority_hints` | no, empty | This entity's superiors. **Publish at least one unless this proxy is itself a trust anchor**: OpenID Federation 1.0 s3 requires it, and a peer's chain composer walks it, so an empty array is a statement nobody can chain to anything. Each entry must be an `https://` URL. |
+| `peer_trust` | no | Inbound peer verification, below. |
+
+### Verifying a peer
+
+The trust half. A caller names the entity it claims to be in a header;
+the proxy fetches that entity's configuration, walks its
+`authority_hints` up to an anchor you pinned, validates every signature
+and linkage in the chain, applies the metadata policy the chain's
+superiors imposed, checks any trust marks you require, and admits or
+refuses the request before authentication runs.
+
+```yaml
+proxy:
+  federation:
+    enabled: true
+    # ... the identity block above ...
+    peer_trust:
+      required: false
+      header: x-federation-entity-id
+      trust_anchors:
+        - entity_id: https://trust-anchor.example
+          jwks:
+            keys:
+              - kty: EC
+                crv: P-256
+                kid: anchor-2026
+                alg: ES256
+                use: sig
+                x: DpZdjog3y9hgIyKgEPltBi5ptXKUeuRwVOAPSmoQAu4
+                y: bfVVYV9slbMcg4dvtvYbeekYtpFXsYCWcIa9RCrBmTc
+      required_trust_marks:
+        - https://trust-anchor.example/mark/certified
+      max_chain_depth: 5
+      cache_ttl_secs: 600
+```
+
+| Key | Required | What it is |
+|---|---|---|
+| `required` | no, `false` | `true` refuses a request that names no peer at all. `false` still refuses one whose named peer fails to verify: an unverifiable claim is worse than no claim. Setting it needs `authority_hints`, so a proxy cannot demand a chain from every caller while publishing one nobody can chain. |
+| `header` | no, `x-federation-entity-id` | Request header the peer names itself in. Matched case-insensitively. |
+| `trust_anchors` | yes | Pinned anchors, each with its `entity_id` and its published `jwks`. These keys are the pin: every chain is verified against them, and they come from your config rather than from the network. At least one is required. |
+| `required_trust_marks` | no, empty | Trust-mark ids a verified peer must additionally carry, each signed by the anchor the chain terminated at. |
+| `max_chain_depth` | no, 5 | Maximum statements in an accepted chain, and the fetch budget the composer walks with. |
+| `cache_ttl_secs` | no, 600 | How long a peer decision is reused before the chain is walked again. Refusals are cached too, so an unverified caller cannot make this proxy generate outbound traffic per request. |
+
+On a verified peer the proxy rewrites `header` to the entity id the
+chain proved, so an upstream reading it reads what was verified rather
+than what the caller wrote. On no claim with `required: false` the
+header is removed outright. A refusal answers 403.
+
+**What this cannot see.** The header is a claim, not a credential. This
+answers "is the entity that name refers to vouched for by an anchor I
+pinned", which is the trust-establishment question OpenID Federation
+exists to answer. It does not answer "is this caller that entity".
+Binding a connection to an entity is mutual TLS or a signed request, and
+the [`authentication:`](configuration.md) providers do that. Run one of
+them alongside this, or what you have is an allowlist keyed on an
+unauthenticated header.
+
+Every fetch this makes runs under the two egress layers described in
+[Where the fetcher may dial](#where-the-fetcher-may-dial). A deployment
+that configures no `peer_trust` block makes no federation fetch at all,
+so `egress.federation` reports armed with zero sightings, and that is
+the correct reading rather than a broken control.
+
 ## Quickstart
 
 ```rust,ignore
@@ -154,9 +266,11 @@ for the exact `curl` commands.
 ## Metrics
 
 Every family carries the `sbproxy_federation_` prefix and registers
-into the process-wide Prometheus registry, so a host that already
-scrapes `/metrics` picks these up the moment it mounts this crate's
-router (or the `entity_configuration_handler` directly).
+into the process-wide Prometheus registry. sbproxy's own request path
+serves the well-known route through this crate's handler body, so the
+two well-known families are live on the shipped binary; a host embedding
+the crate picks all five up the moment it mounts the router (or the
+`entity_configuration_handler` directly).
 
 | Metric | Type | Labels | What it means |
 |---|---|---|---|
@@ -165,6 +279,13 @@ router (or the `entity_configuration_handler` directly).
 | `sbproxy_federation_trust_chain_resolutions_total` | counter | `outcome` (`resolved`, `rejected`) | Every `TrustChainResolver::resolve` call, whether driven directly or through `compose_trust_chain`'s HTTP walk. |
 | `sbproxy_federation_well_known_serves_total` | counter | `outcome` (`served`, `unavailable`) | Every `GET /.well-known/openid-federation` the handler answered. |
 | `sbproxy_federation_well_known_cache_remaining_seconds` | gauge | none | Remaining lifetime of the entity configuration most recently served, sampled at request time. Pinned near zero across many samples means `refresh_margin` is too close to `lifetime` for your request rate. |
+| `sbproxy_federation_peer_decisions_total` | counter | `outcome` (`trusted`, `refused`) | The admission decision the proxy made about a caller's claimed entity. Empty until `proxy.federation.peer_trust` is configured. |
+
+The first three rows are written from inside the verification calls, so
+on an sbproxy deployment they move only when `peer_trust` is configured:
+a proxy that publishes its own statement and verifies nobody leaves them
+empty, and that is the correct reading. The two well-known rows move on
+every request to `/.well-known/openid-federation`.
 
 [dashboards/grafana/sbproxy-federation.json](../dashboards/grafana/sbproxy-federation.json)
 draws all five; see [dashboards/README.md](../dashboards/README.md).
@@ -191,7 +312,15 @@ prose.
 
 ## Admin status
 
-`GET /admin/status` (mounted by `router`) returns the entity id,
+On sbproxy, this surface is `GET /admin/federation` on the proxy's own
+authenticated admin API, documented in
+[admin-api-reference.md](admin-api-reference.md#get-adminfederation). It
+carries the identity fields below plus the peer-trust configuration and
+how many peer decisions are currently cached. A console page for it is
+separate scope, under the admin console work; the JSON route is the
+operator surface today.
+
+For a host embedding the crate, `GET /admin/status` (mounted by `router`) returns the entity id,
 signing algorithm and `kid`, key/authority-hint/trust-mark counts,
 whether a `metadata_policy` is configured, the configured lifetime and
 refresh margin, and how many seconds remain on the cached document.
@@ -201,12 +330,21 @@ configuration this process serves.
 
 ## Honest limits
 
-- **Not a config-driven `authentication:` provider.** Unlike
-  [cap.md](cap.md) or [auth-oidc.md](auth-oidc.md), there is no
-  `type: federation` you can set on an origin today. This crate is a
-  library plus a small standalone axum surface a host process embeds;
-  wiring a trust-chain-verified peer identity into the inbound
-  request pipeline is a separate integration this port does not do.
+- **Not a config-driven `authentication:` provider, and not an
+  authentication provider at all.** There is no `type: federation` you
+  set on an origin, and `proxy.federation.peer_trust` is not a
+  substitute for one: it is proxy-wide rather than per-origin, it runs
+  before the auth phase rather than inside it, and it verifies the
+  entity a header names rather than binding the connection to that
+  entity. Pair it with [cap.md](cap.md), mutual TLS, or
+  [auth-oidc.md](auth-oidc.md) for the binding. What it does do is what
+  the two sections above describe: publish this entity's configuration
+  from the normal listener, and refuse a caller whose claimed entity no
+  pinned anchor vouches for.
+- **No subordinate-statement endpoint.** This proxy publishes its own
+  entity configuration and consumes other entities' chains. It does not
+  serve `/fetch`, so it cannot act as an intermediate that issues
+  subordinate statements about anyone else.
 - **No live trust-mark revocation check.** `verify_trust_mark`
   verifies the mark's signature (the offline half of §7). The
   `/.well-known/federation-trust-mark-status` live revocation check

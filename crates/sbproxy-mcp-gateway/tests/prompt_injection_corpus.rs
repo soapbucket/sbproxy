@@ -922,6 +922,27 @@ async fn corpus_runs_end_to_end() {
     }
 }
 
+/// The count `docs/mcp-oauth-gateway.md` publishes has to be the count
+/// the corpus holds. It drifted once already: the doc said 26 while the
+/// file held 28, and the only assertion was a floor of 20, which cannot
+/// see the difference.
+#[test]
+fn the_documented_corpus_size_matches_the_corpus() {
+    let corpus = load_corpus();
+    let doc = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/mcp-oauth-gateway.md"),
+    )
+    .expect("read docs/mcp-oauth-gateway.md");
+    let claim = format!(
+        "{} entries across six threat categories",
+        corpus.entries.len()
+    );
+    assert!(
+        doc.contains(&claim),
+        "docs/mcp-oauth-gateway.md does not say '{claim}'; the corpus moved and the doc did not"
+    );
+}
+
 #[tokio::test]
 async fn corpus_covers_every_category() {
     use std::collections::HashSet;

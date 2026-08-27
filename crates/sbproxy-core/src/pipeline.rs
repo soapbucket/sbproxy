@@ -849,6 +849,16 @@ pub(crate) struct CacheReserveHealthSnapshot {
 /// Transition state shared by the observed backend, admin, and metrics.
 pub(crate) struct CacheReserveHealthState {
     inner: std::sync::RwLock<CacheReserveHealthSnapshot>,
+    /// Whether the reserve is currently degraded, readable without the
+    /// lock.
+    ///
+    /// Every successful reserve operation calls `mark_healthy`, and
+    /// taking the `RwLock` write guard there just to read one field
+    /// serialized all reserve traffic through one writer. This is the
+    /// same fact, on a relaxed atomic: the read is a fast path that
+    /// only decides whether a transition is possible, and the write
+    /// guard is still what makes the transition itself atomic.
+    degraded: AtomicBool,
     published: AtomicBool,
     audit_enabled: AtomicBool,
 }
@@ -867,6 +877,7 @@ impl CacheReserveHealthState {
                 reason_code: None,
                 last_error: None,
             }),
+            degraded: AtomicBool::new(false),
             published: AtomicBool::new(false),
             audit_enabled: AtomicBool::new(false),
         })
@@ -885,6 +896,7 @@ impl CacheReserveHealthState {
                 reason_code: None,
                 last_error: None,
             }),
+            degraded: AtomicBool::new(false),
             published: AtomicBool::new(false),
             audit_enabled: AtomicBool::new(false),
         })
@@ -916,6 +928,7 @@ impl CacheReserveHealthState {
             state.last_operation = Some(operation);
             state.reason_code = Some(reason_code);
             state.last_error = Some(last_error.to_string());
+            self.degraded.store(true, Ordering::Release);
             transition.then(|| state.clone())
         };
         if let Some(state) = transition {
@@ -924,14 +937,23 @@ impl CacheReserveHealthState {
     }
 
     fn mark_healthy(&self, operation: &'static str) {
+        // Fast path on every successful reserve operation, which is the
+        // overwhelming majority of them: no lock at all unless a
+        // recovery is actually possible.
+        if !self.degraded.load(Ordering::Acquire) {
+            return;
+        }
         let transition = {
             let mut state = self
                 .inner
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Re-check under the lock: two threads can both see the
+            // atomic set and only one of them owns the transition.
             if state.state != CacheReserveHealthStatus::Degraded {
                 return;
             }
+            self.degraded.store(false, Ordering::Release);
             let now = chrono::Utc::now();
             state.state = CacheReserveHealthStatus::Healthy;
             state.since = now;

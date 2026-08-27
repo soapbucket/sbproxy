@@ -1697,7 +1697,7 @@ gateway has reached (or attempted to reach) since process start, with its
 most recent authorization outcome. Both `admin` and `read_only` operators
 may call the route.
 
-Every one of the thirteen wired egress purposes below goes through the
+Every one of the fourteen wired egress purposes below goes through the
 same authorizer and lands in the same inventory and, on denial, the same
 event:
 
@@ -3208,17 +3208,104 @@ model-host artifact cache above:
 | POST | `/admin/cache/purge` | Evict response-cache entries: by exact key, by prefix, or all. |
 | POST | `/admin/cache/key-policy/evict` | Drop one (or all) cached key policies so the next request re-reads the keystore. |
 | GET | `/admin/cache/semantic` | Recent semantic (embedding) cache lookup decisions per AI origin. |
+| GET | `/admin/federation` | OpenID Federation identity this proxy publishes, and what it requires of a peer. |
 
 ### `GET /admin/cache`
 
 ```json
-{"enabled": true, "backend": "redis", "prefix_purge_supported": true}
+{
+  "enabled": true,
+  "backend": "redis",
+  "prefix_purge_supported": true,
+  "reserve": {
+    "configured": true,
+    "active": true,
+    "backend": "s3",
+    "state": "degraded",
+    "since": "2026-08-27T03:04:11Z",
+    "recovered_at": null,
+    "last_operation": "put",
+    "reason_code": "backend_unavailable",
+    "last_error": "reserve put failed"
+  }
+}
 ```
 
-`{"enabled": false}` when no origin turned on response caching.
+When no origin turned on response caching the two cache fields collapse
+and the `reserve` object is still present:
+
+```json
+{"enabled": false, "reserve": {"configured": false, "active": false, "backend": "none", "state": "inactive", "since": "2026-08-27T03:00:00Z", "recovered_at": null, "last_operation": null, "reason_code": null, "last_error": null}}
+```
+
 `prefix_purge_supported` is true only for `memory` and `redis`
 backends (`file` hashes keys into filenames and cannot scan by
 prefix; `memcached` has no scan primitive).
+
+The `reserve` object is the Cache Reserve tier's health, and it is what
+the "Cache Reserve Backend State" tile in
+[`dashboards/grafana/sbproxy-mesh-storage.json`](../dashboards/grafana/sbproxy-mesh-storage.json)
+sends an operator here for:
+
+| Field | Meaning |
+|---|---|
+| `configured` | An operator wrote a `cache_reserve:` block. |
+| `active` | The reserve is wired into the pipeline and serving. |
+| `backend` | `memory`, `filesystem`, `redis`, `s3`, or `none`. |
+| `state` | `healthy`, `degraded`, or `inactive`. |
+| `since` | When the current state began, RFC 3339. |
+| `recovered_at` | When the last degraded-to-healthy transition happened, or `null`. |
+| `last_operation` | The reserve operation that last set the state: `initialize`, `get`, `put`, `delete`, or `evict`. |
+| `reason_code` | Bounded reason for a degraded state, or `null` when healthy. |
+| `last_error` | Bounded error string for a degraded state, or `null`. |
+
+`reason_code` and `last_error` are both bounded, operator-facing
+constants rather than pass-through backend text, so a monitoring script
+can match on them.
+
+### `GET /admin/federation`
+
+OpenID Federation identity and peer trust. Returns `{"enabled": false}`
+when `proxy.federation` is absent or disabled, so a poll can tell "off"
+from a typo in the path. Both `admin` and `read_only` operators may call
+it.
+
+```json
+{
+  "enabled": true,
+  "entity_id": "https://gateway.acme.example",
+  "signing_algorithm": "ES256",
+  "signing_kid": "fed-2026q3",
+  "published_keys": 1,
+  "authority_hints": 1,
+  "trust_marks": 0,
+  "metadata_policy_configured": false,
+  "lifetime_secs": 86400,
+  "refresh_margin_secs": 7800,
+  "cache_remaining_secs": 79211,
+  "peer_trust": {
+    "configured": true,
+    "required": false,
+    "header": "x-federation-entity-id",
+    "pinned_anchors": 1,
+    "cached_peer_decisions": 3
+  }
+}
+```
+
+`cache_remaining_secs` is `null` when the signing key cannot produce a
+statement, which is the same failure
+`GET /.well-known/openid-federation` answers 503 for; the rest of the
+response still comes back so an operator can check the configuration
+while it is broken. `peer_trust` is `{"configured": false}` when no
+`proxy.federation.peer_trust` block is set.
+
+This route is the federation crate's own `GET /admin/status` surface,
+served under the proxy's authenticated admin API because sbproxy serves
+the well-known route from the request path and never mounts that crate's
+router. An admin console page for it is separate scope, under the admin
+console epic; the JSON here is the operator surface today. See
+[federation.md](federation.md).
 
 ### `POST /admin/cache/purge`
 

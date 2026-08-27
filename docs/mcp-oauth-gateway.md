@@ -1,5 +1,5 @@
 # MCP OAuth gateway
-*Last modified: 2026-08-22*
+*Last modified: 2026-08-27*
 
 `sbproxy-mcp-gateway` provides the OAuth 2.1 broker and protected-resource
 authentication used by the live `action: {type: mcp}` request path. The
@@ -47,15 +47,21 @@ unrelated stale entries during normal reads and writes. Point multiple
 replicas at the same session state by constructing
 `sbproxy_storage::RedisStore` instead and passing it to the same
 constructors; nothing else in the broker's wiring changes. DPoP replay
-protection is atomic for callers sharing one in-process cache. A
-multi-replica store must provide an atomic consume-or-insert operation
-before it can give the same cross-replica guarantee.
+protection is atomic across replicas on any backend that implements
+`EphemeralKv::compare_exchange`, which is the atomic set-if-absent the
+jti claim uses; a backend without it refuses the proof rather than
+emulating the claim racily.
+
+That reconstruction is available to a **standalone** embedding only.
+The broker an `mcp` action compiles from `sb.yml` always uses the
+in-process store, because `oauth.broker` carries no key to point it
+somewhere else. Run that form on one replica; see
+[mcp.md](mcp.md#oauth-2-1-broker-and-resource-server).
 
 ## Quickstart
 
 ```bash
-CARGO_TARGET_DIR=target-infra-cluster \
-  MCP_GATEWAY_BASE_URL=http://127.0.0.1:8089 \
+MCP_GATEWAY_BASE_URL=http://127.0.0.1:8089 \
   cargo run -p sbproxy-mcp-gateway --example standalone_broker
 ```
 
@@ -98,10 +104,25 @@ McpGatewayConfig {
 ```
 
 Run `sbproxy_mcp_gateway::config::validate_startup(&config)` before
-binding a listener. It rejects a missing canonical public origin when
-DPoP is enabled and rejects replay retention shorter than twice the
-allowed clock skew. `MCP_GATEWAY_BASE_URL` remains a legacy override
-for standalone deployments.
+binding a listener. `MCP_GATEWAY_BASE_URL` remains a legacy override
+for standalone deployments. It refuses:
+
+- a `base_path` of `/` or empty, which would mount the broker's routes
+  over every path on the origin;
+- `device_code_enabled` with no `broker_signing_key`, since device
+  approval has nothing to mint a token with;
+- an advertised `token_endpoint_auth_method` the broker cannot parse
+  and forward;
+- DPoP enabled with no canonical public origin, so `htu` validation has
+  nothing to compose the token endpoint URL from;
+- `dpop_jti_ttl_secs` shorter than twice the allowed clock skew, which
+  would expire a replay entry while the proof it guards is still fresh;
+- a zero `session_ttl_secs`, and a zero `cimd_cache_ttl_secs` when CIMD
+  is on, either of which builds a store whose rows expire before the
+  round trip that would read them;
+- a `broker_signing_key` supplied as a PEM with no `public_jwk`, which
+  publishes an empty `/.well-known/jwks.json` while AS metadata
+  advertises that URL as where the key is.
 
 ## Resource-server provider
 
@@ -135,7 +156,7 @@ let provider = McpResourceServerProvider::new(McpResourceServerConfig {
     jwks_url: "https://idp.example.com/.well-known/jwks.json".to_string(),
     audience: AudienceConfig::Single("https://mcp.example.com".to_string()),
     dpop_enforce_binding: true,
-    ..
+    ..Default::default()
 })?;
 
 match provider.authenticate(auth_header, dpop_header, "GET", &request_url).await {
@@ -175,6 +196,7 @@ does (`prometheus::TextEncoder` over `prometheus::gather()`).
 | `sbproxy_mcp_gateway_token_requests_total` | counter | `outcome` (`issued`, `rejected`, `upstream_error`) | `/token` decisions. |
 | `sbproxy_mcp_gateway_dpop_proofs_total` | counter | `outcome` (`verified`, `rejected`, `nonce_required`) | RFC 9449 proof verification at `/token`. |
 | `sbproxy_mcp_gateway_revocation_introspection_requests_total` | counter | `endpoint` (`revoke`, `introspect`), `outcome` (`ok`, `error`) | `/revoke` and `/introspect` decisions. |
+| `sbproxy_mcp_gateway_decisions_total` | counter | `surface`, `decision` | Enforcement decisions no HTTP status alone reports. `resource_server`/`unauthenticated` is the verifier's 401. `scope`/`refused` is a token missing the operation's scope; `scope`/`admitted_unadvertised` is the fail-open where `oauth.scopes_supported` does not advertise it, so the check did not run. `authorize`/`rate_limited` and `par`/`rate_limited` are the fixed-window limiter; `authorize`/`session_capacity` is the session store full. `as_metadata`/`stale_fallback` is one request served from an upstream metadata document past its refresh interval, up to `metadata_max_staleness_secs` (3600 by default), which is a fail-open on the issuer the RFC 9207 `iss` check compares against: alert on it. `verify`/`csrf_refused` is a device-consent POST that failed its origin or form-token check. |
 | `sbproxy_mcp_gateway_sessions_active` | gauge | none | In-flight authorization sessions held by the in-memory session store, written on every put, take, and expiry sweep. A deployment on the storage-backed session store reads zero here, because counting those needs a `SCAN`; read the gauge as "in-memory sessions", not as "sessions". A caller keeping its own ledger can write it with `metrics::record_sessions_active(live)`. |
 
 The outcome labels are deliberately coarse: recovering the specific
@@ -244,11 +266,50 @@ The same endpoint is available from the integrated MCP action and the
 standalone axum router. It is a small JSON surface an operator or
 script can poll without a Prometheus query client.
 
+`/admin/status` is mounted only for a standalone embedding. Inside
+sbproxy the whole broker route tree is dispatched on the public MCP
+origin ahead of the resource-server check, and the OAuth routes have to
+stay unauthenticated for the flow to work at all, so the route would
+answer "which security controls are off" to anyone who asked. The
+colocated form does not mount it; the proxy's own authenticated admin
+API is where that belongs.
+
+## The device-consent page
+
+`GET {base_path}/verify` renders a placeholder consent page and
+`POST {base_path}/verify` acts on it. Both require a user the host
+process already authenticated, and the POST requires two things beyond
+that, because approving mints an access token carrying the browser
+user's own `sub` from ambient credentials:
+
+- **A same-origin `Origin` or `Referer`**, checked against the origin of
+  `device_code_verification_uri`. A request carrying neither is refused:
+  every browser that can submit this form sends `Origin` on a POST, so
+  a submission with no origin evidence at all is not the consent page.
+- **A single-use `form_token`**, minted by the GET and bound to the
+  signed-in subject. A token minted for one user cannot approve as
+  another, and it is consumed on use.
+
+Both responses carry `Cache-Control: no-store`, `X-Frame-Options: DENY`,
+and `Content-Security-Policy: frame-ancestors 'none'`, so the Approve
+button cannot be clickjacked out of an iframe.
+
+**Operator requirement.** Set the session cookie your auth provider
+issues to `SameSite=Lax` or stricter. The origin check and the form
+token are the defense the broker can enforce; `SameSite` is the one only
+your cookie can. If you replace the built-in page with a branded one,
+keep the contract: the POST needs `user_code`, an `action` of exactly
+`approve` or `deny`, and the `form_token` the GET rendered.
+
+Every refusal here writes
+`sbproxy_mcp_gateway_decisions_total{surface="verify",decision="csrf_refused"}`
+and one `mcp_gateway::decision` log line.
+
 ## Adversarial coverage
 
 `tests/prompt_injection_corpus.rs` drives
 [`tests/corpora/prompt_injection.json`](../crates/sbproxy-mcp-gateway/tests/corpora/prompt_injection.json)
-against the broker: 26 entries across six threat categories (tool
+against the broker: 28 entries across six threat categories (tool
 description injection, tool-result injection, scope escalation,
 confused-deputy forwarding, replay, and cross-tenant session
 collision), each asserting one of `blocked`, `sanitized`, or

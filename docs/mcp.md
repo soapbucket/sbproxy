@@ -577,6 +577,19 @@ oauth:
       pem: "${MCP_BROKER_SIGNING_KEY_PEM}"
       alg: ES256
       kid: broker-2026-08
+      # The public half of the same key, with the same kid and alg.
+      # Required: without it `/.well-known/jwks.json` serves an empty
+      # key set while AS metadata advertises that URL as where the key
+      # is, and every verifier that follows discovery rejects every
+      # token this broker mints. Startup refuses the combination.
+      public_jwk:
+        kty: EC
+        crv: P-256
+        kid: broker-2026-08
+        alg: ES256
+        use: sig
+        x: "${MCP_BROKER_SIGNING_KEY_X}"
+        y: "${MCP_BROKER_SIGNING_KEY_Y}"
   resource_server:
     resource_uri: https://mcp.example.com/
     authorization_servers: ["https://mcp.example.com/mcp/oauth"]
@@ -594,6 +607,31 @@ The device verification route receives user identity only from
 sbproxy's completed authentication phase, and mTLS bindings receive a
 certificate thumbprint only from the verified TLS connection.
 
+When `resource_server.jwks_url` is the colocated broker's own
+`/.well-known/jwks.json`, as above, the verifier takes the key set from
+the broker in process and makes no HTTP request for it. That matters in
+a cluster: `mcp.example.com` resolves inside a pod to a private address
+or to a load-balancer VIP the pod cannot hairpin, and the OAuth egress
+policy refuses both, so a network fetch of the proxy's own JWKS URL
+would 401 every MCP request.
+
+**One replica per broker.** The colocated broker holds its authorization
+sessions, device codes, and PAR entries in the process that started
+them, and `oauth.broker` has no key to point them at a shared store. A
+second replica behind a load balancer receives the `/callback` for a
+session replica one holds and rejects it, so roughly two logins in three
+fail on three replicas. Run the broker-bearing action on one replica, or
+embed the broker standalone against `sbproxy_storage::RedisStore` per
+[mcp-oauth-gateway.md](mcp-oauth-gateway.md#storage-in-process-by-default-redis-for-multiple-replicas).
+A multi-replica store selector under `oauth.broker` is not shipped.
+
+Every refusal this surface makes is visible: the resource server's 401,
+the per-operation scope refusal, and each broker endpoint's 4xx write
+`sbproxy_mcp_gateway_decisions_total{surface,decision}`, one
+`mcp_gateway::decision` log line, and a typed decision-audit record
+(`auth` for the broker and the verifier, `mcp.tool` for the scope
+refusal). See [events.md](events.md).
+
 With a `resource_server`, the verified token's scopes are also checked
 per operation. `tools/call` needs `mcp.call`; every other method needs
 `mcp.read`. A request whose token carries neither gets a JSON-RPC
@@ -607,8 +645,18 @@ and sbproxy does not enforce a per-operation mapping over it; the
 authorization server owns that decision instead. Audience, issuer,
 expiry, DPoP, and mTLS binding are checked either way.
 
+That is a fail-open, and it is counted as one: every request the check
+does not apply to increments
+`sbproxy_mcp_gateway_decisions_total{surface="scope",decision="admitted_unadvertised"}`
+and logs one line naming the scope that went unchecked. Watch it if you
+publish a partial vocabulary. Advertising `["mcp.read"]` alone on an
+action you meant to keep read-only admits every `tools/call`, because
+`mcp.call` is not in the list for the check to enforce.
+
 See [`examples/mcp-oauth-discovery`](../examples/mcp-oauth-discovery)
-for the discovery-only shape. The full broker behavior and standalone
+for the discovery-only shape and
+[`examples/mcp-oauth-broker`](../examples/mcp-oauth-broker) for the
+colocated broker plus resource server above, as a runnable `sb.yml`. The full broker behavior and standalone
 embedding API are documented in
 [mcp-oauth-gateway.md](mcp-oauth-gateway.md).
 
