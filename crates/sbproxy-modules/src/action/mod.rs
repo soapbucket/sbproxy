@@ -970,8 +970,69 @@ impl Action {
     /// body-reading header rule at config compile rather than accepting
     /// one that would silently read an empty body.
     pub const fn buffers_response_before_headers(&self) -> bool {
-        matches!(self, Self::Static(_) | Self::Mock(_) | Self::Plugin(_))
+        matches!(
+            self.response_transform_phase(),
+            ResponseTransformPhase::Buffered
+        )
     }
+
+    /// Which phase, if any, evaluates this action's origin response
+    /// transforms.
+    ///
+    /// Three answers, not two, because "does not buffer" and "runs in
+    /// the streaming header phase" are different facts and conflating
+    /// them is what left ten actions with header rules that ran in no
+    /// phase at all (WOR-2630).
+    ///
+    /// A new action defaults to [`ResponseTransformPhase::None`], the
+    /// fail-closed answer: a `cel` header rule on it is refused at
+    /// config compile rather than accepted and never run.
+    pub const fn response_transform_phase(&self) -> ResponseTransformPhase {
+        match self {
+            // Builds a complete status, header list, and body in the
+            // request phase and writes them together, so a rule can see
+            // the body and still change a header.
+            Self::Static(_) | Self::Mock(_) | Self::Plugin(_) => ResponseTransformPhase::Buffered,
+            // Streams an upstream response. Origin transforms run in
+            // `response_filter`, which owns the real status and the
+            // real upstream headers and runs before the first body byte
+            // arrives.
+            Self::Proxy(_) | Self::LoadBalancer(_) | Self::A2a(_) => {
+                ResponseTransformPhase::Streaming
+            }
+            // Settles locally without ever running the origin transform
+            // chain. A `headers:` rule configured against one of these
+            // has no phase to run in at all.
+            Self::Redirect(_)
+            | Self::Echo(_)
+            | Self::Beacon(_)
+            | Self::AiProxy(_)
+            | Self::WebSocket(_)
+            | Self::Grpc(_)
+            | Self::GraphQL(_)
+            | Self::Storage(_)
+            | Self::Mcp(_)
+            | Self::Noop => ResponseTransformPhase::None,
+        }
+    }
+}
+
+/// Which phase evaluates an action's origin response transforms.
+///
+/// The two live phases bind different halves of the response and no
+/// phase binds both: see `sbproxy_modules::transform::CelHeaderPhase`
+/// for what each one can serve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseTransformPhase {
+    /// The action buffers its whole response and evaluates transforms
+    /// before it writes any header.
+    Buffered,
+    /// The action streams an upstream response and evaluates transforms
+    /// in `response_filter`, after the headers exist and before the
+    /// body does.
+    Streaming,
+    /// The action never runs the origin transform chain.
+    None,
 }
 
 impl std::fmt::Debug for Action {

@@ -129,27 +129,156 @@ pub struct CelResponseRequestView<'a> {
     pub headless: Option<HeadlessSignalView<'a>>,
 }
 
-/// Whether an authored CEL expression reads the response body.
+/// Whether an authored CEL expression reads `response.<field>`.
 ///
 /// Textual, because the compiled program exposes only its top-level
-/// variable names and every rule here references `response`. The three
-/// forms below are the ones CEL itself accepts for a field of a map;
-/// `response.body_size` is excluded because it is a different binding
-/// and belongs to the assertion surface, not this one.
-fn expression_reads_response_body(expression: &str) -> bool {
-    if expression.contains("response[\"body\"]") || expression.contains("response['body']") {
-        return true;
-    }
-    let mut rest = expression;
-    while let Some(at) = rest.find("response.body") {
-        let after = &rest[at + "response.body".len()..];
-        let next = after.chars().next();
-        if !next.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
-            return true;
+/// variable names and every rule here references `response`. The
+/// scanner walks the source once, tracking string-literal state, and
+/// accepts the three forms CEL itself allows for a field of a map:
+/// `response.field`, `response["field"]`, and `response['field']`.
+///
+/// Two properties the earlier substring scan did not have, both of
+/// which changed a real answer:
+///
+/// * A literal that merely mentions the name is not a reference.
+///   `value_expr: '"see response.body in the docs"'` used to refuse the
+///   config at boot.
+/// * Whitespace inside the index does not hide the reference.
+///   `response[ "body" ]` used to escape the check entirely and reach
+///   the runtime, where the phase that cannot serve it binds the empty
+///   string.
+///
+/// A sibling binding with a longer name is still not a match:
+/// `response.body_size` is its own field and belongs to the assertion
+/// surface, not this one. What the scanner cannot see is a reference
+/// reached through a `cel.bind` alias or assembled by string
+/// concatenation; those reach the runtime.
+fn expression_reads_response_field(expression: &str, field: &str) -> bool {
+    let bytes = expression.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            quote @ (b'"' | b'\'') => {
+                // Skip the whole literal, escapes included, so a name
+                // inside it is prose rather than a reference.
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            _ => {
+                if !starts_identifier(bytes, i, b"response") {
+                    i += 1;
+                    continue;
+                }
+                let mut j = i + "response".len();
+                j = skip_ascii_whitespace(bytes, j);
+                if j < bytes.len() && bytes[j] == b'.' {
+                    let start = skip_ascii_whitespace(bytes, j + 1);
+                    let mut end = start;
+                    while end < bytes.len()
+                        && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
+                    {
+                        end += 1;
+                    }
+                    if &bytes[start..end] == field.as_bytes() {
+                        return true;
+                    }
+                } else if j < bytes.len() && bytes[j] == b'[' {
+                    let start = skip_ascii_whitespace(bytes, j + 1);
+                    if start < bytes.len() && (bytes[start] == b'"' || bytes[start] == b'\'') {
+                        let quote = bytes[start];
+                        let mut end = start + 1;
+                        while end < bytes.len() && bytes[end] != quote {
+                            end += 1;
+                        }
+                        if &bytes[start + 1..end.min(bytes.len())] == field.as_bytes() {
+                            return true;
+                        }
+                    }
+                }
+                i += "response".len();
+            }
         }
-        rest = after;
     }
     false
+}
+
+/// Whether `needle` sits at `at` as a whole identifier.
+fn starts_identifier(bytes: &[u8], at: usize, needle: &[u8]) -> bool {
+    if !bytes[at..].starts_with(needle) {
+        return false;
+    }
+    if at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_') {
+        return false;
+    }
+    let after = at + needle.len();
+    !(after < bytes.len() && (bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_'))
+}
+
+/// Index of the first non-space byte at or after `at`.
+fn skip_ascii_whitespace(bytes: &[u8], at: usize) -> usize {
+    let mut i = at;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// Which response phase a `headers:` rule set is being evaluated in.
+///
+/// The two phases bind different halves of the response, and no phase
+/// binds both. An action that buffers its whole response before it
+/// writes a header (`static`, `mock`, `plugin`) evaluates against the
+/// real body and does not yet own a response header map. An action that
+/// streams an upstream response evaluates in `response_filter`, which
+/// owns the real status and the real upstream headers and runs before
+/// the first body byte arrives. A rule reaching for the half its phase
+/// does not have is skipped and counted rather than resolved against an
+/// empty value (WOR-2630).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CelHeaderPhase {
+    /// The buffered own-write phase: real body, no response headers.
+    BufferedBody,
+    /// The streaming header phase: real status and headers, no body.
+    StreamingHeaders,
+}
+
+impl CelHeaderPhase {
+    /// The `reason` an out-of-phase skip is recorded under.
+    ///
+    /// A closed value: one literal per variant, never derived from the
+    /// authored expression or a header name.
+    #[must_use]
+    pub const fn unavailable_reason(self) -> &'static str {
+        match self {
+            Self::BufferedBody => "response_headers_unavailable",
+            Self::StreamingHeaders => "response_body_unavailable",
+        }
+    }
+}
+
+/// What one `headers:` rule's expression reaches for.
+///
+/// Computed once at config compile, so the per-request phase check is a
+/// bool read rather than a scan of the authored text.
+#[derive(Debug, Clone, Copy, Default)]
+struct CelHeaderRuleNeeds {
+    /// The expression reads `response.body`.
+    body: bool,
+    /// The expression reads `response.headers`.
+    headers: bool,
+}
+
+impl CelHeaderRuleNeeds {
+    /// Whether `phase` can serve this rule.
+    const fn servable_in(self, phase: CelHeaderPhase) -> bool {
+        match phase {
+            CelHeaderPhase::BufferedBody => !self.headers,
+            CelHeaderPhase::StreamingHeaders => !self.body,
+        }
+    }
 }
 
 /// Headers a CEL expression is not allowed to mutate. Case-insensitive
@@ -224,6 +353,10 @@ pub struct CelScriptTransform {
     /// index-aligned with [`Self::headers`]. `remove` rules carry no
     /// expression and hold `None`.
     compiled_headers: Vec<Option<CompiledCel>>,
+    /// What each rule's expression reaches for, index-aligned with
+    /// [`Self::headers`]. Decided once at compile so the per-request
+    /// phase gate never rescans the authored text (WOR-2630).
+    rule_needs: Vec<CelHeaderRuleNeeds>,
 }
 
 impl CelScriptTransform {
@@ -330,9 +463,24 @@ impl CelScriptTransform {
             compiled_headers.push(compiled);
         }
 
+        // WOR-2630: what each rule reaches for, decided once here so
+        // the per-request phase gate is a bool read.
+        let rule_needs = cfg
+            .headers
+            .iter()
+            .map(|rule| {
+                let expression = rule.value_expr.as_deref().unwrap_or_default();
+                CelHeaderRuleNeeds {
+                    body: expression_reads_response_field(expression, "body"),
+                    headers: expression_reads_response_field(expression, "headers"),
+                }
+            })
+            .collect();
+
         Ok(Self {
             headers: cfg.headers,
             compiled_headers,
+            rule_needs,
         })
     }
 
@@ -356,11 +504,53 @@ impl CelScriptTransform {
     /// streaming header phase binds the body as the empty string.
     #[must_use]
     pub fn header_rule_reading_response_body(&self) -> Option<&CelHeaderRule> {
-        self.headers.iter().find(|rule| {
-            rule.value_expr
-                .as_deref()
-                .is_some_and(expression_reads_response_body)
-        })
+        self.headers
+            .iter()
+            .zip(self.rule_needs.iter())
+            .find_map(|(rule, needs)| needs.body.then_some(rule))
+    }
+
+    /// The first `headers:` rule whose expression reads
+    /// `response.headers`.
+    ///
+    /// The mirror of [`Self::header_rule_reading_response_body`], and
+    /// the reason the two exist as a pair: no phase binds both halves
+    /// of the response. An action that buffers its whole response
+    /// before writing a header has the body and does not yet own a
+    /// response header map, so a rule reading `response.headers` has no
+    /// phase to run in there, exactly as a rule reading `response.body`
+    /// has none on a streaming action. The pipeline compiler in
+    /// `sbproxy-core` refuses a rule no route on the origin can serve
+    /// and names the rule this returns (WOR-2630).
+    ///
+    /// Same textual limits as its sibling: see
+    /// [`expression_reads_response_field`].
+    #[must_use]
+    pub fn header_rule_reading_response_headers(&self) -> Option<&CelHeaderRule> {
+        self.headers
+            .iter()
+            .zip(self.rule_needs.iter())
+            .find_map(|(rule, needs)| needs.headers.then_some(rule))
+    }
+
+    /// Names of the `headers:` rules `phase` cannot serve, in config
+    /// order.
+    ///
+    /// The call site evaluates the rest and records one skip per name
+    /// here, so a rule that does not run on this route is counted
+    /// rather than resolved against an empty body or an empty header
+    /// map. An origin whose every route is the wrong phase for a rule
+    /// is refused at config compile instead, so a non-empty return here
+    /// always means another route on the same origin can serve it.
+    pub fn header_rules_out_of_phase(
+        &self,
+        phase: CelHeaderPhase,
+    ) -> impl Iterator<Item = &str> + '_ {
+        self.headers
+            .iter()
+            .zip(self.rule_needs.iter())
+            .filter(move |(_, needs)| !needs.servable_in(phase))
+            .map(|(rule, _)| rule.name.as_str())
     }
 
     /// Evaluate the configured `headers` rules against the live
@@ -381,23 +571,32 @@ impl CelScriptTransform {
     /// which drops invariant errors after logging them.
     pub fn evaluate_headers(
         &self,
+        phase: CelHeaderPhase,
         body: &[u8],
         status: u16,
         headers: &HeaderMap,
     ) -> Result<Vec<CelHeaderMutation>, crate::transform::TransformError> {
-        self.evaluate_headers_with_request(body, status, headers, CelResponseRequestView::default())
+        self.evaluate_headers_with_request(
+            phase,
+            body,
+            status,
+            headers,
+            CelResponseRequestView::default(),
+        )
     }
 
     /// Compatibility wrapper around [`Self::evaluate_headers_with_request`]
     /// for callers that only need `request.tls.*`.
     pub fn evaluate_headers_with_tls(
         &self,
+        phase: CelHeaderPhase,
         body: &[u8],
         status: u16,
         headers: &HeaderMap,
         tls: Option<TlsFingerprintView<'_>>,
     ) -> Result<Vec<CelHeaderMutation>, crate::transform::TransformError> {
         self.evaluate_headers_with_request(
+            phase,
             body,
             status,
             headers,
@@ -413,6 +612,7 @@ impl CelScriptTransform {
     /// and `request.headless_signal.*` resolve inside `value_expr`.
     pub fn evaluate_headers_with_request(
         &self,
+        phase: CelHeaderPhase,
         body: &[u8],
         status: u16,
         headers: &HeaderMap,
@@ -423,7 +623,19 @@ impl CelScriptTransform {
         }
         let ctx = build_response_eval_context(body, status, headers, &request);
         let mut out = Vec::with_capacity(self.headers.len());
-        for (rule, compiled) in self.headers.iter().zip(self.compiled_headers.iter()) {
+        for ((rule, compiled), needs) in self
+            .headers
+            .iter()
+            .zip(self.compiled_headers.iter())
+            .zip(self.rule_needs.iter())
+        {
+            // WOR-2630: a rule reaching for the half of the response
+            // this phase does not bind is skipped, not resolved against
+            // an empty value. The caller counts it; see
+            // [`Self::header_rules_out_of_phase`].
+            if !needs.servable_in(phase) {
+                continue;
+            }
             match rule.op {
                 CelHeaderOp::Remove => {
                     out.push(CelHeaderMutation::Remove(rule.name.clone()));
@@ -522,11 +734,13 @@ impl CelScriptTransform {
     /// loses the partial-rule chain rather than the whole response.
     pub fn evaluate_headers_lossy(
         &self,
+        phase: CelHeaderPhase,
         body: &[u8],
         status: u16,
         headers: &HeaderMap,
     ) -> Vec<CelHeaderMutation> {
         self.evaluate_headers_lossy_with_request(
+            phase,
             body,
             status,
             headers,
@@ -538,12 +752,14 @@ impl CelScriptTransform {
     /// for callers that only need `request.tls.*`.
     pub fn evaluate_headers_lossy_with_tls(
         &self,
+        phase: CelHeaderPhase,
         body: &[u8],
         status: u16,
         headers: &HeaderMap,
         tls: Option<TlsFingerprintView<'_>>,
     ) -> Vec<CelHeaderMutation> {
         self.evaluate_headers_lossy_with_request(
+            phase,
             body,
             status,
             headers,
@@ -559,12 +775,13 @@ impl CelScriptTransform {
     /// logging.
     pub fn evaluate_headers_lossy_with_request(
         &self,
+        phase: CelHeaderPhase,
         body: &[u8],
         status: u16,
         headers: &HeaderMap,
         request: CelResponseRequestView<'_>,
     ) -> Vec<CelHeaderMutation> {
-        match self.evaluate_headers_with_request(body, status, headers, request) {
+        match self.evaluate_headers_with_request(phase, body, status, headers, request) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
@@ -760,28 +977,157 @@ mod tests {
     }
 
     #[test]
-    fn index_syntax_and_only_index_syntax_counts_as_a_body_reference() {
+    fn every_form_cel_accepts_for_a_field_counts_as_a_reference() {
         for expression in [
             "response.body",
             "size(response.body) > 0",
             "response[\"body\"]",
             "response['body']",
+            // Whitespace inside the index used to escape the check
+            // entirely, so the rule reached a phase that binds the
+            // empty string and wrote the wrong header (WOR-2630 fix
+            // round 2).
+            "response[ \"body\" ]",
+            "response [ 'body' ]",
         ] {
             assert!(
-                super::expression_reads_response_body(expression),
+                super::expression_reads_response_field(expression, "body"),
                 "must see a body reference in {expression}"
             );
         }
         for expression in [
             "string(response.status)",
             "response.headers['x-trace']",
+            // The documented carve-out. `response.body_size` is its own
+            // binding, and an edit that dropped the identifier-boundary
+            // check would refuse a config that reads it on a streaming
+            // origin.
+            "response.body_size",
+            "string(response.body_size)",
             "request.body_size",
+            // A literal that merely names the field is prose. This one
+            // used to refuse the config at boot.
+            "\"see response.body in the docs\"",
+            "'response[\\'body\\'] is documented'",
+            // A longer identifier ending in `response` is not the
+            // `response` binding.
+            "my_response.body",
         ] {
             assert!(
-                !super::expression_reads_response_body(expression),
+                !super::expression_reads_response_field(expression, "body"),
                 "must not see a body reference in {expression}"
             );
         }
+    }
+
+    #[test]
+    fn the_header_namespace_is_detected_the_same_way_the_body_is() {
+        // The two halves are symmetric: no phase binds both, so each
+        // needs its own detector and they have to agree on what counts.
+        for expression in [
+            "response.headers['x-trace']",
+            "response[\"headers\"]",
+            "response[ 'headers' ]",
+            "has(response.headers)",
+        ] {
+            assert!(
+                super::expression_reads_response_field(expression, "headers"),
+                "must see a header reference in {expression}"
+            );
+        }
+        for expression in [
+            "string(response.status)",
+            "size(response.body)",
+            "request.headers['x-trace']",
+            "\"response.headers is a namespace\"",
+        ] {
+            assert!(
+                !super::expression_reads_response_field(expression, "headers"),
+                "must not see a header reference in {expression}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_header_rule_reading_the_response_headers_is_reported_by_name() {
+        // WOR-2630 fix round 2: the mirror of the body case. A buffered
+        // own-write action has the body and no response header map, so
+        // this rule has no phase to run in there and the compiler needs
+        // its name.
+        let transform = CelScriptTransform::from_config(serde_json::json!({
+            "headers": [
+                {"op": "set", "name": "x-status", "value_expr": "string(response.status)"},
+                {"op": "set", "name": "x-echo", "value_expr": "response.headers['x-trace']"}
+            ]
+        }))
+        .expect("both expressions compile");
+        assert_eq!(
+            transform
+                .header_rule_reading_response_headers()
+                .map(|rule| rule.name.as_str()),
+            Some("x-echo")
+        );
+        assert!(transform.header_rule_reading_response_body().is_none());
+    }
+
+    #[test]
+    fn a_rule_the_phase_cannot_serve_is_skipped_rather_than_resolved_empty() {
+        // The mixed-route case the forward-rule carve-out admits: one
+        // origin, one transform, two routes whose phases bind different
+        // halves of the response. Before this, the streaming route
+        // evaluated the body rule against `b""` and wrote
+        // `x-body-len: 0` with no error, log, metric, or event.
+        let transform = CelScriptTransform::from_config(serde_json::json!({
+            "headers": [
+                {"op": "set", "name": "x-status", "value_expr": "string(response.status)"},
+                {"op": "set", "name": "x-body-len", "value_expr": "string(size(response.body))"}
+            ]
+        }))
+        .expect("both expressions compile");
+
+        let streaming = transform
+            .evaluate_headers(
+                CelHeaderPhase::StreamingHeaders,
+                b"twelve bytes",
+                200,
+                &HeaderMap::new(),
+            )
+            .expect("the streaming phase evaluates what it can serve");
+        assert_eq!(
+            streaming,
+            vec![CelHeaderMutation::Set("x-status".into(), "200".into())],
+            "the body rule must not run in a phase with no body"
+        );
+        assert_eq!(
+            transform
+                .header_rules_out_of_phase(CelHeaderPhase::StreamingHeaders)
+                .collect::<Vec<_>>(),
+            vec!["x-body-len"],
+            "the skipped rule is named so the call site can count it"
+        );
+
+        let buffered = transform
+            .evaluate_headers(
+                CelHeaderPhase::BufferedBody,
+                b"twelve bytes",
+                200,
+                &HeaderMap::new(),
+            )
+            .expect("the buffered phase evaluates what it can serve");
+        assert_eq!(
+            buffered,
+            vec![
+                CelHeaderMutation::Set("x-status".into(), "200".into()),
+                CelHeaderMutation::Set("x-body-len".into(), "12".into()),
+            ],
+            "the route that owns the body runs the body rule against it"
+        );
+        assert_eq!(
+            transform
+                .header_rules_out_of_phase(CelHeaderPhase::BufferedBody)
+                .count(),
+            0
+        );
     }
 
     #[test]
@@ -793,7 +1139,14 @@ mod tests {
             ],
         });
         let t = CelScriptTransform::from_config(v).unwrap();
-        let mutations = t.evaluate_headers(b"", 418, &HeaderMap::new()).unwrap();
+        let mutations = t
+            .evaluate_headers(
+                CelHeaderPhase::StreamingHeaders,
+                b"",
+                418,
+                &HeaderMap::new(),
+            )
+            .unwrap();
         assert_eq!(
             mutations,
             vec![CelHeaderMutation::Set(
@@ -822,7 +1175,13 @@ mod tests {
             trustworthy: true,
         };
         let mutations = t
-            .evaluate_headers_with_tls(b"", 200, &HeaderMap::new(), Some(view))
+            .evaluate_headers_with_tls(
+                CelHeaderPhase::StreamingHeaders,
+                b"",
+                200,
+                &HeaderMap::new(),
+                Some(view),
+            )
             .unwrap();
         assert_eq!(
             mutations,
@@ -864,7 +1223,13 @@ mod tests {
             }),
         };
         let mutations = t
-            .evaluate_headers_with_request(b"", 200, &HeaderMap::new(), request)
+            .evaluate_headers_with_request(
+                CelHeaderPhase::StreamingHeaders,
+                b"",
+                200,
+                &HeaderMap::new(),
+                request,
+            )
             .unwrap();
         assert_eq!(
             mutations,
@@ -893,7 +1258,14 @@ mod tests {
             ],
         });
         let t = CelScriptTransform::from_config(v).unwrap();
-        let mutations = t.evaluate_headers(b"", 200, &HeaderMap::new()).unwrap();
+        let mutations = t
+            .evaluate_headers(
+                CelHeaderPhase::StreamingHeaders,
+                b"",
+                200,
+                &HeaderMap::new(),
+            )
+            .unwrap();
         assert_eq!(
             mutations,
             vec![CelHeaderMutation::Set(
@@ -911,7 +1283,14 @@ mod tests {
             "headers": [{"op": "remove", "name": "x-internal-trace"}],
         });
         let t = CelScriptTransform::from_config(v).unwrap();
-        let mutations = t.evaluate_headers(b"", 200, &HeaderMap::new()).unwrap();
+        let mutations = t
+            .evaluate_headers(
+                CelHeaderPhase::StreamingHeaders,
+                b"",
+                200,
+                &HeaderMap::new(),
+            )
+            .unwrap();
         assert_eq!(
             mutations,
             vec![CelHeaderMutation::Remove("x-internal-trace".to_string())]
@@ -954,7 +1333,14 @@ mod tests {
             ],
         });
         let t = CelScriptTransform::from_config(v).unwrap();
-        let mutations = t.evaluate_headers(b"", 200, &HeaderMap::new()).unwrap();
+        let mutations = t
+            .evaluate_headers(
+                CelHeaderPhase::StreamingHeaders,
+                b"",
+                200,
+                &HeaderMap::new(),
+            )
+            .unwrap();
         assert_eq!(
             mutations,
             vec![CelHeaderMutation::Set(
@@ -1133,7 +1519,13 @@ mod tests {
         let after_load = cel_compile_count();
 
         for _ in 0..EVALUATIONS {
-            t.evaluate_headers(b"", 200, &HeaderMap::new()).unwrap();
+            t.evaluate_headers(
+                CelHeaderPhase::StreamingHeaders,
+                b"",
+                200,
+                &HeaderMap::new(),
+            )
+            .unwrap();
         }
 
         let added = cel_compile_count() - after_load;
@@ -1230,7 +1622,12 @@ mod tests {
             "headers": [{"op": "remove", "name": "x-internal-trace"}],
         });
         let t = CelScriptTransform::from_config(v).unwrap();
-        let mutations = t.evaluate_headers_lossy(b"", 200, &HeaderMap::new());
+        let mutations = t.evaluate_headers_lossy(
+            CelHeaderPhase::StreamingHeaders,
+            b"",
+            200,
+            &HeaderMap::new(),
+        );
         assert_eq!(
             mutations,
             vec![CelHeaderMutation::Remove("x-internal-trace".to_string())]
@@ -1261,7 +1658,14 @@ mod tests {
             ],
         });
         let t = CelScriptTransform::from_config(v).unwrap();
-        let mutations = t.evaluate_headers(b"", 200, &HeaderMap::new()).unwrap();
+        let mutations = t
+            .evaluate_headers(
+                CelHeaderPhase::StreamingHeaders,
+                b"",
+                200,
+                &HeaderMap::new(),
+            )
+            .unwrap();
         assert_eq!(
             mutations,
             vec![CelHeaderMutation::Set(
@@ -1282,7 +1686,9 @@ mod tests {
         let t = CelScriptTransform::from_config(v).unwrap();
         let mut h = HeaderMap::new();
         h.insert("x-custom", "hello-from-header".parse().unwrap());
-        let mutations = t.evaluate_headers(b"", 200, &h).unwrap();
+        let mutations = t
+            .evaluate_headers(CelHeaderPhase::StreamingHeaders, b"", 200, &h)
+            .unwrap();
         assert_eq!(
             mutations,
             vec![CelHeaderMutation::Set(
@@ -1325,7 +1731,14 @@ mod tests {
             ],
         });
         let t = CelScriptTransform::from_config(v).unwrap();
-        let mutations = t.evaluate_headers(b"", 200, &HeaderMap::new()).unwrap();
+        let mutations = t
+            .evaluate_headers(
+                CelHeaderPhase::StreamingHeaders,
+                b"",
+                200,
+                &HeaderMap::new(),
+            )
+            .unwrap();
         assert_eq!(
             mutations,
             vec![CelHeaderMutation::Set(
@@ -1345,7 +1758,14 @@ mod tests {
             ],
         });
         let t = CelScriptTransform::from_config(v).unwrap();
-        let mutations = t.evaluate_headers(b"", 418, &HeaderMap::new()).unwrap();
+        let mutations = t
+            .evaluate_headers(
+                CelHeaderPhase::StreamingHeaders,
+                b"",
+                418,
+                &HeaderMap::new(),
+            )
+            .unwrap();
         let CelHeaderMutation::Set(name, value) = &mutations[0] else {
             panic!("expected a Set mutation, got {mutations:?}");
         };

@@ -731,12 +731,22 @@ pub(super) async fn handle_action(
             // Set / Append both surface as `extra_headers` entries;
             // Remove is folded in below by deleting the matching
             // entries before the response builder runs.
+            //
+            // WOR-2630 fix round 2: `set` and `append` are kept apart.
+            // `extra_headers` is applied with `insert_header`, which
+            // replaces, so folding `append` into it made two `append`
+            // rules for one header emit only the second value here
+            // while the identical config on a `mock` or `plugin` origin
+            // emitted both.
             let mut cel_header_removals: Vec<String> = Vec::new();
+            let mut cel_header_appends: Vec<(String, String)> = Vec::new();
             for m in std::mem::take(&mut ctx.cel_response_header_mutations) {
                 match m {
-                    sbproxy_modules::transform::CelHeaderMutation::Set(k, v)
-                    | sbproxy_modules::transform::CelHeaderMutation::Append(k, v) => {
+                    sbproxy_modules::transform::CelHeaderMutation::Set(k, v) => {
                         extra_headers.push((k, v));
+                    }
+                    sbproxy_modules::transform::CelHeaderMutation::Append(k, v) => {
+                        cel_header_appends.push((k, v));
                     }
                     sbproxy_modules::transform::CelHeaderMutation::Remove(k) => {
                         cel_header_removals.push(k);
@@ -892,6 +902,18 @@ pub(super) async fn handle_action(
                     continue;
                 }
                 let _ = header.insert_header(k.clone(), v.clone());
+            }
+            // WOR-2630: `op: append` adds a value beside any already
+            // there, which is what the `mock` and `plugin` arms do and
+            // what the operator asked for.
+            for (k, v) in &cel_header_appends {
+                if cel_header_removals
+                    .iter()
+                    .any(|r| r.eq_ignore_ascii_case(k))
+                {
+                    continue;
+                }
+                let _ = header.append_header(k.clone(), v.clone());
             }
             // Final pass: stamp explicit removals so any header set
             // by an earlier middleware (cors, hsts, content-signal)
@@ -1450,8 +1472,17 @@ pub(super) async fn handle_action(
                         // The chain that produced these mutations
                         // faulted and its body is gone, so the headers
                         // it asked for go with it rather than riding
-                        // on the 500.
-                        ctx.cel_response_header_mutations.clear();
+                        // on the 500. Counted rather than dropped
+                        // quietly: a mutation an operator configured
+                        // that never reaches the wire is a fact they
+                        // get to see (WOR-2630).
+                        if !ctx.cel_response_header_mutations.is_empty() {
+                            crate::server::record_stranded_cel_header_mutation(
+                                ctx.hostname.as_str(),
+                                crate::server::CEL_MUTATIONS_DROPPED_REASON,
+                            );
+                            ctx.cel_response_header_mutations.clear();
+                        }
                         set_plugin_action_response_header(
                             &mut headers,
                             "content-type",
@@ -2389,6 +2420,160 @@ origins:
         assert!(
             response.starts_with("HTTP/1.1 451 Blocked By Policy\r\n"),
             "status.text must reach the HTTP/1.1 status line; response: {response}"
+        );
+    }
+
+    /// Every value of one header on an HTTP/1.1 response head.
+    fn header_values(wire: &str, name: &str) -> Vec<String> {
+        wire.split("\r\n\r\n")
+            .next()
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .filter(|(key, _)| key.trim().eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.trim().to_string())
+            .collect()
+    }
+
+    /// WOR-2630 acceptance line 1: every action type applies the same
+    /// documented CEL phase semantics.
+    ///
+    /// `op: append` meant two different things. The `static` arm pushed
+    /// `set` and `append` alike onto `extra_headers`, which is applied
+    /// with `insert_header`, so two `append` rules for one header left
+    /// only the second value; `mock` and `plugin` emitted both. One
+    /// config, two answers, decided by the action type.
+    #[tokio::test]
+    async fn append_rules_emit_the_same_values_on_a_static_and_a_plugin_action() {
+        let config = sbproxy_config::compile_config(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: static
+      content_type: text/plain
+      body: placeholder
+    transforms:
+      - type: cel
+        headers:
+          - op: append
+            name: link
+            value_expr: '"<a>; rel=x"'
+          - op: append
+            name: link
+            value_expr: '"<b>; rel=y"'
+"#,
+        )
+        .expect("fixture config");
+        let pipeline =
+            std::sync::Arc::new(CompiledPipeline::from_config(config).expect("fixture pipeline"));
+
+        let for_static = std::sync::Arc::clone(&pipeline);
+        let (result, wire) = exchange_with(
+            &pipeline.actions[0],
+            &pipeline,
+            Some(0),
+            DEFAULT_TEST_REQUEST,
+            move |ctx| {
+                ctx.pipeline = for_static;
+                ctx.origin_idx = Some(0);
+            },
+        )
+        .await;
+        assert!(result.expect("the static action dispatches"));
+        let static_wire = String::from_utf8(wire).expect("HTTP response is UTF-8");
+
+        let plugin_action = response_action(
+            200,
+            vec![("content-type".into(), "text/plain".into())],
+            Bytes::from_static(b"queued"),
+        );
+        let for_plugin = std::sync::Arc::clone(&pipeline);
+        let (result, wire) = exchange_with(
+            &plugin_action,
+            &pipeline,
+            Some(0),
+            DEFAULT_TEST_REQUEST,
+            move |ctx| {
+                ctx.pipeline = for_plugin;
+                ctx.origin_idx = Some(0);
+            },
+        )
+        .await;
+        assert!(result.expect("the plugin action dispatches"));
+        let plugin_wire = String::from_utf8(wire).expect("HTTP response is UTF-8");
+
+        assert_eq!(
+            header_values(&static_wire, "link"),
+            vec!["<a>; rel=x".to_string(), "<b>; rel=y".to_string()],
+            "two `append` rules add two values: {static_wire}"
+        );
+        assert_eq!(
+            header_values(&static_wire, "link"),
+            header_values(&plugin_wire, "link"),
+            "one config, one answer, whatever the action type\nstatic: \
+             {static_wire}\nplugin: {plugin_wire}"
+        );
+    }
+
+    /// WOR-2630: the buffered-phase flag follows the action actually
+    /// dispatched, not the origin's own.
+    ///
+    /// A matched forward rule settles the request with its own action,
+    /// so reading `pipeline.actions[origin_idx]` would tell the
+    /// transform stage that a `static` forward rule on a `proxy` origin
+    /// streams, and its header mutations would be stashed with nothing
+    /// left to drain them. The commit message claimed this; nothing
+    /// exercised it at dispatch.
+    #[tokio::test]
+    async fn the_buffered_phase_flag_follows_the_dispatched_action_not_the_origins_own() {
+        let config = sbproxy_config::compile_config(
+            r#"
+origins:
+  "plugin.test":
+    action:
+      type: proxy
+      url: https://upstream.invalid
+    forward_rules:
+      - rules:
+          - path: { prefix: /local/ }
+        origin:
+          id: local-static
+          action:
+            type: static
+            status_code: 200
+            content_type: text/plain
+            body: "local"
+    transforms:
+      - type: cel
+        headers:
+          - op: set
+            name: x-body-len
+            value_expr: 'string(size(response.body))'
+"#,
+        )
+        .expect("a streaming origin with a buffered forward rule accepts the body rule");
+        let pipeline = CompiledPipeline::from_config(config).expect("fixture pipeline");
+
+        let (_result, _wire, ctx) = exchange_with_ctx(
+            &pipeline.actions[0],
+            &pipeline,
+            Some(0),
+            DEFAULT_TEST_REQUEST,
+            |_| {},
+        )
+        .await;
+        assert!(
+            !ctx.response_buffered_before_headers,
+            "the origin's own action streams, so the body-buffer stage must not evaluate"
+        );
+
+        let forwarded = &pipeline.forward_rules[0][0].action;
+        let (_result, _wire, ctx) =
+            exchange_with_ctx(forwarded, &pipeline, Some(0), DEFAULT_TEST_REQUEST, |_| {}).await;
+        assert!(
+            ctx.response_buffered_before_headers,
+            "the forward rule's `static` action buffers, so its rule evaluates against the body"
         );
     }
 

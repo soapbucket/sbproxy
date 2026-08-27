@@ -660,25 +660,37 @@ fn apply_transform_with_ctx(
             // scalar and is refused at config compile, so header
             // mutation is the transform's entire output.
             //
-            // The body-buffer call site does not own the live response
-            // header map (Pingora exposes that via the session struct,
-            // not the transform context), so the header rule evaluation
-            // sees an empty header map; richer header-binding wiring is
-            // reserved for a later cleanup. The response status, in
-            // contrast, IS already on `ctx`: the static action stamps
-            // it in before transforms run, and the upstream body filter
-            // runs after `response_filter` populates it. Reading it
-            // here lets `string(response.status)` resolve to the real
-            // status (200 from the static action under test) rather
-            // than the zero placeholder.
+            // This phase does not own a response header map. Pingora
+            // exposes the live one through the session struct, not the
+            // transform context, and a buffered action has not built
+            // its own yet: `static` rebinds its Content-Type after the
+            // transform chain runs, and `plugin` assembles its list
+            // after. So a rule reading `response.headers` has no phase
+            // to run in here and is skipped and counted rather than
+            // resolved against an empty map (WOR-2630). The pipeline
+            // compiler refuses such a rule outright unless some other
+            // route on this origin streams, so reaching this skip means
+            // a forward rule can serve it.
+            //
+            // The response status, in contrast, IS already on `ctx`:
+            // the static action stamps it in before transforms run, and
+            // the upstream body filter runs after `response_filter`
+            // populates it. Reading it here lets
+            // `string(response.status)` resolve to the real status
+            // rather than the zero placeholder.
             let status = ctx.response_status.unwrap_or(0);
             let request_view = cel_response_request_view(ctx);
+            let phase = sbproxy_modules::transform::CelHeaderPhase::BufferedBody;
+            for rule in t.header_rules_out_of_phase(phase) {
+                record_cel_header_rule_skipped(ctx.hostname.as_str(), rule, phase);
+            }
             // WOR-168: `evaluate_headers` now returns
             // `TransformError::InvariantViolated` instead of panicking
             // when the inner Remove arm is reached. Propagate as
             // `anyhow::Error` so the body-buffer pipeline's typed-error
             // path takes over and synthesises a 500 with attribution.
             match t.evaluate_headers_with_request(
+                phase,
                 body.as_ref(),
                 status,
                 &http::HeaderMap::new(),
@@ -2264,6 +2276,49 @@ pub(super) fn csp_emission_mode(name: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+
+/// Record one response-header mutation that will not reach the wire.
+///
+/// WOR-2630's acceptance line is that no mutation is silently
+/// stranded, and its development plan asks for compile/runtime metrics
+/// and structured decisions using closed reasons. A skip whose only
+/// record is a log line is the silent stranding under a different
+/// name, so this ticks `sbproxy_errors_total` too and the `WARN`
+/// carries the per-event detail.
+///
+/// The labels are the hostname and a closed `reason`; the rule name
+/// goes on the log line, never on the counter, so a config with fifty
+/// rules mints one series rather than fifty.
+pub(crate) fn record_cel_header_rule_skipped(
+    hostname: &str,
+    rule: &str,
+    phase: sbproxy_modules::transform::CelHeaderPhase,
+) {
+    let reason = phase.unavailable_reason();
+    tracing::warn!(
+        rule = %rule,
+        reason,
+        "cel header transform: this response phase cannot bind what the rule reads; skipping it"
+    );
+    record_stranded_cel_header_mutation(hostname, reason);
+}
+
+/// Tick the counter for a response-header mutation that will not reach
+/// the wire, under a closed reason.
+///
+/// Separate from the log line so the terminal-transform-failure path,
+/// which drops an already-evaluated mutation set rather than skipping a
+/// rule, reports on the same family with its own reason.
+pub(crate) fn record_stranded_cel_header_mutation(hostname: &str, reason: &'static str) {
+    sbproxy_observe::metrics::metrics()
+        .errors_total
+        .with_label_values(&[hostname, reason])
+        .inc();
+}
+
+/// The closed reason for header mutations dropped because the transform
+/// chain that produced them faulted terminally.
+pub(crate) const CEL_MUTATIONS_DROPPED_REASON: &str = "cel_mutations_dropped_on_transform_failure";
 
 pub(super) fn error_json_body(message: &str) -> String {
     serde_json::json!({ "error": message }).to_string()
@@ -6465,6 +6520,146 @@ mod wor_2477_panic_containment_tests {
 /// `warn!` and the loop continued with the untransformed buffer, so a
 /// redaction transform declared `closed` shipped the exact bytes it
 /// existed to strip.
+#[cfg(test)]
+mod cel_header_phase_gate_tests {
+    use super::*;
+
+    fn cel_transform(rules: serde_json::Value) -> sbproxy_modules::CompiledTransform {
+        let transform = sbproxy_modules::transform::CelScriptTransform::from_config(
+            serde_json::json!({"headers": rules}),
+        )
+        .expect("the fixture rules compile");
+        sbproxy_modules::CompiledTransform {
+            transform: sbproxy_modules::Transform::CelScript(transform),
+            content_types: Vec::new(),
+            failure_posture: sbproxy_config::types::FailureMode::Open,
+            max_body_size: 1024 * 1024,
+        }
+    }
+
+    /// WOR-2630's "each rule evaluates exactly once", pinned.
+    ///
+    /// A streaming action already evaluated its header rules in
+    /// `response_filter`, against the real status and headers, and
+    /// applied them there. The body-buffer stage runs afterwards, and
+    /// before the phase gate it evaluated the same rules a second time
+    /// against an empty header map and stashed the result on a context
+    /// slot no streaming action drains. Deleting the early return in
+    /// `apply_transform_with_ctx`'s `CelScript` arm turns this red.
+    #[test]
+    fn a_streaming_action_does_not_re_evaluate_its_header_rules_in_the_buffered_phase() {
+        let compiled = cel_transform(serde_json::json!([
+            {"op": "set", "name": "x-status", "value_expr": "string(response.status)"}
+        ]));
+        let mut ctx = RequestContext::new();
+        ctx.response_status = Some(200);
+        ctx.response_buffered_before_headers = false;
+        let mut body = bytes::BytesMut::from(&b"hello"[..]);
+
+        apply_transform_with_ctx(&compiled, &mut body, Some("text/plain"), &mut ctx)
+            .expect("the arm returns without evaluating");
+
+        assert!(
+            ctx.cel_response_header_mutations.is_empty(),
+            "a second evaluation would strand mutations no streaming action drains: {:?}",
+            ctx.cel_response_header_mutations
+        );
+    }
+
+    /// The control for the test above: the buffered phase does evaluate,
+    /// so the assertion there is about the gate rather than about a
+    /// transform that never runs at all.
+    #[test]
+    fn a_buffered_action_evaluates_its_header_rules_exactly_once_with_the_real_body() {
+        let compiled = cel_transform(serde_json::json!([
+            {"op": "set", "name": "x-body-len", "value_expr": "string(size(response.body))"}
+        ]));
+        let mut ctx = RequestContext::new();
+        ctx.response_status = Some(200);
+        ctx.response_buffered_before_headers = true;
+        let mut body = bytes::BytesMut::from(&b"hello"[..]);
+
+        apply_transform_with_ctx(&compiled, &mut body, Some("text/plain"), &mut ctx)
+            .expect("the buffered phase evaluates");
+
+        assert_eq!(
+            ctx.cel_response_header_mutations,
+            vec![sbproxy_modules::transform::CelHeaderMutation::Set(
+                "x-body-len".into(),
+                "5".into()
+            )],
+            "the one evaluation sees the real body"
+        );
+    }
+
+    /// Current value of one counter series, 0 when it has never been
+    /// written in this process.
+    fn counter_value(name: &str, labels: &[(&str, &str)]) -> u64 {
+        sbproxy_observe::metrics::metrics()
+            .render()
+            .lines()
+            .find(|line| {
+                line.starts_with(name)
+                    && labels
+                        .iter()
+                        .all(|(key, value)| line.contains(&format!("{key}=\"{value}\"")))
+            })
+            .and_then(|line| line.rsplit(' ').next()?.parse::<f64>().ok())
+            .unwrap_or(0.0) as u64
+    }
+
+    /// A rule the buffered phase cannot bind is skipped and counted,
+    /// not resolved against an empty header map.
+    ///
+    /// The pipeline compiler refuses this pairing outright unless a
+    /// forward rule on the same origin streams, so what this pins is
+    /// the mixed-route case: the rule exists for the other route and
+    /// must not write a wrong header on this one.
+    ///
+    /// The counter is the load-bearing half. Before the phase gate the
+    /// rule was evaluated, failed a CEL key lookup against the empty
+    /// map, and was dropped with a `warn!` and nothing else, which is
+    /// the silent stranding the acceptance line forbids: the same
+    /// mutation set, and no way for an operator to know.
+    #[test]
+    fn the_buffered_phase_skips_and_counts_a_rule_that_reads_the_response_headers() {
+        let compiled = cel_transform(serde_json::json!([
+            {"op": "set", "name": "x-status", "value_expr": "string(response.status)"},
+            {"op": "set", "name": "x-echo", "value_expr": "response.headers['x-trace']"}
+        ]));
+        let reason = sbproxy_modules::transform::CelHeaderPhase::BufferedBody.unavailable_reason();
+        let before = counter_value(
+            "sbproxy_errors_total",
+            &[("hostname", "phase.test"), ("error_type", reason)],
+        );
+        let mut ctx = RequestContext::new();
+        ctx.hostname = "phase.test".into();
+        ctx.response_status = Some(200);
+        ctx.response_buffered_before_headers = true;
+        let mut body = bytes::BytesMut::from(&b"hello"[..]);
+
+        apply_transform_with_ctx(&compiled, &mut body, Some("text/plain"), &mut ctx)
+            .expect("the buffered phase evaluates what it can serve");
+
+        assert_eq!(
+            ctx.cel_response_header_mutations,
+            vec![sbproxy_modules::transform::CelHeaderMutation::Set(
+                "x-status".into(),
+                "200".into()
+            )],
+            "the header-reading rule must not resolve against an empty map"
+        );
+        assert_eq!(
+            counter_value(
+                "sbproxy_errors_total",
+                &[("hostname", "phase.test"), ("error_type", reason)],
+            ),
+            before + 1,
+            "a mutation that will not reach the wire is counted, not just logged"
+        );
+    }
+}
+
 #[cfg(test)]
 mod generated_body_failure_posture_tests {
     use super::*;
