@@ -260,6 +260,15 @@ fn update_router_quota_from_response(
 /// axes cannot disagree about the same attempt. Before WOR-2532 they
 /// were independent calls and the health half was simply absent from
 /// every dispatch path in this file.
+///
+/// One attempt outcome is deliberately not a variant here.
+/// `cancel_upstream_for_client_disconnect` (WOR-2690) ticks the attempt
+/// counter under `client_disconnected` directly, because the client
+/// went away and nothing about the provider was learned: it is the same
+/// "no sample" answer a raced loser the winner cancelled gets, and it
+/// sits in a function that holds neither the router nor the provider
+/// index. Every settled attempt that could say something about a
+/// provider's health goes through here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderAttemptOutcome {
     /// The upstream answered with this status.
@@ -14228,6 +14237,12 @@ fn cancel_upstream_for_client_disconnect(
     observed: &pingora_error::Error,
 ) -> Box<Error> {
     ctx.ai_upstream_cancelled_on_client_disconnect = true;
+    // The one attempt in this file that ticks the counter without going
+    // through `record_provider_attempt_outcome`, and legitimately: the
+    // client left, so there is no upstream verdict to record on the
+    // breaker, the outlier detector, or the cooldown axis. See
+    // `ProviderAttemptOutcome`'s doc for the invariant this is the
+    // stated exception to (WOR-2532 / WOR-2690).
     sbproxy_observe::metrics::record_provider_attempt(provider, "client_disconnected");
     sbproxy_ai::tracing_spans::record_error(
         span,
