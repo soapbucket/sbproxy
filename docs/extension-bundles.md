@@ -226,7 +226,9 @@ Both refusals name the status and nothing else. No guest-supplied bytes reach th
 
 An action bundle finishes the request locally. Its attachment has no upstream configuration, so returning `outcome: "proxy"` fails with `unsupported_action_outcome`. Configure a concrete `type: proxy` or `type: load_balancer` action when the origin should forward traffic. For extension logic around a forwarded stream, attach a Proxy-Wasm filter to that concrete action.
 
-`unsupported_action_outcome` is one reason code across two refusals, so a detection matching it sees both. The other is a linked Rust plugin returning the legacy `ActionOutcome::Responded`, which every transport answers with `501` (see [upgrade.md](upgrade.md#unreleased)). Both tick `sbproxy_errors_total{error_type="unsupported_action_outcome"}` and both carry the code in the response body, so the `plugin_action_outcome` field on the `request_error` event is what separates them.
+`unsupported_action_outcome` is one reason code across two refusals, so a detection matching the code in a response body sees both. The other is a linked Rust plugin returning the legacy `ActionOutcome::Responded`, which every transport answers with `501` (see [upgrade.md](upgrade.md#unreleased)).
+
+Only the plugin one is instrumented. It ticks `sbproxy_errors_total{error_type="unsupported_action_outcome"}` and publishes a `request_error` event whose `plugin_action_outcome` field names the outcome. The bundle refusal above is an envelope validation error: it carries the reason code to the caller and has no counter and no typed event of its own, so a Prometheus alert or a SIEM rule written against those two signals sees the plugin case and not this one.
 
 A `.ts` entry is parsed and stripped to ES2020 JavaScript exactly once while a candidate loads. Every declared export is preflighted then. TypeScript is a source convenience; the runtime is still JavaScript.
 
