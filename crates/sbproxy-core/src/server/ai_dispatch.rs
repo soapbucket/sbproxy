@@ -21526,6 +21526,10 @@ mod external_guardrail_context_tests {
         /// That is louder than a failed assertion, not quieter. The dev
         /// profile this runs under spills more locals than release, so a
         /// pass here is the stricter of the two answers.
+        ///
+        /// What it still cannot see: the fixture provider is local
+        /// plaintext, so no TLS frames sit on this stack, and the release
+        /// binary's own path is not exercised here.
         #[test]
         fn a_non_streaming_dispatch_fits_a_pingora_worker_stack() {
             const PINGORA_WORKER_STACK: usize = 2 * 1024 * 1024;
@@ -21545,8 +21549,23 @@ mod external_guardrail_context_tests {
                             slow_upstream_fixture(Duration::from_millis(50)).await;
                         let config = disconnect_probe_config(&upstream_url);
                         let pipeline = crate::pipeline::CompiledPipeline::default();
-                        let (mut session, client) =
-                            downstream_session(disconnect_probe_request()).await;
+                        // A connected client, deliberately not
+                        // `downstream_session`, which half-closes the
+                        // instant the request is written. That FIN would
+                        // settle the watch on its first poll and let the
+                        // `select!` resolve immediately, so every later
+                        // poll of the provider future, including the one
+                        // that decodes the response header, would run at
+                        // the bare `.await` outside the `select!`. The
+                        // deeper frame is the one this guard exists to
+                        // measure, so the sender is held and never fired
+                        // and the watch stays pending for the whole
+                        // dispatch.
+                        let (mut session, _close, client) = downstream_session_closing_on_demand(
+                            disconnect_probe_request(),
+                            DownstreamClose::Reset,
+                        )
+                        .await;
                         let mut context = crate::context::RequestContext::new();
 
                         super::super::handle_ai_proxy(
@@ -21559,6 +21578,10 @@ mod external_guardrail_context_tests {
                         )
                         .await
                         .expect("the dispatch completes on a worker-sized stack");
+                        assert!(
+                            !context.ai_upstream_cancelled_on_client_disconnect,
+                            "the guard must measure a served dispatch, not a cancelled one"
+                        );
                         drop(session);
                         let response = live_downstream_body(client).await;
                         assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
