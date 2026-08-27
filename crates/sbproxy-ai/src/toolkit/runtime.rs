@@ -229,9 +229,10 @@ impl AiToolkitRuntime {
                 limits.max_dataset_bytes_total,
             )?;
             // Config-seeded rows are operator-authored and already refused
-            // at `validate_config`; they are accounted per scope here so a
-            // later admin registration measures the share it is really
-            // left with rather than an empty one.
+            // at `validate_config`, under the same two per-scope caps the
+            // ceiling is derived from; they are accounted per scope here so
+            // a later admin registration measures the room it is really
+            // left with rather than an empty scope.
             let scope_bytes = datasets
                 .scope_bytes
                 .entry(configured.scope.clone())
@@ -445,12 +446,11 @@ impl AiToolkitRuntime {
             1,
             self.limits.max_dataset_versions,
         )?;
-        // The per-scope caps above multiply out to exactly the shipped
-        // process totals, so on their own they let one tenant hold 100% of
-        // both and refuse every other tenant's registration until the next
-        // config reload. This is that tenant's share of the process budget,
-        // and its own ceiling well before the process one.
-        let (scope_bytes_ceiling, scope_versions_ceiling) = self.scope_dataset_share();
+        // The two caps above bound one name and one scope's name count; the
+        // ceilings below bound what the scope holds in total, so a refusal
+        // names the scope that filled it rather than reading as the whole
+        // process running out.
+        let (scope_bytes_ceiling, scope_versions_ceiling) = self.scope_dataset_ceilings();
         let scope_versions = datasets
             .versions
             .keys()
@@ -499,24 +499,40 @@ impl AiToolkitRuntime {
         })
     }
 
-    /// One scope's share of the process-wide dataset budgets, in bytes and
-    /// in versions.
+    /// One scope's ceiling on the retained dataset budgets, in bytes and in
+    /// versions.
     ///
-    /// No configuration key is introduced. The share is the existing total
-    /// divided by the number of scopes this generation admits, so a
-    /// single-origin deployment still gets the whole budget and a
-    /// multi-tenant one gets the isolation the operations ring already has
-    /// (`retain_scoped_row`). The byte share is floored at one maximum
-    /// request so a scope can always register at least one dataset, and
-    /// neither share can exceed its process total.
-    pub(crate) fn scope_dataset_share(&self) -> (usize, usize) {
-        let scopes = self.allowed_scopes.len().max(1);
-        let bytes = (self.limits.max_dataset_bytes_total / scopes)
-            .max(self.limits.max_request_bytes)
-            .min(self.limits.max_dataset_bytes_total);
-        let versions = (self.limits.max_dataset_versions_total / scopes)
+    /// Derived from the scope's own caps and from nothing else:
+    /// `max_datasets` names x `max_dataset_versions` versions, each of which
+    /// `register_dataset` already bounds by `max_request_bytes`. It is
+    /// deliberately not a share of the process totals divided among the
+    /// admitted scopes, because `allowed_scopes` carries one entry per
+    /// compiled origin in the whole config, most of which never touch the
+    /// toolkit: dividing by it made a harness tenant's ceiling shrink with a
+    /// roster it has nothing to do with, so a hundred-origin gateway left
+    /// the one tenant using the harness two versions of the documented
+    /// 32 x 8.
+    ///
+    /// Both ceilings clamp to the process totals, so those stay the outer
+    /// bound, and they bind by name: a `dataset_bytes_scope` or
+    /// `dataset_versions_scope` refusal says this scope's own datasets
+    /// reached the ceiling, where the `_total` twin says every scope
+    /// together did.
+    ///
+    /// Config-seeded rows are charged into the same per-scope accounting at
+    /// `try_new` and cannot exceed the ceiling on their own, because
+    /// `validate_config` enforces the same two per-scope caps over the
+    /// configured datasets before any of them is seeded.
+    pub(crate) fn scope_dataset_ceilings(&self) -> (usize, usize) {
+        let versions = self
+            .limits
+            .max_datasets
+            .saturating_mul(self.limits.max_dataset_versions)
             .max(1)
             .min(self.limits.max_dataset_versions_total);
+        let bytes = versions
+            .saturating_mul(self.limits.max_request_bytes)
+            .min(self.limits.max_dataset_bytes_total);
         (bytes, versions)
     }
 

@@ -394,15 +394,69 @@ fn registration_and_retention_are_fallible_and_bounded() {
     ));
 }
 
-/// WOR-2661: the per-scope dataset caps multiply out to exactly the
-/// shipped process totals, so without a share one tenant-scoped operator
-/// consumes 100% of the process budget inside its own limits and every
-/// other tenant's registration is refused until the next config reload.
-/// The operations ring already holds this property
-/// (`retention_is_per_scope_and_a_noisy_tenant_cannot_evict_another`);
-/// the dataset budget is the hole in it.
+/// A scope's dataset ceiling is what its own caps entitle it to, and does
+/// not move when the gateway compiles origins that never touch the
+/// toolkit. `allowed_scopes` carries one entry per compiled origin, so a
+/// ceiling derived by dividing the process totals by that count shrinks
+/// with a roster the harness tenant has nothing to do with: at a hundred
+/// origins it left this scope one version of the documented 32 x 8.
 #[test]
-fn one_scope_cannot_saturate_the_process_dataset_byte_budget() {
+fn a_scope_dataset_ceiling_does_not_shrink_with_the_origin_roster() {
+    let entries = vec![DatasetEntry::with_expected("one", "1")];
+    let dataset_bytes = serde_json::to_vec(&entries).expect("serialize").len();
+
+    let mut input = AiToolkitConfigInput::default();
+    input.allowed_scopes.push(scope());
+    // Ninety-nine compiled origins that never register a dataset.
+    for index in 0..99 {
+        input
+            .allowed_scopes
+            .push(ToolkitScope::new(format!("origin-{index}"), "tenant-a").expect("valid scope"));
+    }
+    input.limits.max_request_bytes = dataset_bytes;
+    // The scope's own entitlement is four names x two versions; the process
+    // totals are eight times that, so only the per-scope caps can bind.
+    input.limits.max_datasets = 4;
+    input.limits.max_dataset_versions = 2;
+    input.limits.max_dataset_versions_total = 64;
+    input.limits.max_dataset_bytes_total = dataset_bytes * 64;
+    let runtime = AiToolkitRuntime::try_new(input).expect("runtime");
+
+    let register = |name: usize, version: u32| {
+        runtime.register_dataset(DatasetRegistrationRequest {
+            scope: scope(),
+            name: format!("answers-{name}"),
+            version,
+            entries: entries.clone(),
+        })
+    };
+
+    for name in 0..4 {
+        for version in 1..=2 {
+            register(name, version).expect("a scope may use the ceiling its own caps document");
+        }
+    }
+
+    // What stops it is its own name cap, not a share of the roster.
+    let error = register(4, 1).expect_err("a fifth dataset name is past this scope's own cap");
+    assert!(
+        matches!(
+            error,
+            ToolkitError::LimitExceeded {
+                resource: "dataset_names",
+                limit: 4,
+                ..
+            }
+        ),
+        "expected the scope's own name cap to refuse, got {error:?}"
+    );
+}
+
+/// The process totals stay the outer bound on a single scope, and the
+/// refusal says which accounting noticed: `_scope` when this scope's own
+/// datasets reached the ceiling, `_total` when every scope together did.
+#[test]
+fn the_process_dataset_byte_total_stays_the_outer_bound_on_one_scope() {
     let entries = vec![DatasetEntry::with_expected("one", "1")];
     let dataset_bytes = serde_json::to_vec(&entries).expect("serialize").len();
     let second_scope = ToolkitScope::new("origin-b", "tenant-b").expect("valid scope");
@@ -411,24 +465,24 @@ fn one_scope_cannot_saturate_the_process_dataset_byte_budget() {
     input.allowed_scopes.push(scope());
     input.allowed_scopes.push(second_scope.clone());
     input.limits.max_request_bytes = dataset_bytes;
-    // Four datasets fit the process budget; two scopes share it, so
-    // neither is entitled to more than two.
-    input.limits.max_dataset_bytes_total = dataset_bytes * 4;
+    // Well below what the default 32 x 8 caps entitle a scope to, so the
+    // process total is what clamps the per-scope ceiling.
+    input.limits.max_dataset_bytes_total = dataset_bytes * 2;
     let runtime = AiToolkitRuntime::try_new(input).expect("runtime");
 
-    let register = |scope: ToolkitScope, version: u32| {
+    let register = |scope: ToolkitScope, name: u32| {
         runtime.register_dataset(DatasetRegistrationRequest {
             scope,
-            name: format!("answers-{version}"),
-            version,
+            name: format!("answers-{name}"),
+            version: 1,
             entries: entries.clone(),
         })
     };
 
-    for version in 1..=2 {
-        register(scope(), version).expect("a scope may fill its own share");
+    for name in 1..=2 {
+        register(scope(), name).expect("a scope may fill the clamped ceiling");
     }
-    let error = register(scope(), 3).expect_err("a scope may not exceed its own share");
+    let error = register(scope(), 3).expect_err("past the clamped ceiling");
     assert!(
         matches!(
             error,
@@ -437,14 +491,20 @@ fn one_scope_cannot_saturate_the_process_dataset_byte_budget() {
                 ..
             }
         ),
-        "expected the per-scope share to refuse, got {error:?}"
+        "expected the per-scope charge to name the refusal, got {error:?}"
     );
 
-    // The point of the share: the other tenant's budget is untouched.
-    for version in 1..=2 {
-        register(second_scope.clone(), version)
-            .expect("one scope's traffic must not consume another scope's budget");
-    }
+    let error = register(second_scope, 1).expect_err("the process budget is genuinely full");
+    assert!(
+        matches!(
+            error,
+            ToolkitError::LimitExceeded {
+                resource: "dataset_bytes_total",
+                ..
+            }
+        ),
+        "expected the process total to name the refusal, got {error:?}"
+    );
 }
 
 #[test]

@@ -71,6 +71,34 @@ per-dataset version cap remains scoped, while `max_dataset_versions_total` and
 entry arrays across the runtime generation. Registration is atomic: a refused
 version does not consume either global budget.
 
+One scope is also charged against its own ceiling, so a refusal names the
+scope that filled the budget rather than reading as the whole process running
+out. The ceiling is derived, not configured: it is `max_datasets` names times
+`max_dataset_versions` versions (32 x 8 by default), and that many times
+`max_request_bytes` in serialized entry bytes, each clamped to the matching
+process total. It does not depend on how many origins the gateway compiles, so
+a config with one harness tenant and a hundred unrelated origins leaves that
+tenant the full documented 32 x 8. Datasets seeded from `ai_toolkit.datasets:`
+are charged into the same accounting at startup, under the same two per-scope
+caps, so a config-authored dataset can never leave its scope unable to register
+over the API.
+
+A registration past a ceiling is refused with HTTP 400 and a `limit_exceeded`
+body naming the resource:
+
+| Resource | Ceiling |
+|---|---|
+| `dataset_names` | `max_datasets` distinct names in this scope |
+| `dataset_versions` | `max_dataset_versions` versions of this name |
+| `dataset_versions_scope` | versions retained for this scope |
+| `dataset_bytes_scope` | serialized entry bytes retained for this scope |
+| `dataset_versions_total` | `max_dataset_versions_total`, all scopes |
+| `dataset_bytes_total` | `max_dataset_bytes_total`, all scopes |
+
+Raising a per-scope ceiling means raising `max_datasets` or
+`max_dataset_versions`; raising a `_total` means raising the process budget the
+`_scope` ceiling is clamped to.
+
 ## Register a dataset
 
 The dataset file contains `name`, `version`, and `entries`; the CLI supplies the
