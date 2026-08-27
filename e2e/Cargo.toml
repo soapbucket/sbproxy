@@ -153,6 +153,15 @@ path = "tests/model_cluster_dispatch.rs"
 name = "routing_registry"
 path = "tests/routing_registry.rs"
 
+# WOR-2066: one streaming suite instead of five separately linked
+# binaries. Each former file is a module of `tests/streaming/main.rs`
+# and keeps its own cases; the module name prefixes every test name, so
+# `-E 'test(ai_streaming_usage::)'` selects what `--test
+# ai_streaming_usage` used to.
+[[test]]
+name = "streaming"
+path = "tests/streaming/main.rs"
+
 [build-dependencies]
 # Compiles the in-tree `proto/echo.proto` for the gRPC e2e test. Kept
 # pinned to the same major as `tonic` above.
