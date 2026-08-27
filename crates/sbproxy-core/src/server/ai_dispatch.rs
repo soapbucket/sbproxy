@@ -8902,7 +8902,7 @@ pub(super) async fn handle_ai_proxy(
         // `source` reflects both which path answered and whether a
         // heuristic answer was normal unconfigured operation or a
         // configured hook's fail-open degradation.
-        sbproxy_ai::ai_metrics::record_intent_detection_source(&source.to_string());
+        sbproxy_ai::ai_metrics::record_intent_detection_source(source.as_str());
         debug!(
             origin = %hostname,
             intent = ?cat,

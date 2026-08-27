@@ -196,13 +196,24 @@ pub enum IntentSource {
     HeuristicDegraded,
 }
 
+impl IntentSource {
+    /// Closed metric label for this source.
+    ///
+    /// The recorder matches the label back against these three literals, so
+    /// the AI request path hands it the static string rather than allocating
+    /// a `String` per request to carry one of them.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hook => "hook",
+            Self::HeuristicUnconfigured => "heuristic",
+            Self::HeuristicDegraded => "heuristic_degraded",
+        }
+    }
+}
+
 impl std::fmt::Display for IntentSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Hook => write!(f, "hook"),
-            Self::HeuristicUnconfigured => write!(f, "heuristic"),
-            Self::HeuristicDegraded => write!(f, "heuristic_degraded"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
