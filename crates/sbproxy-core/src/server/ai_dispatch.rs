@@ -3355,6 +3355,222 @@ fn record_posture_refusal(
     );
 }
 
+/// The provider ids a failed cascade dispatch was locked out of by the
+/// calling credential's provider policy, or `None` when the cascade
+/// exhausted for any other reason (WOR-2685).
+///
+/// A named function rather than an inline `downcast_ref` chain so the
+/// disposition can be tested against an error the real cascade
+/// executor built, rather than against a hand-made one that could
+/// disagree with it.
+fn cascade_credential_lock_providers(error: &anyhow::Error) -> Option<String> {
+    error
+        .downcast_ref::<sbproxy_ai::CascadeExhausted>()
+        .filter(|exhausted| exhausted.is_credential_lock())
+        .map(|exhausted| exhausted.locked_providers().join(", "))
+}
+
+/// Stamp every operator-facing surface for a cascade that dispatched
+/// no tier because the credential's provider policy excluded all of
+/// them (WOR-2685).
+///
+/// The `Err` arm this serves used to write nothing to `ctx`, so the
+/// admin console's Routing Decisions row read the same blank it read
+/// before the diagnosis existed and the SIEM feed never learned a
+/// credential policy denied the request. The five surfaces here are
+/// the same ones [`record_posture_refusal`] stamps for the adjacent
+/// refusal class, for the same reason: a refusal that is not recorded
+/// is a refusal an operator cannot alert on.
+///
+/// A free function rather than an inline block because the cascade
+/// arm's frame sits on the Pingora worker's 2 MB stack; its locals
+/// belong in a frame of their own. `locked` is a rendered list of
+/// config-derived provider names, never caller-supplied text.
+fn record_cascade_credential_lock(
+    locked: &str,
+    method: &str,
+    ctx: &mut crate::context::RequestContext,
+) {
+    let detail = format!("credential_provider_lock: {locked}");
+    ctx.ai_outcome = Some("credential_provider_lock".to_string());
+    ctx.record_policy_decision("credential_provider_policy", "deny");
+    ctx.deny_reason = Some(detail.clone());
+    append_ai_route_reason(ctx, detail.clone());
+    sbproxy_observe::SecurityAuditEntry::policy_violation(
+        "credential_provider_policy",
+        detail,
+        502,
+        Some(ctx.hostname.to_string()),
+        ctx.client_ip,
+        Some(ctx.request_id.to_string()),
+        Some(method.to_string()),
+    )
+    .with_tenant_id(ctx.tenant_id.as_str())
+    .with_key_context(
+        ctx.native_key_provider.clone(),
+        ctx.inbound_key_mode.as_str(),
+    )
+    .with_api_key_id(ctx.accountable_key_id())
+    .emit();
+}
+
+#[cfg(test)]
+mod cascade_credential_lock_tests {
+    use super::*;
+
+    fn locked_cascade_config(allowed_to_dispatch: bool) -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "anthropic",
+                "provider_type": "anthropic",
+                "api_key": "test-key",
+                "base_url": "http://127.0.0.1:9",
+                "allow_private_base_url": allowed_to_dispatch
+            }],
+            "routing": {
+                "strategy": "cascade",
+                "tiers": [{
+                    "provider_id": "anthropic",
+                    "model": "claude-3-5-sonnet",
+                    "quality_threshold": 0.5
+                }]
+            }
+        }))
+        .expect("cascade fixture")
+    }
+
+    /// Exhaust a cascade through the entry point the `Err` arm under
+    /// test dispatches on, rather than through a simpler wrapper: the
+    /// classification this asserts on lives in the executor, and a
+    /// test that entered it by another door would not prove the door
+    /// production uses reaches the same place.
+    async fn exhaust_cascade(
+        config: &sbproxy_ai::AiHandlerConfig,
+        allowed_providers: &[String],
+    ) -> anyhow::Error {
+        let cascade = config.router().cascade_config().cloned().expect("cascade");
+        let body = serde_json::json!({
+            "model": "claude-3-5-sonnet",
+            "messages": [{"role": "user", "content": "ping"}]
+        });
+        let admission = sbproxy_ai::quota_pool::QuotaPoolAdmission::new(
+            None,
+            Ok(None),
+            Ok("virtual-key-a".to_string()),
+        );
+        sbproxy_ai::AiClient::new()
+            .forward_cascade_with_policy_and_quota_with_reasoning_eligibility(
+                config,
+                &cascade,
+                allowed_providers,
+                sbproxy_ai::CascadeBlockLists::credential_only(&[]),
+                "/v1/messages",
+                &body,
+                &sbproxy_ai::attribution::AttributionTags::default(),
+                "messages",
+                &admission,
+                "wor-2685:quota-pool:cascade",
+                sbproxy_ai::reasoning_eligibility(&body),
+            )
+            .await
+            .expect_err("this cascade cannot dispatch")
+    }
+
+    /// WOR-2685: the disposition seam. The cascade `Err` arm treats a
+    /// credential provider lock as a policy refusal and every other
+    /// exhaustion as an upstream failure, so this drives the real
+    /// executor across the crate boundary and asks the same question
+    /// the arm asks, rather than asserting against a hand-built error
+    /// that could disagree with what the executor returns.
+    #[tokio::test]
+    async fn a_credential_locked_cascade_is_dispositioned_as_a_refusal() {
+        let config = locked_cascade_config(true);
+
+        let error = exhaust_cascade(&config, &["openai".to_string()]).await;
+
+        assert_eq!(
+            cascade_credential_lock_providers(&error).as_deref(),
+            Some("anthropic"),
+            "the credential's lock is the whole reason nothing dispatched, so the arm has to \
+             see it: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cascade_exhausted_for_another_reason_is_not_a_refusal() {
+        let config = locked_cascade_config(true);
+        // Unhealthy, not locked: the credential allows this provider.
+        config.router().set_provider_health(0, false);
+
+        let error = exhaust_cascade(&config, &[]).await;
+
+        assert_eq!(
+            cascade_credential_lock_providers(&error),
+            None,
+            "an unhealthy provider is an upstream failure; calling it a policy refusal would \
+             stamp a deny reason on a request no policy denied: {error}"
+        );
+    }
+
+    /// WOR-2685: the refusal-surface seam, the same five surfaces
+    /// [`posture_refusal_body`] stamps for the adjacent refusal class.
+    /// The `Err` arm used to write none of them, so the admin console's
+    /// Routing Decisions row stayed blank and the SIEM feed never
+    /// learned a credential policy denied the request.
+    #[test]
+    fn a_credential_lock_stamps_every_refusal_surface() {
+        let mut ctx = crate::context::RequestContext::new();
+        ctx.tenant_id = "cascade-lock-test-tenant".into();
+        ctx.request_id = "cascade-lock-test-rid".into();
+        ctx.ai_route_reason = Some("price_ceiling: 0.02".to_string());
+
+        record_cascade_credential_lock("anthropic", "POST", &mut ctx);
+
+        assert_eq!(
+            ctx.ai_outcome.as_deref(),
+            Some("credential_provider_lock"),
+            "the closed outcome label the access log breaks down by"
+        );
+        assert_eq!(
+            ctx.deny_reason.as_deref(),
+            Some("credential_provider_lock: anthropic"),
+            "metering must classify this as policy_blocked, never origin_5xx"
+        );
+        assert!(
+            ctx.policy_decisions
+                .iter()
+                .any(|decision| decision == "credential_provider_policy:deny"),
+            "the admin ring explainability column carries the deny: {:?}",
+            ctx.policy_decisions
+        );
+        let reason = ctx
+            .ai_route_reason
+            .as_deref()
+            .expect("the admin routing-decisions row reads this column");
+        assert!(
+            reason.contains("credential_provider_lock: anthropic"),
+            "the row has to name the lock, not just that something narrowed: {reason}"
+        );
+        assert!(
+            reason.starts_with("price_ceiling: 0.02"),
+            "an earlier narrowing on the same request is appended to, not overwritten: {reason}"
+        );
+        let audited = sbproxy_observe::audit_ring::recent_audit_events(
+            64,
+            Some("security"),
+            Some("credential_provider_policy"),
+            None,
+        );
+        assert!(
+            audited
+                .iter()
+                .any(|event| event.request_id.as_deref() == Some("cascade-lock-test-rid")),
+            "the refusal must land on the security-audit channel, which is what reaches an \
+             `events:` sink as policy_denied"
+        );
+    }
+}
+
 /// WOR-2557: the typed fail-closed refusal for a candidate set the
 /// data-posture constraint emptied.
 ///
@@ -11424,7 +11640,21 @@ pub(super) async fn handle_ai_proxy(
                     config,
                     cascade_cfg,
                     allowed_providers,
-                    blocked_providers,
+                    // WOR-2685: the executor skips a tier on
+                    // `effective` and diagnoses it on
+                    // `credential_only`, so a tier the data-posture
+                    // constraint excluded is never reported as the
+                    // credential's provider lock. `blocked_providers`
+                    // is the posture-widened binding from the narrowing
+                    // above; `blocked_without_posture` is what it was
+                    // before that. Named fields because the two are
+                    // both `&[String]` and repeating one of them here
+                    // would silently reinstate the misattribution with
+                    // every test still green.
+                    sbproxy_ai::CascadeBlockLists {
+                        effective: blocked_providers,
+                        credential_only: blocked_without_posture,
+                    },
                     &path,
                     &body,
                     &ctx.attribution_tags,
@@ -11647,6 +11877,28 @@ pub(super) async fn handle_ai_proxy(
                             send_error(session, status, message).await?;
                             return Ok(());
                         }
+                    }
+                    // WOR-2685: a cascade that never dispatched because
+                    // the credential's provider policy excluded every
+                    // tier is a policy refusal, not an upstream
+                    // failure, and every surface an operator reads has
+                    // to say so. The detailed message stays here in the
+                    // server log; the caller gets the closed
+                    // `credential_provider_locked` token and nothing
+                    // about the credential's policy contents.
+                    if let Some(locked) = cascade_credential_lock_providers(&e) {
+                        warn!(
+                            event = "ai.cascade.credential_lock",
+                            error = %e,
+                            "AI proxy: cascade refused; the credential's provider policy \
+                             excluded every tier"
+                        );
+                        record_cascade_credential_lock(&locked, &method_str, ctx);
+                        return Err(Error::because(
+                            ErrorType::Custom(CREDENTIAL_PROVIDER_LOCKED_TOKEN),
+                            "AI cascade refused by the credential's provider policy",
+                            e,
+                        ));
                     }
                     warn!(
                         error = %e,

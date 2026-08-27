@@ -6570,6 +6570,13 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
     // Job-progress SSE reconnect: the sequence number of the last event
     // this client saw, so the stream can replay only what it missed.
     let mut last_event_id: Option<String> = None;
+    // WOR-2688: the two markers that tell a browser's script client apart
+    // from a shell one, read by nothing but the 401 challenge decision
+    // below. `X-Requested-With` is the console's own; `Sec-Fetch-Dest` is
+    // the browser's, and reaches the `EventSource` streams the console's
+    // fetch wrapper cannot decorate.
+    let mut requested_with: Option<String> = None;
+    let mut fetch_dest: Option<String> = None;
     for line in lines {
         if line.is_empty() {
             break;
@@ -6604,13 +6611,27 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
             .or_else(|| line.strip_prefix("last-event-id:"))
         {
             last_event_id = Some(rest.trim().to_string());
+        } else if let Some(rest) = line
+            .strip_prefix("X-Requested-With:")
+            .or_else(|| line.strip_prefix("x-requested-with:"))
+        {
+            requested_with = Some(rest.trim().to_string());
+        } else if let Some(rest) = line
+            .strip_prefix("Sec-Fetch-Dest:")
+            .or_else(|| line.strip_prefix("sec-fetch-dest:"))
+        {
+            fetch_dest = Some(rest.trim().to_string());
         }
     }
+    // WOR-2688: whether a 401 written below may carry the Basic challenge.
+    // Derived from the request headers alone and threaded to every response
+    // write on this connection, so a 401 added later cannot forget it.
+    let challenge = basic_challenge_for_request(requested_with.as_deref(), fetch_dest.as_deref());
     // WOR-1717: CORS headers for an allowed cross-origin caller (echoed on
     // every response below), and a direct 204 answer to preflight OPTIONS.
     let mut cors = cors_response_headers(origin.as_deref(), &state.config.cors_origins);
     if method.eq_ignore_ascii_case("OPTIONS") {
-        let _ = write_admin_response_headed(sock, 204, "text/plain", b"", &cors).await;
+        let _ = write_admin_response_headed(sock, 204, "text/plain", b"", &cors, challenge).await;
         return;
     }
 
@@ -6626,7 +6647,8 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
             "Location".to_string(),
             format!("{}/", crate::admin_ui::UI_PREFIX),
         ));
-        let _ = write_admin_response_headed(sock, 302, "text/plain", b"", &headers).await;
+        let _ =
+            write_admin_response_headed(sock, 302, "text/plain", b"", &headers, challenge).await;
         return;
     }
 
@@ -6653,12 +6675,13 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
             body_owned.as_deref(),
             &cors,
             state.config.tls.is_some(),
+            challenge,
         )
         .await;
         return;
     }
     if path == "/admin/logout" && is_state_changing(method) {
-        handle_admin_logout(sock, &state, cookie.as_deref(), &cors).await;
+        handle_admin_logout(sock, &state, cookie.as_deref(), &cors, challenge).await;
         return;
     }
 
@@ -6699,6 +6722,7 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
                     "application/json",
                     br#"{"error":"CSRF token missing or invalid"}"#,
                     &cors,
+                    challenge,
                 )
                 .await;
                 return;
@@ -6715,6 +6739,7 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
                 "application/json",
                 br#"{"error":"forbidden: read-only operator cannot perform this action"}"#,
                 &cors,
+                challenge,
             )
             .await;
             return;
@@ -6776,6 +6801,7 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
             "application/json",
             body.to_string().as_bytes(),
             &cors,
+            challenge,
         )
         .await;
         return;
@@ -6796,6 +6822,7 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
                 "application/json",
                 br#"{"error":"authentication required"}"#,
                 &cors,
+                challenge,
             )
             .await;
             return;
@@ -6807,6 +6834,7 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
                 "application/json",
                 br#"{"error":"method not allowed"}"#,
                 &cors,
+                challenge,
             )
             .await;
             return;
@@ -6821,9 +6849,15 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
         headers.push(("ETag".to_string(), etag.to_string()));
         headers.push(("Cache-Control".to_string(), "private, no-cache".to_string()));
         if if_none_match.as_deref() == Some(etag) {
-            let _ =
-                write_admin_response_headed(sock, 304, "application/schema+json", b"", &headers)
-                    .await;
+            let _ = write_admin_response_headed(
+                sock,
+                304,
+                "application/schema+json",
+                b"",
+                &headers,
+                challenge,
+            )
+            .await;
             return;
         }
         let _ = write_admin_response_headed(
@@ -6832,6 +6866,7 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
             "application/schema+json",
             schema.as_bytes(),
             &headers,
+            challenge,
         )
         .await;
         return;
@@ -6862,6 +6897,7 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
                 response.content_type,
                 response.body.as_bytes(),
                 &cors,
+                challenge,
             )
             .await;
             return;
@@ -6876,9 +6912,15 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
     // request has already had rewritten to the top-level admin credential,
     // so scoping there would read every operator as unscoped.
     if let Some(response) = crate::admin_meter::dispatch(method, path, principal.as_ref()).await {
-        let _ =
-            write_admin_response_headed(sock, response.0, response.1, response.2.as_bytes(), &cors)
-                .await;
+        let _ = write_admin_response_headed(
+            sock,
+            response.0,
+            response.1,
+            response.2.as_bytes(),
+            &cors,
+            challenge,
+        )
+        .await;
         return;
     }
 
@@ -6896,6 +6938,7 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
             response.content_type,
             response.body.as_bytes(),
             &cors,
+            challenge,
         )
         .await;
         return;
@@ -6906,9 +6949,15 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
     // tenant's consumption rows; the sync dispatcher below cannot see the
     // restriction.
     if let Some(response) = dispatch_ai_chargeback(method, path, principal.as_ref()) {
-        let _ =
-            write_admin_response_headed(sock, response.0, response.1, response.2.as_bytes(), &cors)
-                .await;
+        let _ = write_admin_response_headed(
+            sock,
+            response.0,
+            response.1,
+            response.2.as_bytes(),
+            &cors,
+            challenge,
+        )
+        .await;
         return;
     }
 
@@ -6925,12 +6974,14 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
                 "application/json",
                 br#"{"error":"Unauthorized"}"#,
                 &cors,
+                challenge,
             )
             .await;
             return;
         }
         let (status, ct, resp) = crate::admin_playground::list_endpoints();
-        let _ = write_admin_response_headed(sock, status, ct, resp.as_bytes(), &cors).await;
+        let _ =
+            write_admin_response_headed(sock, status, ct, resp.as_bytes(), &cors, challenge).await;
         return;
     }
     if pg_path == crate::admin_playground::CHAT_PATH && method.eq_ignore_ascii_case("POST") {
@@ -6941,6 +6992,7 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
                 "application/json",
                 br#"{"error":"Unauthorized"}"#,
                 &cors,
+                challenge,
             )
             .await;
             return;
@@ -6949,7 +7001,8 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
         // every completed /chat emits (WOR-2497).
         let (status, ct, resp) =
             crate::admin_playground::handle_chat(body_owned.as_deref(), &operator.username).await;
-        let _ = write_admin_response_headed(sock, status, ct, resp.as_bytes(), &cors).await;
+        let _ =
+            write_admin_response_headed(sock, status, ct, resp.as_bytes(), &cors, challenge).await;
         return;
     }
     // Real-dispatch impersonation: same shape as CHAT_PATH above (async,
@@ -6964,13 +7017,15 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
                 "application/json",
                 br#"{"error":"Unauthorized"}"#,
                 &cors,
+                challenge,
             )
             .await;
             return;
         }
         let (status, ct, resp) =
             crate::admin_playground::handle_dispatch(body_owned.as_deref()).await;
-        let _ = write_admin_response_headed(sock, status, ct, resp.as_bytes(), &cors).await;
+        let _ =
+            write_admin_response_headed(sock, status, ct, resp.as_bytes(), &cors, challenge).await;
         return;
     }
 
@@ -6986,6 +7041,7 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
                 "application/json",
                 br#"{"error":"Unauthorized"}"#,
                 &cors,
+                challenge,
             )
             .await;
             return;
@@ -7045,6 +7101,7 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
                     "application/json",
                     br#"{"error":"Unauthorized"}"#,
                     &cors,
+                    challenge,
                 )
                 .await;
                 return;
@@ -7129,7 +7186,9 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
     // filter + rate limiter already ran in the accept loop.
     if crate::admin_ui::path_is_ours(path) {
         if let Some((status, content_type, bytes)) = crate::admin_ui::dispatch_bytes(method, path) {
-            let _ = write_admin_response_headed(sock, status, content_type, &bytes, &cors).await;
+            let _ =
+                write_admin_response_headed(sock, status, content_type, &bytes, &cors, challenge)
+                    .await;
             return;
         }
     }
@@ -7172,7 +7231,15 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
             )
         }
     };
-    let _ = write_admin_response_headed(sock, status, content_type, body.as_bytes(), &cors).await;
+    let _ = write_admin_response_headed(
+        sock,
+        status,
+        content_type,
+        body.as_bytes(),
+        &cors,
+        challenge,
+    )
+    .await;
 }
 
 /// Locate the byte offset of the `\r\n\r\n` (or LF-only `\n\n` for
@@ -7222,24 +7289,97 @@ async fn write_admin_response<S: tokio::io::AsyncWrite + Unpin>(
 /// directly so binary assets (fonts, images, wasm) are sent unmodified.
 /// Generic over the stream so it works over both plain TCP and TLS
 /// (WOR-1717).
+///
+/// Sends the Basic challenge on a 401, which is a statement about who
+/// calls it rather than a default: its three callers answer the IP
+/// allowlist (403), an oversized body (413), and the rate limit (429),
+/// all of them before a single request header has been parsed, so there
+/// is no client marker to read and no 401 to decide about. A 401 written
+/// from here would want `write_admin_response_headed` and the connection's
+/// own `challenge` instead (WOR-2688).
 async fn write_admin_response_bytes<S: tokio::io::AsyncWrite + Unpin>(
     sock: S,
     status: u16,
     content_type: &str,
     body: &[u8],
 ) -> std::io::Result<()> {
-    write_admin_response_headed(sock, status, content_type, body, &[]).await
+    write_admin_response_headed(sock, status, content_type, body, &[], BasicChallenge::Send).await
+}
+
+/// Whether a 401 written by `write_admin_response_headed` carries the
+/// RFC 7235 `WWW-Authenticate: Basic` challenge (WOR-2688).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BasicChallenge {
+    /// Send it. A scripted or CLI caller reads the challenge to learn
+    /// which scheme to retry with, which is what RFC 7235 section 3.1
+    /// asks a 401 to say.
+    Send,
+    /// Omit it. The caller is a browser's script client, where the only
+    /// effect of the challenge is the browser's own credential dialog.
+    Suppress,
+}
+
+/// Decide whether a 401 answering this request may carry the Basic
+/// challenge (WOR-2688).
+///
+/// `requested_with` is the request's `X-Requested-With` header and
+/// `fetch_dest` its `Sec-Fetch-Dest`. Either identifies a caller that
+/// cannot act on a challenge:
+///
+/// - `X-Requested-With: XMLHttpRequest` is what the console's own fetch
+///   wrapper sends on every admin call. It is the deliberate marker, the
+///   one signal this repository sets on both sides of the wire.
+/// - `Sec-Fetch-Dest`, present at any value, is a browser. Browsers that
+///   have it send it on every request they make; curl, `reqwest`, undici,
+///   Deno, and Bun send none of them. It shipped in Chrome 80, Firefox
+///   90, and Safari 16.4, so a browser older than those sends no fetch
+///   metadata: the console's own calls stay covered there by
+///   `X-Requested-With`, but an address-bar navigation on such a browser
+///   still draws the challenge and can still seed the password cache
+///   described below. That is the one hole left in this, and closing it
+///   means refusing Basic on the admin API rather than reading a hint. It covers the
+///   console's `EventSource` log and job streams, which the fetch wrapper
+///   cannot decorate because `EventSource` accepts no request headers, and
+///   it covers the address-bar navigation (`Sec-Fetch-Dest: document`)
+///   that was the last way a browser could be handed the top-level
+///   credential: challenge, dialog, password, and from then on a cached
+///   credential re-attached to every console call, accepted by
+///   `resolve_principal` and upgraded to a session by
+///   `basic_session_upgrade_headers` with no login form ever shown. The
+///   value is deliberately not inspected, because every value of it is
+///   still a browser and a browser is the only client that can open the
+///   dialog. What a browser gets instead is the JSON refusal.
+///
+/// This chooses one response header and nothing else. Neither value
+/// reaches [`AdminState::resolve_principal`], so a request carrying both
+/// markers and no credentials is refused exactly as one carrying neither.
+fn basic_challenge_for_request(
+    requested_with: Option<&str>,
+    fetch_dest: Option<&str>,
+) -> BasicChallenge {
+    let from_fetch_wrapper =
+        requested_with.is_some_and(|v| v.trim().eq_ignore_ascii_case("XMLHttpRequest"));
+    let from_a_browser = fetch_dest.is_some();
+    if from_fetch_wrapper || from_a_browser {
+        BasicChallenge::Suppress
+    } else {
+        BasicChallenge::Send
+    }
 }
 
 /// Write an admin response with a byte body plus extra response headers
 /// (WOR-1717 CORS, WOR-1714 `Set-Cookie`). `write_admin_response_bytes`
 /// is the no-extra-headers wrapper.
+///
+/// `challenge` decides only whether a 401 carries `WWW-Authenticate`
+/// (WOR-2688); it is inert on every other status.
 async fn write_admin_response_headed<S: tokio::io::AsyncWrite + Unpin>(
     mut sock: S,
     status: u16,
     content_type: &str,
     body: &[u8],
     extra_headers: &[(String, String)],
+    challenge: BasicChallenge,
 ) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
     let mut header = format!(
@@ -7275,10 +7415,47 @@ async fn write_admin_response_headed<S: tokio::io::AsyncWrite + Unpin>(
     // The SPA has its own login and CSRF flow (WOR-1714) and never needed
     // this header. Scripted and CLI clients still get a correct challenge
     // where the RFC says it belongs.
-    if status == 401 {
+    //
+    // WOR-2688: which is why the status alone is not the whole condition.
+    // A 401 answering the console's own client still opened the browser's
+    // native credential dialog, and that dialog is a dead end: it is not
+    // the app's sign-in form, Cancel leaves the page wedged until a hard
+    // reload, and typing the top-level credentials into it caches them for
+    // the whole origin, which walks straight back into the loop the
+    // paragraph above describes. The console reads the bare 401 and routes
+    // to its own login page instead. `curl` and `sbproxy admin` send no
+    // browser marker, so their 401s are unchanged.
+    //
+    // A browser typing an admin URL into the address bar is covered by the
+    // same rule, which is what keeps the credential out of the browser's
+    // password cache in the first place: it reads the JSON refusal instead
+    // of being offered a dialog it should not be answering.
+    if status == 401 && challenge == BasicChallenge::Send {
         header.push_str("WWW-Authenticate: Basic realm=\"sbproxy admin\"\r\n");
     }
+    // Whether that header is there depends on two request headers, so
+    // anything caching a 401 has to key on them. Without this a shared
+    // cache can store a browser's challenge-less 401 and replay it to
+    // `curl --anyauth`, which is then left with no scheme to select.
+    // Any `Vary` the extra headers carry (CORS contributes `Origin`) is
+    // folded into this one field line rather than sent as a second, so a
+    // single header names the whole key.
+    if status == 401 {
+        header.push_str("Vary: X-Requested-With, Sec-Fetch-Dest");
+        for (_, value) in extra_headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("vary"))
+        {
+            header.push_str(", ");
+            header.push_str(value);
+        }
+        header.push_str("\r\n");
+    }
     for (k, v) in extra_headers {
+        if status == 401 && k.eq_ignore_ascii_case("vary") {
+            // Already folded into the challenge `Vary` above.
+            continue;
+        }
         header.push_str(k);
         header.push_str(": ");
         header.push_str(v);
@@ -7308,7 +7485,14 @@ fn cors_response_headers(origin: Option<&str>, allowed: &[String]) -> Vec<(Strin
             ),
             (
                 "Access-Control-Allow-Headers".to_string(),
-                "Authorization, Content-Type, X-CSRF-Token".to_string(),
+                // `X-Requested-With` is on the list because the console
+                // sends it on every call (WOR-2688) and it is not a
+                // CORS-safelisted request header. Without it a
+                // cross-origin console preflights every call, including
+                // the plain GETs that used to go straight out, and the
+                // browser blocks each one on a preflight that does not
+                // name the header.
+                "Authorization, Content-Type, X-CSRF-Token, X-Requested-With".to_string(),
             ),
             ("Vary".to_string(), "Origin".to_string()),
         ],
@@ -7356,6 +7540,7 @@ async fn handle_admin_login<S: tokio::io::AsyncWrite + Unpin>(
     body: Option<&str>,
     cors: &[(String, String)],
     secure: bool,
+    challenge: BasicChallenge,
 ) {
     let creds = auth_header.and_then(decode_basic_auth).or_else(|| {
         body.and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
@@ -7375,6 +7560,7 @@ async fn handle_admin_login<S: tokio::io::AsyncWrite + Unpin>(
                 "application/json",
                 br#"{"error":"missing credentials"}"#,
                 cors,
+                challenge,
             )
             .await;
             return;
@@ -7402,6 +7588,7 @@ async fn handle_admin_login<S: tokio::io::AsyncWrite + Unpin>(
                 "application/json",
                 br#"{"error":"invalid credentials"}"#,
                 cors,
+                challenge,
             )
             .await;
             return;
@@ -7430,8 +7617,15 @@ async fn handle_admin_login<S: tokio::io::AsyncWrite + Unpin>(
     headers.push(("Set-Cookie".to_string(), cookie));
     let out = serde_json::json!({"role": role_label(role), "csrf_token": csrf, "username": user})
         .to_string();
-    let _ =
-        write_admin_response_headed(sock, 200, "application/json", out.as_bytes(), &headers).await;
+    let _ = write_admin_response_headed(
+        sock,
+        200,
+        "application/json",
+        out.as_bytes(),
+        &headers,
+        challenge,
+    )
+    .await;
 }
 
 /// Handle `POST /admin/logout` (WOR-1714): revoke the session and clear
@@ -7441,6 +7635,7 @@ async fn handle_admin_logout<S: tokio::io::AsyncWrite + Unpin>(
     state: &AdminState,
     cookie_header: Option<&str>,
     cors: &[(String, String)],
+    challenge: BasicChallenge,
 ) {
     if let Some(ch) = cookie_header {
         if let Some(tok) =
@@ -7465,6 +7660,7 @@ async fn handle_admin_logout<S: tokio::io::AsyncWrite + Unpin>(
         "application/json",
         br#"{"status":"logged out"}"#,
         &headers,
+        challenge,
     )
     .await;
 }
@@ -7548,6 +7744,249 @@ mod tests {
             cors_origins: Vec::new(),
             operators: Vec::new(),
         })
+    }
+
+    /// Drive one admin request end to end over an in-memory socket and
+    /// return the raw response, headers included. The challenge decision
+    /// lives in the response header block, so the assertions below have to
+    /// read the wire bytes rather than a parsed body.
+    async fn admin_connection_roundtrip(
+        state: std::sync::Arc<AdminState>,
+        peer_ip: &'static str,
+        request: &str,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let handler = tokio::spawn(async move {
+            handle_admin_connection(server, peer_ip, &AdminRateLimiter::new(1_000_000), state).await
+        });
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        handler.await.unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn admin_401_omits_the_basic_challenge_for_the_console_fetch_marker() {
+        // WOR-2688: the console's fetch wrapper marks every call. Its 401
+        // must not carry `WWW-Authenticate`, because that header is what
+        // opens the browser's native credential dialog over an app that
+        // has its own sign-in page.
+        let response = admin_connection_roundtrip(
+            std::sync::Arc::new(make_state()),
+            "10.0.0.40",
+            "GET /admin/keys HTTP/1.1\r\nX-Requested-With: XMLHttpRequest\r\n\r\n",
+        )
+        .await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 401 Unauthorized"),
+            "{response}"
+        );
+        assert!(
+            !response.to_ascii_lowercase().contains("www-authenticate"),
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_401_keeps_the_basic_challenge_for_a_scripted_client() {
+        // The same request without the marker is a curl or `sbproxy admin`
+        // caller, and RFC 7235 says its 401 names the scheme to retry with.
+        let response = admin_connection_roundtrip(
+            std::sync::Arc::new(make_state()),
+            "10.0.0.41",
+            "GET /admin/keys HTTP/1.1\r\n\r\n",
+        )
+        .await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 401 Unauthorized"),
+            "{response}"
+        );
+        assert!(
+            response.contains("WWW-Authenticate: Basic realm=\"sbproxy admin\""),
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_401_omits_the_basic_challenge_for_a_browser_event_source() {
+        // The console's log and job tails are `EventSource`, which takes no
+        // request headers, so the fetch wrapper cannot mark them. The
+        // browser marks them instead: `Sec-Fetch-Dest` is on every request a
+        // browser makes and on no shell client.
+        //
+        // Both routes own their socket and write their own 401 ahead of the
+        // generic writer, so both are named here. A path that is not a route
+        // would fall through to the generic 401 and pin neither.
+        for (peer, path) in [
+            ("10.0.0.42", "/api/requests/stream"),
+            ("10.0.0.46", "/admin/model-host/jobs/job-1/stream"),
+        ] {
+            let response = admin_connection_roundtrip(
+                std::sync::Arc::new(make_state()),
+                peer,
+                &format!(
+                    "GET {path} HTTP/1.1\r\nAccept: text/event-stream\r\nSec-Fetch-Dest: empty\r\n\r\n"
+                ),
+            )
+            .await;
+
+            assert!(
+                response.starts_with("HTTP/1.1 401 Unauthorized"),
+                "{path}: {response}"
+            );
+            assert!(
+                !response.to_ascii_lowercase().contains("www-authenticate"),
+                "{path}: {response}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_401_omits_the_basic_challenge_for_a_browser_navigation() {
+        // WOR-2688 review, second Major: a top-level navigation was the last
+        // way a browser could pick up the top-level credential. An operator
+        // pasting an admin URL into the address bar got the challenge, the
+        // dialog took the password, and the browser then attached it to
+        // every later console call, where `resolve_principal` accepts it
+        // against a config credential no restart invalidates and
+        // `basic_session_upgrade_headers` mints a session nobody signed in
+        // for. A browser sends `Sec-Fetch-Dest` on every request whatever
+        // the destination, so keying on the header's presence closes that
+        // door. The cost is that a browser poking the admin API by hand
+        // reads the JSON refusal instead of being offered a dialog.
+        let response = admin_connection_roundtrip(
+            std::sync::Arc::new(make_state()),
+            "10.0.0.45",
+            "GET /admin/keys HTTP/1.1\r\nAccept: text/html\r\nSec-Fetch-Dest: document\r\nSec-Fetch-Mode: navigate\r\n\r\n",
+        )
+        .await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 401 Unauthorized"),
+            "{response}"
+        );
+        assert!(
+            !response.to_ascii_lowercase().contains("www-authenticate"),
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_401_names_the_client_markers_in_one_vary_header() {
+        // WOR-2688 review, third finding: the challenge now varies on two
+        // request headers, so a cache in front of the admin port has to key
+        // on them or it will replay a browser's challenge-less 401 to a
+        // shell client, which is then left with no scheme to select. The
+        // CORS `Vary` folds into the same field line rather than arriving as
+        // a second one.
+        let mut state = make_state();
+        state.config.cors_origins = vec!["https://ops.example.com".to_string()];
+        let response = admin_connection_roundtrip(
+            std::sync::Arc::new(state),
+            "10.0.0.47",
+            "GET /admin/keys HTTP/1.1\r\nOrigin: https://ops.example.com\r\n\r\n",
+        )
+        .await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 401 Unauthorized"),
+            "{response}"
+        );
+        let vary: Vec<&str> = response
+            .lines()
+            .filter(|line| line.to_ascii_lowercase().starts_with("vary:"))
+            .collect();
+        assert_eq!(vary.len(), 1, "one Vary field line: {response}");
+        for name in ["X-Requested-With", "Sec-Fetch-Dest", "Origin"] {
+            assert!(vary[0].contains(name), "{name} missing from {vary:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn console_fetch_marker_suppresses_only_the_challenge_never_the_auth_decision() {
+        // WOR-2688's one real risk: a marker a caller sets on itself must
+        // not become a way in. It chooses one response header, and
+        // `resolve_principal` never sees it.
+        let state = std::sync::Arc::new(make_state());
+        assert!(state.resolve_principal(None, None).is_none());
+
+        // Marked, with a password that does not match: still refused.
+        let refused = admin_connection_roundtrip(
+            std::sync::Arc::clone(&state),
+            "10.0.0.43",
+            &format!(
+                "GET /unknown HTTP/1.1\r\nX-Requested-With: XMLHttpRequest\r\nAuthorization: {}\r\n\r\n",
+                basic_auth("admin", "wrong-password"),
+            ),
+        )
+        .await;
+        assert!(
+            refused.starts_with("HTTP/1.1 401 Unauthorized"),
+            "{refused}"
+        );
+        assert!(refused.contains(r#"{"error":"Unauthorized"}"#), "{refused}");
+
+        // Marked, with the real credentials: admitted exactly as before,
+        // so the marker did not narrow the decision either. A 404 is the
+        // authenticated answer for an unrouted path; a 401 would not be.
+        let admitted = admin_connection_roundtrip(
+            state,
+            "10.0.0.44",
+            &format!(
+                "GET /unknown HTTP/1.1\r\nX-Requested-With: XMLHttpRequest\r\nAuthorization: {}\r\n\r\n",
+                basic_auth("admin", "secret"),
+            ),
+        )
+        .await;
+        assert!(admitted.starts_with("HTTP/1.1 404 Not Found"), "{admitted}");
+    }
+
+    #[test]
+    fn basic_challenge_for_request_reads_the_console_marker_or_any_fetch_metadata() {
+        // The console's marker, case-insensitively (a header value is not
+        // a case-sensitive token here) and whitespace-tolerantly.
+        assert_eq!(
+            basic_challenge_for_request(Some("XMLHttpRequest"), None),
+            BasicChallenge::Suppress
+        );
+        assert_eq!(
+            basic_challenge_for_request(Some(" xmlhttprequest "), None),
+            BasicChallenge::Suppress
+        );
+        // The browser's marker on a script-initiated request.
+        assert_eq!(
+            basic_challenge_for_request(None, Some("empty")),
+            BasicChallenge::Suppress
+        );
+        // Any other destination is a browser too, and a browser is the only
+        // client that can open a credential dialog, so it is suppressed the
+        // same way. `document` is the address-bar navigation the review's
+        // second Major describes.
+        for dest in ["document", "iframe", "script", "image", ""] {
+            assert_eq!(
+                basic_challenge_for_request(None, Some(dest)),
+                BasicChallenge::Suppress,
+                "Sec-Fetch-Dest: {dest:?}"
+            );
+        }
+        // Neither marker is a shell client: curl and `sbproxy admin` send no
+        // fetch metadata at all, and they get the RFC-correct challenge.
+        assert_eq!(
+            basic_challenge_for_request(None, None),
+            BasicChallenge::Send
+        );
+        // A near miss on the console's marker is not the console's marker,
+        // and does not suppress on its own.
+        assert_eq!(
+            basic_challenge_for_request(Some("XMLHttpRequestish"), None),
+            BasicChallenge::Send
+        );
     }
 
     fn git_available() -> bool {
@@ -12383,6 +12822,34 @@ origins:
         assert!(hs
             .iter()
             .any(|(k, v)| k == "Access-Control-Allow-Origin" && v == "https://any.example.com"));
+    }
+
+    #[test]
+    fn cors_allow_headers_admit_the_console_client_marker() {
+        // WOR-2688 review, first Major: the console sends `X-Requested-With`
+        // on every call now, and that is not a CORS-safelisted request
+        // header. A cross-origin console (`proxy.admin.cors_origins`, the
+        // separately hosted UI shape) therefore preflights every call,
+        // including the plain GETs that used to go straight out. A preflight
+        // that does not list the header makes the browser block the real
+        // request, and the admin server never sees it, so there is nothing
+        // in the log to read either.
+        let allowed = vec!["https://ops.example.com".to_string()];
+        let headers = cors_response_headers(Some("https://ops.example.com"), &allowed);
+        let allow = headers
+            .iter()
+            .find(|(k, _)| k == "Access-Control-Allow-Headers")
+            .map(|(_, v)| v.as_str())
+            .expect("Access-Control-Allow-Headers present");
+
+        for expected in [
+            "Authorization",
+            "Content-Type",
+            "X-CSRF-Token",
+            "X-Requested-With",
+        ] {
+            assert!(allow.contains(expected), "{expected} missing from {allow}");
+        }
     }
 
     #[test]

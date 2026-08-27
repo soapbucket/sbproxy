@@ -1,6 +1,6 @@
 # Admin API guide
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-27*
 
 This is the task-oriented "how do I call it" guide to the embedded admin
 server: enabling it, authenticating, and a curl cookbook for the routes
@@ -160,6 +160,55 @@ somewhere to call *to get* a session). The signing key for sessions is
 random per process: restarting the proxy invalidates every open
 session, by design, since this is an admin surface, not a customer
 login.
+
+### What a refused request gets back
+
+A request with no credentials, or the wrong ones, answers `401` with a
+JSON body. Most routes send `{"error":"Unauthorized"}`; the config
+schema (`/admin/config/schema`), the chargeback exports
+(`/admin/ai-chargeback` and `.csv`), and the meter routes
+(`/api/meter/*`) send `{"error":"authentication required"}`, so match on
+the status rather than on the string. For a script that 401 also carries
+`WWW-Authenticate: Basic realm="sbproxy admin"`, the RFC 7235 challenge
+naming the scheme to retry with, so `curl -u` and `sbproxy admin` behave
+the way an HTTP client expects.
+
+A request from a browser gets the same 401 without that header. Two
+markers identify one, and either is enough: `X-Requested-With:
+XMLHttpRequest`, which the console's fetch layer sends on every admin
+call, and `Sec-Fetch-Dest` at any value, which browsers send on every
+request they make and no shell client sends at all (it shipped in Chrome
+80, Firefox 90, and Safari 16.4; older browsers send neither header on a
+navigation, so they still see the dialog, while the console's own calls
+stay covered by `X-Requested-With` everywhere). The reason is that
+the challenge header has one effect in a browser, which is to open the
+native credential dialog, and that dialog is not this console's sign-in
+page. Cancelling it leaves the console wedged until a hard reload, and
+typing the top-level password into it caches the credential for the
+whole origin, where the browser re-sends it on every later request and
+quietly re-establishes a session nobody signed in for. The console reads
+the bare 401 and routes to its own login form.
+
+So opening an admin route in a current browser tab shows you the JSON
+refusal rather than a credential prompt. That is deliberate: the prompt
+is the one path by which a browser picks up the top-level password and
+starts re-sending it invisibly, and the console's own sign-in page is
+the supported way in.
+
+Both markers are a hint about the caller and nothing more. They choose
+one response header: credentials resolve identically with or without
+them, so a marked request carrying no password is refused exactly like
+an unmarked one. Send them from a script if you would rather not read
+challenges, or leave them off and keep the RFC behavior. A 401 carries
+`Vary: X-Requested-With, Sec-Fetch-Dest` so a cache in front of the
+admin port keys on the difference.
+
+One consequence for a separately hosted console
+(`proxy.admin.cors_origins`): `X-Requested-With` is not a
+CORS-safelisted request header, so a cross-origin caller that sends it
+preflights every call. The preflight names it in
+`Access-Control-Allow-Headers` alongside `Authorization`,
+`Content-Type`, and `X-CSRF-Token`.
 
 ## Roles: `admin` vs. `read_only`
 

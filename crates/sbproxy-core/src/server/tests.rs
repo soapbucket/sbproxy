@@ -4875,6 +4875,23 @@ fn map_upstream_failure_translates_pingora_etype_to_status_and_token() {
         super::map_upstream_failure(&e),
         (502, Some("http_request_error"))
     );
+    // WOR-2685: an AI cascade the credential's provider policy locked
+    // out carries its own closed token, so a caller can tell "your
+    // credential cannot reach that provider" from "our upstream is
+    // down" without being told which providers the credential does
+    // reach. Any other custom etype stays on the catch-all.
+    let e = Error::new(ErrorType::Custom(
+        super::ai_support::CREDENTIAL_PROVIDER_LOCKED_TOKEN,
+    ));
+    assert_eq!(
+        super::map_upstream_failure(&e),
+        (502, Some("credential_provider_locked"))
+    );
+    let e = Error::new(ErrorType::Custom("some_other_custom_etype"));
+    assert_eq!(
+        super::map_upstream_failure(&e),
+        (502, Some("http_request_error"))
+    );
 }
 
 // --- WOR-229: native bypass body helper ---
