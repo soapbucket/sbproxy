@@ -231,7 +231,9 @@ const DEFAULT_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5
 /// trickles a byte just under it can restart forever while holding its share
 /// of the process-wide frame budget.
 pub(crate) const DEFAULT_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-/// Whole-connection deadline, from accept to close.
+/// Whole-connection deadline, refreshed by every completed frame. A socket
+/// that stops making progress is closed this long after its last answered
+/// frame; a busy one is never cut mid-exchange.
 pub(crate) const DEFAULT_CONNECTION_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(300);
 const DEFAULT_LISTENER_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -256,8 +258,8 @@ pub(crate) struct TcpLimits {
     /// Whole-frame deadline covering the length prefix and the declared
     /// body. Must be at least `io_timeout`.
     pub frame_timeout: Duration,
-    /// Whole-connection deadline, from accept to close. Must be at least
-    /// `frame_timeout`.
+    /// Whole-connection deadline, measured from accept and moved forward by
+    /// every completed frame. Must be at least `frame_timeout`.
     pub connection_timeout: Duration,
 }
 
@@ -2239,7 +2241,6 @@ async fn read_frame_payload(
 /// unauthenticated frame reached `quality_score`'s trigram map and
 /// `check_streaming_safety`'s per-rule `to_lowercase` with four times the
 /// text the gRPC path refuses.
-#[allow(clippy::result_large_err)]
 fn check_public_text_bytes(text: &str) -> Result<(), String> {
     if text.len() > crate::grpc::MAX_TEXT_BYTES {
         return Err(format!(
@@ -2377,6 +2378,62 @@ struct ListenerResources<'a> {
     shutdown: Option<Arc<TcpListenerCleanupProbe>>,
 }
 
+/// The whole-connection deadline, and the one thing that moves it.
+///
+/// The bound is aimed at a socket that holds a connection slot and a share of
+/// the frame budget without making progress. A client that pools a connection
+/// and keeps it busy is not that, and cutting one at a fixed span after accept
+/// drops the answer to a request the sidecar has already paid for, with no
+/// response frame for whatever was in flight. So the deadline is
+/// last-progress-based: it starts one `connection_timeout` after accept and
+/// every completed frame moves it one `connection_timeout` further out. An
+/// idle or trickling socket still closes on schedule, because nothing it does
+/// completes a frame.
+///
+/// Both listeners share it. A stalled admin socket holds a slot and draws on
+/// the same frame budget a public one does, and an admin client that is
+/// actually working refreshes the deadline like any other.
+struct ConnectionDeadline {
+    budget: Duration,
+    accepted: tokio::time::Instant,
+    /// Milliseconds from `accepted` to the current deadline. An atomic
+    /// rather than a lock so the read in the listener's select arm cannot
+    /// contend with the refresh on the connection's own task.
+    offset_millis: std::sync::atomic::AtomicU64,
+}
+
+impl ConnectionDeadline {
+    fn new(budget: Duration) -> Self {
+        Self {
+            budget,
+            accepted: tokio::time::Instant::now(),
+            offset_millis: std::sync::atomic::AtomicU64::new(Self::millis(budget)),
+        }
+    }
+
+    fn millis(duration: Duration) -> u64 {
+        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn current(&self) -> tokio::time::Instant {
+        self.accepted
+            + Duration::from_millis(
+                self.offset_millis
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+    }
+
+    /// Move the deadline one full budget past now. Called once per answered
+    /// frame, never inside one.
+    fn refresh(&self) {
+        let elapsed = Self::millis(self.accepted.elapsed());
+        self.offset_millis.store(
+            elapsed.saturating_add(Self::millis(self.budget)),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
 /// Serve one accepted connection under its whole-connection deadline.
 ///
 /// The deadline is enforced by dropping the connection future, which drops
@@ -2390,32 +2447,39 @@ async fn serve_bounded_connection(
     #[cfg(test)] controls: Option<Arc<TcpTestControl>>,
     #[cfg(test)] allocation_probe: Option<Arc<FrameAllocationProbe>>,
 ) -> Result<(), std::io::Error> {
-    let connection_timeout = resources.limits.connection_timeout;
-    let served = tokio::time::timeout(
-        connection_timeout,
-        handle_production_connection(
-            stream,
-            mode,
-            resources,
-            #[cfg(test)]
-            controls,
-            #[cfg(test)]
-            allocation_probe,
-        ),
-    )
-    .await;
-    match served {
-        Ok(result) => result,
-        Err(_) => {
-            crate::metrics::begin_outcome(
-                metrics_transport(mode),
-                crate::metrics::Command::Unknown,
-            )
-            .failure(
-                crate::metrics::Stage::Read,
-                crate::metrics::Reason::Deadline,
-            );
-            Ok(())
+    let deadline = ConnectionDeadline::new(resources.limits.connection_timeout);
+    let served = handle_production_connection(
+        stream,
+        mode,
+        resources,
+        &deadline,
+        #[cfg(test)]
+        controls,
+        #[cfg(test)]
+        allocation_probe,
+    );
+    tokio::pin!(served);
+    loop {
+        let expiry = deadline.current();
+        tokio::select! {
+            result = &mut served => return result,
+            () = tokio::time::sleep_until(expiry) => {
+                // A frame completed while this arm was parked, so the socket
+                // is making progress and the deadline it fired against is
+                // stale. Re-arm against the new one.
+                if deadline.current() > expiry {
+                    continue;
+                }
+                crate::metrics::begin_outcome(
+                    metrics_transport(mode),
+                    crate::metrics::Command::Unknown,
+                )
+                .failure(
+                    crate::metrics::Stage::Read,
+                    crate::metrics::Reason::Deadline,
+                );
+                return Ok(());
+            }
         }
     }
 }
@@ -2424,6 +2488,7 @@ async fn handle_production_connection(
     mut stream: TcpStream,
     mode: TransportMode,
     resources: ListenerResources<'_>,
+    deadline: &ConnectionDeadline,
     #[cfg(test)] controls: Option<Arc<TcpTestControl>>,
     #[cfg(test)] allocation_probe: Option<Arc<FrameAllocationProbe>>,
 ) -> Result<(), std::io::Error> {
@@ -2921,6 +2986,11 @@ async fn handle_production_connection(
             PlannedOutcome::Success => outcome.success(),
             PlannedOutcome::Failure(stage, reason) => outcome.failure(stage, reason),
         }
+
+        // One frame in, one frame answered: this connection is making
+        // progress, so it is not the case the whole-connection deadline is
+        // there to close.
+        deadline.refresh();
 
         #[cfg(test)]
         if matches!(request_fault, Some(TcpFault::PanicAfterWrite(fault_command)) if fault_command == metrics_command(command))
@@ -5658,6 +5728,76 @@ mod tests {
         );
         trickle.abort();
         let _ = trickle.await;
+        pair.stop().await;
+    }
+
+    /// The whole-connection deadline is there for a socket that stops making
+    /// progress, and a healthy pooled client is not that. It used to wrap the
+    /// whole connection from accept on both listeners, so a client that kept
+    /// a connection busy had it dropped at the configured span mid-exchange,
+    /// with no response frame for whatever was in flight. Every answered
+    /// frame now moves the deadline out, on the admin listener too, and a
+    /// socket that answers nothing is still closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_busy_connection_refreshes_the_whole_connection_deadline_on_both_listeners() {
+        let registry = Arc::new(Registry::new_empty());
+        registry
+            .register("tenant.example", &sample_tenant_config())
+            .expect("tenant registers");
+        let auth = Arc::new(
+            AdminAuth::from_json(br#"{"tokens":[{"token":"secret","tenants":["*"]}]}"#).unwrap(),
+        );
+        // The nesting rule forbids a connection deadline under the frame
+        // deadline, so the two are equal here: five exchanges 400ms apart
+        // stay inside every read and frame window, and run to roughly twice
+        // the 1s a fixed accept-to-close deadline would have allowed.
+        let pair = spawn_production_listener_pair(
+            registry,
+            auth,
+            TcpLimits {
+                max_connections: 8,
+                io_timeout: Duration::from_millis(800),
+                frame_timeout: Duration::from_millis(1000),
+                connection_timeout: Duration::from_millis(1000),
+            },
+            Arc::new(TcpTestControl::default()),
+            None,
+        )
+        .await;
+
+        let mut request = msg("classify");
+        request.tenant = Some("tenant.example".to_string());
+        request.text = "hello there".to_string();
+        let mut list = msg("list");
+        list.admin_token = Some("secret".to_string());
+
+        let mut public = bounded_tcp_connect(pair.public_address, "busy public client").await;
+        let mut admin = bounded_tcp_connect(pair.admin_address, "busy admin client").await;
+        for round in 1..=5 {
+            let classified: ClassifyResponse =
+                rmp_serde::from_slice(&wire_exchange(&mut public, &request).await).unwrap();
+            assert_eq!(
+                classified.labels[0].label, "greeting",
+                "public round {round} must still be answered"
+            );
+            let listed: AdminResponse =
+                rmp_serde::from_slice(&wire_exchange(&mut admin, &list).await).unwrap();
+            assert!(listed.ok, "admin round {round} must still be answered");
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+
+        // Progress is what refreshes it: a socket that answers nothing is
+        // still closed, by whichever deadline reaches it first.
+        let mut idle = bounded_tcp_connect(pair.public_address, "idle public client").await;
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(3), idle.read(&mut byte))
+            .await
+            .expect("an idle socket must be closed, not held open");
+        assert_eq!(
+            read.expect("closed by the sidecar, not by an error"),
+            0,
+            "an idle socket must reach end of stream"
+        );
         pair.stop().await;
     }
 
