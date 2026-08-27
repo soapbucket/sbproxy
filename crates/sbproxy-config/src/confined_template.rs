@@ -54,16 +54,22 @@
 //!   "env:AWS_SECRET_ACCESS_KEY"` is the attack above with the quotes
 //!   moved.
 //! * `file:PATH` is the same thing against the filesystem.
-//! * `rego_module_path` and `module_path` name a host path the compiler
-//!   opens and inlines into the compiled config
-//!   (`crates/sbproxy-config/src/compiler.rs:590`).
+//! * A named list of config keys carries a host path the proxy opens:
+//!   `rego_module_path` and `module_path` are read by the compiler
+//!   (`crates/sbproxy-config/src/compiler.rs:590`), and `spec_file`,
+//!   `sha1_file`, `transcode.descriptor_set`, `bulk_list.path` and
+//!   `feed.cache_dir` are opened by the module constructors the
+//!   compiled pipeline runs. `HOST_FILE_KEYS` is that list.
 //!
 //! [`ConfinementPolicy`] withholds all three from a fragment, and the
 //! last two from a whole document fetched from elsewhere. Provider-URI
 //! references (`secret://`, `vault://<backend>/`, `awssm://`) are
 //! deliberately still allowed: each resolves only against a backend the
 //! operator declared under `proxy.secrets`, which is a path no
-//! externally authored document may set.
+//! externally authored document may set. The one exception is
+//! [`ConfinementPolicy::bundle_manifest`], where the value being checked
+//! was authored by the bundle itself and lands in guest code that can
+//! read it, so no reference of any kind resolves.
 //!
 //! # The shape, and why this one
 //!
@@ -173,14 +179,18 @@
 //! It does not change the fleet-wide passes. Operator-authored config
 //! keeps today's behavior exactly, `${VAR:-default}` shell semantics
 //! included. Confinement applies where a caller asks for it, and the
-//! callers are the three places config text arrives from a party that
-//! does not own the compiling host: the git arm of
-//! [`crate::source`]'s loader, `validate_publish_payload` on the config
-//! authority, and the subscriber's merge of a remote bundle.
+//! callers are the places config text arrives from a party that does not
+//! own the compiling host: `validate_publish_payload` on the config
+//! authority, the subscriber's merge of a remote bundle, an extension
+//! bundle manifest's own config values
+//! (`sbproxy_extension::bundle::envelope::prepare_hook_config`), and the
+//! git arm of [`crate::source`]'s loader when the operator asked for it
+//! with `source.confine: true`.
 //!
 //! # What this boundary does not stop, stated rather than implied
 //!
-//! [`ConfinementPolicy::remote_document`] still allows `${VAR}`, so a
+//! **A remote document may still name a process variable.**
+//! [`ConfinementPolicy::remote_document`] allows `${VAR}`, so a
 //! git-sourced document or an authority bundle can name a process
 //! variable that resolves on the node. The existing
 //! [`crate::unresolved_env_references`] gate only refuses a reference
@@ -191,6 +201,43 @@
 //! every git-sourced fleet on upgrade, and defaulting it to "any" is the
 //! behavior described here. A fragment has no such gap, because
 //! [`ConfinementPolicy::sealed`] allows no environment name at all.
+//!
+//! **A git-sourced document is not confined unless the operator says
+//! so.** `source.confine` defaults to `false`, so a `source: { kind:
+//! git }` document keeps every power it has today. The reason is that
+//! on that path the refusal's own remedy does not exist: a git-sourced
+//! node's local file is a pointer and the repository *is* the config, so
+//! there is no root config left to declare the value in. `env:NAME` and
+//! `file:PATH` are the documented spellings for the cluster shared key
+//! (docs/secrets.md), the Kubernetes operator generates the first
+//! (`crates/sbproxy-k8s-operator/src/reconcile.rs:708`), and sealing
+//! them by default would leave a clustered GitOps node with no legal
+//! spelling at all. An operator whose config repository is written by
+//! somebody else sets `source.confine: true` and gets
+//! [`ConfinementPolicy::remote_document`].
+//!
+//! **The host-file list is a list.** `HOST_FILE_KEYS` names eleven
+//! config keys and refuses those. It is not a rule about host files in
+//! general and cannot be: the enforcers are module constructors in
+//! `sbproxy-modules`, each of which opens whatever path its own config
+//! key names, and a module added later opens a path this list has never
+//! heard of. The list carries the `path:LINE` of every enforcer it
+//! mirrors so the next reader can check it, which is the same shape as
+//! the `sbproxy-vault` mirror below, and
+//! `every_host_file_key_is_refused_under_the_parent_that_scopes_it`
+//! pins every entry's behavior. What that test cannot do is notice a key
+//! nobody added, which is why the list's own doc carries the grep that
+//! finds them.
+//!
+//! **Naming an environment variable is not always reading a secret out
+//! of it.** `WafFeedConfig::signature_key_env` and `auth_token_env`
+//! (`crates/sbproxy-modules/src/policy/waf/feed.rs:164,170`) take the
+//! *name* of an environment variable from config and read it at
+//! runtime. They are deliberately not refused: the value never reaches
+//! the document or a response (it is an HMAC key and a bearer token the
+//! subscriber sends to the feed it was configured with), and naming the
+//! variable is the only way the feature can be configured at all, so
+//! refusing it would be the no-legal-spelling trap again.
 //!
 //! The mirror of `sbproxy-vault`'s host-backed reference set is a mirror
 //! and not a call, because `sbproxy-config` does not depend on that
@@ -221,39 +268,156 @@ const SCRIPT_BODY_KEYS: &[&str] = &["lua_script", "js_script", "rego_module"];
 /// leaves it literal too.
 const RESOLVABLE_BRACE_PREFIXES: &[&str] = &["env.", "vars.", "variables."];
 
-/// Keys whose value is a path the compiler reads off the host
-/// filesystem and inlines into the compiled config, paired with the key
-/// that carries the same content inline.
+/// One config key whose value the proxy opens on the host filesystem:
+/// the key as authored, the parent key that scopes the match, and the
+/// remedy the refusal offers.
+#[derive(Debug)]
+struct HostFileKey {
+    /// The mapping key that must own this one, or `None` when the key
+    /// name is unambiguous anywhere in a document. `path` is why this
+    /// exists: refusing every `path` in a document would refuse a
+    /// `source:` block's own repository path and half the runtime
+    /// vocabulary with it.
+    parent: Option<&'static str>,
+    /// The key as authored.
+    key: &'static str,
+    /// What the operator does instead, rendered into the refusal. Named
+    /// after the key that actually exists on that module, because a
+    /// remedy naming a key the module does not have is worse than no
+    /// remedy at all.
+    remedy: &'static str,
+}
+
+impl HostFileKey {
+    /// Whether `key`, sitting directly under `parent_key`, is this entry.
+    fn matches(&self, parent_key: Option<&str>, key: &str) -> bool {
+        self.key == key && (self.parent.is_none() || self.parent == parent_key)
+    }
+}
+
+/// Config keys whose value is a path the proxy opens on the host
+/// filesystem while it builds the pipeline.
 ///
-/// `rego_module_path` is read by `resolve_rego_modifier_module`
+/// Two of them are read by the compiler itself: `rego_module_path` in
+/// `resolve_rego_modifier_module`
 /// (`crates/sbproxy-config/src/compiler.rs:590`) at compile and again on
-/// every reload; `module_path` is its spelling on `policy: rego` and on
-/// `transforms[] type: wasm`. A document that may name one of these can
-/// name any path the proxy process can open, which is a host-file read
-/// handed to whoever writes the document. The root config keeps the
-/// power because the operator owns the filesystem.
-const HOST_FILE_KEYS: &[(&str, &str)] = &[
-    ("rego_module_path", "rego_module"),
-    ("module_path", "module"),
+/// every reload, and `module_path`, its spelling on `policy: rego` and
+/// on `transforms[] type: wasm`. The rest are opened by module
+/// constructors that `CompiledPipeline::from_config` runs, which is why
+/// "the compiler has exactly one host-file read" was true and beside the
+/// point (WOR-2433 re-review). Each entry names its enforcer:
+///
+/// * `spec_file` - `crates/sbproxy-modules/src/policy/openapi_validation.rs:140`
+/// * `sha1_file` - `crates/sbproxy-modules/src/policy/exposed_creds.rs:112`
+/// * `transcode.descriptor_set` - `crates/sbproxy-modules/src/action/grpc.rs:135`
+/// * `bulk_list.path` - `crates/sbproxy-modules/src/action/mod.rs:786`, the
+///   worst of them, because the file's contents become the redirect
+///   targets the proxy serves and so come back out over HTTP
+/// * `feed.cache_dir` - `crates/sbproxy-modules/src/policy/waf/feed.rs:838`,
+///   a directory the feed subscriber reads and writes
+/// * `spec_path` - `crates/sbproxy-modules/src/action/mcp.rs:5903`
+/// * `argument_policies[].path` and `result_policies[].path` -
+///   `crates/sbproxy-modules/src/action/mcp.rs:2419,2749`
+/// * `agent_skills[].path` -
+///   `crates/sbproxy-modules/src/projections/agent_skills.rs:330`, which
+///   is `bulk_list`'s twin: the bytes are served to clients
+///
+/// A document that may name one of these can name any path the proxy
+/// process can open, which is a host-file read handed to whoever writes
+/// the document. The root config keeps the power because the operator
+/// owns the filesystem.
+///
+/// This list is a list, not a rule, so it is exactly as wide as its
+/// entries and no wider. It was assembled by reading every host read in
+/// `sbproxy-modules` (`rg 'std::fs::read' crates/sbproxy-modules/src`)
+/// and keeping the ones whose path comes from a config key; run that
+/// again when auditing it. There is deliberately no count ratchet over
+/// that grep: the crate's own tests read files too, so a count would go
+/// red on a new test rather than on a new host-file key, which is a
+/// guard that trains people to bump a number. What the list cannot see
+/// is stated in the module docs under "What this boundary does not
+/// stop".
+const HOST_FILE_KEYS: &[HostFileKey] = &[
+    HostFileKey {
+        parent: None,
+        key: "rego_module_path",
+        remedy: "carry the module inline under `rego_module`",
+    },
+    HostFileKey {
+        parent: None,
+        key: "module_path",
+        remedy: "carry the module inline under `module` (a Rego policy) or under \
+                 `module_bytes` (a wasm transform)",
+    },
+    HostFileKey {
+        parent: None,
+        key: "spec_file",
+        remedy: "carry the OpenAPI document inline under `spec`",
+    },
+    HostFileKey {
+        parent: None,
+        key: "sha1_file",
+        remedy: "carry the hashes inline under `sha1_hashes`",
+    },
+    HostFileKey {
+        parent: Some("transcode"),
+        key: "descriptor_set",
+        remedy: "set the descriptor path in the root config the operator owns",
+    },
+    HostFileKey {
+        parent: Some("bulk_list"),
+        key: "path",
+        remedy: "carry the rows inline under `rows`, or serve the list over https with `url`",
+    },
+    HostFileKey {
+        parent: Some("feed"),
+        key: "cache_dir",
+        remedy: "set the cache directory in the root config the operator owns",
+    },
+    HostFileKey {
+        parent: None,
+        key: "spec_path",
+        remedy: "carry the OpenAPI document inline under `spec`",
+    },
+    HostFileKey {
+        parent: Some("argument_policies"),
+        key: "path",
+        remedy: "carry the policy source inline under `source`",
+    },
+    HostFileKey {
+        parent: Some("result_policies"),
+        key: "path",
+        remedy: "carry the policy source inline under `source`",
+    },
+    HostFileKey {
+        parent: Some("agent_skills"),
+        key: "path",
+        remedy: "carry the artifact inline under `body`",
+    },
 ];
 
 /// What an externally authored document may do inside the confined
 /// boundary.
 ///
-/// Three powers the root operator config keeps and this boundary hands
+/// Four powers the root operator config keeps and this boundary hands
 /// out one at a time, because the party that writes the document is not
 /// the party that owns the host it compiles on:
 ///
 /// * naming a process variable in a template form,
 /// * using a secret reference that reads the host directly
 ///   (`env:NAME`, `vault://env/NAME`, `file:PATH`),
-/// * inlining a host file by path (`rego_module_path`, `module_path`).
+/// * naming a host path the proxy opens (the keys in `HOST_FILE_KEYS`),
+/// * naming a secret backend the operator declared under
+///   `proxy.secrets` (`secret://backend/key` and the other provider
+///   URIs).
 ///
-/// [`ConfinementPolicy::sealed`] grants none of them and is what a
+/// [`ConfinementPolicy::sealed`] grants the last only and is what a
 /// fragment gets. [`ConfinementPolicy::remote_document`] grants the
-/// first only, and is what a whole document fetched from a git
-/// repository or served by a config authority gets; see that
-/// constructor for why the first one stays.
+/// first and the last, and is what a config authority's bundle gets,
+/// along with a git-sourced document whose operator asked for it with
+/// `source.confine: true`. [`ConfinementPolicy::bundle_manifest`] grants
+/// none of them, because a bundle manifest's own text is the one input
+/// here that no operator reviewed at all.
 #[derive(Debug, Clone)]
 pub struct ConfinementPolicy {
     /// `Some` means `{{vars.X}}` resolves against these bindings and an
@@ -268,12 +432,20 @@ pub struct ConfinementPolicy {
     host_backed_secrets: bool,
     /// Whether the document may inline a host file by path.
     host_file_inlining: bool,
+    /// Whether the document may name a secret backend the operator
+    /// declared under `proxy.secrets`.
+    declared_secret_backends: bool,
 }
 
 impl ConfinementPolicy {
     /// No process environment, no host-backed secret reference, no host
     /// file, and no variable the caller did not bind. What a fragment
     /// authored in another repository gets.
+    ///
+    /// A provider URI (`secret://backend/key`) is still allowed: it
+    /// resolves only against a backend the operator declared under
+    /// `proxy.secrets`, which is a path no externally authored document
+    /// may set, so the operator still chooses what it can reach.
     #[must_use]
     pub fn sealed() -> Self {
         Self {
@@ -281,6 +453,7 @@ impl ConfinementPolicy {
             process_environment: false,
             host_backed_secrets: false,
             host_file_inlining: false,
+            declared_secret_backends: true,
         }
     }
 
@@ -294,9 +467,10 @@ impl ConfinementPolicy {
         }
     }
 
-    /// A whole document fetched from a git repository or served by a
-    /// config authority: `${VAR}` keeps working, host-backed secret
-    /// references and host-file inlining do not.
+    /// A whole document served by a config authority, or fetched from a
+    /// git repository the operator marked `source.confine: true`:
+    /// `${VAR}` keeps working, host-backed secret references and
+    /// host-file inlining do not.
     ///
     /// The asymmetry is deliberate and each half has a reason.
     ///
@@ -308,15 +482,20 @@ impl ConfinementPolicy {
     /// is a breaking change wearing a default's clothes. Its residual
     /// risk is stated in the module docs rather than hidden.
     ///
-    /// The other two go, and nothing breaks, because neither is a
-    /// documented power of a remote document and neither is exercised
-    /// anywhere in this tree. They are also the two that
-    /// [`crate::AUTHORITY_DENIED_PATHS`] already reasons about at the
-    /// path level: `proxy.secrets` is denied to an authority precisely
-    /// because the node owns its own secret backends and filesystem.
-    /// Sealing `env:`, `vault://env/` and `file:` applies that same rule
-    /// to values instead of paths, which is where the deny list could
-    /// not reach.
+    /// The other two go because the node owns its own environment,
+    /// secret backends and filesystem, which is the same rule
+    /// [`crate::AUTHORITY_DENIED_PATHS`] already applies at the path
+    /// level (`proxy.secrets` is denied to an authority for exactly this
+    /// reason). Sealing `env:`, `vault://env/` and `file:` applies it to
+    /// values instead of paths, which is where a deny list of paths
+    /// could not reach.
+    ///
+    /// A subscriber's own base config keeps all four powers, because the
+    /// screen runs on the bundle rather than on the merge result, so the
+    /// remedy the refusal offers - declare the value in the config the
+    /// operator owns - is a remedy that exists on this path. A git
+    /// `source:` block is the case where it does not, which is why that
+    /// one is opt-in; see `docs/configuration.md`.
     #[must_use]
     pub fn remote_document() -> Self {
         Self {
@@ -324,6 +503,34 @@ impl ConfinementPolicy {
             process_environment: true,
             host_backed_secrets: false,
             host_file_inlining: false,
+            declared_secret_backends: true,
+        }
+    }
+
+    /// A value a bundle manifest authored for itself: no secret
+    /// reference of any kind resolves, and no template form does either.
+    ///
+    /// The strictest of the three, and the only one that also withholds
+    /// the operator's declared backends. An extension bundle's config
+    /// vars are handed to guest code that can read them and write them
+    /// into a response, so a resolved secret in one is a secret the
+    /// guest has. The manifest's `config_schema` defaults and its
+    /// `secret_vars` list are both written by whoever authored the
+    /// bundle, so a bundle that could point one of its own vars at
+    /// `env:AWS_SECRET_ACCESS_KEY` or at `secret://prod/db-password`
+    /// would read the host with no line of the operator's config naming
+    /// the value. A value the *operator* wrote in the root config for
+    /// that bundle still resolves, through the same code, because the
+    /// operator is the party that owns those secrets (WOR-2433
+    /// re-review).
+    #[must_use]
+    pub fn bundle_manifest() -> Self {
+        Self {
+            inputs: None,
+            process_environment: false,
+            host_backed_secrets: false,
+            host_file_inlining: false,
+            declared_secret_backends: false,
         }
     }
 }
@@ -433,7 +640,14 @@ pub enum ConfinedTemplateError {
     /// they are the same environment read spelled a different way, and
     /// `file:PATH` is the filesystem equivalent.
     #[error(
-        "externally authored config `{fragment}` sets `{path}` to a `{form}` secret          reference, which resolves from {reads} on whichever machine compiles the document.          The party that writes this document is not the party that owns that host, so the          reference is refused rather than resolved: without this, a write to this document          would be a read of the compiling host's credentials. Declare the value in the root          config the operator owns, or name a backend the operator declared under          `proxy.secrets`. See the `Confined fragments` section of docs/configuration.md."
+        "externally authored config `{fragment}` sets `{path}` to a `{form}` secret \
+         reference, which resolves from {reads} on whichever machine compiles the \
+         document. The party that writes this document is not the party that owns that \
+         host, so the reference is refused rather than resolved: without this, a write to \
+         this document would be a read of the compiling host's credentials. Declare the \
+         value in the config the operator owns, or name a backend the operator declared \
+         under `proxy.secrets`. See the `Confined fragments` section of \
+         docs/configuration.md."
     )]
     HostSecretReference {
         /// Caller-supplied label for the document, for the operator.
@@ -447,18 +661,44 @@ pub enum ConfinedTemplateError {
         /// What that spelling reads, e.g. `the process environment`.
         reads: &'static str,
     },
-    /// The document names a host filesystem path the compiler would read
-    /// and inline.
+    /// The document names a host filesystem path the proxy would open.
     #[error(
-        "externally authored config `{fragment}` sets `{path}`, which the compiler reads off          the host filesystem and inlines. A document authored somewhere other than the host          it compiles on may not name a path on that host: the file belongs to whoever runs          the proxy. Carry the source inline under `{inline_key}` instead, or set the path in          the root config. See the `Confined fragments` section of docs/configuration.md."
+        "externally authored config `{fragment}` sets `{path}`, which the proxy opens on the \
+         host filesystem while it builds the pipeline. A document authored somewhere other \
+         than the host it runs on may not name a path on that host: the file belongs to \
+         whoever runs the proxy. Instead, {remedy}. See the `Confined fragments` section of \
+         docs/configuration.md."
     )]
     HostFileInlining {
         /// Caller-supplied label for the document, for the operator.
         fragment: String,
         /// Dotted path to the offending key.
         path: String,
-        /// The key carrying the same content inline, for the remedy.
-        inline_key: &'static str,
+        /// What the operator does instead, named after a key that
+        /// exists on the module this key belongs to.
+        remedy: &'static str,
+    },
+    /// The document carries a secret reference of any kind, on a path
+    /// where the document itself is the party that authored the value.
+    ///
+    /// Only [`ConfinementPolicy::bundle_manifest`] withholds this, and
+    /// only a bundle manifest's own text gets that policy. Everywhere
+    /// else a provider URI is allowed, because it resolves against a
+    /// backend the operator declared.
+    #[error(
+        "externally authored config `{fragment}` sets `{path}` to a secret reference. The \
+         value is one this document authored for itself, not one the operator wrote, so \
+         nothing here resolves a secret on this host: a bundle that could point its own \
+         config var at a secret could read it, and guest code reads its config. Set \
+         `{path}` in the root config if this node should supply a secret for it. See the \
+         `Confined fragments` section of docs/configuration.md."
+    )]
+    SecretReference {
+        /// Caller-supplied label for the document, for the operator.
+        fragment: String,
+        /// The offending key. Never the value, and never the backend or
+        /// name the reference points at.
+        path: String,
     },
 }
 
@@ -552,8 +792,40 @@ fn confine(
         policy,
         bound_names: policy.inputs.as_ref().map_or_else(String::new, bound_names),
     };
-    resolver.walk(&mut root, "", false)?;
+    resolver.walk(&mut root, "", None, false)?;
     Ok(root)
+}
+
+/// Check one already-parsed config value against `policy`, naming it by
+/// the key the operator would edit.
+///
+/// The whole-document entry points above start from YAML text. A bundle
+/// attachment's config vars are JSON that never was text, and the
+/// enforcer for them resolves one named property at a time
+/// (`sbproxy_extension::bundle::envelope::resolve_declared_secrets`), so
+/// this is the same refusal set applied at the granularity that path
+/// actually has. Nothing is substituted and nothing is returned: the
+/// caller keeps the value it passed in, or gets the refusal.
+///
+/// # Errors
+///
+/// Returns a [`ConfinedTemplateError`] naming `label`, `key`, and the
+/// offending form. Never the value.
+pub fn check_confined_value(
+    label: &str,
+    key: &str,
+    value: &str,
+    policy: &ConfinementPolicy,
+) -> Result<(), ConfinedTemplateError> {
+    let resolver = Resolver {
+        fragment: label,
+        policy,
+        bound_names: policy.inputs.as_ref().map_or_else(String::new, bound_names),
+    };
+    let shown = shown_path(key);
+    resolver.refuse_env_references(&shown, value)?;
+    resolver.refuse_host_secret_reference(&shown, value)?;
+    resolver.refuse_secret_reference(&shown, value)
 }
 
 /// The bound input names, sorted, for an error message. Names only.
@@ -584,6 +856,7 @@ impl Resolver<'_> {
         &self,
         value: &mut serde_yaml::Value,
         path: &str,
+        parent_key: Option<&str>,
         in_script_body: bool,
     ) -> Result<(), ConfinedTemplateError> {
         match value {
@@ -600,7 +873,10 @@ impl Resolver<'_> {
             serde_yaml::Value::Sequence(seq) => {
                 for (index, item) in seq.iter_mut().enumerate() {
                     let child = join_path(path, &index.to_string());
-                    self.walk(item, &child, in_script_body)?;
+                    // The parent key travels through a sequence: the
+                    // owning key of `bulk_list: [ { path: ... } ]` is
+                    // still `bulk_list` for the mapping inside it.
+                    self.walk(item, &child, parent_key, in_script_body)?;
                 }
             }
             serde_yaml::Value::Mapping(map) => {
@@ -624,20 +900,20 @@ impl Resolver<'_> {
                 for (key, val) in map.iter_mut() {
                     let key_name = key.as_str().map_or_else(|| "?".to_string(), str::to_owned);
                     let child = join_path(path, &key_name);
-                    if let Some((_, inline_key)) = HOST_FILE_KEYS
+                    if let Some(entry) = HOST_FILE_KEYS
                         .iter()
-                        .find(|(name, _)| *name == key_name.as_str())
+                        .find(|entry| entry.matches(parent_key, key_name.as_str()))
                     {
                         if !self.policy.host_file_inlining {
                             return Err(ConfinedTemplateError::HostFileInlining {
                                 fragment: self.fragment.to_string(),
                                 path: shown_path(&child),
-                                inline_key,
+                                remedy: entry.remedy,
                             });
                         }
                     }
                     let script = in_script_body || SCRIPT_BODY_KEYS.contains(&key_name.as_str());
-                    self.walk(val, &child, script)?;
+                    self.walk(val, &child, Some(key_name.as_str()), script)?;
                 }
             }
             _ => {}
@@ -662,7 +938,8 @@ impl Resolver<'_> {
             serde_yaml::Value::String(text) => {
                 let shown = format!("{} (mapping key)", shown_path(path));
                 self.refuse_env_references(&shown, text)?;
-                self.refuse_host_secret_reference(&shown, text)
+                self.refuse_host_secret_reference(&shown, text)?;
+                self.refuse_secret_reference(&shown, text)
             }
             serde_yaml::Value::Sequence(seq) => {
                 for (index, item) in seq.iter().enumerate() {
@@ -714,6 +991,7 @@ impl Resolver<'_> {
             self.refuse_resolvable_braces(&shown, &resolved)?;
         }
         self.refuse_host_secret_reference(&shown, &resolved)?;
+        self.refuse_secret_reference(&shown, &resolved)?;
         Ok(resolved)
     }
 
@@ -850,6 +1128,34 @@ impl Resolver<'_> {
                 path: shown_path.to_string(),
                 form: source.form(),
                 reads: source.reads(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Refuse a secret reference of any kind, unless the policy grants
+    /// the operator's declared backends.
+    ///
+    /// Only [`ConfinementPolicy::bundle_manifest`] withholds them, and
+    /// this asks `crate::types::is_secret_reference` rather than repeating
+    /// its prefix list, so the refusal is exactly as wide as the
+    /// resolution it prevents: the bundle path resolves a config var
+    /// when and only when that same predicate says yes. The
+    /// host-backed forms are refused before this by
+    /// [`Self::refuse_host_secret_reference`], which has the more
+    /// specific message.
+    fn refuse_secret_reference(
+        &self,
+        shown_path: &str,
+        text: &str,
+    ) -> Result<(), ConfinedTemplateError> {
+        if self.policy.declared_secret_backends {
+            return Ok(());
+        }
+        if crate::types::is_secret_reference(text) {
+            return Err(ConfinedTemplateError::SecretReference {
+                fragment: self.fragment.to_string(),
+                path: shown_path.to_string(),
             });
         }
         Ok(())
@@ -1283,10 +1589,7 @@ mod tests {
 
     #[test]
     fn a_fragment_may_not_inline_a_host_file_by_path() {
-        for (key, inline) in [
-            ("rego_module_path", "rego_module"),
-            ("module_path", "module"),
-        ] {
+        for key in ["rego_module_path", "module_path"] {
             let fragment = serde_yaml::to_string(&serde_json::json!({
                 "request_modifiers": [{ key: "/etc/sbproxy/anything.rego" }],
             }))
@@ -1298,15 +1601,60 @@ mod tests {
                 Err(error) => error,
             };
             match &error {
-                ConfinedTemplateError::HostFileInlining {
-                    path, inline_key, ..
-                } => {
+                ConfinedTemplateError::HostFileInlining { path, remedy, .. } => {
                     assert_eq!(path, &format!("request_modifiers.0.{key}"));
-                    assert_eq!(*inline_key, inline);
+                    assert!(
+                        remedy.contains("module"),
+                        "the remedy must name a key that exists on this module: {remedy}"
+                    );
                 }
                 other => panic!("expected a HostFileInlining refusal, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn every_host_file_key_is_refused_under_the_parent_that_scopes_it() {
+        // The guard is exactly as wide as this list, so the list is what
+        // the test walks: an entry added without a refusal, or a
+        // parent-scoped entry that stopped matching, fails here rather
+        // than in production (WOR-2433 re-review, "a guard narrower than
+        // its claim").
+        for entry in HOST_FILE_KEYS {
+            let leaf = serde_json::json!({ entry.key: "/etc/sbproxy/host-owned" });
+            let document = match entry.parent {
+                None => serde_json::json!({ "origins": { "api": leaf } }),
+                Some(parent) => serde_json::json!({ "origins": { "api": { parent: leaf } } }),
+            };
+            let yaml = serde_yaml::to_string(&document).expect("fixture serializes");
+            let error = check_confined_document(
+                "acme/runtime-config",
+                &yaml,
+                &ConfinementPolicy::remote_document(),
+            )
+            .expect_err("a key on the host-file list must be refused");
+            match &error {
+                ConfinedTemplateError::HostFileInlining { path, remedy, .. } => {
+                    assert!(path.ends_with(entry.key), "{path}");
+                    assert_eq!(*remedy, entry.remedy);
+                }
+                other => panic!("expected a HostFileInlining refusal, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_parent_scoped_host_file_key_is_not_refused_under_another_parent() {
+        // `path` is a host-file key under `bulk_list` and ordinary
+        // config text everywhere else. A guard that refused every `path`
+        // would refuse a `source:` block, an `origins.*.path` route, and
+        // most of the routing vocabulary with it.
+        check_confined_document(
+            "acme/runtime-config",
+            "source:\n  kind: git\n  path: sb.yml\norigins:\n  api:\n    match:\n      path: /v1\n",
+            &ConfinementPolicy::remote_document(),
+        )
+        .expect("`path` outside `bulk_list` is ordinary config text");
     }
 
     #[test]
@@ -1384,6 +1732,84 @@ mod tests {
             matches!(error, ConfinedTemplateError::HostFileInlining { .. }),
             "{error:?}"
         );
+    }
+
+    #[test]
+    fn a_bundle_authored_value_resolves_no_reference_of_any_kind() {
+        let _env = secret_env();
+        let policy = ConfinementPolicy::bundle_manifest();
+        // The three host-backed spellings keep their own message,
+        // because the author needs to know which one they wrote.
+        for value in [
+            format!("env:{SECRET_VAR}"),
+            "file:/etc/passwd".to_string(),
+            format!("vault://env/{SECRET_VAR}"),
+        ] {
+            let error = check_confined_value("acme-bundle", "token", &value, &policy)
+                .expect_err("a bundle manifest may not resolve a host-backed reference");
+            assert!(
+                matches!(error, ConfinedTemplateError::HostSecretReference { .. }),
+                "{error:?}"
+            );
+            let rendered = error.to_string();
+            assert!(rendered.contains("acme-bundle"), "{rendered}");
+            assert!(rendered.contains("token"), "{rendered}");
+            assert!(!rendered.contains(SECRET_VALUE), "{rendered}");
+            assert!(
+                !rendered.contains("/etc/passwd"),
+                "the refusal echoed the value: {rendered}"
+            );
+        }
+        // A whole-value `${VAR}` is the same environment read spelled as
+        // a template, and the bundle path resolves it too.
+        let error = check_confined_value(
+            "acme-bundle",
+            "token",
+            &format!("${{{SECRET_VAR}}}"),
+            &policy,
+        )
+        .expect_err("a bundle manifest may not name a process variable");
+        assert!(
+            matches!(error, ConfinedTemplateError::EnvReference { .. }),
+            "{error:?}"
+        );
+        assert!(!error.to_string().contains(SECRET_VALUE));
+        // A provider URI is allowed everywhere else, and refused here:
+        // the bundle would be choosing which of the operator's declared
+        // secrets its own guest code gets to read.
+        let error =
+            check_confined_value("acme-bundle", "token", "secret://prod/db-password", &policy)
+                .expect_err("a bundle manifest may not name an operator backend either");
+        match &error {
+            ConfinedTemplateError::SecretReference { fragment, path } => {
+                assert_eq!(fragment, "acme-bundle");
+                assert_eq!(path, "token");
+            }
+            other => panic!("expected a SecretReference refusal, got {other:?}"),
+        }
+        assert!(
+            !error.to_string().contains("db-password"),
+            "the refusal echoed the reference: {error}"
+        );
+        // A literal is not a reference, and nothing here rewrites it.
+        check_confined_value("acme-bundle", "threshold", "12", &policy)
+            .expect("a plain value is not a secret reference");
+        check_confined_value("acme-bundle", "label", "not-a-reference", &policy)
+            .expect("a plain value is not a secret reference");
+    }
+
+    #[test]
+    fn only_the_bundle_policy_withholds_an_operator_declared_backend() {
+        // The asymmetry is the point: a fragment's provider URI still
+        // resolves (pinned above for the document walk), and the bundle
+        // policy is the only one that takes it away.
+        for policy in [
+            ConfinementPolicy::sealed(),
+            ConfinementPolicy::remote_document(),
+        ] {
+            check_confined_value("acme/api", "api_key", "secret://prod/key", &policy)
+                .expect("an operator-declared backend still resolves outside a bundle manifest");
+        }
     }
 
     #[test]

@@ -73,7 +73,8 @@ pub use config_merge::{
     MergeOutcome, Provenance, ProvenanceMap, AUTHORITY_DENIED_PATHS,
 };
 pub use confined_template::{
-    check_confined_document, resolve_confined_fragment, ConfinedTemplateError, ConfinementPolicy,
+    check_confined_document, check_confined_value, resolve_confined_fragment,
+    ConfinedTemplateError, ConfinementPolicy,
 };
 pub use extensions::*;
 pub use listing::{

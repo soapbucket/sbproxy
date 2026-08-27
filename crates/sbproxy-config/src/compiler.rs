@@ -111,16 +111,6 @@ pub fn extract_type(value: &serde_json::Value) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("missing or empty 'type' field"))
 }
 
-/// The access-log `custom_fields` bare-name interpolation vocabulary,
-/// resolved per request by `sbproxy-core`'s `custom_log::resolve_var`
-/// and documented in docs/access-log.md. Like the dotted runtime
-/// vocabulary, a placeholder naming one of these is not an env
-/// reference: substituting a process variable would bake a boot-time
-/// constant into a per-request log field, and reporting it as
-/// unresolved would make a config authority refuse the whole bundle
-/// over a documented form. Exact names only - a `:-` default is not
-/// part of `resolve_var`'s syntax, so `${method:-GET}` keeps its env
-/// treatment.
 /// The access-log `custom_fields` DOTTED interpolation vocabulary, the
 /// prefixes `sbproxy-core`'s `custom_log::resolve_var` answers from the
 /// per-request context rather than from the process environment
@@ -142,6 +132,16 @@ pub fn extract_type(value: &serde_json::Value) -> Result<String> {
 /// cannot be wider than the runtime resolver it mirrors.
 const ACCESS_LOG_DOTTED_PREFIXES: &[&str] = &["request.header.", "attribution."];
 
+/// The access-log `custom_fields` bare-name interpolation vocabulary,
+/// resolved per request by `sbproxy-core`'s `custom_log::resolve_var`
+/// and documented in docs/access-log.md. Like the dotted runtime
+/// vocabulary, a placeholder naming one of these is not an env
+/// reference: substituting a process variable would bake a boot-time
+/// constant into a per-request log field, and reporting it as
+/// unresolved would make a config authority refuse the whole bundle
+/// over a documented form. Exact names only - a `:-` default is not
+/// part of `resolve_var`'s syntax, so `${method:-GET}` keeps its env
+/// treatment.
 const ACCESS_LOG_BARE_VARS: &[&str] = &[
     "method",
     "path",
