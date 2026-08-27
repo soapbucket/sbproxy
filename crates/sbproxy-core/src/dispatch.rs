@@ -47,6 +47,78 @@ pub(crate) fn unsupported_plugin_action_responded_message() -> String {
     )
 }
 
+/// The `plugin_action_outcome` label every transport reports for a
+/// legacy [`ActionOutcome::Responded`] refusal.
+///
+/// A closed value: one literal, never derived from anything a plugin
+/// supplies, so the counter's cardinality is bounded by this file.
+pub(crate) const LEGACY_RESPONDED_OUTCOME_LABEL: &str = "responded";
+
+/// The typed decision record for a refused plugin action outcome.
+///
+/// Split out from the publisher so its shape is testable without a
+/// process-wide event egress. Every field is either a constant from
+/// this file or an identifier the gateway itself minted: no plugin
+/// output, no request body, no header value reaches it.
+pub(crate) fn unsupported_plugin_action_outcome_event_data(
+    request_id: Option<&str>,
+    outcome: &'static str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "action": "plugin",
+        "plugin_action_outcome": outcome,
+        "reason": sbproxy_plugin::UNSUPPORTED_ACTION_OUTCOME_CODE,
+        "status": LEGACY_RESPONDED_STATUS,
+        "request_id": request_id,
+    })
+}
+
+/// Record a refused plugin action outcome on every axis an operator
+/// reads, from one place both transports call.
+///
+/// WOR-2632's acceptance line asks telemetry to carry a defined HTTP
+/// status *and* a plugin outcome. The status reaches the access log
+/// through `RequestContext::response_status`; the outcome reached only
+/// a `warn!`, and a log line that rotates is not a record of a
+/// decision. It now also ticks `sbproxy_errors_total` under the stable
+/// [`sbproxy_plugin::UNSUPPORTED_ACTION_OUTCOME_CODE`] reason and
+/// publishes a `request_error` event, so the refusal is alertable in
+/// Prometheus and present in the SIEM feed.
+///
+/// Both label values are closed: `error_type` is the reason constant
+/// and `plugin_action_outcome` is
+/// [`LEGACY_RESPONDED_OUTCOME_LABEL`], neither of them derived from
+/// plugin output.
+pub(crate) fn record_unsupported_plugin_action_outcome(
+    hostname: &str,
+    tenant_id: &str,
+    request_id: Option<&str>,
+    outcome: &'static str,
+) {
+    warn!(
+        outcome,
+        reason = sbproxy_plugin::UNSUPPORTED_ACTION_OUTCOME_CODE,
+        status = LEGACY_RESPONDED_STATUS,
+        "plugin action returned the legacy Responded outcome, which carries no response bytes"
+    );
+    sbproxy_observe::metrics::metrics()
+        .errors_total
+        .with_label_values(&[hostname, sbproxy_plugin::UNSUPPORTED_ACTION_OUTCOME_CODE])
+        .inc();
+    let event_type = sbproxy_observe::EventType::RequestError;
+    if !sbproxy_observe::event_sink::wants_event(event_type) {
+        return;
+    }
+    sbproxy_observe::event_sink::publish_proxy_event(event_type, || {
+        sbproxy_observe::events::ProxyEvent::new(
+            event_type,
+            hostname.to_string(),
+            tenant_id.to_string(),
+            unsupported_plugin_action_outcome_event_data(request_id, outcome),
+        )
+    });
+}
+
 // --- Public dispatch API ---
 
 /// Dispatch an HTTP/3 request through the proxy pipeline.
@@ -503,6 +575,19 @@ async fn dispatch_action(
                         handler.handler().handler_type()
                     )
                 })?;
+            if matches!(&outcome, ActionOutcome::Responded) {
+                // H3 has no `RequestContext`, so the record is stamped
+                // with the request's own Host and the default tenant.
+                // The alternative is a refusal that appears on one
+                // transport's counter and not the other's, which is the
+                // per-transport divergence this ticket is about.
+                record_unsupported_plugin_action_outcome(
+                    &extract_hostname(headers, uri),
+                    sbproxy_observe::decision::DEFAULT_TENANT,
+                    None,
+                    LEGACY_RESPONDED_OUTCOME_LABEL,
+                );
+            }
             plugin_action_outcome_response(outcome)
         }
     }
@@ -526,19 +611,17 @@ pub(crate) fn plugin_action_outcome_response(outcome: ActionOutcome) -> Result<H
             body,
         } => validate_plugin_action_response(status, headers, body),
         ActionOutcome::Proxy => Err(anyhow::anyhow!(unsupported_plugin_action_proxy_message())),
-        ActionOutcome::Responded => {
-            warn!(
-                outcome = "responded",
-                reason = sbproxy_plugin::UNSUPPORTED_ACTION_OUTCOME_CODE,
-                status = LEGACY_RESPONDED_STATUS,
-                "plugin action returned the legacy Responded outcome, which carries no response \
-                 bytes"
-            );
-            Ok(text_response(
-                LEGACY_RESPONDED_STATUS,
-                &unsupported_plugin_action_responded_message(),
-            ))
-        }
+        // WOR-2632: the same `application/json` `{"error": ...}` body
+        // H1/H2 sends through `send_error`, built from the same helper,
+        // so "behavior is transport-independent" covers the body shape
+        // and the content type and not only the status and the reason.
+        // Pure on purpose: the log line, the counter and the typed event
+        // belong to the caller, which is the half that knows the
+        // hostname and the tenant.
+        ActionOutcome::Responded => Ok(json_response(
+            LEGACY_RESPONDED_STATUS,
+            &crate::server::error_json_body(&unsupported_plugin_action_responded_message()),
+        )),
     }
 }
 
@@ -1432,9 +1515,20 @@ mod tests {
         let responded = plugin_action_outcome_response(ActionOutcome::Responded)
             .expect("the legacy outcome is a defined refusal, not an error");
         assert_eq!(responded.status, LEGACY_RESPONDED_STATUS);
+        assert!(
+            responded.headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("content-type") && value == "application/json"
+            }),
+            "H3 answers the same media type H1/H2's send_error does: {:?}",
+            responded.headers
+        );
         let body = String::from_utf8(responded.body.expect("the refusal carries a body").to_vec())
             .expect("refusal body is UTF-8");
-        assert_eq!(body, unsupported_plugin_action_responded_message());
+        assert_eq!(
+            body,
+            crate::server::error_json_body(&unsupported_plugin_action_responded_message()),
+            "both transports build the refusal body from one helper"
+        );
         assert!(
             body.contains(sbproxy_plugin::UNSUPPORTED_ACTION_OUTCOME_CODE),
             "the refusal names the stable plugin-outcome reason: {body}"
@@ -1448,6 +1542,45 @@ mod tests {
                 .to_string()
                 .contains(sbproxy_plugin::UNSUPPORTED_ACTION_OUTCOME_CODE),
             "the proxy refusal keeps its own stable reason: {proxied}"
+        );
+    }
+
+    /// WOR-2632: the typed record the SIEM feed receives for a refused
+    /// plugin outcome.
+    ///
+    /// Rubric: a refusal whose only record is a log line is a refusal
+    /// nobody can alert on or reconstruct. This pins the field names an
+    /// operator writes a detection against, and pins that nothing a
+    /// plugin authored reaches the payload.
+    #[test]
+    fn the_refused_plugin_outcome_event_names_the_outcome_the_reason_and_the_status() {
+        let data = unsupported_plugin_action_outcome_event_data(
+            Some("req-1234"),
+            LEGACY_RESPONDED_OUTCOME_LABEL,
+        );
+
+        assert_eq!(data["action"], "plugin");
+        assert_eq!(data["plugin_action_outcome"], "responded");
+        assert_eq!(
+            data["reason"],
+            sbproxy_plugin::UNSUPPORTED_ACTION_OUTCOME_CODE
+        );
+        assert_eq!(data["status"], LEGACY_RESPONDED_STATUS);
+        assert_eq!(data["request_id"], "req-1234");
+
+        // Every value is a constant from this file or an identifier the
+        // gateway minted. A payload that grew a plugin-supplied field
+        // would be a disclosure decision, not a formatting one.
+        let object = data.as_object().expect("the payload is an object");
+        assert_eq!(
+            object.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                "action",
+                "plugin_action_outcome",
+                "reason",
+                "status",
+                "request_id"
+            ]
         );
     }
 }

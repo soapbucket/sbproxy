@@ -1,6 +1,6 @@
 # Upgrade SBproxy
 
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-27*
 
 Use this procedure for the Rust v1 release line. Upgrade a test or canary instance before the rest of a fleet, and keep the previous binary or image available until the new process has served traffic.
 
@@ -86,6 +86,10 @@ After the fleet is stable on the intended version, remove the temporary `sb.yml.
 
 What follows is not the changelog; it is the subset that changes behavior under an existing config, refuses a config that used to load, or moves a metric label a dashboard might key on. Skipping versions compounds the list: upgrading 1.9.0 to 1.12.0 means reading all three sections below.
 
+### Unreleased
+
+- **For out-of-tree plugin authors only: a linked plugin returning `ActionOutcome::Responded` now gets a `501` on the wire.** The variant is the 0.2 signal that the handler already wrote a response through host state, and no host state a linked `ActionHandler` reaches writes one. HTTP/1.1 and HTTP/2 previously marked the request served and sent nothing, so the client saw an empty exchange and the access log had no status; HTTP/3 already answered `501`. All three now answer `501 Not Implemented` with an `application/json` body carrying the stable `unsupported_action_outcome` reason, tick `sbproxy_errors_total{error_type="unsupported_action_outcome"}`, and publish a `request_error` event. Nothing on the wire worked before, so no functioning deployment changes behavior; return `ActionOutcome::Response { status, headers, body }` instead.
+
 ### 1.12.0
 
 - **A broken `ai_policy.expression` now refuses the config.** A syntax error or an out-of-namespace binding previously logged once and booted with the policy silently absent. If your config stops loading on this upgrade, that policy was never running; fix the expression and it starts enforcing.
@@ -114,7 +118,7 @@ Also worth checking: `compression.level` is now applied to the response encoders
 ### 1.10.0
 
 - **`engine: embedded` is removed from the model host.** It was opt-in at build time and never certified. A config that still sets it fails to parse; llama.cpp covers the CPU/Metal zero-external-binary case, and the `mistralrs` subprocess engine covers safetensors serving.
-- **For out-of-tree plugin authors only:** `sbproxy-plugin` moved to 0.3.0 with a data-bearing `ActionOutcome::Response` variant; exhaustive matches on the 0.2 enum stop compiling. The migration note is on the enum's rustdoc.
+- **For out-of-tree plugin authors only:** `sbproxy-plugin` moved to 0.3.0 with a data-bearing `ActionOutcome::Response` variant; exhaustive matches on the 0.2 enum stop compiling. The migration note is on the enum's rustdoc. Source compatibility was not behavior compatibility: see the Unreleased entry above for what the retained 0.2 `Responded` variant now does on the wire.
 
 ### 1.9.0
 

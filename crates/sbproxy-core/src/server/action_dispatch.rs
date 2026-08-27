@@ -1398,12 +1398,11 @@ pub(super) async fn handle_action(
                     // the access log with no status, while an H3 client
                     // got a defined 501 for the same outcome. Send the one
                     // refusal both transports share.
-                    warn!(
-                        outcome = "responded",
-                        reason = sbproxy_plugin::UNSUPPORTED_ACTION_OUTCOME_CODE,
-                        status = crate::dispatch::LEGACY_RESPONDED_STATUS,
-                        "plugin action returned the legacy Responded outcome, which carries no \
-                         response bytes"
+                    crate::dispatch::record_unsupported_plugin_action_outcome(
+                        ctx.hostname.as_str(),
+                        ctx.tenant_id.as_str(),
+                        Some(ctx.request_id.as_str()),
+                        crate::dispatch::LEGACY_RESPONDED_OUTCOME_LABEL,
                     );
                     ctx.response_status = Some(crate::dispatch::LEGACY_RESPONDED_STATUS);
                     send_error(
@@ -2083,10 +2082,88 @@ mod plugin_action_tests {
             text.contains(sbproxy_plugin::UNSUPPORTED_ACTION_OUTCOME_CODE),
             "the refusal carries the stable plugin-outcome reason, got: {text}"
         );
+        assert!(
+            text.to_ascii_lowercase()
+                .contains("content-type: application/json"),
+            "H1 answers the media type H3 answers, got: {text}"
+        );
+        assert!(
+            over_h3.headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("content-type") && value == "application/json"
+            }),
+            "the premise: H3's refusal is JSON too, got {:?}",
+            over_h3.headers
+        );
         assert_eq!(
             ctx.response_status,
             Some(over_h3.status),
             "the access log, metrics, and traces all read the status off the context"
+        );
+    }
+
+    /// Current value of one counter series, 0 when it has never been
+    /// written in this process.
+    ///
+    /// Reads the rendered scrape rather than `prometheus::gather()`:
+    /// `sbproxy_errors_total` lives in `ProxyMetrics`'s own registry,
+    /// and `render()` is the scrape that unions it with the default one.
+    fn counter_value(name: &str, labels: &[(&str, &str)]) -> u64 {
+        sbproxy_observe::metrics::metrics()
+            .render()
+            .lines()
+            .find(|line| {
+                line.starts_with(name)
+                    && labels
+                        .iter()
+                        .all(|(key, value)| line.contains(&format!("{key}=\"{value}\"")))
+            })
+            .and_then(|line| line.rsplit(' ').next()?.parse::<f64>().ok())
+            .unwrap_or(0.0) as u64
+    }
+
+    /// WOR-2632: the refusal is alertable, not just loggable.
+    ///
+    /// Stamping `ctx.response_status` gave the access log a status. It
+    /// gave Prometheus nothing: an operator upgrading with a linked 0.2
+    /// plugin still returning `Responded` got a 501 indistinguishable
+    /// from every other 501, and a `warn!` that rotates. This drives the
+    /// real H1 session and reads the counter, so deleting the recorder
+    /// from the dispatch arm turns it red while the payload unit test in
+    /// `dispatch` stays green.
+    #[tokio::test]
+    async fn plugin_action_http1_counts_the_refused_outcome_under_its_closed_reason() {
+        let action = outcome_action(ActionOutcome::Responded);
+        let pipeline = CompiledPipeline::empty_for_test();
+        let before = counter_value(
+            "sbproxy_errors_total",
+            &[
+                ("hostname", "plugin.test"),
+                (
+                    "error_type",
+                    sbproxy_plugin::UNSUPPORTED_ACTION_OUTCOME_CODE,
+                ),
+            ],
+        );
+
+        let (_result, _wire, _ctx) =
+            exchange_with_ctx(&action, &pipeline, None, DEFAULT_TEST_REQUEST, |ctx| {
+                ctx.hostname = "plugin.test".into()
+            })
+            .await;
+
+        assert_eq!(
+            counter_value(
+                "sbproxy_errors_total",
+                &[
+                    ("hostname", "plugin.test"),
+                    (
+                        "error_type",
+                        sbproxy_plugin::UNSUPPORTED_ACTION_OUTCOME_CODE
+                    ),
+                ],
+            ),
+            before + 1,
+            "the refused plugin outcome has to reach sbproxy_errors_total under its closed reason"
         );
     }
 

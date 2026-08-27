@@ -226,6 +226,8 @@ Both refusals name the status and nothing else. No guest-supplied bytes reach th
 
 An action bundle finishes the request locally. Its attachment has no upstream configuration, so returning `outcome: "proxy"` fails with `unsupported_action_outcome`. Configure a concrete `type: proxy` or `type: load_balancer` action when the origin should forward traffic. For extension logic around a forwarded stream, attach a Proxy-Wasm filter to that concrete action.
 
+`unsupported_action_outcome` is one reason code across two refusals, so a detection matching it sees both. The other is a linked Rust plugin returning the legacy `ActionOutcome::Responded`, which every transport answers with `501` (see [upgrade.md](upgrade.md#unreleased)). Both tick `sbproxy_errors_total{error_type="unsupported_action_outcome"}` and both carry the code in the response body, so the `plugin_action_outcome` field on the `request_error` event is what separates them.
+
 A `.ts` entry is parsed and stripped to ES2020 JavaScript exactly once while a candidate loads. Every declared export is preflighted then. TypeScript is a source convenience; the runtime is still JavaScript.
 
 sbproxy adds no TypeScript CLI, package manager, install command, module loader, or runtime dependency resolution. Imports, re-exports, and dynamic `import()` are rejected. If the extension uses dependencies, resolve them in your own build and ship one prebuilt flat `.js` artifact. Point `entry` at that final artifact and calculate its digest from those final bytes.
