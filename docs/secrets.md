@@ -54,7 +54,7 @@ complete working config showing every scheme above alongside `${ENV}`.
 Two of the four read the proxy host directly: `env:NAME` (and its `${VAR_NAME}` and legacy `vault://env/NAME` spellings) reads the process environment, and `file:PATH` reads the filesystem. Config text the operator did not write is not allowed to use them, because the party that wrote that text is not the party that owns the host it compiles on:
 
 * A **config-authority bundle** may not carry one, at publish and again at the subscriber.
-* A **git-sourced document** may not carry one when its `source:` block sets `confine: true`. That is off by default, so an ordinary GitOps repository keeps writing `env:` and `file:` as documented here, and gets one warning per finding at boot naming what `confine: true` would refuse; see [Config source (GitOps)](configuration.md#config-source-gitops).
+* A **git-sourced document** may not carry one when its `source:` block sets `confine: true`. That is off by default, so an ordinary GitOps repository keeps writing `env:` and `file:` as documented here, and gets one warning naming the first finding, at boot and on refresh, saying what `confine: true` would refuse; see [Config source (GitOps)](configuration.md#config-source-gitops).
 * An **extension bundle manifest** may not supply one for its own config vars, and there the provider URIs are refused too, because guest code reads its config.
 
 A provider URI resolves in all but the last case, because it can only reach a backend the operator declared under `proxy.secrets.backends`. The full rule, and what it does not cover, is in [Confined fragments](configuration.md#confined-fragments).

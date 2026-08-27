@@ -6433,23 +6433,47 @@ other.
 
 The third row is a list of config keys, not a rule about files:
 
+A key written `parent.key` is refused only directly under that parent, a
+bare `key` anywhere in the document, and `engines.*.path` under any
+engine name you choose.
+
 | Where | Keys |
 |---|---|
-| Policy and transform modules | `rego_module_path`, `module_path`, `spec_file`, `sha1_file`, `detector_config.model_path`, `detector_config.tokenizer_path`, `detector_config.model_signature_path`, `detector_config.tokenizer_signature_path` |
-| Actions | `action.path` (the `local` storage backend), `bulk_list.path`, `transcode.descriptor_set`, `spec_path`, `argument_policies[].path`, `result_policies[].path`, `tool_versioning.lockfile` |
-| Served content | `agent_skills[].path`, `agent_skills[].url` (any value that is not an absolute `http(s)` URL) |
-| Durable sinks | `feed.cache_dir`, `feed.cache_file`, `store.path`, `usage_sinks[].path`, `backend.path` |
-| Node identity and node state | `tls_cert_file`, `tls_key_file`, `security.cert_file`, `security.key_file`, `security.ca_file`, `authority_dir`, `signing_key_file`, `verifying_key_file`, `state_dir`, `model_host.store_path`, `model_host.catalog_file`, `bundles.bundles_dir`, `proxy.ai_providers_file` |
+| Compiled by the pipeline | `rego_module_path`, `module_path`, `spec_file`, `sha1_file`, `transcode.descriptor_set`, `bulk_list.path`, `feed.cache_dir`, `feed.cache_file`, `spec_path`, `argument_policies.path`, `result_policies.path`, `agent_skills.path`, `agent_skills.url` (any value that is not an absolute `http(s)` URL), `action.path` (the `local` storage backend), `tool_versioning.lockfile` |
+| Model, tokenizer and rule-pack weights | `model_path`, `tokenizer_path`, `model_signature_path`, `tokenizer_signature_path`, `rule_pack_path`, `onnx_model_path` |
+| Extension code | `extensions.bundles_dir`, `sources.path` |
+| Node identity and node state | `tls_cert_file`, `tls_key_file`, `cert_file`, `key_file`, `ca_file`, `client_ca_file`, `tls.cert`, `tls.key`, `authority_dir`, `signing_key_file`, `verifying_key_file`, `verifying_keys_file`, `state_dir`, `state_path`, `store_dir`, `store.path`, `model_host.store_path`, `model_host.catalog_file`, `cache.directory`, `engines.*.path`, `socket_path`, `tls_certificate_path`, `jwt_path`, `auth.path`, `service_account_key_file.path`, `external_account_file.path`, `backends.path`, `proxy.ai_providers_file` |
+| Durable sinks and evidence | `audit.path`, `audit.config_path`, `audit.key_path`, `audit.admin_path`, `output.path`, `events.path`, `request_events.path`, `session_ledger.path`, `usage_rollups.path`, `usage_sinks.path`, `ledger.path`, `queue.path`, `config_history.dir`, `revocation_store.path`, `cache_path`, `storage_path`, `compression_state.local_path`, `prompt_persistence_path`, `backend.path` |
 
-Two things about that table. It is a list, so it is exactly as wide as
-its entries: a module added later opens a path the list has never heard
-of until somebody adds it, and the list's own source (`HOST_FILE_KEYS`)
-carries the sweep that finds them. And it refuses the *document's*
-choice of path, not the key: `state_dir: "${SB_STATE_DIR}"` is fine,
-because the node resolves that from its own environment and an unset
-variable fails the compile closed, while `state_dir: /var/lib/x` and
+Three things about that table.
+
+It is a list, so it is exactly as wide as its entries: a module added
+later opens a path the list has never heard of until somebody adds it.
+What keeps it honest is a test that walks the shipped JSON Schema for
+every property whose name looks like a path and requires each one to be
+on this list or on a written allowlist saying why it is not a path on
+this host. The untyped blocks the schema cannot see (`policies[]`,
+`action`, `ai`, `proxy.extensions[]`) are swept out of the crates that
+deserialize them.
+
+It refuses the *document's* choice of path, not the key.
+`state_dir: "${SB_STATE_DIR}"` is fine, because the node resolves that
+from its own environment and an unset variable fails the compile closed,
+while `state_dir: /var/lib/x` and
 `state_dir: "${SB_STATE_DIR:-/var/lib/x}"` are both refused, because the
 document picked the bytes.
+
+And a `${VAR:-default}` default is document text everywhere, not only on
+these keys. The pre-parse pass makes the default the value whenever the
+variable is unset, so the whole document is checked a second time with
+its own defaults filled in: `"${SB_NOPE:-path}"` in key position becomes
+the key `path` and meets this table, and
+`"${SB_NOPE:-env:AWS_SECRET_ACCESS_KEY}"` in value position becomes a
+host-backed secret reference and meets the row above it. A default that
+is itself a secret reference, or an absolute or `~`-relative path, is
+refused wherever it appears, which also refuses a URL path written as
+`${SB_PREFIX:-/v1}`: write the literal, or write `${SB_PREFIX}` with no
+default and export it on the node.
 
 Keys that take the *name* of an environment variable rather than its
 value (the WAF feed's `signature_key_env` and `auth_token_env`, the MCP
@@ -6861,7 +6885,7 @@ Two settings close most of that gap, and both are yours to choose:
 
   It is off by default on purpose: turning it on for everybody would be a fail-closed upgrade. Every GitOps repository that names a host path anywhere in its document would refuse its own config on the release that changed the default, and a node that boots into a refusal serves nothing. That is a decision you take, on a repository you know is written by somebody else, not one a release takes for you.
 
-  It is not silent while it is off. A git source whose document reaches for this host logs one warning per finding at boot, naming the source and the key and never the value, with a pointer to this setting. That is the answer to "what would `confine: true` refuse if I turned it on".
+  It is not silent while it is off. A git source whose document reaches for this host logs one warning naming the first finding, at boot and again whenever a refresh brings a revision this process has not already checked, naming the source and the key and never the value, with a pointer to this setting. That is the answer to "what would `confine: true` refuse if I turned it on". First rather than every: the check stops at the first thing it refuses, so a document that names both a host path and an `env:` reference reports one of them now and the other once you fix it.
 
   A secret still has a spelling under it. `${VAR}` survives confinement, so `shared_key: "${SB_CLUSTER_SHARED_KEY}"` and any other secret-bearing field can name a variable your node exports; an unset variable fails the compile closed. What confinement takes away is `env:NAME`, `file:PATH`, `vault://env/NAME` and the host-path keys, so a document that uses those has to move them into a layer this node owns: the pointer file, through a `kind: git_overlay` source whose `base` is `kind: local`, which is the one arm that merges the local file's own content rather than discarding it.
 
@@ -6893,7 +6917,7 @@ The interval carries jitter, so a fleet that restarts together does not hit your
 | `revision` pins a sha and `HEAD` is a different commit | Refuse the document. `revision_mismatch`. |
 | `verify_signature` set and no verifiable signature | Refuse the document. `verify_failed`. |
 | `confine` set and the document reaches for this host | Refuse the document. `confinement_refused`. |
-| `confine` unset and the document reaches for this host | Serve it, and warn once per finding, naming the source and the key. |
+| `confine` unset and the document reaches for this host | Serve it, and warn once naming the source and the first finding. |
 | Resolved document does not compile or cannot be constructed | Refuse the document. `compile_failed`. |
 | Another reload in flight | Skip the cycle. `reload_busy`. |
 | Resolved commit unchanged | Nothing at all. `not_modified`. |
