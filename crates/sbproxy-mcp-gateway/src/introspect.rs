@@ -193,7 +193,7 @@ pub async fn introspect(
         Err(e) => {
             tracing::warn!(
                 target: "mcp_gateway::introspect",
-                error = %e,
+                error = %sbproxy_httpkit::request_error_summary(&e),
                 "upstream introspection transport failed"
             );
             return (

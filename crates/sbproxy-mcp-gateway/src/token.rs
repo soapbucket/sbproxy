@@ -419,7 +419,7 @@ pub async fn token(
         Ok(r) => r,
         Err(e) => {
             tracing::error!(
-                error = %e,
+                error = %sbproxy_httpkit::request_error_summary(&e),
                 "upstream /token call failed"
             );
             return oauth_error(

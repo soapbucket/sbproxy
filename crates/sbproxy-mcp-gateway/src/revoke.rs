@@ -329,8 +329,11 @@ pub async fn revoke(
                 "upstream revocation acknowledged"
             );
             if let Some(exp) = validated_exp {
-                if let Err(e) = app.revocations.record_validated(&token, exp).await {
-                    tracing::error!(error = %e, "local revocation persistence failed");
+                if let Err(store_error) = app.revocations.record_validated(&token, exp).await {
+                    tracing::error!(
+                        error = %store_error,
+                        "local revocation persistence failed"
+                    );
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         axum::Json(serde_json::json!({

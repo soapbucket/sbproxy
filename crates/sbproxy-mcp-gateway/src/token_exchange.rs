@@ -413,7 +413,7 @@ pub async fn handle_token_exchange(
         Ok(r) => r,
         Err(e) => {
             tracing::error!(
-                error = %e,
+                error = %sbproxy_httpkit::request_error_summary(&e),
                 "upstream token-exchange call failed"
             );
             return crate::token::oauth_error(
