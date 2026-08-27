@@ -8741,6 +8741,7 @@ name = "sbproxy-classifier-client"
 version = "0.1.0"
 dependencies = [
  "hyper-util",
+ "prometheus",
  "rcgen",
  "sbproxy-classifier-proto",
  "sbproxy-classifiers",

@@ -29,6 +29,176 @@
 //! demonstration of all three cases above.
 
 use crate::{ClassifierClient, ClassifierClientError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+/// How long one degrade reason stays quiet after it has been logged once.
+///
+/// A configured-but-unreachable sidecar at 5k rps used to emit 5k WARN lines
+/// per second in a release build, so the outage became the log flood that
+/// hid it. The window aggregates instead: the first degrade of each reason
+/// logs immediately, the rest are counted and reported on the next line.
+const DEGRADE_WARNING_WINDOW: Duration = Duration::from_secs(60);
+
+/// Closed reason vocabulary for the fallback counter and the warning window.
+///
+/// Derived from the client's own error enum, never from a sidecar-supplied
+/// string, so the label set cannot be opened by a hostile peer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DegradeReason {
+    Connect,
+    Timeout,
+    Rpc,
+    Protocol,
+    InvalidRequest,
+    EmptyResponse,
+}
+
+impl DegradeReason {
+    const ALL: [Self; 6] = [
+        Self::Connect,
+        Self::Timeout,
+        Self::Rpc,
+        Self::Protocol,
+        Self::InvalidRequest,
+        Self::EmptyResponse,
+    ];
+
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::Timeout => "timeout",
+            Self::Rpc => "rpc",
+            Self::Protocol => "protocol",
+            Self::InvalidRequest => "invalid_request",
+            Self::EmptyResponse => "empty_response",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Connect => 0,
+            Self::Timeout => 1,
+            Self::Rpc => 2,
+            Self::Protocol => 3,
+            Self::InvalidRequest => 4,
+            Self::EmptyResponse => 5,
+        }
+    }
+
+    fn of(error: &ClassifierClientError) -> Self {
+        match error {
+            ClassifierClientError::Connect(_) => Self::Connect,
+            ClassifierClientError::Timeout(_) => Self::Timeout,
+            ClassifierClientError::Rpc { .. } => Self::Rpc,
+            ClassifierClientError::Protocol(_) => Self::Protocol,
+            ClassifierClientError::InvalidRequest(_) => Self::InvalidRequest,
+        }
+    }
+}
+
+fn fallback_total() -> Option<&'static prometheus::IntCounterVec> {
+    static FALLBACK_TOTAL: OnceLock<Option<prometheus::IntCounterVec>> = OnceLock::new();
+    FALLBACK_TOTAL
+        .get_or_init(|| {
+            let counter = prometheus::IntCounterVec::new(
+                prometheus::Opts::new(
+                    "sbproxy_classifier_client_fallback_total",
+                    "Classifier calls served by the in-process fallback because the configured sidecar did not answer, by closed reason.",
+                ),
+                &["reason"],
+            )
+            .ok()?;
+            prometheus::register(Box::new(counter.clone())).ok()?;
+            // Publish a zero for every reason so a dashboard shows the family
+            // rather than nothing at all before the first outage.
+            for reason in DegradeReason::ALL {
+                counter.with_label_values(&[reason.as_label()]);
+            }
+            Some(counter)
+        })
+        .as_ref()
+}
+
+/// Per-reason warning window shared by every `FallbackClassifier` in the
+/// process. Holds the epoch of the last emitted warning and how many
+/// degrades have been suppressed since.
+struct DegradeWindow {
+    started: Instant,
+    last_logged_millis: [AtomicU64; 6],
+    suppressed: [AtomicU64; 6],
+}
+
+impl DegradeWindow {
+    fn get() -> &'static Self {
+        static WINDOW: OnceLock<DegradeWindow> = OnceLock::new();
+        WINDOW.get_or_init(|| DegradeWindow {
+            started: Instant::now(),
+            last_logged_millis: std::array::from_fn(|_| AtomicU64::new(u64::MAX)),
+            suppressed: std::array::from_fn(|_| AtomicU64::new(0)),
+        })
+    }
+
+    /// Record one degrade. Returns the number of degrades this line speaks
+    /// for when the caller should log, and `None` while the window is open.
+    fn admit(&self, reason: DegradeReason) -> Option<u64> {
+        let index = reason.index();
+        let now = self.started.elapsed().as_millis() as u64;
+        let last = self.last_logged_millis[index].load(Ordering::Relaxed);
+        let window = DEGRADE_WARNING_WINDOW.as_millis() as u64;
+        if last != u64::MAX && now.saturating_sub(last) < window {
+            self.suppressed[index].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        if self.last_logged_millis[index]
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            self.suppressed[index].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        Some(self.suppressed[index].swap(0, Ordering::Relaxed) + 1)
+    }
+
+    #[cfg(test)]
+    fn reset(&self) {
+        for index in 0..self.last_logged_millis.len() {
+            self.last_logged_millis[index].store(u64::MAX, Ordering::Relaxed);
+            self.suppressed[index].store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Count one degrade and log at most one line per reason per window.
+///
+/// The error's `Display` is deliberately absent from the suppressed-path
+/// bookkeeping and the counter: only the closed reason label crosses into
+/// either, so nothing a sidecar returns can open the label space or reach a
+/// log line.
+fn note_degrade(reason: DegradeReason, error: Option<&ClassifierClientError>) {
+    if let Some(counter) = fallback_total() {
+        counter.with_label_values(&[reason.as_label()]).inc();
+    }
+    let Some(degrades) = DegradeWindow::get().admit(reason) else {
+        return;
+    };
+    match error {
+        Some(error) => tracing::warn!(
+            reason = reason.as_label(),
+            degraded_calls = degrades,
+            window_seconds = DEGRADE_WARNING_WINDOW.as_secs(),
+            error = %error,
+            "classifier sidecar unavailable; degrading to in-process classifier"
+        ),
+        None => tracing::warn!(
+            reason = reason.as_label(),
+            degraded_calls = degrades,
+            window_seconds = DEGRADE_WARNING_WINDOW.as_secs(),
+            "classifier sidecar returned zero labels despite client validation; degrading to in-process classifier"
+        ),
+    }
+}
 
 /// A classification verdict: a label plus its confidence score.
 ///
@@ -120,10 +290,7 @@ impl<F: InProcessClassifier> FallbackClassifier<F> {
                 // clean verdict on a broken invariant would be the exact
                 // "reads as covered but is not" failure mode this
                 // architecture exists to avoid. Fall through to in-process.
-                tracing::warn!(
-                    "classifier sidecar returned zero labels despite client validation; \
-                     degrading to in-process classifier"
-                );
+                note_degrade(DegradeReason::EmptyResponse, None);
                 self.inprocess.classify(text)
             }
             Err(err) => self.on_sidecar_error(text, &err),
@@ -131,10 +298,7 @@ impl<F: InProcessClassifier> FallbackClassifier<F> {
     }
 
     fn on_sidecar_error(&self, text: &str, err: &ClassifierClientError) -> Verdict {
-        tracing::warn!(
-            error = %err,
-            "classifier sidecar unavailable; degrading to in-process classifier"
-        );
+        note_degrade(DegradeReason::of(err), Some(err));
         self.inprocess.classify(text)
     }
 }
@@ -182,6 +346,78 @@ mod tests {
         let verdict = classifier.classify("hello").await;
         assert_eq!(verdict.label, "clean");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The degrade path used to emit one unaggregated `warn!` per request
+    /// and record no metric at all, so a configured-but-unreachable sidecar
+    /// at 5k rps turned the outage into the log flood that hid it, and no
+    /// counter existed to alert on "we are running on the fallback".
+    #[tokio::test]
+    async fn every_degrade_counts_and_the_warning_is_windowed_by_reason() {
+        DegradeWindow::get().reset();
+        let before = degraded_calls_total();
+
+        // Port 1 refuses immediately, so each call degrades without hanging.
+        let sidecar =
+            ClassifierClient::connect_lazy("http://127.0.0.1:1", Duration::from_millis(200))
+                .expect("lazy client construction does not dial");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let classifier = FallbackClassifier::new(
+            Some(sidecar),
+            "prompt-injection",
+            CountingInProcess {
+                calls: Arc::clone(&calls),
+                verdict: Verdict {
+                    label: "clean".to_string(),
+                    score: 0.0,
+                },
+            },
+        );
+
+        for _ in 0..8 {
+            classifier.classify("hello").await;
+        }
+
+        assert_eq!(
+            degraded_calls_total() - before,
+            8,
+            "every degraded call must be counted, not just the logged one"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 8);
+
+        // The window opened on the first degrade of that reason and swallowed
+        // the rest, so the remainder are parked against the next line rather
+        // than each writing one.
+        let window = DegradeWindow::get();
+        let suppressed: u64 = DegradeReason::ALL
+            .iter()
+            .map(|reason| window.suppressed[reason.index()].load(Ordering::Relaxed))
+            .sum();
+        assert_eq!(
+            suppressed, 7,
+            "only the first degrade in the window may reach the log"
+        );
+
+        // A different reason has its own window and is not suppressed by the
+        // first one.
+        window.reset();
+        assert_eq!(window.admit(DegradeReason::Connect), Some(1));
+        assert_eq!(window.admit(DegradeReason::Connect), None);
+        assert_eq!(
+            window.admit(DegradeReason::Protocol),
+            Some(1),
+            "each reason carries its own window"
+        );
+    }
+
+    fn degraded_calls_total() -> u64 {
+        let Some(counter) = fallback_total() else {
+            return 0;
+        };
+        DegradeReason::ALL
+            .iter()
+            .map(|reason| counter.with_label_values(&[reason.as_label()]).get())
+            .sum()
     }
 
     #[tokio::test]

@@ -16,6 +16,11 @@ tokio = { workspace = true, features = ["net", "process", "sync", "time", "macro
 tokio-stream = { version = "0.1", features = ["sync"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# `sbproxy_classifier_client_fallback_total`: the one counter an operator can
+# alert on for "we are running on the in-process fallback". Same `prometheus`
+# crate the rest of the workspace uses, registered in the default registry the
+# proxy already scrapes, rather than a second metrics stack for one family.
+prometheus = { workspace = true }
 # WOR-705 UDS transport: `tower::service_fn` is the tonic-recommended
 # adapter for `Endpoint::connect_with_connector`. tonic 0.12 already
 # pulls `tower` in transitively but does not re-export `service_fn`,
