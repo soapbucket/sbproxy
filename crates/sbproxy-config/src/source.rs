@@ -173,6 +173,17 @@ pub enum ConfigSourceError {
     /// path, a path that escapes the repository, or a timeout of zero.
     #[error("source.invalid: {0}")]
     Invalid(String),
+    /// The document the repository served reaches for something only the
+    /// host owner may reach: a secret read straight off the process
+    /// environment or the filesystem, or a host path the compiler would
+    /// inline (WOR-2433).
+    ///
+    /// Separate from [`Self::Invalid`] because it is not a malformed
+    /// document. It parses, it would compile, and refusing it is a trust
+    /// decision rather than a syntax one, so it earns its own metric
+    /// label and its own operator message.
+    #[error("source.confinement: {0}")]
+    Confinement(String),
 }
 
 impl ConfigSourceError {
@@ -198,6 +209,7 @@ impl ConfigSourceError {
             Self::Timeout(_) => "timeout",
             Self::RevisionMismatch(_) => "revision_mismatch",
             Self::Signature(_) => "verify_failed",
+            Self::Confinement(_) => "confinement_refused",
             Self::Read(_) | Self::Merge(_) | Self::RecursionLimit | Self::Invalid(_) => "invalid",
         }
     }
@@ -1423,6 +1435,16 @@ fn sanitize_materialization_error(
         ConfigSourceError::Merge(detail) => {
             ConfigSourceError::Merge(clean(detail, resolved_credential, http_auth))
         }
+        // A confinement refusal names a field path and a static form,
+        // never a value, so there is nothing here for `clean` to find.
+        // It goes through it anyway: this match is exhaustive on purpose
+        // so that a new variant has to make this decision explicitly,
+        // and "scrubbed, and here is why that is a no-op" is the
+        // decision that survives someone later adding detail to the
+        // message.
+        ConfigSourceError::Confinement(detail) => {
+            ConfigSourceError::Confinement(clean(detail, resolved_credential, http_auth))
+        }
         ConfigSourceError::MissingGitBinary(detail) => {
             ConfigSourceError::MissingGitBinary(clean(detail, resolved_credential, http_auth))
         }
@@ -1627,6 +1649,26 @@ fn load_with_depth(
                 timeout: Duration::from_secs(*timeout_secs),
             };
             let (text, resolved) = load_git(&spec, fetch_ctx)?;
+            // The document a repository serves is authored by whoever
+            // can push to that repository, which is not necessarily
+            // whoever runs this proxy. `ConfigSource::Local` above
+            // returns the operator's own file and is deliberately not
+            // confined; this branch is the one place in the loader where
+            // config text arrives from somewhere else, so it is where
+            // the boundary belongs (WOR-2433).
+            //
+            // `remote_document()` keeps `${VAR}`, which is the
+            // documented and only supported way to run one shared
+            // document across a fleet, and withholds the two powers a
+            // remote document was never granted: a secret reference read
+            // straight off this host, and a host path the compiler
+            // inlines.
+            crate::confined_template::check_confined_document(
+                &format!("{}:{}", spec.repo, spec.path),
+                &text,
+                &crate::confined_template::ConfinementPolicy::remote_document(),
+            )
+            .map_err(|error| ConfigSourceError::Confinement(error.to_string()))?;
             revisions.push(resolved);
             Ok(text)
         }

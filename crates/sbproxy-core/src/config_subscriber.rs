@@ -839,6 +839,33 @@ impl ConfigSubscriber {
         // has no `source:` block of its own, so deriving an origin from it
         // later would misreport a git-sourced base as `BaseOrigin::Local`.
         let base_origin = base_origin_for(base_yaml);
+        // Screened on the BUNDLE, never on the merge result. The merged
+        // document also contains this node's own base config, which is
+        // operator-authored on this machine and keeps every power: a
+        // local `api_key: "env:OPENAI_API_KEY"` must go on working. Only
+        // the authority's half is externally authored, so only the
+        // authority's half is confined (WOR-2433).
+        //
+        // `merge_config`'s deny list screens the PATHS this node owns.
+        // It cannot screen a value, so a bundle setting any allowed path
+        // to `env:AWS_SECRET_ACCESS_KEY`, `vault://env/...` or
+        // `file:/etc/...` reads this node's own secrets and sends them
+        // wherever the bundle's action points. The authority screens the
+        // same thing at publish with the same function, so this is the
+        // subscriber's own copy of that check rather than trust in the
+        // publisher having run it.
+        if let Err(error) = sbproxy_config::check_confined_document(
+            "the config bundle",
+            &bundle.config_yaml,
+            &sbproxy_config::ConfinementPolicy::remote_document(),
+        ) {
+            tracing::error!(
+                error = %error,
+                revision = bundle.revision,
+                "config bundle reaches for a host resource this node owns; refusing it",
+            );
+            return Err(CycleResult::DeniedPath);
+        }
         let merged = match merge_config(
             base_yaml,
             base_origin.clone(),

