@@ -1111,7 +1111,7 @@ then rather than at the first request.
 
 Per-provider circuit breaker, outlier detection, and active health probes layered on top of the routing strategy. Each signal independently ejects a provider; when every provider is ejected, the router falls back to the unfiltered enabled list rather than refusing the request.
 
-`health_check` is unconditionally live: it runs its own background probe task regardless of routing strategy. `circuit_breaker` and `outlier_detection` are configured and enforced as a selection gate, but as of this pass the production dispatch path does not feed either one a live request outcome, on any routing strategy, so a provider that fails every request is not currently ejected by either signal. See [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md#what-is-adaptive-and-what-fails-over) for the details and file citations.
+`health_check` is unconditionally live: it runs its own background probe task regardless of routing strategy. `circuit_breaker` and `outlier_detection` are enforced as a selection gate and fed by production traffic: every settled provider attempt records one outcome against both, on every routing strategy and whether the request streams or not, so a provider that fails every request is ejected. See [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md#what-is-adaptive-and-what-fails-over) for which status counts which way.
 
 ```yaml
 resilience:
