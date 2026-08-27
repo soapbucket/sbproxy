@@ -10505,38 +10505,21 @@ fn config_show_document_text(detail: &serde_json::Value) -> &str {
         .unwrap_or_default()
 }
 
-/// `${VAR}` interpolation matching the config compiler: a set variable
-/// is substituted, an unset one is left literal.
+/// `${VAR}` interpolation for the CLI paths that read a config file
+/// without compiling it (`config print`, `mcp lock`).
+///
+/// This is [`sbproxy_config::interpolate_env_vars`], the compiler's own
+/// pass, rather than a copy of it. A local copy shipped here for a while
+/// and had drifted three ways from the pass it claimed to match: it
+/// substituted `$${VAR}`, which is the documented escape and must stay
+/// literal; it substituted `${args.id}` and `${steps.x.y}`, which are
+/// MCP local-tool vocabulary the executor owns at call time; and it had
+/// no `${VAR:-default}` support at all, so a shipped example resolving
+/// to its default printed the raw placeholder instead. A second reader
+/// of the environment on a config path is only safe while it is the
+/// same reader; WOR-2433 makes it literally so.
 fn interpolate_env_vars(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '$' && chars.peek() == Some(&'{') {
-            chars.next();
-            let mut name = String::new();
-            let mut closed = false;
-            for c in chars.by_ref() {
-                if c == '}' {
-                    closed = true;
-                    break;
-                }
-                name.push(c);
-            }
-            match (closed && !name.is_empty(), std::env::var(&name)) {
-                (true, Ok(val)) => out.push_str(&val),
-                _ => {
-                    out.push_str("${");
-                    out.push_str(&name);
-                    if closed {
-                        out.push('}');
-                    }
-                }
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-    out
+    sbproxy_config::interpolate_env_vars(input)
 }
 
 /// Field names whose string value is a secret unless it is a resolver
@@ -14020,6 +14003,30 @@ hooks:
         let out = interpolate_env_vars("p=${PATH}");
         assert_ne!(out, "p=${PATH}");
         assert!(out.starts_with("p="));
+    }
+
+    /// The CLI's `${VAR}` pass is the compiler's, not a lookalike
+    /// (WOR-2433). Each of these three was wrong while a local copy
+    /// stood here, and each one is a config path reading the process
+    /// environment on semantics nothing else in the workspace shares.
+    #[test]
+    fn config_print_env_interpolation_is_the_compilers_pass() {
+        // The documented `$$` escape stays literal rather than being
+        // substituted.
+        assert_eq!(interpolate_env_vars("p=$${PATH}"), "p=$${PATH}");
+        // MCP local-tool vocabulary belongs to the executor at call
+        // time, not to a config-load-time environment read.
+        assert_eq!(
+            interpolate_env_vars("${args.user_id}/${steps.fetch.body.x}"),
+            "${args.user_id}/${steps.fetch.body.x}"
+        );
+        // `${VAR:-default}` takes its shell meaning, so a config whose
+        // value resolves to a default prints that default rather than
+        // the raw placeholder.
+        assert_eq!(
+            interpolate_env_vars("k=${SB_DEFINITELY_UNSET_XYZZY:-fixture-local-token}"),
+            "k=fixture-local-token"
+        );
     }
 
     #[test]
