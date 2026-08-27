@@ -816,6 +816,22 @@ impl CacheReserveHealthStatus {
     }
 }
 
+/// Write `sbproxy_cache_reserve_degraded{backend}` for one generation.
+///
+/// The family is optional because a build or registration failure
+/// drops it rather than ending the process (see
+/// `sbproxy_observe::metrics::ProxyMetrics::cache_reserve_degraded`),
+/// so every write goes through here rather than repeating the
+/// `Option` check and the healthy-versus-degraded mapping at each of
+/// the three call sites.
+fn set_reserve_degraded_gauge(backend: &str, state: CacheReserveHealthStatus) {
+    if let Some(family) = sbproxy_observe::metrics().cache_reserve_degraded.as_ref() {
+        family
+            .with_label_values(&[backend])
+            .set(i64::from(state == CacheReserveHealthStatus::Degraded));
+    }
+}
+
 /// Bounded operator-facing snapshot of one pipeline generation's reserve.
 #[derive(Debug, Clone)]
 pub(crate) struct CacheReserveHealthSnapshot {
@@ -937,14 +953,7 @@ impl CacheReserveHealthState {
         if !state.configured {
             return;
         }
-        sbproxy_observe::metrics()
-            .cache_reserve_degraded
-            .with_label_values(&[state.backend])
-            .set(if state.state == CacheReserveHealthStatus::Degraded {
-                1
-            } else {
-                0
-            });
+        set_reserve_degraded_gauge(state.backend, state.state);
         if state.state == CacheReserveHealthStatus::Degraded {
             self.observe_transition(&state);
         }
@@ -957,10 +966,7 @@ impl CacheReserveHealthState {
         self.audit_enabled.store(false, Ordering::Release);
         let state = self.snapshot();
         if state.configured {
-            sbproxy_observe::metrics()
-                .cache_reserve_degraded
-                .with_label_values(&[state.backend])
-                .set(0);
+            set_reserve_degraded_gauge(state.backend, CacheReserveHealthStatus::Healthy);
         }
     }
 
@@ -970,18 +976,15 @@ impl CacheReserveHealthState {
         }
         let state_label = state.state.as_str();
         let reason = state.reason_code.unwrap_or("recovered");
-        sbproxy_observe::metrics()
-            .cache_reserve_degraded
-            .with_label_values(&[state.backend])
-            .set(if state.state == CacheReserveHealthStatus::Degraded {
-                1
-            } else {
-                0
-            });
-        sbproxy_observe::metrics()
+        set_reserve_degraded_gauge(state.backend, state.state);
+        if let Some(family) = sbproxy_observe::metrics()
             .cache_reserve_health_transitions
-            .with_label_values(&[state.backend, state_label, reason])
-            .inc();
+            .as_ref()
+        {
+            family
+                .with_label_values(&[state.backend, state_label, reason])
+                .inc();
+        }
 
         use sbproxy_observe::decision::{DecisionEngine, DecisionEvent, DecisionOutcome};
         let outcome = if state.state == CacheReserveHealthStatus::Degraded {

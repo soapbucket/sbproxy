@@ -11,6 +11,39 @@ use crate::agent_labels::AgentLabels;
 use crate::cardinality::{CardinalityConfig, CardinalityLimiter};
 use crate::decision::{DecisionEvent, DecisionOutcome};
 
+/// Keep a metric that built and registered, or drop it and say which
+/// one went.
+///
+/// Construction fails only on an illegal metric or label name and
+/// registration only on a duplicate family, so both are build-time
+/// mistakes: every name in this file is a literal and the constructor
+/// below runs once per registry. The `debug_assert`
+/// makes either one a test failure. In a release build the family is
+/// dropped and the writes through it become no-ops, because a proxy
+/// that cannot chart a number must still answer the request that
+/// would have produced it.
+///
+/// What this cannot do: bring the family back, or tell an operator
+/// anything beyond the one warning. A process that lost a family stays
+/// without it until it restarts.
+fn kept<M>(result: prometheus::Result<M>, family: &'static str) -> Option<M> {
+    match result {
+        Ok(metric) => Some(metric),
+        Err(error) => {
+            debug_assert!(
+                false,
+                "metric family {family} must build and register exactly once: {error}"
+            );
+            tracing::warn!(
+                metric = family,
+                %error,
+                "metric family did not register; every panel reading it stays flat for this process"
+            );
+            None
+        }
+    }
+}
+
 /// Global metrics registry.
 static METRICS: OnceLock<ProxyMetrics> = OnceLock::new();
 
@@ -589,10 +622,19 @@ pub struct ProxyMetrics {
     pub cache_reserve_evictions: IntCounterVec,
     /// Gauge `sbproxy_cache_reserve_degraded` set to one while the
     /// configured reserve backend is degraded, labelled by backend.
-    pub cache_reserve_degraded: IntGaugeVec,
+    ///
+    /// `None` only when the family failed to build, which needs an
+    /// illegal metric or label name and is therefore a build-time
+    /// mistake rather than a runtime one. A reserve that cannot chart
+    /// its health must not take the proxy down with it, so the family
+    /// is dropped and every write through it becomes a no-op.
+    pub cache_reserve_degraded: Option<IntGaugeVec>,
     /// Counter `sbproxy_cache_reserve_health_transitions_total` of
     /// bounded reserve health transitions by backend, state, and reason.
-    pub cache_reserve_health_transitions: IntCounterVec,
+    ///
+    /// `None` under the same conditions as
+    /// [`Self::cache_reserve_degraded`].
+    pub cache_reserve_health_transitions: Option<IntCounterVec>,
 
     // --- Synthetic probe metrics ---
     /// Counter `sbproxy_synthetic_probe_failures_total` of synthetic
@@ -1015,23 +1057,35 @@ impl ProxyMetrics {
         )
         .unwrap();
 
-        let cache_reserve_degraded = IntGaugeVec::new(
-            Opts::new(
-                "sbproxy_cache_reserve_degraded",
-                "Whether the configured Cache Reserve backend is degraded",
+        // The two Cache Reserve health families are the one pair here
+        // that answers a construction or registration failure by
+        // dropping the family rather than by ending the process. A
+        // reserve exists so a proxy keeps serving when its cache is
+        // sick; dying because the gauge that reports that could not be
+        // built would invert the whole point. `kept` debug_asserts, so
+        // a mistake in either name is a test failure rather than
+        // something an operator discovers from a flat panel.
+        let cache_reserve_degraded = kept(
+            IntGaugeVec::new(
+                Opts::new(
+                    "sbproxy_cache_reserve_degraded",
+                    "Whether the configured Cache Reserve backend is degraded",
+                ),
+                &["backend"],
             ),
-            &["backend"],
-        )
-        .unwrap();
+            "sbproxy_cache_reserve_degraded",
+        );
 
-        let cache_reserve_health_transitions = IntCounterVec::new(
-            Opts::new(
-                "sbproxy_cache_reserve_health_transitions_total",
-                "Cache Reserve backend health transitions by bounded reason",
+        let cache_reserve_health_transitions = kept(
+            IntCounterVec::new(
+                Opts::new(
+                    "sbproxy_cache_reserve_health_transitions_total",
+                    "Cache Reserve backend health transitions by bounded reason",
+                ),
+                &["backend", "state", "reason"],
             ),
-            &["backend", "state", "reason"],
-        )
-        .unwrap();
+            "sbproxy_cache_reserve_health_transitions_total",
+        );
 
         // --- Synthetic probe counters ---
 
@@ -1194,12 +1248,18 @@ impl ProxyMetrics {
         registry
             .register(Box::new(cache_reserve_evictions.clone()))
             .unwrap();
-        registry
-            .register(Box::new(cache_reserve_degraded.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(cache_reserve_health_transitions.clone()))
-            .unwrap();
+        if let Some(family) = cache_reserve_degraded.clone() {
+            kept(
+                registry.register(Box::new(family)),
+                "sbproxy_cache_reserve_degraded",
+            );
+        }
+        if let Some(family) = cache_reserve_health_transitions.clone() {
+            kept(
+                registry.register(Box::new(family)),
+                "sbproxy_cache_reserve_health_transitions_total",
+            );
+        }
         registry
             .register(Box::new(synthetic_probe_failures.clone()))
             .unwrap();

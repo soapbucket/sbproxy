@@ -42,15 +42,11 @@ async fn manifest(State(mp): State<Arc<CompMarketplace>>) -> Response {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(error = %e, "comp.manifest.encode_failed");
-            metrics::MANIFEST_SERVES_TOTAL
-                .with_label_values(&["error"])
-                .inc();
+            metrics::record_manifest_serve("error");
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, "encode_failed");
         }
     };
-    metrics::MANIFEST_SERVES_TOTAL
-        .with_label_values(&["ok"])
-        .inc();
+    metrics::record_manifest_serve("ok");
     let mut response = (StatusCode::OK, body).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -81,9 +77,7 @@ async fn quote(
                 amount_micros = resp.pricing.amount_micros,
                 "comp.quote.issued"
             );
-            metrics::QUOTE_REQUESTS_TOTAL
-                .with_label_values(&["ok"])
-                .inc();
+            metrics::record_quote("ok");
             let body = match serde_json::to_vec(&resp) {
                 Ok(b) => b,
                 Err(e) => {
@@ -110,9 +104,7 @@ async fn quote(
                 reason = %e,
                 "comp.quote.rejected"
             );
-            metrics::QUOTE_REQUESTS_TOTAL
-                .with_label_values(&["rejected"])
-                .inc();
+            metrics::record_quote("rejected");
             map_error(e)
         }
     }
@@ -133,9 +125,7 @@ async fn redeem(
                 agent_id = %resp.agent_id,
                 "comp.redeem.minted"
             );
-            metrics::REDEEM_REQUESTS_TOTAL
-                .with_label_values(&["ok"])
-                .inc();
+            metrics::record_redeem("ok");
             let mut response = (StatusCode::OK, Json(resp)).into_response();
             response.headers_mut().insert(
                 header::CACHE_CONTROL,
@@ -151,9 +141,7 @@ async fn redeem(
                 reason = %e,
                 "comp.redeem.rejected"
             );
-            metrics::REDEEM_REQUESTS_TOTAL
-                .with_label_values(&["rejected"])
-                .inc();
+            metrics::record_redeem("rejected");
             map_error(e)
         }
     }

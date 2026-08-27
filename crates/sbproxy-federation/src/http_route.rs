@@ -61,7 +61,7 @@ pub async fn entity_configuration_handler(State(issuer): State<Arc<WellKnownIssu
         Ok(doc) => {
             let max_age = doc.cache_max_age_secs(now);
             crate::metrics::record_well_known_serve("served");
-            crate::metrics::WELL_KNOWN_CACHE_REMAINING_SECONDS.set(max_age as i64);
+            crate::metrics::record_well_known_cache_remaining(max_age as i64);
             let mut response = (
                 StatusCode::OK,
                 [

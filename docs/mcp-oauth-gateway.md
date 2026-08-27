@@ -175,7 +175,7 @@ does (`prometheus::TextEncoder` over `prometheus::gather()`).
 | `sbproxy_mcp_gateway_token_requests_total` | counter | `outcome` (`issued`, `rejected`, `upstream_error`) | `/token` decisions. |
 | `sbproxy_mcp_gateway_dpop_proofs_total` | counter | `outcome` (`verified`, `rejected`, `nonce_required`) | RFC 9449 proof verification at `/token`. |
 | `sbproxy_mcp_gateway_revocation_introspection_requests_total` | counter | `endpoint` (`revoke`, `introspect`), `outcome` (`ok`, `error`) | `/revoke` and `/introspect` decisions. |
-| `sbproxy_mcp_gateway_sessions_active` | gauge | none | In-flight authorization sessions. Only meaningful when the deployment updates it explicitly (`InMemorySessionStore` does not expose a count without an O(n) walk; a caller that wants this gauge live calls `metrics::SESSIONS_ACTIVE.set(...)` from its own periodic sweep). |
+| `sbproxy_mcp_gateway_sessions_active` | gauge | none | In-flight authorization sessions held by the in-memory session store, written on every put, take, and expiry sweep. A deployment on the storage-backed session store reads zero here, because counting those needs a `SCAN`; read the gauge as "in-memory sessions", not as "sessions". A caller keeping its own ledger can write it with `metrics::record_sessions_active(live)`. |
 
 The outcome labels are deliberately coarse: recovering the specific
 OAuth `error` string would mean buffering and JSON-parsing every
