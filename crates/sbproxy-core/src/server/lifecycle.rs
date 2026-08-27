@@ -707,6 +707,166 @@ fn build_request_event_sink(
                 ))
             }
         },
+        // WOR-2674. Both fall back to the logging sink the way `file`
+        // does when their own block is missing or malformed: a
+        // deployment that asked for its events to go somewhere should
+        // still see them locally rather than discover the typo as
+        // silence in a warehouse.
+        RequestEventSinkKind::Nats => match build_ingest_sink(cfg, "nats") {
+            Some(sink) => Some((sink, "nats")),
+            None => Some((
+                Arc::new(LoggingSink) as Arc<dyn RequestEventSink>,
+                "logging",
+            )),
+        },
+        RequestEventSinkKind::ClickHouse => match build_ingest_sink(cfg, "clickhouse") {
+            Some(sink) => Some((sink, "clickhouse")),
+            None => Some((
+                Arc::new(LoggingSink) as Arc<dyn RequestEventSink>,
+                "logging",
+            )),
+        },
+    }
+}
+
+/// Build one of the two optional ingest sinks, or `None` when its block is
+/// missing, malformed, or its credential will not resolve.
+///
+/// The credential resolution is fail-soft here and fail-loud in the
+/// `events:` sink next door, and the difference is what a failure costs.
+/// An unresolvable `events.signing_secret` means a SIEM stops verifying
+/// signatures it thinks it is still verifying, which is a security
+/// property quietly turning off. An unresolvable broker token means the
+/// events go to the local log instead of the broker, which is visible in
+/// the log the operator is then reading.
+/// Turn a `nats:` block into a target, or `None` when it will not work.
+///
+/// Takes the block rather than the whole config so the two destinations do
+/// not share one function with a `kind` string deciding which half of it
+/// runs, and so each names the type it reads.
+fn build_nats_target(
+    nats: &sbproxy_config::types::RequestEventsNatsConfig,
+) -> Option<sbproxy_observe::event_ingest::IngestTarget> {
+    let token = resolve_ingest_secret("request_events.nats.token", nats.token.as_deref())?;
+    Some(sbproxy_observe::event_ingest::IngestTarget::Nats {
+        address: nats.address.clone(),
+        subject_prefix: nats.subject_prefix.clone(),
+        token,
+    })
+}
+
+/// Turn a `clickhouse:` block into a target, or `None` when it will not
+/// work.
+fn build_clickhouse_target(
+    clickhouse: &sbproxy_config::types::RequestEventsClickHouseConfig,
+) -> Option<sbproxy_observe::event_ingest::IngestTarget> {
+    let password = resolve_ingest_secret(
+        "request_events.clickhouse.password",
+        clickhouse.password.as_deref(),
+    )?;
+    Some(sbproxy_observe::event_ingest::IngestTarget::ClickHouse {
+        url: clickhouse.url.clone(),
+        database: clickhouse.database.clone(),
+        table: clickhouse.table.clone(),
+        user: clickhouse.user.clone(),
+        password,
+    })
+}
+
+/// Resolve one ingest credential reference.
+///
+/// `Some(None)` is "no credential configured", `Some(Some(_))` is a
+/// resolved one, and `None` is a reference that would not resolve, which
+/// the caller turns into the logging-sink fallback.
+///
+/// Fail-soft here and fail-loud in the `events:` sink next door, and the
+/// difference is what a failure costs. An unresolvable
+/// `events.signing_secret` means a SIEM stops verifying signatures it
+/// thinks it is still verifying, which is a security property quietly
+/// turning off. An unresolvable broker token means the events go to the
+/// local log instead of the broker, which is visible in the log the
+/// operator is then reading.
+fn resolve_ingest_secret(field: &'static str, reference: Option<&str>) -> Option<Option<String>> {
+    let Some(reference) = reference else {
+        return Some(None);
+    };
+    let resolver = sbproxy_vault::process_resolver();
+    let resolved = match resolver.as_deref() {
+        Some(resolver) => resolver.resolve(reference),
+        None => sbproxy_vault::SecretResolver::new().resolve(reference),
+    };
+    match resolved {
+        Ok(value) => Some(Some(value)),
+        // The reference itself is not echoed: it can name a path or a vault
+        // key an operator would rather not have in a boot log.
+        Err(error) => {
+            tracing::warn!(
+                field,
+                error = %error,
+                "request_events credential would not resolve; using the logging sink"
+            );
+            None
+        }
+    }
+}
+
+/// Build one of the two optional ingest sinks, or `None` when its block is
+/// missing, malformed, or its credential will not resolve.
+fn build_ingest_sink(
+    cfg: &sbproxy_config::types::RequestEventsConfig,
+    kind: &'static str,
+) -> Option<std::sync::Arc<dyn sbproxy_observe::RequestEventSink>> {
+    use sbproxy_observe::event_ingest::EventIngest;
+
+    let target = match kind {
+        "nats" => match cfg.nats.as_ref() {
+            Some(nats) => build_nats_target(nats)?,
+            None => {
+                tracing::warn!(
+                    "request_events.sink is `nats` but no `nats` block is set; using the logging sink"
+                );
+                return None;
+            }
+        },
+        _ => match cfg.clickhouse.as_ref() {
+            Some(clickhouse) => build_clickhouse_target(clickhouse)?,
+            None => {
+                tracing::warn!(
+                    "request_events.sink is `clickhouse` but no `clickhouse` block is set; \
+                     using the logging sink"
+                );
+                return None;
+            }
+        },
+    };
+
+    let watermark = cfg.watermark_store_path.as_ref().and_then(|path| {
+        match sbproxy_platform::storage::EmbeddedKvStore::open_shared(path, "event_ingest") {
+            Ok(store) => Some(store as std::sync::Arc<dyn sbproxy_platform::storage::PersistentKv>),
+            Err(error) => {
+                // Fail-soft: the watermark is bookkeeping about delivery,
+                // not delivery. Losing it costs an operator a checkpoint,
+                // and refusing to deliver would cost them the events.
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "request_events watermark store could not be opened; delivering without a checkpoint"
+                );
+                None
+            }
+        }
+    });
+
+    match EventIngest::start(target, cfg.queue_capacity, watermark) {
+        Ok(sink) => Some(std::sync::Arc::new(sink)),
+        Err(error) => {
+            tracing::warn!(
+                sink = kind,
+                error = %error,
+                "request event ingest sink could not start; using the logging sink"
+            );
+            None
+        }
     }
 }
 
@@ -6890,6 +7050,7 @@ mod request_event_sink_tests {
         let cfg = RequestEventsConfig {
             sink: RequestEventSinkKind::Logging,
             path: None,
+            ..Default::default()
         };
         let (sink, kind) = build_request_event_sink(&cfg).expect("logging sink is built");
         assert_eq!(kind, "logging");
@@ -6906,6 +7067,7 @@ mod request_event_sink_tests {
         let cfg = RequestEventsConfig {
             sink: RequestEventSinkKind::File,
             path: Some(path.display().to_string()),
+            ..Default::default()
         };
 
         let (sink, kind) = build_request_event_sink(&cfg).expect("file sink is built");
@@ -6924,11 +7086,82 @@ mod request_event_sink_tests {
         assert!(written.contains("api.example.com"), "{written:?}");
     }
 
+    /// WOR-2674: the two optional ingest sinks fall back the way the file
+    /// sink does. A deployment that asked for its events to go somewhere
+    /// and typed the block name wrong should read them locally rather than
+    /// discover the typo as silence in a warehouse.
+    #[test]
+    fn an_ingest_sink_without_its_block_falls_back_to_logging() {
+        for sink in [RequestEventSinkKind::Nats, RequestEventSinkKind::ClickHouse] {
+            let cfg = RequestEventsConfig {
+                sink,
+                ..Default::default()
+            };
+            let (_, kind) = build_request_event_sink(&cfg).expect("a fallback sink is still built");
+            assert_eq!(kind, "logging", "{sink:?}");
+        }
+    }
+
+    /// A malformed target is refused at build time rather than at the
+    /// first request. `nats://` is the shape an operator reaches for and
+    /// the shape this sink does not take.
+    #[test]
+    fn a_malformed_ingest_target_falls_back_to_logging() {
+        let cfg = RequestEventsConfig {
+            sink: RequestEventSinkKind::Nats,
+            nats: Some(sbproxy_config::types::RequestEventsNatsConfig {
+                address: "nats://broker:4222".into(),
+                subject_prefix: "sb.events".into(),
+                token: None,
+            }),
+            ..Default::default()
+        };
+        let (_, kind) = build_request_event_sink(&cfg).expect("a fallback sink is still built");
+        assert_eq!(kind, "logging");
+    }
+
+    /// A credential reference that will not resolve must not become a
+    /// verbatim token on the wire, and must not silently become an
+    /// unauthenticated connection either.
+    #[test]
+    fn an_unresolvable_broker_token_falls_back_to_logging() {
+        let cfg = RequestEventsConfig {
+            sink: RequestEventSinkKind::Nats,
+            nats: Some(sbproxy_config::types::RequestEventsNatsConfig {
+                address: "127.0.0.1:4222".into(),
+                subject_prefix: "sb.events".into(),
+                token: Some("file:/nonexistent/sbproxy-nats-token".into()),
+            }),
+            ..Default::default()
+        };
+        let (_, kind) = build_request_event_sink(&cfg).expect("a fallback sink is still built");
+        assert_eq!(kind, "logging");
+    }
+
+    /// The sink starts without dialing: a broker that is down at boot must
+    /// not stop the proxy from booting.
+    #[test]
+    fn an_ingest_sink_starts_without_reaching_the_broker() {
+        let cfg = RequestEventsConfig {
+            sink: RequestEventSinkKind::Nats,
+            nats: Some(sbproxy_config::types::RequestEventsNatsConfig {
+                // Nothing listens here. Construction still succeeds.
+                address: "127.0.0.1:1".into(),
+                subject_prefix: "sb.events".into(),
+                token: None,
+            }),
+            ..Default::default()
+        };
+        let (_, kind) = build_request_event_sink(&cfg).expect("the sink is built");
+        assert_eq!(kind, "nats");
+    }
+
     #[test]
     fn a_file_sink_without_a_path_falls_back_to_logging() {
         let cfg = RequestEventsConfig {
             sink: RequestEventSinkKind::File,
             path: None,
+            ..Default::default()
         };
         let (_, kind) = build_request_event_sink(&cfg).expect("a fallback sink is still built");
         assert_eq!(
@@ -6946,6 +7179,7 @@ mod request_event_sink_tests {
         let cfg = RequestEventsConfig {
             sink: RequestEventSinkKind::File,
             path: Some(path.display().to_string()),
+            ..Default::default()
         };
 
         let (_, kind) = build_request_event_sink(&cfg).expect("a fallback sink is still built");

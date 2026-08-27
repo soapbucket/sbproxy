@@ -641,6 +641,84 @@ pub struct RequestEventsConfig {
     /// `sink: file`; ignored otherwise.
     #[serde(default)]
     pub path: Option<String>,
+    /// Broker settings for `sink: nats`. Ignored otherwise.
+    #[serde(default)]
+    pub nats: Option<RequestEventsNatsConfig>,
+    /// Warehouse settings for `sink: clickhouse`. Ignored otherwise.
+    #[serde(default)]
+    pub clickhouse: Option<RequestEventsClickHouseConfig>,
+    /// Path to an embedded store holding the delivery watermark, so an
+    /// operator reconciling a broker or a warehouse against the proxy has
+    /// a checkpoint that survives a restart. Absent means no watermark is
+    /// kept, which costs nothing and answers nothing.
+    #[serde(default)]
+    pub watermark_store_path: Option<std::path::PathBuf>,
+    /// Bound on the hand-off queue between the request path and the
+    /// delivery worker, for the `nats` and `clickhouse` sinks. A full
+    /// queue drops the incoming event and counts the drop rather than
+    /// making a request wait on a broker.
+    #[serde(default = "default_request_events_queue_capacity")]
+    pub queue_capacity: usize,
+}
+
+/// Broker settings for `request_events.sink: nats`.
+///
+/// The address is `host:port`, not a URL: the core NATS protocol this
+/// speaks is plain TCP, and a `nats://` string would suggest a URL parser
+/// that is not there.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RequestEventsNatsConfig {
+    /// `host:port` of the broker.
+    pub address: String,
+    /// Prefix every subject starts with. The published subject is
+    /// `<prefix>.<workspace_id>.<event_type>`, with the workspace id
+    /// sanitized so it cannot add a level or name a wildcard.
+    #[serde(default = "default_nats_subject_prefix")]
+    pub subject_prefix: String,
+    /// Secret reference for the broker's authentication token, resolved
+    /// through `proxy.secrets`. A literal here is refused the same way
+    /// every other credential reference is.
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+/// Warehouse settings for `request_events.sink: clickhouse`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RequestEventsClickHouseConfig {
+    /// HTTP endpoint, for example `http://clickhouse.internal:8123`.
+    pub url: String,
+    /// Database name. Refused unless it matches `[A-Za-z0-9_]+`.
+    #[serde(default = "default_clickhouse_database")]
+    pub database: String,
+    /// Table name. Refused unless it matches `[A-Za-z0-9_]+`. The proxy
+    /// never applies DDL; create the table first.
+    #[serde(default = "default_clickhouse_table")]
+    pub table: String,
+    /// Optional user.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Secret reference for the password, resolved through
+    /// `proxy.secrets`.
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+fn default_request_events_queue_capacity() -> usize {
+    8_192
+}
+
+fn default_nats_subject_prefix() -> String {
+    "sb.events".to_string()
+}
+
+fn default_clickhouse_database() -> String {
+    "sbproxy".to_string()
+}
+
+fn default_clickhouse_table() -> String {
+    "sbproxy_request_events".to_string()
 }
 
 /// Request-event sink kinds.
@@ -665,6 +743,12 @@ pub enum RequestEventSinkKind {
     Logging,
     /// Append each event as one NDJSON line to `path`.
     File,
+    /// Publish one JSON message per event to a NATS subject tree.
+    /// Requires `request_events.nats`.
+    Nats,
+    /// Insert batches into a ClickHouse table over its HTTP interface.
+    /// Requires `request_events.clickhouse`.
+    ClickHouse,
 }
 
 /// Egress for the typed proxy events.

@@ -6820,6 +6820,8 @@ name = "sbproxy-observe"
 version = "1.13.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
+ "async-trait",
  "base64 0.22.1",
  "chrono",
  "ed25519-dalek",
@@ -6841,6 +6843,7 @@ dependencies = [
  "sbproxy-capability",
  "sbproxy-httpkit",
  "sbproxy-meter",
+ "sbproxy-platform",
  "sbproxy-plugin",
  "sbproxy-security",
  "sbproxy-util",

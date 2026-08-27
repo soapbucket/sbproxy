@@ -2346,6 +2346,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_event_ingest_events_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_ingest"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["target", "outcome"],
+        description: "Request events handed to an optional ingest sink (NATS or ClickHouse), by target and outcome: published, dropped at a full queue, errored, or reconnected.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_errors_total",
         kind: MetricKind::Counter,
         writer: Writer::Field("errors_total"),

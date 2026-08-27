@@ -1215,6 +1215,62 @@
         }
       ],
       "description": "How many webhook subscriptions are configured, and how many deliveries are sitting in the deadletter queue waiting for a replay. The deadletter series is bounded: past its capacity the oldest record is dropped and the drop is counted under outcome=\"deadletter_evicted\" on the panel to the left, so a queue pinned at its ceiling is losing history rather than holding it. A configured notifier publishes both series at zero on boot, so No data means it is not configured rather than that there is nothing to send."
+    },
+    {
+      "id": 17,
+      "title": "Optional Event Ingest",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 53
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto"
+          },
+          "min": 0,
+          "noValue": "No optional ingest sink is configured on any scraped process. Set request_events.sink to nats or clickhouse to populate this."
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (target, outcome) (rate(sbproxy_event_ingest_events_total[5m]))",
+          "legendFormat": "{{target}} {{outcome}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ],
+      "description": "What the optional NATS and ClickHouse request-event sinks did with each event. published is a batch the destination confirmed: for NATS that is a PONG after the publishes, for ClickHouse a 2xx on the insert. dropped is the hand-off queue at capacity, which means the request path outran the sink and events were discarded rather than made to wait on a broker. error is a batch the destination did not take, and it is lost: this sink does not retry, because holding a request-event batch is a spool with its own operational surface. reconnected counts broker redials, and a steady rate there is a broker cycling rather than a healthy one."
     }
   ],
   "templating": {

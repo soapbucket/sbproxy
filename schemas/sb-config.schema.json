@@ -12272,6 +12272,45 @@
             "string",
             "null"
           ]
+        },
+        "nats": {
+          "description": "Broker settings for `sink: nats`. Ignored otherwise.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RequestEventsNatsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "clickhouse": {
+          "description": "Warehouse settings for `sink: clickhouse`. Ignored otherwise.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RequestEventsClickHouseConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "watermark_store_path": {
+          "description": "Path to an embedded store holding the delivery watermark, so an operator reconciling a broker or a warehouse against the proxy has a checkpoint that survives a restart. Absent means no watermark is kept, which costs nothing and answers nothing.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "queue_capacity": {
+          "description": "Bound on the hand-off queue between the request path and the delivery worker, for the `nats` and `clickhouse` sinks. A full queue drops the incoming event and counts the drop rather than making a request wait on a broker.",
+          "default": 8192,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
         }
       },
       "additionalProperties": false
@@ -12299,8 +12338,89 @@
           "enum": [
             "file"
           ]
+        },
+        {
+          "description": "Publish one JSON message per event to a NATS subject tree. Requires `request_events.nats`.",
+          "type": "string",
+          "enum": [
+            "nats"
+          ]
+        },
+        {
+          "description": "Insert batches into a ClickHouse table over its HTTP interface. Requires `request_events.clickhouse`.",
+          "type": "string",
+          "enum": [
+            "click_house"
+          ]
         }
       ]
+    },
+    "RequestEventsNatsConfig": {
+      "description": "Broker settings for `request_events.sink: nats`.\n\nThe address is `host:port`, not a URL: the core NATS protocol this speaks is plain TCP, and a `nats://` string would suggest a URL parser that is not there.",
+      "type": "object",
+      "required": [
+        "address"
+      ],
+      "properties": {
+        "address": {
+          "description": "`host:port` of the broker.",
+          "type": "string"
+        },
+        "subject_prefix": {
+          "description": "Prefix every subject starts with. The published subject is `<prefix>.<workspace_id>.<event_type>`, with the workspace id sanitized so it cannot add a level or name a wildcard.",
+          "default": "sb.events",
+          "type": "string"
+        },
+        "token": {
+          "description": "Secret reference for the broker's authentication token, resolved through `proxy.secrets`. A literal here is refused the same way every other credential reference is.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "RequestEventsClickHouseConfig": {
+      "description": "Warehouse settings for `request_events.sink: clickhouse`.",
+      "type": "object",
+      "required": [
+        "url"
+      ],
+      "properties": {
+        "url": {
+          "description": "HTTP endpoint, for example `http://clickhouse.internal:8123`.",
+          "type": "string"
+        },
+        "database": {
+          "description": "Database name. Refused unless it matches `[A-Za-z0-9_]+`.",
+          "default": "sbproxy",
+          "type": "string"
+        },
+        "table": {
+          "description": "Table name. Refused unless it matches `[A-Za-z0-9_]+`. The proxy never applies DDL; create the table first.",
+          "default": "sbproxy_request_events",
+          "type": "string"
+        },
+        "user": {
+          "description": "Optional user.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "password": {
+          "description": "Secret reference for the password, resolved through `proxy.secrets`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
     },
     "EventsConfig": {
       "description": "Egress for the typed proxy events.\n\nDistinct from [`RequestEventsConfig`], and the difference is the stream rather than the transport. `request_events:` carries the capture envelope: one fully populated record per terminating request, for analytics and billing reconciliation. `events:` carries the lifecycle events an operator wants to react to (a policy denial, an auth failure, a config reload) and can filter down to just those, so a SIEM subscription does not cost one delivery per request served.\n\nDelivery never runs on the request path. The publish site puts the event on a bounded queue and returns; a background worker owns the file handle or the HTTP client. When the queue is full the event is dropped and counted on `sbproxy_events_dropped_total`, because the alternative is a slow SIEM adding latency to every denied request.\n\nShutdown does not flush; see `docs/events.md`.",
