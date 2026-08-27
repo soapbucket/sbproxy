@@ -312,7 +312,14 @@ impl DecisionEvent {
             // every one of the fourteen auth call sites goes through.
             // ai.guardrail.*: ai_dispatch.rs, the input and output
             // guardrail funnels.
-            // mcp.tool: action_dispatch.rs `emit_mcp_tool_attribution`.
+            // mcp.tool: action_dispatch.rs `emit_mcp_tool_attribution`
+            // for a dispatched tool call, and
+            // `record_mcp_scope_decision` for the per-operation OAuth
+            // scope refusal that stops one before dispatch.
+            // cache.reserve.health: pipeline.rs
+            // `CacheReserveHealthState::observe_transition`, on the
+            // healthy-to-degraded and degraded-to-healthy edges only,
+            // not once per reserve operation.
             // ai.tool_call: ai_dispatch.rs `handle_verdicts`, one record
             // per judged streamed tool call. Bounded by tool calls
             // rather than chunks, which is what separates it from

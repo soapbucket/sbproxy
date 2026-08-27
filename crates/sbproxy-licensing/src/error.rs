@@ -40,6 +40,16 @@ pub enum LicensingError {
     #[error("signature invalid")]
     SignatureInvalid,
 
+    /// A CoMP request named a `tier_id` this publisher's manifest does
+    /// not declare.
+    ///
+    /// Its own variant rather than an [`Self::Encode`] the HTTP layer
+    /// substring-matches: the status this maps to is 404, and matching
+    /// on message text means rewording the message silently turns that
+    /// 404 into a 500.
+    #[error("unknown tier_id: {0}")]
+    UnknownTier(String),
+
     /// A time-bounded object (a CoMP quote) is being redeemed after
     /// its `valid_until` has passed.
     #[error("expired (exp={exp}, now={now})")]

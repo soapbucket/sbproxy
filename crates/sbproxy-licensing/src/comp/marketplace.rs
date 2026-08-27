@@ -112,7 +112,53 @@ pub struct CompMarketplace {
     /// on that basis alone) and every write is one `insert` or
     /// `retain`, so reading a map that survived another thread's panic
     /// is strictly better than refusing every redeem from here on.
-    issued_quotes: std::sync::Mutex<HashMap<String, u64>>,
+    issued_quotes: std::sync::Mutex<HashMap<String, IssuedQuote>>,
+}
+
+/// How long an expired quote stays in the ledger as a tombstone.
+///
+/// The row has to outlive the quote, or the only thing that removes it
+/// is the next `quote()` call and an expired quote becomes redeemable
+/// again the moment any buyer asks for a new one. Twenty-four hours is
+/// far past any quote lifetime a publisher configures and bounds the
+/// map the same way the old sweep did.
+const QUOTE_TOMBSTONE_SECS: u64 = 24 * 60 * 60;
+
+/// One issued quote, as the ledger remembers it.
+#[derive(Clone, Debug)]
+struct IssuedQuote {
+    /// Unix seconds the quote stops being redeemable.
+    valid_until: u64,
+    /// `sha256:<hex>` over the canonical signing bytes of the quote
+    /// this process issued. The redeem request carries the buyer's copy
+    /// in `buyer_acceptance.accepted_quote_hash`; comparing the two is
+    /// what binds a redeem to a quote at all.
+    quote_hash: String,
+}
+
+/// The `accepted_quote_hash` a buyer puts in its redeem request.
+///
+/// A redeem is bound to a quote by this value, so a buyer client has to
+/// be able to compute it from the quote it received. It is the SHA-256
+/// of the same canonical bytes the quote's own signature covers, in
+/// `sha256:<hex>` form, and the ordering contract on
+/// [`canonical_quote_signing_input`] applies to it too.
+///
+/// # Errors
+///
+/// Returns an error when the quote cannot be serialized, which cannot
+/// happen for a quote this crate produced.
+pub fn quote_acceptance_hash(quote: &CompQuoteResponse) -> Result<String, LicensingError> {
+    Ok(quote_hash(&canonical_quote_signing_input(quote)?))
+}
+
+/// Hash a quote's canonical signing bytes the way the acceptance
+/// attestation is specified to.
+fn quote_hash(signing_input: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(signing_input);
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("sha256:{hex}")
 }
 
 impl CompMarketplace {
@@ -193,8 +239,22 @@ impl CompMarketplace {
                 .issued_quotes
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            ledger.retain(|_, exp| *exp > now);
-            ledger.insert(quote_id, valid_until_unix);
+            // Keep expired rows as tombstones. Sweeping them at expiry
+            // is what made the expiry check unreachable: the only code
+            // that removed a row was this sweep, and once removed the id
+            // fell into the "unknown to this process" branch, which
+            // proceeds. Any buyer could trigger the sweep by asking for
+            // a new quote, so the window in which the check fired was
+            // close to zero.
+            ledger
+                .retain(|_, issued| issued.valid_until.saturating_add(QUOTE_TOMBSTONE_SECS) > now);
+            ledger.insert(
+                quote_id,
+                IssuedQuote {
+                    valid_until: valid_until_unix,
+                    quote_hash: quote_hash(&signing_input),
+                },
+            );
         }
 
         Ok(response)
@@ -237,18 +297,29 @@ impl CompMarketplace {
         }
 
         let now = unix_now();
-        if let Some(valid_until) = self
+        let issued = self
             .issued_quotes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&request.quote_id)
-            .copied()
-        {
-            if valid_until <= now {
+            .cloned();
+        if let Some(issued) = issued {
+            if issued.valid_until <= now {
                 return Err(LicensingError::Expired {
-                    exp: valid_until,
+                    exp: issued.valid_until,
                     now,
                 });
+            }
+            // Bind the redeem to the quote. Without this the whole
+            // request reduces to a syntactically valid body with a
+            // fabricated quote_id and a fabricated hash, redeemable on
+            // a loop by any onboarded buyer key.
+            if request.buyer_acceptance.accepted_quote_hash != issued.quote_hash {
+                return Err(LicensingError::Malformed(
+                    "buyer_acceptance.accepted_quote_hash does not match the quote this \
+                     publisher issued for that quote_id"
+                        .to_string(),
+                ));
             }
         }
 
@@ -281,7 +352,7 @@ impl CompMarketplace {
             .tiers
             .iter()
             .find(|t| t.id == tier_id)
-            .ok_or_else(|| LicensingError::Encode(format!("unknown tier_id {tier_id}")))
+            .ok_or_else(|| LicensingError::UnknownTier(tier_id.to_string()))
     }
 
     fn tier_for_acceptance(
@@ -347,6 +418,14 @@ fn format_unit(volume: &super::types::CompRequestedVolume) -> String {
 
 // --- Canonical signing inputs ---
 
+/// The bytes a CoMP quote signature covers.
+///
+/// "Canonical" here means `serde_json` over this Rust struct with the
+/// signature `kid` and `value` cleared, which fixes the byte order as
+/// the struct's field declaration order. A non-Rust client that signs
+/// or verifies has to reproduce that order exactly; this is not JCS.
+/// `docs/comp-marketplace.md` states the ordering contract for anyone
+/// writing a client.
 fn canonical_quote_signing_input(quote: &CompQuoteResponse) -> Result<Vec<u8>, LicensingError> {
     let mut clone = quote.clone();
     // Strip kid + value so signer and verifier compute identical bytes.
@@ -355,6 +434,8 @@ fn canonical_quote_signing_input(quote: &CompQuoteResponse) -> Result<Vec<u8>, L
     serde_json::to_vec(&clone).map_err(LicensingError::from)
 }
 
+/// The bytes a CoMP redeem signature covers. Same ordering contract as
+/// [`canonical_quote_signing_input`].
 fn canonical_redeem_signing_input(req: &CompRedeemRequest) -> Result<Vec<u8>, LicensingError> {
     let mut clone = req.clone();
     clone.buyer_signature.value = String::new();
@@ -538,7 +619,22 @@ mod tests {
         }
     }
 
+    /// Build a redeem carrying the quote hash a buyer who actually held
+    /// the quote would compute.
+    fn build_redeem_for(quote: &CompQuoteResponse, signer: &SigningKey) -> CompRedeemRequest {
+        let hash = quote_hash(&canonical_quote_signing_input(quote).unwrap());
+        build_redeem_with_hash(quote.quote_id.clone(), &hash, signer)
+    }
+
     fn build_redeem(quote_id: String, signer: &SigningKey) -> CompRedeemRequest {
+        build_redeem_with_hash(quote_id, "sha256:placeholder", signer)
+    }
+
+    fn build_redeem_with_hash(
+        quote_id: String,
+        accepted_quote_hash: &str,
+        signer: &SigningKey,
+    ) -> CompRedeemRequest {
         let mut req = CompRedeemRequest {
             comp_version: COMP_VERSION.into(),
             quote_id,
@@ -548,7 +644,7 @@ mod tests {
                 value: String::new(),
             },
             buyer_acceptance: CompAcceptance {
-                accepted_quote_hash: "sha256:placeholder".into(),
+                accepted_quote_hash: accepted_quote_hash.into(),
                 accepted_at: "2026-05-02T14:35:00Z".into(),
                 buyer_legal_entity: "Acme AI Inc.".into(),
             },
@@ -588,14 +684,14 @@ mod tests {
         let mut req = quote_request();
         req.tier_id = "tier_does_not_exist".into();
         let err = mp.quote(req).unwrap_err();
-        assert!(matches!(err, LicensingError::Encode(_)));
+        assert!(matches!(err, LicensingError::UnknownTier(_)), "got {err:?}");
     }
 
     #[tokio::test]
     async fn redeem_happy_path_returns_bridged_token() {
         let (mp, _, signer) = build_marketplace();
         let quote = mp.quote(quote_request()).unwrap();
-        let redeem = build_redeem(quote.quote_id.clone(), &signer);
+        let redeem = build_redeem_for(&quote, &signer);
         let res = mp.redeem(redeem).await.unwrap();
         assert_eq!(res.token_type, "Bearer");
         assert_eq!(res.license, "urn:rsl:pay-per-inference:default");
@@ -639,13 +735,57 @@ mod tests {
         let quote = mp.quote(quote_request()).unwrap();
         // Force the in-process ledger's entry into the past without
         // waiting a real hour.
-        mp.issued_quotes
-            .lock()
-            .unwrap()
-            .insert(quote.quote_id.clone(), unix_now().saturating_sub(1));
-        let redeem = build_redeem(quote.quote_id, &signer);
+        let hash = quote_hash(&canonical_quote_signing_input(&quote).unwrap());
+        mp.issued_quotes.lock().unwrap().insert(
+            quote.quote_id.clone(),
+            IssuedQuote {
+                valid_until: unix_now().saturating_sub(1),
+                quote_hash: hash,
+            },
+        );
+        let redeem = build_redeem_for(&quote, &signer);
         let err = mp.redeem(redeem).await.unwrap_err();
         assert!(matches!(err, LicensingError::Expired { .. }));
+    }
+
+    #[tokio::test]
+    async fn an_expired_quote_stays_refusable_after_a_later_quote_request() {
+        // The interaction the two tests either side of this one hid
+        // from each other: quote, expire, quote again, redeem the first.
+        // The second quote's sweep used to remove the expired row, and
+        // the redeem then fell into the "unknown to this process"
+        // branch and minted a token.
+        let (mp, _, signer) = build_marketplace();
+        let first = mp.quote(quote_request()).unwrap();
+        let hash = quote_hash(&canonical_quote_signing_input(&first).unwrap());
+        mp.issued_quotes.lock().unwrap().insert(
+            first.quote_id.clone(),
+            IssuedQuote {
+                valid_until: unix_now().saturating_sub(1),
+                quote_hash: hash,
+            },
+        );
+        // Anyone can trigger this: /quote is unauthenticated.
+        let _second = mp.quote(quote_request()).unwrap();
+        let redeem = build_redeem_for(&first, &signer);
+        let err = mp.redeem(redeem).await.unwrap_err();
+        assert!(matches!(err, LicensingError::Expired { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn redeem_rejects_an_acceptance_hash_that_is_not_the_issued_quote() {
+        // Without this the redeem is bound to nothing: the quote_id and
+        // the acceptance hash are both free-form strings the buyer
+        // writes, and an onboarded key could mint a license per call
+        // forever without ever asking for a quote.
+        let (mp, _, signer) = build_marketplace();
+        let quote = mp.quote(quote_request()).unwrap();
+        let redeem = build_redeem(quote.quote_id, &signer);
+        let err = mp.redeem(redeem).await.unwrap_err();
+        assert!(
+            matches!(err, LicensingError::Malformed(ref message) if message.contains("accepted_quote_hash")),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]

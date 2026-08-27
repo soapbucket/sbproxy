@@ -1248,18 +1248,25 @@ impl ProxyMetrics {
         registry
             .register(Box::new(cache_reserve_evictions.clone()))
             .unwrap();
-        if let Some(family) = cache_reserve_degraded.clone() {
+        // Rebind from the register result. Discarding it left the field
+        // `Some` while the family was never in the registry, so writes
+        // through it went to a gauge nothing scrapes, which is exactly
+        // the state `kept`'s doc says cannot happen.
+        let cache_reserve_degraded = cache_reserve_degraded.and_then(|family| {
             kept(
-                registry.register(Box::new(family)),
+                registry.register(Box::new(family.clone())),
                 "sbproxy_cache_reserve_degraded",
-            );
-        }
-        if let Some(family) = cache_reserve_health_transitions.clone() {
-            kept(
-                registry.register(Box::new(family)),
-                "sbproxy_cache_reserve_health_transitions_total",
-            );
-        }
+            )
+            .map(|()| family)
+        });
+        let cache_reserve_health_transitions =
+            cache_reserve_health_transitions.and_then(|family| {
+                kept(
+                    registry.register(Box::new(family.clone())),
+                    "sbproxy_cache_reserve_health_transitions_total",
+                )
+                .map(|()| family)
+            });
         registry
             .register(Box::new(synthetic_probe_failures.clone()))
             .unwrap();

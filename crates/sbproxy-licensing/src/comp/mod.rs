@@ -18,7 +18,8 @@ pub mod router;
 pub mod types;
 
 pub use marketplace::{
-    BuyerKeyRegistry, CompMarketplace, InMemoryBuyerKeyRegistry, COMP_QUOTE_VALIDITY_SECS,
+    quote_acceptance_hash, BuyerKeyRegistry, CompMarketplace, InMemoryBuyerKeyRegistry,
+    COMP_QUOTE_VALIDITY_SECS,
 };
 pub use olp_bridge::{OlpBridgeClaims, OlpBridgeSigner, OLP_JWS_TYP};
 pub use router::comp_router;

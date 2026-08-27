@@ -20,9 +20,15 @@ fn cache_reserve_degradation_has_a_typed_emitted_decision() {
         .expect("cache reserve health transitions need a typed decision event");
 
     assert_eq!(event.as_label(), "cache.reserve.health");
+    // `has_emitter` reads the same hand-maintained coverage table this
+    // change wrote, so it proves the arm is `Emitted`, not that an
+    // emitter runs. It stays green if the emitter is deleted. The
+    // production emitter is `CacheReserveHealthState::observe_transition`
+    // in `sbproxy-core/src/pipeline.rs`, driven by `ObservedCacheReserve`
+    // on every reserve operation and covered by that crate's own tests.
     assert!(
         event.has_emitter(),
-        "the typed event must have a production transition emitter"
+        "the coverage table must classify this event as one that publishes its own records"
     );
 }
 

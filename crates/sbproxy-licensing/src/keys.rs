@@ -169,6 +169,16 @@ impl KeyManager {
     /// Retire a kid from the verifier map. The active key cannot be
     /// retired; rotate it via [`Self::set_active`] first.
     pub fn retire_kid(&self, kid: &str) -> Result<(), LicensingError> {
+        // Take the verifier write lock first and re-check `active`
+        // under it. Reading `active` and then acquiring this lock left
+        // a window where a concurrent `set_active` could promote the
+        // kid being retired, and the retire would then remove the
+        // active key from both the verifier map and the published
+        // JWKS while it kept signing.
+        let mut verifiers = self
+            .verifiers
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(active) = self
             .active
             .read()
@@ -181,10 +191,7 @@ impl KeyManager {
                 )));
             }
         }
-        self.verifiers
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(kid);
+        verifiers.remove(kid);
         Ok(())
     }
 

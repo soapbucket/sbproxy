@@ -13,11 +13,11 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use sbproxy_licensing::comp::{
-    comp_router, CompAcceptance, CompAuthorization, CompBuyer, CompEndpoints, CompManifest,
-    CompMarketplace, CompPaymentProof, CompPricing, CompPricingModel, CompPublisher,
-    CompQuoteRequest, CompQuoteResponse, CompRateCaps, CompRedeemRequest, CompRedeemResponse,
-    CompRequestedVolume, CompSignature, CompTier, InMemoryBuyerKeyRegistry, OlpBridgeSigner,
-    COMP_VERSION,
+    comp_router, quote_acceptance_hash, CompAcceptance, CompAuthorization, CompBuyer,
+    CompEndpoints, CompManifest, CompMarketplace, CompPaymentProof, CompPricing, CompPricingModel,
+    CompPublisher, CompQuoteRequest, CompQuoteResponse, CompRateCaps, CompRedeemRequest,
+    CompRedeemResponse, CompRequestedVolume, CompSignature, CompTier, InMemoryBuyerKeyRegistry,
+    OlpBridgeSigner, COMP_VERSION,
 };
 use sbproxy_licensing::keys::{KeyManager, MasterKey};
 use sbproxy_licensing::revocation::InMemoryRevocation;
@@ -189,6 +189,7 @@ async fn comp_redeem_token_is_accepted_by_the_oss_olp_verifier() {
     assert_eq!(quote_res.status(), StatusCode::OK);
     let quote_bytes = quote_res.into_body().collect().await.unwrap().to_bytes();
     let quote: CompQuoteResponse = serde_json::from_slice(&quote_bytes).unwrap();
+    let quote_for_hash = quote.clone();
 
     // Build a redeem and sign it with the buyer key.
     let mut redeem = CompRedeemRequest {
@@ -200,7 +201,9 @@ async fn comp_redeem_token_is_accepted_by_the_oss_olp_verifier() {
             value: String::new(),
         },
         buyer_acceptance: CompAcceptance {
-            accepted_quote_hash: "sha256:placeholder".into(),
+            // What a buyer holding the quote would compute. The redeem
+            // is bound to the quote by this value.
+            accepted_quote_hash: quote_acceptance_hash(&quote_for_hash).unwrap(),
             accepted_at: "2026-05-02T14:35:00Z".into(),
             buyer_legal_entity: "Acme AI Inc.".into(),
         },

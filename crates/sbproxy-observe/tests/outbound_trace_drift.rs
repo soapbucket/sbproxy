@@ -458,13 +458,6 @@ const EXEMPT: &[Exemption] = &[
                  triggered it. WOR-2318.",
     },
     Exemption {
-        file: "crates/sbproxy-mcp-gateway/src/authorize.rs",
-        reason: "The broker's `/authorize` leg, on the OAuth request path and not yet \
-                 plumbed. The broker is an axum router that can be mounted standalone, so \
-                 it has no sbproxy request context to read unless the mount point hands \
-                 one in. WOR-2318.",
-    },
-    Exemption {
         file: "crates/sbproxy-mcp-gateway/src/cimd.rs",
         reason: "Client Instance Metadata Document retrieval, on the OAuth request path \
                  and not yet plumbed. Same standalone-router constraint as the \
@@ -491,27 +484,18 @@ const EXEMPT: &[Exemption] = &[
     Exemption {
         file: "crates/sbproxy-mcp-gateway/src/lib.rs",
         reason: "Builds the broker runtime's shared client and sends nothing itself. The \
-                 sends are in the endpoint modules, each of which carries its own row \
-                 here. Listed so the construction stays visible. WOR-2318.",
-    },
-    Exemption {
-        file: "crates/sbproxy-mcp-gateway/src/resource_server.rs",
-        reason: "The resource-server verifier's JWKS fetch. Cached and refreshed behind \
-                 whichever protected MCP request happened to miss the cache, so the call \
-                 belongs to no one caller's trace even when a request triggered it. \
-                 WOR-2318.",
+                 sends are in the endpoint modules; since every one of them now takes its \
+                 client from `egress.rs` rather than building its own, only `egress.rs` \
+                 and this file carry a client marker, so the scanner no longer sees \
+                 `authorize.rs`, `token.rs`, or `resource_server.rs`. Their sends are \
+                 still on the OAuth request path and still unplumbed, for the same \
+                 standalone-router reason. WOR-2318.",
     },
     Exemption {
         file: "crates/sbproxy-mcp-gateway/src/revoke.rs",
         reason: "RFC 7009 revocation forwarded to the upstream authorization server, on \
                  the OAuth request path and not yet plumbed. Same standalone-router \
                  constraint as the `/authorize` leg. WOR-2318.",
-    },
-    Exemption {
-        file: "crates/sbproxy-mcp-gateway/src/token.rs",
-        reason: "The broker's `/token` leg, on the OAuth request path and not yet \
-                 plumbed. Same standalone-router constraint as the `/authorize` leg. \
-                 WOR-2318.",
     },
     Exemption {
         file: "crates/sbproxy-mcp-gateway/src/token_exchange.rs",

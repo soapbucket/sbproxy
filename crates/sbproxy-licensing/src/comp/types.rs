@@ -55,8 +55,15 @@ pub struct CompManifest {
     pub rsl_url: String,
     /// Manifest assembly timestamp (UTC, RFC 3339).
     pub generated_at: String,
-    /// SHA-256 of the canonical-JSON of the manifest with this field
-    /// cleared. Format `sha256:<base64-no-pad>`.
+    /// Integrity hash of the manifest, supplied by the operator.
+    ///
+    /// The intended value is the SHA-256 of the canonical JSON of this
+    /// manifest with the field cleared, in `sha256:<base64-no-pad>`
+    /// form. Nothing in this crate computes it and nothing verifies it:
+    /// it is carried through to the buyer as the operator wrote it, and
+    /// the shipped example carries a placeholder. Treat it as a value
+    /// an out-of-band process fills in, not as something a consumer can
+    /// check against this document.
     pub manifest_hash: String,
 }
 

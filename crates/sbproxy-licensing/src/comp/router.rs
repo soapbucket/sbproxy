@@ -62,6 +62,27 @@ async fn manifest(State(mp): State<Arc<CompMarketplace>>) -> Response {
     response
 }
 
+/// Make a caller-supplied string safe to put in a log line.
+///
+/// `tier_id`, `quote_id`, and the error text derived from them come
+/// out of a POST body on an unauthenticated endpoint. A newline in one
+/// of them forges a whole log line in any collector that reads
+/// newline-delimited records, which is how a fabricated "quoted"
+/// decision gets into an audit trail. Control characters go, and the
+/// value is capped so one request cannot write a megabyte into the log.
+fn log_safe(value: &str) -> String {
+    const MAX: usize = 200;
+    let mut out: String = value
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX)
+        .collect();
+    if value.chars().count() > MAX {
+        out.push_str("...");
+    }
+    out
+}
+
 async fn quote(
     State(mp): State<Arc<CompMarketplace>>,
     Json(req): Json<CompQuoteRequest>,
@@ -72,8 +93,8 @@ async fn quote(
             tracing::info!(
                 event = "comp_quote_decision",
                 outcome = "quoted",
-                tier_id = %tier_id,
-                quote_id = %resp.quote_id,
+                tier_id = %log_safe(&tier_id),
+                quote_id = %log_safe(&resp.quote_id),
                 amount_micros = resp.pricing.amount_micros,
                 "comp.quote.issued"
             );
@@ -100,8 +121,8 @@ async fn quote(
             tracing::info!(
                 event = "comp_quote_decision",
                 outcome = "rejected",
-                tier_id = %tier_id,
-                reason = %e,
+                tier_id = %log_safe(&tier_id),
+                reason = %log_safe(&e.to_string()),
                 "comp.quote.rejected"
             );
             metrics::record_quote("rejected");
@@ -120,7 +141,7 @@ async fn redeem(
             tracing::info!(
                 event = "comp_redeem_decision",
                 outcome = "minted",
-                quote_id = %quote_id,
+                quote_id = %log_safe(&quote_id),
                 license = %resp.license,
                 agent_id = %resp.agent_id,
                 "comp.redeem.minted"
@@ -137,8 +158,8 @@ async fn redeem(
             tracing::info!(
                 event = "comp_redeem_decision",
                 outcome = "rejected",
-                quote_id = %quote_id,
-                reason = %e,
+                quote_id = %log_safe(&quote_id),
+                reason = %log_safe(&e.to_string()),
                 "comp.redeem.rejected"
             );
             metrics::record_redeem("rejected");
@@ -161,17 +182,10 @@ fn map_error(err: LicensingError) -> Response {
         LicensingError::RevocationBackend(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "revocation_backend")
         }
-        LicensingError::Encode(msg) => {
-            // Encode-class errors with "unknown tier_id" context are
-            // 404; everything else is 500.
-            if msg.contains("unknown tier_id") {
-                (StatusCode::NOT_FOUND, "unknown_tier")
-            } else {
-                (StatusCode::INTERNAL_SERVER_ERROR, "encode_error")
-            }
-        }
+        LicensingError::UnknownTier(_) => (StatusCode::NOT_FOUND, "unknown_tier"),
+        LicensingError::Encode(_) => (StatusCode::INTERNAL_SERVER_ERROR, "encode_error"),
     };
-    tracing::warn!(error = %err, code = %code, status = %status.as_u16(), "comp.error");
+    tracing::warn!(error = %log_safe(&err.to_string()), code = %code, status = %status.as_u16(), "comp.error");
     error_response(status, code)
 }
 
