@@ -6541,9 +6541,14 @@ async fn handle_admin_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
     let method = parts.next().unwrap_or("GET");
     let path = parts.next().unwrap_or("/");
     if !path_is_exempt_from_rate_limit(path) && !rate_limiter.check(peer_ip) {
+        // A throttled caller is a concurrency refusal, the same 429
+        // `toolkit_error` maps `ToolkitError::Busy` onto. `Internal` is the
+        // one outcome in this closed vocabulary that means the gateway
+        // broke, so recording it here pages an operator for ordinary
+        // client throttling and buries a real fault in that noise.
         crate::admin_toolkit::record_boundary_outcome(
             path,
-            sbproxy_ai::ai_metrics::AiToolkitOutcome::Internal,
+            sbproxy_ai::ai_metrics::AiToolkitOutcome::Busy,
         );
         let _ = write_admin_response(
             sock,
@@ -7938,6 +7943,57 @@ mod tests {
         // asset traffic above did not quietly refill the same bucket.
         let still_blocked = get_through_rate_limiter("/admin/config", &limiter).await;
         assert!(still_blocked.starts_with("HTTP/1.1 429"));
+    }
+
+    // One toolkit capability/outcome cell of
+    // `sbproxy_ai_toolkit_operations_total`.
+    fn toolkit_operations_count(capability: &str, outcome: &str) -> f64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == "sbproxy_ai_toolkit_operations_total")
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter(|metric| {
+                        let matches = |name: &str, value: &str| {
+                            metric
+                                .get_label()
+                                .iter()
+                                .any(|label| label.name() == name && label.value() == value)
+                        };
+                        matches("capability", capability) && matches("outcome", outcome)
+                    })
+                    .map(|metric| metric.get_counter().value())
+                    .sum()
+            })
+            .unwrap_or_default()
+    }
+
+    /// An admin rate-limit 429 on a toolkit route is a concurrency refusal,
+    /// not a gateway fault. `internal` is the one outcome in that closed
+    /// vocabulary an operator alerts on for "the gateway broke", so a
+    /// script hammering the route must not page them.
+    #[tokio::test]
+    async fn admin_rate_limit_on_a_toolkit_route_records_busy_not_internal() {
+        let limiter = Arc::new(AdminRateLimiter::new(1));
+        let busy_before = toolkit_operations_count("workflow", "busy");
+        let internal_before = toolkit_operations_count("workflow", "internal");
+
+        // The first request spends the cap (and answers 401, unauthenticated).
+        let _ = get_through_rate_limiter("/admin/ai-toolkit/workflows/run", &limiter).await;
+        let blocked = get_through_rate_limiter("/admin/ai-toolkit/workflows/run", &limiter).await;
+
+        assert!(blocked.starts_with("HTTP/1.1 429"), "{blocked}");
+        assert!(
+            toolkit_operations_count("workflow", "busy") > busy_before,
+            "a throttled toolkit request is counted as busy"
+        );
+        assert_eq!(
+            toolkit_operations_count("workflow", "internal"),
+            internal_before,
+            "client throttling must not read as a gateway fault"
+        );
     }
 
     #[tokio::test]
