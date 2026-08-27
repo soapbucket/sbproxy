@@ -1,5 +1,5 @@
 # Intent detection and quality-based routing
-*Last modified: 2026-08-25*
+*Last modified: 2026-08-26*
 
 SBproxy can classify each AI prompt into a coarse intent and use prompt-aware
 classifier scores to choose among eligible providers. Both capabilities are
@@ -139,8 +139,14 @@ Live outcomes are visible in three places:
 - `sbproxy_ai_quality_routing_decisions_total{outcome="selected"|"hook_unavailable"|"target_ineligible"|"prompt_too_large"}`.
 - The "Quality Hook Routing Outcomes" Grafana panel and AI performance admin
   view.
-- Structured `ai.quality_routing.*` events and the `quality_hook:` reason on
-  the admin routing row.
+- The `quality_hook:` reason on the admin routing-decisions row, which is the
+  only per-request answer to "why did this one go where it went".
+
+There is no decision-audit record for a routing outcome, and no log line in a
+release binary. The `ai.quality_routing.*` tracing events exist, but they are
+`debug!`, and the release profile compiles those out
+(`release_max_level_info`), so a released proxy emits none of them. Alert on
+the counter; read the routing-decisions row for an individual request.
 
 `hook_unavailable` includes transport/deadline failures, incomplete provider
 contracts, malformed classifier responses, and the valid case where no score
