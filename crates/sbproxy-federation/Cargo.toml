@@ -35,11 +35,20 @@ async-trait = { workspace = true }
 reqwest = { workspace = true }
 http = { workspace = true }
 url = { workspace = true }
-# Hardened outbound client (WOR-170 timeout / redirect-cap /
-# connection-pool defaults) for the trust-chain composer's HTTP
-# fetches; federation endpoints are public per §9, so the looser
-# `default_outbound` policy applies rather than the token-bearing one.
+# Bounded outbound client builder (WOR-170 timeout / connection-pool
+# defaults) for the trust-chain composer's HTTP fetches. A federation
+# fetch carries no credential (the §9 endpoints are public), so the
+# client is built with `no_redirects` and pinned addresses rather than
+# a token-bearing policy; the redirect decision belongs to the governed
+# egress loop below, not to reqwest.
 sbproxy-httpkit = { workspace = true }
+# Governed egress: the unconditional private-address refusal and DNS pin
+# (`ssrf::validate_url_resolved`) plus the operator's per-purpose
+# allowlist and per-hop redirect re-authorization
+# (`governed_egress::GovernedEgress`). A federation peer URL arrives
+# signed by another entity, not from this operator's config, so it does
+# not get a bare client.
+sbproxy-security = { workspace = true }
 
 # Per-crate axum pin for the well-known + admin-status routes. Not
 # promoted to workspace.dependencies because sbproxy-mcp-gateway

@@ -271,6 +271,8 @@ pub struct CompiledEgressGates {
     pub model_artifacts: Option<sbproxy_security::egress::EgressAuthorizer>,
     /// Arms `EgressPurpose::TokenExchange` for the non-MCP resolver.
     pub token_exchange: Option<sbproxy_security::egress::EgressAuthorizer>,
+    /// Arms `EgressPurpose::Federation` for the OpenID Federation fetcher.
+    pub federation: Option<sbproxy_security::egress::EgressAuthorizer>,
     /// Arms `EgressPurpose::Telemetry` (WOR-2481).
     pub telemetry: Option<sbproxy_security::egress::EgressAuthorizer>,
 }

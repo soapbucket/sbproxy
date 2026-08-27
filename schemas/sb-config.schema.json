@@ -96,6 +96,7 @@
         "attestation": null,
         "tenants": [],
         "credentials": [],
+        "federation": null,
         "payments": null
       },
       "allOf": [
@@ -892,6 +893,18 @@
           "items": {
             "$ref": "#/definitions/CredentialBlock"
           }
+        },
+        "federation": {
+          "description": "OpenID Federation entity-statement serving for this proxy process. Absent, or present with `enabled: false`, leaves the well-known endpoint unmounted.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FederationConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "payments": {
           "description": "Durable payment settlement. When absent, the proxy keeps its existing non-settlement crawl-ledger behavior exactly. When present, a paid request reaches the origin only after its durable intent has committed `Succeeded`.\n\nThe block is always parsed, on every build, so `sbproxy validate` reads the same document everywhere. The consumer compares [`crate::payments::PaymentsConfig::required_features`] against its own compiled feature set and fails startup naming the missing feature, so a configured rail that was not compiled in never reaches a first request.",
@@ -7983,6 +7996,76 @@
       },
       "additionalProperties": false
     },
+    "FederationConfig": {
+      "description": "`proxy.federation`: the signing identity served by the normal proxy listener at `/.well-known/openid-federation`.",
+      "type": "object",
+      "required": [
+        "entity_id",
+        "published_jwks",
+        "signing_key"
+      ],
+      "properties": {
+        "enabled": {
+          "description": "Whether the process mounts the well-known entity-statement route.",
+          "default": false,
+          "type": "boolean"
+        },
+        "entity_id": {
+          "description": "Externally visible HTTPS entity identifier used for `iss` and `sub`.",
+          "type": "string"
+        },
+        "signing_key": {
+          "description": "Private signing-key location and JWS header selection.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/FederationSigningKeyConfig"
+            }
+          ]
+        },
+        "published_jwks": {
+          "description": "Public JWKS embedded in the signed entity statement."
+        },
+        "lifetime_secs": {
+          "description": "Lifetime of each generated entity statement.",
+          "default": 3600,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "refresh_margin_secs": {
+          "description": "Time before expiry at which the cached statement is regenerated.",
+          "default": 300,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "FederationSigningKeyConfig": {
+      "description": "Private-key reference and protected JWS header fields for federation entity-statement signing.",
+      "type": "object",
+      "required": [
+        "algorithm",
+        "kid",
+        "pem_file"
+      ],
+      "properties": {
+        "pem_file": {
+          "description": "PEM file read only when a runtime pipeline is constructed.",
+          "type": "string"
+        },
+        "algorithm": {
+          "description": "Asymmetric JWS algorithm name, such as `ES256`.",
+          "type": "string"
+        },
+        "kid": {
+          "description": "Key identifier stamped into the protected JWS header.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
     "PaymentsConfig": {
       "description": "`proxy.payments`: durable settlement for paid requests.\n\nAbsent means the proxy keeps its existing non-settlement ledger behaviour exactly. Present means a paid request reaches the origin only after a durable intent has committed `Succeeded`.",
       "type": "object",
@@ -12054,6 +12137,18 @@
         },
         "token_exchange": {
           "description": "Arms `EgressPurpose::TokenExchange`: every OAuth token-endpoint call this proxy makes, the non-MCP outbound credential resolver's and the MCP run-as-user token exchange's (`sbproxy_extension::mcp::auth`) alike. A per-server `egress:` block gates that server's upstream connects and OpenAPI tool calls and does not reach this purpose, so this sub-block is the only way to arm a token endpoint.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EgressPurposeConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "federation": {
+          "description": "Arms `EgressPurpose::Federation`: the OpenID Federation fetcher's entity-configuration and subordinate-statement GETs (`crates/sbproxy-federation`). Unlike every other sub-block here, omitting this one does not leave the purpose unguarded: the fetcher refuses a peer that resolves to a private, loopback, or link-local address whether or not an allowlist is armed, and it never follows a redirect it has not re-authorized. What this sub-block adds on top is the host, scheme, and port allowlist, so a federation peer outside the trust anchors an operator wrote down cannot be dialed at all.",
           "default": null,
           "anyOf": [
             {

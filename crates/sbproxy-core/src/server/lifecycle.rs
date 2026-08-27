@@ -5027,6 +5027,10 @@ fn arm_egress_gates_from_config(compiled: &sbproxy_config::CompiledConfig) {
         &[EgressPurpose::TokenExchange],
         compiled.egress.token_exchange.clone(),
     );
+    arm(
+        &[EgressPurpose::Federation],
+        compiled.egress.federation.clone(),
+    );
     // Rebuild the AI client immediately, in the same call, so `AiProvider`
     // is live before this function returns rather than depending on the
     // caller to remember a second call. Lives behind an `ArcSwap`, so
@@ -7328,6 +7332,9 @@ egress:
   token_exchange:
     mode: deny_by_default
     hosts: ["idp.internal"]
+  federation:
+    mode: deny_by_default
+    hosts: ["anchor.example"]
 "#;
         let compiled = sbproxy_config::compile_config(yaml).expect("config compiles");
         let armed: Vec<sbproxy_security::egress::EgressPurpose> = [
@@ -7337,6 +7344,7 @@ egress:
             compiled.egress.usage_sinks.as_ref(),
             compiled.egress.model_artifacts.as_ref(),
             compiled.egress.token_exchange.as_ref(),
+            compiled.egress.federation.as_ref(),
         ]
         .into_iter()
         .flatten()

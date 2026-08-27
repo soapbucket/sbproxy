@@ -1739,27 +1739,29 @@ stops being tracked while every already-tracked one keeps updating. Every
 wired egress purpose writes here: AI providers, the dual-LLM quarantine
 judge, agent endpoints invoked by AI toolkit workflows, stock classifier
 hooks, OpenAPI-backed MCP tools, token exchange, webhooks, usage sinks,
-model and engine artifact downloads, extension bundle hooks, and the OTLP
-telemetry exporters. `mcp_upstream` covers the base MCP connect for a
-plain `type: mcp` federated server, gated and DNS-pinned at the dial.
+model and engine artifact downloads, extension bundle hooks, OpenID
+Federation peer fetches, and the OTLP telemetry exporters.
+`mcp_upstream` covers the base MCP connect for a plain `type: mcp`
+federated server, gated and DNS-pinned at the dial.
 
-The thirteen purpose labels, exactly as they appear in
+The fourteen purpose labels, exactly as they appear in
 `endpoints[].purpose`, in `sbproxy_egress_refused_total{purpose}`, and in
 the `egress_refused` event, are `ai_provider`, `ai_judge`,
 `agent_orchestration`, `classifier_hook`, `mcp_upstream`, `openapi_tool`,
 `token_exchange`, `webhook`, `usage_sink`, `model_artifact`,
-`engine_artifact`, `bundle_hook`, and `telemetry`.
+`engine_artifact`, `bundle_hook`, `federation`, and `telemetry`.
 
 The top-level `egress:` section (see
-[Egress allowlists](configuration.md#egress-allowlists)) arms eight of
-the purposes above through seven sub-blocks: `ai_providers` (AI
+[Egress allowlists](configuration.md#egress-allowlists)) arms nine of
+the purposes above through eight sub-blocks: `ai_providers` (AI
 providers), `agent_orchestration` (agent endpoints invoked by configured
 AI toolkit workflows), `classifier_hooks` (stock intent and
 provider-quality classifier RPCs), `usage_sinks` (usage sinks and
 webhooks, one allowlist for both, including the `events:` webhook sink),
 `model_artifacts`, `token_exchange` (both the non-MCP
 outbound-credential resolver and the MCP run-as-user token exchange),
-and `telemetry`. Until a sub-block sets `mode: deny_by_default`, its
+`federation` (the OpenID Federation entity-configuration and
+subordinate-statement fetches), and `telemetry`. Until a sub-block sets `mode: deny_by_default`, its
 purpose stays `ungated`: reached, but nothing was ever denied because
 nothing was armed. `agent_orchestration` is the exception in the other
 direction: a configured agent fails closed unless that sub-block arms it
@@ -1781,20 +1783,25 @@ No purpose lets its HTTP client follow a redirect on its own. Each `3xx`
 fresh DNS pins; a chain longer than ten hops is refused with
 `too_many_redirects`.
 
-Two purposes go further and dial only the addresses that authorization
+Three purposes go further and dial only the addresses that authorization
 resolved, on the first request and on every hop after it: the
-`token_exchange` calls the MCP run-as-user exchange makes, and the
-`webhook` deliveries the `events:` sink makes. Those are the two whose
-request body is itself a credential. The others, `ai_provider`,
-`usage_sink`, and `model_artifact`, re-authorize each hop against the
-allowlist and then let the client resolve the host again at dial time,
-so the allowlist and the hop bound apply and the DNS pin does not yet.
+`token_exchange` calls the MCP run-as-user exchange makes, the
+`webhook` deliveries the `events:` sink makes, and every `federation`
+fetch. The first two are the ones whose request body is itself a
+credential. `federation` is pinned for a different reason: the peer URL
+arrives signed by another entity in the trust chain rather than from
+this operator's config, so it is also the one purpose that refuses a
+private, loopback, or link-local destination whether or not
+`egress.federation` is armed. The others, `ai_provider`, `usage_sink`,
+and `model_artifact`, re-authorize each hop against the allowlist and
+then let the client resolve the host again at dial time, so the
+allowlist and the hop bound apply and the DNS pin does not yet.
 
 Every hop shows up in this inventory under its own host, so a redirect
 chain is visible here as the several destinations it actually is rather
 than as the one URL an operator configured.
 
-On the two pinned purposes, a hop that changes scheme, host, or port
+On the pinned purposes, a hop that changes scheme, host, or port
 drops `Authorization`, `Proxy-Authorization`, `Cookie`, and any
 signature header before it is replayed. A request carrying a body does
 not make that hop at all: it is refused with

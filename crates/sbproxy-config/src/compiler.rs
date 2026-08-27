@@ -2741,6 +2741,11 @@ fn compile_egress_gates(cfg: Option<&EgressTopLevelConfig>) -> Result<CompiledEg
             cfg.token_exchange.as_ref(),
             "token_exchange",
         )?,
+        federation: compile_egress_purpose(
+            &[EgressPurpose::Federation],
+            cfg.federation.as_ref(),
+            "federation",
+        )?,
         telemetry: compile_egress_purpose(
             &[EgressPurpose::Telemetry],
             cfg.telemetry.as_ref(),

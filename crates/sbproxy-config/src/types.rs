@@ -495,6 +495,18 @@ pub struct EgressTopLevelConfig {
     /// only way to arm a token endpoint.
     #[serde(default)]
     pub token_exchange: Option<EgressPurposeConfig>,
+    /// Arms `EgressPurpose::Federation`: the OpenID Federation fetcher's
+    /// entity-configuration and subordinate-statement GETs
+    /// (`crates/sbproxy-federation`). Unlike every other sub-block here,
+    /// omitting this one does not leave the purpose unguarded: the
+    /// fetcher refuses a peer that resolves to a private, loopback, or
+    /// link-local address whether or not an allowlist is armed, and it
+    /// never follows a redirect it has not re-authorized. What this
+    /// sub-block adds on top is the host, scheme, and port allowlist, so
+    /// a federation peer outside the trust anchors an operator wrote
+    /// down cannot be dialed at all.
+    #[serde(default)]
+    pub federation: Option<EgressPurposeConfig>,
     /// Arms `EgressPurpose::Telemetry` (WOR-2481): the OTLP trace, metric,
     /// and log exporter endpoints. Authorized once at boot, where each
     /// exporter is constructed. A config reload re-verifies the

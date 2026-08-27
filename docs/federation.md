@@ -1,6 +1,6 @@
 # OpenID Federation
 
-*Last modified: 2026-08-22*
+*Last modified: 2026-08-27*
 
 [`sbproxy-federation`](../crates/sbproxy-federation) is a standalone
 crate implementing enough of
@@ -45,7 +45,8 @@ per-request token exchange makes sense.
   every `iss`/`sub` linkage, rejecting cycles, and enforcing a depth
   cap.
 - **The HTTP fetcher + chain composer**: `ReqwestFederationFetcher`
-  (HTTPS-only, hardened via `sbproxy-httpkit`'s outbound defaults) and
+  (HTTPS-only, governed egress, see
+  [Where the fetcher may dial](#where-the-fetcher-may-dial)) and
   `compose_trust_chain` walk a leaf's `authority_hints` up to a
   configured anchor and hand the assembled chain to the resolver.
 - **Trust marks** (§7): `sign_trust_mark` / `verify_trust_mark`
@@ -56,6 +57,44 @@ per-request token exchange makes sense.
   operators (`value`, `add`, `default`, `one_of`, `subset_of`,
   `superset_of`, `essential`) a superior can impose on a
   subordinate's published metadata.
+
+## Where the fetcher may dial
+
+A federation peer URL is not written by you. It arrives in an
+`authority_hints` array or a `federation_fetch_endpoint` metadata field
+signed by some other entity in the chain, and the fetcher is asked to GET
+it. So the fetch runs under the same governed egress machinery every other
+outbound call in this proxy uses, in two layers.
+
+The first layer is unconditional and has no configuration. Before any
+connect, the peer host is resolved and the fetch is refused outright if
+any answer is a loopback, RFC 1918, link-local, CGNAT, or otherwise
+special-use address. The dial is then pinned to exactly the addresses that
+check resolved, so a name that answers publicly at check time and privately
+at connect time is refused rather than followed. The refusal says
+`destination refused` and names no address, port, or reason: the peer URL
+can itself be the thing a probe is asking about.
+
+The second layer is the operator's allowlist, under the top-level
+`egress:` section:
+
+```yaml
+egress:
+  federation:
+    mode: deny_by_default
+    hosts: ["anchor.example", "intermediate.example"]
+```
+
+That arms the `federation` egress purpose: host, scheme, and port are
+checked against the list, every redirect hop is re-authorized against it
+before any second connect, the chain is bounded, and each refusal is
+counted on `sbproxy_egress_refused_total{purpose="federation"}`, logged,
+and stamped into `GET /api/egress`.
+
+What is left when you do not write that block: any *public* address is
+reachable. A federation deployment discovers its peers through the trust
+chain rather than listing them in advance, which is why the allowlist is
+opt-in rather than required. Write it once the anchors are known.
 
 ## Storage: in-memory only
 

@@ -361,6 +361,9 @@ egress:
     hosts: ["cloud.langfuse.com"]
   model_artifacts: { ... }
   token_exchange: { ... }
+  federation:
+    mode: deny_by_default
+    hosts: ["anchor.example", "intermediate.example"]
   telemetry:
     mode: deny_by_default
     hosts: ["otel-collector.internal"]
@@ -376,6 +379,7 @@ egress:
 | `usage_sinks` | `usage_sink`, `webhook` | Langfuse, Datadog, and object-store usage-sink deliveries (`usage_sink`), plus webhook usage-sink deliveries and the `events:` webhook sink (`webhook`, a separate purpose the same sub-block arms with one allowlist). |
 | `model_artifacts` | `model_artifact` | The model-host artifact fetcher's HTTP downloads. |
 | `token_exchange` | `token_exchange` | Every OAuth token-endpoint call this proxy makes: the non-MCP outbound-credential resolver's, and the MCP run-as-user token exchange's. A per-server `egress:` block gates that server's upstream connects and OpenAPI tool calls; it does not reach this purpose, so this sub-block is the only way to arm a token endpoint. |
+| `federation` | `federation` | The OpenID Federation fetcher's entity-configuration and subordinate-statement GETs. This is the one sub-block whose absence does not leave the purpose unguarded: a peer URL that resolves to a private, loopback, or link-local address is refused before any connect either way, and the dial is pinned to the addresses that check resolved. What the block adds is the host, scheme, and port allowlist, which is what stops a peer discovered through the chain from being dialed at all unless an operator named it. See [federation.md](federation.md). |
 | `telemetry` | `telemetry` | The OTLP trace, metric, and log exporter endpoints. Authorized once at boot, where each exporter is constructed; a denied endpoint refuses boot with a fatal error naming it. A config reload re-verifies the still-running trace and metric exporters against the new allowlist and refuses the reload, naming the endpoint, if either is now denied; the log exporter is rebuilt on every reload and re-authorizes itself then. |
 
 Each sub-block accepts `mode` (`deny_by_default` or `allow_by_default`,

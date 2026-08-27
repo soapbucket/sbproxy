@@ -155,7 +155,7 @@ Proof: `e2e/tests/redaction.rs::redaction_per_sink_fan_out`.
 
 ### 7. Egress is inventoried
 
-Every outbound destination the gateway reaches, across thirteen wired
+Every outbound destination the gateway reaches, across fourteen wired
 egress purposes, is recorded with its authorization status and last-seen
 time, readable from the admin API. The purposes, by their inventory and
 metric labels, are `ai_provider`, `ai_judge` (the dual-LLM quarantine
@@ -163,22 +163,28 @@ judge), `agent_orchestration` (agent endpoints invoked by configured AI
 toolkit workflows), `classifier_hook` (the stock intent and
 provider-quality RPCs), `mcp_upstream`, `openapi_tool`, `token_exchange`,
 `webhook`, `usage_sink`, `model_artifact`, `engine_artifact`,
-`bundle_hook`, and `telemetry`.
+`bundle_hook`, `federation` (OpenID Federation entity-configuration and
+subordinate-statement fetches), and `telemetry`.
 
-Config: the top-level `egress:` block arms eight of the thirteen through
-seven sub-blocks (`ai_providers`, `agent_orchestration` for AI toolkit
+Config: the top-level `egress:` block arms nine of the fourteen through
+eight sub-blocks (`ai_providers`, `agent_orchestration` for AI toolkit
 agent endpoints, `classifier_hooks` covers the stock intent and
 provider-quality RPCs, `usage_sinks` covers both usage sinks and webhooks
 including the `events:` sink, `model_artifacts`,
 `token_exchange` for every token endpoint, the non-MCP resolver's and
-the MCP run-as-user exchange's alike, `telemetry`), each
+the MCP run-as-user exchange's alike, `federation`, `telemetry`), each
 `mode: deny_by_default`. MCP upstream connects, OpenAPI-backed MCP tools,
 and the dual-LLM quarantine judge arm from a per-server or per-action
 `egress:` block instead. Extension bundle hooks are always armed
 automatically from the bundle's own outbound grant. Engine artifact
 downloads pass no authorizer today and cannot be armed by any config.
 `agent_orchestration` is the one purpose that fails closed: a configured
-agent refuses to dial at all until its sub-block arms it.
+agent refuses to dial at all until its sub-block arms it. `federation` is
+the one purpose with a floor under it: whether or not the sub-block is
+present, a peer URL that resolves to a private, loopback, or link-local
+address is refused before any connect, because a federation peer arrives
+signed by another entity in the chain rather than written by this
+operator.
 Signal: `GET /api/egress`,
 `sbproxy_egress_refused_total{purpose,reason,tenant,origin}`. Proof:
 `crates/sbproxy-security/src/egress.rs::egress_seen_records_a_single_sighting_with_counts`,
