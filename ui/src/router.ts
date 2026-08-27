@@ -1,3 +1,4 @@
+import { watch } from "vue";
 import { createMemoryHistory, createRouter, createWebHistory } from "vue-router";
 import { useAuth } from "./composables/useAuth";
 
@@ -216,4 +217,28 @@ router.beforeEach(async (to) => {
     return true;
   }
   return { name: "login", query: to.fullPath === "/" ? {} : { next: to.fullPath } };
+});
+
+// The other half of the same story: a session that lapses mid-use surfaces
+// as a 401 on whatever panel polled next, and the API client flips
+// `authenticated` false through `useAuth`'s unauthorized handler. The guard
+// above only runs on a navigation, so nothing moved. The operator was left
+// on the page they were reading with the chrome gone and every panel
+// reporting "Not authorized".
+//
+// Send them to the sign-in route, carrying the destination the way the
+// guard does, so signing back in returns them where they were. This is the
+// client-side half of WOR-2688: the server now answers the console's 401s
+// without `WWW-Authenticate`, so no browser dialog interrupts, and this
+// app's own login page is the only thing that asks for credentials.
+watch(useAuth().authenticated, (isAuthenticated) => {
+  if (isAuthenticated) return;
+  const current = router.currentRoute.value;
+  // Already there (a failed sign-in attempt, say): pushing again would be a
+  // duplicate navigation and would drop the `next` already in the query.
+  if (current.name === "login") return;
+  void router.push({
+    name: "login",
+    query: current.fullPath === "/" ? {} : { next: current.fullPath },
+  });
 });

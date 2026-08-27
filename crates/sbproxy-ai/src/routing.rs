@@ -1952,6 +1952,21 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    #[test]
+    fn provider_blocklist_overrides_allowlist() {
+        // A block entry always wins, including over an explicit allow
+        // of the same name. Every caller of this predicate (the
+        // selection paths, the shadow gate, the cascade's per-tier
+        // eligibility) inherits that precedence from here, which is
+        // why it is pinned beside the function rather than in one
+        // caller's test module.
+        let allowed = vec!["openai".to_string()];
+        let blocked = vec!["openai".to_string()];
+
+        assert!(!provider_allowed_by_policy("openai", &allowed, &blocked));
+        assert!(provider_allowed_by_policy("openai", &allowed, &[]));
+    }
+
     fn make_provider(
         name: &str,
         weight: u32,

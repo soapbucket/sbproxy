@@ -1,5 +1,5 @@
 # Policy engine
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-27*
 
 The policy engine evaluates a list of policies on every request. Each policy returns one of four verdicts: `Allow`, `Deny`, `AllowWithHeaders`, or `Confirm`. The dispatcher folds the per-policy results into a single decision and applies it before the request reaches the upstream.
 
@@ -163,7 +163,7 @@ The fail-closed contract is deliberate: a misconfigured or unreachable judge can
 
 ## NL-to-Cedar decision
 
-SBproxy does not offer NL-to-Cedar compilation or a compiled-policy store. The inactive components had no runtime consumer and were removed. `semantic_constraint` remains supported because it evaluates its configured judge directly. Reintroduce a compiler only with a concrete runtime consumer, evaluator or durable-store contract, and an explicit configuration lifecycle.
+SBproxy does not offer natural-language-to-Cedar compilation: nothing turns a prose rule into Cedar policy text, and the inactive NL components that once attempted it had no runtime consumer and were removed. That is a different thing from the Cedar engine itself, which does ship: an `mcp` action's `cedar_policies` block hands Cedar source to `sbproxy-extension`'s compiler, which turns it into a schema-validated policy set, and its evaluator maps verdicts onto allow, deny, and confirm on the built-in MCP `tools/call` hook. Write Cedar under `cedar_policies`; the gateway compiles and enforces it at config load. The engine's embedded policy store (redb, stateless by default) is in the tree but is not yet wired to that hook; policies come from the config block, and the store's console and CLI surfaces are tracked as separate work.
 
 ## request_validator
 
