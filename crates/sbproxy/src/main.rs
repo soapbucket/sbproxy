@@ -9170,7 +9170,34 @@ fn read_bounded_admin_json(
     if bytes.len() > maximum {
         anyhow::bail!("{surface} admin response exceeds the {maximum} byte limit");
     }
-    Ok(serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    Ok(serde_json::from_slice(&bytes).unwrap_or_else(|_| non_json_admin_body(&bytes)))
+}
+
+/// Stand in for an admin response body that arrived and was not JSON.
+///
+/// `Null` was indistinguishable from a JSON `null` and from no body at
+/// all, so a reverse proxy answering the admin listener with an HTML error
+/// page left the operator a bare status code. The marker keeps the shape
+/// `report_admin_refusal` reads (`code` and `error`) and carries a bounded,
+/// single-line excerpt so the answering party is identifiable.
+fn non_json_admin_body(bytes: &[u8]) -> serde_json::Value {
+    const MAX_EXCERPT_CHARS: usize = 120;
+    if bytes.is_empty() {
+        return serde_json::Value::Null;
+    }
+    let excerpt: String = String::from_utf8_lossy(bytes)
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX_EXCERPT_CHARS)
+        .collect();
+    serde_json::json!({
+        "code": "non_json_response",
+        "error": format!(
+            "{} byte response body was not JSON: {}",
+            bytes.len(),
+            excerpt.trim()
+        ),
+    })
 }
 
 /// Send one admin request, returning the status alongside the body.
@@ -16816,6 +16843,33 @@ origins:
                 "AI toolkit admin response exceeds the {} byte limit",
                 exact.len()
             )
+        );
+    }
+
+    /// An admin body that is present but not JSON has to stay
+    /// distinguishable from a JSON `null` and from no body at all, or a
+    /// reverse proxy's HTML error page leaves the operator a bare status
+    /// code with nothing naming who answered.
+    #[test]
+    fn bounded_admin_json_marks_a_non_json_body_rather_than_dropping_it() {
+        let html = b"<html><head><title>502 Bad Gateway</title></head></html>";
+        let value = read_bounded_admin_json(std::io::Cursor::new(html), html.len(), "AI toolkit")
+            .expect("a non-JSON body under the limit is still admitted");
+        assert_eq!(value["code"], "non_json_response");
+        let error = value["error"].as_str().expect("marker carries a reason");
+        assert!(error.contains("502 Bad Gateway"), "{error}");
+        assert!(error.contains(&html.len().to_string()), "{error}");
+
+        // A real JSON null, and an empty body, keep reading as Null.
+        assert_eq!(
+            read_bounded_admin_json(std::io::Cursor::new(b"null"), 8, "AI toolkit")
+                .expect("null is valid JSON"),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            read_bounded_admin_json(std::io::Cursor::new(b""), 8, "AI toolkit")
+                .expect("an empty body is not a discarded one"),
+            serde_json::Value::Null
         );
     }
 
