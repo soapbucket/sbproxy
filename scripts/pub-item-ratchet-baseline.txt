@@ -882,3 +882,15 @@ crate-external sites, and the scanner counts the ones inside `ssrf.rs`. It is
 public deliberately: it is the single place the workspace unwraps an
 IPv4-mapped IPv6 address, and a guard that writes its own range check has to
 be able to reach it or the mapped-address hole comes back.
+
+2026-08-27 (WOR-2690): unreferenced baseline 1462 -> 1461. Ground gained,
+not given. `pipeline::CompiledFallback` had only ever been named inside
+`pipeline.rs`; the AI client-disconnect work moved `fail_to_proxy`'s
+`on_error` condition into a named function that takes one, so the type is
+now referenced from `server/proxy_http.rs` and leaves the bucket.
+
+2026-08-27 (WOR-2661 infra cluster merged with main at 1216bebf): the two
+parents counted the unreferenced bucket from different absolute bases, 1508 on
+this branch and 1461 on main. The merged tree measures 1508, so the committed
+baseline is unchanged and main's one-item gain is already inside it. Tests-only
+holds at 323.

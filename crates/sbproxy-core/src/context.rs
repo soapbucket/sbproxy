@@ -844,6 +844,22 @@ pub struct RequestContext {
     pub path_params: Option<HashMap<String, String>>,
 
     // --- Fallback state ---
+    /// Set to true when the AI dispatcher abandoned an in-flight provider
+    /// call because the client's connection was gone (WOR-2690).
+    ///
+    /// Read by `fail_to_proxy` to decline the origin's `on_error`
+    /// fallback for that one case. The fallback exists to give a waiting
+    /// caller something rather than a 502, and there is no waiting caller
+    /// here; on an `ai_proxy` fallback, running it would dispatch a
+    /// second paid provider call for someone who has already left, handing
+    /// straight back the spend the cancellation saved.
+    ///
+    /// Deliberately a marker on the request rather than a test of the
+    /// error's `ErrorSource`. Pingora stamps `Downstream` on request
+    /// sanitization failures too (a malformed `Connection` header, say),
+    /// where the caller is alive and reading and its configured fallback
+    /// is exactly what it should get.
+    pub ai_upstream_cancelled_on_client_disconnect: bool,
     /// Set to true when the primary upstream failed (`on_error`) or
     /// answered with a listed bad status (`on_status`) and a fallback
     /// response was served instead. Both triggers write the fallback
@@ -1914,6 +1930,7 @@ impl RequestContext {
             rsl_inject_link_emitted: false,
             forward_rule_idx: None,
             path_params: None,
+            ai_upstream_cancelled_on_client_disconnect: false,
             fallback_triggered: false,
             csrf_cookie: None,
             replacement_request_body: None,
