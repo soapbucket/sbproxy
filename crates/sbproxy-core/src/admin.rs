@@ -4417,7 +4417,7 @@ impl ExportFormat {
 /// the column index a spreadsheet or a billing importer has already
 /// bound to. Unlike the JSONL shape, a CSV row is positional, so the
 /// order is part of the contract.
-const EXPORT_CSV_COLUMNS: [&str; 37] = [
+const EXPORT_CSV_COLUMNS: [&str; 39] = [
     "timestamp",
     "origin",
     "method",
@@ -8997,7 +8997,8 @@ mod tests {
         );
         for column in ["credential_source", "tokens_cached", "tokens_cache_write"] {
             assert_eq!(
-                row[col(column)], "",
+                row[col(column)],
+                "",
                 "a non-AI row leaves {column} empty rather than dropping the field"
             );
         }

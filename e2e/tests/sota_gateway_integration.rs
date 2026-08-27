@@ -203,8 +203,7 @@ impl ScriptedUpstream {
                                 stalled.push(stream);
                             }
                             Reply::Sse(frames) => {
-                                let head =
-                                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                                let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
                                      Cache-Control: no-cache\r\nConnection: close\r\n\r\n";
                                 let _ = stream.write_all(head.as_bytes());
                                 for frame in frames {
@@ -264,6 +263,11 @@ impl Drop for ScriptedUpstream {
 /// Read one HTTP/1.1 request: request line, headers, `Content-Length`
 /// body. Enough for a stub, and deliberately no more.
 fn read_request(stream: &mut TcpStream) -> std::io::Result<SeenRequest> {
+    // The listener is non-blocking so the accept loop can poll its stop
+    // flag; the accepted stream must not be, or every read here returns
+    // `WouldBlock` before the request arrives. A read timeout also has
+    // no meaning on a non-blocking socket.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -1496,7 +1500,8 @@ fn a_stream_that_dies_after_the_first_byte_is_not_failed_over() {
 
     let dials = gateway.standard.seen().len() + gateway.standard_backup.seen().len();
     assert_eq!(
-        dials, 1,
+        dials,
+        1,
         "a committed stream was retried or moved: {} dial(s) on openai-standard and {} \
          on openai-standard-backup",
         gateway.standard.seen().len(),

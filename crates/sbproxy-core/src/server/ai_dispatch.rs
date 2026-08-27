@@ -21464,13 +21464,11 @@ origins:
             .owns_candidate_order(),
             "the arm that was missing"
         );
-        assert!(
-            !sbproxy_ai::routing::Router::new(
-                sbproxy_ai::routing::RoutingStrategy::RoundRobin,
-                2
-            )
-            .owns_candidate_order()
-        );
+        assert!(!sbproxy_ai::routing::Router::new(
+            sbproxy_ai::routing::RoutingStrategy::RoundRobin,
+            2
+        )
+        .owns_candidate_order());
     }
 
     /// WOR-2652: the security regression test.
