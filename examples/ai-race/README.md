@@ -1,8 +1,8 @@
 # AI race routing
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-27*
 
-Race strategy fans out the request to every eligible provider in parallel, returns the first 2xx response, and cancels the losers. Trade-off: race minimises p99 latency by always taking the fastest provider for any given request; the cost is N times the API spend (one paid completion per provider per request). The config below pairs it with `resilience.outlier_detection` so persistently failing providers fall out of the eligible set instead of being dialed forever: every leg that settles feeds the circuit breaker, the outlier detector, and the per-error-class cooldown policy, so a provider that loses every race by failing is ejected and the fan-out shrinks.
+Race strategy fans out the request to every eligible provider in parallel, returns the first 2xx response, and cancels the losers. Trade-off: race minimizes p99 latency by always taking the fastest provider for any given request; the cost is N times the API spend (one paid completion per provider per request). The config below pairs it with `resilience.outlier_detection` so persistently failing providers fall out of the eligible set instead of being dialed forever: every leg that settles feeds the circuit breaker, the outlier detector, and the per-error-class cooldown policy, so a provider that loses every race by failing is ejected and the fan-out shrinks.
 
 ## Run
 
@@ -48,15 +48,30 @@ curl -s http://127.0.0.1:8080/metrics | grep sbproxy_ai_provider
 # sbproxy_ai_provider_attempts_total{outcome="success",provider="openai"} 9
 ```
 
-Watch the ejection land. Point `groq` at an invalid key so it fails every
-attempt, then send a batch of requests past `min_requests: 5` at a 100%
-error rate against `threshold: 0.5`. An `"ai provider ejected by outlier
-detection"` line names `groq`, its attempt counter stops climbing, and the
-fan-out drops to the two providers still eligible. A `5xx` and a transport
-error both count as the provider's failure; a `4xx` counts as the caller's
-and does not eject, so a provider rate-limiting every request is parked by
-`resilience.cooldown_policy: { rate_limit: <seconds> }` rather than by the
-outlier detector.
+Watch the ejection land. The detector counts a `5xx` and a transport error
+as the provider's failure and a `4xx` as the caller's, so an invalid key is
+the wrong lever: the vendor answers `401`, the attempt counter climbs under
+`outcome="error"`, and the provider still reads as healthy. Point the `groq`
+entry at something that cannot answer at all instead. Add these two keys to
+it, temporarily:
+
+```yaml
+        - name: groq
+          base_url: http://127.0.0.1:9/v1
+          allow_private_base_url: true
+```
+
+Port 9 is the discard port and nothing is listening on it, so every `groq`
+leg ends in a refused connection, which is a transport error and a provider
+failure. Send a batch of requests past `min_requests: 5` at a 100% error rate
+against `threshold: 0.5`, and an `"ai provider ejected by outlier detection"`
+line names `groq`; its attempt counter stops climbing and the fan-out drops to
+the two providers still eligible. Remove the two keys afterwards.
+
+A provider rate-limiting every request never reaches the outlier detector for
+the same reason: `429` is a `4xx`. `resilience.cooldown_policy:
+{ rate_limit: <seconds> }` is the axis that parks that one, and the race path
+feeds it from the same settled leg.
 
 ## What this exercises
 
