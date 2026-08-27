@@ -773,3 +773,12 @@ under `-D warnings`, which is the #757 shape the 2026-08-25 entry above
 describes: an item whose only callers are cfg(test) code is dead code.
 They stay pub until the scorer calls them, and their contracts are
 pinned by in-file tests in the meantime.
+
+Deliberately not lowered to 1476, which is what the scan reads at the
+end of the fix round. The one item that left the bucket, `TargetCost`,
+left it because a comment in `sbproxy-ai/src/client.rs` names
+`TargetCost::delta_usd` while explaining why both vendors' cache
+spellings are read from one body. That is a comment naming the symbol,
+not a caller, so the item is exactly as unreferenced as it was; holding
+1476 would make deleting one comment line turn the gate red for no real
+regression. The number moves when a caller appears.

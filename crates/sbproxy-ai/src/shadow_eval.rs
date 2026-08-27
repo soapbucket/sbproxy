@@ -62,6 +62,24 @@ use serde::Serialize;
 /// sample whose edges it cannot see.
 const PAIR_LEDGER_CAPACITY: usize = 512;
 
+/// How long a slot stays in the ring before age alone removes it.
+///
+/// The widest window `GET /api/ai/shadow/report` serves is `30d`, so
+/// anything shorter would silently narrow that window; anything longer
+/// would hold slots no report can reach. A slot this old has no primary
+/// leg coming and no window that would show it, so dropping it is loss
+/// free, and it is what lets the ring actually drain on a route that
+/// has gone quiet rather than holding its last 512 slots for the life
+/// of the process.
+///
+/// Age eviction is not counted under
+/// [`TargetProvenance::evicted_before_primary`]. That field is the
+/// pressure signal, meaning the ring turned over faster than primaries
+/// completed; a slot that sat unpaired for thirty days is a different
+/// fact and folding the two together would make the error bar
+/// unreadable.
+const PAIR_LEDGER_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
 /// Upper bound on target legs recorded against one primary.
 ///
 /// `shadow.targets` is an operator-written list with no length limit of
@@ -275,26 +293,57 @@ struct PairSlot {
 #[derive(Default)]
 struct LedgerState {
     slots: std::collections::VecDeque<PairSlot>,
-    /// Per target, requests whose slot left the ring before their
-    /// primary leg arrived. Monotonic for the life of the process.
-    evicted_before_primary: BTreeMap<String, u64>,
+    /// Per target, requests whose slot left the ring under capacity
+    /// pressure before their primary leg arrived. Monotonic for the
+    /// life of the process.
+    evicted_before_primary: BTreeMap<String, EvictedTally>,
+}
+
+/// What the ring lost for one target, and at what sample rate.
+///
+/// The rate is carried because a target whose every slot was evicted
+/// still gets a row, and `provenance.sample_rate` is documented as the
+/// rate that was actually applied. Seeding that row from a default
+/// would publish `0.0`, which is a rate no operator configured.
+#[derive(Default, Clone, Copy)]
+struct EvictedTally {
+    count: u64,
+    sample_rate: f32,
 }
 
 /// Bounded ring of primary/shadow pairs, joined on the proxy's own
 /// per-request identifier.
-#[derive(Default)]
 pub struct ShadowPairLedger {
     state: Mutex<LedgerState>,
-    /// Set by [`ShadowPairLedger::open`], cleared when the ring drains.
+    /// How long a slot survives on age alone. Always
+    /// [`PAIR_LEDGER_RETENTION`] outside tests, which override it so a
+    /// test can reach the expiry path without sleeping.
+    retention: Duration,
+    /// Set by [`ShadowPairLedger::open`], cleared once every slot has
+    /// expired and the ring is empty.
     ///
     /// The primary leg is recorded from the end-of-request hook on
     /// every AI request that reached a provider, and a deployment with
     /// no `shadow:` block anywhere should not pay a mutex and a scan
-    /// for that. One relaxed load answers it. It is cleared again once
-    /// the ring is empty, so removing every `shadow:` block on a reload
-    /// stops costing the primary path a lock as soon as the last open
-    /// slot ages out, rather than for the life of the process.
+    /// for that. One relaxed load answers it.
+    ///
+    /// Clearing it is what makes a reload that removes the last
+    /// `shadow:` block eventually free again. It takes
+    /// [`PAIR_LEDGER_RETENTION`], because that is how long the ring is
+    /// obliged to hold a slot the widest report window could still ask
+    /// for, and it happens on the primary hook rather than on a timer,
+    /// so a process with no AI traffic at all pays nothing to reach it.
     armed: AtomicBool,
+}
+
+impl Default for ShadowPairLedger {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(LedgerState::default()),
+            retention: PAIR_LEDGER_RETENTION,
+            armed: AtomicBool::new(false),
+        }
+    }
 }
 
 /// Where the pairs in one target's row came from.
@@ -488,6 +537,7 @@ impl ShadowPairLedger {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
+        Self::drop_expired(&mut state, self.retention);
         if state.slots.iter().any(|slot| slot.pair_key == pair_key) {
             return;
         }
@@ -501,10 +551,16 @@ impl ShadowPairLedger {
                 // cannot see.
                 if evicted.primary.is_none() {
                     for leg in &evicted.legs {
-                        *state
+                        let tally = state
                             .evicted_before_primary
                             .entry(leg.target.clone())
-                            .or_default() += 1;
+                            .or_default();
+                        tally.count += 1;
+                        // The rate this target was last seen applying,
+                        // so a row seeded only from this tally reports
+                        // the rate that was actually applied rather
+                        // than a zero nobody configured.
+                        tally.sample_rate = leg.sample_rate;
                     }
                 }
             }
@@ -532,6 +588,25 @@ impl ShadowPairLedger {
         });
     }
 
+    /// Drop every slot older than `retention`, oldest first.
+    ///
+    /// The ring is ordered by `opened_at`, since `open` only ever
+    /// pushes to the back, so this stops at the first slot still inside
+    /// the window instead of walking all 512. Without it nothing ever
+    /// leaves the ring except under capacity pressure, which means a
+    /// route that has gone quiet holds its last slots forever and the
+    /// arming flag can never return to `false`.
+    fn drop_expired(state: &mut LedgerState, retention: Duration) {
+        let now = Instant::now();
+        while state
+            .slots
+            .front()
+            .is_some_and(|slot| now.duration_since(slot.opened_at) > retention)
+        {
+            state.slots.pop_front();
+        }
+    }
+
     /// Record the primary half. Ignored unless the request armed a slot.
     pub fn record_primary(&self, pair_key: &str, leg: PrimaryLeg) {
         if !self.armed.load(Ordering::Relaxed) {
@@ -546,11 +621,18 @@ impl ShadowPairLedger {
             .find(|slot| slot.pair_key == pair_key)
         {
             slot.primary = Some(leg);
-        } else if state.slots.is_empty() {
-            // Every slot has aged out and nothing has opened a new one,
+            return;
+        }
+        // No slot for this request. Take the chance to age the ring
+        // out: this hook is the one thing that runs on every AI request
+        // whether or not a `shadow:` block is still configured.
+        Self::drop_expired(&mut state, self.retention);
+        if state.slots.is_empty() {
+            // Every slot has expired and nothing has opened a new one,
             // which is what a reload that removed the last `shadow:`
-            // block looks like from here. Disarm under the lock, so an
-            // `open` that is mid-flight cannot have its arming undone.
+            // block looks like from here once the retention window has
+            // passed. Disarm under the lock, so an `open` that is mid
+            // flight cannot have its arming undone.
             self.armed.store(false, Ordering::Relaxed);
         }
     }
@@ -611,11 +693,10 @@ impl ShadowPairLedger {
         // Seed from the eviction tally first, so a target whose every
         // slot was evicted still gets a row saying so instead of
         // vanishing from the report along with its evidence.
-        for (target, count) in &state.evicted_before_primary {
-            folded
-                .entry(target.clone())
-                .or_default()
-                .evicted_before_primary = *count;
+        for (target, tally) in &state.evicted_before_primary {
+            let fold = folded.entry(target.clone()).or_default();
+            fold.evicted_before_primary = tally.count;
+            fold.sample_rate = tally.sample_rate;
         }
         for slot in state.slots.iter() {
             if now.duration_since(slot.opened_at) > window {
@@ -679,6 +760,19 @@ impl ShadowPairLedger {
                 fold.finish(target, agreement)
             })
             .collect()
+    }
+
+    /// A ledger whose slots expire after `retention`.
+    ///
+    /// Test-only. The production retention is thirty days, which no
+    /// test can wait out, and faking `Instant` to reach the expiry path
+    /// would test a clock rather than the ledger.
+    #[cfg(test)]
+    fn with_retention(retention: Duration) -> Self {
+        Self {
+            retention,
+            ..Self::default()
+        }
     }
 
     /// Drop every slot. Test-only affordance so one test's pairs cannot
@@ -1110,6 +1204,11 @@ mod tests {
             .expect("the evicted target still has a row");
         assert_eq!(ghost.provenance.requests_seen, 0);
         assert_eq!(ghost.provenance.evicted_before_primary, 1);
+        assert!(
+            (ghost.provenance.sample_rate - 1.0).abs() < 1e-6,
+            "an evictions-only row still reports the rate that was actually applied, \
+             not a zero nobody configured: {ghost:?}"
+        );
     }
 
     /// Retention is counted, so an operator can tell a window with
@@ -1291,21 +1390,56 @@ mod tests {
 
     /// The arming flag exists to keep the primary hook free on a
     /// deployment with no `shadow:` block. A reload that removes every
-    /// block should get that back, rather than paying a lock forever
-    /// because one slot was opened once.
+    /// block has to get that back, and it has to get it back through a
+    /// path production can take: nothing removes a slot except capacity
+    /// pressure, which immediately replaces it, so without age eviction
+    /// the ring never empties and the flag is one-way for the life of
+    /// the process.
     #[test]
-    fn a_drained_ledger_disarms_itself_again() {
-        let ledger = ShadowPairLedger::default();
+    fn an_expired_ledger_drains_and_disarms_itself_again() {
+        let ledger = ShadowPairLedger::with_retention(Duration::ZERO);
         ledger.open("req-drain", &legs(&["t"], 1.0));
         assert!(
             ledger.armed.load(Ordering::Relaxed),
             "an open arms the ledger"
         );
-        ledger.clear();
-        ledger.record_primary("req-after-drain", primary(0.01, 10));
+        assert_eq!(
+            ledger.report(Duration::from_secs(60), &no_judge).len(),
+            1,
+            "and the slot is reportable while it is there"
+        );
+
+        // The end-of-request hook for some later request that opened no
+        // slot of its own, which is exactly what an AI request on a
+        // route whose `shadow:` block was removed looks like.
+        ledger.record_primary("req-after-the-block-was-removed", primary(0.01, 10));
         assert!(
             !ledger.armed.load(Ordering::Relaxed),
-            "a primary hook that finds an empty ring disarms it again"
+            "an expired ring has to drain and disarm, or every AI request keeps \
+             paying a lock and a scan for a block nobody configured any more"
+        );
+        assert!(
+            ledger.report(Duration::from_secs(60), &no_judge).is_empty(),
+            "and the expired slot is gone rather than merely skipped"
+        );
+    }
+
+    /// The retention floor: a slot inside the window survives the same
+    /// hook, so draining cannot be mistaken for a ledger that discards
+    /// everything it is handed.
+    #[test]
+    fn a_slot_inside_the_retention_window_survives_the_primary_hook() {
+        let ledger = ShadowPairLedger::with_retention(Duration::from_secs(3600));
+        ledger.open("req-live", &legs(&["t"], 1.0));
+        ledger.record_primary("req-unrelated", primary(0.01, 10));
+        assert!(ledger.armed.load(Ordering::Relaxed));
+        ledger.record_primary("req-live", primary(0.02, 20));
+        ledger.record_shadow("req-live", "t", ran(0.01, 10, Some("stop")));
+        assert_eq!(
+            ledger.report(Duration::from_secs(60), &no_judge)[0]
+                .provenance
+                .pairs_retained,
+            1
         );
     }
 
