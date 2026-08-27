@@ -13781,9 +13781,31 @@ fn record_ai_admission_refusal(ctx: &RequestContext, surface: &str, reason: &'st
 /// never constructs one, so `ai.close` publishes nothing there even
 /// with `decision_audit` enabled. See `DecisionEvent::coverage`'s doc
 /// on the `AiClose` arm and `docs/events.md`.
+///
+/// `refusal_code` is the `ai_close` hook's refusal code when the hook
+/// blocked the close, and `None` for a clean one. It decides the
+/// outcome, the way [`record_guardrail_decision`] takes one: `Deny` for
+/// a refusal, `Allow` otherwise. `DecisionDetails` does not change
+/// shape for it, because `verdict` is contracted as the stream's
+/// terminal `finish_reason` (see `decision_contract`), and putting a
+/// second vocabulary in that field would break every rule selecting on
+/// it.
+///
+/// The code, never the hook's `message`. A code is bounded at decode to
+/// lowercase ASCII, digits, and `_-.` (`valid_event_code`), while the
+/// message is guest-authored prose that can quote the generation the
+/// hook just read; the message reaches the client's refusal body and
+/// nothing else. Same line `record_guardrail_decision` draws when it
+/// names a guardrail and carries positions rather than matched text.
+///
+/// A host-side fault (`ai_extension_failed` from a session that could
+/// not finish) records as a refusal too: the client gets the same
+/// refused close either way, and the code in the reason is what
+/// separates a hook's verdict from the host's own failure.
 fn record_ai_close_decision(
     ctx: Option<&RequestContext>,
     summary: &crate::ai_extensions::AiCloseSummary,
+    refusal_code: Option<&str>,
 ) {
     use sbproxy_observe::decision::{
         DecisionDetails, DecisionEngine, DecisionEvent, DecisionOutcome,
@@ -13791,6 +13813,11 @@ fn record_ai_close_decision(
 
     let Some(ctx) = ctx else {
         return;
+    };
+    let outcome = if refusal_code.is_some() {
+        DecisionOutcome::Deny
+    } else {
+        DecisionOutcome::Allow
     };
     let origin_id = ctx
         .origin_idx
@@ -13800,7 +13827,7 @@ fn record_ai_close_decision(
     sbproxy_observe::decision::record_decision(
         DecisionEvent::AiClose,
         DecisionEngine::BuiltIn,
-        DecisionOutcome::Allow,
+        outcome,
         origin_for_family,
         &ctx.tenant_id,
     );
@@ -13816,20 +13843,64 @@ fn record_ai_close_decision(
     ) {
         return;
     }
-    let reason = match summary.finish_reason.as_deref() {
-        Some(reason) => format!("stream closed (finish_reason={reason})"),
-        None => "stream closed (no finish_reason reported)".to_owned(),
+    let reason = match (refusal_code, summary.finish_reason.as_deref()) {
+        (Some(code), Some(finish)) => {
+            format!("stream close refused by an AI extension: {code} (finish_reason={finish})")
+        }
+        (Some(code), None) => format!("stream close refused by an AI extension: {code}"),
+        (None, Some(finish)) => format!("stream closed (finish_reason={finish})"),
+        (None, None) => "stream closed (no finish_reason reported)".to_owned(),
     };
     crate::policy_bus::emit_decision_audit_detailed(
         DecisionEvent::AiClose,
         DecisionEngine::BuiltIn,
-        DecisionOutcome::Allow,
+        outcome,
         &ctx.request_id,
         &origin_id,
         &origin_id,
         &ctx.tenant_id,
         &reason,
         DecisionDetails::ai_close(summary.finish_reason.as_deref()),
+    );
+}
+
+/// The one place both `relay_ai_stream` exit paths turn a finished
+/// close into its `ai.close` record (WOR-2689).
+///
+/// `close()` is idempotent across those two paths, but the decision
+/// record is not one of the things it idempotently guards, so the
+/// once-per-generation rule lives here rather than being written twice
+/// and drifting on one path. `already_closed` is the caller's read of
+/// [`crate::ai_extensions::AiRequestExtensions::is_closed`] from
+/// *before* it called `close()`, since `close()` flips that flag as its
+/// own first act.
+///
+/// `refusal` is the close's own `Err` and never a block another hook
+/// raised earlier in the same batch: a stream-event hook's refusal is
+/// `ai.stream.event`'s fact, and filing it here would attribute it to
+/// the wrong event. That is also why the tail-events call site keeps one
+/// condition of its own that this function cannot see: when an earlier
+/// hook in the batch blocked and the close itself was clean, it does not
+/// call here at all, because an `allow` record would claim a normal end
+/// the client never got.
+///
+/// Synchronous on purpose, like [`record_ai_close_decision`]. This sits
+/// on the AI request path, which runs at the Pingora worker's 2 MB
+/// stack limit, so it takes no future and adds no frame the compiler
+/// has to hold live across an await.
+fn record_ai_close_outcome(
+    ctx: Option<&RequestContext>,
+    extensions: &crate::ai_extensions::AiRequestExtensions,
+    already_closed: bool,
+    refusal: Option<&crate::ai_extensions::AiExtensionBlock>,
+) {
+    if already_closed {
+        return;
+    }
+    record_ai_close_decision(
+        ctx,
+        &extensions.close_summary(),
+        refusal.map(|block| block.code.as_str()),
     );
 }
 
@@ -17892,21 +17963,32 @@ pub(super) async fn relay_ai_stream(
                 }
                 if let Some(extensions) = ai_extensions.as_mut() {
                     let already_closed = extensions.is_closed();
-                    let decision = dispatch_ai_hub_events(
+                    let tail = dispatch_ai_hub_events(
                         extensions,
                         &tail_events,
                         &completed_tool_calls,
                         &mut close_released,
                     )
-                    .await
-                    .and(extensions.close().await);
-                    // WOR-2486: `close()` is idempotent across the two
-                    // exit paths this function has, but the decision
-                    // record is not one of the things it idempotently
-                    // guards, so this call site owns not double-firing.
-                    if decision.is_ok() && !already_closed {
-                        record_ai_close_decision(ctx.as_deref(), &extensions.close_summary());
+                    .await;
+                    // WOR-2689: awaited on its own line rather than
+                    // folded into the `and` below, so the record follows
+                    // the close's own verdict. A block from the tail
+                    // dispatch is `ai.stream.event`'s fact, so it never
+                    // becomes this record's refusal, and it does not let
+                    // a clean close claim the stream reached a normal
+                    // end either: that combination publishes nothing,
+                    // exactly as it did before. A close that refuses
+                    // still records, whatever the tail did.
+                    let closed = extensions.close().await;
+                    if closed.is_err() || tail.is_ok() {
+                        record_ai_close_outcome(
+                            ctx.as_deref(),
+                            extensions,
+                            already_closed,
+                            closed.as_ref().err(),
+                        );
                     }
+                    let decision = tail.and(closed);
                     if let Err(block) = decision {
                         warn!(
                             extension_code = %block.code,
@@ -18164,9 +18246,12 @@ pub(super) async fn relay_ai_stream(
     if let Some(extensions) = ai_extensions.as_mut() {
         let already_closed = extensions.is_closed();
         let close_result = extensions.close().await;
-        if close_result.is_ok() && !already_closed {
-            record_ai_close_decision(ctx.as_deref(), &extensions.close_summary());
-        }
+        record_ai_close_outcome(
+            ctx.as_deref(),
+            extensions,
+            already_closed,
+            close_result.as_ref().err(),
+        );
         if let Err(block) = close_result {
             warn!(
                 extension_code = %block.code,
@@ -21978,6 +22063,20 @@ origins:
         manifest: &str,
         javascript: &str,
     ) -> (TempDir, crate::pipeline::CompiledPipeline) {
+        let (directory, chain) = ai_chain_fixture(manifest, javascript);
+        let pipeline = crate::pipeline::CompiledPipeline {
+            ai_extension_chain: Arc::new(chain),
+            ..Default::default()
+        };
+        (directory, pipeline)
+    }
+
+    /// The bundle half of [`pipeline_with_ai_javascript`], for a test
+    /// that needs the chain on a pipeline compiled from real config
+    /// (origins, tenants, and `decision_audit` scoping) instead of on
+    /// `Default::default()`, which carries none of them and so publishes
+    /// no audit record at all.
+    fn ai_chain_fixture(manifest: &str, javascript: &str) -> (TempDir, AiExtensionChain) {
         let directory = TempDir::new().expect("extension fixture directory");
         let bundle = directory.path().join("fixture");
         std::fs::create_dir(&bundle).expect("create extension fixture");
@@ -21993,14 +22092,9 @@ origins:
             &BTreeSet::new(),
         )
         .expect("load extension fixture");
-        let pipeline = crate::pipeline::CompiledPipeline {
-            ai_extension_chain: Arc::new(
-                AiExtensionChain::from_registry(registry.as_ref())
-                    .expect("prepare AI extension chain"),
-            ),
-            ..Default::default()
-        };
-        (directory, pipeline)
+        let chain =
+            AiExtensionChain::from_registry(registry.as_ref()).expect("prepare AI extension chain");
+        (directory, chain)
     }
 
     struct DenyingBufferedPolicy;
@@ -26717,6 +26811,205 @@ origins:
         );
     }
 
+    /// The `ai_close` fixture chain, for the two close-verdict tests
+    /// below. One `ai_close` hook and nothing else, so the only hook
+    /// verdict either test can be reading is the close's own.
+    const AI_CLOSE_MANIFEST: &str = "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: close-verdict\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: ai_close\n    type: inspect_close\n    export: inspect\n";
+
+    /// A two-chunk SSE completion that ends `stop`, so the close
+    /// summary the record is built from carries a finish reason.
+    fn ai_close_upstream_stream() -> Vec<u8> {
+        concat!(
+            "data: {\"id\":\"chatcmpl-close\",\"object\":\"chat.completion.chunk\",",
+            "\"created\":1,\"model\":\"requested-model\",\"choices\":[{\"index\":0,",
+            "\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-close\",\"object\":\"chat.completion.chunk\",",
+            "\"created\":1,\"model\":\"requested-model\",\"choices\":[{\"index\":0,",
+            "\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .as_bytes()
+        .to_vec()
+    }
+
+    /// Compile the `ai.close` audit fixture and hang an AI extension
+    /// chain built from `javascript` off it.
+    fn ai_close_pipeline(
+        javascript: &str,
+    ) -> (TempDir, std::sync::Arc<crate::pipeline::CompiledPipeline>) {
+        let compiled = sbproxy_config::compile_config(
+            r#"
+proxy:
+  tenants:
+    - id: acme
+  observability:
+    log:
+      decision_audit:
+        enabled: false
+        events:
+          ai.close: true
+origins:
+  "ai.test":
+    tenant_id: acme
+    action:
+      type: static
+      body: ok
+"#,
+        )
+        .expect("ai.close fixture config");
+        let mut pipeline = crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+            .expect("ai.close fixture pipeline");
+        let (directory, chain) = ai_chain_fixture(AI_CLOSE_MANIFEST, javascript);
+        pipeline.ai_extension_chain = Arc::new(chain);
+        (directory, std::sync::Arc::new(pipeline))
+    }
+
+    /// Every `ai.close` record this request published.
+    fn ai_close_records(
+        rx: &mut crate::policy_bus::PolicyVerdictReceiver,
+        request_id: &str,
+    ) -> Vec<sbproxy_observe::decision::DecisionAudit> {
+        let mut ours = Vec::new();
+        while let Ok(record) = rx.try_recv() {
+            if let crate::policy_bus::AuditRecord::Decision(audit) = record {
+                if audit.request_id == request_id
+                    && audit.event == sbproxy_observe::decision::DecisionEvent::AiClose
+                {
+                    ours.push(*audit);
+                }
+            }
+        }
+        ours
+    }
+
+    /// WOR-2689: an `ai_close` hook that refuses the close has to reach
+    /// the decision feed.
+    ///
+    /// Red before the fix: both `relay_ai_stream` close sites published
+    /// only when `close()` returned `Ok`, so a refused close cut the
+    /// stream, wrote a warn line, and left the audit feed with nothing
+    /// at all, while `docs/extension-bundles.md` promises a record
+    /// either way. Driven through `handle_ai_proxy` rather than against
+    /// `record_ai_close_decision` directly, because the defect was in
+    /// the call sites' gating, which a direct call cannot see.
+    #[tokio::test]
+    async fn a_refused_stream_close_publishes_a_denied_ai_close_record() {
+        let (upstream_url, _hits) =
+            upstream_bytes_fixture(ai_close_upstream_stream(), "text/event-stream").await;
+        let (_directory, pipeline) = ai_close_pipeline(
+            r#"export function inspect() { return {version:"sbproxy-envelope/v1",decision:"block",status:409,code:"fixture_close_refused",message:"zebramarker close refusal"}; }"#,
+        );
+        let config = openai_proxy_config(&upstream_url);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        context.pipeline = std::sync::Arc::clone(&pipeline);
+        context.origin_idx = Some(0);
+        context.tenant_id = "acme".into();
+        context.request_id = "req-ai-close-block".into();
+
+        let (bus, mut rx) = crate::policy_bus::channel(32);
+        crate::policy_bus::init_global_bus(bus);
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            pipeline.as_ref(),
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("the refused close is handled");
+        drop(session);
+        let _ = live_downstream_body(client).await;
+
+        let ours = ai_close_records(&mut rx, "req-ai-close-block");
+        assert_eq!(
+            ours.len(),
+            1,
+            "a refused close publishes exactly one ai.close record"
+        );
+        let audit = &ours[0];
+        assert_eq!(
+            audit.outcome,
+            sbproxy_observe::decision::DecisionOutcome::Deny
+        );
+        assert_eq!(audit.origin, "ai.test");
+        assert_eq!(audit.tenant, "acme");
+        // The stream's own terminal reason still rides in `verdict`; the
+        // refusal is the record's outcome, not a second vocabulary in
+        // that field.
+        assert_eq!(audit.details.verdict.as_deref(), Some("stop"));
+        assert!(
+            audit.reason.as_str().contains("fixture_close_refused"),
+            "the hook's bounded code is what says which hook refused: {}",
+            audit.reason.as_str()
+        );
+        let rendered = audit.to_ocsf().to_string();
+        assert!(
+            !rendered.contains("zebramarker"),
+            "the hook's message is guest-authored prose that can quote the \
+             generation, so it must not reach the record: {rendered}"
+        );
+    }
+
+    /// The other half of the same promise: a clean close still records
+    /// `allow`, and still records exactly once.
+    #[tokio::test]
+    async fn a_clean_stream_close_publishes_an_allowed_ai_close_record() {
+        let (upstream_url, _hits) =
+            upstream_bytes_fixture(ai_close_upstream_stream(), "text/event-stream").await;
+        let (_directory, pipeline) = ai_close_pipeline(
+            r#"export function inspect() { return {version:"sbproxy-envelope/v1",decision:"release"}; }"#,
+        );
+        let config = openai_proxy_config(&upstream_url);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        context.pipeline = std::sync::Arc::clone(&pipeline);
+        context.origin_idx = Some(0);
+        context.tenant_id = "acme".into();
+        context.request_id = "req-ai-close-allow".into();
+
+        let (bus, mut rx) = crate::policy_bus::channel(32);
+        crate::policy_bus::init_global_bus(bus);
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            pipeline.as_ref(),
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("the clean close is handled");
+        drop(session);
+        let _ = live_downstream_body(client).await;
+
+        let ours = ai_close_records(&mut rx, "req-ai-close-allow");
+        assert_eq!(
+            ours.len(),
+            1,
+            "close() is idempotent across the relay's two exit paths, so one \
+             generation publishes one record"
+        );
+        assert_eq!(
+            ours[0].outcome,
+            sbproxy_observe::decision::DecisionOutcome::Allow
+        );
+        assert_eq!(ours[0].details.verdict.as_deref(), Some("stop"));
+    }
+
     /// The negative case: a request the shim admits with a lossiness
     /// note must publish no `ai.admission` record at all.
     ///
@@ -29645,6 +29938,7 @@ origins:
             &crate::ai_extensions::AiCloseSummary {
                 finish_reason: Some("tool_calls".to_string()),
             },
+            None,
         );
 
         let mut ours = None;
@@ -29703,6 +29997,7 @@ origins:
             &crate::ai_extensions::AiCloseSummary {
                 finish_reason: Some("stop".to_string()),
             },
+            None,
         );
 
         while let Ok(record) = rx.try_recv() {
