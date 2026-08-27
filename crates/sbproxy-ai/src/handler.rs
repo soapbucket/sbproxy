@@ -3718,6 +3718,78 @@ mod tests {
     }
 
     #[test]
+    /// WOR-2654: the cap has no default, and the refusal says why.
+    /// Red without it in the way that matters: a judge block that
+    /// parsed with no cap would bill an operator an amount nobody
+    /// chose.
+    #[test]
+    fn a_judge_without_a_spend_cap_is_refused() {
+        let error = shadow_config(serde_json::json!({
+            "targets": [{"provider": "anthropic"}],
+            "judge": {"provider": "judge-openai"}
+        }))
+        .expect_err("a judge with no cap is refused at config load")
+        .to_string();
+        assert!(error.contains("max_spend_usd"), "{error}");
+        assert!(error.contains("spend cap"), "{error}");
+    }
+
+    /// Zero is not a cap, it is judging turned off with extra steps,
+    /// and the message says which key to remove instead.
+    #[test]
+    fn a_judge_capped_at_zero_is_refused() {
+        let error = shadow_config(serde_json::json!({
+            "targets": [{"provider": "anthropic"}],
+            "judge": {"provider": "judge-openai", "max_spend_usd": 0}
+        }))
+        .expect_err("a zero cap is refused")
+        .to_string();
+        assert!(error.contains("positive number"), "{error}");
+        assert!(error.contains("remove the judge block"), "{error}");
+    }
+
+    /// The judge rides both spellings of the block. The flat form
+    /// deserializes straight into `AiShadowTarget`, whose
+    /// `deny_unknown_fields` would reject a sibling key it had not been
+    /// told to lift out first.
+    #[test]
+    fn a_judge_parses_beside_a_single_flat_target() {
+        let config = shadow_config(serde_json::json!({
+            "provider": "anthropic",
+            "sample_rate": 1.0,
+            "judge": {"provider": "judge-openai", "max_spend_usd": 2.5}
+        }))
+        .expect("a judge beside the flat form parses");
+        let shadow = config.shadow.expect("shadow block");
+        assert_eq!(shadow.targets.len(), 1);
+        let judge = shadow.judge.expect("judge block");
+        assert_eq!(judge.provider, "judge-openai");
+        assert!((judge.max_spend_usd - 2.5).abs() < f64::EPSILON);
+        assert_eq!(
+            judge.spend_window,
+            crate::shadow_judge::JudgeSpendWindow::Daily,
+            "daily is the default window"
+        );
+        assert!(
+            judge.divergence_prefilter,
+            "the pre-filter is on unless an operator turns it off"
+        );
+    }
+
+    /// A judge naming no provider would fall back to whatever answered,
+    /// which is the model under evaluation grading its own homework.
+    #[test]
+    fn a_judge_with_a_blank_provider_is_refused() {
+        let error = shadow_config(serde_json::json!({
+            "targets": [{"provider": "anthropic"}],
+            "judge": {"provider": "  ", "max_spend_usd": 1.0}
+        }))
+        .expect_err("a blank judge provider is refused")
+        .to_string();
+        assert!(error.contains("providers[] entry"), "{error}");
+    }
+
+    #[test]
     fn an_unknown_shadow_target_key_is_refused() {
         let error = shadow_config(serde_json::json!({
             "targets": [{"provider": "anthropic", "sample_rare": 0.1}],
