@@ -19432,6 +19432,7 @@ mod external_guardrail_context_tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use super::cache_affinity_may_reorder;
     use crate::server::{ai_idempotency_body_is_wire, AI_IDEMPOTENCY_BODY_FORMAT_HEADER};
     use pingora_core::protocols::l4::stream::Stream;
     use pingora_proxy::Session;
