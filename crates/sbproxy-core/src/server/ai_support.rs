@@ -217,6 +217,15 @@ pub(super) fn extract_into(value: &serde_json::Value, out: &mut Vec<String>) {
                         }
                     } else if let Some(content) = obj.get("content") {
                         extract_into(content, out);
+                    } else if let Some(parts) = obj.get("parts") {
+                        // WOR-2622: Vertex / Gemini wrap their text in
+                        // `{"parts": [...], "role": "model"}`, on the
+                        // request side under `contents[]` and on the
+                        // stream side under `candidates[].content`.
+                        // Without this arm the object has no `text` and
+                        // no `content`, so a Gemini stream extracted to
+                        // nothing and a delivered answer priced at zero.
+                        extract_into(parts, out);
                     }
                 }
             }
@@ -651,10 +660,158 @@ fn truncate_utf8_with_marker(input: &str, max_bytes: usize) -> String {
         .into_owned()
 }
 
-#[derive(Default)]
-pub(super) struct AiTraceStreamContent {
+/// What a [`SseLineSplitter`] does with a line longer than its bound.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SseLineOverflow {
+    /// Hand the fragment on as though it were a complete line. The trace
+    /// accumulator wants this: an over-long frame is still content a
+    /// reader should see, truncated.
+    Flush,
+    /// Discard the fragment and every later byte of the same line. The
+    /// estimator wants this: a fragment is not parseable JSON, and
+    /// flushing it would leave the line's remainder to be read as a
+    /// fresh line, so one over-long frame used to cost the estimate two.
+    Drop,
+}
+
+/// Splits a raw SSE byte stream into complete lines.
+///
+/// Chunk boundaries on the wire fall wherever the transport put them, so
+/// both a line and a multi-byte character can straddle two chunks. This
+/// carries each across:
+///
+/// * a partial line waits in `carry` for the bytes that finish it;
+/// * a partial UTF-8 sequence waits in `pending`. Decoding each chunk on
+///   its own instead used to throw the whole chunk away when one
+///   character split, which on a CJK or emoji-heavy stream discarded
+///   every complete frame that chunk also carried.
+///
+/// Genuinely invalid bytes are skipped rather than replaced: a
+/// replacement character would be counted as delivered output by the
+/// estimator that reads these lines.
+struct SseLineSplitter {
+    /// Bytes of a partially received line, rejoined on the next feed.
     carry: String,
+    /// Trailing bytes of a multi-byte character split across chunks.
+    /// Never longer than three bytes once a feed returns.
+    pending: Vec<u8>,
+    /// Longest line handed on whole. Past this the `overflow` policy
+    /// decides, so neither `carry` nor a consumer's buffer grows with
+    /// the size of one provider frame.
+    line_max_bytes: usize,
+    /// What happens at `line_max_bytes`.
+    overflow: SseLineOverflow,
+    /// True while the remainder of an over-long line is being skipped.
+    dropping: bool,
+}
+
+impl SseLineSplitter {
+    /// A splitter bounded at `line_max_bytes` with the given overflow
+    /// policy.
+    fn new(line_max_bytes: usize, overflow: SseLineOverflow) -> Self {
+        Self {
+            carry: String::new(),
+            pending: Vec::new(),
+            line_max_bytes,
+            overflow,
+            dropping: false,
+        }
+    }
+
+    /// Decode `bytes`, rejoining a character split across chunks.
+    fn decode(&mut self, bytes: &[u8]) -> String {
+        self.pending.extend_from_slice(bytes);
+        let mut out = String::new();
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(text) => {
+                    out.push_str(text);
+                    self.pending.clear();
+                    return out;
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    out.push_str(std::str::from_utf8(&self.pending[..valid]).unwrap_or(""));
+                    match error.error_len() {
+                        // Real garbage: drop the offending bytes and
+                        // keep decoding what follows them.
+                        Some(len) => {
+                            self.pending.drain(..valid.saturating_add(len));
+                        }
+                        // A character the next chunk finishes.
+                        None => {
+                            self.pending.drain(..valid);
+                            return out;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Feed one raw chunk, calling `on_line` once per complete line with
+    /// its trailing newline trimmed.
+    fn feed(&mut self, bytes: &[u8], on_line: &mut dyn FnMut(&str)) {
+        if bytes.is_empty() {
+            return;
+        }
+        let text = self.decode(bytes);
+        if text.is_empty() {
+            return;
+        }
+        self.carry.push_str(&text);
+        while let Some(pos) = self.carry.find('\n') {
+            let line: String = self.carry.drain(..=pos).collect();
+            if self.dropping {
+                // The tail of a line already given up on.
+                self.dropping = false;
+                continue;
+            }
+            on_line(line.trim_end_matches(&['\r', '\n'][..]));
+        }
+        if self.carry.len() > self.line_max_bytes {
+            let line = std::mem::take(&mut self.carry);
+            match self.overflow {
+                SseLineOverflow::Flush => on_line(line.trim_end_matches(&['\r', '\n'][..])),
+                SseLineOverflow::Drop => self.dropping = true,
+            }
+        }
+    }
+
+    /// Hand over whatever line is still in hand at stream close.
+    fn finish(&mut self, on_line: &mut dyn FnMut(&str)) {
+        self.pending.clear();
+        if self.dropping {
+            self.carry.clear();
+            self.dropping = false;
+            return;
+        }
+        if !self.carry.trim().is_empty() {
+            let line = std::mem::take(&mut self.carry);
+            on_line(line.trim_end_matches(&['\r', '\n'][..]));
+        }
+    }
+
+    /// Forget any partial state. Used when the consumer stops caring.
+    fn clear(&mut self) {
+        self.carry.clear();
+        self.pending.clear();
+        self.dropping = false;
+    }
+}
+
+pub(super) struct AiTraceStreamContent {
+    lines: SseLineSplitter,
     content: BoundedTraceContent,
+}
+
+impl Default for AiTraceStreamContent {
+    fn default() -> Self {
+        Self {
+            lines: SseLineSplitter::new(AI_TRACE_STREAM_LINE_MAX_BYTES, SseLineOverflow::Flush),
+            content: BoundedTraceContent::default(),
+        }
+    }
 }
 
 impl AiTraceStreamContent {
@@ -662,52 +819,62 @@ impl AiTraceStreamContent {
         if self.content.is_full() || bytes.is_empty() {
             return;
         }
-        let Ok(text) = std::str::from_utf8(bytes) else {
-            return;
-        };
-        self.carry.push_str(text);
-        while let Some(pos) = self.carry.find('\n') {
-            let line: String = self.carry.drain(..=pos).collect();
-            self.process_line(line.trim_end_matches(&['\r', '\n'][..]));
-            if self.content.is_full() {
-                self.carry.clear();
-                return;
+        let Self { lines, content } = self;
+        lines.feed(bytes, &mut |line| {
+            if !content.is_full() {
+                append_trace_line(content, line);
             }
-        }
-        if self.carry.len() > AI_TRACE_STREAM_LINE_MAX_BYTES {
-            let line = std::mem::take(&mut self.carry);
-            self.process_line(line.trim_end_matches(&['\r', '\n'][..]));
+        });
+        if self.content.is_full() {
+            self.lines.clear();
         }
     }
 
     pub(super) fn finish(mut self) -> String {
-        if !self.carry.trim().is_empty() {
-            let line = std::mem::take(&mut self.carry);
-            self.process_line(line.trim_end_matches(&['\r', '\n'][..]));
-        }
+        let Self { lines, content } = &mut self;
+        lines.finish(&mut |line| {
+            if !content.is_full() {
+                append_trace_line(content, line);
+            }
+        });
         self.content.finish()
     }
+}
 
-    fn process_line(&mut self, line: &str) {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with(':') || line.starts_with("event:") {
-            return;
-        }
-        let payload = line
-            .strip_prefix("data:")
-            .map(str::trim_start)
-            .unwrap_or(line);
-        if payload == "[DONE]" {
-            return;
-        }
-        let text = match serde_json::from_str::<serde_json::Value>(payload) {
-            Ok(value) => extract_stream_delta_text(&value),
-            Err(_) => payload.to_string(),
-        };
-        if !text.trim().is_empty() {
-            self.content.push_str(&text);
-        }
+/// Draw the assistant text out of one SSE line and append it to the
+/// bounded trace buffer.
+///
+/// Diverges from the estimator's line handler on one point, which is why
+/// the two are not one function: a line that is not JSON is kept
+/// verbatim here (a provider control frame is content a reader wants)
+/// and dropped there (counting a control frame's bytes as generated
+/// output would inflate the bill).
+fn append_trace_line(content: &mut BoundedTraceContent, line: &str) {
+    let Some(payload) = sse_line_payload(line) else {
+        return;
+    };
+    let text = match serde_json::from_str::<serde_json::Value>(payload) {
+        Ok(value) => extract_stream_delta_text(&value),
+        Err(_) => payload.to_string(),
+    };
+    if !text.trim().is_empty() {
+        content.push_str(&text);
     }
+}
+
+/// The data payload of an SSE line, or `None` for a line that carries no
+/// payload at all (blank, comment, `event:` name, or the `[DONE]`
+/// sentinel).
+fn sse_line_payload(line: &str) -> Option<&str> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with(':') || line.starts_with("event:") {
+        return None;
+    }
+    let payload = line
+        .strip_prefix("data:")
+        .map(str::trim_start)
+        .unwrap_or(line);
+    (payload != "[DONE]").then_some(payload)
 }
 
 /// How much streamed assistant text is kept verbatim for the tokenizer
@@ -715,6 +882,18 @@ impl AiTraceStreamContent {
 /// sample's token density over the rest, so a multi-megabyte generation
 /// costs one fixed buffer rather than a copy of the whole answer.
 const STREAM_ESTIMATE_SAMPLE_MAX_BYTES: usize = 32 * 1024;
+
+/// Longest single SSE frame the estimator will parse, and therefore the
+/// documented bound on its per-frame CPU and memory.
+///
+/// Deliberately far above the trace accumulator's own bound: a frame
+/// carrying a long tool-call argument block or a reasoning turn is
+/// routinely tens of kilobytes, and at 16 KiB those frames were handed
+/// to the JSON parser in fragments, failed to parse, and were dropped
+/// from the estimate entirely. A megabyte is past any frame the
+/// documented providers emit, and one frame larger than this is skipped
+/// (with the rest of the stream still counted) rather than buffered.
+const STREAM_ESTIMATE_LINE_MAX_BYTES: usize = 1024 * 1024;
 
 /// WOR-2622: the assistant text a stream actually delivered, kept so the
 /// stream finalizer can price a response whose provider never sent a
@@ -732,13 +911,23 @@ const STREAM_ESTIMATE_SAMPLE_MAX_BYTES: usize = 32 * 1024;
 /// [`Self::estimate_completion_tokens`] does the counting once, at
 /// stream close.
 ///
+/// Every wire shape the `usage_parser` table documents is covered:
+/// OpenAI `choices[].delta`, Anthropic `content_block_delta`, Vertex /
+/// Gemini `candidates[].content.parts[]`, Bedrock's base64 `bytes`
+/// envelope, Cohere `text`, and Ollama `message.content`.
+///
+/// Bounded on both axes and neither bound depends on the response size:
+/// at most [`STREAM_ESTIMATE_SAMPLE_MAX_BYTES`] of text is retained, at
+/// most [`STREAM_ESTIMATE_LINE_MAX_BYTES`] of one frame is buffered, and
+/// the tokenizer runs once, over the sample, at close.
+///
 /// The estimate is deliberately coarse. It exists so that work a
 /// provider really performed cannot be billed at zero purely because a
 /// usage frame never arrived, not to compete with the provider's own
 /// count; a stream that produced a real usage frame never reaches it.
 pub(super) struct StreamOutputEstimator {
-    /// Bytes of a partially received SSE line, rejoined on the next feed.
-    carry: String,
+    /// Splits the raw chunks into frames.
+    lines: SseLineSplitter,
     /// The leading `STREAM_ESTIMATE_SAMPLE_MAX_BYTES` of assistant text.
     sample: String,
     /// Every byte of assistant text seen, sample and overflow alike.
@@ -749,35 +938,24 @@ impl StreamOutputEstimator {
     /// Start an estimator for one stream.
     pub(super) fn new() -> Self {
         Self {
-            carry: String::new(),
+            lines: SseLineSplitter::new(STREAM_ESTIMATE_LINE_MAX_BYTES, SseLineOverflow::Drop),
             sample: String::new(),
             text_bytes: 0,
         }
     }
 
     /// Feed one raw upstream chunk. Chunk boundaries are arbitrary, so
-    /// the estimator rejoins partial lines the same way the usage
-    /// parsers and the trace accumulator do.
+    /// the estimator rejoins partial lines and partial characters the
+    /// same way the usage parsers and the trace accumulator do.
     pub(super) fn feed(&mut self, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        let Ok(text) = std::str::from_utf8(bytes) else {
-            // A chunk that splits a multi-byte character is skipped
-            // rather than lossily decoded: an estimate is allowed to
-            // undercount a fragment, and a replacement character would
-            // otherwise be counted as delivered output.
-            return;
-        };
-        self.carry.push_str(text);
-        while let Some(pos) = self.carry.find('\n') {
-            let line: String = self.carry.drain(..=pos).collect();
-            self.process_line(line.trim_end_matches(&['\r', '\n'][..]));
-        }
-        if self.carry.len() > AI_TRACE_STREAM_LINE_MAX_BYTES {
-            let line = std::mem::take(&mut self.carry);
-            self.process_line(line.trim_end_matches(&['\r', '\n'][..]));
-        }
+        let Self {
+            lines,
+            sample,
+            text_bytes,
+        } = self;
+        lines.feed(bytes, &mut |line| {
+            accumulate_estimate_line(sample, text_bytes, line);
+        });
     }
 
     /// Tokens the received assistant text is worth under `model`.
@@ -785,14 +963,23 @@ impl StreamOutputEstimator {
     /// Flushes whatever line is still in hand, counts the sample with
     /// [`sbproxy_ai::estimate_tokens`] (the model's BPE when one is
     /// known, a byte-length heuristic otherwise), and scales that
-    /// density over any text past the sample bound. Returns 0 when the
-    /// stream delivered no assistant text at all, which is the caller's
-    /// signal that there is nothing to estimate from.
+    /// density over any text past the sample bound.
+    ///
+    /// Returns 0 when no assistant text could be drawn out of the
+    /// stream. That is not the same statement as "the stream delivered
+    /// nothing": a wire shape this extractor does not know, or a single
+    /// frame past [`STREAM_ESTIMATE_LINE_MAX_BYTES`], also counts zero.
+    /// The caller treats a zero as nothing to bill, so widening the
+    /// extractor is what keeps delivered work off that branch.
     pub(super) fn estimate_completion_tokens(&mut self, model: &str) -> u64 {
-        if !self.carry.trim().is_empty() {
-            let line = std::mem::take(&mut self.carry);
-            self.process_line(line.trim_end_matches(&['\r', '\n'][..]));
-        }
+        let Self {
+            lines,
+            sample,
+            text_bytes,
+        } = self;
+        lines.finish(&mut |line| {
+            accumulate_estimate_line(sample, text_bytes, line);
+        });
         if self.sample.is_empty() || self.text_bytes == 0 {
             return 0;
         }
@@ -806,50 +993,53 @@ impl StreamOutputEstimator {
             return sampled;
         }
         // Scale the sample's tokens-per-byte over the text the bound
-        // dropped. Saturating throughout: an overflow here would be a
-        // free generation, not a rounding error.
+        // dropped. Saturating throughout: the caller clamps the product
+        // into a `u32`, so an overflow here would bill the most
+        // expensive generation the type can express rather than wrap
+        // into a cheap one. Unreachable in practice (it needs a
+        // generation of roughly 2^64 bytes) and clamped rather than
+        // trusted for the same reason every other arithmetic on this
+        // path is.
         sampled
             .saturating_mul(self.text_bytes)
             .checked_div(sample_bytes)
             .unwrap_or(sampled)
     }
+}
 
-    fn process_line(&mut self, line: &str) {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with(':') || line.starts_with("event:") {
-            return;
-        }
-        let payload = line
-            .strip_prefix("data:")
-            .map(str::trim_start)
-            .unwrap_or(line);
-        if payload == "[DONE]" {
-            return;
-        }
-        // Only structured frames count. An unparseable line is a
-        // keep-alive, a provider-specific control frame, or a fragment,
-        // and counting its bytes as output would inflate the bill.
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
-            return;
-        };
-        let text = extract_stream_delta_text(&value);
-        if text.is_empty() {
-            return;
-        }
-        self.text_bytes = self.text_bytes.saturating_add(text.len() as u64);
-        let remaining = STREAM_ESTIMATE_SAMPLE_MAX_BYTES.saturating_sub(self.sample.len());
-        if remaining == 0 {
-            return;
-        }
-        let mut boundary = remaining.min(text.len());
-        while boundary > 0 && !text.is_char_boundary(boundary) {
-            boundary -= 1;
-        }
-        self.sample.push_str(&text[..boundary]);
+/// Count one SSE line's assistant text into the estimator's sample.
+///
+/// Kept as a free function so [`StreamOutputEstimator::feed`] can lend
+/// the splitter and the sample to the callback at the same time.
+fn accumulate_estimate_line(sample: &mut String, text_bytes: &mut u64, line: &str) {
+    let Some(payload) = sse_line_payload(line) else {
+        return;
+    };
+    // Only structured frames count. An unparseable line is a
+    // keep-alive, a provider-specific control frame, or a fragment,
+    // and counting its bytes as output would inflate the bill.
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return;
+    };
+    let text = extract_stream_delta_text(&value);
+    if text.is_empty() {
+        return;
     }
+    *text_bytes = text_bytes.saturating_add(text.len() as u64);
+    let remaining = STREAM_ESTIMATE_SAMPLE_MAX_BYTES.saturating_sub(sample.len());
+    if remaining == 0 {
+        return;
+    }
+    let mut boundary = remaining.min(text.len());
+    while boundary > 0 && !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    sample.push_str(&text[..boundary]);
 }
 
 fn extract_stream_delta_text(value: &serde_json::Value) -> String {
+    use base64::Engine as _;
+
     let mut parts = Vec::new();
 
     if let Some(choices) = value.get("choices").and_then(|v| v.as_array()) {
@@ -887,6 +1077,29 @@ fn extract_stream_delta_text(value: &serde_json::Value) -> String {
     ] {
         if let Some(v) = value.get(key) {
             extract_into(v, &mut parts);
+        }
+    }
+
+    // WOR-2622: Bedrock wraps every model-native chunk in
+    // `{"bytes": "<base64 of the inner JSON>"}`, the same envelope
+    // `sbproxy_ai::usage_parser::bedrock` opens to find the usage block,
+    // so the outer frame carries no text of its own. Opened after the
+    // arms above rather than instead of them: a frame that merely
+    // happens to carry a `bytes` field that is not a base64 JSON
+    // envelope is still read as itself.
+    if let Some(inner) = value
+        .get("bytes")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|encoded| {
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()
+        })
+        .and_then(|decoded| serde_json::from_slice::<serde_json::Value>(&decoded).ok())
+    {
+        let text = extract_stream_delta_text(&inner);
+        if !text.is_empty() {
+            parts.push(text);
         }
     }
 
@@ -5336,6 +5549,120 @@ mod stream_output_estimator_tests {
                 estimator.estimate_completion_tokens("gpt-4o-mini"),
                 expected,
                 "split at byte {split} changed the count"
+            );
+        }
+    }
+
+    /// Every wire shape the `usage_parser` table documents has to price
+    /// above zero, because the finalizer treats "no text found" and "no
+    /// text delivered" as the same thing and refunds both.
+    ///
+    /// One assertion per shape rather than one aggregate: Vertex and
+    /// Bedrock both extracted to nothing before WOR-2622's fix round,
+    /// and an aggregate over all six would have stayed green on the four
+    /// that worked.
+    #[test]
+    fn every_documented_wire_shape_prices_above_zero() {
+        let shapes: [(&str, &str); 5] = [
+            (
+                "openai",
+                r#"{"choices":[{"delta":{"content":"the quick brown fox jumps over"}}]}"#,
+            ),
+            (
+                "anthropic",
+                r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"the quick brown fox jumps over"}}"#,
+            ),
+            (
+                "vertex",
+                r#"{"candidates":[{"content":{"parts":[{"text":"the quick brown fox jumps over"}],"role":"model"}}]}"#,
+            ),
+            (
+                "cohere",
+                r#"{"event_type":"text-generation","text":"the quick brown fox jumps over"}"#,
+            ),
+            (
+                "ollama",
+                r#"{"message":{"role":"assistant","content":"the quick brown fox jumps over"}}"#,
+            ),
+        ];
+        for (name, frame) in shapes {
+            let mut estimator = StreamOutputEstimator::new();
+            estimator.feed(format!("data: {frame}\n\n").as_bytes());
+            assert!(
+                estimator.estimate_completion_tokens("gpt-4o-mini") > 0,
+                "{name}-shaped output priced at zero, so a delivered answer refunds in full"
+            );
+        }
+    }
+
+    /// Bedrock wraps the inner provider event in a base64 `bytes`
+    /// envelope, so the outer frame carries no text of its own.
+    #[test]
+    fn a_bedrock_envelope_is_decoded_before_counting() {
+        use base64::Engine as _;
+
+        let inner = r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"the quick brown fox jumps over"}}"#;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(inner);
+        let mut estimator = StreamOutputEstimator::new();
+        estimator.feed(format!("data: {{\"bytes\":\"{encoded}\"}}\n\n").as_bytes());
+        assert!(
+            estimator.estimate_completion_tokens("gpt-4o-mini") > 0,
+            "a Bedrock stream priced at zero because its envelope was never opened"
+        );
+
+        // A frame that merely happens to carry a `bytes` field that is
+        // not a base64 JSON envelope is read as itself, not dropped.
+        let mut estimator = StreamOutputEstimator::new();
+        estimator.feed(
+            br#"data: {"bytes":"not base64 json","choices":[{"delta":{"content":"hello there"}}]}
+"#,
+        );
+        assert!(
+            estimator.estimate_completion_tokens("gpt-4o-mini") > 0,
+            "a non-envelope frame with a bytes field still counts its own text"
+        );
+    }
+
+    /// A frame larger than the trace accumulator's 16 KiB line bound
+    /// used to be handed to the JSON parser in fragments and dropped
+    /// whole. A long tool argument or reasoning block is routinely that
+    /// size.
+    #[test]
+    fn a_frame_past_the_trace_line_bound_is_still_counted() {
+        let long: String = "lorem ipsum dolor sit amet ".repeat(2000);
+        assert!(long.len() > 32 * 1024, "fixture has to exceed 16 KiB");
+        let mut estimator = StreamOutputEstimator::new();
+        estimator.feed(
+            format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{long}\"}}}}]}}\n\n")
+                .as_bytes(),
+        );
+        assert!(
+            estimator.estimate_completion_tokens("gpt-4o-mini") > 1000,
+            "a frame past the old 16 KiB line bound priced at zero"
+        );
+    }
+
+    /// reqwest yields TLS-record-sized chunks, so a multi-byte character
+    /// straddles a chunk boundary on any CJK or emoji-heavy stream. The
+    /// earlier decoder rejected the whole chunk when that happened,
+    /// losing complete frames it had already received.
+    #[test]
+    fn a_multibyte_character_split_across_chunks_is_not_lost() {
+        let frame = "data: {\"choices\":[{\"delta\":{\"content\":\"\u{4f60}\u{597d}\u{4e16}\u{754c}\u{ff0c}\u{8fd9}\u{662f}\u{4e00}\u{4e2a}\u{6d4b}\u{8bd5}\"}}]}\n\n";
+        let bytes = frame.as_bytes();
+        let mut whole = StreamOutputEstimator::new();
+        whole.feed(bytes);
+        let expected = whole.estimate_completion_tokens("gpt-4o-mini");
+        assert!(expected > 0, "the fixture frame has to carry real text");
+
+        for split in 1..bytes.len() {
+            let mut estimator = StreamOutputEstimator::new();
+            estimator.feed(&bytes[..split]);
+            estimator.feed(&bytes[split..]);
+            assert_eq!(
+                estimator.estimate_completion_tokens("gpt-4o-mini"),
+                expected,
+                "split at byte {split} lost the frame"
             );
         }
     }
