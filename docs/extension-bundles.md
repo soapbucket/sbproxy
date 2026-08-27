@@ -57,7 +57,7 @@ extensions:
 
 `refresh_interval_secs` accepts `0` or 1 through 86400. Zero fetches at startup and on ordinary reload only. Positive values start one jittered refresh loop at the shortest enabled interval across all Git bundle sources. An unchanged set of verified commits skips publication. A changed source builds and validates the complete registry, then uses the normal atomic reload transaction. Fetch, digest, export, runtime, or lifecycle failure leaves the last verified generation serving.
 
-`GET /api/extensions` keeps the redacted repository, requested reference, verified commit, and latest refresh health in each Git bundle's bounded `load.detail`. It never includes the credential reference or resolved value.
+`GET /api/extensions` keeps the redacted repository, requested reference, verified commit, and latest refresh health in each Git bundle's bounded `load.detail`. It never includes the credential reference or resolved value. A rejected candidate also moves that bundle to `load.status: degraded`, which holds until a poll reaches the source and succeeds; a poll skipped because a reload was in progress clears neither the status nor the failure count. The bundle's `state` stays what it was, because the generation it loaded is still serving, so `summary.failed` does not count it.
 
 ## Bundle manifest
 

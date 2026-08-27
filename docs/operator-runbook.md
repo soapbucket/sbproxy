@@ -1,6 +1,6 @@
 # Operator runbook
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-08-27*
 
 This runbook is the dashboard/action companion to
 [`quickstart-operator.md`](quickstart-operator.md). Use the quickstart for first
@@ -806,12 +806,28 @@ and the new config revision. `active` means the hook is attached to this
 generation. `available` or `unconsumed` means it loaded but is not attached.
 AI hooks become active when their compiled lifecycle chain attaches. Payment
 hooks stay `unconsumed` until the payment dispatcher installs successfully.
-`failed` and a nonempty `collisions` list need investigation.
+`failed` and a nonempty `collisions` list need investigation. A hook in either
+state carries the reason in `hooks[].detail`.
+
+`summary.failed` is not the whole health check. It counts bundles and hooks in
+the `failed` state, and a Git bundle whose refresh keeps being rejected is not
+one: it loaded, and it is still serving the generation it loaded. That bundle
+reports `load.status: "degraded"` with `state` unchanged, so a scripted check on
+`summary.failed` alone passes over a node that has stopped tracking its source.
+Scan the load status too:
+
+```bash
+curl -fsS -u "oncall:${ONCALL_PASSWORD}" \
+  "${SB_ADMIN_URL}/api/extensions" \
+  | jq '[.bundles[] | select(.load.status == "degraded") | {id, detail: .load.detail}]'
+```
 
 For a Git bundle, `bundles[].load.detail` names the redacted repository,
 requested reference, verified commit, and latest refresh health. After a failed
 refresh it says the node is serving the last verified generation and counts
-consecutive failures. It does not copy the rejected error or any secret
+consecutive failures, and `load.status` becomes `degraded` until a poll reaches
+the source and succeeds. A poll skipped because a reload held the lifecycle lock
+does not clear either one. It does not copy the rejected error or any secret
 material into inventory.
 
 Bundle loading is part of the candidate transaction. A bad digest, missing

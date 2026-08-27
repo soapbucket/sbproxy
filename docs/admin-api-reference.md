@@ -1,6 +1,6 @@
 # Admin API reference
 
-*Last modified: 2026-08-26*
+*Last modified: 2026-08-27*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
@@ -1388,6 +1388,24 @@ commit, and latest refresh health. A failed refresh reports that the last
 verified generation is still serving, without copying the rejected error,
 credential reference, or resolved value. This route serves operational metadata
 only.
+
+`load.status` is `ok` for a bundle this generation loaded, `installed` for one
+linked into the binary, `unattributed` for a load nothing could be attributed
+to, and `degraded` for a Git bundle whose refresh candidate was rejected. A
+`degraded` bundle is still serving its last verified generation, so treat it as
+"this proxy has stopped tracking its source" rather than as an outage: read
+`load.detail` for the consecutive-failure count, fix the source or its
+credential, and confirm the status returns to `ok`. It stays `degraded` until a
+poll actually reaches the source and succeeds. A poll skipped because a reload
+held the lifecycle lock changes neither the status nor the count, and says so in
+`load.detail`. `summary.failed` does not count degraded bundles, because the
+bundle itself loaded: `state` reports the lifecycle, and `load` reports how the
+bundle got there.
+
+A hook has no load record, so its `detail` carries the reason for its `state`.
+An unresolved collision names the resolution and the contested match key; a
+resolved one names the registration that won. Every other hook reports
+`detail: null`.
 
 | Status | When |
 |---|---|
