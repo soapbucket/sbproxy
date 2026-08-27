@@ -664,7 +664,13 @@ pub const METRICS: &[MetricCapability] = &[
         compat: CompatTier::Beta,
         registry: Registry::Default,
         labels: &["tier", "outcome"],
-        description: "Cascade routing tier outcomes (accepted | retry | cost_cap).",
+        // Comma-separated because this renders into a Markdown table
+        // cell in `docs/metrics-stability.md`, where an unescaped pipe
+        // opens a new column. WOR-2685 split the pre-dispatch
+        // exclusions out of `retry`, which had been carrying five
+        // meanings that were never retries.
+        description: "Cascade routing tier outcomes (accepted, retry, cost_cap, \
+                      credential_lock, data_posture, disabled, not_found, unhealthy).",
         dead_reason: None,
     },
     MetricCapability {

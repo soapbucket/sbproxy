@@ -580,6 +580,226 @@ pub(super) fn enforce_upstream_subprotocol_selection(
     ))
 }
 
+/// Re-raise a body-phase refusal the upstream answered anyway (WOR-2687).
+///
+/// Every refusal decided in `request_body_filter` stashes its typed
+/// response on [`RequestContext::validator_failed`] and returns `Err`,
+/// and `fail_to_proxy` writes that response. Against an HTTP/1 upstream
+/// that holds: pingora's h1 duplex loop propagates the body filter's
+/// error out of `proxy_handle_downstream` with `?`. Against an HTTP/2
+/// upstream it does not. `pingora-proxy`'s h2 loop logs
+/// `Upstream h2 body send error` and continues, so the upstream's own
+/// answer to the request whose body we refused to forward is filtered
+/// and written downstream, `fail_to_proxy` never runs, and the client
+/// receives the backend's response with the refusal recorded nowhere it
+/// can act on. `tune_peer` sets `ALPN::H2H1` on every peer, so h2 is the
+/// negotiated protocol for any `https://` backend that offers it: the
+/// broken path was the default one, not an exotic configuration.
+///
+/// This runs at the top of `response_filter`, the last hook before an
+/// upstream response reaches the client. Returning the error here hands
+/// the request to the same `fail_to_proxy` writer the h1 path already
+/// uses (one rejection writer for both protocols, not two that can
+/// drift), and pingora discards the upstream response task before
+/// `write_response_tasks` can send any of it downstream. It also lets
+/// the proxy loop disable the cache for the request, which a rewrite of
+/// the response header in place would not.
+///
+/// It covers every policy that funnels through `validator_failed`, which
+/// is every body-phase refusal in this file: `openapi_validation`,
+/// `request_validator`, `content_digest`, `body_threat_protection`,
+/// `prompt_injection_v2`'s body scan, and the A2A push-notification
+/// check.
+///
+/// What it cannot see or fix:
+///
+/// * A refusal that never sets `validator_failed`. Everything in
+///   `request_body_filter` does today, and every write site in this
+///   file refuses the request immediately, either with an `Err` on the
+///   next line or, in the idempotency-conflict case, by signalling the
+///   caller that returns one. That is what makes reading the field
+///   here unambiguous: it is only ever set by a phase that has already
+///   refused the request, so a response arriving with it set is a
+///   response to a request the proxy said no to.
+/// * The upstream having received the request at all. The peer is
+///   dialed and the request head is sent before `request_body_filter`
+///   runs, so a backend that answers without reading the body has
+///   already acted on the head. That is inherent to deciding on the
+///   body and predates this guard; the refusal it fixes is what the
+///   *client* is told.
+/// * An upstream that never answers. Then no response header arrives,
+///   this hook never runs, and the request ends on the read timeout with
+///   `fail_to_proxy` rendering the same stashed refusal.
+/// * An upstream response that reached the client before the body phase
+///   decided. The refusal is decided on the last body chunk, so a
+///   response the proxy has already written downstream is past every
+///   hook. In practice the downstream body is buffered locally and its
+///   select branch is ready before an upstream round trip can complete,
+///   which is why the h1 path has never been observed to lose this
+///   race either; it is a property of deciding on the body, not of
+///   this guard, and it is the same on both protocols.
+fn body_phase_refusal(ctx: &RequestContext) -> Option<Box<pingora_error::Error>> {
+    let (status, _, _) = ctx.validator_failed.as_ref()?;
+    // Deliberately not `take()`: `fail_to_proxy` is the one writer, and
+    // it takes the slot when it renders. Taking it here would leave that
+    // writer with nothing and fall through to the generic 502.
+    Some(pingora_error::Error::explain(
+        pingora_error::ErrorType::HTTPStatus(*status),
+        "request body refused; upstream response withheld",
+    ))
+}
+
+/// One refusal decided in the request-body phase, in the shape the
+/// terminal surfaces need it (WOR-2687).
+struct BodyPhaseDeny<'a> {
+    /// The id the enforcer registers under, which is the `policy`
+    /// metric label, the audit record's `event_type`, and the
+    /// `policy_id` on the verdict event.
+    policy_id: &'a str,
+    /// Status the configured refusal renders.
+    status: u16,
+    /// Stable, bounded label for why the policy refused.
+    ///
+    /// Never the validator's own message. A schema error quotes the
+    /// offending value out of the request body, and this string reaches
+    /// four sinks at once: the `security_audit` tracing target, the
+    /// admin console's audit ring, the hash-chained file under
+    /// `audit.sink: chain`, and the `events:` egress as a
+    /// `policy_denied` event. The detail an operator needs to debug the
+    /// request is already in the rejection body the client receives and
+    /// in the policy's own `warn!`, neither of which is an evidence
+    /// feed. `content_digest` passes an outcome label here for the same
+    /// reason.
+    reason: &'a str,
+    /// Request method, for the audit record.
+    method: &'a str,
+    /// Where this policy compiled to, read off the compiled enforcer so
+    /// the body-phase record and the header-phase record for the same
+    /// policy cannot disagree about who decided.
+    surface: sbproxy_observe::events::PolicySurface,
+    /// Which engine decided, from the same lookup.
+    engine: sbproxy_observe::decision::DecisionEngine,
+    /// When the evaluation that produced this verdict started, so
+    /// `decision_latency_ms` is the real number rather than a zero.
+    started: std::time::Instant,
+}
+
+/// Record a body-phase policy refusal on every surface a proxy-level
+/// refusal is supposed to reach (WOR-2687).
+///
+/// The convention this file states at the top of `check_policies`' call
+/// site: a refusal lands as the access log's policy column, the shared
+/// policy counter, and a `SecurityAuditEntry::policy_violation` record.
+/// `openapi_validation` reached the first two and nothing else, so an
+/// operator running `audit.sink: chain` for tamper-evident evidence saw
+/// `content_digest` and `body_threat_protection` refusals and zero
+/// `openapi_validation` refusals, forever, with no error to explain the
+/// hole.
+///
+/// A free function taking `&mut RequestContext` rather than more lines
+/// inside `request_body_filter`, which is fifteen levels of nesting
+/// deep and reachable only with a live Pingora `Session`: this shape is
+/// unit-testable on the gate, and the e2e suite this workspace does not
+/// run in CI is then proving the wiring rather than the emission.
+fn record_body_phase_policy_deny(
+    ctx: &mut RequestContext,
+    verdict_ctx: &PolicyVerdictCtx,
+    deny: BodyPhaseDeny<'_>,
+) {
+    sbproxy_observe::metrics::record_policy(ctx.hostname.as_str(), deny.policy_id, "deny");
+    ctx.record_policy_decision(deny.policy_id, "deny");
+    // `meter_runtime` gates `BillableOutcome::PolicyBlocked` entirely on
+    // this field, so a refusal that leaves it `None` is invoiced to the
+    // buyer as ordinary work. It is also the one column the admin
+    // request ring shows to answer "why was this refused".
+    if ctx.deny_reason.is_none() {
+        ctx.deny_reason = Some(format!("{}: {}", deny.policy_id, deny.reason));
+    }
+    sbproxy_observe::SecurityAuditEntry::policy_violation(
+        deny.policy_id,
+        deny.reason,
+        deny.status,
+        Some(ctx.hostname.to_string()),
+        ctx.client_ip,
+        Some(ctx.request_id.to_string()),
+        Some(deny.method.to_string()),
+    )
+    .with_tenant_id(ctx.tenant_id.to_string())
+    .with_key_context(
+        ctx.native_key_provider.clone(),
+        ctx.inbound_key_mode.as_str(),
+    )
+    .with_api_key_id(ctx.accountable_key_id())
+    .emit();
+    emit_policy_verdict(
+        verdict_ctx,
+        deny.policy_id,
+        deny.surface,
+        deny.engine,
+        sbproxy_observe::events::VerdictTag::Deny,
+        deny.started,
+    );
+}
+
+/// Record a body-phase policy's `allow` (WOR-2687).
+///
+/// The counterpart to [`record_body_phase_policy_deny`] for a policy
+/// whose header-phase `allow` is suppressed because it defers its real
+/// decision to this phase. Emits the verdict and mirrors it onto the
+/// admin ring, and deliberately touches no metric that a header-phase
+/// `allow` did not: `sbproxy_policy_triggers_total` is a refusal
+/// counter here and on every sibling arm in this file, so an allow
+/// recording one would invent a series operators do not have today.
+fn record_body_phase_policy_allow(
+    ctx: &mut RequestContext,
+    verdict_ctx: &PolicyVerdictCtx,
+    policy_id: &str,
+    surface: sbproxy_observe::events::PolicySurface,
+    engine: sbproxy_observe::decision::DecisionEngine,
+    started: std::time::Instant,
+) {
+    emit_policy_verdict(
+        verdict_ctx,
+        policy_id,
+        surface,
+        engine,
+        sbproxy_observe::events::VerdictTag::Allow,
+        started,
+    );
+    ctx.record_policy_decision(policy_id, "allow");
+}
+
+/// Surface and engine the compiled chain resolved for `policy_id`.
+///
+/// The header-phase record for a policy reads these off the
+/// `CompiledEnforcer` (`check_policies`), so a body-phase record that
+/// hardcodes them starts disagreeing with its own header-phase sibling
+/// the moment the registry routes that `Policy` variant through a
+/// different constructor, and `PolicyVerdictEvent::engine` exists
+/// precisely to prevent that drift.
+///
+/// Falls back to `BuiltIn`/`BuiltIn` when the id is not in the chain,
+/// which is what every body-phase-refusing policy in this file compiles
+/// to today. Reached by lookup rather than asserted: a chain that no
+/// longer carries the policy that just refused should record the
+/// refusal, not panic a Pingora worker.
+fn compiled_policy_attribution(
+    enforcers: &[crate::builtin_enforcers::CompiledEnforcer],
+    policy_id: &str,
+) -> (
+    sbproxy_observe::events::PolicySurface,
+    sbproxy_observe::decision::DecisionEngine,
+) {
+    enforcers
+        .iter()
+        .find(|compiled| compiled.enforcer.policy_type() == policy_id)
+        .map(|compiled| (compiled.surface, compiled.engine))
+        .unwrap_or((
+            sbproxy_observe::events::PolicySurface::BuiltIn,
+            sbproxy_observe::decision::DecisionEngine::BuiltIn,
+        ))
+}
+
 /// Whether this request is riding an upgraded tunnel, and whether the
 /// gateway's own frame scanner already tore it down (WOR-2551).
 ///
@@ -4168,6 +4388,16 @@ impl ProxyHttp for SbProxy {
         // this hook once per upstream response.
         ctx.upstream_first_byte_at = Some(std::time::Instant::now());
 
+        // WOR-2687: a body-phase policy already refused this request and
+        // the upstream answered anyway, which only happens on an h2
+        // upstream (see `body_phase_refusal`). Ahead of every rewrite
+        // below, including `capture_origin_headers`: none of them should
+        // run on, meter, or attest a response that is not going to the
+        // client.
+        if let Some(refusal) = body_phase_refusal(ctx) {
+            return Err(refusal);
+        }
+
         // WOR-2145: snapshot the response headers the attestation config
         // meters, before this hook starts rewriting headers of its own.
         // The evidence on a receipt has to be what the origin actually
@@ -6516,14 +6746,67 @@ impl ProxyHttp for SbProxy {
                                         OpenApiValidationMode, OpenApiValidationResult,
                                     };
                                     let req = session.req_header();
-                                    let method = req.method.as_str();
-                                    let path = req.uri.path();
-                                    match oa.validate(
-                                        method,
-                                        path,
+                                    let method = req.method.as_str().to_string();
+                                    let path = req.uri.path().to_string();
+                                    // WOR-2687: this phase publishes the
+                                    // `openapi_validation` verdict for this
+                                    // request, and `check_policies` no longer
+                                    // publishes the premature header-phase
+                                    // `allow` for it (see
+                                    // `emits_own_verdict_in_body_phase`). The
+                                    // header phase always returned `Allow`
+                                    // because the body this policy validates
+                                    // is not buffered yet, which put an
+                                    // `allow` on the audit bus before the
+                                    // check that decides had run.
+                                    //
+                                    // The clock starts before `validate`, not
+                                    // at the emission site: `emit_policy_verdict`
+                                    // feeds this instant into three shared
+                                    // histograms, so an `Instant::now()` taken
+                                    // after the work injects a guaranteed 0.0
+                                    // sample into the built-in surface's
+                                    // decision-latency percentiles and into
+                                    // the per-verdict series.
+                                    let started = std::time::Instant::now();
+                                    let result = oa.validate(
+                                        &method,
+                                        &path,
                                         content_type.as_deref(),
                                         &collected,
-                                    ) {
+                                    );
+                                    // Reached by lookup rather than by index.
+                                    // `action_dispatch` states the rule for
+                                    // this exact pair: a policy chain that
+                                    // outlives its origin should fail this
+                                    // request closed rather than the process.
+                                    // A missing origin costs the record its
+                                    // two id labels and changes nothing about
+                                    // whether the request is refused.
+                                    let origin = pipeline.config.origins.get(origin_idx);
+                                    let verdict_ctx = PolicyVerdictCtx {
+                                        request_id: ctx.request_id.to_string(),
+                                        workspace_id: origin
+                                            .map(|o| o.workspace_id.to_string())
+                                            .unwrap_or_default(),
+                                        origin: origin
+                                            .map(|o| o.origin_id.to_string())
+                                            .unwrap_or_default(),
+                                        tenant: ctx.tenant_id.to_string(),
+                                        record_format: pipeline
+                                            .config
+                                            .decision_audit
+                                            .policy_record_format(),
+                                    };
+                                    let (surface, engine) = compiled_policy_attribution(
+                                        pipeline
+                                            .enforcers
+                                            .get(origin_idx)
+                                            .map(Vec::as_slice)
+                                            .unwrap_or_default(),
+                                        "openapi_validation",
+                                    );
+                                    match result {
                                         OpenApiValidationResult::Failed(msg) => match oa.mode {
                                             OpenApiValidationMode::Enforce => {
                                                 let body_str =
@@ -6534,6 +6817,25 @@ impl ProxyHttp for SbProxy {
                                                         })
                                                         .to_string()
                                                     });
+                                                tracing::warn!(
+                                                    target: "sbproxy::openapi_validation",
+                                                    detail = %msg,
+                                                    status = oa.status,
+                                                    "openapi validation refused the request body"
+                                                );
+                                                record_body_phase_policy_deny(
+                                                    ctx,
+                                                    &verdict_ctx,
+                                                    BodyPhaseDeny {
+                                                        policy_id: "openapi_validation",
+                                                        status: oa.status,
+                                                        reason: "schema_violation",
+                                                        method: &method,
+                                                        surface,
+                                                        engine,
+                                                        started,
+                                                    },
+                                                );
                                                 failed = Some((
                                                     oa.status,
                                                     body_str,
@@ -6547,10 +6849,43 @@ impl ProxyHttp for SbProxy {
                                                     detail = %msg,
                                                     "openapi validation failed (log mode)"
                                                 );
+                                                // `mode: log` admits the
+                                                // request, so the verdict this
+                                                // policy reached is `allow`.
+                                                // The `warn!` above is what
+                                                // says the body would have
+                                                // been refused under
+                                                // `enforce`; the verdict
+                                                // vocabulary has no monitor
+                                                // tag to say it with.
+                                                record_body_phase_policy_allow(
+                                                    ctx,
+                                                    &verdict_ctx,
+                                                    "openapi_validation",
+                                                    surface,
+                                                    engine,
+                                                    started,
+                                                );
                                             }
                                         },
                                         OpenApiValidationResult::Passed
-                                        | OpenApiValidationResult::OutOfScope => {}
+                                        | OpenApiValidationResult::OutOfScope => {
+                                            // Both admit the request, and both
+                                            // need the record: with the header
+                                            // phase's terminal `allow`
+                                            // suppressed for this policy, a
+                                            // silent arm here would delete the
+                                            // policy from the audit trail of
+                                            // every request it admits.
+                                            record_body_phase_policy_allow(
+                                                ctx,
+                                                &verdict_ctx,
+                                                "openapi_validation",
+                                                surface,
+                                                engine,
+                                                started,
+                                            );
+                                        }
                                     }
                                 }
                                 Policy::A2A(p) => {
@@ -11970,6 +12305,245 @@ origins:
         assert_eq!(
             websocket_teardown_count("subprotocol_violation", "none", ORIGIN),
             before + 1
+        );
+    }
+
+    // --- WOR-2687: a body-phase refusal an h2 upstream answered anyway ---
+
+    /// A request context as the body phase leaves one, plus the
+    /// identifiers every terminal surface stamps on a record.
+    fn body_phase_ctx(origin: &str) -> RequestContext {
+        let mut ctx = RequestContext::new();
+        ctx.hostname = origin.into();
+        ctx.tenant_id = "acme".into();
+        ctx.request_id = "req-openapi-1".into();
+        ctx.client_ip = Some("203.0.113.9".parse().expect("test ip"));
+        ctx
+    }
+
+    /// The dispatcher correlation the body phase rebuilds for its own
+    /// emission.
+    fn body_phase_verdict_ctx(origin: &str) -> PolicyVerdictCtx {
+        PolicyVerdictCtx {
+            request_id: "req-openapi-1".to_string(),
+            workspace_id: String::new(),
+            origin: origin.to_string(),
+            tenant: "acme".to_string(),
+            record_format: sbproxy_config::types::PolicyRecordFormat::default(),
+        }
+    }
+
+    /// WOR-2687, red-first: the guard that stops an h2 upstream's
+    /// response from reaching a client whose request a body-phase
+    /// policy already refused.
+    ///
+    /// Pingora's h1 duplex loop propagates `request_body_filter`'s
+    /// `Err` with `?` and `fail_to_proxy` renders the refusal. Its h2
+    /// loop logs `Upstream h2 body send error` and keeps going, so the
+    /// upstream's own response was filtered and written downstream and
+    /// the client got the backend's answer to a request the proxy had
+    /// refused. `tune_peer` sets `ALPN::H2H1` on every peer, so that
+    /// was the default for any `https://` backend.
+    #[test]
+    fn wor_2687_a_refused_body_withholds_the_upstream_response() {
+        let mut ctx = body_phase_ctx("openapi-guard.example.com");
+        assert!(
+            body_phase_refusal(&ctx).is_none(),
+            "a request nothing refused forwards its upstream response untouched"
+        );
+
+        ctx.validator_failed = Some((
+            422,
+            "{\"error\":\"openapi validation failed\"}".to_string(),
+            "application/json".to_string(),
+        ));
+        let refusal = body_phase_refusal(&ctx)
+            .expect("a stashed refusal withholds the upstream response on every protocol");
+        assert_eq!(
+            refusal.etype(),
+            &pingora_error::ErrorType::HTTPStatus(422),
+            "the error carries the status the policy configured, not a generic 502"
+        );
+        assert!(
+            ctx.validator_failed.is_some(),
+            "the guard leaves the slot for fail_to_proxy, the one writer: taking it here \
+             would leave that writer with nothing and fall through to the generic 502"
+        );
+    }
+
+    /// WOR-2687, red-first: the refusal reaches every surface a
+    /// proxy-level refusal is supposed to reach.
+    ///
+    /// Before this change the `openapi_validation` arm reached the
+    /// policy counter and the access log's policy column and nothing
+    /// else, so an operator running `audit.sink: chain` for
+    /// tamper-evident evidence saw `content_digest` refusals and zero
+    /// `openapi_validation` refusals, forever, and a metered origin
+    /// billed the refusal as ordinary work because
+    /// `BillableOutcome::PolicyBlocked` is gated entirely on
+    /// `deny_reason`.
+    #[test]
+    fn wor_2687_a_body_phase_deny_records_on_every_refusal_surface() {
+        const ORIGIN: &str = "openapi-deny.example.com";
+        let before = counter_value(
+            "sbproxy_policy_triggers_total",
+            &[
+                ("origin", ORIGIN),
+                ("policy_type", "openapi_validation"),
+                ("action", "deny"),
+            ],
+        );
+        let mut ctx = body_phase_ctx(ORIGIN);
+        let verdict_ctx = body_phase_verdict_ctx(ORIGIN);
+
+        let records = capture_security_audit(|| {
+            record_body_phase_policy_deny(
+                &mut ctx,
+                &verdict_ctx,
+                BodyPhaseDeny {
+                    policy_id: "openapi_validation",
+                    status: 422,
+                    reason: "schema_violation",
+                    method: "POST",
+                    surface: sbproxy_observe::events::PolicySurface::BuiltIn,
+                    engine: sbproxy_observe::decision::DecisionEngine::BuiltIn,
+                    started: std::time::Instant::now(),
+                },
+            );
+        });
+
+        assert_eq!(
+            counter_value(
+                "sbproxy_policy_triggers_total",
+                &[
+                    ("origin", ORIGIN),
+                    ("policy_type", "openapi_validation"),
+                    ("action", "deny"),
+                ],
+            ),
+            before + 1,
+            "the shared policy counter sees the refusal"
+        );
+        assert_eq!(
+            ctx.policy_decisions,
+            vec!["openapi_validation:deny".to_string()],
+            "the admin ring row explains what applied"
+        );
+        assert_eq!(
+            ctx.deny_reason.as_deref(),
+            Some("openapi_validation: schema_violation"),
+            "the refusal is billed as a policy block and the admin row can say why"
+        );
+
+        assert_eq!(
+            records.len(),
+            1,
+            "exactly one policy_violation record, the shape that bridges to the \
+             security_audit target, the audit ring, the hash-chained file, and the \
+             events: egress: {records:?}"
+        );
+        let record = &records[0];
+        assert_eq!(record["event_type"], "openapi_validation");
+        assert_eq!(record["reason"], "schema_violation");
+        assert_eq!(record["status_code"], 422);
+        assert_eq!(record["hostname"], ORIGIN);
+        assert_eq!(record["tenant_id"], "acme");
+        assert_eq!(record["method"], "POST");
+        assert_eq!(record["request_id"], "req-openapi-1");
+    }
+
+    /// WOR-2687: the reason on that record is a stable label, never the
+    /// validator's own message.
+    ///
+    /// A JSON Schema error quotes the offending value out of the
+    /// request body (`"30" is not of type "string"`), and this record
+    /// reaches four sinks at once, one of them a tamper-evident file an
+    /// operator keeps as evidence. The detail belongs in the rejection
+    /// body the client receives and in the policy's `warn!`, neither of
+    /// which is an evidence feed.
+    #[test]
+    fn wor_2687_the_deny_record_carries_no_request_body_content() {
+        const ORIGIN: &str = "openapi-redaction.example.com";
+        let mut ctx = body_phase_ctx(ORIGIN);
+        let verdict_ctx = body_phase_verdict_ctx(ORIGIN);
+        let records = capture_security_audit(|| {
+            record_body_phase_policy_deny(
+                &mut ctx,
+                &verdict_ctx,
+                BodyPhaseDeny {
+                    policy_id: "openapi_validation",
+                    status: 422,
+                    reason: "schema_violation",
+                    method: "POST",
+                    surface: sbproxy_observe::events::PolicySurface::BuiltIn,
+                    engine: sbproxy_observe::decision::DecisionEngine::BuiltIn,
+                    started: std::time::Instant::now(),
+                },
+            );
+        });
+        let rendered = serde_json::to_string(&records).expect("records serialize");
+        for probe in ["ssn", "not of type", "additionalProperties", "required"] {
+            assert!(
+                !rendered.contains(probe),
+                "a schema message reached the audit record: {rendered}"
+            );
+        }
+        assert!(
+            ctx.deny_reason
+                .as_deref()
+                .is_some_and(|reason| reason == "openapi_validation: schema_violation"),
+            "the billing and admin reason is the same bounded label"
+        );
+    }
+
+    /// WOR-2687: attribution is read off the compiled chain, not
+    /// hardcoded at the emission site.
+    ///
+    /// The header-phase record for a policy reads `surface` and
+    /// `engine` off its `CompiledEnforcer`. A body-phase record that
+    /// hardcodes them starts disagreeing with its own header-phase
+    /// sibling the moment the registry routes that variant through a
+    /// different constructor, which is the drift
+    /// `PolicyVerdictEvent::engine` exists to prevent.
+    #[test]
+    fn wor_2687_body_phase_attribution_comes_from_the_compiled_chain() {
+        let config = sbproxy_config::compile_config(
+            r#"
+proxy:
+  http_bind_port: 0
+origins:
+  "api.localhost":
+    action: {type: static, status_code: 200, body: "ok"}
+    policies:
+      - type: openapi_validation
+        mode: enforce
+        status: 422
+        spec:
+          openapi: "3.0.3"
+          info: {title: t, version: "1"}
+          paths: {}
+"#,
+        )
+        .expect("fixture config");
+        let mut pipeline =
+            crate::pipeline::CompiledPipeline::from_config(config).expect("fixture pipeline");
+        let chain = pipeline.enforcers.remove(0);
+        assert_eq!(
+            compiled_policy_attribution(&chain, "openapi_validation"),
+            (
+                sbproxy_observe::events::PolicySurface::BuiltIn,
+                sbproxy_observe::decision::DecisionEngine::BuiltIn,
+            ),
+            "today's registry compiles this policy as a plain built-in"
+        );
+        assert_eq!(
+            compiled_policy_attribution(&[], "openapi_validation"),
+            (
+                sbproxy_observe::events::PolicySurface::BuiltIn,
+                sbproxy_observe::decision::DecisionEngine::BuiltIn,
+            ),
+            "a chain that no longer carries the policy records the refusal rather than \
+             panicking a Pingora worker"
         );
     }
 }

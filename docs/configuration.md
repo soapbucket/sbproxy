@@ -564,9 +564,17 @@ startup. Full auth, RBAC, remote-access, and endpoint reference is in
 | `POST /admin/reload` | Re-read the on-disk config file and hot-swap the pipeline. Single-flight; concurrent calls return 409. |
 | `GET /admin/drift` | Compare the on-disk config file against the loaded baseline. See below. |
 
-Unauthenticated requests get a 401 with a `WWW-Authenticate: Basic`
-header. Requests from outside `127.0.0.1` are dropped at the
-socket level.
+Unauthenticated requests get a 401. For a script that 401 carries the
+RFC 7235 challenge, `WWW-Authenticate: Basic realm="sbproxy admin"`. For
+a browser it does not, so the console's own sign-in page is what asks
+for credentials rather than the browser's native dialog; the two markers
+that identify a browser, and what a browser sees instead, are in
+[admin-api-guide.md](admin-api-guide.md#what-a-refused-request-gets-back).
+
+A peer outside `allow_ips` is refused before a single request byte is
+read, with a 403 and `{"error":"Forbidden"}`. With `allow_ips` unset,
+and with an entry that parses as neither an address nor a CIDR, the
+allowlist is loopback only.
 
 #### `GET /admin/drift`
 
@@ -5430,8 +5438,12 @@ anything below that no authored page matches renders as problem+json:
   Pingora's `fail_to_proxy` path. The `detail` field carries the
   RFC 9209 error token (`connection_refused`,
   `connection_timeout`, `tls_protocol_error`, `connection_terminated`,
-  `http_request_error`) so downstream tooling can break down by
-  failure mode without scraping the body.
+  `http_request_error`, `credential_provider_locked`) so downstream
+  tooling can break down by failure mode without scraping the body.
+  `credential_provider_locked` is the one token that is not an upstream
+  failure: it means the calling credential's provider policy excluded
+  every tier of an AI cascade. It carries no policy contents, so a
+  caller cannot learn from it which providers exist behind the gateway.
 
 ### What it does not cover
 

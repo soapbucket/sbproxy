@@ -142,7 +142,12 @@ Proxy-Status: sbproxy; received-status=502; error="connection_terminated"
 
 The error token catalog mirrors RFC 9209 section 2.3.4
 (`connection_refused`, `connection_timeout`, `tls_protocol_error`,
-`connection_terminated`, `http_request_error`).
+`connection_terminated`, `http_request_error`), plus one SBproxy
+extension token that section 2.3 provides for:
+
+| Token | Status | Meaning |
+|---|---|---|
+| `credential_provider_locked` | 502 | An AI cascade dispatched no tier because the calling credential's `provider` allow/block policy excluded every one of them. The token is the whole of what the caller is told: which providers the credential can reach, and which exist behind the gateway, stay server-side. The detail is in the server log under `event="ai.cascade.credential_lock"`. |
 
 ### `application/problem+json` (RFC 9457)
 
