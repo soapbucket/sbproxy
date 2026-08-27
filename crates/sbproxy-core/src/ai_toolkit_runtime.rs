@@ -327,14 +327,20 @@ origins:
                 entries: Vec::new(),
             })
             .expect_err("configured process-wide version limit is lowered");
-        assert!(matches!(
-            error,
-            sbproxy_ai::toolkit::ToolkitError::LimitExceeded {
-                resource: "dataset_versions_total",
-                limit: 1,
-                observed: 2
-            }
-        ));
+        // This generation admits one scope, so that scope's share of the
+        // process-wide version budget is the whole lowered budget, and the
+        // share ceiling is the guard that names the refusal.
+        assert!(
+            matches!(
+                error,
+                sbproxy_ai::toolkit::ToolkitError::LimitExceeded {
+                    resource: "dataset_versions_scope",
+                    limit: 1,
+                    observed: 2
+                }
+            ),
+            "unexpected refusal: {error:?}"
+        );
 
         let unknown = ToolkitScope::new("other.example.test", "__default__")
             .expect("syntactically valid scope");
