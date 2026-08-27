@@ -445,12 +445,7 @@ impl ShadowUsageRecord {
         // Minted per call, so each target's row is a distinct ledger
         // entry. See the note in `new`.
         self.event.request_id = Some(format!("{:032x}:shadow", rand::random::<u128>()));
-        let usage = crate::budget::AiUsage::Tokens {
-            input: result.prompt_tokens,
-            output: result.completion_tokens,
-            cached_input: 0,
-            cache_creation: 0,
-        };
+        let usage = shadow_usage_dimensions(&result);
         self.event.provider = provider;
         self.event.model = model;
         self.event.prompt_tokens = result.prompt_tokens;
@@ -472,8 +467,23 @@ impl ShadowUsageRecord {
 struct ShadowCallResult {
     status: u16,
     latency_ms: u64,
+    /// The call's *whole* prompt volume, cache-read and cache-write
+    /// tokens included, matching what
+    /// [`crate::budget::AiUsage::Tokens::input`] is defined to carry.
     prompt_tokens: u64,
     completion_tokens: u64,
+    /// Cache-read prompt tokens, a subset of `prompt_tokens` billed at
+    /// the model's discounted cache-read rate.
+    ///
+    /// The primary's realized cost already carries this discount, so a
+    /// shadow leg priced without it would make a candidate holding a
+    /// warm prefix look more expensive than the primary it is being
+    /// compared against, which is the one number the comparison report
+    /// exists to produce.
+    cache_read_tokens: u64,
+    /// Cache-write (cache-creation) prompt tokens, a subset of
+    /// `prompt_tokens` billed at the model's cache-write rate.
+    cache_write_tokens: u64,
     /// The target's terminal `finish_reason`, already parsed by
     /// [`parse_shadow_metadata`] for the log line and previously
     /// discarded. It is the cheapest disagreement signal there is: a
@@ -924,9 +934,9 @@ impl AiClient {
                         // placeholder, so a fair-share refusal reads as
                         // `quota_denied` in the provenance block rather
                         // than as a copy that failed on the wire.
-                        if let Some(request_id) = prepared.eval.request_id() {
+                        if let Some(pair_key) = prepared.eval.pair_key() {
                             crate::shadow_eval::ShadowPairLedger::global().record_drop(
-                                request_id,
+                                pair_key,
                                 &prepared.usage_provider,
                                 crate::shadow_eval::PairDropReason::QuotaDenied,
                             );
@@ -1008,9 +1018,9 @@ impl AiClient {
         // so `requests_seen` counts every eligible request and the
         // provenance block's denominator is the traffic the operator
         // configured rather than the copies that happened to run. A
-        // request with no `primary_request_id` (nothing above installed
-        // one) records nothing: `open` returns on an empty id.
-        if let Some(request_id) = eval.request_id() {
+        // request with no `pair_key` (nothing above installed one)
+        // records nothing: `open` returns on an empty id.
+        if let Some(pair_key) = eval.pair_key() {
             let legs: Vec<(String, f32, Option<crate::shadow_eval::PairDropReason>)> = shadow_cfg
                 .targets
                 .iter()
@@ -1023,7 +1033,7 @@ impl AiClient {
                     (target.provider.clone(), target.sample_rate, drop)
                 })
                 .collect();
-            crate::shadow_eval::ShadowPairLedger::global().open(request_id, &legs);
+            crate::shadow_eval::ShadowPairLedger::global().open(pair_key, &legs);
         }
         Ok(prepared)
     }
@@ -1256,6 +1266,8 @@ impl AiClient {
                         latency_ms: task_timeout_ms,
                         prompt_tokens: 0,
                         completion_tokens: 0,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
                         finish_reason: None,
                         response_retained: false,
                     };
@@ -3419,6 +3431,8 @@ async fn run_shadow_request(
                     latency_ms: started.elapsed().as_millis() as u64,
                     prompt_tokens: 0,
                     completion_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
                     finish_reason: None,
                     response_retained: false,
                 };
@@ -3432,6 +3446,16 @@ async fn run_shadow_request(
     let bytes: &[u8] = &bytes_vec;
     let elapsed = started.elapsed();
     let (prompt_tokens, completion_tokens, finish_reason) = parse_shadow_metadata(bytes);
+    // The vendors' cache counters, read from whichever body still
+    // carries them. The OpenAI spelling survives translation; the
+    // Anthropic one does not, so the untranslated bytes are the
+    // fallback. Without this the shadow leg is priced at the full
+    // input rate while the primary it is compared against already
+    // carries the cache-read discount, and the report's headline
+    // delta says a cheaper candidate is more expensive.
+    let cache = parse_shadow_cache_tokens(bytes).or_else(|| parse_shadow_cache_tokens(&raw_bytes));
+    let (prompt_tokens, cache_read_tokens, cache_write_tokens) =
+        shadow_prompt_volume(prompt_tokens.unwrap_or(0), cache.as_ref());
     // WOR-2654: the paired half. The sink exists only when this
     // request already passed the content-recording gate, so the
     // ordinary path evaluates `is_some()` on a `None` and keeps
@@ -3439,9 +3463,8 @@ async fn run_shadow_request(
     // has always held and are dropped with the frame either way. The
     // sink refuses an answer whose primary was not captured, so half a
     // pair is never retained.
-    let response_retained = match (eval.retention.as_ref(), eval.primary_request_id.as_deref()) {
-        (Some(sink), Some(request_id)) => sink.retain(
-            request_id,
+    let response_retained = eval.retention.as_ref().is_some_and(|sink| {
+        sink.retain(
             provider.name.as_str(),
             // The shadow's own body, not the translated one: this is
             // the model the usage row bills under, and a report that
@@ -3452,9 +3475,8 @@ async fn run_shadow_request(
                 .unwrap_or_default(),
             status.as_u16(),
             bytes,
-        ),
-        _ => false,
-    };
+        )
+    });
     info!(
         target: "sbproxy_ai_shadow",
         provider = %provider.name,
@@ -3470,11 +3492,104 @@ async fn run_shadow_request(
     ShadowCallResult {
         status: status.as_u16(),
         latency_ms: elapsed.as_millis() as u64,
-        prompt_tokens: prompt_tokens.unwrap_or(0),
+        prompt_tokens,
         completion_tokens: completion_tokens.unwrap_or(0),
+        cache_read_tokens,
+        cache_write_tokens,
         finish_reason,
         response_retained,
     }
+}
+
+/// The token dimensions one completed shadow call is priced on.
+///
+/// One function, because two surfaces price the same call: the pair
+/// ledger the comparison report folds, and the shadow usage row a
+/// configured `usage_sinks:` receives. A cache dimension threaded into
+/// one and not the other would let the two disagree about what a
+/// target spent, which is the one thing the module doc promises they
+/// cannot do.
+fn shadow_usage_dimensions(result: &ShadowCallResult) -> crate::budget::AiUsage {
+    // The cache counts are carried rather than zeroed because the
+    // primary's `cost_usd`, on the other side of the report's
+    // subtraction, is the realized bill and already carries them. A
+    // shadow leg priced as if every prompt token were fresh reads as
+    // more expensive than the primary it beat.
+    crate::budget::AiUsage::Tokens {
+        input: result.prompt_tokens,
+        output: result.completion_tokens,
+        cached_input: result.cache_read_tokens,
+        cache_creation: result.cache_write_tokens,
+    }
+}
+
+/// Resolve one shadow call's whole prompt volume and its two cache
+/// subsets from what the body reported.
+///
+/// Returns `(prompt_tokens, cache_read, cache_write)` where
+/// `prompt_tokens` is the total the pricing path expects: cache-read
+/// and cache-write included, whichever vendor reported them.
+fn shadow_prompt_volume(
+    reported_prompt_tokens: u64,
+    cache: Option<&ShadowCacheTokens>,
+) -> (u64, u64, u64) {
+    let Some(cache) = cache else {
+        return (reported_prompt_tokens, 0, 0);
+    };
+    let total = if cache.included_in_prompt_tokens {
+        reported_prompt_tokens
+    } else {
+        reported_prompt_tokens
+            .saturating_add(cache.read)
+            .saturating_add(cache.write)
+    };
+    (total, cache.read, cache.write)
+}
+
+/// The vendors' prompt-cache counters as one shadow call reported them.
+struct ShadowCacheTokens {
+    read: u64,
+    write: u64,
+    /// Whether the body's `prompt_tokens` already counts these.
+    ///
+    /// OpenAI's `prompt_tokens` does, and reports the cached share
+    /// under `prompt_tokens_details`. Anthropic's `input_tokens` does
+    /// not, and reports the two cache counts beside it, so the whole
+    /// prompt volume is the sum of the three.
+    included_in_prompt_tokens: bool,
+}
+
+/// Read one shadow response's prompt-cache counters, in either
+/// vendor's spelling. `None` when the body reports neither.
+fn parse_shadow_cache_tokens(body: &[u8]) -> Option<ShadowCacheTokens> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let usage = value.get("usage")?;
+    let openai_read = usage
+        .get("prompt_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(serde_json::Value::as_u64);
+    if let Some(read) = openai_read {
+        return Some(ShadowCacheTokens {
+            read,
+            // OpenAI bills no separate cache-write dimension.
+            write: 0,
+            included_in_prompt_tokens: true,
+        });
+    }
+    let read = usage
+        .get("cache_read_input_tokens")
+        .and_then(serde_json::Value::as_u64);
+    let write = usage
+        .get("cache_creation_input_tokens")
+        .and_then(serde_json::Value::as_u64);
+    if read.is_none() && write.is_none() {
+        return None;
+    }
+    Some(ShadowCacheTokens {
+        read: read.unwrap_or(0),
+        write: write.unwrap_or(0),
+        included_in_prompt_tokens: false,
+    })
 }
 
 /// WOR-2654: fold one completed target call into the pair ledger the
@@ -3492,17 +3607,12 @@ fn record_shadow_pair_leg(
     model: &str,
     result: &ShadowCallResult,
 ) {
-    let Some(request_id) = eval.request_id() else {
+    let Some(pair_key) = eval.pair_key() else {
         return;
     };
-    let usage = crate::budget::AiUsage::Tokens {
-        input: result.prompt_tokens,
-        output: result.completion_tokens,
-        cached_input: 0,
-        cache_creation: 0,
-    };
+    let usage = shadow_usage_dimensions(result);
     crate::shadow_eval::ShadowPairLedger::global().record_shadow(
-        request_id,
+        pair_key,
         target,
         crate::shadow_eval::ShadowLeg {
             model: model.to_string(),
@@ -3521,6 +3631,8 @@ fn failed_shadow_call(started: std::time::Instant) -> ShadowCallResult {
         latency_ms: started.elapsed().as_millis() as u64,
         prompt_tokens: 0,
         completion_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
         // A call that never produced a response has no finish reason.
         // `None` rather than a synthetic value, so a report counting
         // `length` truncations cannot pick up transport failures.
@@ -5219,6 +5331,8 @@ mod tests {
             latency_ms: 12,
             prompt_tokens: 3,
             completion_tokens: 4,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             finish_reason: finish_reason.map(str::to_string),
             response_retained: false,
         }
@@ -5289,6 +5403,127 @@ mod tests {
                  suppress another's rows on ledger replay: {request_id}"
             );
         }
+    }
+
+    /// The report's headline number is a subtraction, and the primary
+    /// side of it is the realized bill, cache-read discount included.
+    /// A shadow leg priced as if every prompt token were fresh makes a
+    /// candidate holding a warm prefix read as more expensive than the
+    /// primary it beat, which is the one number the comparison surface
+    /// exists to produce.
+    #[test]
+    fn a_targets_prompt_cache_tokens_reach_the_price() {
+        let openai = serde_json::json!({
+            "choices": [{"finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 20_000,
+                "completion_tokens": 100,
+                "prompt_tokens_details": {"cached_tokens": 18_000},
+            },
+        })
+        .to_string();
+        let cache =
+            parse_shadow_cache_tokens(openai.as_bytes()).expect("the OpenAI spelling is read");
+        assert_eq!(cache.read, 18_000);
+        assert_eq!(cache.write, 0);
+        assert!(
+            cache.included_in_prompt_tokens,
+            "OpenAI's prompt_tokens already counts the cached share"
+        );
+
+        let anthropic = serde_json::json!({
+            "usage": {
+                "input_tokens": 500,
+                "output_tokens": 100,
+                "cache_read_input_tokens": 18_000,
+                "cache_creation_input_tokens": 1_500,
+            },
+        })
+        .to_string();
+        let cache = parse_shadow_cache_tokens(anthropic.as_bytes())
+            .expect("the Anthropic spelling is read");
+        assert_eq!(cache.read, 18_000);
+        assert_eq!(cache.write, 1_500);
+        assert!(
+            !cache.included_in_prompt_tokens,
+            "Anthropic's input_tokens excludes both, so the whole prompt is the sum"
+        );
+
+        assert!(
+            parse_shadow_cache_tokens(
+                serde_json::json!({"usage": {"prompt_tokens": 10, "completion_tokens": 1}})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .is_none(),
+            "a body reporting no cache at all reports none"
+        );
+    }
+
+    /// The whole prompt volume, whichever vendor reported the cache.
+    /// Anthropic's `input_tokens` excludes both cache counts, so a
+    /// shadow leg priced on it alone would bill 500 tokens for a
+    /// 20,000-token prompt and report a candidate as far cheaper than
+    /// it is.
+    #[test]
+    fn a_targets_prompt_volume_includes_whatever_the_cache_served() {
+        let openai = ShadowCacheTokens {
+            read: 18_000,
+            write: 0,
+            included_in_prompt_tokens: true,
+        };
+        assert_eq!(
+            shadow_prompt_volume(20_000, Some(&openai)),
+            (20_000, 18_000, 0),
+            "OpenAI's prompt_tokens is already the whole prompt"
+        );
+
+        let anthropic = ShadowCacheTokens {
+            read: 18_000,
+            write: 1_500,
+            included_in_prompt_tokens: false,
+        };
+        assert_eq!(
+            shadow_prompt_volume(500, Some(&anthropic)),
+            (20_000, 18_000, 1_500),
+            "Anthropic's input_tokens excludes both, so the whole prompt is the sum"
+        );
+
+        assert_eq!(shadow_prompt_volume(500, None), (500, 0, 0));
+    }
+
+    /// The two surfaces that price a shadow call, the pair ledger and
+    /// the shadow usage row, read the same dimensions from the same
+    /// function, and those dimensions carry the cache.
+    #[test]
+    fn a_shadow_call_is_priced_on_the_cache_dimensions_it_reported() {
+        let result = ShadowCallResult {
+            status: 200,
+            latency_ms: 10,
+            prompt_tokens: 20_000,
+            completion_tokens: 100,
+            cache_read_tokens: 18_000,
+            cache_write_tokens: 1_500,
+            finish_reason: Some("stop".to_string()),
+            response_retained: false,
+        };
+        let crate::budget::AiUsage::Tokens {
+            input,
+            output,
+            cached_input,
+            cache_creation,
+        } = shadow_usage_dimensions(&result)
+        else {
+            panic!("a shadow call is always token usage");
+        };
+        assert_eq!(input, 20_000);
+        assert_eq!(output, 100);
+        assert_eq!(
+            (cached_input, cache_creation),
+            (18_000, 1_500),
+            "the cache dimensions must survive to the price call, because the \
+             primary this is subtracted from already carries them"
+        );
     }
 
     #[test]

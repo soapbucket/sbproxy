@@ -142,16 +142,30 @@ pub fn attach_output(request_id: &str, output_text: String) {
 /// answer either. There is no partial capture: a shadow answer never
 /// creates a sample of its own.
 ///
+/// `tenant_id` must match the stored sample's own. The store key is
+/// the request correlation id, which `server.correlation_id` adopts
+/// from an inbound header by default, so two tenants can present the
+/// same one; and unlike the primary's own answer, a shadow answer is
+/// written from a detached task that outlives its request. Without
+/// this check a late shadow leg could write one tenant's candidate
+/// output into another tenant's stored sample, and
+/// `GET /api/requests/{id}/content` would then serve it inside a
+/// record stamped with the wrong tenant.
+///
 /// A second answer from the same target replaces the first rather than
 /// appending, so a retry cannot make one request look like two
 /// comparisons.
-pub fn attach_shadow_response(request_id: &str, response: ShadowResponseSample) -> bool {
+pub fn attach_shadow_response(
+    request_id: &str,
+    tenant_id: &str,
+    response: ShadowResponseSample,
+) -> bool {
     let Ok(mut store) = store().lock() else {
         return false;
     };
     let Some(sample) = store
         .iter_mut()
-        .find(|sample| sample.request_id == request_id)
+        .find(|sample| sample.request_id == request_id && sample.tenant_id == tenant_id)
     else {
         return false;
     };
@@ -251,10 +265,12 @@ mod tests {
         attach_output("req-cc-pair", "primary says four".to_string());
         assert!(attach_shadow_response(
             "req-cc-pair",
+            "tenant-cc-pair",
             shadow("candidate-a", "candidate a says four")
         ));
         assert!(attach_shadow_response(
             "req-cc-pair",
+            "tenant-cc-pair",
             shadow("candidate-b", "candidate b says five")
         ));
         let got = sample_for("req-cc-pair").expect("sample stored");
@@ -270,12 +286,47 @@ mod tests {
     #[test]
     fn a_shadow_answer_without_consent_retains_nothing_at_all() {
         assert!(
-            !attach_shadow_response("req-cc-no-consent", shadow("candidate", "secret answer")),
+            !attach_shadow_response(
+                "req-cc-no-consent",
+                "tenant-cc-none",
+                shadow("candidate", "secret answer")
+            ),
             "a shadow answer must not create a sample the consent gate refused"
         );
         assert!(
             sample_for("req-cc-no-consent").is_none(),
             "and it must not leave a partial one behind either"
+        );
+    }
+
+    /// The store key is a correlation id a caller can choose, and a
+    /// shadow answer is written from a task that outlives its request,
+    /// so a late leg landing on a colliding id must not write one
+    /// tenant's candidate output into another tenant's record.
+    #[test]
+    fn a_shadow_answer_never_lands_in_another_tenants_sample() {
+        store_input(sample("req-cc-collide", "tenant-cc-owner"));
+        assert!(
+            !attach_shadow_response(
+                "req-cc-collide",
+                "tenant-cc-stranger",
+                shadow("candidate", "the other tenant's answer")
+            ),
+            "a shadow answer from a different tenant must be refused"
+        );
+        let got = sample_for("req-cc-collide").expect("sample stored");
+        assert!(
+            got.shadow_responses.is_empty(),
+            "and it must leave the owner's sample untouched: {:?}",
+            got.shadow_responses
+        );
+        assert!(
+            attach_shadow_response(
+                "req-cc-collide",
+                "tenant-cc-owner",
+                shadow("candidate", "the owner's answer")
+            ),
+            "the owning tenant's own answer still lands"
         );
     }
 
@@ -286,10 +337,12 @@ mod tests {
         store_input(sample("req-cc-retry", "tenant-cc-retry"));
         assert!(attach_shadow_response(
             "req-cc-retry",
+            "tenant-cc-retry",
             shadow("candidate", "first")
         ));
         assert!(attach_shadow_response(
             "req-cc-retry",
+            "tenant-cc-retry",
             shadow("candidate", "second")
         ));
         let got = sample_for("req-cc-retry").expect("sample stored");
@@ -302,8 +355,11 @@ mod tests {
     fn retained_shadow_answers_are_capped_per_sample() {
         store_input(sample("req-cc-cap", "tenant-cc-cap"));
         for index in 0..(MAX_SHADOW_RESPONSES_PER_SAMPLE + 4) {
-            let landed =
-                attach_shadow_response("req-cc-cap", shadow(&format!("candidate-{index}"), "text"));
+            let landed = attach_shadow_response(
+                "req-cc-cap",
+                "tenant-cc-cap",
+                shadow(&format!("candidate-{index}"), "text"),
+            );
             assert_eq!(
                 landed,
                 index < MAX_SHADOW_RESPONSES_PER_SAMPLE,

@@ -17,10 +17,10 @@
 //! refused by the store rather than retained on its own.
 //!
 //! **Aggregation.** [`ShadowPairLedger`] is a bounded, process-local
-//! ring of what a window's worth of requests did, joined on the
-//! primary's request id, which is the `shadow_of` key the ledger rows
-//! already carry. [`TargetSummary`] is one row per target, and it leads
-//! with provenance on purpose: requests seen, the sample rate that was
+//! ring of what a window's worth of requests did, joined on a
+//! proxy-minted per-request identifier rather than on the correlation
+//! id a caller can choose. [`TargetSummary`] is one row per target,
+//! and it leads with provenance on purpose: requests seen, the sample rate that was
 //! actually applied, pairs retained, and pairs dropped by reason. Every
 //! delta below that is computed over the same paired subset and nothing
 //! else, so the numbers are falsifiable against the counts above them.
@@ -47,11 +47,19 @@ use serde::Serialize;
 
 /// Upper bound on primary requests tracked for pairing at once.
 ///
-/// A slot is opened only for a request that reached per-target shadow
-/// admission, so this bounds concurrently *evaluated* requests rather
-/// than traffic. The shadow supervisor admits 16 tasks at a time, so
-/// 512 slots hold a long tail of primaries whose shadow legs are still
-/// in flight without letting a busy route grow the ring without limit.
+/// A slot is opened for **every** request that reached per-target
+/// admission, including the ones every target sampled out, because
+/// that is what makes `requests_seen` a real denominator. So this
+/// bounds requests rather than admitted copies, and a busy route turns
+/// it over at the route's own rate: at 200 AI requests per second the
+/// ring holds about 2.5 seconds of traffic, while a completion takes
+/// seconds to report its primary leg.
+///
+/// A slot evicted before its primary arrived is therefore a real
+/// possibility rather than a corner, and it is counted:
+/// [`TargetProvenance::evicted_before_primary`] is the number of them,
+/// so a report over a saturated ring says so instead of certifying a
+/// sample whose edges it cannot see.
 const PAIR_LEDGER_CAPACITY: usize = 512;
 
 /// Upper bound on target legs recorded against one primary.
@@ -68,6 +76,9 @@ const NO_FINISH_REASON: &str = "none";
 ///
 /// The vocabulary is closed so the provenance block sums: every leg the
 /// ledger holds is either retained or dropped for exactly one of these.
+/// The shadow-eval section of `docs/ai-gateway.md` enumerates the same
+/// set, because a dashboard has to be written against the whole
+/// vocabulary rather than against whichever keys one sample produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PairDropReason {
     /// The request's single sampling draw did not select this target.
@@ -95,6 +106,15 @@ pub enum PairDropReason {
     /// The primary leg never arrived, so there is nothing to compare
     /// against. A shadow that outlives its own request ends here.
     PrimaryMissing,
+    /// The copy was admitted and has not reported back yet, or its
+    /// task died without reporting at all.
+    ///
+    /// Deliberately off the error axis: a call still in flight has
+    /// failed nothing, and counting it as an error would make
+    /// `errors.shadow_rate` climb with concurrency on a target whose
+    /// every call succeeds. A copy whose task died stays here rather
+    /// than disappearing, so the provenance block still sums.
+    NotReported,
 }
 
 impl PairDropReason {
@@ -113,6 +133,7 @@ impl PairDropReason {
             Self::ShadowTimeout => "shadow_timeout",
             Self::ShadowError => "shadow_error",
             Self::PrimaryMissing => "primary_missing",
+            Self::NotReported => "not_reported",
         }
     }
 }
@@ -127,24 +148,22 @@ impl PairDropReason {
 ///
 /// Implementations are called from the shadow task, off the caller's
 /// request path, and must not block.
+///
+/// The sink is built per request and carries its own store key, so
+/// this crate never sees, holds, or passes the caller-controlled
+/// correlation id that keys the content store. That is deliberate: the
+/// only identifier crossing this seam is the one the proxy minted.
 pub trait ShadowResponseSink: Send + Sync {
-    /// Retain one target's answer against `primary_request_id`, and
-    /// report whether it landed.
+    /// Retain one target's answer against the primary this sink was
+    /// built for, and report whether it landed.
     ///
     /// `response_body` is the target's response normalized to the
     /// OpenAI shape, so one extractor reads every vendor. The
     /// implementation redacts and caps before storing, and returns
-    /// `false` when no primary sample exists for that id: half a pair
-    /// is not a comparison, and retaining it would keep content whose
-    /// counterpart the consent gate refused.
-    fn retain(
-        &self,
-        primary_request_id: &str,
-        target: &str,
-        model: &str,
-        status: u16,
-        response_body: &[u8],
-    ) -> bool;
+    /// `false` when no primary sample exists for its request: half a
+    /// pair is not a comparison, and retaining it would keep content
+    /// whose counterpart the consent gate refused.
+    fn retain(&self, target: &str, model: &str, status: u16, response_body: &[u8]) -> bool;
 }
 
 /// Request-scoped evaluation context handed to every shadow target of
@@ -155,9 +174,20 @@ pub trait ShadowResponseSink: Send + Sync {
 /// means no response text is retained.
 #[derive(Clone, Default)]
 pub struct ShadowEvalContext {
-    /// The primary's request id: the join key for the pair ledger and
-    /// the `shadow_of` value already on the target's ledger row.
-    pub primary_request_id: Option<String>,
+    /// The pair ledger's join key: a **proxy-minted** per-request
+    /// identifier, never the inbound correlation header.
+    ///
+    /// `server.correlation_id` is on by default and adopts an inbound
+    /// `X-Request-Id` verbatim, so a caller can choose it. Joining a
+    /// ledger on a value the caller picks lets one client send every
+    /// request under one id, open a single slot, and overwrite that
+    /// slot's legs on every later request: the operator's comparison
+    /// report would then show one pair whose cost, latency, finish
+    /// reason and status the caller chose, and the rest of that
+    /// caller's traffic would be invisible to the evaluation. The
+    /// proxy mints an identifier of its own beside the correlation id
+    /// for exactly this reason, and that is what this field carries.
+    pub pair_key: Option<String>,
     /// Installed only when the request passed the content-recording
     /// gate. `None` means the target's response body is drained and
     /// never kept.
@@ -165,17 +195,17 @@ pub struct ShadowEvalContext {
 }
 
 impl ShadowEvalContext {
-    /// The primary id, when this request is being paired.
+    /// The pair ledger's join key, when this request is being paired.
     #[must_use]
-    pub fn request_id(&self) -> Option<&str> {
-        self.primary_request_id.as_deref()
+    pub fn pair_key(&self) -> Option<&str> {
+        self.pair_key.as_deref()
     }
 }
 
 impl std::fmt::Debug for ShadowEvalContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ShadowEvalContext")
-            .field("primary_request_id", &self.primary_request_id)
+            .field("pair_key", &self.pair_key)
             .field("retention", &self.retention.is_some())
             .finish()
     }
@@ -232,22 +262,38 @@ struct TargetLeg {
 }
 
 struct PairSlot {
-    request_id: String,
+    pair_key: String,
     opened_at: Instant,
     primary: Option<PrimaryLeg>,
     legs: Vec<TargetLeg>,
 }
 
-/// Bounded ring of primary/shadow pairs, joined on the primary's id.
+/// Everything the ledger holds, behind one lock.
+///
+/// The eviction tally lives here rather than beside the ring so there
+/// is no second lock to order against the first.
+#[derive(Default)]
+struct LedgerState {
+    slots: std::collections::VecDeque<PairSlot>,
+    /// Per target, requests whose slot left the ring before their
+    /// primary leg arrived. Monotonic for the life of the process.
+    evicted_before_primary: BTreeMap<String, u64>,
+}
+
+/// Bounded ring of primary/shadow pairs, joined on the proxy's own
+/// per-request identifier.
 #[derive(Default)]
 pub struct ShadowPairLedger {
-    slots: Mutex<std::collections::VecDeque<PairSlot>>,
-    /// Set by the first [`ShadowPairLedger::open`] and never cleared.
+    state: Mutex<LedgerState>,
+    /// Set by [`ShadowPairLedger::open`], cleared when the ring drains.
     ///
     /// The primary leg is recorded from the end-of-request hook on
     /// every AI request that reached a provider, and a deployment with
     /// no `shadow:` block anywhere should not pay a mutex and a scan
-    /// for that. One relaxed load answers it.
+    /// for that. One relaxed load answers it. It is cleared again once
+    /// the ring is empty, so removing every `shadow:` block on a reload
+    /// stops costing the primary path a lock as soon as the last open
+    /// slot ages out, rather than for the life of the process.
     armed: AtomicBool,
 }
 
@@ -267,6 +313,20 @@ pub struct TargetProvenance {
     /// Everything else, by reason. Sums with `pairs_retained` to
     /// `requests_seen`.
     pub pairs_dropped: BTreeMap<String, u64>,
+    /// Requests dropped from the bounded ring before their primary leg
+    /// arrived, counted since process start rather than over the
+    /// window.
+    ///
+    /// Read it as the sample's error bar. The ring holds a fixed
+    /// number of requests and a completion reports its primary leg
+    /// seconds after the slot opened, so a route busy enough to turn
+    /// the ring over inside that gap loses pairs the window's counts
+    /// above can never mention. A non-zero value here says the counts
+    /// above are a truncated sample biased toward the primaries that
+    /// finished fastest, which is the direction that hides a tail
+    /// regression, and that a narrower `window` will read truer than a
+    /// wider one.
+    pub evicted_before_primary: u64,
     /// Pairs whose response *text* was kept under the content-recording
     /// consent. Zero unless the origin sets `capture_content` and the
     /// key's policy sets `allow_content_capture`.
@@ -421,22 +481,37 @@ impl ShadowPairLedger {
     /// id keeps what is already there rather than resetting it, because
     /// the three dispatch arms that spawn shadows can each reach this
     /// once per request.
-    pub fn open(&self, request_id: &str, legs: &[(String, f32, Option<PairDropReason>)]) {
-        if request_id.is_empty() || legs.is_empty() {
+    pub fn open(&self, pair_key: &str, legs: &[(String, f32, Option<PairDropReason>)]) {
+        if pair_key.is_empty() || legs.is_empty() {
             return;
         }
-        let Ok(mut slots) = self.slots.lock() else {
+        let Ok(mut state) = self.state.lock() else {
             return;
         };
-        if slots.iter().any(|slot| slot.request_id == request_id) {
+        if state.slots.iter().any(|slot| slot.pair_key == pair_key) {
             return;
         }
-        if slots.len() >= PAIR_LEDGER_CAPACITY {
-            slots.pop_front();
+        if state.slots.len() >= PAIR_LEDGER_CAPACITY {
+            if let Some(evicted) = state.slots.pop_front() {
+                // A slot that leaves the ring having never been paired
+                // is a request the report would otherwise never
+                // mention: not in `requests_seen`, not under any drop
+                // reason, nowhere. Counting it here is what stops the
+                // provenance block certifying a sample whose edges it
+                // cannot see.
+                if evicted.primary.is_none() {
+                    for leg in &evicted.legs {
+                        *state
+                            .evicted_before_primary
+                            .entry(leg.target.clone())
+                            .or_default() += 1;
+                    }
+                }
+            }
         }
         self.armed.store(true, Ordering::Relaxed);
-        slots.push_back(PairSlot {
-            request_id: request_id.to_string(),
+        state.slots.push_back(PairSlot {
+            pair_key: pair_key.to_string(),
             opened_at: Instant::now(),
             primary: None,
             legs: legs
@@ -446,36 +521,52 @@ impl ShadowPairLedger {
                     target: target.clone(),
                     sample_rate: *sample_rate,
                     // A leg with no drop reason was admitted and is
-                    // running. It stays `ShadowError` until the task
+                    // running. It stays `NotReported` until the task
                     // reports back, so a copy whose process died mid
-                    // flight is never silently counted as a success.
-                    outcome: LegOutcome::NotRun(drop.unwrap_or(PairDropReason::ShadowError)),
+                    // flight is never silently counted as a success and
+                    // a copy still in flight is never counted as an
+                    // error.
+                    outcome: LegOutcome::NotRun(drop.unwrap_or(PairDropReason::NotReported)),
                 })
                 .collect(),
         });
     }
 
     /// Record the primary half. Ignored unless the request armed a slot.
-    pub fn record_primary(&self, request_id: &str, leg: PrimaryLeg) {
+    pub fn record_primary(&self, pair_key: &str, leg: PrimaryLeg) {
         if !self.armed.load(Ordering::Relaxed) {
             return;
         }
-        let Ok(mut slots) = self.slots.lock() else {
+        let Ok(mut state) = self.state.lock() else {
             return;
         };
-        if let Some(slot) = slots.iter_mut().find(|slot| slot.request_id == request_id) {
+        if let Some(slot) = state
+            .slots
+            .iter_mut()
+            .find(|slot| slot.pair_key == pair_key)
+        {
             slot.primary = Some(leg);
+        } else if state.slots.is_empty() {
+            // Every slot has aged out and nothing has opened a new one,
+            // which is what a reload that removed the last `shadow:`
+            // block looks like from here. Disarm under the lock, so an
+            // `open` that is mid-flight cannot have its arming undone.
+            self.armed.store(false, Ordering::Relaxed);
         }
     }
 
     /// Record one target's completed call, replacing the placeholder
     /// `open` left for it. Ignored unless the request armed a slot and
     /// declared that target.
-    pub fn record_shadow(&self, request_id: &str, target: &str, leg: ShadowLeg) {
-        let Ok(mut slots) = self.slots.lock() else {
+    pub fn record_shadow(&self, pair_key: &str, target: &str, leg: ShadowLeg) {
+        let Ok(mut state) = self.state.lock() else {
             return;
         };
-        let Some(slot) = slots.iter_mut().find(|slot| slot.request_id == request_id) else {
+        let Some(slot) = state
+            .slots
+            .iter_mut()
+            .find(|slot| slot.pair_key == pair_key)
+        else {
             return;
         };
         if let Some(existing) = slot.legs.iter_mut().find(|entry| entry.target == target) {
@@ -485,11 +576,15 @@ impl ShadowPairLedger {
 
     /// Record that a target the ledger believed was running was
     /// refused before transport.
-    pub fn record_drop(&self, request_id: &str, target: &str, reason: PairDropReason) {
-        let Ok(mut slots) = self.slots.lock() else {
+    pub fn record_drop(&self, pair_key: &str, target: &str, reason: PairDropReason) {
+        let Ok(mut state) = self.state.lock() else {
             return;
         };
-        let Some(slot) = slots.iter_mut().find(|slot| slot.request_id == request_id) else {
+        let Some(slot) = state
+            .slots
+            .iter_mut()
+            .find(|slot| slot.pair_key == pair_key)
+        else {
             return;
         };
         if let Some(existing) = slot.legs.iter_mut().find(|entry| entry.target == target) {
@@ -508,12 +603,21 @@ impl ShadowPairLedger {
         window: Duration,
         judge: &dyn Fn(&str) -> Option<TargetAgreement>,
     ) -> Vec<TargetSummary> {
-        let Ok(slots) = self.slots.lock() else {
+        let Ok(state) = self.state.lock() else {
             return Vec::new();
         };
         let now = Instant::now();
         let mut folded: BTreeMap<String, Fold> = BTreeMap::new();
-        for slot in slots.iter() {
+        // Seed from the eviction tally first, so a target whose every
+        // slot was evicted still gets a row saying so instead of
+        // vanishing from the report along with its evidence.
+        for (target, count) in &state.evicted_before_primary {
+            folded
+                .entry(target.clone())
+                .or_default()
+                .evicted_before_primary = *count;
+        }
+        for slot in state.slots.iter() {
             if now.duration_since(slot.opened_at) > window {
                 continue;
             }
@@ -581,8 +685,9 @@ impl ShadowPairLedger {
     /// leak into another's report through the process-global ledger.
     #[cfg(test)]
     fn clear(&self) {
-        if let Ok(mut slots) = self.slots.lock() {
-            slots.clear();
+        if let Ok(mut state) = self.state.lock() {
+            state.slots.clear();
+            state.evicted_before_primary.clear();
         }
     }
 }
@@ -593,6 +698,7 @@ struct Fold {
     sample_rate: f32,
     pairs_retained: u64,
     responses_retained: u64,
+    evicted_before_primary: u64,
     dropped: BTreeMap<PairDropReason, u64>,
     shadow_cost_usd: f64,
     primary_cost_usd: f64,
@@ -654,6 +760,7 @@ impl Fold {
                     .map(|(reason, count)| (reason.as_str().to_string(), count))
                     .collect(),
                 responses_retained: self.responses_retained,
+                evicted_before_primary: self.evicted_before_primary,
             },
             cost: TargetCost {
                 shadow_usd: self.shadow_cost_usd,
@@ -931,16 +1038,78 @@ mod tests {
         assert_eq!(row.cost.delta_usd, 0.0, "{row:?}");
     }
 
-    /// A target admitted but never reported on stays a failure rather
-    /// than becoming a silent success.
+    /// A target admitted but never reported on stays visible rather
+    /// than becoming a silent success, and stays off the error axis
+    /// rather than being counted as a failure it has not had. A shadow
+    /// task runs for as long as the target takes, so at any instant a
+    /// window holds copies still in flight; charging those to
+    /// `errors.shadow_rate` would make the rate climb with concurrency
+    /// on a target whose every call succeeds.
     #[test]
-    fn an_admitted_target_that_never_reports_is_an_error_not_a_pair() {
+    fn an_admitted_target_that_never_reports_is_pending_not_an_error() {
         let ledger = ShadowPairLedger::default();
         ledger.open("req-lost", &legs(&["t"], 1.0));
         ledger.record_primary("req-lost", primary(0.01, 100));
         let row = &ledger.report(Duration::from_secs(60), &no_judge)[0];
         assert_eq!(row.provenance.pairs_retained, 0);
-        assert_eq!(row.provenance.pairs_dropped.get("shadow_error"), Some(&1));
+        assert_eq!(row.provenance.pairs_dropped.get("not_reported"), Some(&1));
+        assert_eq!(
+            row.provenance.pairs_dropped.get("shadow_error"),
+            None,
+            "a copy still in flight has failed nothing: {row:?}"
+        );
+        assert_eq!(
+            row.errors.shadow_rate, 0.0,
+            "and it must not move the error rate: {row:?}"
+        );
+    }
+
+    /// The ring bounds requests, not admitted copies, and a primary leg
+    /// lands seconds after its slot opens. A route busy enough to turn
+    /// the ring over inside that gap loses pairs, and the report has to
+    /// say so rather than certify the survivors.
+    #[test]
+    fn a_slot_evicted_before_its_primary_is_counted_and_reported() {
+        let ledger = ShadowPairLedger::default();
+        // One slot that never gets a primary, then enough traffic to
+        // push it out of the ring.
+        ledger.open("req-evicted", &legs(&["t"], 1.0));
+        for index in 0..PAIR_LEDGER_CAPACITY {
+            let id = format!("req-fill-{index}");
+            ledger.open(&id, &legs(&["t"], 1.0));
+            ledger.record_primary(&id, primary(0.01, 10));
+            ledger.record_shadow(&id, "t", ran(0.01, 10, Some("stop")));
+        }
+        let row = &ledger.report(Duration::from_secs(60), &no_judge)[0];
+        assert_eq!(
+            row.provenance.evicted_before_primary, 1,
+            "the evicted request is named rather than silently dropped: {row:?}"
+        );
+        assert_eq!(
+            row.provenance.requests_seen as usize, PAIR_LEDGER_CAPACITY,
+            "and the windowed counts still describe only what the ring holds: {row:?}"
+        );
+    }
+
+    /// A saturated ring must not make a target disappear from the
+    /// report along with the evidence that it was saturated.
+    #[test]
+    fn a_target_whose_every_slot_was_evicted_still_gets_a_row() {
+        let ledger = ShadowPairLedger::default();
+        ledger.open("req-vanish", &legs(&["ghost"], 1.0));
+        for index in 0..PAIR_LEDGER_CAPACITY {
+            let id = format!("req-other-{index}");
+            ledger.open(&id, &legs(&["other"], 1.0));
+            ledger.record_primary(&id, primary(0.01, 10));
+            ledger.record_shadow(&id, "other", ran(0.01, 10, Some("stop")));
+        }
+        let report = ledger.report(Duration::from_secs(60), &no_judge);
+        let ghost = report
+            .iter()
+            .find(|row| row.target == "ghost")
+            .expect("the evicted target still has a row");
+        assert_eq!(ghost.provenance.requests_seen, 0);
+        assert_eq!(ghost.provenance.evicted_before_primary, 1);
     }
 
     /// Retention is counted, so an operator can tell a window with
@@ -1116,7 +1285,27 @@ mod tests {
                 .provenance
                 .pairs_retained,
             1,
-            "and one open arms the ledger for the rest of the process"
+            "and one open arms the ledger"
+        );
+    }
+
+    /// The arming flag exists to keep the primary hook free on a
+    /// deployment with no `shadow:` block. A reload that removes every
+    /// block should get that back, rather than paying a lock forever
+    /// because one slot was opened once.
+    #[test]
+    fn a_drained_ledger_disarms_itself_again() {
+        let ledger = ShadowPairLedger::default();
+        ledger.open("req-drain", &legs(&["t"], 1.0));
+        assert!(
+            ledger.armed.load(Ordering::Relaxed),
+            "an open arms the ledger"
+        );
+        ledger.clear();
+        ledger.record_primary("req-after-drain", primary(0.01, 10));
+        assert!(
+            !ledger.armed.load(Ordering::Relaxed),
+            "a primary hook that finds an empty ring disarms it again"
         );
     }
 
@@ -1129,6 +1318,6 @@ mod tests {
             context.retention.is_none(),
             "no sink means the target's body is never kept"
         );
-        assert!(context.request_id().is_none());
+        assert!(context.pair_key().is_none());
     }
 }

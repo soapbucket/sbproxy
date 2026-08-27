@@ -1169,34 +1169,26 @@ pub struct AiShadowJudge {
     /// Provider entry on this action the judge calls. Named rather
     /// than defaulted to the primary, because judging with the model
     /// under evaluation is how a candidate grades its own homework.
+    ///
+    /// Resolved against `providers[]` at config load and refused when
+    /// it names nothing, so a typo is a boot-time error rather than a
+    /// report that reads `scoring_pending` forever.
     pub provider: String,
-    /// Model override for the judge call. Defaults to the provider
-    /// entry's own default model.
-    #[serde(default)]
-    pub model: Option<String>,
-    /// Hard spend cap per `spend_window`, in USD. Required, not
-    /// defaulted: an unbounded judge is the exact failure this key
-    /// exists to prevent, and a default would be an operator's bill
-    /// chosen by us.
+    /// Hard spend cap per `spend_window`, in USD, shared by every
+    /// target in this `shadow:` block. Required, not defaulted: an
+    /// unbounded judge is the exact failure this key exists to
+    /// prevent, and a default would be an operator's bill chosen by
+    /// us.
     pub max_spend_usd: f64,
     /// How long the cap covers before it resets. `daily` (the default)
-    /// or `weekly`.
+    /// or `weekly`, both rolling from when the window opened rather
+    /// than from a calendar boundary.
     #[serde(default = "default_judge_spend_window")]
     pub spend_window: crate::shadow_judge::JudgeSpendWindow,
-    /// Whether the deterministic divergence pre-filter runs before any
-    /// judge call. On by default, and there is no good reason to turn
-    /// it off: two byte-identical answers cost money to have an LLM
-    /// confirm are identical.
-    #[serde(default = "default_divergence_prefilter")]
-    pub divergence_prefilter: bool,
 }
 
 fn default_judge_spend_window() -> crate::shadow_judge::JudgeSpendWindow {
     crate::shadow_judge::JudgeSpendWindow::Daily
-}
-
-fn default_divergence_prefilter() -> bool {
-    true
 }
 
 /// One provider this route is shadowed against.
@@ -1942,6 +1934,33 @@ impl AiHandlerConfig {
             }
         }
 
+        // WOR-2654: the judge's provider is a `providers[]` entry, and
+        // the deserializer's refusal already says so, so resolve it
+        // here where the list exists. Without this a typo boots clean
+        // and surfaces only when the scorer ships, against a config
+        // that has been in production for months.
+        if let Some(judge) = config
+            .shadow
+            .as_ref()
+            .and_then(|shadow| shadow.judge.as_ref())
+        {
+            let named = judge.provider.trim();
+            if !config
+                .providers
+                .iter()
+                .any(|provider| provider.name == named)
+            {
+                let known: Vec<&str> = config
+                    .providers
+                    .iter()
+                    .map(|provider| provider.name.as_str())
+                    .collect();
+                anyhow::bail!(
+                    "ai shadow.judge.provider {named:?} names no providers[] entry on this \
+                     action; declared providers are {known:?}"
+                );
+            }
+        }
         // WOR-1880: reject strong consistency / invalid pool shapes at load.
         if let Some(pool) = &config.quota_pool {
             crate::quota_pool::validate_quota_pool_config(pool)
@@ -2115,13 +2134,19 @@ impl AiHandlerConfig {
         if install_price_table {
             if let Some(shadow) = config.shadow.as_ref() {
                 if let Some(judge) = shadow.judge.as_ref() {
-                    for target in &shadow.targets {
-                        crate::shadow_judge::JudgeRegistry::global().install(
-                            &target.provider,
-                            judge.max_spend_usd,
-                            judge.spend_window,
-                        );
-                    }
+                    // One budget for the whole block, not one per
+                    // target: the operator wrote one number and it has
+                    // to be one ceiling.
+                    let targets: Vec<String> = shadow
+                        .targets
+                        .iter()
+                        .map(|target| target.provider.clone())
+                        .collect();
+                    crate::shadow_judge::JudgeRegistry::global().install(
+                        &targets,
+                        judge.max_spend_usd,
+                        judge.spend_window,
+                    );
                 }
             }
         }
@@ -3644,6 +3669,7 @@ mod tests {
                 {"name": "primary", "api_key": "k"},
                 {"name": "anthropic", "api_key": "k"},
                 {"name": "gemini", "api_key": "k"},
+                {"name": "judge-openai", "api_key": "k"},
             ],
             "shadow": block,
         }))
@@ -3769,9 +3795,89 @@ mod tests {
             crate::shadow_judge::JudgeSpendWindow::Daily,
             "daily is the default window"
         );
+    }
+
+    /// The seam nothing tested: a `judge:` block in the config, and the
+    /// agreement row the admin report serializes for it. Every piece
+    /// between the two (the compile-time install, the registry lookup,
+    /// the snapshot, the row) was covered alone; the path from one end
+    /// to the other was not, so a compile that stopped installing
+    /// budgets would have left every test green.
+    #[test]
+    fn a_judge_block_reaches_the_reports_agreement_row() {
+        crate::shadow_judge::JudgeRegistry::global().clear_for_test();
+        let config = shadow_config(serde_json::json!({
+            "targets": [{"provider": "anthropic"}, {"provider": "gemini"}],
+            "judge": {
+                "provider": "judge-openai",
+                "max_spend_usd": 5.0,
+                "spend_window": "weekly",
+            }
+        }))
+        .expect("a two-target block with a judge parses and compiles");
+        assert_eq!(config.shadow.as_ref().expect("shadow").targets.len(), 2);
+
+        let ledger = crate::shadow_eval::ShadowPairLedger::default();
+        for target in ["anthropic", "gemini"] {
+            let id = format!("req-seam-{target}");
+            ledger.open(&id, &[(target.to_string(), 1.0, None)]);
+            ledger.record_primary(
+                &id,
+                crate::shadow_eval::PrimaryLeg {
+                    provider: "primary".to_string(),
+                    model: "primary-model".to_string(),
+                    cost_usd: 0.01,
+                    latency_ms: 100,
+                    status: 200,
+                },
+            );
+            ledger.record_shadow(
+                &id,
+                target,
+                crate::shadow_eval::ShadowLeg {
+                    model: "candidate".to_string(),
+                    status: 200,
+                    cost_usd: 0.005,
+                    latency_ms: 80,
+                    finish_reason: Some("stop".to_string()),
+                    response_retained: false,
+                },
+            );
+        }
+        let rows = ledger.report(
+            std::time::Duration::from_secs(60),
+            &crate::shadow_judge::agreement_for,
+        );
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        for row in &rows {
+            assert_eq!(
+                row.agreement.status, "scoring_pending",
+                "a configured judge is pending, not absent: {row:?}"
+            );
+            assert_eq!(
+                row.agreement.judge_spend_cap_usd,
+                Some(5.0),
+                "the one cap the operator wrote is the cap both targets report: {row:?}"
+            );
+        }
+        crate::shadow_judge::JudgeRegistry::global().clear_for_test();
+    }
+
+    /// The refusal message promises `providers[]` resolution, so the
+    /// resolution has to run. A typo that boots clean surfaces only
+    /// when the scorer ships, against a config that has been in
+    /// production for months.
+    #[test]
+    fn a_judge_naming_an_undeclared_provider_is_refused() {
+        let error = shadow_config(serde_json::json!({
+            "targets": [{"provider": "anthropic"}],
+            "judge": {"provider": "judge-opeani", "max_spend_usd": 1.0}
+        }))
+        .expect_err("a judge naming no providers[] entry is refused");
+        let message = error.to_string();
         assert!(
-            judge.divergence_prefilter,
-            "the pre-filter is on unless an operator turns it off"
+            message.contains("judge-opeani") && message.contains("providers[]"),
+            "the refusal must name the typo and what it failed to resolve against: {message}"
         );
     }
 

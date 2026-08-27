@@ -2400,26 +2400,26 @@ pub(super) fn shadow_usage_record_from_context(
 /// Held by the shadow task, which outlives the request, so the redactor
 /// is cloned rather than borrowed; `PiiRedactor` keeps its rules behind
 /// an `Arc` and the clone is a handle.
+/// The store key and the owning tenant are held here rather than
+/// passed across the seam, so the AI crate never handles the
+/// caller-controlled correlation id, and every write this sink makes
+/// is checked against the tenant the request was authorized as.
 pub(super) struct ContentCaptureShadowSink {
+    request_id: String,
+    tenant_id: String,
     pii_redactor: Option<sbproxy_security::pii::PiiRedactor>,
 }
 
 impl sbproxy_ai::shadow_eval::ShadowResponseSink for ContentCaptureShadowSink {
-    fn retain(
-        &self,
-        primary_request_id: &str,
-        target: &str,
-        model: &str,
-        status: u16,
-        response_body: &[u8],
-    ) -> bool {
+    fn retain(&self, target: &str, model: &str, status: u16, response_body: &[u8]) -> bool {
         let completion = extract_completion_text(response_body);
         let redacted = redact_ai_trace_content(&completion, self.pii_redactor.as_ref());
         if redacted.trim().is_empty() {
             return false;
         }
         crate::content_capture::attach_shadow_response(
-            primary_request_id,
+            &self.request_id,
+            &self.tenant_id,
             crate::content_capture::ShadowResponseSample {
                 target: target.to_string(),
                 model: model.to_string(),
@@ -2437,22 +2437,43 @@ impl sbproxy_ai::shadow_eval::ShadowResponseSink for ContentCaptureShadowSink {
 /// `allow_content_capture`), passed in rather than recomputed so the
 /// retention decision and the primary's own capture decision cannot
 /// drift apart. When it is false the returned context still carries the
-/// request id, so the aggregate view keeps working on a route that
+/// pair key, so the aggregate view keeps working on a route that
 /// records no content at all, and carries no sink, so no response text
 /// is kept anywhere.
+///
+/// The pair key is [`crate::context::RequestContext::envelope_request_id`],
+/// the ULID the proxy mints at request entry, and never `request_id`:
+/// that one is the correlation header's value when the caller sent
+/// one, so joining a process-wide ledger on it would let a caller
+/// choose which of its requests the operator's comparison report sees.
+/// The retention sink still keys the content store on `request_id`,
+/// because that is the store's own key and the id an operator looks a
+/// request up by, but it carries the tenant so a colliding id cannot
+/// cross tenants.
 pub(super) fn shadow_eval_context(
     config: &AiHandlerConfig,
     ctx: &crate::context::RequestContext,
     capture_allowed: bool,
 ) -> sbproxy_ai::shadow_eval::ShadowEvalContext {
     sbproxy_ai::shadow_eval::ShadowEvalContext {
-        primary_request_id: (!ctx.request_id.is_empty()).then(|| ctx.request_id.to_string()),
-        retention: capture_allowed.then(|| {
+        pair_key: shadow_pair_key(ctx),
+        retention: (capture_allowed && !ctx.request_id.is_empty()).then(|| {
             std::sync::Arc::new(ContentCaptureShadowSink {
+                request_id: ctx.request_id.to_string(),
+                tenant_id: ctx.tenant_id.to_string(),
                 pii_redactor: config.pii_redactor().cloned(),
             }) as std::sync::Arc<dyn sbproxy_ai::shadow_eval::ShadowResponseSink>
         }),
     }
+}
+
+/// The pair ledger's join key for this request.
+///
+/// One place, so the dispatch side that opens a slot and the
+/// end-of-request hook that records the primary leg cannot key on
+/// different things and quietly stop pairing.
+pub(super) fn shadow_pair_key(ctx: &crate::context::RequestContext) -> Option<String> {
+    ctx.envelope_request_id.map(|id| id.to_string())
 }
 
 /// WOR-2654: record the primary half of a shadow pair.
@@ -2467,11 +2488,11 @@ pub(super) fn record_shadow_primary_leg(ctx: &crate::context::RequestContext, st
     let Some(provider) = ctx.ai_provider.clone() else {
         return;
     };
-    if ctx.request_id.is_empty() {
+    let Some(pair_key) = shadow_pair_key(ctx) else {
         return;
-    }
+    };
     sbproxy_ai::shadow_eval::ShadowPairLedger::global().record_primary(
-        ctx.request_id.as_str(),
+        pair_key.as_str(),
         sbproxy_ai::shadow_eval::PrimaryLeg {
             provider,
             model: ctx.ai_model.clone().unwrap_or_default(),

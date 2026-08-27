@@ -140,12 +140,19 @@ fn normalize_whitespace(input: &str) -> String {
 }
 
 /// How long a spend cap covers before it resets.
+///
+/// Both windows roll from when the budget's own window opened, which
+/// is process start or the last reset, and not from a calendar
+/// boundary: `daily` is a rolling 24 hours rather than midnight UTC,
+/// and `weekly` is a rolling 7 days rather than Monday. A restart
+/// opens a fresh window, so a proxy that restarts more often than the
+/// window rolls never reaches the cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JudgeSpendWindow {
-    /// Reset 24 hours after the window opened.
+    /// A rolling 24 hours from when the window opened.
     Daily,
-    /// Reset 7 days after the window opened.
+    /// A rolling 7 days from when the window opened.
     Weekly,
 }
 
@@ -181,13 +188,27 @@ pub struct JudgeSpendSnapshot {
     pub spent_usd: f64,
     /// The configured hard cap.
     pub cap_usd: f64,
-    /// Whether the cap has auto-paused judging.
+    /// Whether the cap has refused a pair in this window, which is
+    /// what auto-pause means: `plan_batch` stops at the first refusal
+    /// and refuses the rest of the batch behind it. True while the
+    /// spend is still under the cap, when the next pair's reservation
+    /// would not fit.
     pub paused: bool,
 }
 
 struct BudgetState {
     window_started: Instant,
     spent_usd: f64,
+    /// Set the first time [`JudgeBudget::admit`] refuses in this
+    /// window, cleared when the window rolls.
+    ///
+    /// This is the flag the report publishes, and it is recorded
+    /// rather than derived because the derived form was wrong: judging
+    /// pauses when the *next* pair's estimate does not fit under the
+    /// cap, which happens while the spend is still below it, so
+    /// `spent >= cap` reported `paused: false` on a budget that was
+    /// already refusing every pair.
+    paused: bool,
 }
 
 /// A hard, self-resetting spend cap on the judge.
@@ -211,6 +232,7 @@ impl JudgeBudget {
             state: Mutex::new(BudgetState {
                 window_started: Instant::now(),
                 spent_usd: 0.0,
+                paused: false,
             }),
         }
     }
@@ -225,17 +247,22 @@ impl JudgeBudget {
         let Ok(mut state) = self.state.lock() else {
             // A poisoned budget cannot prove it is under its cap, so it
             // is treated as spent. Failing open here would mean an
-            // unbounded bill on a lock error.
+            // unbounded bill on a lock error. Reported as the cap
+            // rather than as `NaN`, which serializes to `null` and
+            // would leave the operator's report with two blank money
+            // fields and no explanation.
             return JudgeAdmission::Paused {
-                spent_usd: f64::NAN,
+                spent_usd: self.cap_usd,
                 cap_usd: self.cap_usd,
             };
         };
         if state.window_started.elapsed() >= self.window {
             state.window_started = Instant::now();
             state.spent_usd = 0.0;
+            state.paused = false;
         }
         if state.spent_usd + estimate_usd > self.cap_usd {
+            state.paused = true;
             return JudgeAdmission::Paused {
                 spent_usd: state.spent_usd,
                 cap_usd: self.cap_usd,
@@ -257,21 +284,22 @@ impl JudgeBudget {
     #[must_use]
     pub fn snapshot(&self) -> JudgeSpendSnapshot {
         let Ok(state) = self.state.lock() else {
+            // Same reading as `admit`'s: a budget that cannot prove it
+            // is under its cap is spent, and it says so with numbers
+            // rather than with `null`.
             return JudgeSpendSnapshot {
-                spent_usd: f64::NAN,
+                spent_usd: self.cap_usd,
                 cap_usd: self.cap_usd,
                 paused: true,
             };
         };
-        let spent_usd = if state.window_started.elapsed() >= self.window {
-            0.0
-        } else {
-            state.spent_usd
-        };
+        let rolled = state.window_started.elapsed() >= self.window;
+        let spent_usd = if rolled { 0.0 } else { state.spent_usd };
         JudgeSpendSnapshot {
             spent_usd,
             cap_usd: self.cap_usd,
-            paused: spent_usd >= self.cap_usd,
+            // The flag `admit` actually set, not a re-derivation of it.
+            paused: !rolled && state.paused,
         }
     }
 }
@@ -377,12 +405,21 @@ pub fn plan_batch(
     plan
 }
 
-/// Per-target judge budgets, installed at config load.
+/// Judge budgets, installed at config load and looked up by target.
 ///
-/// Keyed by target name and nothing else, which is the same key the
-/// shadow metric families and the pair ledger already use: two routes
-/// naming one candidate provider share its cap, because the operator's
-/// bill for judging that candidate is one bill.
+/// The lookup is by target name, which is the same key the shadow
+/// metric families and the pair ledger already use, but the *budget*
+/// is one per `judge:` block: every target in one `shadow:` block
+/// shares a single [`JudgeBudget`], so the one `max_spend_usd` the
+/// operator wrote is one ceiling rather than a ceiling per target.
+/// WOR-2654 demands that of shadow admission ("shared across targets,
+/// not multiplied") and money is the axis where multiplying it matters
+/// most: an operator who budgets five dollars against a two-target
+/// block must not be exposed to ten.
+///
+/// Two routes naming one candidate provider still share that
+/// candidate's budget, because the last block installed wins the key
+/// and the bill for judging one candidate is one bill.
 #[derive(Default)]
 pub struct JudgeRegistry {
     budgets: Mutex<BTreeMap<String, Arc<JudgeBudget>>>,
@@ -395,32 +432,54 @@ impl JudgeRegistry {
         REGISTRY.get_or_init(Self::default)
     }
 
-    /// Install (or re-cap) the budget for `target`.
+    /// Install (or re-cap) one budget covering every target in one
+    /// `judge:` block.
     ///
-    /// A reload that leaves the cap and window unchanged keeps the
-    /// existing budget, so hot-reloading a config does not hand an
-    /// exhausted judge a fresh allowance. A changed cap is a
-    /// deliberate operator act and takes effect immediately, spend
-    /// carried over.
-    pub fn install(&self, target: &str, cap_usd: f64, window: JudgeSpendWindow) {
+    /// All of `targets` end up pointing at the same [`JudgeBudget`],
+    /// which is what makes the block's single `max_spend_usd` a single
+    /// ceiling.
+    ///
+    /// A reload that leaves the cap, the window, and the target set
+    /// unchanged keeps the existing budget, so hot-reloading a config
+    /// does not hand an exhausted judge a fresh allowance. A changed
+    /// cap is a deliberate operator act and takes effect immediately,
+    /// spend carried over.
+    pub fn install(&self, targets: &[String], cap_usd: f64, window: JudgeSpendWindow) {
+        if targets.is_empty() {
+            return;
+        }
         let Ok(mut budgets) = self.budgets.lock() else {
             return;
         };
-        match budgets.get(target) {
-            Some(existing)
-                if existing.cap_usd == cap_usd && existing.window == window.duration() => {}
-            Some(existing) => {
-                let carried = existing.snapshot().spent_usd;
-                let replacement = JudgeBudget::new(cap_usd, window);
-                replacement.admit(carried.min(cap_usd));
-                budgets.insert(target.to_string(), Arc::new(replacement));
+        // The block's current budget, if every target already shares
+        // one. `None` when a target is new, when a target was moved off
+        // another block's budget, or when nothing is installed yet.
+        let shared = budgets.get(&targets[0]).cloned().filter(|first| {
+            targets.iter().all(|target| {
+                budgets
+                    .get(target)
+                    .is_some_and(|held| Arc::ptr_eq(held, first))
+            })
+        });
+        if let Some(existing) = shared.as_ref() {
+            if existing.cap_usd == cap_usd && existing.window == window.duration() {
+                return;
             }
-            None => {
-                budgets.insert(
-                    target.to_string(),
-                    Arc::new(JudgeBudget::new(cap_usd, window)),
-                );
-            }
+        }
+        // Carry the spend over so a re-cap is not a way to buy a fresh
+        // allowance. The highest spend among the budgets these targets
+        // held is the conservative reading when they are being merged.
+        let carried = targets
+            .iter()
+            .filter_map(|target| budgets.get(target))
+            .map(|budget| budget.snapshot().spent_usd)
+            .fold(0.0_f64, f64::max);
+        let replacement = Arc::new(JudgeBudget::new(cap_usd, window));
+        if carried > 0.0 {
+            replacement.admit(carried.min(cap_usd));
+        }
+        for target in targets {
+            budgets.insert(target.clone(), Arc::clone(&replacement));
         }
     }
 
@@ -430,9 +489,12 @@ impl JudgeRegistry {
         self.budgets.lock().ok()?.get(target).cloned()
     }
 
-    /// Forget every installed budget. Test-only.
+    /// Forget every installed budget.
+    ///
+    /// Test-only affordance: the registry is process-global, so a test
+    /// that installs a budget has to be able to put the process back.
     #[cfg(test)]
-    fn clear(&self) {
+    pub(crate) fn clear_for_test(&self) {
         if let Ok(mut budgets) = self.budgets.lock() {
             budgets.clear();
         }
@@ -606,6 +668,7 @@ mod tests {
             state: Mutex::new(BudgetState {
                 window_started: Instant::now(),
                 spent_usd: 0.02,
+                paused: true,
             }),
         };
         assert_eq!(
@@ -632,10 +695,11 @@ mod tests {
     #[test]
     fn reinstalling_an_unchanged_budget_keeps_its_spend() {
         let registry = JudgeRegistry::default();
-        registry.install("candidate", 1.0, JudgeSpendWindow::Daily);
+        let targets = vec!["candidate".to_string()];
+        registry.install(&targets, 1.0, JudgeSpendWindow::Daily);
         let budget = registry.budget_for("candidate").expect("installed");
         assert_eq!(budget.admit(0.75), JudgeAdmission::Admitted);
-        registry.install("candidate", 1.0, JudgeSpendWindow::Daily);
+        registry.install(&targets, 1.0, JudgeSpendWindow::Daily);
         let after = registry.budget_for("candidate").expect("still installed");
         assert!(
             (after.snapshot().spent_usd - 0.75).abs() < 1e-9,
@@ -648,33 +712,83 @@ mod tests {
     #[test]
     fn a_changed_cap_carries_the_spend_over() {
         let registry = JudgeRegistry::default();
-        registry.install("candidate", 1.0, JudgeSpendWindow::Daily);
+        let targets = vec!["candidate".to_string()];
+        registry.install(&targets, 1.0, JudgeSpendWindow::Daily);
         registry
             .budget_for("candidate")
             .expect("installed")
             .admit(0.75);
-        registry.install("candidate", 2.0, JudgeSpendWindow::Daily);
+        registry.install(&targets, 2.0, JudgeSpendWindow::Daily);
         let after = registry.budget_for("candidate").expect("reinstalled");
         let snapshot = after.snapshot();
         assert!((snapshot.cap_usd - 2.0).abs() < 1e-9, "{snapshot:?}");
         assert!((snapshot.spent_usd - 0.75).abs() < 1e-9, "{snapshot:?}");
     }
 
+    /// WOR-2654 requires shadow admission to be shared across targets
+    /// rather than multiplied by their number. Money is the axis where
+    /// that matters most: one `max_spend_usd` written under one
+    /// `judge:` key must be one ceiling for the block, not one per
+    /// target name.
+    #[test]
+    fn one_cap_covers_every_target_in_the_block() {
+        let registry = JudgeRegistry::default();
+        let targets = vec!["anthropic".to_string(), "gemini".to_string()];
+        registry.install(&targets, 5.0, JudgeSpendWindow::Daily);
+        let first = registry.budget_for("anthropic").expect("installed");
+        let second = registry.budget_for("gemini").expect("installed");
+        assert_eq!(first.admit(5.0), JudgeAdmission::Admitted);
+        assert!(
+            matches!(second.admit(0.01), JudgeAdmission::Paused { .. }),
+            "the second target must draw on the same five dollars, not a second five"
+        );
+        assert!(
+            second.snapshot().paused,
+            "and the report has to say the block is paused"
+        );
+    }
+
+    /// The flag the report publishes is the one the cap actually set.
+    /// Judging pauses when the next pair's reservation does not fit,
+    /// which happens while the spend is still under the cap.
+    #[test]
+    fn a_budget_refusing_the_next_pair_reports_itself_paused() {
+        let budget = JudgeBudget::new(1.0, JudgeSpendWindow::Daily);
+        assert_eq!(budget.admit(0.9), JudgeAdmission::Admitted);
+        assert!(
+            matches!(budget.admit(0.2), JudgeAdmission::Paused { .. }),
+            "0.9 + 0.2 is over the cap"
+        );
+        let snapshot = budget.snapshot();
+        assert!(
+            snapshot.spent_usd < snapshot.cap_usd,
+            "the spend is still under the cap: {snapshot:?}"
+        );
+        assert!(
+            snapshot.paused,
+            "and judging is nonetheless paused: {snapshot:?}"
+        );
+    }
+
     /// The agreement block an operator reads before the scorer ships.
     #[test]
     fn a_configured_judge_reports_its_cap_and_a_pending_score() {
-        JudgeRegistry::global().clear();
+        JudgeRegistry::global().clear_for_test();
         assert!(
             agreement_for("unconfigured-target").is_none(),
             "an unconfigured target must not claim a judge"
         );
-        JudgeRegistry::global().install("judged-target", 5.0, JudgeSpendWindow::Weekly);
+        JudgeRegistry::global().install(
+            &["judged-target".to_string()],
+            5.0,
+            JudgeSpendWindow::Weekly,
+        );
         let agreement = agreement_for("judged-target").expect("configured");
         assert_eq!(agreement.status, "scoring_pending");
         assert_eq!(agreement.judge_spend_cap_usd, Some(5.0));
         assert_eq!(agreement.pairs_judged, 0);
         assert!(agreement.reverse_order_flip_rate.is_none());
-        JudgeRegistry::global().clear();
+        JudgeRegistry::global().clear_for_test();
     }
 
     /// A weekly window is seven daily ones, stated once so a reader
