@@ -333,6 +333,13 @@ pub fn ai_request_span(surface: &str, operation: &str, method: &str) -> Span {
         "llm.token_count.prompt" = Empty,
         "llm.token_count.completion" = Empty,
         "llm.token_count.total" = Empty,
+        // Resolved coarse intent (`coding`, `vision`, `analysis`,
+        // `summarization`, `general`), filled by the dispatch path from the
+        // same closed vocabulary the access log writes. Declared here
+        // because `Span::record` on a field the span never declared is a
+        // silent no-op, which is what the docs' claim about this slot had
+        // been resting on.
+        "sbproxy.ai.intent" = Empty,
     )
 }
 

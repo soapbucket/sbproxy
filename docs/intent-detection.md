@@ -78,7 +78,8 @@ configuration without dialing the sidecar.
 ## Intent detection
 
 Every AI request with a non-empty prompt receives one of five categories,
-recorded on the request context, access log, and request span:
+recorded on the request context, on the access log as `classifier_intent`,
+and on the `ai.request` span as `sbproxy.ai.intent`:
 
 | Category | Example prompt |
 |---|---|

@@ -158,6 +158,23 @@ pub enum IntentCategory {
     General,
 }
 
+impl IntentCategory {
+    /// Closed lowercase label for this category.
+    ///
+    /// One spelling for the access log, the request span, and the docs, so
+    /// an operator filtering a trace by intent uses the same word the
+    /// access log wrote.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Coding => "coding",
+            Self::Vision => "vision",
+            Self::Analysis => "analysis",
+            Self::Summarization => "summarization",
+            Self::General => "general",
+        }
+    }
+}
+
 /// Detects the coarse intent of an incoming prompt.
 ///
 /// Typically backed by a lightweight classifier or keyword heuristic.

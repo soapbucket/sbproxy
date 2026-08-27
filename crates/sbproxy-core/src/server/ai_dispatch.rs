@@ -8909,8 +8909,12 @@ pub(super) async fn handle_ai_proxy(
             source = %source,
             "AI proxy: intent detected"
         );
-        let span = tracing::Span::current();
-        span.record("classifier.intent", tracing::field::debug(&cat));
+        // Recorded on `ai.request` itself, the way every other attributed
+        // field on this path is: `Span::current()` here is whatever span
+        // happens to be entered, and `classifier.intent` was never one of
+        // the span's declared slots, so the record was dropped and the
+        // documented span attribute did not exist.
+        ai_span.record("sbproxy.ai.intent", cat.as_str());
         ctx.classifier_intent = Some(cat);
     }
 
@@ -20322,6 +20326,144 @@ mod external_guardrail_context_tests {
         assert_eq!(
             context.ai_route_reason.as_deref(),
             Some("quality_hook: unavailable, preserved configured routing")
+        );
+    }
+
+    /// Span-field capture for one live dispatch.
+    ///
+    /// A bare subscriber rather than a layer, because what is under test is
+    /// whether the value reaches the span's own metadata: `Span::record`
+    /// for a field the span never declared is dropped by the tracing core
+    /// before any subscriber sees it, which is exactly how a documented
+    /// attribute can be absent while the recording line is right there.
+    #[derive(Clone, Default)]
+    struct SpanFieldCapture {
+        names: Arc<std::sync::Mutex<std::collections::HashMap<u64, String>>>,
+        fields: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+        next_id: Arc<AtomicUsize>,
+    }
+
+    impl SpanFieldCapture {
+        fn field(&self, name: &str) -> Option<String> {
+            self.fields
+                .lock()
+                .expect("span field capture")
+                .get(name)
+                .cloned()
+        }
+
+        fn is_request_span(&self, id: u64) -> bool {
+            self.names
+                .lock()
+                .expect("span name capture")
+                .get(&id)
+                .is_some_and(|name| name == "ai.request")
+        }
+    }
+
+    struct SpanFieldVisitor<'a> {
+        out: &'a mut std::collections::HashMap<String, String>,
+    }
+
+    impl tracing::field::Visit for SpanFieldVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.out
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.out.insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    impl tracing::Subscriber for SpanFieldCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            let id = self.next_id.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+            self.names
+                .lock()
+                .expect("span name capture")
+                .insert(id, attrs.metadata().name().to_string());
+            if attrs.metadata().name() == "ai.request" {
+                let mut fields = self.fields.lock().expect("span field capture");
+                attrs.record(&mut SpanFieldVisitor { out: &mut fields });
+            }
+            tracing::span::Id::from_u64(id)
+        }
+
+        fn record(&self, span: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+            if !self.is_request_span(span.into_u64()) {
+                return;
+            }
+            let mut fields = self.fields.lock().expect("span field capture");
+            values.record(&mut SpanFieldVisitor { out: &mut fields });
+        }
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, _event: &tracing::Event<'_>) {}
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Seam: the resolved intent category on the live `ai.request` span.
+    /// `docs/intent-detection.md` tells an operator the category is on the
+    /// request span, and the recording line was writing an undeclared field
+    /// on whatever span happened to be current, so the value never reached
+    /// a trace backend.
+    #[tokio::test]
+    async fn intent_detection_records_the_category_on_the_request_span() {
+        let (upstream_url, _hits) =
+            upstream_fixture(r#"{"choices":[{"message":{"content":"ok"}}]}"#).await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }]
+        }))
+        .expect("intent span fixture config");
+        let pipeline = crate::pipeline::CompiledPipeline::default();
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "Implement a binary search tree in Rust"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        let capture = SpanFieldCapture::default();
+
+        {
+            let _default = tracing::subscriber::set_default(capture.clone());
+            super::handle_ai_proxy(
+                &mut session,
+                &config,
+                &pipeline,
+                "ai.test",
+                &mut context,
+                None,
+            )
+            .await
+            .expect("the fixture request is dispatched");
+        }
+        drop(session);
+        let response = live_downstream_body(client).await;
+
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        assert_eq!(
+            context.classifier_intent,
+            Some(crate::hooks::IntentCategory::Coding)
+        );
+        assert_eq!(
+            capture.field("sbproxy.ai.intent").as_deref(),
+            Some("coding"),
+            "the documented span attribute has to reach the span itself"
         );
     }
 
