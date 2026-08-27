@@ -1,6 +1,7 @@
 //! Build script for the e2e test crate.
 //!
-//! Compiles `proto/echo.proto` into Rust types via `tonic-build` so
+//! Compiles `proto/echo.proto` into Rust types via `tonic-prost-build`
+//! so
 //! `tests/action_grpc.rs` can stand up a real tonic Echo service and
 //! drive RPCs through the proxy. The generated module lands in
 //! `OUT_DIR` and is pulled in via `tonic::include_proto!`.
@@ -19,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let descriptor_path =
         std::path::PathBuf::from(std::env::var("OUT_DIR")?).join("echo_descriptor.bin");
 
-    tonic_build::configure()
+    tonic_prost_build::configure()
         // The e2e test spawns the server in-process; we do not need
         // a generated client transport, but generating both keeps the
         // ergonomics simple and the cost is negligible.
