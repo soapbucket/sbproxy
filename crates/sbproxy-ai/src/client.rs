@@ -3564,31 +3564,36 @@ struct ShadowCacheTokens {
 fn parse_shadow_cache_tokens(body: &[u8]) -> Option<ShadowCacheTokens> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     let usage = value.get("usage")?;
-    let openai_read = usage
+    // Both spellings are read from the same body and merged rather than
+    // branched on, because the primary side of the very subtraction
+    // this feeds does the same: `extract_usage_full` in `sbproxy-core`
+    // reads the nested OpenAI key and the top-level Anthropic ones
+    // independently and unconditionally. A body carrying both, which
+    // OpenAI-compatible vendors do emit, would otherwise be priced by
+    // two different rules on the two sides of `TargetCost::delta_usd`.
+    let nested_read = usage
         .get("prompt_tokens_details")
         .and_then(|details| details.get("cached_tokens"))
         .and_then(serde_json::Value::as_u64);
-    if let Some(read) = openai_read {
-        return Some(ShadowCacheTokens {
-            read,
-            // OpenAI bills no separate cache-write dimension.
-            write: 0,
-            included_in_prompt_tokens: true,
-        });
-    }
-    let read = usage
+    let flat_read = usage
         .get("cache_read_input_tokens")
         .and_then(serde_json::Value::as_u64);
     let write = usage
         .get("cache_creation_input_tokens")
         .and_then(serde_json::Value::as_u64);
+    let read = nested_read.or(flat_read);
     if read.is_none() && write.is_none() {
         return None;
     }
     Some(ShadowCacheTokens {
         read: read.unwrap_or(0),
         write: write.unwrap_or(0),
-        included_in_prompt_tokens: false,
+        // `prompt_tokens` is the OpenAI spelling and already counts the
+        // cached share; `input_tokens` is Anthropic's and does not. The
+        // key that is present decides, not which cache spelling was,
+        // because a body can carry one vendor's totals and the other's
+        // cache keys.
+        included_in_prompt_tokens: usage.get("prompt_tokens").is_some(),
     })
 }
 
@@ -5447,6 +5452,33 @@ mod tests {
         assert!(
             !cache.included_in_prompt_tokens,
             "Anthropic's input_tokens excludes both, so the whole prompt is the sum"
+        );
+
+        // The shape this branch's own e2e stub emits, and the one the
+        // primary side of the subtraction already handles: an OpenAI
+        // body carrying the nested cache-read key and the top-level
+        // cache-write key at once. Returning early on the first
+        // spelling would price the write at the full input rate on one
+        // side of the delta and at the cache-write rate on the other.
+        let mixed = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 20_000,
+                "completion_tokens": 100,
+                "prompt_tokens_details": {"cached_tokens": 18_000},
+                "cache_creation_input_tokens": 1_500,
+            },
+        })
+        .to_string();
+        let cache =
+            parse_shadow_cache_tokens(mixed.as_bytes()).expect("a mixed body reports its cache");
+        assert_eq!(
+            (cache.read, cache.write),
+            (18_000, 1_500),
+            "both spellings in one body have to be read, not just the first"
+        );
+        assert!(
+            cache.included_in_prompt_tokens,
+            "`prompt_tokens` is present, so the totals are OpenAI's and already whole"
         );
 
         assert!(
