@@ -524,6 +524,37 @@ type name. And whether that test still asserts anything, since the guard
 checks the function exists rather than what it does. The script's own
 header says all three in the same words.
 
+### Why the policy is one rule and not one type
+
+The rule is single: on a registered type, the credential does not print,
+the identifier that names what failed does, an `Option` renders presence
+rather than a flat marker, and raw key bytes render their length. One
+registry states it, one guard enforces it, and there are no exemptions.
+
+The *mechanism* is a hand-written `Debug` per type rather than one
+wrapper type used everywhere, and `sbproxy_vault::SecretString` is that
+wrapper going unused. Two constraints, both checkable rather than
+asserted, are why.
+
+`SecretString` implements `Debug`, `Display`, `Clone` and a
+constant-time `PartialEq`, and nothing else. It has no `Deserialize`, no
+`Serialize`, and no `JsonSchema`, so it cannot be the type of a config
+field at all: a config struct that held one would neither parse nor
+appear in `schemas/sb-config.schema.json`. Adding `Serialize` to it is
+not a small change but a contradiction, because most of the config types
+here derive `Serialize` and round-tripping them means writing the
+plaintext back out, which is the disclosure the type exists to prevent.
+
+And `sbproxy-vault` depends on `sbproxy-observe`. Every protected type
+that lives in `sbproxy-observe` (the event sink target, the alert
+channel) therefore cannot reach `SecretString` without a dependency
+cycle, whatever the serde question.
+
+The honest summary is that the redacted-string type is the right shape
+for a value held in memory at runtime and the wrong shape for a value
+parsed out of a config document, and most of what this rule protects is
+the second kind.
+
 ## Related Reading
 
 * `docs/configuration.md` for the `proxy.secrets` block and reference URI grammar.
