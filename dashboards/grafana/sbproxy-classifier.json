@@ -28,7 +28,7 @@
       }
     ]
   },
-  "description": "Rich classifier sidecar (sbproxy-classifier, WOR-2665): exact request lifecycle, refusals, tenant count, quality scores, and streaming safety verdicts. Runbook: docs/classifier-sidecar.md.",
+  "description": "Rich classifier sidecar (sbproxy-classifier): exact request lifecycle, refusals, tenant count, quality scores, and streaming safety verdicts. Runbook: docs/classifier-sidecar.md.",
   "editable": true,
   "graphTooltip": 0,
   "id": null,

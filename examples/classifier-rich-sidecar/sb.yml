@@ -1,5 +1,5 @@
 # yaml-language-server: $schema=../../schemas/sb-config.schema.json
-# prompt_injection_v2 against the rich classifier sidecar (WOR-2665).
+# prompt_injection_v2 against the rich classifier sidecar.
 #
 # `sbproxy-classifier` implements the same `InferenceService` gRPC
 # contract as the minimal `sbproxy-classifier-sidecar`, so this config is

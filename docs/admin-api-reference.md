@@ -1451,7 +1451,7 @@ rollup store is configured is `503` naming the config knob.
 
 ### `GET /api/meter/summary`, `GET /api/meter/receipts`, `POST /api/meter/verify`
 
-The attested-metering operator surface (WOR-2131): units by tenant against
+The attested-metering operator surface: units by tenant against
 the hash-chained receipt ledger `proxy.attestation` writes, a cursor-paged
 read of the chain itself, and a chain-integrity check. All three sit behind
 the same operator gate as the rest of this page and are read-only except

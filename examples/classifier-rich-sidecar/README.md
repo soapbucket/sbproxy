@@ -1,6 +1,6 @@
 # classifier-rich-sidecar
 
-The `prompt_injection_v2` policy with the out-of-process `sidecar` detector, pointed at `sbproxy-classifier` (WOR-2665's port of the enterprise rich sidecar) instead of the minimal `sbproxy-classifier-sidecar`. Both sidecars implement the same `InferenceService` gRPC contract, so this config is identical in shape to [`examples/prompt-injection-sidecar/`](../prompt-injection-sidecar/); only the port differs (9500, the rich sidecar's default, versus 9440).
+The `prompt_injection_v2` policy with the out-of-process `sidecar` detector, pointed at `sbproxy-classifier` (the port of the enterprise rich sidecar) instead of the minimal `sbproxy-classifier-sidecar`. Both sidecars implement the same `InferenceService` gRPC contract, so this config is identical in shape to [`examples/prompt-injection-sidecar/`](../prompt-injection-sidecar/); only the port differs (9500, the rich sidecar's default, versus 9440).
 
 The rich sidecar carries additional capability this single-policy example does not exercise: quality scoring and per-token streaming safety over gRPC, and multi-tenant heuristic classification, intent/content-type detection, and tenant admin over its TCP + MessagePack port (9400 by default). See [docs/classifier-sidecar.md](../../docs/classifier-sidecar.md) for the full list. The policy's mandatory verified ONNX fallback keeps the sidecar an optional deployment component: an operator can omit or lose it without turning prompt-injection checks into unscored allows.
 

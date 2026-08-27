@@ -297,7 +297,7 @@ See [guardrails.md](guardrails.md) and [prompt-injection-v2.md](prompt-injection
 
 ## 6. The Rich Sidecar (`sbproxy-classifier`) and the Optional-Degrade Architecture
 
-`sbproxy-classifier` (port to OSS, WOR-2665) is the superset sidecar the `InferenceService` proto comment refers to: same `Classify` / `Embed` / `ModelInfo` / `Version` contract as the minimal sidecar (so `prompt_injection_v2`'s `detector: sidecar` config, unchanged, works against either binary), plus additional capability the minimal sidecar does not carry.
+`sbproxy-classifier` (port to OSS) is the superset sidecar the `InferenceService` proto comment refers to: same `Classify` / `Embed` / `ModelInfo` / `Version` contract as the minimal sidecar (so `prompt_injection_v2`'s `detector: sidecar` config, unchanged, works against either binary), plus additional capability the minimal sidecar does not carry.
 
 ### What it adds
 

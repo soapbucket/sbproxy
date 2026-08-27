@@ -1,7 +1,7 @@
 # AI chargeback and spend forecasting
 *Last modified: 2026-08-26*
 
-`sbproxy_ai::billing` (WOR-2672) is per-event usage attribution,
+`sbproxy_ai::billing` is per-event usage attribution,
 chargeback rollups, unified bill generation, and spend forecasting for
 AI gateway traffic. It layers onto this crate's existing usage-sink
 seam rather than duplicating it, and holds no durable state of its own.
@@ -104,7 +104,7 @@ for lacking a tag; the money was still spent.
 
 ### Storage: none
 
-The tracker is in-memory only, by design (WOR-2661 forbids a hard
+The tracker is in-memory only, by design (the port rules forbid a hard
 external-store dependency for this port). Rollups cover the lifetime of
 the process, while raw-entry retention is a bounded recent window. An
 embedder that needs durable or cross-replica totals periodically exports
@@ -116,7 +116,7 @@ not claim persistence across a restart.
 The enterprise source's per-employee rollup (behind
 `#[cfg(feature = "employee-binding")]`, keyed by SSO subject with a
 four-level hierarchical budget walk) is not ported. `employee_binding`
-is being rescoped on a separate branch (WOR-2667); this port does not
+is being rescoped on a separate branch; this port does not
 wait on that landing, and `ChargebackTracker` / `WorkspaceTotals` work
 standalone at the workspace level without it.
 
