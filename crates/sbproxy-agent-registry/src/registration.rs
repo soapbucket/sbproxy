@@ -35,6 +35,7 @@
 //! the shape every read path returns and it has no field a hash could
 //! occupy, so a listing endpoint cannot leak one by forgetting to strip it.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use argon2::password_hash::rand_core::{OsRng, RngCore};
@@ -49,6 +50,7 @@ use ulid::Ulid;
 use sbproxy_platform::storage::{CasOutcome, EphemeralKv, KvNamespace, PersistentKv};
 
 use crate::error::{RegistryError, Result};
+use crate::metrics::record_registry_op;
 
 /// Prefix on a minted client secret, so an operator reading a log or a
 /// paste can tell one from a registration access token at a glance.
@@ -135,11 +137,31 @@ impl AgentMetadata {
     /// somebody has to clean up.
     pub fn validate(&self) -> Result<()> {
         bounded("vendor", &self.vendor, 1, MAX_VENDOR_BYTES)?;
+        if self.vendor.trim().is_empty() {
+            return Err(RegistryError::Invalid {
+                field: "vendor",
+                detail: "must not be blank".into(),
+            });
+        }
         bounded("contact_url", &self.contact_url, 1, 512)?;
-        if !self.contact_url.starts_with("https://") {
+        // Parsed rather than prefix-matched: `https://` also opens
+        // `https://` with no host, which a `starts_with` accepts and a
+        // reviewer following the link discovers.
+        let contact =
+            url::Url::parse(&self.contact_url).map_err(|error| RegistryError::Invalid {
+                field: "contact_url",
+                detail: format!("is not a URL: {error}"),
+            })?;
+        if contact.scheme() != "https" {
             return Err(RegistryError::Invalid {
                 field: "contact_url",
                 detail: "must be an https:// URL".into(),
+            });
+        }
+        if contact.host_str().is_none_or(str::is_empty) {
+            return Err(RegistryError::Invalid {
+                field: "contact_url",
+                detail: "must name a host".into(),
             });
         }
         bounded_list(
@@ -197,6 +219,12 @@ fn bounded_list(field: &'static str, values: &[String], min: usize, max: usize) 
     }
     for value in values {
         bounded(field, value, 1, MAX_LIST_ENTRY_BYTES)?;
+        if value.trim().is_empty() {
+            return Err(RegistryError::Invalid {
+                field,
+                detail: "entries must not be blank".into(),
+            });
+        }
     }
     Ok(())
 }
@@ -474,6 +502,25 @@ fn hasher() -> Result<Argon2<'static>> {
     Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
 }
 
+/// Hash a plaintext credential into a PHC string, off the executor.
+///
+/// Argon2id at these parameters is roughly 100 ms of CPU and 19 MiB of
+/// allocation. Run inline on an `async fn` it holds an executor thread for
+/// that long, and `register` does two of them back to back; ten concurrent
+/// submissions would stall unrelated admin requests scheduled behind them.
+async fn hash_credential_off_thread(plaintext: String) -> Result<String> {
+    tokio::task::spawn_blocking(move || hash_credential(&plaintext))
+        .await
+        .map_err(|error| RegistryError::Backend(format!("argon2 task failed: {error}")))?
+}
+
+/// Constant-time verify, off the executor, for the same reason.
+async fn verify_credential_off_thread(plaintext: String, encoded: String) -> Result<bool> {
+    tokio::task::spawn_blocking(move || verify_credential(&plaintext, &encoded))
+        .await
+        .map_err(|error| RegistryError::Backend(format!("argon2 task failed: {error}")))?
+}
+
 /// Hash a plaintext credential into a PHC string.
 fn hash_credential(plaintext: &str) -> Result<String> {
     let salt = SaltString::generate(&mut OsRng);
@@ -560,7 +607,26 @@ pub struct RegistrationQueue {
     dedup_window: KvNamespace,
     duplicate_window: Duration,
     rotation_grace: Duration,
+    /// Live count per state, in [`ApprovalState`] declaration order.
+    ///
+    /// Seeded once by [`Self::seed_gauge_counts`] and adjusted by every
+    /// mutation afterwards. The alternative, re-listing and re-parsing
+    /// every record to publish a gauge after every write, is quadratic in
+    /// queue depth and pays a full-table read and a JSON parse per record
+    /// for four numbers. [`Self::counts`] still scans, because it answers
+    /// per tenant and an admin summary is not on any hot path.
+    gauge_counts: [AtomicUsize; 4],
 }
+
+/// Most pending registrations the queue holds before it refuses new ones.
+///
+/// A queue with no bound is a disk-exhaustion primitive, and the deployment
+/// `docs/agent-registry.md` describes (an operator fronting the submission
+/// route for public self-service) is the one where whoever fills it is a
+/// stranger. Terminal records are not counted against it: they are the audit
+/// trail, they cannot be resubmitted, and evicting them would be evicting
+/// the durable replay refusal itself.
+pub const MAX_PENDING_REGISTRATIONS: usize = 5_000;
 
 /// One decision, as a value, so the four things that vary between approve,
 /// reject, and revoke travel together instead of as a row of positional
@@ -610,7 +676,61 @@ impl RegistrationQueue {
             dedup_window: namespace(Self::DEDUP)?,
             duplicate_window,
             rotation_grace,
+            gauge_counts: Default::default(),
         })
+    }
+
+    /// Index into [`Self::gauge_counts`] for one state.
+    fn gauge_slot(state: ApprovalState) -> usize {
+        match state {
+            ApprovalState::Pending => 0,
+            ApprovalState::Approved => 1,
+            ApprovalState::Rejected => 2,
+            ApprovalState::Revoked => 3,
+        }
+    }
+
+    /// Read the store once and seed the live counts from it.
+    ///
+    /// Called at boot. Everything after that is incremental, so the full
+    /// scan happens once per process rather than once per write.
+    pub async fn seed_gauge_counts(&self) -> Result<()> {
+        for (state, count) in self.counts(&TenantScope::All).await? {
+            self.gauge_counts[Self::gauge_slot(state)].store(count, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Move one record between two count slots.
+    fn adjust_gauge_counts(&self, from: Option<ApprovalState>, to: ApprovalState) {
+        if let Some(from) = from {
+            let slot = &self.gauge_counts[Self::gauge_slot(from)];
+            // Saturating: a count seeded before a sibling process wrote the
+            // same store could otherwise wrap to `usize::MAX` and render a
+            // gauge nobody can read.
+            let _ = slot.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(1))
+            });
+        }
+        self.gauge_counts[Self::gauge_slot(to)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The live per-state counts, without touching the store.
+    pub fn gauge_counts(&self) -> Vec<(ApprovalState, usize)> {
+        [
+            ApprovalState::Pending,
+            ApprovalState::Approved,
+            ApprovalState::Rejected,
+            ApprovalState::Revoked,
+        ]
+        .into_iter()
+        .map(|state| {
+            (
+                state,
+                self.gauge_counts[Self::gauge_slot(state)].load(Ordering::Relaxed),
+            )
+        })
+        .collect()
     }
 
     /// Read one record, refusing one another tenant owns.
@@ -752,6 +872,16 @@ impl RegistrationQueue {
         let tenant = scope.owning_tenant().to_string();
         let fingerprint = metadata_fingerprint(&metadata)?;
 
+        // Checked before the replay guards rather than after, so a full
+        // queue costs one atomic load rather than two store reads.
+        let pending =
+            self.gauge_counts[Self::gauge_slot(ApprovalState::Pending)].load(Ordering::Relaxed);
+        if pending >= MAX_PENDING_REGISTRATIONS {
+            return Err(RegistryError::QueueFull {
+                limit: MAX_PENDING_REGISTRATIONS,
+            });
+        }
+
         if let Some(decided) = self.indexed_decision(&tenant, &fingerprint).await? {
             match decided.state {
                 ApprovalState::Rejected | ApprovalState::Revoked => {
@@ -797,10 +927,13 @@ impl RegistrationQueue {
             agent_id: agent_id.clone(),
             tenant: tenant.clone(),
             client_id: Ulid::new().to_string(),
-            client_secret_hash: hash_credential(&client_secret)?,
+            client_secret_hash: hash_credential_off_thread(client_secret.clone()).await?,
             previous_client_secret_hash: None,
             previous_secret_valid_until: None,
-            registration_access_token_hash: hash_credential(&registration_access_token)?,
+            registration_access_token_hash: hash_credential_off_thread(
+                registration_access_token.clone(),
+            )
+            .await?,
             metadata_hash: fingerprint.clone(),
             metadata,
             state: ApprovalState::Pending,
@@ -822,13 +955,15 @@ impl RegistrationQueue {
         if landed.is_none() {
             return Err(RegistryError::Conflict(agent_id));
         }
+        self.adjust_gauge_counts(None, ApprovalState::Pending);
 
         let window = self
             .duplicate_window
             .to_std()
             .unwrap_or(std::time::Duration::from_secs(0));
         if !window.is_zero() {
-            self.dedup
+            let recorded = self
+                .dedup
                 .put_with_ttl(
                     &self.dedup_window,
                     &Self::index_key(&tenant, &fingerprint),
@@ -837,6 +972,21 @@ impl RegistrationQueue {
                 )
                 .await
                 .map_err(|error| RegistryError::Backend(error.to_string()))?;
+            if !recorded {
+                // The window store is at its cap and refused the write, so
+                // this fingerprint is not in the window and the next
+                // identical submission will not be suppressed by it. Not a
+                // refusal of the registration, which has already landed,
+                // and not silence either: the durable index still catches
+                // every decided description, and what is lost is only the
+                // undecided case.
+                record_registry_op("register", "dedup_window_full");
+                tracing::warn!(
+                    "the registration duplicate-detection window is at its capacity; an \
+                     identical resubmission of an undecided registration will take a fresh \
+                     slot until the window drains"
+                );
+            }
         }
 
         Ok((
@@ -899,17 +1049,28 @@ impl RegistrationQueue {
             bounded("reason", reason, 0, MAX_REASON_BYTES)?;
         }
         let (mut record, revision) = self.load(request.scope, request.agent_id).await?;
+        if record.state == request.target {
+            // The compare-and-swap landed and the index write did not, or
+            // the same decision is being retried. Re-index and answer
+            // success: leaving a terminal record whose description is not
+            // indexed would let the submitter resubmit it, and there is no
+            // other route that would ever repair it.
+            self.index_decision(&record).await?;
+            return Ok(RegistrationView::from(&record));
+        }
         if !request.from.contains(&record.state) {
             return Err(RegistryError::InvalidTransition {
                 action: request.action,
                 state: record.state.as_str(),
             });
         }
+        let previous = record.state;
         record.state = request.target;
         record.reason = request.reason;
         record.decided_by = request.decided_by;
         record.updated_at = request.now;
         self.store_if_unchanged(&record, revision).await?;
+        self.adjust_gauge_counts(Some(previous), request.target);
         // Every decision is indexed, not only the terminal ones: an
         // approval has to stop the same description becoming a second
         // agent with its own credentials, which is the case the enterprise
@@ -1022,7 +1183,7 @@ impl RegistrationQueue {
         let previous_secret_valid_until = now + self.rotation_grace;
         record.previous_client_secret_hash = Some(record.client_secret_hash.clone());
         record.previous_secret_valid_until = Some(previous_secret_valid_until);
-        record.client_secret_hash = hash_credential(&client_secret)?;
+        record.client_secret_hash = hash_credential_off_thread(client_secret.clone()).await?;
         record.rotated_at = Some(now);
         record.updated_at = now;
         self.store_if_unchanged(&record, revision).await?;
@@ -1054,7 +1215,9 @@ impl RegistrationQueue {
         if record.state != ApprovalState::Approved {
             return Ok(false);
         }
-        if verify_credential(presented, &record.client_secret_hash)? {
+        if verify_credential_off_thread(presented.to_string(), record.client_secret_hash.clone())
+            .await?
+        {
             return Ok(true);
         }
         match (
@@ -1062,7 +1225,7 @@ impl RegistrationQueue {
             record.previous_secret_valid_until,
         ) {
             (Some(previous), Some(valid_until)) if now < valid_until => {
-                verify_credential(presented, previous)
+                verify_credential_off_thread(presented.to_string(), previous.to_string()).await
             }
             _ => Ok(false),
         }
@@ -1129,6 +1292,102 @@ mod tests {
         }
     }
 
+    /// The queue had no bound at all, and `docs/agent-registry.md` tells an
+    /// operator to front the submission route for public self-service, so
+    /// whoever fills it need not be anybody they know. Terminal records are
+    /// deliberately not counted against the cap: they are the durable
+    /// replay refusal and the audit trail.
+    #[tokio::test]
+    async fn a_full_pending_queue_refuses_rather_than_growing() {
+        let path = temp_path();
+        let queue = queue(&path);
+
+        // Reaching the cap through 5,000 Argon2id submissions would cost
+        // minutes, so the counter the production check reads is set
+        // directly. The refusal below is the shipped path.
+        queue.gauge_counts[RegistrationQueue::gauge_slot(ApprovalState::Pending)]
+            .store(MAX_PENDING_REGISTRATIONS, Ordering::Relaxed);
+        match queue.register(&TenantScope::All, metadata(), now()).await {
+            Err(RegistryError::QueueFull { limit }) => {
+                assert_eq!(limit, MAX_PENDING_REGISTRATIONS)
+            }
+            other => panic!("a full queue must refuse, got {other:?}"),
+        }
+
+        // A reviewer working one record off the queue makes room again.
+        queue.gauge_counts[RegistrationQueue::gauge_slot(ApprovalState::Pending)]
+            .store(MAX_PENDING_REGISTRATIONS - 1, Ordering::Relaxed);
+        queue
+            .register(&TenantScope::All, metadata(), now())
+            .await
+            .expect("room was made");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The gauge counts are maintained incrementally rather than by
+    /// re-listing and re-parsing every record after every write, so they
+    /// have to agree with a full scan after a mixed run of mutations.
+    #[tokio::test]
+    async fn the_incremental_gauge_counts_agree_with_a_full_scan() {
+        let path = temp_path();
+        let live = queue(&path);
+
+        let (first, _) = live
+            .register(&TenantScope::All, metadata(), now())
+            .await
+            .expect("first");
+        let mut second_meta = metadata();
+        second_meta.vendor = "Globex".into();
+        let (second, _) = live
+            .register(&TenantScope::All, second_meta, now())
+            .await
+            .expect("second");
+        let mut third_meta = metadata();
+        third_meta.vendor = "Initech".into();
+        live.register(&TenantScope::All, third_meta, now())
+            .await
+            .expect("third");
+
+        live.approve(&TenantScope::All, &first.agent_id, None, None, now())
+            .await
+            .expect("approve");
+        live.reject(
+            &TenantScope::All,
+            &second.agent_id,
+            "no".into(),
+            None,
+            now(),
+        )
+        .await
+        .expect("reject");
+        live.revoke(&TenantScope::All, &first.agent_id, None, None, now())
+            .await
+            .expect("revoke");
+
+        assert_eq!(
+            live.gauge_counts(),
+            live.counts(&TenantScope::All).await.expect("scan")
+        );
+
+        // And a restart re-seeds them from the store rather than starting
+        // at zero and reporting an empty queue an operator would read as a
+        // drained one.
+        drop(live);
+        let reopened = queue(&path);
+        reopened.seed_gauge_counts().await.expect("seed");
+        assert_eq!(
+            reopened.gauge_counts(),
+            reopened.counts(&TenantScope::All).await.expect("scan")
+        );
+        assert_eq!(
+            reopened.gauge_counts()[RegistrationQueue::gauge_slot(ApprovalState::Pending)].1,
+            1
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn vendor_slug_collapses_and_trims() {
         assert_eq!(vendor_slug("Acme Research Labs"), "acme-research-labs");
@@ -1178,6 +1437,22 @@ mod tests {
         let mut meta = metadata();
         meta.expected_keyids = vec!["no-colon".into()];
         assert!(meta.validate().is_err());
+
+        // A prefix match accepts these; a parse does not.
+        for bad in ["https://", "not a url", "https://?a=b"] {
+            let mut meta = metadata();
+            meta.contact_url = bad.into();
+            assert!(meta.validate().is_err(), "{bad} must be refused");
+        }
+        let mut meta = metadata();
+        meta.vendor = "   ".into();
+        assert!(meta.validate().is_err(), "a blank vendor must be refused");
+        let mut meta = metadata();
+        meta.expected_user_agents = vec!["  ".into()];
+        assert!(
+            meta.validate().is_err(),
+            "a blank user agent must be refused"
+        );
 
         let mut meta = metadata();
         meta.requested_scopes.clear();

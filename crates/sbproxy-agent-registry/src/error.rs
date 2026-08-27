@@ -67,6 +67,20 @@ pub enum RegistryError {
     #[error("a registration with identical metadata already exists as {0}")]
     DuplicateMetadata(String),
 
+    /// The pending queue is at its cap.
+    ///
+    /// A queue with no bound is a disk-exhaustion primitive handed to
+    /// whoever can reach the submission route, and the operator fronting it
+    /// for public self-service (see `docs/agent-registry.md`) is exactly the
+    /// deployment where that reach is a stranger's. Refusing is recoverable:
+    /// a reviewer working the queue down makes room, and the submitter can
+    /// try again.
+    #[error("the pending registration queue is at its limit of {limit}; try again once a reviewer has worked it down")]
+    QueueFull {
+        /// The cap that was reached.
+        limit: usize,
+    },
+
     /// No registration under that id.
     #[error("no registration {0}")]
     NotFound(String),
@@ -108,6 +122,7 @@ impl RegistryError {
             Self::FeedExpired { .. } => "expired",
             Self::UnsupportedFormatVersion { .. } => "unsupported_version",
             Self::MetadataBurned { .. } => "burned",
+            Self::QueueFull { .. } => "queue_full",
             Self::DuplicateMetadata(_) => "duplicate",
             Self::NotFound(_) => "not_found",
             Self::Unauthorized => "unauthorized",
@@ -127,6 +142,11 @@ impl RegistryError {
             | Self::UnsupportedFormatVersion { .. } => 400,
             Self::Unauthorized => 401,
             Self::MetadataBurned { .. } | Self::DuplicateMetadata(_) | Self::Conflict(_) => 409,
+            // 429 rather than 503: the refusal is about how much is
+            // already queued, not about the registry being unavailable,
+            // and a submitter reading Retry-After semantics into it is
+            // reading it right.
+            Self::QueueFull { .. } => 429,
             Self::NotFound(_) => 404,
             Self::InvalidTransition { .. } => 422,
             Self::Backend(_) => 500,
@@ -171,6 +191,7 @@ mod tests {
                 "duplicate",
                 409,
             ),
+            (RegistryError::QueueFull { limit: 5_000 }, "queue_full", 429),
             (RegistryError::NotFound("acme-1".into()), "not_found", 404),
             (RegistryError::Unauthorized, "unauthorized", 401),
             (

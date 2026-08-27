@@ -94,6 +94,13 @@ struct RotateBody {
     registration_access_token: String,
 }
 
+/// `POST .../verify` body.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifyBody {
+    client_secret: String,
+}
+
 /// The route prefix every path below hangs off.
 pub const ADMIN_PREFIX: &str = "/admin/agent-registry";
 
@@ -251,6 +258,26 @@ pub async fn dispatch(
                         Err(error) => AdminResponse::from_refusal(&error),
                     }
                 }
+                ("POST", "verify") => {
+                    let parsed: VerifyBody = match decode(body) {
+                        Ok(parsed) => parsed,
+                        Err(response) => return Some(response),
+                    };
+                    match registry
+                        .verify_client_secret(&scope, agent_id, &parsed.client_secret, now)
+                        .await
+                    {
+                        // A wrong secret, an agent in another tenant, an
+                        // agent that was never approved, and one that does
+                        // not exist all answer the same shape, so this
+                        // route cannot be used to tell them apart.
+                        Ok(authenticated) => AdminResponse::encode(
+                            200,
+                            &serde_json::json!({"authenticated": authenticated}),
+                        ),
+                        Err(error) => AdminResponse::from_refusal(&error),
+                    }
+                }
                 ("POST", "rotate") => {
                     let parsed: RotateBody = match decode(body) {
                         Ok(parsed) => parsed,
@@ -301,6 +328,12 @@ fn parse_state_filter(query: &str) -> std::result::Result<Option<ApprovalState>,
         };
     }
     Ok(None)
+}
+
+/// Strip anything that could forge a line in a log or a response body from a
+/// caller-supplied string, and bound it.
+pub(crate) fn sanitize_label(value: &str) -> String {
+    sanitize(value)
 }
 
 /// Strip anything that could forge a line in a log or a response body from a
@@ -784,6 +817,83 @@ mod tests {
         .await;
         assert_eq!(again.status, 422);
         assert!(again.body.contains("invalid_transition"));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// WOR-2664 review: `verify_client_secret` and the `op="verify"` metric
+    /// dimension it writes had no production caller at all, so the doc told
+    /// operators how to read a series that was flat zero forever. This is
+    /// that caller: the DCR client-authentication check, which is what an
+    /// operator or an automation runs before wiring an agent into a policy.
+    #[tokio::test]
+    async fn the_client_authentication_route_verifies_only_an_approved_agents_own_secret() {
+        let path = temp_path();
+        let registry = registry(&path);
+        let created = call(
+            &registry,
+            "POST",
+            "/admin/agent-registry/registrations",
+            Some(&register_body()),
+        )
+        .await;
+        let created: serde_json::Value = serde_json::from_str(&created.body).expect("json");
+        let agent_id = created["registration"]["agent_id"]
+            .as_str()
+            .expect("id")
+            .to_string();
+        let secret = created["secrets"]["client_secret"]
+            .as_str()
+            .expect("secret")
+            .to_string();
+
+        let verify = |secret: String, agent: String| {
+            let registry = &registry;
+            async move {
+                call(
+                    registry,
+                    "POST",
+                    &format!("/admin/agent-registry/registrations/{agent}/verify"),
+                    Some(
+                        serde_json::to_vec(&serde_json::json!({"client_secret": secret}))
+                            .expect("body")
+                            .as_slice(),
+                    ),
+                )
+                .await
+            }
+        };
+
+        // Pending: the approval gate is not decorative.
+        let pending = verify(secret.clone(), agent_id.clone()).await;
+        assert_eq!(pending.status, 200);
+        assert!(
+            pending.body.contains("\"authenticated\":false"),
+            "{}",
+            pending.body
+        );
+
+        call(
+            &registry,
+            "POST",
+            &format!("/admin/agent-registry/registrations/{agent_id}/approve"),
+            None,
+        )
+        .await;
+
+        let approved = verify(secret.clone(), agent_id.clone()).await;
+        assert!(
+            approved.body.contains("\"authenticated\":true"),
+            "{}",
+            approved.body
+        );
+
+        // A wrong secret and an agent that does not exist answer
+        // identically, so the route is not an oracle.
+        let wrong = verify("sk_agent_wrong".into(), agent_id.clone()).await;
+        let missing = verify(secret, "no-such-agent".into()).await;
+        assert_eq!(wrong.body, missing.body);
+        assert!(wrong.body.contains("\"authenticated\":false"));
 
         std::fs::remove_file(&path).ok();
     }

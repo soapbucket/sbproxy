@@ -40,8 +40,21 @@ use crate::feed::{AgentFeed, FeedEntry};
 const CATALOG_NAMESPACE: &str = "agent_catalog";
 /// Namespace holding the one-record feed envelope alongside it.
 const ENVELOPE_NAMESPACE: &str = "agent_catalog_envelope";
-/// The single key inside [`ENVELOPE_NAMESPACE`].
+/// The single key inside [`ENVELOPE_NAMESPACE`] holding the live envelope.
 const ENVELOPE_KEY: &str = "current";
+/// Key written before a catalog swap starts and removed once it has
+/// finished.
+///
+/// `PersistentKv` has no batch write, so `apply` is a sequence of
+/// independent transactions and a crash or a full disk part-way through
+/// leaves the store holding some of the new generation under the old
+/// generation's envelope. This marker is what makes that state
+/// recognizable: a restore that finds it refuses the whole copy rather
+/// than serving a mixture stamped with a `generated_at` that never
+/// described it. The boot refresh re-applies from the feed immediately
+/// afterwards, so the cost of refusing is one refresh rather than a
+/// wrong catalog nobody can detect.
+const ENVELOPE_IN_PROGRESS_KEY: &str = "swap_in_progress";
 
 /// The feed envelope, kept next to the cached entries so a restored catalog
 /// still knows when the publisher meant it to expire.
@@ -150,6 +163,19 @@ impl CatalogStore {
     /// Returns how many entries were restored. A store with no envelope is
     /// a first boot rather than an error, and answers zero.
     pub async fn restore(&self) -> Result<usize> {
+        if self
+            .store
+            .get(&self.envelope, ENVELOPE_IN_PROGRESS_KEY)
+            .await
+            .map_err(|error| RegistryError::Backend(error.to_string()))?
+            .is_some()
+        {
+            tracing::warn!(
+                "the cached agent catalog is a partially written generation and was not \
+                 restored; the next feed refresh replaces it"
+            );
+            return Ok(0);
+        }
         let Some(envelope_entry) = self
             .store
             .get(&self.envelope, ENVELOPE_KEY)
@@ -196,6 +222,11 @@ impl CatalogStore {
     pub async fn apply(&self, feed: AgentFeed) -> Result<usize> {
         let catalog = Catalog::from_feed(feed);
 
+        self.store
+            .put(&self.envelope, ENVELOPE_IN_PROGRESS_KEY, b"1")
+            .await
+            .map_err(|error| RegistryError::Backend(error.to_string()))?;
+
         let existing: Vec<String> = self
             .store
             .list(&self.entries)
@@ -235,6 +266,11 @@ impl CatalogStore {
                 .await
                 .map_err(|error| RegistryError::Backend(error.to_string()))?;
         }
+
+        self.store
+            .delete(&self.envelope, ENVELOPE_IN_PROGRESS_KEY)
+            .await
+            .map_err(|error| RegistryError::Backend(error.to_string()))?;
 
         let applied = catalog.len();
         self.live.store(Arc::new(catalog));
@@ -350,6 +386,49 @@ mod tests {
             store.snapshot().get("acme-2").is_none(),
             "a withdrawn agent must not come back on restart"
         );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `apply` is a sequence of independent transactions, so a crash or a
+    /// full disk part-way through leaves the store holding some of the new
+    /// generation under the old generation's envelope. Serving that mixture
+    /// stamped with a `generated_at` that never described it is the failure
+    /// the marker exists to make recognizable.
+    #[tokio::test]
+    async fn a_partially_written_generation_is_refused_rather_than_restored() {
+        let path = temp_path();
+        {
+            let store = catalog_store(&path);
+            store.apply(feed(&["acme-1"])).await.expect("apply");
+        }
+
+        // Simulate the crash: the marker is present and the entries are a
+        // mixture, exactly as an interrupted apply leaves them.
+        let raw: Arc<dyn PersistentKv> =
+            Arc::new(EmbeddedKvStore::open(&path, "agent_registry").expect("open"));
+        let envelope = KvNamespace::new(ENVELOPE_NAMESPACE).expect("ns");
+        raw.put(&envelope, ENVELOPE_IN_PROGRESS_KEY, b"1")
+            .await
+            .expect("mark");
+        drop(raw);
+
+        let store = catalog_store(&path);
+        assert_eq!(
+            store.restore().await.expect("restore"),
+            0,
+            "a partial generation must not be served"
+        );
+        assert!(store.snapshot().is_empty());
+
+        // A successful apply clears the marker, so the next restore works.
+        store
+            .apply(feed(&["acme-1", "acme-2"]))
+            .await
+            .expect("apply");
+        drop(store);
+        let store = catalog_store(&path);
+        assert_eq!(store.restore().await.expect("restore"), 2);
 
         std::fs::remove_file(&path).ok();
     }

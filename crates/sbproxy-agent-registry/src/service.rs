@@ -132,6 +132,10 @@ impl AgentRegistry {
     pub async fn boot(&self) -> Result<usize> {
         let restored = self.catalog.restore().await?;
         record_registry_op("boot", "applied");
+        // The one full scan of the queue this process makes. Every mutation
+        // after it adjusts the counts in place, so publishing a gauge does
+        // not cost a table read and a JSON parse per record.
+        self.queue.seed_gauge_counts().await?;
         self.publish_gauges().await?;
         tracing::info!(
             restored_entries = restored,
@@ -189,7 +193,9 @@ impl AgentRegistry {
                 detail: "no feed path and key directory path are configured".into(),
             });
         };
-        let directory_bytes = std::fs::read(directory_path).map_err(|error| {
+        // `tokio::fs` rather than `std::fs`: both documents are capped at
+        // 8 MiB and this runs on the admin connection task.
+        let directory_bytes = tokio::fs::read(directory_path).await.map_err(|error| {
             RegistryError::Backend(format!(
                 "could not read the key directory at {}: {error}",
                 directory_path.display()
@@ -197,7 +203,7 @@ impl AgentRegistry {
         })?;
         let directory = verify_key_directory(&directory_bytes, &self.options.bootstrap_keys)?;
 
-        let feed_bytes = std::fs::read(feed_path).map_err(|error| {
+        let feed_bytes = tokio::fs::read(feed_path).await.map_err(|error| {
             RegistryError::Backend(format!(
                 "could not read the catalog feed at {}: {error}",
                 feed_path.display()
@@ -310,7 +316,9 @@ impl AgentRegistry {
             Err(error) => {
                 record_registry_op(op, error.outcome());
                 tracing::warn!(
-                    agent_id = %agent_id,
+                    // Sanitized: the id comes off the request path, and an
+                    // unsanitized one in a warn is newline log forging.
+                    agent_id = %crate::admin::sanitize_label(agent_id),
                     decision = op,
                     reason = error.outcome(),
                     "agent registration decision refused"
@@ -414,7 +422,7 @@ impl AgentRegistry {
 
     async fn publish_gauges(&self) -> Result<()> {
         set_registry_entries("catalog", self.catalog.snapshot().len() as i64);
-        for (state, count) in self.queue.counts(&TenantScope::All).await? {
+        for (state, count) in self.queue.gauge_counts() {
             let collection = match state {
                 ApprovalState::Pending => "pending",
                 ApprovalState::Approved => "approved",

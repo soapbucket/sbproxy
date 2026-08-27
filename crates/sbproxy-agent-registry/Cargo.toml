@@ -36,6 +36,9 @@ sha2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 ulid.workspace = true
+# A submitted contact URL is parsed rather than prefix-matched: `https://`
+# with no host passes a `starts_with` and is not a link.
+url.workspace = true
 
 # Ed25519 feed and key-directory verification.
 ed25519-dalek = "2"
@@ -43,6 +46,9 @@ ed25519-dalek = "2"
 # tokens, at the parameters OWASP's password-storage guidance recommends.
 argon2.workspace = true
 rand.workspace = true
+# Argon2id is ~100 ms of CPU and 19 MiB of allocation per call, which is not
+# something to run on the executor thread an admin request arrives on.
+tokio = { workspace = true, features = ["rt", "fs"] }
 
 [dev-dependencies]
 ed25519-dalek = { version = "2", features = ["rand_core"] }
