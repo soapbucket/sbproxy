@@ -1,6 +1,6 @@
 # OpenAPI schema validation
 
-*Last modified: 2026-08-20*
+*Last modified: 2026-08-27*
 
 The `openapi_validation` policy loads an OpenAPI 3.0 document at startup and validates each incoming request body against the matching operation's `requestBody` schema. Requests whose path + method are not described in the spec, or whose `Content-Type` has no schema, are passed through untouched, with one exception: when the matched operation declares `requestBody.required: true`, a request whose `Content-Type` matches no schema is rejected rather than passed through.
 
@@ -160,16 +160,55 @@ curl -sS -o /dev/null -w '%{http_code}\n' -H 'Host: api.local' \
 
 Validation runs in `request_body_filter`, which only executes for a request the
 proxy forwards. Pair `openapi_validation` with a `static` action and the policy
-compiles, appears in the verdict stream, and validates nothing: the static
-response is produced before the body is ever read, so every body is accepted.
-The same applies to `request_validator`, and to `content_digest` on every branch
-that needs the body. `content_digest`'s one header-phase branch is the exception:
+compiles and validates nothing: the static response is produced before the body
+is ever read, so every body is accepted, and the policy publishes no verdict for
+that request because it never reached the phase where it decides. The same
+applies to `request_validator`, and to `content_digest` on every branch that
+needs the body. `content_digest`'s one header-phase branch is the exception:
 `on_missing: require` decides from the request headers, so it refuses behind a
 `static` action too.
 
 The example uses a `proxy` action for that reason. If you are testing this
 policy against a stub origin and every malformed body returns success, check
 the action type first.
+
+The upstream connection is dialed, and the request head sent, before the body
+that decides the verdict has arrived. A refused request therefore costs one
+upstream dial, and a backend that answers off the request line alone may have
+already produced a response for a request the edge goes on to refuse. That
+response is discarded and the client receives the configured status and body, on
+an HTTP/1.1 upstream and on an HTTP/2 one alike, as long as the verdict is
+reached before the backend's response header arrives. A client that streams its
+body slowly enough for a head-answering backend to reply first is the one case
+that outruns the check, on either protocol, and that request gets the backend's
+answer. What the guarantee covers is the request body, which is never forwarded,
+and the answer the client receives; it is not a promise that the backend saw
+nothing.
+
+## What a refusal records
+
+A refusal in `enforce` mode lands on three surfaces:
+
+- `sbproxy_policy_triggers_total{policy_type="openapi_validation",action="deny"}`,
+  the shared policy counter.
+- One `policy_verdict_event` on the [decision audit feed](observability.md)
+  carrying `"policy_id":"openapi_validation"` and `"verdict":"deny"`.
+- One `security_audit` record of type `openapi_validation`, which is also what
+  reaches the admin console's audit ring, the hash-chained file under
+  `audit.sink: chain`, and the `events:` egress as a `policy_denied` event.
+
+The `reason` on that record is the stable label `schema_violation`, not the
+validator's message. The message names the failing JSON pointer, and the audit
+record goes to sinks an operator keeps as evidence, so the detail stays in the
+rejection body the client receives and in the proxy's own log line.
+
+One request produces one `policy_verdict_event` for this policy: `deny` when
+the body fails, `allow` when it passes or the request is out of scope, and
+`allow` in `log` mode, where the request is admitted and the warning in the log
+is what says the body would have been refused. A request that never reaches the
+body phase, because an earlier policy refused it or the action answers without
+going upstream, produces no record for this policy at all, since it never
+decided.
 
 ## Limitations
 

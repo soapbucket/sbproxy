@@ -6674,3 +6674,51 @@ async fn ldap_auth_missing_credentials_denies_with_401() {
     );
     assert!(principal.is_none());
 }
+
+/// WOR-2687: the header phase must not publish a terminal `allow` for a
+/// policy whose real decision happens in the request-body phase.
+///
+/// `OpenApiValidationEnforcer::enforce` returns `Allow` unconditionally
+/// because all it does at that phase is arm body buffering, so before
+/// this change a request the body phase went on to refuse carried two
+/// contradicting `policy_verdict_event` records keyed identically on
+/// `(request_id, policy_id)`, and the natural SIEM query for "which
+/// requests did `openapi_validation` admit" matched every request it
+/// denied.
+///
+/// The negative halves are the load-bearing halves. Suppressing a
+/// header-phase record that no body phase republishes deletes a
+/// decision instead of de-duplicating one, and that can arrive on
+/// either axis: a sibling built-in that refuses in the body phase
+/// without emitting there, or a plugin bundle that names its hook after
+/// a built-in policy.
+#[test]
+fn wor_2687_only_policies_that_emit_in_the_body_phase_skip_the_header_verdict() {
+    use sbproxy_observe::events::PolicySurface;
+
+    assert!(
+        emits_own_verdict_in_body_phase(PolicySurface::BuiltIn, "openapi_validation"),
+        "the body phase publishes this policy's verdict, so the header phase must not"
+    );
+    for policy_id in [
+        "request_validator",
+        "content_digest",
+        "body_threat_protection",
+        "prompt_injection_v2",
+        "a2a",
+        "rate_limit",
+        "waf",
+    ] {
+        assert!(
+            !emits_own_verdict_in_body_phase(PolicySurface::BuiltIn, policy_id),
+            "{policy_id} publishes no verdict from the body phase; suppressing its \
+             header-phase record would delete the decision, not de-duplicate it"
+        );
+    }
+    assert!(
+        !emits_own_verdict_in_body_phase(PolicySurface::Plugin, "openapi_validation"),
+        "a plugin or bundle hook may call itself anything, including a built-in policy \
+         name; nothing republishes its verdict in the body phase, so it keeps the only \
+         record it has"
+    );
+}
