@@ -1435,13 +1435,26 @@ fn cache_affinity_returns_a_caller_to_the_provider_that_holds_its_warm_prefix() 
          alone does: {served:?}"
     );
 
-    // And the affinity is the caller's, not the route's: a second
-    // caller with its own key is free to land anywhere, so the lease is
-    // keyed rather than a global pin.
-    let unkeyed = gateway.chat(MODEL_STALL, "no cache key at all", &[]);
-    assert_eq!(
-        unkeyed.status, 200,
-        "a caller that sends no cache key is routed by the strategy alone"
+    // The control, so the assertion above is a claim about this feature
+    // rather than about a rotation that happened to sit still. Twelve
+    // more turns on the same route with no cache key: a caller who
+    // sends nothing to lease on is routed by the strategy alone, and
+    // round robin over two members splits them.
+    let mut unkeyed = Vec::new();
+    for turn in 0..12 {
+        let response = gateway.chat(MODEL_STALL, &format!("no key {turn}"), &[]);
+        assert_eq!(response.status, 200, "unkeyed turn {turn} failed");
+        unkeyed.push(
+            response.json().expect("json")["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        );
+    }
+    assert!(
+        unkeyed.iter().any(|answer| *answer != first),
+        "without a cache key these should have been split across the pool; if they all \
+         landed on one member the keyed run above proves nothing: {unkeyed:?}"
     );
 }
 
