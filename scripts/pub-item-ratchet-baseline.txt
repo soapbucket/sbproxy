@@ -717,14 +717,28 @@ pub(crate) would leave items whose only callers are cfg(test) code, which
 same-file constant `AI_TOOLKIT_EVENT_ID_MAX_BYTES` was narrowed to
 pub(crate) before recording this result.
 
+2026-08-27 (WOR-2690): unreferenced baseline 1462 -> 1461. Ground gained,
+not given. `pipeline::CompiledFallback` had only ever been named inside
+`pipeline.rs`; the AI client-disconnect work moved `fail_to_proxy`'s
+`on_error` condition into a named function that takes one, so the type is
+now referenced from `server/proxy_http.rs` and leaves the bucket.
+
 2026-08-27 (WOR-2658 / WOR-2654, the shadow-eval comparison surface):
-unreferenced 1462 -> 1478, tests-only unchanged at 314. Two avoidable
-items were removed before recording this: `ShadowEvalContext::
-retains_responses` was deleted rather than narrowed, since the public
-field it wrapped says the same thing, and `ShadowPairLedger::is_armed`
-was removed, since its only reader was a test and the behavior it
-described is asserted through the report instead. `TargetSummary` was already reachable from `sbproxy-core` and
-is now named there explicitly so the scan can see it.
+unreferenced 1461 -> 1477, tests-only unchanged at 314. Recomputed
+against the tree after merging the WOR-2690 entry above, not carried
+over from the pre-merge run: the two entries move the same counter and
+only a recount can say what the merged tree holds.
+
+Four avoidable items were removed before recording this.
+`ShadowEvalContext::retains_responses` was deleted rather than narrowed,
+since the public field it wrapped says the same thing, and
+`ShadowPairLedger::is_armed` was removed, since its only reader was a
+test and the behavior it described is asserted through the report
+instead. `AiShadowJudge::model` and `AiShadowJudge::divergence_prefilter`
+were removed outright: both parsed and nothing read them, and a
+parse-only config key is worse than an absent one. `TargetSummary` was
+already reachable from `sbproxy-core` and is now named there explicitly
+so the scan can see it.
 
 The additions fall in two groups, and both were tried as pub(crate)
 first.

@@ -2115,6 +2115,26 @@ run_68_fallback_triggers() {
     assert_body_json_field "Fallback on_status - trigger=status" ".trigger" "status" \
         -H "Host: fb-status.test" "$PROXY_URL/"
 
+    # WOR-2686: on_status against a primary that answers with a genuinely
+    # empty body (Content-Length: 0, no bytes). Before the fix the real
+    # primary's headers leaked onto the fallback response and the
+    # fallback's own body never reached the client despite a correct
+    # Content-Length being declared for it.
+    assert_status "Fallback on_status (empty upstream body) - serves from fallback" 200 \
+        -H "Host: fb-status-empty.test" "$PROXY_URL/"
+
+    assert_body_json_field "Fallback on_status (empty upstream body) - trigger=status-empty" \
+        ".trigger" "status-empty" \
+        -H "Host: fb-status-empty.test" "$PROXY_URL/"
+
+    assert_body_json_field "Fallback on_status (empty upstream body) - source=fallback" \
+        ".source" "fallback" \
+        -H "Host: fb-status-empty.test" "$PROXY_URL/"
+
+    assert_no_header "Fallback on_status (empty upstream body) - primary's marker header does not leak" \
+        "X-Origin-Marker" \
+        -H "Host: fb-status-empty.test" "$PROXY_URL/"
+
     stop_proxy
 }
 

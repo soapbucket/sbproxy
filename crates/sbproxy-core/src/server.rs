@@ -2555,76 +2555,329 @@ fn match_accept_q(ranges: &[AcceptRange], content_type: &str) -> f32 {
 
 // --- Fallback action helper ---
 
-/// Serve a fallback action's response directly (for error/status fallback).
-/// Returns Ok(status_code) on success.
-async fn serve_fallback_action(
-    session: &mut Session,
+/// A `fallback_origin` action's response, built without touching the
+/// session.
+///
+/// WOR-2686 split this out of [`serve_fallback_action`]: the response is
+/// pure data, so it can be built (and asserted on) synchronously, and
+/// the only part that has to be `async` is the pair of session writes.
+struct FallbackResponse {
+    /// The complete downstream header, built from nothing. No header the
+    /// primary upstream set can survive onto it.
+    header: pingora_http::ResponseHeader,
+    /// The bytes that belong to `header`. Empty when the framing forbids
+    /// a body.
+    body: bytes::Bytes,
+    /// The status `header` carries.
+    status: u16,
+}
+
+/// True when the response framing forbids a body whatever the operator
+/// configured.
+///
+/// Pingora's `Http1Session::init_body_writer` installs a zero-length body
+/// writer for `204`, `304`, and every response to a `HEAD`, so bytes
+/// handed to `write_response_body` for one of those never reach the
+/// wire. What is declared has to agree with that, or an HTTP/1.1
+/// keep-alive client frames the next response on the connection by a
+/// length no bytes back and desynchronizes.
+fn fallback_body_suppressed(status: u16, method: &http::Method) -> bool {
+    matches!(status, 204 | 304) || *method == http::Method::HEAD
+}
+
+/// Build the response a fallback action serves.
+///
+/// Never reads the primary upstream's response: the header is built from
+/// the action's own configuration, which is what keeps a header the
+/// primary set from surviving onto a fallback (WOR-2686).
+///
+/// `Content-Length` is declared for every status Pingora writes a body
+/// for. `204` and `304` get none: RFC 9110 section 8.6 forbids it on a
+/// `204`, Pingora writes no body for either, and an intermediary that
+/// framed one by its declared length would eat the head of whatever came
+/// next on the connection. That is the same carve-out the `static` and
+/// `mock` arms take in `action_dispatch.rs` under WOR-2599, and this arm
+/// is the one both `fallback_origin` triggers now depend on. A `HEAD`
+/// keeps its declared length, which is the length the matching `GET`
+/// would return, and loses only the bytes.
+fn build_fallback_response(
     action: &Action,
     add_debug_header: bool,
     trigger: &str,
-) -> Result<u16> {
-    match action {
-        Action::Static(s) => {
-            let ct = s.content_type.as_deref().unwrap_or("text/plain");
-            let num_headers = 2 + s.headers.len() + if add_debug_header { 1 } else { 0 };
-            let mut header = pingora_http::ResponseHeader::build(s.status, Some(num_headers))
-                .map_err(|e| {
-                    Error::because(
-                        ErrorType::InternalError,
-                        "failed to build fallback header",
-                        e,
-                    )
-                })?;
-            header.insert_header("content-type", ct).map_err(|e| {
-                Error::because(ErrorType::InternalError, "failed to set content-type", e)
+    method: &http::Method,
+) -> Result<FallbackResponse> {
+    let (status, content_type, body) = match action {
+        Action::Static(s) => (
+            s.status,
+            s.content_type.as_deref().unwrap_or("text/plain"),
+            bytes::Bytes::copy_from_slice(s.body.as_bytes()),
+        ),
+        // Every other action shape serves a generic fallback error. This
+        // could be extended to support proxy/redirect fallback actions.
+        _ => (
+            502u16,
+            "application/json",
+            bytes::Bytes::from_static(b"{\"error\":\"fallback not available\"}"),
+        ),
+    };
+
+    let mut header = pingora_http::ResponseHeader::build(status, Some(4)).map_err(|e| {
+        Error::because(
+            ErrorType::InternalError,
+            "failed to build fallback header",
+            e,
+        )
+    })?;
+    header
+        .insert_header("content-type", content_type)
+        .map_err(|e| Error::because(ErrorType::InternalError, "failed to set content-type", e))?;
+    if !matches!(status, 204 | 304) {
+        header
+            .insert_header("content-length", body.len().to_string())
+            .map_err(|e| {
+                Error::because(ErrorType::InternalError, "failed to set content-length", e)
             })?;
-            header
-                .insert_header("content-length", s.body.len().to_string())
-                .map_err(|e| {
-                    Error::because(ErrorType::InternalError, "failed to set content-length", e)
-                })?;
-            for (k, v) in &s.headers {
-                let _ = header.insert_header(k.clone(), v.clone());
-            }
-            if add_debug_header {
-                let _ = header.insert_header("X-Fallback-Trigger", trigger);
-            }
-            session
-                .write_response_header(Box::new(header), false)
-                .await?;
-            session
-                .write_response_body(Some(bytes::Bytes::copy_from_slice(s.body.as_bytes())), true)
-                .await?;
-            Ok(s.status)
-        }
-        _ => {
-            // For non-static fallback actions, serve a generic fallback error.
-            // This could be extended to support proxy/redirect fallback actions.
-            let body = b"{\"error\":\"fallback not available\"}";
-            let mut header = pingora_http::ResponseHeader::build(502, Some(2)).map_err(|e| {
-                Error::because(
-                    ErrorType::InternalError,
-                    "failed to build fallback error header",
-                    e,
-                )
-            })?;
-            header
-                .insert_header("content-type", "application/json")
-                .map_err(|e| {
-                    Error::because(ErrorType::InternalError, "failed to set content-type", e)
-                })?;
-            if add_debug_header {
-                let _ = header.insert_header("X-Fallback-Trigger", trigger);
-            }
-            session
-                .write_response_header(Box::new(header), false)
-                .await?;
-            session
-                .write_response_body(Some(bytes::Bytes::copy_from_slice(body)), true)
-                .await?;
-            Ok(502)
+    }
+    // The operator's own headers land after the computed ones, the same
+    // ordering the mainline `type: static` arm takes, so a fallback can
+    // override what it declares about itself.
+    if let Action::Static(s) = action {
+        for (k, v) in &s.headers {
+            let _ = header.insert_header(k.clone(), v.clone());
         }
     }
+    if add_debug_header {
+        let _ = header.insert_header("X-Fallback-Trigger", trigger);
+    }
+
+    let body = if fallback_body_suppressed(status, method) {
+        bytes::Bytes::new()
+    } else {
+        body
+    };
+    Ok(FallbackResponse {
+        header,
+        body,
+        status,
+    })
+}
+
+/// Stamp the response headers sbproxy itself owns onto a fallback
+/// response.
+///
+/// # Why this exists
+///
+/// A fallback response is built from nothing, which is what stops the
+/// primary's headers leaking onto it (WOR-2686). Built from nothing also
+/// means built without the headers *sbproxy* would have put on the
+/// response it replaced, and some of those are load-bearing for the
+/// client rather than decorative. CORS is the one that reaches real
+/// users: `apply_cors_headers` runs below the fallback's early return in
+/// `response_filter`, so on an origin with `cors` configured a browser
+/// `fetch()` would meet a fallback carrying no
+/// `access-control-allow-origin` and report an opaque network error
+/// instead of rendering the fallback's own JSON.
+///
+/// # What survives a fallback
+///
+/// Recomputed here from the origin's own configuration, never copied off
+/// the primary's response:
+///
+/// * CORS (`origin.cors`) and HSTS (`origin.hsts`).
+/// * `SecHeaders` policy headers including a per-request CSP nonce, and
+///   the `PageShield` CSP. A fallback carries no upstream CSP, so the
+///   policy's yield-to-upstream setting cannot engage.
+/// * The CSRF cookie the request phase minted.
+/// * `x-sbproxy-debug-request-id` and `x-sbproxy-debug-config-rev` when
+///   the client asked for them with `x-sb-flags: debug`, plus the
+///   correlation-id echo, so a client still holds an identifier that
+///   finds this request in the proxy log.
+/// * `traceparent` and `tracestate`.
+/// * The RFC 9209 `proxy-status` header, carrying the status the
+///   *primary* answered with. On a fallback that header is the only
+///   place that value reaches the client at all.
+/// * The `x-sbproxy-idempotency` and `x-sbproxy-retry-skip-reason`
+///   operator markers, and the e2e harness identity marker.
+///
+/// # What does not
+///
+/// Every header the primary upstream set, which is the whole point. And,
+/// deliberately: `response_modifiers` (their header `set`/`add`/`remove`,
+/// status override, body replacement and scripts all describe a response
+/// that no longer exists), the `Deprecation`/`Sunset` announcements,
+/// `Content-Signal` / `TDM-Reservation`, response compression, the
+/// `Content-Type` rewrite, and response caching. `docs/routing.md` states
+/// this list for operators.
+///
+/// # What this cannot see
+///
+/// It mirrors `response_filter`'s header stages rather than sharing their
+/// code, because those stages are inlined into a 1400-line hook that a
+/// fallback must not run. A stage added to `response_filter` after this
+/// is written therefore will not appear on a fallback until it is added
+/// here too, and nothing fails when that happens. The unit test
+/// `a_fallback_response_carries_the_gateway_owned_headers` pins the set
+/// as it stands.
+fn stamp_fallback_gateway_headers(
+    request: &pingora_http::RequestHeader,
+    ctx: &RequestContext,
+    header: &mut pingora_http::ResponseHeader,
+    primary_status: Option<u16>,
+) {
+    let pipeline = ctx.pipeline.clone();
+    let Some(origin_idx) = ctx.origin_idx else {
+        return;
+    };
+    let Some(origin) = pipeline.config.origins.get(origin_idx) else {
+        return;
+    };
+
+    if let Some(cors_config) = &origin.cors {
+        let request_origin = request.headers.get("origin").and_then(|v| v.to_str().ok());
+        let mut temp = http::HeaderMap::new();
+        sbproxy_middleware::cors::apply_cors_headers(cors_config, request_origin, &mut temp);
+        for (name, value) in &temp {
+            let _ =
+                header.insert_header(name.to_string(), value.to_str().unwrap_or("").to_string());
+        }
+    }
+
+    if let Some(hsts_config) = &origin.hsts {
+        let mut temp = http::HeaderMap::new();
+        sbproxy_middleware::hsts::apply_hsts(hsts_config, &mut temp);
+        for (name, value) in &temp {
+            let _ =
+                header.insert_header(name.to_string(), value.to_str().unwrap_or("").to_string());
+        }
+    }
+
+    if let Some(policies) = pipeline.policies.get(origin_idx) {
+        let path = request.uri.path();
+        for policy in policies {
+            match policy {
+                Policy::SecHeaders(sec) => {
+                    let (headers, nonce) = sec.resolved_headers_for_request(path);
+                    for (name, value) in headers {
+                        if let Some(mode) = csp_emission_mode(&name) {
+                            sbproxy_observe::metrics::record_security_headers_csp_emitted(
+                                mode,
+                                ctx.tenant_id.as_ref(),
+                            );
+                        }
+                        let _ = header.insert_header(name, value);
+                    }
+                    if let Some(n) = nonce {
+                        let _ = header.insert_header("x-csp-nonce", n);
+                    }
+                }
+                // The fallback carries no upstream CSP of its own, so a
+                // policy configured to defer to one cannot engage here.
+                Policy::PageShield(shield) if !shield.yields_to_upstream(false) => {
+                    let host = request
+                        .headers
+                        .get("host")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    let (name, value) = shield.header(host);
+                    let _ = header.insert_header(name.to_string(), value);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if let Some(ref cookie) = ctx.csrf_cookie {
+        let _ = header.append_header("set-cookie", cookie);
+    }
+
+    if ctx.flags.debug {
+        let _ = header.insert_header("x-sbproxy-debug-request-id", ctx.request_id.as_str());
+        let _ = header.insert_header(
+            "x-sbproxy-debug-config-rev",
+            pipeline.config_revision.as_str(),
+        );
+    }
+
+    if let Some(token) = e2e_harness_token() {
+        let _ = header.insert_header("x-sbproxy-e2e-harness-token", token);
+    }
+
+    // The primary's status is what an on-call engineer needs off a
+    // fallback, and `proxy-status` is where a client can read it.
+    if let Some(status) = primary_status.filter(|s| !(200..300).contains(s)) {
+        if let Some(cfg) = origin.proxy_status.as_ref() {
+            if cfg.enabled {
+                let identity = cfg.identity.as_deref().unwrap_or("sbproxy");
+                let value = sbproxy_middleware::proxy_status::build_proxy_status_with_identity(
+                    identity,
+                    status,
+                    ai_support::proxy_status_error_token(status),
+                );
+                let _ = header.insert_header("proxy-status", value);
+            }
+        }
+    }
+
+    if let Some(reason) = ctx.idempotency_skip_reason {
+        let _ = header.insert_header("x-sbproxy-idempotency", reason);
+    }
+    if let Some(reason) = ctx.status_retry_skip_reason {
+        let _ = header.insert_header("x-sbproxy-retry-skip-reason", reason);
+    }
+
+    if let Some(ref trace_ctx) = ctx.trace_ctx {
+        let _ = header.insert_header("traceparent", trace_ctx.to_traceparent());
+        if let Some(ref ts) = trace_ctx.tracestate {
+            let _ = header.insert_header("tracestate", ts.as_str());
+        }
+    }
+
+    let correlation = &pipeline.config.server.correlation_id;
+    if correlation.enabled && correlation.echo_response && !ctx.request_id.is_empty() {
+        let _ = header.insert_header(correlation.header.clone(), ctx.request_id.as_str());
+    }
+}
+
+/// Serve a fallback action's response directly (for error/status
+/// fallback).
+///
+/// Returns `Ok((status_code, body_len_bytes))` on success, where
+/// `body_len_bytes` is what actually reached the wire and is therefore
+/// zero on a framing that forbids a body. The length lets callers keep
+/// `ctx.response_body_bytes` (the access log's and the billing meter's
+/// `bytes_out`, per WOR-2686) honest for a fallback response that never
+/// goes through `response_body_filter`'s own accounting.
+///
+/// `primary_status` is the status the primary upstream answered with on
+/// the `on_status` trigger and `None` on `on_error`, where no upstream
+/// response exists. It is what the RFC 9209 `Proxy-Status` header
+/// reports.
+async fn serve_fallback_action(
+    session: &mut Session,
+    ctx: &RequestContext,
+    action: &Action,
+    add_debug_header: bool,
+    trigger: &str,
+    primary_status: Option<u16>,
+) -> Result<(u16, u64)> {
+    let built = {
+        let request = session.req_header();
+        let mut built =
+            build_fallback_response(action, add_debug_header, trigger, &request.method)?;
+        stamp_fallback_gateway_headers(request, ctx, &mut built.header, primary_status);
+        built
+    };
+    let FallbackResponse {
+        header,
+        body,
+        status,
+    } = built;
+    let body_len = body.len() as u64;
+    session
+        .write_response_header(Box::new(header), false)
+        .await?;
+    session.write_response_body(Some(body), true).await?;
+    Ok((status, body_len))
 }
 
 // --- Auth checking ---
