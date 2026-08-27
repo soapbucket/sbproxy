@@ -7329,9 +7329,15 @@ enum BasicChallenge {
 /// - `X-Requested-With: XMLHttpRequest` is what the console's own fetch
 ///   wrapper sends on every admin call. It is the deliberate marker, the
 ///   one signal this repository sets on both sides of the wire.
-/// - `Sec-Fetch-Dest`, present at any value, is a browser. Browsers send
-///   the fetch-metadata headers on every request they make; curl,
-///   `reqwest`, undici, Deno, and Bun send none of them. It covers the
+/// - `Sec-Fetch-Dest`, present at any value, is a browser. Browsers that
+///   have it send it on every request they make; curl, `reqwest`, undici,
+///   Deno, and Bun send none of them. It shipped in Chrome 80, Firefox
+///   90, and Safari 16.4, so a browser older than those sends no fetch
+///   metadata: the console's own calls stay covered there by
+///   `X-Requested-With`, but an address-bar navigation on such a browser
+///   still draws the challenge and can still seed the password cache
+///   described below. That is the one hole left in this, and closing it
+///   means refusing Basic on the admin API rather than reading a hint. It covers the
 ///   console's `EventSource` log and job streams, which the fetch wrapper
 ///   cannot decorate because `EventSource` accepts no request headers, and
 ///   it covers the address-bar navigation (`Sec-Fetch-Dest: document`)

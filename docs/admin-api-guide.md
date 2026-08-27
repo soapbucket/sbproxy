@@ -177,7 +177,10 @@ A request from a browser gets the same 401 without that header. Two
 markers identify one, and either is enough: `X-Requested-With:
 XMLHttpRequest`, which the console's fetch layer sends on every admin
 call, and `Sec-Fetch-Dest` at any value, which browsers send on every
-request they make and no shell client sends at all. The reason is that
+request they make and no shell client sends at all (it shipped in Chrome
+80, Firefox 90, and Safari 16.4; older browsers send neither header on a
+navigation, so they still see the dialog, while the console's own calls
+stay covered by `X-Requested-With` everywhere). The reason is that
 the challenge header has one effect in a browser, which is to open the
 native credential dialog, and that dialog is not this console's sign-in
 page. Cancelling it leaves the console wedged until a hard reload, and
@@ -186,11 +189,11 @@ whole origin, where the browser re-sends it on every later request and
 quietly re-establishes a session nobody signed in for. The console reads
 the bare 401 and routes to its own login form.
 
-So opening an admin route in a browser tab shows you the JSON refusal
-rather than a credential prompt. That is deliberate: the prompt is the
-one path by which a browser picks up the top-level password and starts
-re-sending it invisibly, and the console's own sign-in page is the
-supported way in.
+So opening an admin route in a current browser tab shows you the JSON
+refusal rather than a credential prompt. That is deliberate: the prompt
+is the one path by which a browser picks up the top-level password and
+starts re-sending it invisibly, and the console's own sign-in page is
+the supported way in.
 
 Both markers are a hint about the caller and nothing more. They choose
 one response header: credentials resolve identically with or without
