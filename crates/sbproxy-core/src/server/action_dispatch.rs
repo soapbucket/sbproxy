@@ -3820,6 +3820,18 @@ pub(super) async fn handle_mcp_action(
                     error,
                 )
             })?;
+        // Every broker refusal publishes a typed record. Without this
+        // the only trace of an /authorize, /token, /revoke, or
+        // /introspect refusal was a `tracing::info!` line inside the
+        // crate, so none of it reached the SIEM feed that
+        // `docs/events.md` publishes for comparable refusal surfaces.
+        // The status class is what crosses the adapter boundary; the
+        // specific OAuth error code stays in the response body and the
+        // broker's own decision log, which is the same split the
+        // broker's metrics middleware already makes.
+        if response.status >= 400 {
+            record_mcp_broker_refusal(ctx, &req_path, response.status);
+        }
         let mut header =
             pingora_http::ResponseHeader::build(response.status, Some(response.headers.len() + 1))?;
         for (name, value) in response.headers {
@@ -3950,6 +3962,24 @@ pub(super) async fn handle_mcp_action(
                     }
                 }
                 Err(error) => {
+                    // The enforcement decision this whole surface
+                    // exists to make. Before this it was a bare 401:
+                    // no counter, no log line, no audit record, so an
+                    // operator whose agents suddenly could not
+                    // authenticate had nothing anywhere to look at.
+                    sbproxy_mcp_gateway::metrics::record_broker_decision(
+                        "resource_server",
+                        "unauthenticated",
+                    );
+                    tracing::warn!(
+                        target: "mcp_gateway::decision",
+                        event = "mcp_oauth_resource_server_decision",
+                        outcome = "unauthenticated",
+                        reason = %error,
+                        method = %method,
+                        "MCP request refused: access token verification failed"
+                    );
+                    record_mcp_authentication_refusal(ctx, &error.to_string());
                     let challenge = provider.www_authenticate_header(&error);
                     let mut header = pingora_http::ResponseHeader::build(401, Some(3))?;
                     let _ = header.insert_header("www-authenticate", challenge);
@@ -4437,21 +4467,53 @@ pub(super) async fn handle_mcp_action(
             .as_ref()
             .map(|oauth| oauth.scopes_supported.as_slice())
             .unwrap_or(&[]);
-        if let Some(required_scope) = mcp_scope_refusal(
+        match mcp_scope_refusal(
             request.method.as_str(),
             scopes_supported,
             ctx.principal.attrs.claims.as_ref(),
         ) {
-            let message = format!("insufficient scope, requires {required_scope}");
-            let error = match request_id.clone() {
-                sbproxy_extension::mcp::DecodedRequestId::Modern(id) => {
-                    sbproxy_extension::mcp::McpWireError::modern_invalid_params(id, &message)
-                }
-                sbproxy_extension::mcp::DecodedRequestId::Legacy(id) => {
-                    sbproxy_extension::mcp::McpWireError::invalid_params(id, &message)
-                }
-            };
-            return write_mcp_wire_response(session, *error.0).await;
+            McpScopeDecision::Granted => {}
+            McpScopeDecision::Unadvertised(scope) => {
+                // The check did not apply. Counted and logged as the
+                // fail-open it is: the operator's own
+                // `scopes_supported` list is what turned it off, and
+                // without this line there is nothing to tell them.
+                sbproxy_mcp_gateway::metrics::record_broker_decision(
+                    "scope",
+                    "admitted_unadvertised",
+                );
+                tracing::info!(
+                    target: "mcp_gateway::decision",
+                    event = "mcp_oauth_scope_decision",
+                    outcome = "admitted_unadvertised",
+                    method = %request.method,
+                    scope = scope,
+                    "per-operation scope check did not apply: oauth.scopes_supported does not advertise this scope"
+                );
+            }
+            McpScopeDecision::Refused(required_scope) => {
+                sbproxy_mcp_gateway::metrics::record_broker_decision("scope", "refused");
+                tracing::warn!(
+                    target: "mcp_gateway::decision",
+                    event = "mcp_oauth_scope_decision",
+                    outcome = "refused",
+                    method = %request.method,
+                    scope = required_scope,
+                    principal = %ctx.principal.sub,
+                    "MCP operation refused: the verified token does not carry the required scope"
+                );
+                record_mcp_scope_decision(ctx, request.method.as_str(), required_scope);
+                let message = format!("insufficient scope, requires {required_scope}");
+                let error = match request_id.clone() {
+                    sbproxy_extension::mcp::DecodedRequestId::Modern(id) => {
+                        sbproxy_extension::mcp::McpWireError::modern_invalid_params(id, &message)
+                    }
+                    sbproxy_extension::mcp::DecodedRequestId::Legacy(id) => {
+                        sbproxy_extension::mcp::McpWireError::invalid_params(id, &message)
+                    }
+                };
+                return write_mcp_wire_response(session, *error.0).await;
+            }
         }
     }
 
@@ -8420,6 +8482,155 @@ fn record_mcp_tool_decision(
     );
 }
 
+/// Publish one in-process OAuth broker refusal to the audit feed, as an
+/// `auth` decision record.
+///
+/// `surface` is the broker route, taken from the request path rather
+/// than from a response body, so the record names which endpoint
+/// refused without this function having to parse anything the broker
+/// wrote.
+fn record_mcp_broker_refusal(ctx: &RequestContext, req_path: &str, status: u16) {
+    use sbproxy_observe::decision::{DecisionEngine, DecisionEvent, DecisionOutcome};
+
+    let surface = req_path.rsplit('/').next().unwrap_or("broker");
+    let outcome = if status >= 500 {
+        DecisionOutcome::Error
+    } else {
+        DecisionOutcome::Deny
+    };
+    let origin_id = ctx
+        .origin_idx
+        .and_then(|idx| ctx.pipeline.config.origins.get(idx))
+        .map(|origin| origin.origin_id.to_string());
+    let origin_for_family = origin_id.as_deref().unwrap_or("__unmatched__");
+    sbproxy_observe::decision::record_decision(
+        DecisionEvent::Auth,
+        DecisionEngine::BuiltIn,
+        outcome,
+        origin_for_family,
+        &ctx.tenant_id,
+    );
+    let Some(origin_id) = origin_id else {
+        return;
+    };
+    if !crate::server::proxy_http::audit_publishes(
+        &ctx.pipeline,
+        DecisionEvent::Auth,
+        Some(&ctx.tenant_id),
+        Some(&origin_id),
+    ) {
+        return;
+    }
+    crate::policy_bus::emit_decision_audit_detailed(
+        DecisionEvent::Auth,
+        DecisionEngine::BuiltIn,
+        outcome,
+        &ctx.request_id,
+        &origin_id,
+        &origin_id,
+        &ctx.tenant_id,
+        &format!("mcp oauth broker refused {surface} with {status}"),
+        sbproxy_observe::decision::DecisionDetails::auth(&format!("mcp_oauth_{surface}")),
+    );
+}
+
+/// Publish one MCP resource-server authentication refusal to the audit
+/// feed, as an `auth` decision record.
+///
+/// `auth` is the right event: the resource server is an authentication
+/// gate, and the record answers the question an analyst actually has,
+/// which is whether the proxy or the upstream turned an agent away.
+/// `docs/events.md` already publishes `auth`, so this needs no new
+/// event type and no new operator configuration to reach a SIEM.
+fn record_mcp_authentication_refusal(ctx: &RequestContext, reason: &str) {
+    use sbproxy_observe::decision::{DecisionEngine, DecisionEvent, DecisionOutcome};
+
+    let origin_id = ctx
+        .origin_idx
+        .and_then(|idx| ctx.pipeline.config.origins.get(idx))
+        .map(|origin| origin.origin_id.to_string());
+    let origin_for_family = origin_id.as_deref().unwrap_or("__unmatched__");
+    sbproxy_observe::decision::record_decision(
+        DecisionEvent::Auth,
+        DecisionEngine::BuiltIn,
+        DecisionOutcome::Deny,
+        origin_for_family,
+        &ctx.tenant_id,
+    );
+    let Some(origin_id) = origin_id else {
+        return;
+    };
+    if !crate::server::proxy_http::audit_publishes(
+        &ctx.pipeline,
+        DecisionEvent::Auth,
+        Some(&ctx.tenant_id),
+        Some(&origin_id),
+    ) {
+        return;
+    }
+    crate::policy_bus::emit_decision_audit_detailed(
+        DecisionEvent::Auth,
+        DecisionEngine::BuiltIn,
+        DecisionOutcome::Deny,
+        &ctx.request_id,
+        &origin_id,
+        &origin_id,
+        &ctx.tenant_id,
+        &format!("mcp resource server refused the access token: {reason}"),
+        sbproxy_observe::decision::DecisionDetails::auth("mcp_oauth_resource_server"),
+    );
+}
+
+/// Publish one per-operation scope refusal to the audit feed, as an
+/// `mcp.tool` decision record.
+///
+/// The sibling MCP refusals in this function already use `mcp.tool`,
+/// and this refusal is about the same thing: which operation the
+/// gateway let an agent run. The missing scope is the verdict, so a
+/// rule can select on it.
+fn record_mcp_scope_decision(ctx: &RequestContext, method: &str, required_scope: &str) {
+    use sbproxy_observe::decision::{DecisionEngine, DecisionEvent, DecisionOutcome};
+
+    let origin_id = ctx
+        .origin_idx
+        .and_then(|idx| ctx.pipeline.config.origins.get(idx))
+        .map(|origin| origin.origin_id.to_string());
+    let origin_for_family = origin_id.as_deref().unwrap_or("__unmatched__");
+    sbproxy_observe::decision::record_decision(
+        DecisionEvent::McpTool,
+        DecisionEngine::BuiltIn,
+        DecisionOutcome::Deny,
+        origin_for_family,
+        &ctx.tenant_id,
+    );
+    let Some(origin_id) = origin_id else {
+        return;
+    };
+    if !crate::server::proxy_http::audit_publishes(
+        &ctx.pipeline,
+        DecisionEvent::McpTool,
+        Some(&ctx.tenant_id),
+        Some(&origin_id),
+    ) {
+        return;
+    }
+    crate::policy_bus::emit_decision_audit_detailed(
+        DecisionEvent::McpTool,
+        DecisionEngine::BuiltIn,
+        DecisionOutcome::Deny,
+        &ctx.request_id,
+        &origin_id,
+        &origin_id,
+        &ctx.tenant_id,
+        &format!("mcp {method} refused: token lacks scope {required_scope}"),
+        sbproxy_observe::decision::DecisionDetails::mcp_tool(
+            method,
+            "oauth_resource_server",
+            "insufficient_scope",
+        ),
+    );
+}
+
 /// Returns `true` when the caller must refuse the tool call outright
 /// because `events.fail_closed` names `mcp_governance_decision` and the
 /// evidence record for this call could not be queued (WOR-2384). `false`
@@ -9882,41 +10093,61 @@ pub(super) fn required_mcp_scope(method: &str) -> &'static str {
     }
 }
 
-/// Decide whether a verified token may run `method`, returning the scope
-/// it lacks when it may not.
+/// The three answers [`mcp_scope_refusal`] can give.
+///
+/// `Unadvertised` exists so the caller can tell "the token carries the
+/// scope" apart from "the check did not apply". Collapsing them into
+/// one `None` is what made the fail-open invisible: a deployment that
+/// publishes `scopes_supported: ["mcp.read"]` intending a read-only
+/// surface admits every `tools/call`, and nothing counted it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum McpScopeDecision {
+    /// The token carries the scope this operation maps to.
+    Granted,
+    /// The resource does not advertise the scope this operation maps
+    /// to, so the check does not apply. A fail-open, carrying the scope
+    /// that went unchecked.
+    Unadvertised(&'static str),
+    /// The token does not carry the scope this operation maps to.
+    Refused(&'static str),
+}
+
+/// Decide whether a verified token may run `method`.
 ///
 /// What this cannot see: a deployment whose scope vocabulary is not
 /// sbproxy's. The mapping above is a convention, not something RFC 9728
 /// fixes, so it is enforced only for a resource that advertises the
 /// scope it names in `scopes_supported`. A resource advertising some
-/// other vocabulary (or none) is admitted here and gets whatever
+/// other vocabulary (or none) is admitted and gets whatever
 /// per-operation authorization its authorization server applies; this
 /// function is not the only gate on such a deployment, and it does not
 /// claim to be. Audience, issuer, expiry, DPoP, and mTLS binding are
-/// checked earlier by the resource-server verifier regardless.
+/// checked earlier by the resource-server verifier regardless. That
+/// case comes back as [`McpScopeDecision::Unadvertised`] rather than as
+/// a plain admit, so the caller counts and logs it.
 pub(super) fn mcp_scope_refusal(
     method: &str,
     scopes_supported: &[String],
     claims: Option<&serde_json::Map<String, serde_json::Value>>,
-) -> Option<&'static str> {
+) -> McpScopeDecision {
     let required = required_mcp_scope(method);
     if !scopes_supported.iter().any(|s| s == required) {
-        return None;
+        return McpScopeDecision::Unadvertised(required);
     }
     let granted = claims
         .and_then(|c| c.get("scope"))
         .and_then(|s| s.as_str())
         .is_some_and(|s| s.split_whitespace().any(|scope| scope == required));
     if granted {
-        None
+        McpScopeDecision::Granted
     } else {
-        Some(required)
+        McpScopeDecision::Refused(required)
     }
 }
 
 #[cfg(test)]
 mod mcp_scope_enforcement_tests {
-    use super::{mcp_scope_refusal, required_mcp_scope};
+    use super::{mcp_scope_refusal, required_mcp_scope, McpScopeDecision};
 
     fn advertised() -> Vec<String> {
         vec!["mcp.read".to_string(), "mcp.call".to_string()]
@@ -9943,23 +10174,23 @@ mod mcp_scope_enforcement_tests {
         let read_only = claims("mcp.read");
         assert_eq!(
             mcp_scope_refusal("tools/call", &advertised(), Some(&read_only)),
-            Some("mcp.call"),
+            McpScopeDecision::Refused("mcp.call"),
             "a read-only token must not be able to invoke a tool"
         );
         assert_eq!(
             mcp_scope_refusal("tools/list", &advertised(), None),
-            Some("mcp.read"),
+            McpScopeDecision::Refused("mcp.read"),
             "a token carrying no scope claim must not be able to list tools"
         );
         let empty = serde_json::Map::new();
         assert_eq!(
             mcp_scope_refusal("tools/list", &advertised(), Some(&empty)),
-            Some("mcp.read"),
+            McpScopeDecision::Refused("mcp.read"),
         );
         let unrelated = claims("openid profile");
         assert_eq!(
             mcp_scope_refusal("tools/call", &advertised(), Some(&unrelated)),
-            Some("mcp.call"),
+            McpScopeDecision::Refused("mcp.call"),
         );
     }
 
@@ -9968,16 +10199,16 @@ mod mcp_scope_enforcement_tests {
         let both = claims("mcp.read mcp.call");
         assert_eq!(
             mcp_scope_refusal("tools/call", &advertised(), Some(&both)),
-            None
+            McpScopeDecision::Granted
         );
         assert_eq!(
             mcp_scope_refusal("tools/list", &advertised(), Some(&both)),
-            None
+            McpScopeDecision::Granted
         );
         let read_only = claims("mcp.read");
         assert_eq!(
             mcp_scope_refusal("tools/list", &advertised(), Some(&read_only)),
-            None
+            McpScopeDecision::Granted
         );
     }
 
@@ -9987,7 +10218,7 @@ mod mcp_scope_enforcement_tests {
             let map = claims(lookalike);
             assert_eq!(
                 mcp_scope_refusal("tools/call", &advertised(), Some(&map)),
-                Some("mcp.call"),
+                McpScopeDecision::Refused("mcp.call"),
                 "{lookalike} must not satisfy mcp.call"
             );
         }
@@ -9997,9 +10228,20 @@ mod mcp_scope_enforcement_tests {
     fn a_resource_advertising_another_vocabulary_is_left_to_its_issuer() {
         let other = vec!["api.full".to_string()];
         let map = claims("api.full");
-        assert_eq!(mcp_scope_refusal("tools/call", &other, Some(&map)), None);
-        assert_eq!(mcp_scope_refusal("tools/call", &other, None), None);
-        assert_eq!(mcp_scope_refusal("tools/call", &[], None), None);
+        // Admitted, but reported as the fail-open it is so the caller
+        // counts it. `None` here is what hid the whole class.
+        assert_eq!(
+            mcp_scope_refusal("tools/call", &other, Some(&map)),
+            McpScopeDecision::Unadvertised("mcp.call")
+        );
+        assert_eq!(
+            mcp_scope_refusal("tools/call", &other, None),
+            McpScopeDecision::Unadvertised("mcp.call")
+        );
+        assert_eq!(
+            mcp_scope_refusal("tools/call", &[], None),
+            McpScopeDecision::Unadvertised("mcp.call")
+        );
     }
 }
 
