@@ -33,6 +33,16 @@
 //!   pin, so a branch moving underneath the node cannot be followed.
 //! * Set `verify_signature: true`. The loader then requires a good
 //!   signature on the resolved tag or commit.
+//! * Set `confine: true` when the repository is written by somebody
+//!   other than whoever runs the proxy. The fetched document then goes
+//!   through [`crate::confined_template`] with
+//!   [`crate::ConfinementPolicy::remote_document`]: no secret reference
+//!   that reads this host (`env:NAME`, `file:PATH`, `vault://env/NAME`)
+//!   and no config key naming a path on it. Off by default, because on
+//!   an ordinary GitOps node the repository *is* the operator's config
+//!   and the local file is only a pointer, so sealing those spellings
+//!   would leave the operator nowhere to write a secret reference at
+//!   all (WOR-2433).
 //!
 //! ## How a git source is fetched
 //!
@@ -175,13 +185,17 @@ pub enum ConfigSourceError {
     Invalid(String),
     /// The document the repository served reaches for something only the
     /// host owner may reach: a secret read straight off the process
-    /// environment or the filesystem, or a host path the compiler would
-    /// inline (WOR-2433).
+    /// environment or the filesystem, or a host path the proxy would
+    /// open (WOR-2433). Only raised for a source the operator marked
+    /// `confine: true`.
     ///
     /// Separate from [`Self::Invalid`] because it is not a malformed
     /// document. It parses, it would compile, and refusing it is a trust
     /// decision rather than a syntax one, so it earns its own metric
-    /// label and its own operator message.
+    /// label and its own operator message. A fetched document that does
+    /// not parse is reported as [`Self::Invalid`] even though the
+    /// confinement check is what noticed, so this counter keeps meaning
+    /// "somebody tried to reach this host".
     #[error("source.confinement: {0}")]
     Confinement(String),
 }
@@ -1436,12 +1450,13 @@ fn sanitize_materialization_error(
             ConfigSourceError::Merge(clean(detail, resolved_credential, http_auth))
         }
         // A confinement refusal names a field path and a static form,
-        // never a value, so there is nothing here for `clean` to find.
-        // It goes through it anyway: this match is exhaustive on purpose
-        // so that a new variant has to make this decision explicitly,
-        // and "scrubbed, and here is why that is a no-op" is the
-        // decision that survives someone later adding detail to the
-        // message.
+        // never a value, and its label is redacted at the point it is
+        // built (`confine_fetched_document`) because this sanitizer only
+        // wraps the fetch and the check runs after `load_git` returns.
+        // It goes through `clean` anyway: this match is exhaustive on
+        // purpose so that a new variant has to make this decision
+        // explicitly, and a second scrub of an already-redacted string
+        // is a no-op rather than a cost.
         ConfigSourceError::Confinement(detail) => {
             ConfigSourceError::Confinement(clean(detail, resolved_credential, http_auth))
         }
@@ -1637,6 +1652,7 @@ fn load_with_depth(
             path,
             credential,
             verify_signature,
+            confine,
             timeout_secs,
             refresh_interval_secs: _,
         } => {
@@ -1651,24 +1667,28 @@ fn load_with_depth(
             let (text, resolved) = load_git(&spec, fetch_ctx)?;
             // The document a repository serves is authored by whoever
             // can push to that repository, which is not necessarily
-            // whoever runs this proxy. `ConfigSource::Local` above
-            // returns the operator's own file and is deliberately not
-            // confined; this branch is the one place in the loader where
-            // config text arrives from somewhere else, so it is where
-            // the boundary belongs (WOR-2433).
+            // whoever runs this proxy. When the operator says those are
+            // different parties (`source.confine: true`), the document
+            // gets the same boundary a config-authority bundle gets
+            // (WOR-2433).
+            //
+            // Opt-in rather than on by default, because in the ordinary
+            // GitOps shape the repository is the operator's own config
+            // store: the local file is a pointer, so the refusal's
+            // remedy - declare the value in the config the operator
+            // owns - has nowhere to go, and `env:` / `file:` are the
+            // documented (and for the cluster shared key the only)
+            // spellings for a secret there. See `ConfigSource::Git`'s
+            // `confine` field for the full reasoning.
             //
             // `remote_document()` keeps `${VAR}`, which is the
             // documented and only supported way to run one shared
             // document across a fleet, and withholds the two powers a
             // remote document was never granted: a secret reference read
-            // straight off this host, and a host path the compiler
-            // inlines.
-            crate::confined_template::check_confined_document(
-                &format!("{}:{}", spec.repo, spec.path),
-                &text,
-                &crate::confined_template::ConfinementPolicy::remote_document(),
-            )
-            .map_err(|error| ConfigSourceError::Confinement(error.to_string()))?;
+            // straight off this host, and a host path the proxy opens.
+            if *confine {
+                confine_fetched_document(&spec, &text)?;
+            }
             revisions.push(resolved);
             Ok(text)
         }
@@ -1681,6 +1701,35 @@ fn load_with_depth(
             Ok(acc)
         }
     }
+}
+
+/// Check a fetched document against the externally-authored boundary,
+/// naming it by repository and path.
+///
+/// Two details the call site would otherwise get wrong. The label goes
+/// through [`redact_repo`] like every other repository string that
+/// reaches a log line or an error message: this one is rendered on every
+/// boot and every refresh of a refusing document, and a `source.repo`
+/// carrying `https://token@host/repo.git` would print the token each
+/// time (WOR-2433 re-review). And a document that does not parse is
+/// reported as [`ConfigSourceError::Invalid`], not as a confinement
+/// refusal: this check is the first parse of the fetched text, and
+/// `Confinement` means "it parses, it would compile, and this node
+/// refuses what it reaches for", which is what makes its metric label
+/// worth reading.
+fn confine_fetched_document(spec: &GitSpec<'_>, text: &str) -> Result<(), ConfigSourceError> {
+    let label = format!("{}:{}", redact_repo(spec.repo), spec.path);
+    crate::confined_template::check_confined_document(
+        &label,
+        text,
+        &crate::confined_template::ConfinementPolicy::remote_document(),
+    )
+    .map_err(|error| match error {
+        crate::confined_template::ConfinedTemplateError::Parse { .. } => {
+            ConfigSourceError::Invalid(error.to_string())
+        }
+        other => ConfigSourceError::Confinement(other.to_string()),
+    })
 }
 
 /// One `Git` source, flattened so the loader is not passing seven
@@ -1874,6 +1923,7 @@ mod tests {
             path: path.to_string(),
             credential: None,
             verify_signature: false,
+            confine: false,
             timeout_secs: 60,
             refresh_interval_secs: 60,
         }
@@ -1885,6 +1935,64 @@ mod tests {
         ctx: &FetchContext,
     ) -> Result<ResolvedDocument, ConfigSourceError> {
         load_source_blocking(source, inline, ctx)
+    }
+
+    /// WOR-2433 re-review. The confinement label is built from the
+    /// `source.repo` string, which may carry a token, and it is rendered
+    /// on every boot and every refresh of a refusing document. This
+    /// error never passes through `sanitize_materialization_error`
+    /// either, because that only wraps the fetch and this check runs
+    /// after `load_git` has returned, so the redaction has to happen
+    /// where the label is built.
+    #[test]
+    fn a_confinement_refusal_never_carries_the_repositorys_credential() {
+        for repo in [
+            "https://ghp_examplesecrettoken@github.com/acme/config.git",
+            "https://acme:ghp_examplesecrettoken@github.com/acme/config.git",
+        ] {
+            let spec = GitSpec {
+                repo,
+                revision: None,
+                path: "sb.yml",
+                credential: None,
+                verify_signature: false,
+                timeout: Duration::from_secs(60),
+            };
+            let error = confine_fetched_document(
+                &spec,
+                "origins:\n  api:\n    authentication:\n      api_key: \"env:AWS_SECRET_ACCESS_KEY\"\n",
+            )
+            .expect_err("a confined document may not read this host's environment");
+
+            let rendered = error.to_string();
+            assert!(
+                !rendered.contains("ghp_examplesecrettoken"),
+                "the refusal carried the repository credential: {rendered}"
+            );
+            assert!(
+                rendered.contains("github.com/acme/config.git:sb.yml"),
+                "the refusal must still say which document it refused: {rendered}"
+            );
+        }
+    }
+
+    /// The other half of the same site: a document that does not parse is
+    /// a syntax problem, not a trust decision, so it must not climb the
+    /// confinement counter.
+    #[test]
+    fn a_confined_document_that_does_not_parse_is_invalid() {
+        let spec = GitSpec {
+            repo: "https://github.com/acme/config.git",
+            revision: None,
+            path: "sb.yml",
+            credential: None,
+            verify_signature: false,
+            timeout: Duration::from_secs(60),
+        };
+        let error = confine_fetched_document(&spec, "origins:\n  api\n    action: [unclosed\n")
+            .expect_err("a malformed document must fail");
+        assert!(matches!(error, ConfigSourceError::Invalid(_)), "{error:?}");
+        assert_eq!(error.metric_label(), "invalid");
     }
 
     #[test]
@@ -2123,6 +2231,7 @@ mod tests {
             path: "sb.yml".into(),
             credential: Some("env:SB_GIT_TOKEN".into()),
             verify_signature: false,
+            confine: false,
             timeout_secs: 60,
             refresh_interval_secs: 60,
         };
@@ -2144,6 +2253,7 @@ mod tests {
             path: "sb.yml".into(),
             credential: Some("env:SB_GIT_TOKEN".into()),
             verify_signature: false,
+            confine: false,
             timeout_secs: 60,
             refresh_interval_secs: 60,
         };

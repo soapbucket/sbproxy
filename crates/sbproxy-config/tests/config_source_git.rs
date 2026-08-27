@@ -162,9 +162,20 @@ fn git_source(repo: &str, revision: Option<&str>) -> ConfigSource {
         path: "sb.yml".to_string(),
         credential: None,
         verify_signature: false,
+        confine: false,
         timeout_secs: 120,
         refresh_interval_secs: 60,
     }
+}
+
+/// The same source with `confine: true`, the opt-in that says the
+/// repository is written by somebody other than whoever runs this proxy.
+fn confined_git_source(repo: &str, revision: Option<&str>) -> ConfigSource {
+    let mut source = git_source(repo, revision);
+    if let ConfigSource::Git { confine, .. } = &mut source {
+        *confine = true;
+    }
+    source
 }
 
 fn resolve(source: &ConfigSource) -> Result<ResolvedDocument, ConfigSourceError> {
@@ -304,8 +315,8 @@ fn a_git_document_reading_this_hosts_environment_is_refused() {
       api_key: "env:AWS_SECRET_ACCESS_KEY"
 "#,
     );
-    let error = resolve(&git_source(&fixture.url(), Some("main")))
-        .expect_err("a repository may not name this host's environment");
+    let error = resolve(&confined_git_source(&fixture.url(), Some("main")))
+        .expect_err("a confined repository may not name this host's environment");
     assert!(
         matches!(error, ConfigSourceError::Confinement(_)),
         "{error:?}",
@@ -330,8 +341,8 @@ fn a_git_document_naming_a_host_path_is_refused() {
       - rego_module_path: /etc/sbproxy/anything.rego
 "#,
     );
-    let error = resolve(&git_source(&fixture.url(), Some("main")))
-        .expect_err("a repository may not name a path on the host that compiles it");
+    let error = resolve(&confined_git_source(&fixture.url(), Some("main")))
+        .expect_err("a confined repository may not name a path on the host that compiles it");
     assert!(
         matches!(error, ConfigSourceError::Confinement(_)),
         "{error:?}",
@@ -352,6 +363,64 @@ fn a_git_document_may_still_name_per_node_variables() {
         resolved.text, REPO_CONFIG_WITH_ENV,
         "the loader must return the document byte for byte, not a rewritten copy",
     );
+}
+
+#[test]
+fn an_unconfined_git_document_keeps_the_documented_secret_spellings() {
+    // The default, and the reason it is the default. On a git-sourced
+    // node the local file is a pointer, so "declare the value in the
+    // config the operator owns" has nowhere to go, and `env:NAME` is the
+    // only spelling `proxy.cluster.security.shared_key` accepts
+    // (docs/secrets.md) as well as the one the Kubernetes operator
+    // generates. Sealing this by default would take a clustered GitOps
+    // node down on upgrade with no legal spelling left, which is what
+    // the first cut of this change did (WOR-2433 re-review).
+    if !require_git("an_unconfined_git_document_keeps_the_documented_secret_spellings") {
+        return;
+    }
+    let document = r#"proxy:
+  http_bind_port: 8080
+  cluster:
+    security:
+      shared_key: "env:SB_CLUSTER_SHARED_KEY"
+origins:
+  "edge.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+    authentication:
+      type: api_key
+      api_key: "file:/run/secrets/api-key"
+    request_modifiers:
+      - rego_module_path: /etc/sbproxy/policy.rego
+"#;
+    let fixture = Fixture::new(document);
+
+    let resolved = resolve(&git_source(&fixture.url(), Some("main")))
+        .expect("an ordinary git source is the operator's own config store");
+
+    assert_eq!(
+        resolved.text, document,
+        "the loader must return the document byte for byte",
+    );
+}
+
+#[test]
+fn a_confined_documents_yaml_error_is_invalid_not_a_confinement_refusal() {
+    // The confinement check is the first parse of a fetched document, so
+    // without this it reports a plain YAML typo as a security refusal and
+    // climbs a counter that is supposed to mean "somebody tried to reach
+    // this host" (WOR-2433 re-review).
+    if !require_git("a_confined_documents_yaml_error_is_invalid_not_a_confinement_refusal") {
+        return;
+    }
+    let fixture = Fixture::new("origins:\n  \"edge.example.com\"\n    action: [unclosed\n");
+
+    let error = resolve(&confined_git_source(&fixture.url(), Some("main")))
+        .expect_err("a malformed document must fail");
+
+    assert!(matches!(error, ConfigSourceError::Invalid(_)), "{error:?}");
+    assert_eq!(error.metric_label(), "invalid");
 }
 
 // --- failure modes ---------------------------------------------------

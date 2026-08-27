@@ -294,6 +294,11 @@
               "default": false,
               "type": "boolean"
             },
+            "confine": {
+              "description": "Treat the fetched document as externally authored: it may not carry a host-backed secret reference (`env:NAME`, `file:PATH`, `vault://env/NAME`) and may not name a host path the proxy opens (WOR-2433).\n\nOff by default, and deliberately. In the ordinary GitOps shape the repository *is* the operator's config: the local file is a pointer, `env:` is the documented spelling for the cluster shared key, and the Kubernetes operator generates it. Sealing that by default would leave those nodes with no legal spelling for a secret at all, because the refusal's remedy (declare the value in the config the operator owns) has nowhere to go on this path. Turn it on when the repository is written by somebody other than whoever runs this proxy; the document then gets the same treatment a config-authority bundle gets. See the `Confined fragments` section of docs/configuration.md.",
+              "default": false,
+              "type": "boolean"
+            },
             "timeout_secs": {
               "description": "Hard timeout for one fetch, in seconds. The child `git` process is killed when it expires; a config-load path with no timeout hangs startup.",
               "default": 60,
