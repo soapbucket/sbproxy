@@ -1,0 +1,1655 @@
+//! WOR-2658: the SOTA gateway epic (WOR-2646), assembled.
+//!
+//! The nine feature siblings of this epic each merged with their own
+//! unit coverage, and every one of them touches the same dispatch path:
+//! a model group picks a member, cache affinity re-orders the pick,
+//! service tier rewrites the outbound body, SigV4 signs whatever that
+//! rewriting produced, the pre-header budget decides when a stream may
+//! still be moved, and the tenant-key fallback decides which credential
+//! pays. Green unit tests on nine features that share one code path are
+//! not evidence that the nine compose. This file is that evidence.
+//!
+//! Everything here runs against the **release** binary through the real
+//! `ProxyHarness`, and every claim is a named test.
+//!
+//! # Where a stub cannot be the real vendor, the wire is
+//!
+//! Two of the epic's claims are about a vendor this suite cannot dial,
+//! so both are emulated at the wire level and the emulation is stated
+//! rather than implied:
+//!
+//! - **SigV4 to Bedrock.** No AWS account is involved. The Bedrock stub
+//!   captures the request the proxy actually sent and
+//!   [`recompute_sigv4_signature`] rebuilds the canonical request,
+//!   string-to-sign, and signature from the same static credentials the
+//!   config names, then compares them against the `Authorization`
+//!   header byte for byte. Because the payload hash is folded into the
+//!   canonical request, a signature that verifies against the *arrived*
+//!   body is proof that nothing rewrote the body after signing, which
+//!   is the property the epic is worried about. What this does not
+//!   prove is that AWS would accept the signature; that is the
+//!   `aws-sigv4` crate's own contract, exercised by
+//!   `crates/sbproxy-ai/src/aws_sigv4.rs` against AWS's published test
+//!   vectors.
+//! - **An OpenAI SDK client reading `GET /v1/models`.** No SDK is
+//!   linked here. [`assert_openai_sdk_model_shape`] applies a strict
+//!   schema of exactly what the OpenAI `Model` object declares required
+//!   (`id`, `object == "model"`, an integer `created`, a string
+//!   `owned_by`), which is the set an SDK-shaped deserializer refuses
+//!   the response without. A field the SDK ignores is allowed through;
+//!   a missing required field or a wrong JSON type fails.
+//!
+//! # What this file deliberately does not assert
+//!
+//! Two of WOR-2658's verification lines describe surfaces the merged
+//! code does not have, and inventing an assertion that passes anyway
+//! would be worse than saying so:
+//!
+//! - The per-request record names model, provider, serving credential,
+//!   and cache read/write tokens, and it does **not** name the service
+//!   tier. `crates/sbproxy-observe/src/request_event.rs` carries an
+//!   explicit instruction that adding a top-level field to that struct
+//!   is a schema-breaking change, so widening it is a deliberate act
+//!   and not an integration fix.
+//!   [`the_request_row_names_the_serving_credential_and_the_cache_tokens`]
+//!   asserts the four that are there and records the fifth's absence.
+//! - The value ledger answers what *local versus cloud serving* and
+//!   what *compression* saved (`record_local`, `record_cloud`,
+//!   `record_compression`). It has no tier lane and no cache-affinity
+//!   lane, so it cannot answer what the tier choice or the affinity
+//!   saved. That is a new value lane rather than a defect in any
+//!   sibling, and no test here pretends otherwise.
+
+use std::collections::HashMap;
+use std::io::{Read as _, Write as _};
+use std::net::{TcpListener, TcpStream};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use hmac::{Hmac, Mac};
+use sbproxy_e2e::{proxy_binary_path, ProxyHarness};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+
+/// The tenant's own provider key, refused by the flex stub in the
+/// fallback tests.
+const TENANT_KEY: &str = "sk-tenant-acme-e2e";
+/// The operator-held credential the fallback retries on.
+const HOUSE_KEY: &str = "sk-house-operator-e2e";
+/// Static AWS credentials for the signed member. Not real, and never
+/// leave loopback.
+const AWS_ACCESS_KEY_ID: &str = "AKIAIOSFODNN7EXAMPLE";
+const AWS_SECRET_ACCESS_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+const AWS_REGION: &str = "us-east-1";
+
+/// Model ids, one per group member. Distinct on purpose: a member that
+/// can be addressed by its own id makes every non-group test
+/// deterministic without leaning on a weighted draw.
+const MODEL_SIGNED: &str = "claude-e2e";
+const MODEL_FLEX: &str = "gpt-e2e-flex";
+const MODEL_STANDARD: &str = "gpt-e2e-standard";
+/// The one public name the group publishes.
+const GROUP: &str = "sota-chat";
+
+// ---------------------------------------------------------------------
+// Stubs
+// ---------------------------------------------------------------------
+
+/// A raw HTTP/1.1 stub that answers every request from a closure and
+/// records what it was sent.
+///
+/// `MockUpstream` covers fixed and sequenced replies; this one exists
+/// because several tests here need the *request* to decide the reply
+/// (a Bedrock path, a refused credential, a stalled stream) and need
+/// the captured bytes afterward for signature verification.
+struct ScriptedUpstream {
+    port: u16,
+    seen: Arc<Mutex<Vec<SeenRequest>>>,
+    stop: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+/// One request as the stub received it, before anything normalized it.
+#[derive(Debug, Clone)]
+struct SeenRequest {
+    method: String,
+    path: String,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+impl SeenRequest {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .get(&name.to_ascii_lowercase())
+            .map(String::as_str)
+    }
+
+    fn json(&self) -> Value {
+        serde_json::from_slice(&self.body).unwrap_or(Value::Null)
+    }
+}
+
+/// What a stub does with one request.
+enum Reply {
+    /// A complete response: status, content type, body.
+    Body(u16, &'static str, Vec<u8>),
+    /// Accept the connection, send nothing at all, and hold it open.
+    /// This is the pre-header stall: the proxy has a live socket and no
+    /// response line.
+    StallForever,
+    /// Send response headers and one SSE frame, then drop the
+    /// connection mid-stream. Past the headers the request is committed
+    /// to this provider.
+    DieMidStream(String),
+}
+
+impl ScriptedUpstream {
+    fn start<F>(reply: F) -> ScriptedUpstream
+    where
+        F: Fn(&SeenRequest, usize) -> Reply + Send + Sync + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("stub listener");
+        let port = listener.local_addr().expect("stub addr").port();
+        listener
+            .set_nonblocking(true)
+            .expect("stub nonblocking listener");
+        let seen: Arc<Mutex<Vec<SeenRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let count = Arc::new(AtomicUsize::new(0));
+
+        let seen_thread = Arc::clone(&seen);
+        let stop_thread = Arc::clone(&stop);
+        let reply = Arc::new(reply);
+        let join = std::thread::spawn(move || {
+            // Held open until shutdown so a `StallForever` connection is
+            // not closed by dropping its stream.
+            let mut stalled: Vec<TcpStream> = Vec::new();
+            while !stop_thread.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let request = match read_request(&mut stream) {
+                            Ok(request) => request,
+                            Err(_) => continue,
+                        };
+                        if let Ok(mut log) = seen_thread.lock() {
+                            log.push(request.clone());
+                        }
+                        let index = count.fetch_add(1, Ordering::SeqCst);
+                        match reply(&request, index) {
+                            Reply::Body(status, content_type, body) => {
+                                let head = format!(
+                                    "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\n\
+                                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                                    body.len()
+                                );
+                                let _ = stream.write_all(head.as_bytes());
+                                let _ = stream.write_all(&body);
+                                let _ = stream.flush();
+                            }
+                            Reply::StallForever => {
+                                stalled.push(stream);
+                            }
+                            Reply::DieMidStream(frame) => {
+                                let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                                            Cache-Control: no-cache\r\n\
+                                            Transfer-Encoding: chunked\r\n\r\n";
+                                let _ = stream.write_all(head.as_bytes());
+                                let chunk = format!("{:x}\r\n{}\r\n", frame.len(), frame);
+                                let _ = stream.write_all(chunk.as_bytes());
+                                let _ = stream.flush();
+                                // No terminating chunk: the peer sees a
+                                // truncated body, which is what a
+                                // provider dying mid-stream looks like.
+                                drop(stream);
+                            }
+                        }
+                    }
+                    Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        ScriptedUpstream {
+            port,
+            seen,
+            stop,
+            join: Some(join),
+        }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    fn seen(&self) -> Vec<SeenRequest> {
+        self.seen.lock().map(|log| log.clone()).unwrap_or_default()
+    }
+}
+
+impl Drop for ScriptedUpstream {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+/// Read one HTTP/1.1 request: request line, headers, `Content-Length`
+/// body. Enough for a stub, and deliberately no more.
+fn read_request(stream: &mut TcpStream) -> std::io::Result<SeenRequest> {
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let head_end = loop {
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "peer closed before headers",
+            ));
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(position) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+            break position + 4;
+        }
+    };
+    let head = String::from_utf8_lossy(&buffer[..head_end]).to_string();
+    let mut lines = head.lines();
+    let request_line = lines.next().unwrap_or_default();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_string();
+    let path = parts.next().unwrap_or_default().to_string();
+    let mut headers = HashMap::new();
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
+    }
+    let content_length: usize = headers
+        .get("content-length")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let mut body = buffer[head_end..].to_vec();
+    while body.len() < content_length {
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+    body.truncate(content_length);
+    Ok(SeenRequest {
+        method,
+        path,
+        headers,
+        body,
+    })
+}
+
+fn openai_reply(model: &str, content: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "id": "chatcmpl-sota",
+        "object": "chat.completion",
+        "created": 1_700_000_000,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 11,
+            "completion_tokens": 5,
+            "total_tokens": 16,
+            "prompt_tokens_details": {"cached_tokens": 7}
+        }
+    }))
+    .expect("openai reply")
+}
+
+fn converse_reply(text: &str, stop_reason: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "output": {"message": {"role": "assistant", "content": [{"text": text}]}},
+        "stopReason": stop_reason,
+        "usage": {"inputTokens": 12, "outputTokens": 4, "totalTokens": 16}
+    }))
+    .expect("converse reply")
+}
+
+fn refused_credential() -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "error": {
+            "message": "Incorrect API key provided.",
+            "type": "invalid_request_error",
+            "code": "invalid_api_key"
+        }
+    }))
+    .expect("refusal body")
+}
+
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("ephemeral listener")
+        .local_addr()
+        .expect("listener address")
+        .port()
+}
+
+// ---------------------------------------------------------------------
+// The composite config
+// ---------------------------------------------------------------------
+
+/// Ports and paths one composite gateway needs.
+struct Wiring<'a> {
+    admin_port: u16,
+    key_store: &'a Path,
+    usage_path: &'a Path,
+    events_path: &'a Path,
+    signed_url: &'a str,
+    flex_url: &'a str,
+    standard_url: &'a str,
+    shadow_a_url: &'a str,
+    shadow_b_url: &'a str,
+}
+
+/// The whole epic in one `ai_proxy` action.
+///
+/// Every sibling of WOR-2646 is present here at once, which is the
+/// point: these keys were reviewed one at a time and they all lower
+/// onto one candidate-selection path.
+fn composite_config(wiring: &Wiring<'_>) -> String {
+    let Wiring {
+        admin_port,
+        key_store,
+        usage_path,
+        events_path,
+        signed_url,
+        flex_url,
+        standard_url,
+        shadow_a_url,
+        shadow_b_url,
+    } = wiring;
+    let key_store = key_store.display();
+    let usage_path = usage_path.display();
+    let events_path = events_path.display();
+    format!(
+        r#"
+proxy:
+  http_bind_port: 0
+  admin:
+    enabled: true
+    port: {admin_port}
+    username: admin
+    password: secret
+  tenants:
+    - id: acme
+  key_management:
+    enabled: true
+    store:
+      backend: embedded
+      path: "{key_store}"
+    crypto:
+      pepper: e2e-pepper-value-not-a-real-secret
+      master_key: e2e-master-value-not-a-real-secret
+    inbound:
+      headers:
+        - name: x-sb-api
+          scheme: ""
+      require: false
+    seed:
+      credentials:
+        - id: house-openai
+          name: house openai account
+          provider: openai
+          secret: {HOUSE_KEY}
+events:
+  sink: file
+  path: "{events_path}"
+  types:
+    - credential_fallback
+origins:
+  "sota.local":
+    tenant_id: acme
+    action:
+      type: ai_proxy
+      capture_content: true
+      usage_sinks:
+        - type: jsonl_file
+          path: "{usage_path}"
+      routing:
+        strategy: round_robin
+      cache_affinity:
+        ttl_secs: 300
+        max_keys_per_provider: 64
+      resilience:
+        pre_header_timeout_ms: 400
+      providers:
+        - name: bedrock-guarded
+          provider_type: bedrock
+          base_url: "{signed_url}"
+          allow_private_base_url: true
+          models: [{MODEL_SIGNED}]
+          aws_sigv4:
+            region: {AWS_REGION}
+            credentials:
+              source: static
+              access_key_id: {AWS_ACCESS_KEY_ID}
+              secret_access_key: {AWS_SECRET_ACCESS_KEY}
+          bedrock_guardrail:
+            identifier: e2e-guardrail
+            version: DRAFT
+            trace: true
+        - name: openai-flex
+          provider_type: openai
+          api_key: {TENANT_KEY}
+          base_url: "{flex_url}"
+          allow_private_base_url: true
+          models: [{MODEL_FLEX}]
+          service_tier: flex
+          fallback_credential_id: house-openai
+        - name: openai-standard
+          provider_type: openai
+          api_key: {TENANT_KEY}
+          base_url: "{standard_url}"
+          allow_private_base_url: true
+          models: [{MODEL_STANDARD}]
+          service_tier: standard
+          on_key_failure: fail_closed
+        - name: shadow-a
+          provider_type: openai
+          api_key: shadow-a-key
+          base_url: "{shadow_a_url}"
+          allow_private_base_url: true
+          enabled: false
+          models: [{MODEL_STANDARD}]
+        - name: shadow-b
+          provider_type: openai
+          api_key: shadow-b-key
+          base_url: "{shadow_b_url}"
+          allow_private_base_url: true
+          enabled: false
+          models: [{MODEL_STANDARD}]
+      model_groups:
+        - name: {GROUP}
+          routing: weighted
+          members:
+            - provider: bedrock-guarded
+              model: {MODEL_SIGNED}
+              weight: 1
+            - provider: openai-flex
+              model: {MODEL_FLEX}
+              weight: 8
+            - provider: openai-standard
+              model: {MODEL_STANDARD}
+              weight: 1
+      shadow:
+        targets:
+          - provider: shadow-a
+            sample_rate: 1.0
+            timeout_ms: 5000
+            task_timeout_ms: 5000
+            model: {MODEL_STANDARD}
+          - provider: shadow-b
+            sample_rate: 1.0
+            timeout_ms: 5000
+            task_timeout_ms: 5000
+            model: {MODEL_STANDARD}
+"#
+    )
+}
+
+/// One composite gateway plus everything it points at, so a test can
+/// hold the whole fixture alive with a single binding.
+struct Gateway {
+    proxy: ProxyHarness,
+    admin_port: u16,
+    signed: ScriptedUpstream,
+    flex: ScriptedUpstream,
+    standard: ScriptedUpstream,
+    shadow_a: ScriptedUpstream,
+    shadow_b: ScriptedUpstream,
+    usage_path: std::path::PathBuf,
+    events_path: std::path::PathBuf,
+    _workdir: tempfile::TempDir,
+}
+
+/// Behaviors the individual tests vary. Everything else is the
+/// composite config above, unchanged, so a test that only cares about
+/// one sibling still boots all nine.
+#[derive(Default, Clone, Copy)]
+struct Behavior {
+    /// The Bedrock stub answers `stopReason: guardrail_intervened`.
+    guardrail_intervenes: bool,
+    /// The flex stub refuses the first credential it sees with a 401.
+    flex_refuses_first_key: bool,
+    /// The standard stub refuses the first credential it sees with 401.
+    standard_refuses_first_key: bool,
+    /// The flex stub accepts the connection and never answers.
+    flex_stalls: bool,
+    /// The standard stub answers headers plus one frame, then dies.
+    standard_dies_mid_stream: bool,
+}
+
+fn start_gateway(behavior: Behavior) -> Gateway {
+    let workdir = tempfile::tempdir().expect("workdir");
+    let key_store = workdir.path().join("keys.redb");
+    let usage_path = workdir.path().join("usage.jsonl");
+    let events_path = workdir.path().join("events.ndjson");
+    let admin_port = free_port();
+
+    let signed = ScriptedUpstream::start(move |_request, _index| {
+        Reply::Body(
+            200,
+            "application/json",
+            if behavior.guardrail_intervenes {
+                converse_reply("", "guardrail_intervened")
+            } else {
+                converse_reply("signed member answered", "end_turn")
+            },
+        )
+    });
+    let flex = ScriptedUpstream::start(move |request, index| {
+        if behavior.flex_stalls {
+            return Reply::StallForever;
+        }
+        if behavior.flex_refuses_first_key && index == 0 {
+            return Reply::Body(401, "application/json", refused_credential());
+        }
+        let model = request
+            .json()
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or(MODEL_FLEX)
+            .to_string();
+        Reply::Body(200, "application/json", openai_reply(&model, "flex"))
+    });
+    let standard = ScriptedUpstream::start(move |request, index| {
+        if behavior.standard_dies_mid_stream {
+            return Reply::DieMidStream(
+                "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n"
+                    .to_string(),
+            );
+        }
+        if behavior.standard_refuses_first_key && index == 0 {
+            return Reply::Body(401, "application/json", refused_credential());
+        }
+        let model = request
+            .json()
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or(MODEL_STANDARD)
+            .to_string();
+        Reply::Body(200, "application/json", openai_reply(&model, "standard"))
+    });
+    let shadow_a = ScriptedUpstream::start(|_, _| {
+        Reply::Body(
+            200,
+            "application/json",
+            openai_reply(MODEL_STANDARD, "shadow a said something else"),
+        )
+    });
+    let shadow_b = ScriptedUpstream::start(|_, _| {
+        Reply::Body(
+            200,
+            "application/json",
+            openai_reply(MODEL_STANDARD, "shadow b said something else"),
+        )
+    });
+
+    let yaml = composite_config(&Wiring {
+        admin_port,
+        key_store: &key_store,
+        usage_path: &usage_path,
+        events_path: &events_path,
+        signed_url: &signed.base_url(),
+        flex_url: &flex.base_url(),
+        standard_url: &standard.base_url(),
+        shadow_a_url: &shadow_a.base_url(),
+        shadow_b_url: &shadow_b.base_url(),
+    });
+    let proxy = ProxyHarness::start_with_workspace(&yaml, &[]).expect("composite gateway boots");
+
+    Gateway {
+        proxy,
+        admin_port,
+        signed,
+        flex,
+        standard,
+        shadow_a,
+        shadow_b,
+        usage_path,
+        events_path,
+        _workdir: workdir,
+    }
+}
+
+impl Gateway {
+    fn chat(&self, model: &str, prompt: &str, headers: &[(&str, &str)]) -> sbproxy_e2e::Response {
+        self.proxy
+            .post_json(
+                "/v1/chat/completions",
+                "sota.local",
+                &json!({"model": model, "messages": [{"role": "user", "content": prompt}]}),
+                headers,
+            )
+            .expect("chat request")
+    }
+
+    fn admin_json(&self, path: &str) -> Value {
+        reqwest::blocking::Client::new()
+            .get(format!("http://127.0.0.1:{}{path}", self.admin_port))
+            .basic_auth("admin", Some("secret"))
+            .send()
+            .expect("admin request")
+            .json()
+            .expect("admin json")
+    }
+
+    /// Mint a governed key, optionally consenting to content recording.
+    fn mint_key(&self, name: &str, allow_content_capture: bool) -> (String, String) {
+        let response: Value = reqwest::blocking::Client::new()
+            .post(format!("http://127.0.0.1:{}/admin/keys", self.admin_port))
+            .basic_auth("admin", Some("secret"))
+            .json(&json!({"name": name, "allow_content_capture": allow_content_capture}))
+            .send()
+            .expect("mint request")
+            .json()
+            .expect("mint json");
+        (
+            response["token"].as_str().expect("token").to_string(),
+            response["key"]["key_id"]
+                .as_str()
+                .expect("key id")
+                .to_string(),
+        )
+    }
+
+    fn usage_rows(&self, want: usize) -> Vec<Value> {
+        for _ in 0..80 {
+            let rows: Vec<Value> = std::fs::read_to_string(&self.usage_path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
+            if rows.len() >= want {
+                return rows;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        std::fs::read_to_string(&self.usage_path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
+    fn events(&self) -> String {
+        std::fs::read_to_string(&self.events_path).unwrap_or_default()
+    }
+
+    fn logs(&self) -> String {
+        format!(
+            "{}\n{}",
+            self.proxy.stdout_contents(),
+            self.proxy.stderr_contents()
+        )
+    }
+}
+
+// ---------------------------------------------------------------------
+// Wire-level emulation helpers
+// ---------------------------------------------------------------------
+
+type HmacSha256 = Hmac<Sha256>;
+
+fn hmac(key: &[u8], data: &str) -> Vec<u8> {
+    let mut mac = HmacSha256::new_from_slice(key).expect("hmac accepts any key length");
+    mac.update(data.as_bytes());
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Rebuild the SigV4 signature for `request` from the static
+/// credentials the config names, and return it beside the one the proxy
+/// sent.
+///
+/// This is the wire-level stand-in for a real Bedrock endpoint. The
+/// payload hash is part of the canonical request, so a match proves the
+/// bytes that arrived are the bytes that were signed: if the guardrail
+/// rewrite (or anything else) had touched the body after signing, the
+/// two signatures would differ.
+fn recompute_sigv4_signature(request: &SeenRequest) -> (String, String) {
+    let authorization = request
+        .header("authorization")
+        .expect("a signed provider sends an Authorization header");
+    assert!(
+        authorization.starts_with("AWS4-HMAC-SHA256 "),
+        "the signed member must use SigV4, got {authorization}"
+    );
+    let mut credential = String::new();
+    let mut signed_headers = String::new();
+    let mut sent_signature = String::new();
+    for part in authorization
+        .trim_start_matches("AWS4-HMAC-SHA256 ")
+        .split(',')
+    {
+        let part = part.trim();
+        if let Some(value) = part.strip_prefix("Credential=") {
+            credential = value.to_string();
+        } else if let Some(value) = part.strip_prefix("SignedHeaders=") {
+            signed_headers = value.to_string();
+        } else if let Some(value) = part.strip_prefix("Signature=") {
+            sent_signature = value.to_string();
+        }
+    }
+    // Credential=<access key>/<date>/<region>/<service>/aws4_request
+    let scope_parts: Vec<&str> = credential.splitn(2, '/').collect();
+    assert_eq!(
+        scope_parts.first().copied(),
+        Some(AWS_ACCESS_KEY_ID),
+        "the signature is scoped to the configured access key, not another one"
+    );
+    let scope = scope_parts.get(1).copied().unwrap_or_default().to_string();
+    let scope_fields: Vec<&str> = scope.split('/').collect();
+    let date = scope_fields.first().copied().unwrap_or_default();
+    let region = scope_fields.get(1).copied().unwrap_or_default();
+    let service = scope_fields.get(2).copied().unwrap_or_default();
+    assert_eq!(
+        region, AWS_REGION,
+        "credential scope names the config region"
+    );
+    assert_eq!(
+        service, "bedrock",
+        "a bedrock provider signs for the bedrock service by default"
+    );
+
+    let canonical_headers: String = signed_headers
+        .split(';')
+        .map(|name| {
+            let value = request
+                .header(name)
+                .unwrap_or_else(|| panic!("SignedHeaders names {name}, which never arrived"));
+            format!("{name}:{}\n", value.trim())
+        })
+        .collect();
+    let canonical_request = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        request.method,
+        request.path.split('?').next().unwrap_or(&request.path),
+        "",
+        canonical_headers,
+        signed_headers,
+        sha256_hex(&request.body),
+    );
+    let amz_date = request
+        .header("x-amz-date")
+        .expect("a signed request carries x-amz-date");
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+        sha256_hex(canonical_request.as_bytes())
+    );
+    let k_date = hmac(format!("AWS4{AWS_SECRET_ACCESS_KEY}").as_bytes(), date);
+    let k_region = hmac(&k_date, region);
+    let k_service = hmac(&k_region, service);
+    let k_signing = hmac(&k_service, "aws4_request");
+    (
+        hex::encode(hmac(&k_signing, &string_to_sign)),
+        sent_signature,
+    )
+}
+
+/// Every field the OpenAI `Model` object declares required, and the
+/// JSON type an SDK-shaped deserializer demands for each.
+///
+/// A field the SDK ignores may be present; a required field that is
+/// missing or wrongly typed is what makes an SDK refuse the whole
+/// listing, which is the failure WOR-2647 was about.
+fn assert_openai_sdk_model_shape(entry: &Value) {
+    assert!(
+        entry["id"].is_string() && !entry["id"].as_str().unwrap_or_default().is_empty(),
+        "`id` must be a non-empty string: {entry}"
+    );
+    assert_eq!(
+        entry["object"].as_str(),
+        Some("model"),
+        "`object` must be the literal \"model\": {entry}"
+    );
+    assert!(
+        entry["created"].is_i64() || entry["created"].is_u64(),
+        "`created` must be an integer; the SDK's Model refuses a listing without it: {entry}"
+    );
+    assert!(
+        entry["owned_by"].is_string(),
+        "`owned_by` must be a string: {entry}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------
+
+/// The integration claim itself, before any individual sibling's: nine
+/// features that were each reviewed alone compile together into one
+/// action, boot, and serve a request. A key refused at config load or a
+/// pipeline that fails to construct fails here first, and every other
+/// test in this file inherits that.
+#[test]
+fn the_whole_epic_composes_into_one_action_that_boots_and_serves() {
+    let gateway = start_gateway(Behavior::default());
+    let response = gateway.chat(MODEL_STANDARD, "hello", &[]);
+    assert_eq!(
+        response.status,
+        200,
+        "composite gateway refused a plain request: {}",
+        String::from_utf8_lossy(&response.body)
+    );
+    let body = response.json().expect("chat response json");
+    assert_eq!(
+        body["choices"][0]["message"]["content"], "standard",
+        "the standard member answered: {body}"
+    );
+}
+
+/// WOR-2657 plus WOR-2647: the group is discoverable under its one
+/// public name, its members are enumerable with their own upstream
+/// model ids and weights, and the listing still deserializes into an
+/// OpenAI SDK's `Model` list.
+#[test]
+fn the_model_group_and_its_members_are_listed_and_parse_as_an_openai_model_list() {
+    let gateway = start_gateway(Behavior::default());
+
+    let listing = gateway
+        .proxy
+        .get("/v1/models", "sota.local")
+        .expect("models listing")
+        .json()
+        .expect("models json");
+    assert_eq!(listing["object"], "list", "{listing}");
+    let data = listing["data"].as_array().expect("data array");
+    for entry in data {
+        assert_openai_sdk_model_shape(entry);
+    }
+    let ids: Vec<&str> = data
+        .iter()
+        .filter_map(|entry| entry["id"].as_str())
+        .collect();
+    assert!(
+        ids.contains(&GROUP),
+        "the one public name an operator published has to be listed: {ids:?}"
+    );
+    for member in [MODEL_SIGNED, MODEL_FLEX, MODEL_STANDARD] {
+        assert!(
+            ids.contains(&member),
+            "member {member} missing from the listing: {ids:?}"
+        );
+    }
+
+    let group_entry = data
+        .iter()
+        .find(|entry| entry["id"] == GROUP)
+        .expect("group entry");
+    assert!(
+        group_entry["capabilities"]
+            .as_array()
+            .is_some_and(|caps| caps.iter().any(|c| c == "chat_completions")),
+        "a group's capabilities are the union across its members: {group_entry}"
+    );
+
+    // The LiteLLM-parity surface, which is the only one that can carry
+    // per-member facts: a derived group is several providers behind one
+    // model id and has nothing per-deployment to say.
+    let info = gateway.admin_json_via_proxy("/model_group/info");
+    let group = info["data"]
+        .as_array()
+        .expect("model_group/info data")
+        .iter()
+        .find(|entry| entry["model_group"] == GROUP)
+        .unwrap_or_else(|| panic!("named group missing from /model_group/info: {info}"));
+    let members = group["members"].as_array().expect("members array");
+    assert_eq!(members.len(), 3, "three members: {group}");
+    let weights: Vec<(&str, &str, u64)> = members
+        .iter()
+        .map(|member| {
+            (
+                member["provider"].as_str().unwrap_or_default(),
+                member["model"].as_str().unwrap_or_default(),
+                member["weight"].as_u64().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert!(
+        weights.contains(&("bedrock-guarded", MODEL_SIGNED, 1)),
+        "the signed member and its own upstream model id: {weights:?}"
+    );
+    assert!(
+        weights.contains(&("openai-flex", MODEL_FLEX, 8)),
+        "the cheap-tier member and its weight: {weights:?}"
+    );
+    assert!(
+        weights.contains(&("openai-standard", MODEL_STANDARD, 1)),
+        "the standard member: {weights:?}"
+    );
+}
+
+/// WOR-2648 with WOR-2649 on top, which is the pairing the epic called
+/// out: the guardrail attaches `guardrailConfig` to the Converse body,
+/// and the signature has to cover the body that rewriting produced.
+///
+/// Wire-level emulation: the signature is recomputed here from the
+/// arrived bytes. See this file's header for what that does and does
+/// not prove.
+#[test]
+fn the_signed_member_signs_the_body_the_guardrail_rewrite_produced() {
+    let gateway = start_gateway(Behavior::default());
+    let response = gateway.chat(MODEL_SIGNED, "sign this", &[]);
+    assert_eq!(
+        response.status,
+        200,
+        "signed member refused: {}",
+        String::from_utf8_lossy(&response.body)
+    );
+
+    let seen = gateway.signed.seen();
+    let request = seen.first().expect("the signed member was dialed");
+    assert!(
+        request.path.contains("/converse"),
+        "a bedrock provider translates to the Converse path: {}",
+        request.path
+    );
+    assert!(
+        request
+            .header("authorization")
+            .is_none_or(|value| !value.to_ascii_lowercase().starts_with("bearer")),
+        "a signed provider must not also present an api_key"
+    );
+    let body = request.json();
+    assert_eq!(
+        body["guardrailConfig"]["guardrailIdentifier"], "e2e-guardrail",
+        "the inline guardrail rode on the Converse call: {body}"
+    );
+    assert_eq!(
+        body["guardrailConfig"]["guardrailVersion"], "DRAFT",
+        "{body}"
+    );
+
+    let (recomputed, sent) = recompute_sigv4_signature(request);
+    assert_eq!(
+        recomputed, sent,
+        "the signature does not cover the body that arrived, which means something \
+         rewrote the request after signing"
+    );
+}
+
+/// WOR-2649's headline, and the one behavior change on upgrade: an
+/// intervention is a 200 with `stopReason: guardrail_intervened` on the
+/// wire, and it must not reach the caller as a successful empty
+/// completion. The refusal names the guardrail and not the caller's own
+/// text, because a Bedrock assessment quotes the prompt back.
+#[test]
+fn a_guardrail_intervention_becomes_a_403_that_quotes_nothing() {
+    let gateway = start_gateway(Behavior {
+        guardrail_intervenes: true,
+        ..Behavior::default()
+    });
+    let secret_prompt = "my social security number is 000-00-0000";
+    let response = gateway.chat(MODEL_SIGNED, secret_prompt, &[]);
+    assert_eq!(
+        response.status,
+        403,
+        "an intervention relayed as a 200 is the bug: {}",
+        String::from_utf8_lossy(&response.body)
+    );
+    let text = response.text().unwrap_or_default();
+    assert!(
+        text.contains("guardrail"),
+        "the refusal has to say what refused: {text}"
+    );
+    assert!(
+        !text.contains("000-00-0000"),
+        "the block reason must never quote the caller's own text back: {text}"
+    );
+}
+
+/// WOR-2652: the tier is the operator's, and a caller asking for a
+/// dearer one loses the argument. Both halves in one request, because
+/// on its own "the operator's tier arrives" is green even if the
+/// caller's was never stripped.
+#[test]
+fn the_operator_tier_reaches_the_provider_and_the_callers_is_stripped() {
+    let gateway = start_gateway(Behavior::default());
+    let response = gateway
+        .proxy
+        .post_json(
+            "/v1/chat/completions",
+            "sota.local",
+            &json!({
+                "model": MODEL_FLEX,
+                "messages": [{"role": "user", "content": "hi"}],
+                "service_tier": "priority"
+            }),
+            &[],
+        )
+        .expect("chat request");
+    assert_eq!(
+        response.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&response.body)
+    );
+
+    let seen = gateway.flex.seen();
+    let body = seen.first().expect("the flex member was dialed").json();
+    assert_eq!(
+        body["service_tier"], "flex",
+        "the destination's own tier is what reaches the vendor: {body}"
+    );
+    assert_ne!(
+        body["service_tier"], "priority",
+        "raising the tier raises the bill and the operator pays it: {body}"
+    );
+}
+
+/// WOR-2655: a credential refusal is a statement about the key, so the
+/// operator's credential answers where the tenant's was refused, and
+/// the loud record of the swap names no secret material anywhere.
+#[test]
+fn a_refused_tenant_key_is_served_on_the_operator_credential_and_names_no_secret() {
+    let gateway = start_gateway(Behavior {
+        flex_refuses_first_key: true,
+        ..Behavior::default()
+    });
+    let response = gateway.chat(MODEL_FLEX, "hi", &[]);
+    assert_eq!(
+        response.status,
+        200,
+        "the operator's credential should have answered: {}",
+        String::from_utf8_lossy(&response.body)
+    );
+
+    let presented: Vec<String> = gateway
+        .flex
+        .seen()
+        .iter()
+        .map(|request| {
+            request
+                .header("authorization")
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        presented,
+        vec![
+            format!("Bearer {TENANT_KEY}"),
+            format!("Bearer {HOUSE_KEY}")
+        ],
+        "the entry's own key first, then the operator's, both under the vendor's header"
+    );
+
+    // Loud: the typed feed carries the swap.
+    let mut events = String::new();
+    for _ in 0..60 {
+        events = gateway.events();
+        if events.contains("credential_fallback") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let line = events
+        .lines()
+        .find(|line| line.contains("credential_fallback"))
+        .unwrap_or_else(|| panic!("no credential_fallback event: {events}"));
+    let event: Value = serde_json::from_str(line).expect("event json");
+    assert_eq!(event["data"]["id"], "house-openai", "{event}");
+    assert_eq!(event["data"]["outcome"], "engaged", "{event}");
+
+    // And silent about the material, on every surface that leaves the
+    // process.
+    let logs = gateway.logs();
+    for secret in [TENANT_KEY, HOUSE_KEY, AWS_SECRET_ACCESS_KEY] {
+        assert!(
+            !events.contains(secret),
+            "credential material reached the event feed"
+        );
+        assert!(
+            !logs.contains(secret),
+            "credential material reached the log"
+        );
+    }
+}
+
+/// The opt-out, written as a differential against the test above:
+/// `fail_closed` is *defined* as the behavior the fallback changed away
+/// from, so on its own it passes with or without the feature.
+#[test]
+fn the_second_credential_opts_out_and_gets_the_providers_own_refusal() {
+    let gateway = start_gateway(Behavior {
+        flex_refuses_first_key: true,
+        standard_refuses_first_key: true,
+        ..Behavior::default()
+    });
+    assert_eq!(
+        gateway.chat(MODEL_FLEX, "hi", &[]).status,
+        200,
+        "the fallback entry is served on the house credential"
+    );
+    assert_eq!(
+        gateway.chat(MODEL_STANDARD, "hi", &[]).status,
+        401,
+        "the fail_closed entry returns the provider's rejection: a revoked tenant \
+         must not keep working on the house account"
+    );
+    let presented: Vec<String> = gateway
+        .standard
+        .seen()
+        .iter()
+        .map(|request| {
+            request
+                .header("authorization")
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        presented,
+        vec![format!("Bearer {TENANT_KEY}")],
+        "the house credential is never presented to the opted-out entry"
+    );
+}
+
+/// WOR-2651 against WOR-2657: affinity layers over the group's weighted
+/// pick rather than replacing it, so a caller who sent a
+/// `prompt_cache_key` goes back to the provider that already holds
+/// their warm prefix on every later turn.
+///
+/// The group is weighted 1:8:1, so an unbiased draw would land a
+/// twelve-turn conversation on more than one member with overwhelming
+/// probability; every turn landing on the first one is the signal.
+#[test]
+fn cache_affinity_returns_a_caller_to_the_provider_that_holds_its_warm_prefix() {
+    let gateway = start_gateway(Behavior::default());
+    let cache_key = "sota-e2e-conversation-1";
+
+    let mut served = Vec::new();
+    for turn in 0..12 {
+        let response = gateway
+            .proxy
+            .post_json(
+                "/v1/chat/completions",
+                "sota.local",
+                &json!({
+                    "model": GROUP,
+                    "prompt_cache_key": cache_key,
+                    "messages": [{"role": "user", "content": format!("turn {turn}")}]
+                }),
+                &[],
+            )
+            .expect("chat request");
+        assert_eq!(
+            response.status,
+            200,
+            "turn {turn} failed: {}",
+            String::from_utf8_lossy(&response.body)
+        );
+        served.push(
+            response.json().expect("json")["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        );
+    }
+
+    let first = served.first().cloned().unwrap_or_default();
+    assert!(
+        served.iter().all(|answer| *answer == first),
+        "a warm-cache caller was scattered across members: {served:?}"
+    );
+}
+
+/// WOR-2650, the half that has to move: a provider that accepts the
+/// connection and then goes quiet is bounded by the pre-header budget
+/// and the request moves to a sibling. Before that budget existed the
+/// only bound was the attempt's own `timeout_ms`, which has to be long
+/// enough for a real completion, so nothing failed over for as long as
+/// it ran.
+#[test]
+fn a_stream_that_never_produces_a_first_byte_fails_over_before_the_commit_point() {
+    let gateway = start_gateway(Behavior {
+        flex_stalls: true,
+        ..Behavior::default()
+    });
+    let started = std::time::Instant::now();
+    let response = gateway
+        .proxy
+        .post_json(
+            "/v1/chat/completions",
+            "sota.local",
+            &json!({
+                "model": GROUP,
+                "stream": true,
+                "prompt_cache_key": "sota-e2e-stall",
+                "messages": [{"role": "user", "content": "stream please"}]
+            }),
+            &[],
+        )
+        .expect("streaming request");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        response.status,
+        200,
+        "a stalled candidate should have been replaced, not relayed: {}",
+        String::from_utf8_lossy(&response.body)
+    );
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "the pre-header budget is 400ms and the failover has to happen on it, \
+         not on the 30s HTTP client default; took {elapsed:?}"
+    );
+    assert!(
+        !gateway.flex.seen().is_empty(),
+        "the stalled member was dialed, which is what makes this a failover \
+         rather than a member that was never picked"
+    );
+}
+
+/// The other half of the same budget, and the one that is a safety
+/// property rather than an availability one: past the response headers
+/// the caller is already reading this provider's output, so a later
+/// candidate cannot replace it. A stream that dies mid-body ends,
+/// truncated, rather than being silently restarted somewhere else with
+/// a second copy of the answer.
+#[test]
+fn a_stream_that_dies_after_the_first_byte_is_not_failed_over() {
+    let gateway = start_gateway(Behavior {
+        standard_dies_mid_stream: true,
+        ..Behavior::default()
+    });
+    let response = gateway.proxy.post_json(
+        "/v1/chat/completions",
+        "sota.local",
+        &json!({
+            "model": MODEL_STANDARD,
+            "stream": true,
+            "messages": [{"role": "user", "content": "stream please"}]
+        }),
+        &[],
+    );
+    // Either a truncated body or a transport error is a correct
+    // outcome for a stream that died after commit. What is not correct
+    // is a second, complete answer from another provider.
+    let body = response
+        .map(|response| String::from_utf8_lossy(&response.body).to_string())
+        .unwrap_or_default();
+    assert!(
+        !body.contains("flex"),
+        "a committed stream was replaced by another provider's answer: {body}"
+    );
+    assert!(
+        gateway.flex.seen().is_empty(),
+        "no sibling may be dialed after the commit point; the flex member saw {} requests",
+        gateway.flex.seen().len()
+    );
+}
+
+/// WOR-2654's dispatch half, running under everything else: two targets
+/// answer, and neither one is on the caller's latency path.
+#[test]
+fn both_shadow_targets_run_beside_the_primary_and_neither_delays_it() {
+    let gateway = start_gateway(Behavior::default());
+    assert_eq!(gateway.chat(MODEL_STANDARD, "shadow me", &[]).status, 200);
+
+    for (name, stub) in [
+        ("shadow-a", &gateway.shadow_a),
+        ("shadow-b", &gateway.shadow_b),
+    ] {
+        let mut seen = 0;
+        for _ in 0..60 {
+            seen = stub.seen().len();
+            if seen > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(seen > 0, "{name} never ran");
+    }
+    // The primary's answer is the primary's. A shadow reply reaching
+    // the client would be the failure this whole design exists to
+    // prevent.
+    let body = gateway
+        .chat(MODEL_STANDARD, "shadow me again", &[])
+        .json()
+        .expect("json");
+    assert_eq!(
+        body["choices"][0]["message"]["content"], "standard",
+        "a shadow answer reached the caller: {body}"
+    );
+}
+
+/// WOR-2654's retention half, and the gate that decides it: two
+/// credentials on one route, one consenting to content recording and
+/// one not. The consenting one's request retains the primary answer and
+/// both candidates' answers as one pair; the other retains nothing at
+/// all, not even a partial sample.
+#[test]
+fn content_recording_consent_decides_whether_the_shadow_pair_is_retained() {
+    let gateway = start_gateway(Behavior::default());
+    let (consenting, consenting_id) = gateway.mint_key("consents", true);
+    let (refusing, refusing_id) = gateway.mint_key("does-not-consent", false);
+
+    for (token, prompt) in [(&consenting, "keep this pair"), (&refusing, "keep nothing")] {
+        let status = gateway
+            .chat(MODEL_STANDARD, prompt, &[("x-sb-api", token.as_str())])
+            .status;
+        assert_eq!(status, 200, "chat under a governed key failed");
+    }
+
+    let consented = gateway
+        .retained_pair(&consenting_id)
+        .expect("the consenting key's pair should be retained");
+    assert!(
+        consented["output_text"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty()),
+        "the primary's own answer is half the pair: {consented}"
+    );
+    let shadows = consented["shadow_responses"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no shadow_responses on a consenting sample: {consented}"));
+    let targets: Vec<&str> = shadows
+        .iter()
+        .filter_map(|entry| entry["target"].as_str())
+        .collect();
+    assert!(
+        targets.contains(&"shadow-a") && targets.contains(&"shadow-b"),
+        "both candidates' answers belong in the pair: {targets:?}"
+    );
+
+    assert!(
+        gateway.retained_pair(&refusing_id).is_none(),
+        "a key that did not consent to content recording must retain nothing, \
+         and that includes the shadow half on its own"
+    );
+}
+
+/// WOR-2654's aggregate view. Provenance leads, because a delta over
+/// two pairs and a delta over two thousand read identically once each
+/// is a single number.
+#[test]
+fn the_shadow_report_leads_with_provenance_and_names_every_target() {
+    let gateway = start_gateway(Behavior::default());
+    for turn in 0..3 {
+        assert_eq!(
+            gateway
+                .chat(MODEL_STANDARD, &format!("report {turn}"), &[])
+                .status,
+            200
+        );
+    }
+    // The shadow legs and the primary leg land from different tasks.
+    let mut report = Value::Null;
+    for _ in 0..80 {
+        report = gateway.admin_json("/api/ai/shadow/report?window=1h");
+        let paired = report["targets"]
+            .as_array()
+            .map(|targets| {
+                targets
+                    .iter()
+                    .filter(|row| row["provenance"]["pairs_retained"].as_u64().unwrap_or(0) > 0)
+                    .count()
+            })
+            .unwrap_or(0);
+        if paired == 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    assert_eq!(report["window_secs"], 3600, "{report}");
+    let targets = report["targets"].as_array().expect("targets array");
+    assert_eq!(targets.len(), 2, "one row per configured target: {report}");
+    for row in targets {
+        let name = row["target"].as_str().unwrap_or_default();
+        let provenance = &row["provenance"];
+        assert!(
+            provenance["requests_seen"].as_u64().unwrap_or(0) >= 3,
+            "{name} saw fewer requests than were sent: {provenance}"
+        );
+        assert!(
+            provenance["pairs_retained"].as_u64().unwrap_or(0) > 0,
+            "{name} retained no pair: {provenance}"
+        );
+        let dropped: u64 = provenance["pairs_dropped"]
+            .as_object()
+            .map(|map| map.values().filter_map(Value::as_u64).sum())
+            .unwrap_or(0);
+        assert_eq!(
+            dropped + provenance["pairs_retained"].as_u64().unwrap_or(0),
+            provenance["requests_seen"].as_u64().unwrap_or(0),
+            "the provenance block has to sum: {provenance}"
+        );
+        assert!(
+            row["latency"]["shadow_p95_ms"].is_number()
+                && row["latency"]["delta_p50_ms"].is_number(),
+            "latency is reported at p50 and p95, not as a mean: {row}"
+        );
+        assert!(
+            row["finish_reasons"]
+                .as_object()
+                .is_some_and(|map| map.contains_key("stop")),
+            "the finish-reason distribution is the cheapest disagreement signal: {row}"
+        );
+        assert_eq!(
+            row["agreement"]["status"], "not_configured",
+            "no judge is configured here, and a zero score would read as a tie: {row}"
+        );
+    }
+}
+
+/// The usage and request records, read as one operator would.
+///
+/// Four of WOR-2658's five named facts are here: model, provider, the
+/// serving credential, and the cache read tokens. The fifth, the
+/// service tier, is on no per-request record at all; see this file's
+/// header for why that is reported rather than papered over.
+#[test]
+fn the_request_row_names_the_serving_credential_and_the_cache_tokens() {
+    let gateway = start_gateway(Behavior {
+        flex_refuses_first_key: true,
+        ..Behavior::default()
+    });
+    assert_eq!(
+        gateway.chat(MODEL_FLEX, "account for this", &[]).status,
+        200
+    );
+
+    let mut row = Value::Null;
+    for _ in 0..80 {
+        let rows: Vec<Value> = gateway
+            .admin_json("/api/requests?limit=5")
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if let Some(first) = rows.into_iter().next() {
+            row = first;
+            if row["credential_source"].is_string() {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(row["provider"], "openai-flex", "{row}");
+    assert_eq!(row["model"], MODEL_FLEX, "{row}");
+    assert_eq!(
+        row["credential_source"], "fallback",
+        "the row has to say which credential paid: {row}"
+    );
+    assert_eq!(
+        row["tokens_cached"], 7,
+        "the provider's prompt-cache read count reaches the record: {row}"
+    );
+
+    // The ledger row for the same request, which is where cost lives.
+    let usage = gateway.usage_rows(1);
+    let primary = usage
+        .iter()
+        .find(|entry| entry["tag"] != json!("shadow"))
+        .unwrap_or_else(|| panic!("no primary usage row: {usage:?}"));
+    assert_eq!(primary["provider"], "openai-flex", "{primary}");
+    assert_eq!(primary["model"], MODEL_FLEX, "{primary}");
+    assert_eq!(
+        primary["credential_source"], "fallback",
+        "the ledger names the serving credential too: {primary}"
+    );
+
+    // And the shadow rows join back to it rather than floating free.
+    let shadow_rows: Vec<&Value> = usage
+        .iter()
+        .filter(|entry| entry["tag"] == json!("shadow"))
+        .collect();
+    assert!(
+        !shadow_rows.is_empty(),
+        "shadow rows are missing from the ledger: {usage:?}"
+    );
+    for shadow in shadow_rows {
+        assert!(
+            shadow["shadow_of"].is_string(),
+            "a shadow row with no join key cannot be compared to anything: {shadow}"
+        );
+    }
+}
+
+/// WOR-2653: the verb an operator runs once, against this very gateway,
+/// and the reverse that has to leave the tree as it found it.
+///
+/// `CODEX_HOME` is a tempdir, so nothing here touches the developer's
+/// own Codex install.
+#[test]
+fn sbproxy_connect_configures_a_client_and_disconnect_restores_it_byte_for_byte() {
+    let gateway = start_gateway(Behavior::default());
+    let codex_home = tempfile::tempdir().expect("codex home");
+    let existing = codex_home.path().join("config.toml");
+    let existing_bytes = b"# a hand-written Codex config\nmodel = \"gpt-5\"\n";
+    std::fs::write(&existing, existing_bytes).expect("seed codex config");
+
+    let run = |verb: &str| {
+        std::process::Command::new(proxy_binary_path())
+            .arg(verb)
+            .arg("codex")
+            .args(if verb == "connect" {
+                vec!["--base-url".to_string(), gateway.proxy.base_url()]
+            } else {
+                Vec::new()
+            })
+            .env("CODEX_HOME", codex_home.path())
+            .output()
+            .unwrap_or_else(|error| panic!("`sbproxy {verb}` did not run: {error}"))
+    };
+
+    let connected = run("connect");
+    assert!(
+        connected.status.success(),
+        "`sbproxy connect` failed: {}",
+        String::from_utf8_lossy(&connected.stderr)
+    );
+    let profile = codex_home.path().join("sbproxy.config.toml");
+    let profile_text = std::fs::read_to_string(&profile)
+        .expect("connect writes a profile of its own, never your config.toml");
+    assert!(
+        profile_text.contains(&gateway.proxy.base_url()),
+        "the profile has to point at this gateway: {profile_text}"
+    );
+    assert_eq!(
+        std::fs::read(&existing).expect("read config.toml"),
+        existing_bytes,
+        "`connect` must never edit the operator's own config.toml"
+    );
+
+    let disconnected = run("disconnect");
+    assert!(
+        disconnected.status.success(),
+        "`sbproxy disconnect` failed: {}",
+        String::from_utf8_lossy(&disconnected.stderr)
+    );
+    assert!(
+        !profile.exists(),
+        "`disconnect` has to remove the profile it wrote"
+    );
+    assert_eq!(
+        std::fs::read(&existing).expect("read config.toml"),
+        existing_bytes,
+        "the tree `disconnect` leaves has to be the tree `connect` found, byte for byte"
+    );
+    assert!(
+        codex_home
+            .path()
+            .join("sbproxy.config.toml.sbproxy.removed")
+            .exists(),
+        "a hand edit made after connecting survives the removal"
+    );
+}
+
+impl Gateway {
+    /// The retained content sample for the most recent request made
+    /// under `key_id`, or `None` when nothing was retained.
+    fn retained_pair(&self, key_id: &str) -> Option<Value> {
+        let mut request_id = None;
+        for _ in 0..60 {
+            let rows: Vec<Value> = self
+                .admin_json(&format!("/api/requests?api_key_id={key_id}"))
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            if let Some(id) = rows.first().and_then(|row| row["request_id"].as_str()) {
+                request_id = Some(id.to_string());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let request_id = request_id?;
+        // The shadow halves land from their own tasks, so poll until
+        // both are attached or the window closes.
+        let mut last = None;
+        for _ in 0..60 {
+            let response = reqwest::blocking::Client::new()
+                .get(format!(
+                    "http://127.0.0.1:{}/api/requests/{request_id}/content",
+                    self.admin_port
+                ))
+                .basic_auth("admin", Some("secret"))
+                .send()
+                .expect("content fetch");
+            if response.status().as_u16() != 200 {
+                return None;
+            }
+            let body: Value = response.json().unwrap_or(Value::Null);
+            let shadows = body["shadow_responses"].as_array().map_or(0, Vec::len);
+            last = Some(body);
+            if shadows >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        last
+    }
+
+    /// A GET served by the proxy itself rather than the admin server,
+    /// for the LiteLLM-parity read-only endpoints.
+    fn admin_json_via_proxy(&self, path: &str) -> Value {
+        self.proxy
+            .get(path, "sota.local")
+            .expect("proxy-served management endpoint")
+            .json()
+            .expect("management json")
+    }
+}

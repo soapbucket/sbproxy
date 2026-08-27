@@ -5546,6 +5546,56 @@ pub fn handle_admin_request(
             ),
         };
     }
+    // WOR-2654: the shadow-eval comparison view, one row per target.
+    // `window` accepts the spend vocabulary plus `15m`; the default is
+    // `1h`. GET-only, so read RBAC applies with no extra gating.
+    //
+    // Every row leads with provenance (requests seen, the sample rate
+    // applied, pairs retained, pairs dropped by reason) because the
+    // deltas under it are computed over the retained pairs alone and a
+    // delta over four pairs reads identically to one over four thousand
+    // once it is a single number. The source is a bounded process-local
+    // ring, so a window wider than the ring's turnover reports the ring;
+    // `requests_seen` is what says which happened.
+    if path_only == "/api/ai/shadow/report" {
+        if !method.eq_ignore_ascii_case("GET") {
+            return (
+                405,
+                "application/json",
+                r#"{"error":"method not allowed"}"#.to_string(),
+            );
+        }
+        let window_secs = match rl_query_param(path, "window") {
+            None => 3_600,
+            Some("15m") => 900,
+            Some(window) => match parse_spend_window(window) {
+                Some(secs) => secs,
+                None => {
+                    return (
+                        400,
+                        "application/json",
+                        r#"{"error":"unknown window (15m|1h|24h|7d|30d)"}"#.to_string(),
+                    );
+                }
+            },
+        };
+        let targets = sbproxy_ai::shadow_eval::report_with_judge(
+            std::time::Duration::from_secs(window_secs),
+            &sbproxy_ai::shadow_judge::agreement_for,
+        );
+        let body = serde_json::json!({
+            "window_secs": window_secs,
+            "targets": targets,
+        });
+        return match serde_json::to_string(&body) {
+            Ok(body) => (200, "application/json", body),
+            Err(e) => (
+                500,
+                "application/json",
+                format!(r#"{{"error":"serialization failed: {e}"}}"#),
+            ),
+        };
+    }
     // WOR-2578: multi-dimension aggregation over the same filtered ring.
     // `group_by` is required and takes any mix of the four dimensions at
     // once, which is the "who spent what on which model" question the

@@ -1144,6 +1144,59 @@ pub struct AiShadowConfig {
     ///   sample_rate: 0.1
     /// ```
     pub targets: Vec<AiShadowTarget>,
+    /// Optional batch judge over retained pairs (WOR-2654).
+    ///
+    /// Accepted in both spellings, so a single-target `shadow:` block
+    /// can carry a `judge:` beside its `provider:` key. Absent by
+    /// default: shadow eval reports numbers with no judge at all, and
+    /// `GET /api/ai/shadow/report` then says `not_configured` on the
+    /// agreement row rather than reporting a zero that reads as a tie.
+    pub judge: Option<AiShadowJudge>,
+}
+
+/// The batch judge attached to a `shadow:` block.
+///
+/// Judging is a batch job over pairs the content-recording consent
+/// already retained, never an inline call on the request path: the
+/// shadow leg is fire-and-forget, so by the time the candidate answers
+/// the caller has been served and there is nothing to block on. See
+/// [`crate::shadow_judge`] for the budget and the divergence
+/// pre-filter, and the shadow-eval section of `docs/ai-gateway.md` for
+/// what is and is not implemented behind this key today.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct AiShadowJudge {
+    /// Provider entry on this action the judge calls. Named rather
+    /// than defaulted to the primary, because judging with the model
+    /// under evaluation is how a candidate grades its own homework.
+    pub provider: String,
+    /// Model override for the judge call. Defaults to the provider
+    /// entry's own default model.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Hard spend cap per `spend_window`, in USD. Required, not
+    /// defaulted: an unbounded judge is the exact failure this key
+    /// exists to prevent, and a default would be an operator's bill
+    /// chosen by us.
+    pub max_spend_usd: f64,
+    /// How long the cap covers before it resets. `daily` (the default)
+    /// or `weekly`.
+    #[serde(default = "default_judge_spend_window")]
+    pub spend_window: crate::shadow_judge::JudgeSpendWindow,
+    /// Whether the deterministic divergence pre-filter runs before any
+    /// judge call. On by default, and there is no good reason to turn
+    /// it off: two byte-identical answers cost money to have an LLM
+    /// confirm are identical.
+    #[serde(default = "default_divergence_prefilter")]
+    pub divergence_prefilter: bool,
+}
+
+fn default_judge_spend_window() -> crate::shadow_judge::JudgeSpendWindow {
+    crate::shadow_judge::JudgeSpendWindow::Daily
+}
+
+fn default_divergence_prefilter() -> bool {
+    true
 }
 
 /// One provider this route is shadowed against.
@@ -1204,7 +1257,45 @@ impl<'de> Deserialize<'de> for AiShadowConfig {
         // variant" for a typo anywhere in either arm, which for a block
         // with five sibling keys is a worse error than the one
         // `deny_unknown_fields` gives.
-        let value = serde_json::Value::deserialize(deserializer)?;
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        // Lift `judge:` out before branching. Both spellings carry it,
+        // and the flat branch deserializes straight into
+        // `AiShadowTarget`, whose `deny_unknown_fields` would otherwise
+        // reject a judge written beside a single `provider:`.
+        let judge_value = value
+            .as_object_mut()
+            .and_then(|object| object.remove("judge"));
+        let judge = match judge_value {
+            Some(raw) => Some(
+                serde_json::from_value::<AiShadowJudge>(raw)
+                    .map_err(|error| {
+                        D::Error::custom(format!(
+                            "ai shadow.judge: {error}; `provider` and `max_spend_usd` are \
+                             both required, because a judge with no spend cap is the \
+                             failure the key exists to prevent"
+                        ))
+                    })
+                    .and_then(|judge| {
+                        if !(judge.max_spend_usd.is_finite() && judge.max_spend_usd > 0.0) {
+                            return Err(D::Error::custom(format!(
+                                "ai shadow.judge.max_spend_usd must be a positive number of \
+                                 US dollars, got {}; remove the judge block to disable \
+                                 judging rather than capping it at zero",
+                                judge.max_spend_usd
+                            )));
+                        }
+                        if judge.provider.trim().is_empty() {
+                            return Err(D::Error::custom(
+                                "ai shadow.judge.provider must name a providers[] entry on \
+                                 this action; judging with the model under evaluation is \
+                                 how a candidate grades its own homework",
+                            ));
+                        }
+                        Ok(judge)
+                    })?,
+            ),
+            None => None,
+        };
         let targets = if value.get("targets").is_some() {
             serde_json::from_value::<AiShadowTargetList>(value)
                 .map_err(D::Error::custom)?
@@ -1235,7 +1326,7 @@ impl<'de> Deserialize<'de> for AiShadowConfig {
                 )));
             }
         }
-        Ok(Self { targets })
+        Ok(Self { targets, judge })
     }
 }
 
@@ -2015,6 +2106,24 @@ impl AiHandlerConfig {
             crate::budget::build_price_table(&config.model_prices, config.rate_card.as_deref());
         if install_price_table {
             crate::budget::set_price_table(price_table);
+        }
+        // WOR-2654: install this route's judge spend caps beside the
+        // price table, on the same reload footing, and for the same
+        // reason: both are operator money decisions that have to move
+        // when the config moves. A validation-only compile installs
+        // nothing, so a rejected candidate cannot re-cap a live judge.
+        if install_price_table {
+            if let Some(shadow) = config.shadow.as_ref() {
+                if let Some(judge) = shadow.judge.as_ref() {
+                    for target in &shadow.targets {
+                        crate::shadow_judge::JudgeRegistry::global().install(
+                            &target.provider,
+                            judge.max_spend_usd,
+                            judge.spend_window,
+                        );
+                    }
+                }
+            }
         }
         Ok(config)
     }

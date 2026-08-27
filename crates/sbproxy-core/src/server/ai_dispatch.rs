@@ -2190,6 +2190,13 @@ fn try_spawn_governed_shadow_after_primary(
         return;
     }
     let usage = super::ai_support::shadow_usage_record_from_context(ctx);
+    // WOR-2654: the pair's join key, plus the retention sink when this
+    // request already passed the content-recording gate. The gate is
+    // read here with the same helper the primary's own capture uses, so
+    // a route that keeps the caller's answer keeps the candidate's and
+    // a route that keeps neither keeps neither.
+    let eval =
+        super::ai_support::shadow_eval_context(config, ctx, content_capture_allowed(config, ctx));
     let reservation_prefix = format!("{}:quota-pool", ctx.request_id);
     // Shared client on purpose. A shadow copy outlives the caller's
     // request and is the operator's evaluation traffic, so a caller's
@@ -2209,6 +2216,7 @@ fn try_spawn_governed_shadow_after_primary(
             quota.clone(),
             &reservation_prefix,
             reasoning_eligibility,
+            &eval,
         );
 }
 
@@ -8837,6 +8845,10 @@ pub(super) async fn handle_ai_proxy(
                 captured_at: chrono::Utc::now().to_rfc3339(),
                 input_messages: capture_messages,
                 output_text: None,
+                // WOR-2654: filled in by the shadow tasks as their
+                // targets answer, and only for a request that reached
+                // here, which is to say only under this same consent.
+                shadow_responses: Vec::new(),
             });
         }
     }

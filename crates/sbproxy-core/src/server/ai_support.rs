@@ -2378,6 +2378,103 @@ pub(super) fn shadow_usage_record_from_context(
     Some(sbproxy_ai::client::ShadowUsageRecord::new(event, sinks))
 }
 
+/// WOR-2654: the proxy's half of the shadow retention seam.
+///
+/// A target's answer reaches the redacted console store through here
+/// and nowhere else, so the redaction stack the primary's answer goes
+/// through (the always-on secret redactor, then the origin's PII rules,
+/// then the payload cap) is the same one the candidate's goes through.
+/// Held by the shadow task, which outlives the request, so the redactor
+/// is cloned rather than borrowed; `PiiRedactor` keeps its rules behind
+/// an `Arc` and the clone is a handle.
+pub(super) struct ContentCaptureShadowSink {
+    pii_redactor: Option<sbproxy_security::pii::PiiRedactor>,
+}
+
+impl sbproxy_ai::shadow_eval::ShadowResponseSink for ContentCaptureShadowSink {
+    fn retain(
+        &self,
+        primary_request_id: &str,
+        target: &str,
+        model: &str,
+        status: u16,
+        response_body: &[u8],
+    ) -> bool {
+        let completion = extract_completion_text(response_body);
+        let redacted = redact_ai_trace_content(&completion, self.pii_redactor.as_ref());
+        if redacted.trim().is_empty() {
+            return false;
+        }
+        crate::content_capture::attach_shadow_response(
+            primary_request_id,
+            crate::content_capture::ShadowResponseSample {
+                target: target.to_string(),
+                model: model.to_string(),
+                status,
+                output_text: redacted,
+            },
+        )
+    }
+}
+
+/// WOR-2654: build the request-scoped shadow evaluation context.
+///
+/// `capture_allowed` is the caller's own read of the content-recording
+/// gate (the origin's `capture_content` AND the governed key's
+/// `allow_content_capture`), passed in rather than recomputed so the
+/// retention decision and the primary's own capture decision cannot
+/// drift apart. When it is false the returned context still carries the
+/// request id, so the aggregate view keeps working on a route that
+/// records no content at all, and carries no sink, so no response text
+/// is kept anywhere.
+pub(super) fn shadow_eval_context(
+    config: &AiHandlerConfig,
+    ctx: &crate::context::RequestContext,
+    capture_allowed: bool,
+) -> sbproxy_ai::shadow_eval::ShadowEvalContext {
+    sbproxy_ai::shadow_eval::ShadowEvalContext {
+        primary_request_id: (!ctx.request_id.is_empty()).then(|| ctx.request_id.to_string()),
+        retention: capture_allowed.then(|| {
+            std::sync::Arc::new(ContentCaptureShadowSink {
+                pii_redactor: config.pii_redactor().cloned(),
+            }) as std::sync::Arc<dyn sbproxy_ai::shadow_eval::ShadowResponseSink>
+        }),
+    }
+}
+
+/// WOR-2654: record the primary half of a shadow pair.
+///
+/// Called from the end-of-request logging hook, which is the first
+/// point where the primary's realized cost exists: the shadow spawns
+/// while the response is still being assembled, so nothing at spawn
+/// time can supply it. A no-op on any request that did not reach a
+/// provider, and free on a deployment that has never configured a
+/// `shadow:` block anywhere (the ledger short-circuits on an atomic).
+pub(super) fn record_shadow_primary_leg(ctx: &crate::context::RequestContext, status: u16) {
+    let Some(provider) = ctx.ai_provider.clone() else {
+        return;
+    };
+    if ctx.request_id.is_empty() {
+        return;
+    }
+    sbproxy_ai::shadow_eval::ShadowPairLedger::global().record_primary(
+        ctx.request_id.as_str(),
+        sbproxy_ai::shadow_eval::PrimaryLeg {
+            provider,
+            model: ctx.ai_model.clone().unwrap_or_default(),
+            cost_usd: ctx
+                .ai_cost_usd_micros
+                .map(|micros| micros as f64 / 1_000_000.0)
+                .unwrap_or(0.0),
+            latency_ms: ctx
+                .request_start
+                .map(|start| start.elapsed().as_millis() as u64)
+                .unwrap_or(0),
+            status,
+        },
+    );
+}
+
 /// WOR-1541: fold this request's realized outcome into the global routing
 /// feedback store, so the `outcome_aware` strategy scores providers by
 /// realized cost-per-success. No-op unless the origin opted in (the

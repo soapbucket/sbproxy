@@ -8292,6 +8292,13 @@ impl ProxyHttp for SbProxy {
         // so reading it recorded a failure for every successful call.
         record_routing_feedback(ctx, status_u16);
 
+        // WOR-2654: the primary half of any shadow pair this request
+        // opened. Same `status_u16` as above and for the same reason:
+        // the AI path never reaches the `response_filter` that sets
+        // `ctx.response_status`, so reading that field would report
+        // every paired primary as a failure.
+        record_shadow_primary_leg(ctx, status_u16);
+
         // WOR-2145: cut the attested consumption receipt.
         //
         // Here rather than in `response_filter` because this is the
