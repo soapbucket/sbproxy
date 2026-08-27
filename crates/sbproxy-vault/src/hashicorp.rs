@@ -201,10 +201,10 @@ pub enum HashiCorpAuth {
     },
 }
 
-/// Redacted `Debug` (WOR-2640). The operator-facing twin of
-/// [`AuthSource`], and the one that reaches a config-load error: a
-/// static Vault client token and an AppRole `secret_id` are both
-/// reusable credentials.
+/// Redacted `Debug` (WOR-2640). The operator-facing twin of the
+/// crate-private `AuthSource`, and the one that reaches a config-load
+/// error: a static Vault client token and an AppRole `secret_id` are
+/// both reusable credentials.
 impl std::fmt::Debug for HashiCorpAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
