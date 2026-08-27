@@ -47,6 +47,14 @@ pub enum StartupConfigError {
         /// Minimum safe replay TTL.
         minimum: u64,
     },
+    /// A lifetime the broker builds a bounded store from was set to
+    /// zero. Every row in such a store expires before the round trip
+    /// that would read it, so the flow it backs can never complete.
+    #[error("{field} must be greater than zero; a zero lifetime expires every entry before it can be read")]
+    ZeroLifetime {
+        /// Name of the configuration key that was set to zero.
+        field: &'static str,
+    },
 }
 
 /// Run startup-time validation against the broker config and process
@@ -64,6 +72,21 @@ pub fn validate_startup(cfg: &McpGatewayConfig) -> Result<(), StartupConfigError
     }
     if cfg.device_code_enabled && cfg.broker_signing_key.is_none() {
         return Err(StartupConfigError::DeviceAuthorizationRequiresSigningKey);
+    }
+    // A zero lifetime is refused here rather than clamped at the store,
+    // because the store's floor keeps the process alive without telling
+    // anyone the flow is dead. `cimd_cache_ttl_secs` is only judged when
+    // CIMD is on: an operator who never enabled it should not have to
+    // explain a key the broker never reads.
+    if cfg.session_ttl_secs == 0 {
+        return Err(StartupConfigError::ZeroLifetime {
+            field: "session_ttl_secs",
+        });
+    }
+    if cfg.cimd_enabled && cfg.cimd_cache_ttl_secs == 0 {
+        return Err(StartupConfigError::ZeroLifetime {
+            field: "cimd_cache_ttl_secs",
+        });
     }
     const SUPPORTED_CLIENT_AUTH_METHODS: &[&str] = &[
         "client_secret_basic",
@@ -851,6 +874,53 @@ mod tests {
                 ttl: 59,
                 minimum: 60
             }
+        ));
+    }
+
+    /// A zero lifetime builds a store whose every row expires before
+    /// the round trip that reads it, so the flow it backs can never
+    /// complete. Startup refuses it instead of booting a broker that
+    /// rejects every callback.
+    #[test]
+    fn validate_startup_rejects_a_zero_session_lifetime() {
+        let cfg = McpGatewayConfig {
+            session_ttl_secs: 0,
+            dpop_supported: false,
+            dpop_require_nonce: false,
+            ..McpGatewayConfig::default()
+        };
+        assert!(matches!(
+            validate_startup(&cfg),
+            Err(StartupConfigError::ZeroLifetime {
+                field: "session_ttl_secs"
+            })
+        ));
+    }
+
+    /// The CIMD cache lifetime is only judged when CIMD is enabled:
+    /// an operator who never turned it on should not have to explain a
+    /// key the broker never reads.
+    #[test]
+    fn validate_startup_rejects_a_zero_cimd_cache_lifetime_only_when_cimd_is_on() {
+        let disabled = McpGatewayConfig {
+            cimd_enabled: false,
+            cimd_cache_ttl_secs: 0,
+            dpop_supported: false,
+            dpop_require_nonce: false,
+            ..McpGatewayConfig::default()
+        };
+        validate_startup(&disabled).expect("a key CIMD never reads is not a startup failure");
+
+        let enabled = McpGatewayConfig {
+            cimd_enabled: true,
+            cimd_cache_ttl_secs: 0,
+            ..disabled
+        };
+        assert!(matches!(
+            validate_startup(&enabled),
+            Err(StartupConfigError::ZeroLifetime {
+                field: "cimd_cache_ttl_secs"
+            })
         ));
     }
 

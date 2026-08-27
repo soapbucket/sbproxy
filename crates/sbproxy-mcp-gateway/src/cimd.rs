@@ -577,12 +577,41 @@ pub struct InMemoryCimdCache {
 
 const DEFAULT_CIMD_CACHE_CAPACITY: usize = 1_024;
 
+/// Floor [`InMemoryCimdCache::new`] applies to a zero TTL.
+///
+/// A zero would evict every document before the `/authorize` call that
+/// fetched it could reuse it, turning the cache into a fetch per
+/// request against a client-controlled URL. `McpGatewayConfig` refuses
+/// it at startup; this floor is what keeps the constructor total for
+/// the callers that build a cache by hand.
+const MIN_CIMD_CACHE_TTL: Duration = Duration::from_secs(1);
+
 impl InMemoryCimdCache {
     /// Build a fresh, empty cache with the given default TTL applied
     /// to documents whose response has no `Cache-Control: max-age`.
+    ///
+    /// A zero `default_ttl` is the one thing [`Self::with_capacity`]
+    /// refuses, and it is a caller mistake: every document would be
+    /// evicted before the `/authorize` call that fetched it could
+    /// reuse it. [`crate::config::validate_startup`] refuses it
+    /// outright when CIMD is enabled, so a configured deployment never
+    /// reaches the floor below. A caller building a cache by hand gets
+    /// `MIN_CIMD_CACHE_TTL` and a `debug_assert`, rather than a panic
+    /// that would take a running broker down for one bad argument.
     pub fn new(default_ttl: Duration) -> Self {
-        Self::with_capacity(default_ttl, DEFAULT_CIMD_CACHE_CAPACITY)
-            .expect("non-zero default CIMD cache capacity")
+        debug_assert!(
+            !default_ttl.is_zero(),
+            "CIMD cache TTL must be greater than zero"
+        );
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            default_ttl: if default_ttl.is_zero() {
+                MIN_CIMD_CACHE_TTL
+            } else {
+                default_ttl
+            },
+            capacity: DEFAULT_CIMD_CACHE_CAPACITY,
+        }
     }
 
     /// Build a cache with an explicit entry cap. On insertion at

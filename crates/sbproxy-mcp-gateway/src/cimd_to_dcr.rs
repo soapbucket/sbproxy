@@ -278,10 +278,25 @@ impl Default for CimdToDcrCache {
 }
 
 impl CimdToDcrCache {
-    /// Build a fresh, empty cache.
+    /// Build a fresh, empty cache on the default TTL and capacity.
+    ///
+    /// [`Self::with_limits`] refuses exactly one thing, a zero, and
+    /// both defaults are non-zero compile-time constants. The `const`
+    /// block below is that proof: set either to zero and the build
+    /// fails rather than the process. Because the check is settled at
+    /// compile time, this constructor builds the struct directly
+    /// instead of carrying a runtime panic for a case that cannot
+    /// arise.
     pub fn new() -> Self {
-        Self::with_limits(DEFAULT_DCR_CACHE_TTL, DEFAULT_DCR_CACHE_CAPACITY)
-            .expect("non-zero default DCR cache limits")
+        const _: () = assert!(
+            !DEFAULT_DCR_CACHE_TTL.is_zero() && DEFAULT_DCR_CACHE_CAPACITY > 0,
+            "CimdToDcrCache::new builds its limits directly, so both defaults must be non-zero"
+        );
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            ttl: DEFAULT_DCR_CACHE_TTL,
+            capacity: DEFAULT_DCR_CACHE_CAPACITY,
+        }
     }
 
     /// Build a cache with explicit TTL and entry capacity. Expired

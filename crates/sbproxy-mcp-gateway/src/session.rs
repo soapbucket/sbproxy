@@ -30,6 +30,15 @@ use tokio::sync::Mutex;
 
 const DEFAULT_SESSION_CAPACITY: usize = 4_096;
 
+/// Floor [`InMemorySessionStore::new`] applies to a zero TTL.
+///
+/// A zero would expire every session before the user agent could come
+/// back with the authorization code, so it is a caller mistake rather
+/// than a setting. `McpGatewayConfig` refuses it at startup; this
+/// floor is what keeps the constructor total for the callers that
+/// build a store by hand.
+const MIN_SESSION_TTL: Duration = Duration::from_secs(1);
+
 // --- Session row ---
 
 /// One pending authorization request, keyed by the broker's outbound
@@ -95,9 +104,25 @@ pub struct InMemorySessionStore {
 
 impl InMemorySessionStore {
     /// Builds a new store with the given TTL applied to every entry.
+    ///
+    /// A zero `ttl` is the one thing [`Self::with_capacity`] refuses,
+    /// and it is a caller mistake: every session would expire before
+    /// the user agent could return with its code.
+    /// [`crate::config::validate_startup`] refuses it outright, so a
+    /// configured deployment never reaches the floor below. A caller
+    /// building a store by hand gets `MIN_SESSION_TTL` and a
+    /// `debug_assert`, rather than a panic that would take a running
+    /// broker down for one bad argument.
     pub fn new(ttl: Duration) -> Self {
-        Self::with_capacity(ttl, DEFAULT_SESSION_CAPACITY)
-            .expect("non-zero default authorization-session capacity")
+        debug_assert!(
+            !ttl.is_zero(),
+            "authorization-session TTL must be greater than zero"
+        );
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            ttl: if ttl.is_zero() { MIN_SESSION_TTL } else { ttl },
+            capacity: DEFAULT_SESSION_CAPACITY,
+        }
     }
 
     /// Build a store with a strict live-session capacity. A new state

@@ -279,9 +279,10 @@ impl McpGatewayRuntime {
         }
         validate_startup(&config)?;
         let base_path = config.base_path.trim_end_matches('/').to_string();
-        let sessions = InMemorySessionStore::arc(std::time::Duration::from_secs(
-            config.session_ttl_secs.max(1),
-        ));
+        // `validate_startup` above refuses a zero `session_ttl_secs`, so
+        // this no longer clamps it on the way past.
+        let sessions =
+            InMemorySessionStore::arc(std::time::Duration::from_secs(config.session_ttl_secs));
         Ok(Self {
             base_path,
             router: router_with_security_context(Arc::new(config), sessions, security),

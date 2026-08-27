@@ -134,10 +134,30 @@ impl Default for LocalStore {
 }
 
 impl LocalStore {
-    /// Build an empty store.
+    /// Build an empty store on the default limits.
+    ///
+    /// [`Self::with_limits`] refuses exactly one thing, a zero, and
+    /// every default limit is a non-zero compile-time constant. The
+    /// `const` block below is that proof: change any default to zero
+    /// and the build fails rather than the process. Because the check
+    /// is settled at compile time, this constructor builds the struct
+    /// directly instead of carrying a runtime panic for a case that
+    /// cannot arise.
     pub fn new() -> Self {
-        Self::with_capacity(DEFAULT_EPHEMERAL_CAPACITY, DEFAULT_PERSISTENT_CAPACITY)
-            .expect("non-zero default LocalStore capacities")
+        const _: () = assert!(
+            DEFAULT_EPHEMERAL_CAPACITY > 0
+                && DEFAULT_PERSISTENT_CAPACITY > 0
+                && DEFAULT_MAX_KEY_BYTES > 0
+                && DEFAULT_MAX_VALUE_BYTES > 0
+                && DEFAULT_EPHEMERAL_BYTES_PER_NAMESPACE > 0
+                && DEFAULT_PERSISTENT_BYTES > 0,
+            "LocalStore::new builds its limits directly, so every default must be non-zero"
+        );
+        Self {
+            ephemeral: Mutex::new(EphemeralState::default()),
+            persistent: Mutex::new(PersistentState::default()),
+            limits: LocalStoreLimits::default(),
+        }
     }
 
     /// Build an empty store with explicit upper bounds for ephemeral
