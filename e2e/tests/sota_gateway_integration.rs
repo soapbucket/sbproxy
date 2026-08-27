@@ -9,8 +9,14 @@
 //! pays. Green unit tests on nine features that share one code path are
 //! not evidence that the nine compose. This file is that evidence.
 //!
-//! Everything here runs against the **release** binary through the real
-//! `ProxyHarness`, and every claim is a named test.
+//! Everything here runs through the real `ProxyHarness` against the
+//! binary `sbproxy_e2e::proxy_binary_path` resolves, which is
+//! `SBPROXY_E2E_BIN` when set, then `target/release/sbproxy`, then
+//! `target/debug/sbproxy`. Nothing here enforces the release build, so
+//! every wall-clock assertion in this file is sized to hold under a
+//! debug one: the pre-header tests allow two seconds for a 400 ms
+//! budget, and the shadow-dispatch test allows 700 ms against copies
+//! that take 1.5 seconds. Every claim is a named test.
 //!
 //! # Where a stub cannot be the real vendor, the wire is
 //!
@@ -41,24 +47,16 @@
 //!
 //! # What this file deliberately does not assert
 //!
-//! Two of WOR-2658's verification lines describe surfaces the merged
+//! One of WOR-2658's verification lines describes a surface the merged
 //! code does not have, and inventing an assertion that passes anyway
-//! would be worse than saying so:
-//!
-//! - The per-request record names model, provider, serving credential,
-//!   and cache read/write tokens, and it does **not** name the service
-//!   tier. `crates/sbproxy-observe/src/request_event.rs` carries an
-//!   explicit instruction that adding a top-level field to that struct
-//!   is a schema-breaking change, so widening it is a deliberate act
-//!   and not an integration fix.
-//!   [`the_request_row_names_the_serving_credential_and_the_cache_tokens`]
-//!   asserts the four that are there and records the fifth's absence.
-//! - The value ledger answers what *local versus cloud serving* and
-//!   what *compression* saved (`record_local`, `record_cloud`,
-//!   `record_compression`). It has no tier lane and no cache-affinity
-//!   lane, so it cannot answer what the tier choice or the affinity
-//!   saved. That is a new value lane rather than a defect in any
-//!   sibling, and no test here pretends otherwise.
+//! would be worse than saying so: the value ledger answers what *local
+//! versus cloud serving* and what *compression* saved (`record_local`,
+//! `record_cloud`, `record_compression`). It has no tier lane and no
+//! cache-affinity lane, so it cannot answer what the tier choice or the
+//! affinity saved. Pricing the tier that was not chosen, and pricing
+//! the cache miss that did not happen, are both counterfactuals nobody
+//! has defined yet, which makes a fourth lane a design decision rather
+//! than an integration fix. No test here pretends otherwise.
 
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
@@ -156,6 +154,10 @@ enum Reply {
     DieMidStream(String),
     /// A complete SSE stream, terminated properly.
     Sse(Vec<String>),
+    /// Read the request and close the connection without answering.
+    /// The proxy sees a transport failure, which is the failure class
+    /// a candidate order exists to route around.
+    Hangup,
 }
 
 impl ScriptedUpstream {
@@ -202,6 +204,10 @@ impl ScriptedUpstream {
                             }
                             Reply::StallForever => {
                                 stalled.push(stream);
+                            }
+                            Reply::Hangup => {
+                                let _ = stream.shutdown(std::net::Shutdown::Both);
+                                drop(stream);
                             }
                             Reply::Sse(frames) => {
                                 let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
@@ -333,10 +339,48 @@ fn openai_reply(model: &str, content: &str) -> Vec<u8> {
             "prompt_tokens": 11,
             "completion_tokens": 5,
             "total_tokens": 16,
-            "prompt_tokens_details": {"cached_tokens": 7}
+            "prompt_tokens_details": {"cached_tokens": 7},
+            // The gateway's usage extractor reads this key in either
+            // vendor shape, and this branch's own admin row column
+            // `tokens_cache_write` has no other source. A stub that
+            // reported only cache reads would leave that column
+            // untested on every request the suite makes.
+            "cache_creation_input_tokens": 3
         }
     }))
     .expect("openai reply")
+}
+
+/// A guardrail intervention shaped the way Bedrock shapes one: the
+/// `stopReason`, and a `trace` whose input assessment carries the
+/// matched text verbatim.
+///
+/// The echo is the point. Without it the proxy has nothing of the
+/// caller's to leak and "the refusal quotes nothing" passes whatever
+/// the proxy does with the upstream payload.
+fn intervened_converse_reply(caller_text: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "output": {"message": {"role": "assistant", "content": [{"text": ""}]}},
+        "stopReason": "guardrail_intervened",
+        "usage": {"inputTokens": 12, "outputTokens": 4, "totalTokens": 16},
+        "trace": {
+            "guardrail": {
+                "inputAssessment": {
+                    "e2e-guardrail": {
+                        "sensitiveInformationPolicy": {
+                            "piiEntities": [{
+                                "type": "US_SOCIAL_SECURITY_NUMBER",
+                                "match": caller_text,
+                                "action": "BLOCKED"
+                            }]
+                        },
+                        "invocationMetrics": {"guardrailProcessingLatency": 12}
+                    }
+                }
+            }
+        }
+    }))
+    .expect("intervened converse reply")
 }
 
 fn converse_reply(text: &str, stop_reason: &str) -> Vec<u8> {
@@ -416,6 +460,7 @@ struct Wiring<'a> {
     shadow_b_url: &'a str,
     flex_backup_url: &'a str,
     standard_backup_url: &'a str,
+    rate_card_path: &'a Path,
 }
 
 /// The whole epic in one `ai_proxy` action.
@@ -436,10 +481,12 @@ fn composite_config(wiring: &Wiring<'_>) -> String {
         shadow_b_url,
         flex_backup_url,
         standard_backup_url,
+        rate_card_path,
     } = wiring;
     let key_store = key_store.display();
     let usage_path = usage_path.display();
     let events_path = events_path.display();
+    let rate_card_path = rate_card_path.display();
     format!(
         r#"
 proxy:
@@ -481,6 +528,13 @@ origins:
     action:
       type: ai_proxy
       capture_content: true
+      # WOR-2647: the published limits come from the operator's rate
+      # card, which is where `max_output_tokens` lives. Without one the
+      # listing can only report a context window for models the static
+      # table happens to name, so the verify line "the group, its
+      # members, and their limits" would be unreachable by fixture
+      # construction rather than by product behavior.
+      rate_card: "{rate_card_path}"
       usage_sinks:
         - type: jsonl_file
           path: "{usage_path}"
@@ -491,6 +545,13 @@ origins:
         max_keys_per_provider: 64
       resilience:
         pre_header_timeout_ms: 400
+        # `round_robin` spreads rather than orders, so on its own it
+        # gives the attempt loop a budget of one and a dead candidate
+        # is a 502. The attempt budget, not the strategy, is what
+        # decides whether a failure is handed on, and this key opens
+        # it. That is what lets a keyed conversation on this origin
+        # cross a real failover, which is WOR-2658's third scope item.
+        content_policy_fallback: true
       providers:
         - name: bedrock-guarded
           provider_type: bedrock
@@ -589,6 +650,17 @@ origins:
     tenant_id: acme
     action:
       type: ai_proxy
+      # The price table is process-global and the last compiled origin
+      # installs it, so both origins name the same card. Without that
+      # the published limits would depend on origin compile order.
+      rate_card: "{rate_card_path}"
+      # WOR-2651: `fallback_chain` owns its candidate order, so on this
+      # origin a lease must be neither read nor recorded. The block is
+      # configured here precisely so the standing-aside is under test
+      # rather than merely unreachable.
+      cache_affinity:
+        ttl_secs: 300
+        max_keys_per_provider: 64
       routing:
         strategy: fallback_chain
       resilience:
@@ -634,9 +706,36 @@ struct Gateway {
     shadow_b: ScriptedUpstream,
     flex_backup: ScriptedUpstream,
     standard_backup: ScriptedUpstream,
+    /// Arm to make the next request the `flex` stub receives fail at
+    /// the transport layer. Cleared by the stub as it fires.
+    flex_hangup: Arc<AtomicBool>,
     usage_path: std::path::PathBuf,
     events_path: std::path::PathBuf,
     _workdir: tempfile::TempDir,
+}
+
+/// What `GET /api/requests/{id}/content` had to say.
+#[derive(Debug)]
+enum RetainedPair {
+    /// A sample exists, with whatever shadow answers were attached by
+    /// the time the poll window closed.
+    Sample(Value),
+    /// The endpoint refused by status. `404` is the consent refusal:
+    /// no sample was ever stored for that request.
+    Refused(u16),
+    /// No request row appeared under that key at all, which means the
+    /// request never reached the admin ring rather than that its
+    /// content was refused.
+    NoRequestRow,
+}
+
+impl RetainedPair {
+    fn sample(self) -> Value {
+        match self {
+            Self::Sample(body) => body,
+            other => panic!("expected a retained sample, got {other:?}"),
+        }
+    }
 }
 
 /// Behaviors the individual tests vary. Everything else is the
@@ -660,7 +759,22 @@ struct Behavior {
     /// point" is a claim about a gateway that had a good option and did
     /// not take it.
     standard_dies_mid_stream: bool,
+    /// Both shadow stubs hold their answer for [`SHADOW_STUB_DELAY`]
+    /// before replying, so "neither delays the primary" is a measured
+    /// claim rather than a claim about two stubs that answer instantly.
+    shadows_are_slow: bool,
 }
+
+/// How long a slow shadow stub holds its answer.
+///
+/// Long enough that a primary waiting on either copy could not finish
+/// inside [`PRIMARY_WITHOUT_SHADOWS`], and short enough that a test
+/// which does wait for the copies still finishes.
+const SHADOW_STUB_DELAY: Duration = Duration::from_millis(1500);
+
+/// The ceiling a primary request has to come in under while both
+/// shadow copies are still in flight.
+const PRIMARY_WITHOUT_SHADOWS: Duration = Duration::from_millis(700);
 
 /// One SSE frame, truncated: response headers and a partial body, then
 /// the connection drops.
@@ -682,20 +796,36 @@ fn start_gateway(behavior: Behavior) -> Gateway {
     let key_store = workdir.path().join("keys.redb");
     let usage_path = workdir.path().join("usage.jsonl");
     let events_path = workdir.path().join("events.ndjson");
+    let rate_card_path = workdir.path().join("rate-card.json");
+    std::fs::write(&rate_card_path, rate_card()).expect("rate card");
     let admin_port = free_port();
 
-    let signed = ScriptedUpstream::start(move |_request, _index| {
+    let signed = ScriptedUpstream::start(move |request, _index| {
         Reply::Body(
             200,
             "application/json",
             if behavior.guardrail_intervenes {
-                converse_reply("", "guardrail_intervened")
+                // Real Bedrock returns the matched input inside
+                // `trace.guardrail.inputAssessment`, so a stub that
+                // returns a bare `stopReason` gives the proxy nothing
+                // to leak and makes "the refusal quotes nothing"
+                // vacuous. This one hands back the caller's own prompt
+                // exactly where AWS does.
+                intervened_converse_reply(&caller_prompt(request))
             } else {
                 converse_reply("signed member answered", "end_turn")
             },
         )
     });
+    let flex_hangup = Arc::new(AtomicBool::new(false));
+    let flex_hangup_stub = Arc::clone(&flex_hangup);
     let flex = ScriptedUpstream::start(move |request, index| {
+        // Armed by a test that needs this provider to fail exactly
+        // once, so a failover can be provoked at a chosen turn rather
+        // than at a request index the test has to guess.
+        if flex_hangup_stub.swap(false, Ordering::SeqCst) {
+            return Reply::Hangup;
+        }
         if behavior.flex_stalls {
             return Reply::StallForever;
         }
@@ -745,14 +875,20 @@ fn start_gateway(behavior: Behavior) -> Gateway {
             .to_string();
         Reply::Body(200, "application/json", openai_reply(&model, "standard"))
     });
-    let shadow_a = ScriptedUpstream::start(|_, _| {
+    let shadow_a = ScriptedUpstream::start(move |_, _| {
+        if behavior.shadows_are_slow {
+            std::thread::sleep(SHADOW_STUB_DELAY);
+        }
         Reply::Body(
             200,
             "application/json",
             openai_reply(MODEL_STANDARD, "shadow a said something else"),
         )
     });
-    let shadow_b = ScriptedUpstream::start(|_, _| {
+    let shadow_b = ScriptedUpstream::start(move |_, _| {
+        if behavior.shadows_are_slow {
+            std::thread::sleep(SHADOW_STUB_DELAY);
+        }
         Reply::Body(
             200,
             "application/json",
@@ -772,6 +908,7 @@ fn start_gateway(behavior: Behavior) -> Gateway {
         shadow_b_url: &shadow_b.base_url(),
         flex_backup_url: &flex_backup.base_url(),
         standard_backup_url: &standard_backup.base_url(),
+        rate_card_path: &rate_card_path,
     });
     let proxy = ProxyHarness::start_with_workspace(&yaml, &[]).expect("composite gateway boots");
 
@@ -785,10 +922,50 @@ fn start_gateway(behavior: Behavior) -> Gateway {
         shadow_b,
         flex_backup,
         standard_backup,
+        flex_hangup,
         usage_path,
         events_path,
         _workdir: workdir,
     }
+}
+
+/// A LiteLLM-shaped rate card naming this fixture's models.
+///
+/// `max_output_tokens` has exactly one source in the product, the
+/// operator's rate card, so a fixture that ships none can never publish
+/// it. The windows differ per member on purpose: a group's published
+/// window is the floor across its members, and identical numbers would
+/// not tell a floor from a copy.
+fn rate_card() -> String {
+    serde_json::to_string_pretty(&json!({
+        MODEL_SIGNED: {
+            "max_input_tokens": 200_000,
+            "max_output_tokens": 8_192,
+            "input_cost_per_token": 0.000_003,
+            "output_cost_per_token": 0.000_015,
+        },
+        MODEL_FLEX: {
+            "max_input_tokens": 128_000,
+            "max_output_tokens": 16_384,
+            "input_cost_per_token": 0.000_000_15,
+            "output_cost_per_token": 0.000_000_6,
+        },
+        MODEL_STANDARD: {
+            "max_input_tokens": 400_000,
+            "max_output_tokens": 32_768,
+            "input_cost_per_token": 0.000_002_5,
+            "output_cost_per_token": 0.000_01,
+        },
+    }))
+    .expect("rate card json")
+}
+
+/// The caller's own prompt text, as the Bedrock stub received it.
+fn caller_prompt(request: &SeenRequest) -> String {
+    request.json()["messages"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
 }
 
 impl Gateway {
@@ -863,9 +1040,14 @@ impl Gateway {
         )
     }
 
-    /// The retained content sample for the most recent request made
-    /// under `key_id`, or `None` when nothing was retained.
-    fn retained_pair(&self, key_id: &str) -> Option<Value> {
+    /// What the content endpoint says about the most recent request
+    /// made under `key_id`.
+    ///
+    /// Three outcomes rather than an `Option`, because "no pair" has
+    /// two very different causes and a consent assertion that cannot
+    /// tell them apart would pass on a slow write as readily as on a
+    /// refusal.
+    fn retained_pair(&self, key_id: &str) -> RetainedPair {
         let mut request_id = None;
         for _ in 0..60 {
             let rows: Vec<Value> = self
@@ -879,7 +1061,9 @@ impl Gateway {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        let request_id = request_id?;
+        let Some(request_id) = request_id else {
+            return RetainedPair::NoRequestRow;
+        };
         // The shadow halves land from their own tasks, so poll until
         // both are attached or the window closes.
         let mut last = None;
@@ -892,8 +1076,9 @@ impl Gateway {
                 .basic_auth("admin", Some("secret"))
                 .send()
                 .expect("content fetch");
-            if response.status().as_u16() != 200 {
-                return None;
+            let status = response.status().as_u16();
+            if status != 200 {
+                return RetainedPair::Refused(status);
             }
             let body: Value = response.json().unwrap_or(Value::Null);
             let shadows = body["shadow_responses"].as_array().map_or(0, Vec::len);
@@ -903,7 +1088,10 @@ impl Gateway {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        last
+        match last {
+            Some(body) => RetainedPair::Sample(body),
+            None => RetainedPair::NoRequestRow,
+        }
     }
 
     /// A GET served by the proxy itself rather than the admin server,
@@ -1108,15 +1296,52 @@ fn the_model_group_and_its_members_are_listed_and_parse_as_an_openai_model_list(
         );
     }
 
-    let group_entry = data
-        .iter()
-        .find(|entry| entry["id"] == GROUP)
-        .expect("group entry");
+    // WOR-2647's third verify line: the limits, not only the names. A
+    // client sizing a prompt reads these, and a listing that omits them
+    // sends it to the vendor to find out.
+    let entry_for = |wanted: &str| {
+        data.iter()
+            .find(|entry| entry["id"] == wanted)
+            .unwrap_or_else(|| panic!("{wanted} missing from the listing: {data:?}"))
+            .clone()
+    };
+    for (member, window, max_output) in [
+        (MODEL_SIGNED, 200_000_u64, 8_192_u64),
+        (MODEL_FLEX, 128_000, 16_384),
+        (MODEL_STANDARD, 400_000, 32_768),
+    ] {
+        let entry = entry_for(member);
+        assert_eq!(
+            entry["context_window"].as_u64(),
+            Some(window),
+            "{member} published no context window: {entry}"
+        );
+        assert_eq!(
+            entry["max_output_tokens"].as_u64(),
+            Some(max_output),
+            "{member} published no output limit: {entry}"
+        );
+    }
+
+    let group_entry = entry_for(GROUP);
     assert!(
         group_entry["capabilities"]
             .as_array()
             .is_some_and(|caps| caps.iter().any(|c| c == "chat_completions")),
         "a group's capabilities are the union across its members: {group_entry}"
+    );
+    // A group is several models behind one id, so the only limit it can
+    // honestly publish is the one every member can honor: the floor.
+    assert_eq!(
+        group_entry["context_window"].as_u64(),
+        Some(128_000),
+        "a group's window is the floor across its members, not any one member's: \
+         {group_entry}"
+    );
+    assert_eq!(
+        group_entry["max_output_tokens"].as_u64(),
+        Some(8_192),
+        "and so is its output limit: {group_entry}"
     );
 
     // The LiteLLM-parity surface, which is the only one that can carry
@@ -1180,11 +1405,13 @@ fn the_signed_member_signs_the_body_the_guardrail_rewrite_produced() {
         "a bedrock provider translates to the Converse path: {}",
         request.path
     );
+    let authorization = request
+        .header("authorization")
+        .expect("a signed request carries an Authorization header");
     assert!(
-        request
-            .header("authorization")
-            .is_none_or(|value| !value.to_ascii_lowercase().starts_with("bearer")),
-        "a signed provider must not also present an api_key"
+        authorization.starts_with("AWS4-HMAC-SHA256"),
+        "a signed provider presents a SigV4 credential and never an api_key bearer \
+         token: {authorization}"
     );
     let body = request.json();
     assert_eq!(
@@ -1228,9 +1455,27 @@ fn a_guardrail_intervention_becomes_a_403_that_quotes_nothing() {
         text.contains("guardrail"),
         "the refusal has to say what refused: {text}"
     );
+    // The premise, asserted rather than assumed: the upstream payload
+    // this refusal was derived from *did* carry the caller's own text,
+    // the way a real Bedrock assessment does. Without this the next
+    // assertion is a claim about a stub that had nothing to leak.
+    let upstream = gateway
+        .signed
+        .seen()
+        .first()
+        .map(SeenRequest::json)
+        .expect("the signed member was dialed");
+    assert_eq!(
+        upstream["messages"][0]["content"][0]["text"], secret_prompt,
+        "the stub was sent the secret, so its assessment echoes one: {upstream}"
+    );
     assert!(
         !text.contains("000-00-0000"),
         "the block reason must never quote the caller's own text back: {text}"
+    );
+    assert!(
+        !text.contains("piiEntities") && !text.contains("inputAssessment"),
+        "the vendor's assessment payload must not be relayed either: {text}"
     );
 }
 
@@ -1270,6 +1515,28 @@ fn the_operator_tier_reaches_the_provider_and_the_callers_is_stripped() {
     assert_ne!(
         body["service_tier"], "priority",
         "raising the tier raises the bill and the operator pays it: {body}"
+    );
+
+    // The half `flex` cannot show, because `flex` spells the same in
+    // the config and on the wire. `openai-standard` declares
+    // `service_tier: standard` and OpenAI's catalog vocabulary spells
+    // that tier `default`, so a gateway that passed the configured
+    // string through unchanged would send `standard` and the vendor
+    // would reject or ignore it.
+    assert_eq!(
+        gateway.chat(MODEL_STANDARD, "hi", &[]).status,
+        200,
+        "the standard member refused"
+    );
+    let standard = gateway.standard.seen();
+    let standard_body = standard
+        .first()
+        .expect("the standard member was dialed")
+        .json();
+    assert_eq!(
+        standard_body["service_tier"], "default",
+        "the vendor's own spelling of `standard` is what goes on the wire, not the \
+         gateway's canonical name for the tier: {standard_body}"
     );
 }
 
@@ -1434,6 +1701,80 @@ fn cache_affinity_returns_a_caller_to_the_provider_that_holds_its_warm_prefix() 
         "a warm-cache caller was scattered across the pool, which is what round robin \
          alone does: {served:?}"
     );
+    assert_eq!(
+        first, "flex",
+        "the premise of the failover below: round robin's first pick on a fresh \
+         process is the first declared member, so the lease is held by `openai-flex`"
+    );
+
+    // WOR-2658 scope item 3: the conversation has to cross a *failover*,
+    // not merely sit still on a healthy pool. The lease holder fails at
+    // the transport layer for exactly one turn.
+    gateway.flex_hangup.store(true, Ordering::SeqCst);
+    let dialed_before = gateway.flex.seen().len();
+    let response = gateway
+        .proxy
+        .post_json(
+            "/v1/chat/completions",
+            "sota.local",
+            &json!({
+                "model": MODEL_STALL,
+                "prompt_cache_key": cache_key,
+                "messages": [{"role": "user", "content": "the leased provider just died"}]
+            }),
+            &[],
+        )
+        .expect("chat request");
+    assert_eq!(
+        response.status,
+        200,
+        "a keyed conversation whose leased provider died must still be served: {}",
+        String::from_utf8_lossy(&response.body)
+    );
+    assert!(
+        gateway.flex.seen().len() > dialed_before,
+        "the leased provider was never dialed, so nothing here was a failover"
+    );
+    let after_failover = response.json().expect("json")["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        after_failover, "flex backup",
+        "the sibling had to answer the turn the lease holder could not: {after_failover}"
+    );
+
+    // And the conversation continues to be pinned afterward, now to
+    // whichever member holds the warm prefix. Either destination is
+    // correct; being scattered again is not.
+    let mut resumed = Vec::new();
+    for turn in 0..8 {
+        let response = gateway
+            .proxy
+            .post_json(
+                "/v1/chat/completions",
+                "sota.local",
+                &json!({
+                    "model": MODEL_STALL,
+                    "prompt_cache_key": cache_key,
+                    "messages": [{"role": "user", "content": format!("resumed {turn}")}]
+                }),
+                &[],
+            )
+            .expect("chat request");
+        assert_eq!(response.status, 200, "resumed turn {turn} failed");
+        resumed.push(
+            response.json().expect("json")["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        );
+    }
+    let resumed_first = resumed.first().cloned().unwrap_or_default();
+    assert!(
+        resumed.iter().all(|answer| *answer == resumed_first),
+        "the conversation was scattered across the pool after the failover: {resumed:?}"
+    );
 
     // The control, so the assertion above is a claim about this feature
     // rather than about a rotation that happened to sit still. Twelve
@@ -1456,6 +1797,69 @@ fn cache_affinity_returns_a_caller_to_the_provider_that_holds_its_warm_prefix() 
         "without a cache key these should have been split across the pool; if they all \
          landed on one member the keyed run above proves nothing: {unkeyed:?}"
     );
+}
+
+/// WOR-2651, the other half of the same feature and the one this branch
+/// fixed: four routing strategies own their candidate order outright,
+/// and on those origins a prompt-cache lease is neither read nor
+/// recorded.
+///
+/// `stream.local` is `fallback_chain` **with** a `cache_affinity:`
+/// block, which is the only shape where the standing-aside can be
+/// observed. The first turn fails the declared first candidate at the
+/// transport layer, so the successor serves it; if a lease were
+/// recorded on that success and read on the next turn, the successor
+/// would keep the conversation and the operator's declared priority
+/// order would drift further from itself the longer the route ran.
+#[test]
+fn cache_affinity_stands_aside_for_the_chains_declared_order() {
+    let gateway = start_gateway(Behavior::default());
+    let cache_key = "sota-e2e-chain-conversation";
+
+    let turn = |content: &str| {
+        gateway
+            .proxy
+            .post_json(
+                "/v1/chat/completions",
+                "stream.local",
+                &json!({
+                    "model": MODEL_STALL,
+                    "prompt_cache_key": cache_key,
+                    "messages": [{"role": "user", "content": content}]
+                }),
+                &[],
+            )
+            .expect("chat request")
+    };
+
+    // Turn one: the declared first candidate dies, the successor
+    // answers, and a lease-recording origin would now hold a lease on
+    // the successor.
+    gateway.flex_hangup.store(true, Ordering::SeqCst);
+    let first = turn("the chain's first candidate just died");
+    assert_eq!(
+        first.status,
+        200,
+        "the chain's successor should have answered: {}",
+        String::from_utf8_lossy(&first.body)
+    );
+    assert_eq!(
+        first.json().expect("json")["choices"][0]["message"]["content"],
+        "flex backup",
+        "the premise: the successor served this turn, so any lease is on the successor"
+    );
+
+    // Every turn after it goes back to the declared first candidate.
+    for index in 0..6 {
+        let response = turn(&format!("chain turn {index}"));
+        assert_eq!(response.status, 200, "chain turn {index} failed");
+        assert_eq!(
+            response.json().expect("json")["choices"][0]["message"]["content"],
+            "flex",
+            "a cache lease re-fronted a fallback_chain origin's declared order on turn \
+             {index}; the operator's priority order is not the router's to reorder"
+        );
+    }
 }
 
 /// WOR-2650, the half that has to move: a provider that accepts the
@@ -1501,10 +1905,15 @@ fn a_stream_that_never_produces_a_first_byte_fails_over_before_the_commit_point(
         response.text().unwrap_or_default().contains("flex backup"),
         "the successor's answer is the one the caller reads"
     );
+    // Two seconds, not twenty. The harness client's own timeout is ten
+    // seconds and `.expect("streaming request")` above panics first, so
+    // any bound at or above it can never fire: raising
+    // `pre_header_timeout_ms` from 400 to 9000 would have left the old
+    // assertion green, which made WOR-2650's central number untested.
     assert!(
-        elapsed < Duration::from_secs(20),
+        elapsed < Duration::from_secs(2),
         "the pre-header budget is 400ms and the handoff has to happen on it, not on \
-         the 30s HTTP client default; took {elapsed:?}"
+         the attempt's own timeout; took {elapsed:?}"
     );
     assert!(
         !gateway.flex.seen().is_empty(),
@@ -1547,24 +1956,47 @@ fn a_stream_that_dies_after_the_first_byte_is_not_failed_over() {
         &[],
     );
 
-    assert_eq!(
-        gateway.standard.seen().len(),
-        1,
-        "the committed provider was retried"
-    );
-    assert!(
-        gateway.standard_backup.seen().is_empty(),
-        "a committed stream was moved to the chain's next candidate, which would hand \
-         the caller a second copy of an answer it is already reading"
-    );
+    // A negative with no settle window passes on a race: the request
+    // returns as soon as the stream dies, and a retry the proxy was
+    // about to make would land after the assertions. Hold the window
+    // open and re-check throughout, so a late dial fails the test at
+    // the moment it happens rather than after it.
+    let settle = std::time::Instant::now();
+    while settle.elapsed() < Duration::from_secs(2) {
+        assert!(
+            gateway.standard_backup.seen().is_empty(),
+            "a committed stream was moved to the chain's next candidate, which would \
+             hand the caller a second copy of an answer it is already reading"
+        );
+        assert_eq!(
+            gateway.standard.seen().len(),
+            1,
+            "the committed provider was retried"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// WOR-2654's dispatch half, running under everything else: two targets
 /// answer, and neither one is on the caller's latency path.
 #[test]
 fn both_shadow_targets_run_beside_the_primary_and_neither_delays_it() {
-    let gateway = start_gateway(Behavior::default());
+    // Both copies hold their answers for well over a second, so "the
+    // caller does not wait for them" is a measurement. With instant
+    // stubs the claim is unfalsifiable: a gateway that awaited both
+    // copies inline would still answer immediately.
+    let gateway = start_gateway(Behavior {
+        shadows_are_slow: true,
+        ..Behavior::default()
+    });
+    let started = std::time::Instant::now();
     assert_eq!(gateway.chat(MODEL_STANDARD, "shadow me", &[]).status, 200);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < PRIMARY_WITHOUT_SHADOWS,
+        "the primary waited on a shadow copy: each one holds its answer for \
+         {SHADOW_STUB_DELAY:?} and the caller was served in {elapsed:?}"
+    );
 
     for (name, stub) in [
         ("shadow-a", &gateway.shadow_a),
@@ -1611,9 +2043,7 @@ fn content_recording_consent_decides_whether_the_shadow_pair_is_retained() {
         assert_eq!(status, 200, "chat under a governed key failed");
     }
 
-    let consented = gateway
-        .retained_pair(&consenting_id)
-        .expect("the consenting key's pair should be retained");
+    let consented = gateway.retained_pair(&consenting_id).sample();
     assert!(
         consented["output_text"]
             .as_str()
@@ -1632,11 +2062,18 @@ fn content_recording_consent_decides_whether_the_shadow_pair_is_retained() {
         "both candidates' answers belong in the pair: {targets:?}"
     );
 
-    assert!(
-        gateway.retained_pair(&refusing_id).is_none(),
-        "a key that did not consent to content recording must retain nothing, \
-         and that includes the shadow half on its own"
-    );
+    // A refusal, named by status, not merely an absence. `404` is the
+    // content endpoint saying no sample was ever stored; a request row
+    // that never appeared, or a sample that arrived slowly, would read
+    // as a different variant and fail here rather than passing as
+    // "nothing was retained".
+    match gateway.retained_pair(&refusing_id) {
+        RetainedPair::Refused(404) => {}
+        other => panic!(
+            "a key that did not consent to content recording must retain nothing, and \
+             that includes the shadow half on its own: {other:?}"
+        ),
+    }
 }
 
 /// WOR-2654's aggregate view. Provenance leads, because a delta over
@@ -1715,12 +2152,11 @@ fn the_shadow_report_leads_with_provenance_and_names_every_target() {
 
 /// The usage and request records, read as one operator would.
 ///
-/// Four of WOR-2658's five named facts are here: model, provider, the
-/// serving credential, and the cache read tokens. The fifth, the
-/// service tier, is on no per-request record at all; see this file's
-/// header for why that is reported rather than papered over.
+/// All five of WOR-2658's named facts are here: the model, the
+/// provider, the serving credential, the prompt-cache read and write
+/// counts, and the service tier that priced them.
 #[test]
-fn the_request_row_names_the_serving_credential_and_the_cache_tokens() {
+fn the_request_row_names_the_serving_credential_the_cache_tokens_and_the_tier() {
     let gateway = start_gateway(Behavior {
         flex_refuses_first_key: true,
         ..Behavior::default()
@@ -1754,6 +2190,14 @@ fn the_request_row_names_the_serving_credential_and_the_cache_tokens() {
     assert_eq!(
         row["tokens_cached"], 7,
         "the provider's prompt-cache read count reaches the record: {row}"
+    );
+    assert_eq!(
+        row["tokens_cache_write"], 3,
+        "and the cache-write count, which is the other column this branch adds: {row}"
+    );
+    assert_eq!(
+        row["service_tier"], "flex",
+        "the row has to name the tier that priced the tokens beside it: {row}"
     );
 
     // The ledger rows for the same request, which is where cost lives:
@@ -1856,6 +2300,7 @@ fn sbproxy_connect_configures_a_client_and_disconnect_restores_it_byte_for_byte(
             .path()
             .join("sbproxy.config.toml.sbproxy.removed")
             .exists(),
-        "a hand edit made after connecting survives the removal"
+        "`disconnect` keeps the profile it removed beside the client's config, so an \
+         edit made to it after connecting is recoverable rather than deleted"
     );
 }
