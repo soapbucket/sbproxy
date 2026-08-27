@@ -178,6 +178,34 @@ pub fn create_truncate_owner_only(path: &Path) -> io::Result<File> {
     open_with_mode(options, path)
 }
 
+/// Tightens a file that is already on disk, and does nothing when it
+/// is not there.
+///
+/// The opener for a file this process did not write and will not
+/// write: a rotated backup left by an older build, an archive moved
+/// into place by `rename(2)`. Unlike [`ensure_file_owner_only`] it
+/// never creates, because a sweep that creates is a sweep that
+/// resurrects a file somebody just deleted.
+///
+/// A path that does not exist is `Ok(())`. Every other failure is
+/// reported, because a backup that cannot be tightened is a backup
+/// other accounts can still read.
+///
+/// # Errors
+///
+/// As [`open_append_owner_only`], minus the not-found case.
+pub fn tighten_existing_owner_only(path: &Path) -> io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    // Read-only and no `create`: this call is a chmod through a
+    // descriptor, not an open of something to write.
+    options.read(true);
+    match open_with_mode(options, path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Creates `path` and every missing parent, each at `0o700`.
 ///
 /// Directories that already exist are left exactly as they are, mode

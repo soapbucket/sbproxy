@@ -905,6 +905,17 @@ mod tests {
     /// meaningful: a file loosened between two records is tightened on
     /// the next one rather than inherited. Pre-creating it at `0o644`
     /// keeps the test red before the fix on any umask.
+    ///
+    /// What that covers is the *file* assertion, and only that one. The
+    /// directory assertion below is umask-dependent and cannot be made
+    /// otherwise from inside this crate: a directory has nowhere to put
+    /// a starting mode, because the mode it is *created* at is the
+    /// claim, and with the fix backed out `create_dir_all` under a
+    /// `0o077` umask produces `0o700` and the assertion passes green.
+    /// Pinning the umask needs `libc::umask`, which this crate's
+    /// `#![forbid(unsafe_code)]` refuses, so that half is proved in
+    /// `tests/durable_directory_modes.rs`, an integration test that is
+    /// its own crate and pins it.
     #[cfg(unix)]
     #[test]
     fn the_file_sink_and_its_directory_are_owner_only() {

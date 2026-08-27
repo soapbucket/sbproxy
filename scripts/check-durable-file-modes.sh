@@ -126,13 +126,31 @@ production_region() {
 }
 
 # Rule A: no direct std file or directory creation in a guarded crate.
+#
+# Every pattern here creates a file at `0o666 & ~umask` (or a directory
+# at `0o777 & ~umask`) and hands the mode decision to the environment.
+# The first three were the original list; the rest were a blind spot the
+# script did not name, which is the shape this whole check exists to
+# stop:
+#
+#   std::fs::write(path, bytes)   creates, truncates, and closes
+#   File::options()               the same builder as OpenOptions::new()
+#   fs::copy(src, dst)            creates `dst`; the mode it copies is
+#                                 the *source's*, which for a file this
+#                                 process did not write is whatever the
+#                                 source happened to be
+#   File::create_new(             O_EXCL, still at the umask default
+#
+# `File::create_buffered` is deliberately absent: it is nightly-only and
+# a pattern that matches nothing is a pattern nobody maintains.
+CREATION_APIS='File::create\(|File::create_new\(|File::options\(\)|OpenOptions::new\(\)|fs::write\(|fs::copy\(|create_dir_all\(|fs::create_dir\('
+
 scan_guarded_file() {
   local file="$1" found=0 line
   while IFS= read -r line; do
     printf '%s:%s\n' "$file" "${line/$'\t'/: }"
     found=1
-  done < <(production_region "$file" |
-    grep -E 'File::create\(|OpenOptions::new\(\)|create_dir_all\(' || true)
+  done < <(production_region "$file" | grep -E "$CREATION_APIS" || true)
   return "$found"
 }
 
@@ -221,6 +239,20 @@ run_check() {
     while IFS= read -r file; do
       relative="${file#"$root"/}"
       is_exempt "$relative" && continue
+      # `src/bin/` holds developer generators that rewrite committed
+      # repository artifacts: the metrics-stability table, the span
+      # vocabulary block inside `docs/observability.md`, the JSON
+      # schemas under `schemas/`. Those files are checked in and are
+      # meant to be world-readable; making them `0o600` would be wrong,
+      # not merely unnecessary. None of them runs in a served process.
+      #
+      # What that means this script cannot see: a durable runtime sink
+      # added under `src/bin/` in a guarded crate. Stated here rather
+      # than left as the reader's problem, because a rule narrower than
+      # its claim is the thing this whole file exists to prevent.
+      case "$relative" in
+        */src/bin/*) continue ;;
+      esac
       if ! hits="$(scan_guarded_file "$file" 2>&1)"; then
         printf '%s\n' "$hits" >&2
         failures=1
@@ -301,6 +333,43 @@ pub fn open(path: &std::path::Path) -> std::io::Result<std::fs::File> {
 }
 EOF
   expect "a converted sink passes" 0 scan_guarded_file "$scratch/bad/good.rs"
+
+  # Rule A's blind spots, each of which creates a file at the umask
+  # default and each of which passed the original three patterns green.
+  cat >"$scratch/bad/write.rs" <<'EOF'
+pub fn dump(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)
+}
+EOF
+  expect "std::fs::write is refused" 1 scan_guarded_file "$scratch/bad/write.rs"
+
+  cat >"$scratch/bad/options.rs" <<'EOF'
+pub fn open(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::options().create(true).append(true).open(path)
+}
+EOF
+  expect "File::options is refused" 1 scan_guarded_file "$scratch/bad/options.rs"
+
+  cat >"$scratch/bad/copy.rs" <<'EOF'
+pub fn archive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<u64> {
+    std::fs::copy(src, dst)
+}
+EOF
+  expect "fs::copy is refused" 1 scan_guarded_file "$scratch/bad/copy.rs"
+
+  cat >"$scratch/bad/create_new.rs" <<'EOF'
+pub fn stake(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::create_new(path)
+}
+EOF
+  expect "File::create_new is refused" 1 scan_guarded_file "$scratch/bad/create_new.rs"
+
+  cat >"$scratch/bad/one_dir.rs" <<'EOF'
+pub fn make(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir(path)
+}
+EOF
+  expect "a single create_dir is refused" 1 scan_guarded_file "$scratch/bad/one_dir.rs"
 
   # A test module that pre-creates a loose fixture must not trip it.
   cat >"$scratch/bad/tested.rs" <<'EOF'
@@ -440,7 +509,7 @@ EOF
     echo "self-test failed: the detector is narrower than the enforcer" >&2
     return 1
   fi
-  echo "self-test passed: 14 fixtures"
+  echo "self-test passed: 19 fixtures"
   return 0
 }
 

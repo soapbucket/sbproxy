@@ -601,6 +601,7 @@ fn rotate_access_log(path: &Path, max_backups: usize, compress: bool) -> anyhow:
         }
     }
     if !path.exists() {
+        tighten_rotated_backups(path, max_backups, compress);
         return Ok(());
     }
     if compress {
@@ -609,7 +610,39 @@ fn rotate_access_log(path: &Path, max_backups: usize, compress: bool) -> anyhow:
     } else {
         std::fs::rename(path, rotated_path(path, 1, false))?;
     }
+    tighten_rotated_backups(path, max_backups, compress);
     Ok(())
+}
+
+/// Make every rotated backup owner-only, not just the one this
+/// rotation produced.
+///
+/// The uncompressed rotation is a `rename(2)`, which preserves the
+/// inode and therefore the mode. On a host upgraded from a build that
+/// wrote its access log at `0o644`, that carried the old mode forward
+/// forever: `max_backups: 10` with weekly rotation left ten
+/// world-readable files, each holding a week of every request's path,
+/// identity and decision, for ten more weeks, while the docs said a
+/// file at a wider mode is tightened when the sink opens it. Only the
+/// active file was ever reopened.
+///
+/// The sweep runs at rotation, where the paths are already computed,
+/// and it is best-effort per file: a backup on a filesystem with no
+/// permission bits, or one another account owns, must not stop the
+/// rotation that is keeping the live log bounded. Each failure is
+/// warned about by name so the gap is visible rather than silent.
+fn tighten_rotated_backups(path: &Path, max_backups: usize, compress: bool) {
+    for idx in 1..=max_backups {
+        let backup = rotated_path(path, idx, compress);
+        if let Err(error) = sbproxy_util::secure_fs::tighten_existing_owner_only(&backup) {
+            tracing::warn!(
+                path = %backup.display(),
+                error = %error,
+                "access log: a rotated backup could not be made owner-only; it holds the same \
+                 request records as the live log. See https://sbproxy.dev/docs/access-log"
+            );
+        }
+    }
 }
 
 fn rotated_path(path: &Path, idx: usize, compress: bool) -> PathBuf {
@@ -1707,6 +1740,17 @@ mod tests {
     /// to the ambient umask, so this stays red before the fix on a
     /// runner whose umask is already `0o077` and the assertion is about
     /// the sink rather than about the environment it ran in.
+    ///
+    /// What that covers is the *file* assertion, and only that one. The
+    /// directory assertion below is umask-dependent and cannot be made
+    /// otherwise from inside this crate: a directory has nowhere to put
+    /// a starting mode, because the mode it is *created* at is the
+    /// claim, and with the fix backed out `create_dir_all` under a
+    /// `0o077` umask produces `0o700` and the assertion passes green.
+    /// Pinning the umask needs `libc::umask`, which this crate's
+    /// `#![forbid(unsafe_code)]` refuses, so that half is proved in
+    /// `tests/durable_directory_modes.rs`, an integration test that is
+    /// its own crate and pins it.
     #[cfg(unix)]
     #[test]
     fn the_access_log_and_its_rotated_copy_are_owner_only() {
