@@ -5484,13 +5484,10 @@ impl ProxyHttp for SbProxy {
         // Wave 5 day-6 Item 1: drain CEL header transform mutations.
         //
         // Each `type: cel` transform with a non-empty `headers:` array
-        // gets its rules evaluated against the response headers we have
-        // in hand. Body content is not yet available at this phase
-        // (the transforms only see request.* and response.status /
-        // response.headers), but that is the documented surface for
-        // the day-6 header-mutating variant. Evaluations that reach
-        // for `response.body` resolve to "" - the body-rewriting
-        // expression continues to run at body-buffer time as before.
+        // gets its rules evaluated against the status and header map we
+        // have in hand. The body does not exist at this phase, so a
+        // rule reading `response.body` is skipped and counted rather
+        // than resolved against the empty string (WOR-2630).
         {
             let pipeline = ctx.pipeline.clone();
             if let Some(idx) = ctx.origin_idx {
@@ -5510,7 +5507,27 @@ impl ProxyHttp for SbProxy {
                             // where the failure must be visible to the
                             // client.
                             let request_view = cel_response_request_view(ctx);
+                            // WOR-2630: this phase owns the real status
+                            // and the real upstream headers and runs
+                            // before the first body byte arrives, so a
+                            // rule reading `response.body` is skipped
+                            // and counted rather than resolved against
+                            // the empty string. The pipeline compiler
+                            // refuses such a rule outright unless some
+                            // other route on this origin buffers, so
+                            // reaching this skip means a forward rule
+                            // can serve it.
+                            let phase =
+                                sbproxy_modules::transform::CelHeaderPhase::StreamingHeaders;
+                            for rule in t.header_rules_out_of_phase(phase) {
+                                crate::server::record_cel_header_rule_skipped(
+                                    ctx.hostname.as_str(),
+                                    rule,
+                                    phase,
+                                );
+                            }
                             let mutations = t.evaluate_headers_lossy_with_request(
+                                phase,
                                 b"",
                                 upstream_response.status.as_u16(),
                                 &upstream_response.headers,

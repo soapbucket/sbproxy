@@ -26,22 +26,27 @@ pub const UNSUPPORTED_ACTION_OUTCOME_CODE: &str = "unsupported_action_outcome";
 /// 2. **An exhaustive `match` stops compiling.** Adding an arm for
 ///    `Response { .. }` is the whole fix.
 ///
-/// The two 0.2 variants still exist and still mean what they meant, so a
-/// handler that only ever returned [`Self::Responded`] keeps compiling
-/// once the two points above are addressed. Nothing needs rewriting to
-/// use the new variant.
+/// The two 0.2 variants still exist, so a handler that only ever
+/// returned [`Self::Responded`] keeps compiling once the two points
+/// above are addressed. It no longer produces a request the host treats
+/// as served, though: [`Self::Responded`] names a host capability that
+/// does not exist and every transport now refuses it with `501`. Source
+/// compatibility is not behavior compatibility here, and a plugin still
+/// returning it has to move to [`Self::Response`].
 ///
 /// Prefer [`Self::Response`] in new code. It hands the host a complete
 /// response as data, which is what lets ordinary response middleware,
 /// transforms, and the bundle action contract see it. The older
 /// [`Self::Responded`] says only "I wrote something through host state",
-/// which no bundle runtime can express, and [`Self::Proxy`] is rejected
-/// outright by the current host action.
+/// which no bundle runtime can express and no host state a handler can
+/// reach actually does, and [`Self::Proxy`] is rejected outright by the
+/// current host action. Both are refused at dispatch.
 ///
 /// ```
 /// use sbproxy_plugin::ActionOutcome;
 ///
-/// // 0.2 style: still valid.
+/// // 0.2 style: still compiles, but carries no response for the host
+/// // to send, so dispatch refuses it with 501.
 /// let legacy = ActionOutcome::Responded;
 /// assert_eq!(legacy.response_status(), None);
 ///
@@ -64,8 +69,23 @@ pub enum ActionOutcome {
     Proxy,
     /// Legacy signal that the handler wrote a response through host state.
     ///
-    /// This variant carries no response bytes and is not part of the bundle
-    /// action contract. New implementations should return [`Self::Response`].
+    /// **Deprecated, and refused at dispatch.** The variant claims the
+    /// handler already wrote a response, but [`ActionHandler::handle`]
+    /// receives only the request and an opaque `&mut dyn Any`: no
+    /// session, no response writer, nothing that can put bytes on the
+    /// wire. Returning it therefore ends the request with no response of
+    /// its own.
+    ///
+    /// Every transport answers it with `501 Not Implemented` and the
+    /// stable [`UNSUPPORTED_ACTION_OUTCOME_CODE`] reason, so the outcome
+    /// is at least a complete, logged exchange rather than the empty one
+    /// HTTP/1.1 and HTTP/2 used to leave behind. It carries no response
+    /// bytes and is not part of the bundle action contract.
+    ///
+    /// Return [`Self::Response`] instead: it hands the host a complete
+    /// status, header list, and body as data. The variant is retained
+    /// only so a linked 0.2 plugin keeps compiling, and is scheduled for
+    /// removal at the next semver break of this crate.
     Responded,
     /// Handler supplied a complete response for ordinary response middleware.
     Response {

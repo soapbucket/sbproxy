@@ -397,6 +397,16 @@ fn any_value_to_string(value: &AnyValue) -> String {
         Some(any_value::Value::ArrayValue(v)) => format!("{:?}", v.values),
         Some(any_value::Value::KvlistValue(v)) => format!("{:?}", v.values),
         Some(any_value::Value::BytesValue(v)) => format!("{v:?}"),
+        // WOR-2549: OTLP's experimental string-table interning, added in
+        // the 0.32 proto. The value is an index into the request's
+        // shared string table, and this fixture holds no table to
+        // resolve it against. The exporter under test never emits one,
+        // so render it unambiguously: an assertion that starts seeing
+        // interned attributes has to fail loudly rather than compare
+        // against an empty string. The match stays exhaustive so the
+        // next proto variant is a compile error here, not a silently
+        // blank attribute.
+        Some(any_value::Value::StringValueStrindex(index)) => format!("<strindex:{index}>"),
         None => String::new(),
     }
 }

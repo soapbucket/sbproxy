@@ -1,8 +1,8 @@
 # AI race routing
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-27*
 
-Race strategy fans out the request to every eligible provider in parallel, returns the first 2xx response, and cancels the losers. Trade-off: race minimises p99 latency by always taking the fastest provider for any given request; the cost is N times the API spend (one paid completion per provider per request). The config below pairs it with `resilience.outlier_detection` so persistently failing providers are meant to fall out of the eligible set instead of being dialed forever, but as of this pass that does not hold in practice for race (see the SUSPECTED PRODUCT BUG note under "Try it"): a losing racer's outcome never reaches the circuit breaker or the outlier detector, so it keeps getting raced no matter how often it fails.
+Race strategy fans out the request to every eligible provider in parallel, returns the first 2xx response, and cancels the losers. Trade-off: race minimizes p99 latency by always taking the fastest provider for any given request; the cost is N times the API spend (one paid completion per provider per request). The config below pairs it with `resilience.outlier_detection` so persistently failing providers fall out of the eligible set instead of being dialed forever: every leg that settles feeds the circuit breaker, the outlier detector, and the per-error-class cooldown policy, so a provider that loses every race by failing is ejected and the fan-out shrinks.
 
 ## Run
 
@@ -48,29 +48,36 @@ curl -s http://127.0.0.1:8080/metrics | grep sbproxy_ai_provider
 # sbproxy_ai_provider_attempts_total{outcome="success",provider="openai"} 9
 ```
 
-**SUSPECTED PRODUCT BUG:** `resilience.outlier_detection` never ejects a
-provider from a race. The race dispatch loop in
-`crates/sbproxy-core/src/server/ai_dispatch.rs` (the `race_mode` block) only
-calls `sbproxy_observe::metrics::record_provider_attempt(...)` for a losing
-or erroring racer; it never calls `Router::record_provider_failure` /
-`record_provider_success`, which are the only entry points that feed the
-circuit breaker and the outlier detector. Repro: point `groq` at an invalid
-key so it errors on every attempt (well past `min_requests: 5` at 100% error
-rate, against `threshold: 0.5`) and send a batch of requests. `groq`'s
-attempt counter keeps climbing forever and neither an `"ai provider ejected
-by outlier detection"` nor an `"ai provider circuit breaker opened"` log line
-ever appears, confirmed over 11 consecutive failing attempts in this session.
-`Router::eligible_indices` (used elsewhere, e.g. by `forward_race` in
-`crates/sbproxy-ai/src/client.rs`, which does call `record_provider_failure`)
-never sees a race-mode failure to eject on, so the "pair with resilience"
-guidance in this example's config comments does not currently hold for the
-strategy actually reached by the HTTP server.
+Watch the ejection land. The detector counts a `5xx` and a transport error
+as the provider's failure and a `4xx` as the caller's, so an invalid key is
+the wrong lever: the vendor answers `401`, the attempt counter climbs under
+`outcome="error"`, and the provider still reads as healthy. Point the `groq`
+entry at something that cannot answer at all instead. Add these two keys to
+it, temporarily:
+
+```yaml
+        - name: groq
+          base_url: http://127.0.0.1:9/v1
+          allow_private_base_url: true
+```
+
+Port 9 is the discard port and nothing is listening on it, so every `groq`
+leg ends in a refused connection, which is a transport error and a provider
+failure. Send a batch of requests past `min_requests: 5` at a 100% error rate
+against `threshold: 0.5`, and an `"ai provider ejected by outlier detection"`
+line names `groq`; its attempt counter stops climbing and the fan-out drops to
+the two providers still eligible. Remove the two keys afterwards.
+
+A provider rate-limiting every request never reaches the outlier detector for
+the same reason: `429` is a `4xx`. `resilience.cooldown_policy:
+{ rate_limit: <seconds> }` is the axis that parks that one, and the race path
+feeds it from the same settled leg.
 
 ## What this exercises
 
 - `ai_proxy` action with `routing.strategy: race`
 - Three providers (OpenAI, Anthropic, Groq) racing in parallel; first 2xx wins, losers are cancelled
-- `resilience.outlier_detection` config accepted and parsed for a race origin, though ejection does not currently take effect on the race dispatch path (SUSPECTED PRODUCT BUG, see "Try it")
+- `resilience.outlier_detection` ejecting a persistently failing racer, so the fan-out shrinks instead of paying for a leg that always fails
 
 ## See also
 
