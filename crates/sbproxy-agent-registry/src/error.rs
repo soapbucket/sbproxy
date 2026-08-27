@@ -49,13 +49,22 @@ pub enum RegistryError {
         supported: u32,
     },
 
-    /// A registration named a slug that a rejection or revocation burned.
-    #[error("agent id {0} is not available")]
-    SlugBurned(String),
+    /// A submission repeated metadata a reviewer has already refused or
+    /// withdrawn. Terminal: the decision is durable and keyed on the
+    /// metadata fingerprint, so resubmitting the same description gets the
+    /// same answer forever rather than a fresh queue slot and a second
+    /// reviewer.
+    #[error("this registration was already {decision} as {agent_id} and cannot be resubmitted")]
+    MetadataBurned {
+        /// The registration that carries the decision.
+        agent_id: String,
+        /// What was decided. A fixed vocabulary, safe as a metric label.
+        decision: &'static str,
+    },
 
-    /// A registration repeated metadata already submitted inside the
-    /// duplicate-detection window.
-    #[error("a registration with identical metadata is already pending as {0}")]
+    /// A submission repeated metadata that is already live: an approved
+    /// agent, or another submission inside the duplicate-detection window.
+    #[error("a registration with identical metadata already exists as {0}")]
     DuplicateMetadata(String),
 
     /// No registration under that id.
@@ -98,7 +107,7 @@ impl RegistryError {
             Self::UnknownKey(_) => "unknown_key",
             Self::FeedExpired { .. } => "expired",
             Self::UnsupportedFormatVersion { .. } => "unsupported_version",
-            Self::SlugBurned(_) => "burned",
+            Self::MetadataBurned { .. } => "burned",
             Self::DuplicateMetadata(_) => "duplicate",
             Self::NotFound(_) => "not_found",
             Self::Unauthorized => "unauthorized",
@@ -117,7 +126,7 @@ impl RegistryError {
             | Self::FeedExpired { .. }
             | Self::UnsupportedFormatVersion { .. } => 400,
             Self::Unauthorized => 401,
-            Self::SlugBurned(_) | Self::DuplicateMetadata(_) | Self::Conflict(_) => 409,
+            Self::MetadataBurned { .. } | Self::DuplicateMetadata(_) | Self::Conflict(_) => 409,
             Self::NotFound(_) => 404,
             Self::InvalidTransition { .. } => 422,
             Self::Backend(_) => 500,
@@ -149,7 +158,14 @@ mod tests {
                 400,
             ),
             (RegistryError::Signature("bad".into()), "bad_signature", 400),
-            (RegistryError::SlugBurned("acme-1".into()), "burned", 409),
+            (
+                RegistryError::MetadataBurned {
+                    agent_id: "acme-1".into(),
+                    decision: "rejected",
+                },
+                "burned",
+                409,
+            ),
             (
                 RegistryError::DuplicateMetadata("acme-1".into()),
                 "duplicate",

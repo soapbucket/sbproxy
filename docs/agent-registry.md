@@ -53,15 +53,33 @@ flowchart LR
     D -- no --> M[mint slug, client id,<br/>secret, access token]
     M --> P[pending]
     P -->|operator approves| A[approved]
-    P -->|operator rejects| X[rejected, slug burned]
-    A -->|operator revokes| Z[revoked, slug burned]
+    P -->|operator rejects| X[rejected, description refused for good]
+    A -->|operator revokes| Z[revoked, description refused for good]
     A -->|agent rotates| A
 ```
 
 `pending`, `approved`, `rejected`, and `revoked` are the whole set.
-`rejected` and `revoked` are terminal and burn the slug: the same agent id
-can never be issued again, so a submitter cannot resubmit under the same
-name until a different reviewer says yes.
+
+`rejected` and `revoked` are terminal, and the decision is durable and
+keyed on the *description*, not on the minted id. Resubmitting metadata a
+reviewer has already refused or withdrawn returns their answer rather than a
+fresh queue slot, so a submitter cannot shop the same description around
+until a different reviewer says yes:
+
+```json
+{"error":"this registration was already rejected as acme-research-labs-01J8ZK... and cannot be resubmitted","code":"burned"}
+```
+
+`approved` is durable in the same index for a different reason: an approved
+agent's description cannot become a *second* agent with its own client id
+and secret, because revoking one of the pair would leave the other live and
+revocation would stop being the control it is documented as. Resubmitting
+an approved description answers `409 duplicate`.
+
+Keying on the description rather than on the id is what makes any of this
+reachable. The id is `<vendor-slug>-<ULID>`, minted fresh on every
+submission, so it is never the thing a resubmission reuses. Change the
+description and it is a new question, which is accepted.
 
 ### Submitting
 
@@ -117,10 +135,15 @@ agent:
 
 Array order does not matter to that check: the fingerprint is a SHA-256 over
 the RFC 8785 canonical form of the metadata with its arrays sorted, so a
-retry with the fields shuffled is still recognized as a retry. Once a
-reviewer has decided the first submission, the window no longer refuses a
-resubmission, because the question has been answered and a new one is a new
-question.
+retry with the fields shuffled is still recognized as a retry.
+
+The window and the durable index answer different questions, and the split
+is deliberate. The index owns every *decided* description, forever. The
+window owns exactly the case the index does not: a submission nobody has
+decided yet. A pending submission a reviewer never gets to should not block
+its submitter permanently, so it expires after `duplicate_window_secs` and a
+resubmission then takes a fresh slot. A submission a reviewer *has* decided
+is the index's answer, and the window is not consulted for it.
 
 ### Deciding
 
@@ -134,7 +157,7 @@ curl -s -u admin:admin -X POST \
   http://127.0.0.1:9090/admin/agent-registry/registrations/$AGENT_ID/approve \
   -H 'Content-Type: application/json' -d '{"reason":"contact page checks out"}'
 
-# Reject. The reason is required, because a burned slug needs an explanation.
+# Reject. The reason is required: it refuses this description for good.
 curl -s -u admin:admin -X POST \
   http://127.0.0.1:9090/admin/agent-registry/registrations/$AGENT_ID/reject \
   -H 'Content-Type: application/json' -d '{"reason":"contact url 404s"}'

@@ -57,8 +57,9 @@
 #     http://127.0.0.1:9090/admin/agent-registry/registrations/$AGENT_ID/approve \
 #     -H 'Content-Type: application/json' -d '{"reason":"contact page checks out"}' | jq
 #
-# Or refuse it, which burns the slug permanently so the same name cannot be
-# resubmitted until a different reviewer says yes. A reason is required:
+# Or refuse it. The decision is durable and keyed on the description, so
+# resubmitting the same metadata returns this answer rather than a fresh
+# queue slot for a different reviewer. A reason is required:
 #   curl -s -u admin:admin -X POST \
 #     http://127.0.0.1:9090/admin/agent-registry/registrations/$AGENT_ID/reject \
 #     -H 'Content-Type: application/json' -d '{"reason":"contact url 404s"}' | jq

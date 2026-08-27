@@ -229,7 +229,7 @@ to see one was a curl against the admin API.
 - **Mutations:** `POST /admin/agent-registry/registrations/{agent_id}/approve`,
   `.../reject`, `.../revoke`, and `POST /admin/agent-registry/refresh` to
   reverify the feed on disk. The reject button stays disabled until a reason
-  is typed, because a rejection burns the agent id permanently.
+  is typed, because a rejection refuses that description for good.
 - **Empty/error notes:** every route answers `404` when
   `proxy.agent_registry` is absent or disabled, and the page renders that as
   "not configured" rather than as an error. A configured registry with no

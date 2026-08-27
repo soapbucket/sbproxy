@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "A rejected or revoked agent registration is now refused for good: the decision is stored durably against the metadata fingerprint, so an identical resubmission gets the reviewer answer back instead of a fresh queue slot, and an approved description cannot become a second agent with its own credentials."
+}

@@ -201,8 +201,8 @@ async function refreshFeed() {
                   :disabled="busy === row.agent_id || !reasons[row.agent_id]?.trim()"
                   :title="
                     reasons[row.agent_id]?.trim()
-                      ? 'Reject permanently. The agent id is burned.'
-                      : 'A rejection needs a reason: it burns the agent id permanently.'
+                      ? 'Reject permanently. This description cannot be resubmitted.'
+                      : 'A rejection needs a reason: it refuses this description for good.'
                   "
                   @click="decide(row, 'reject')"
                 >

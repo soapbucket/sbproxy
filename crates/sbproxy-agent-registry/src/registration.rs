@@ -8,9 +8,11 @@
 //! and a registration access token, stores Argon2id hashes of the two
 //! secrets, and parks the record in `Pending`. An operator approves or
 //! rejects it. Approval is what makes the agent eligible to appear in a
-//! published catalog; rejection and revocation burn the slug permanently, so
-//! a rejected submitter cannot resubmit under the same name and get a
-//! different answer from a different reviewer.
+//! published catalog. A reviewer's decision is durable and is stored
+//! against the fingerprint of the description they decided about, so a
+//! rejected submitter cannot resubmit the same description and get a
+//! different answer from a different reviewer, and an approved agent's
+//! description cannot become a second agent with its own credentials.
 //!
 //! # Which store holds what, and why it matters
 //!
@@ -207,7 +209,7 @@ pub enum ApprovalState {
     Pending,
     /// A reviewer approved it.
     Approved,
-    /// A reviewer refused it. Terminal, and the slug stays burned.
+    /// A reviewer refused it. Terminal, and the description stays refused.
     Rejected,
     /// An approved registration was later withdrawn. Terminal, and the slug
     /// stays burned.
@@ -248,6 +250,17 @@ struct RegistrationRecord {
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     rotated_at: Option<DateTime<Utc>>,
+}
+
+/// One decided metadata fingerprint, and what was decided about it.
+///
+/// Keyed on the fingerprint rather than on the slug, because the slug is
+/// minted fresh on every submission and is therefore never what a
+/// resubmission reuses.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MetadataIndexEntry {
+    agent_id: String,
+    state: ApprovalState,
 }
 
 /// What every read path returns.
@@ -449,7 +462,7 @@ pub struct RegistrationQueue {
     store: Arc<dyn PersistentKv>,
     dedup: Arc<dyn EphemeralKv>,
     registrations: KvNamespace,
-    burned: KvNamespace,
+    metadata_index: KvNamespace,
     dedup_window: KvNamespace,
     duplicate_window: Duration,
     rotation_grace: Duration,
@@ -471,11 +484,16 @@ struct DecisionRequest<'a> {
 impl RegistrationQueue {
     /// Namespace holding one JSON record per registration.
     const REGISTRATIONS: &'static str = "agent_registrations";
-    /// Namespace holding one marker per burned slug. Separate from the
-    /// records so a burn survives any future record compaction, and so the
-    /// "is this slug available" question is one point lookup rather than a
-    /// scan of every terminal record.
-    const BURNED: &'static str = "agent_slugs_burned";
+    /// Namespace holding one entry per decided metadata fingerprint,
+    /// keyed on the fingerprint rather than on the minted slug.
+    ///
+    /// The slug is `<vendor>-<ULID>`, freshly minted on every submission,
+    /// so a slug is never the thing a resubmission reuses and a burn keyed
+    /// on one can never fire. The fingerprint is: a submitter who sends
+    /// the same description twice produces the same hash both times, which
+    /// is what makes this the reachable half of the enterprise queue's two
+    /// durable replay checks.
+    const METADATA_INDEX: &'static str = "agent_metadata_index";
     /// Namespace holding the duplicate-detection window.
     const DEDUP: &'static str = "agent_registration_dedup";
 
@@ -493,7 +511,7 @@ impl RegistrationQueue {
             store,
             dedup,
             registrations: namespace(Self::REGISTRATIONS)?,
-            burned: namespace(Self::BURNED)?,
+            metadata_index: namespace(Self::METADATA_INDEX)?,
             dedup_window: namespace(Self::DEDUP)?,
             duplicate_window,
             rotation_grace,
@@ -541,29 +559,67 @@ impl RegistrationQueue {
         }
     }
 
-    async fn burn(&self, agent_id: &str) -> Result<()> {
+    /// Record what a reviewer decided about this metadata, keyed on the
+    /// fingerprint, so the decision outlives the record's own key and the
+    /// process.
+    async fn index_decision(&self, record: &RegistrationRecord) -> Result<()> {
+        let entry = MetadataIndexEntry {
+            agent_id: record.agent_id.clone(),
+            state: record.state,
+        };
+        let bytes = serde_json::to_vec(&entry).map_err(|error| {
+            RegistryError::Backend(format!("could not encode metadata index entry: {error}"))
+        })?;
         self.store
-            .put(&self.burned, agent_id, b"1")
+            .put(&self.metadata_index, &record.metadata_hash, &bytes)
             .await
             .map(|_| ())
             .map_err(|error| RegistryError::Backend(error.to_string()))
     }
 
-    async fn is_burned(&self, agent_id: &str) -> Result<bool> {
-        Ok(self
+    /// What a reviewer has already decided about this metadata, if
+    /// anything.
+    async fn indexed_decision(&self, fingerprint: &str) -> Result<Option<MetadataIndexEntry>> {
+        let Some(entry) = self
             .store
-            .get(&self.burned, agent_id)
+            .get(&self.metadata_index, fingerprint)
             .await
             .map_err(|error| RegistryError::Backend(error.to_string()))?
-            .is_some())
+        else {
+            return Ok(None);
+        };
+        serde_json::from_slice(&entry.value)
+            .map(Some)
+            .map_err(|error| {
+                RegistryError::Backend(format!(
+                    "stored metadata index entry is unreadable: {error}"
+                ))
+            })
     }
 
     /// Accept a submission into the queue.
     ///
-    /// The order is validate, fingerprint, check the window, mint, insert.
-    /// Minting after the window check means a recognized retry costs no
-    /// Argon2id work and produces no new slug, which is what makes the
-    /// window worth having.
+    /// The order is validate, fingerprint, check both replay guards, mint,
+    /// insert. Minting after the checks means a recognized retry costs no
+    /// Argon2id work and produces no new slug.
+    ///
+    /// # Two replay guards, and the different questions they answer
+    ///
+    /// The durable one is the metadata index. A reviewer's decision is
+    /// stored against the fingerprint of what they decided about, so
+    /// resubmitting an identical description gets the reviewer's answer
+    /// back rather than a fresh queue slot: a rejection or a revocation is
+    /// terminal, and an approved agent's description cannot become a
+    /// second agent with its own credentials. That is the enterprise
+    /// queue's durable half, which this port originally kept the shape of
+    /// and dropped the query.
+    ///
+    /// The ephemeral one is the window, and it owns exactly one case the
+    /// index does not: a submission nobody has decided yet. Keeping that
+    /// case out of the durable index is deliberate. A pending submission
+    /// that a reviewer never gets to should not block its submitter
+    /// forever, so it expires after `duplicate_window_secs` and a
+    /// resubmission then takes a fresh slot.
     pub async fn register(
         &self,
         metadata: AgentMetadata,
@@ -572,6 +628,25 @@ impl RegistrationQueue {
         metadata.validate()?;
         let fingerprint = metadata_fingerprint(&metadata)?;
 
+        if let Some(decided) = self.indexed_decision(&fingerprint).await? {
+            match decided.state {
+                ApprovalState::Rejected | ApprovalState::Revoked => {
+                    return Err(RegistryError::MetadataBurned {
+                        agent_id: decided.agent_id,
+                        decision: decided.state.as_str(),
+                    })
+                }
+                ApprovalState::Approved => {
+                    return Err(RegistryError::DuplicateMetadata(decided.agent_id))
+                }
+                // An indexed Pending entry cannot occur: only a decision
+                // writes the index. Treated as no decision rather than as a
+                // refusal, so a future writer that broadens the index does
+                // not silently become a permanent block.
+                ApprovalState::Pending => {}
+            }
+        }
+
         if let Some(existing) = self
             .dedup
             .get(&self.dedup_window, &fingerprint)
@@ -579,10 +654,10 @@ impl RegistrationQueue {
             .map_err(|error| RegistryError::Backend(error.to_string()))?
         {
             let agent_id = String::from_utf8_lossy(&existing).to_string();
-            // A window entry that outlived its record, or that names a
-            // registration a reviewer has already decided, is stale rather
-            // than a duplicate: fall through and let the resubmission take
-            // a fresh slot.
+            // A window entry that outlived its record is stale rather than
+            // a duplicate: fall through and let the resubmission take a
+            // fresh slot. A decided record is the index's business, not
+            // this one's, and the index was already consulted above.
             if let Ok((record, _)) = self.load(&agent_id).await {
                 if record.state == ApprovalState::Pending {
                     return Err(RegistryError::DuplicateMetadata(agent_id));
@@ -591,12 +666,6 @@ impl RegistrationQueue {
         }
 
         let agent_id = mint_agent_id(&metadata.vendor);
-        if self.is_burned(&agent_id).await? {
-            // A ULID collision is not reachable in practice; refusing is
-            // still the right answer, because minting a second slug here
-            // would mean a burned name could be reissued by retrying.
-            return Err(RegistryError::SlugBurned(agent_id));
-        }
 
         let client_secret = mint_secret(CLIENT_SECRET_PREFIX);
         let registration_access_token = mint_secret(REGISTRATION_ACCESS_TOKEN_PREFIX);
@@ -692,9 +761,10 @@ impl RegistrationQueue {
     ///
     /// The three decisions differ only in the four fields of
     /// [`DecisionRequest`], so they share one implementation: the read, the
-    /// legality check, the compare-and-swap write, and the burn are the same
-    /// four steps in the same order every time, and a copy per decision is
-    /// where a missing burn or a missing legality check comes from.
+    /// legality check, the compare-and-swap write, and the index write are
+    /// the same four steps in the same order every time, and a copy per
+    /// decision is where a missing index write or a missing legality check
+    /// comes from.
     async fn decide(&self, request: DecisionRequest<'_>) -> Result<RegistrationView> {
         if let Some(reason) = request.reason.as_deref() {
             bounded("reason", reason, 0, MAX_REASON_BYTES)?;
@@ -711,9 +781,11 @@ impl RegistrationQueue {
         record.decided_by = request.decided_by;
         record.updated_at = request.now;
         self.store_if_unchanged(&record, revision).await?;
-        if request.target.is_terminal() {
-            self.burn(request.agent_id).await?;
-        }
+        // Every decision is indexed, not only the terminal ones: an
+        // approval has to stop the same description becoming a second
+        // agent with its own credentials, which is the case the enterprise
+        // queue refused with `Pending | Approved` and this port dropped.
+        self.index_decision(&record).await?;
         Ok(RegistrationView::from(&record))
     }
 
@@ -737,7 +809,7 @@ impl RegistrationQueue {
         .await
     }
 
-    /// Reject a pending registration. The slug is burned.
+    /// Reject a pending registration. The description is refused for good.
     pub async fn reject(
         &self,
         agent_id: &str,
@@ -757,7 +829,7 @@ impl RegistrationQueue {
         .await
     }
 
-    /// Revoke a registration. The slug is burned.
+    /// Revoke a registration. The description is refused for good.
     pub async fn revoke(
         &self,
         agent_id: &str,
@@ -1028,33 +1100,63 @@ mod tests {
             other => panic!("expected a duplicate refusal, got {other:?}"),
         }
 
-        // Once a reviewer has decided the first one, the window entry names
-        // a settled registration and a resubmission is a new question.
+        // The window owns only the undecided case. Once a reviewer has
+        // decided, the durable index owns the answer, and it is the same
+        // answer forever.
         queue
             .reject(&first.agent_id, "not a real crawler".into(), None, now())
             .await
             .expect("reject");
-        let (second, _) = queue
-            .register(metadata(), now())
+        assert!(matches!(
+            queue.register(metadata(), now()).await,
+            Err(RegistryError::MetadataBurned { .. })
+        ));
+
+        // A submission nobody ever decided expires out of the window, so a
+        // submitter is not blocked forever by a queue entry a reviewer
+        // never reached.
+        let mut fresh = metadata();
+        fresh.vendor = "Globex".into();
+        let short = RegistrationQueue::new(
+            Arc::new(EmbeddedKvStore::open(temp_path(), "agent_registry").expect("store")),
+            Arc::new(MemoryKv::new("agent_registry")),
+            Duration::milliseconds(30),
+            Duration::days(30),
+        )
+        .expect("queue");
+        let (pending, _) = short.register(fresh.clone(), now()).await.expect("first");
+        assert!(matches!(
+            short.register(fresh.clone(), now()).await,
+            Err(RegistryError::DuplicateMetadata(_))
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        let (second, _) = short
+            .register(fresh, now())
             .await
-            .expect("resubmission after a decision");
-        assert_ne!(second.agent_id, first.agent_id);
+            .expect("an undecided submission expires out of the window");
+        assert_ne!(second.agent_id, pending.agent_id);
 
         std::fs::remove_file(&path).ok();
     }
 
-    /// A rejection is final and the slug stays burned, so a submitter
-    /// cannot shop the same name around until a different reviewer says
-    /// yes.
+    /// A rejection is final for that description. This is the durable half
+    /// of the enterprise queue's replay protection, and the port had
+    /// dropped it: the slug burn it shipped instead was keyed on a
+    /// freshly minted ULID and could never fire, so a rejected submitter
+    /// could re-POST byte-identical metadata and land a second pending row
+    /// for a different reviewer to approve.
     #[tokio::test]
-    async fn a_rejection_is_terminal_and_burns_the_slug() {
+    async fn a_rejected_description_cannot_be_resubmitted() {
         let path = temp_path();
-        let queue = queue(&path);
-        let (secrets, _) = queue.register(metadata(), now()).await.expect("register");
+        let first_boot = queue(&path);
+        let (first, _) = first_boot
+            .register(metadata(), now())
+            .await
+            .expect("register");
 
-        queue
+        first_boot
             .reject(
-                &secrets.agent_id,
+                &first.agent_id,
                 "unverifiable".into(),
                 Some("casey".into()),
                 now(),
@@ -1062,13 +1164,84 @@ mod tests {
             .await
             .expect("reject");
 
-        assert!(
-            queue
-                .is_burned(&secrets.agent_id)
-                .await
-                .expect("burn check"),
-            "a rejected slug is burned"
-        );
+        match first_boot.register(metadata(), now()).await {
+            Err(RegistryError::MetadataBurned { agent_id, decision }) => {
+                assert_eq!(agent_id, first.agent_id);
+                assert_eq!(decision, "rejected");
+            }
+            other => panic!("a rejected description must stay rejected, got {other:?}"),
+        }
+
+        // The refusal survives a restart, which is the whole point of it
+        // being durable rather than a one-hour window.
+        drop(first_boot);
+        let reopened = queue(&path);
+        assert!(matches!(
+            reopened.register(metadata(), now()).await,
+            Err(RegistryError::MetadataBurned { .. })
+        ));
+
+        // A different description from the same vendor is a different
+        // question and is still accepted.
+        let mut other = metadata();
+        other.expected_user_agents = vec!["AcmeBot/2.0".into()];
+        assert!(reopened.register(other, now()).await.is_ok());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// An approved agent's description cannot become a second agent with
+    /// its own credentials. Without this, revoking one of the pair leaves
+    /// the other live and revocation stops being the control it is
+    /// documented as.
+    #[tokio::test]
+    async fn an_approved_description_cannot_be_registered_twice() {
+        let path = temp_path();
+        let queue = queue(&path);
+        let (first, _) = queue.register(metadata(), now()).await.expect("register");
+        queue
+            .approve(&first.agent_id, None, Some("casey".into()), now())
+            .await
+            .expect("approve");
+
+        match queue.register(metadata(), now()).await {
+            Err(RegistryError::DuplicateMetadata(agent_id)) => {
+                assert_eq!(agent_id, first.agent_id);
+            }
+            other => panic!("an approved description must not be registered twice, got {other:?}"),
+        }
+
+        // Revoking it does not reopen the description either: a withdrawn
+        // agent's operator does not get to re-onboard the same one by
+        // resubmitting.
+        queue
+            .revoke(&first.agent_id, Some("key compromised".into()), None, now())
+            .await
+            .expect("revoke");
+        assert!(matches!(
+            queue.register(metadata(), now()).await,
+            Err(RegistryError::MetadataBurned {
+                decision: "revoked",
+                ..
+            })
+        ));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The state machine's own transitions, kept separate from the replay
+    /// guards above.
+    #[tokio::test]
+    async fn a_terminal_registration_refuses_every_further_transition() {
+        let path = temp_path();
+        let queue = queue(&path);
+        let (secrets, _) = queue.register(metadata(), now()).await.expect("register");
+
+        queue
+            .reject(&secrets.agent_id, "unverifiable".into(), None, now())
+            .await
+            .expect("reject");
+
         assert!(matches!(
             queue.approve(&secrets.agent_id, None, None, now()).await,
             Err(RegistryError::InvalidTransition {
