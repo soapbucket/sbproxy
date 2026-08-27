@@ -678,13 +678,27 @@ pub fn datadog_log_body(event: &LlmUsageEvent, service: &str) -> serde_json::Val
 }
 
 /// A sink that POSTs each event to Langfuse's ingestion API, fire-and-forget.
-#[derive(Debug)]
 pub struct LangfuseSink {
     url: String,
     public_key: String,
     secret_key: String,
     client: reqwest::Client,
     egress: Option<EgressAuthorizer>,
+}
+
+/// Redacted `Debug` (WOR-2640). The Langfuse secret key is half of a
+/// basic-auth pair that writes into the operator's observability
+/// account, and a sink whose POST fails is exactly what gets formatted
+/// into a warning. The public key and the URL stay: they name which
+/// project the sink is pointed at and neither authenticates on its own.
+impl std::fmt::Debug for LangfuseSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LangfuseSink")
+            .field("url", &self.url)
+            .field("public_key", &self.public_key)
+            .field("secret_key", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
 }
 
 impl LangfuseSink {
@@ -800,13 +814,26 @@ impl UsageSink for LangfuseSink {
 }
 
 /// A sink that POSTs each event to Datadog's logs-intake API, fire-and-forget.
-#[derive(Debug)]
 pub struct DatadogSink {
     url: String,
     api_key: String,
     service: String,
     client: reqwest::Client,
     egress: Option<EgressAuthorizer>,
+}
+
+/// Redacted `Debug` (WOR-2640). A Datadog API key writes into the
+/// operator's account and is accepted on its own; see
+/// [`LangfuseSink`]'s `Debug` for the same reasoning. The site URL and
+/// the service tag stay.
+impl std::fmt::Debug for DatadogSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatadogSink")
+            .field("url", &self.url)
+            .field("api_key", &"[REDACTED]")
+            .field("service", &self.service)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DatadogSink {
@@ -2532,5 +2559,35 @@ mod tests {
 
         let written = std::fs::read_to_string(&path).expect("read the feed");
         assert_eq!(written.lines().count(), 2, "both events were appended");
+    }
+
+    /// WOR-2640: both usage sinks hold a write credential for the
+    /// operator's observability account, and a sink whose POST fails is
+    /// exactly what gets formatted into a warning.
+    #[test]
+    fn debug_never_renders_a_usage_sink_credential() {
+        const SENTINEL: &str = "SENTINEL-SECRET-9f3a";
+
+        let langfuse = LangfuseSink::new("https://cloud.langfuse.com", "pk-public", SENTINEL);
+        let rendered = format!("{langfuse:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the Langfuse secret key reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("pk-public"),
+            "the public key must survive so the project is nameable: {rendered}"
+        );
+
+        let datadog = DatadogSink::new("datadoghq.com", SENTINEL, "sbproxy");
+        let rendered = format!("{datadog:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the Datadog API key reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("sbproxy"),
+            "the service tag must survive: {rendered}"
+        );
     }
 }

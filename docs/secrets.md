@@ -468,6 +468,37 @@ the request is rejected. Peppered hashes still print: they are what
 correlates a mint with the record it produced, and they are not
 credentials.
 
+It covers every credential SBproxy holds, not only the ones a secret
+backend supplies. The same redaction applies to the keys a caller
+presents inbound (API keys, bearer tokens, Basic and Digest passwords,
+the JWT HMAC secret), to the credentials SBproxy presents upstream (an
+AI provider's API key, an OAuth client secret, a vault-resolved bearer
+token, a usage sink's write key), to the session material the proxy
+issues itself (the OIDC client and cookie secrets, a stored refresh
+token, the admin session signing key), and to the keys whose disclosure
+forges what they sign (the CSRF token key, the crawl ledger's HMAC key,
+a mesh enrollment token). The operator-facing config types are covered
+alongside their runtime twins, because a config-load diagnostic is the
+likelier of the two to reach a log.
+
+Two shapes are deliberate rather than incidental. An `Option` field
+renders as present-but-redacted or as absent, because "no credential
+configured" and "wrong credential configured" produce the same 401 and
+are different things to fix. And a key's *length* is printed where the
+key is raw bytes: a key of the wrong length is a common
+misconfiguration, a trailing newline in a key file being the usual
+cause, and the length discloses nothing an attacker cannot infer from
+the algorithm.
+
+The set is enforced rather than remembered.
+`scripts/secret-debug-registry.txt` lists every protected type, and a
+CI guard refuses a tree where one of them has regained a derived
+`Debug`, lost its redacting implementation, or lost the test that
+pushes a sentinel through it. What the guard cannot see, and this is
+worth knowing rather than assuming: a *new* credential-bearing type
+that never gets a registry line. Adding the line is part of adding the
+type.
+
 ## Related Reading
 
 * `docs/configuration.md` for the `proxy.secrets` block and reference URI grammar.

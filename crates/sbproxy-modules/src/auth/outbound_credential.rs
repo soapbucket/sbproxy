@@ -63,7 +63,7 @@ pub enum OutboundCredentialConfig {
 }
 
 /// RFC 8693 token-exchange settings.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct TokenExchangeConfig {
     /// Token endpoint that performs the exchange.
     pub token_endpoint: String,
@@ -100,7 +100,7 @@ pub struct TokenExchangeConfig {
 }
 
 /// OAuth 2.0 client-credentials settings.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ClientCredentialsConfig {
     /// Token endpoint that issues the client-credentials token.
     pub token_endpoint: String,
@@ -120,7 +120,7 @@ pub struct ClientCredentialsConfig {
 }
 
 /// Static vault-resolved secret settings.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct VaultSecretConfig {
     /// Vault reference (or literal) for the secret.
     pub secret: String,
@@ -134,6 +134,63 @@ pub struct VaultSecretConfig {
     /// Optional RFC 9449 sender constraint for a pre-issued access token.
     #[serde(default)]
     pub dpop: Option<DpopOutboundConfig>,
+}
+
+/// Redacted `Debug` for the three outbound credential shapes
+/// (WOR-2640).
+///
+/// Each field doc above calls its secret "a vault reference", and each
+/// is one right up until the resolver pass runs. After that the struct
+/// holds the resolved value, and these are the structs a failed token
+/// exchange formats into an `anyhow` chain. Endpoints, client ids,
+/// audiences and scopes stay: they are what tells one misconfigured
+/// upstream from another, and none of them authenticates anything.
+impl std::fmt::Debug for TokenExchangeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenExchangeConfig")
+            .field("token_endpoint", &self.token_endpoint)
+            .field("audience", &self.audience)
+            .field("scope", &self.scope)
+            .field("subject_token_issuers", &self.subject_token_issuers)
+            .field("allowed_audiences", &self.allowed_audiences)
+            .field("act_depth_cap", &self.act_depth_cap)
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("dpop", &self.dpop)
+            .finish()
+    }
+}
+
+/// See [`TokenExchangeConfig`]'s `Debug` for the reasoning.
+impl std::fmt::Debug for ClientCredentialsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientCredentialsConfig")
+            .field("token_endpoint", &self.token_endpoint)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[REDACTED]")
+            .field("scope", &self.scope)
+            .field("audience", &self.audience)
+            .field("dpop", &self.dpop)
+            .finish()
+    }
+}
+
+/// See [`TokenExchangeConfig`]'s `Debug` for the reasoning. Here the
+/// secret is presented directly on the wire under `header` and
+/// `scheme`, both of which stay: which header a credential went out on
+/// is the question an operator asks when the upstream refuses it.
+impl std::fmt::Debug for VaultSecretConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultSecretConfig")
+            .field("secret", &"[REDACTED]")
+            .field("header", &self.header)
+            .field("scheme", &self.scheme)
+            .field("dpop", &self.dpop)
+            .finish()
+    }
 }
 
 impl OutboundCredentialConfig {
@@ -1683,5 +1740,65 @@ mod tests {
             .expect("validation must not dereference the key");
         let error = cfg.resolve_runtime_secret_refs().unwrap_err();
         assert!(format!("{error:#}").contains("failed to read secret file"));
+    }
+
+    /// WOR-2640: the three outbound credential shapes each hold a
+    /// resolved secret by the time anything formats them, and a failed
+    /// token exchange is what formats them.
+    #[test]
+    fn debug_never_renders_an_outbound_credential() {
+        const SENTINEL: &str = "SENTINEL-SECRET-9f3a";
+
+        let exchange = TokenExchangeConfig {
+            token_endpoint: "https://idp.example.com/token".to_string(),
+            audience: "https://api.example.com".to_string(),
+            scope: None,
+            subject_token_issuers: Vec::new(),
+            allowed_audiences: Vec::new(),
+            act_depth_cap: 4,
+            client_id: Some("client-1".to_string()),
+            client_secret: Some(SENTINEL.to_string()),
+            dpop: None,
+        };
+        let rendered = format!("{exchange:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the exchange client secret reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("client-1") && rendered.contains("https://idp.example.com/token"),
+            "the client id and endpoint must survive: {rendered}"
+        );
+
+        let client_credentials = ClientCredentialsConfig {
+            token_endpoint: "https://idp.example.com/token".to_string(),
+            client_id: "client-2".to_string(),
+            client_secret: SENTINEL.to_string(),
+            scope: None,
+            audience: None,
+            dpop: None,
+        };
+        let rendered = format!("{client_credentials:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the client-credentials secret reached Debug: {rendered}"
+        );
+        assert!(rendered.contains("client-2"), "the client id must survive");
+
+        let vault_secret = VaultSecretConfig {
+            secret: SENTINEL.to_string(),
+            header: "authorization".to_string(),
+            scheme: "Bearer".to_string(),
+            dpop: None,
+        };
+        let rendered = format!("{vault_secret:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the vault secret reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("authorization"),
+            "the header must survive so a refused upstream is diagnosable: {rendered}"
+        );
     }
 }

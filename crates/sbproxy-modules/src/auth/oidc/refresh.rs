@@ -83,7 +83,7 @@ pub fn should_refresh_now(now: u64, access_token_exp: u64, skew_secs: u64) -> bo
 /// omitted the OP is implying the access token has no fixed expiry
 /// (a long-lived opaque token), in which case the caller should use
 /// the configured `session_ttl_secs` instead.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, PartialEq, Eq)]
 pub struct RefreshTokenResponse {
     /// Fresh access token. REQUIRED per RFC 6749 §5.1.
     pub access_token: String,
@@ -109,6 +109,30 @@ pub struct RefreshTokenResponse {
     /// the original grant.
     #[serde(default)]
     pub scope: Option<String>,
+}
+
+/// Redacted `Debug` (WOR-2640). Every token in an OP's refresh
+/// response is a bearer credential: the access token authorizes calls
+/// upstream, the rotated refresh token mints more access tokens, and
+/// the ID token is a signed assertion of who the user is. A refresh
+/// that fails is exactly when something formats this, and an `anyhow`
+/// context around a deserialize error is one hop from the admin log.
+///
+/// `token_type` and `expires_in` stay: neither authenticates anything
+/// and both are what explain a refresh that succeeded and then did not
+/// help.
+impl std::fmt::Debug for RefreshTokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefreshTokenResponse")
+            .field("access_token", &"[REDACTED]")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Parse a token-endpoint refresh response into the typed struct.
@@ -303,5 +327,29 @@ mod tests {
             scope: None,
         };
         assert_eq!(pick_next_refresh_token("rt-OLD", &r), "rt-OLD");
+    }
+
+    /// WOR-2640: every token in an OP's refresh response is a bearer
+    /// credential, and a refresh that fails is what formats this.
+    #[test]
+    fn debug_never_renders_a_refreshed_token() {
+        const SENTINEL: &str = "SENTINEL-SECRET-9f3a";
+        let response = RefreshTokenResponse {
+            access_token: SENTINEL.to_string(),
+            refresh_token: Some(format!("{SENTINEL}-refresh")),
+            token_type: Some("Bearer".to_string()),
+            expires_in: Some(3600),
+            scope: None,
+            id_token: Some(format!("{SENTINEL}-id")),
+        };
+        let rendered = format!("{response:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "a refreshed token reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("Bearer") && rendered.contains("3600"),
+            "the type and lifetime must survive: {rendered}"
+        );
     }
 }

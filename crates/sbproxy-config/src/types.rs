@@ -1568,11 +1568,24 @@ pub struct AiToolkitAgentConfig {
 }
 
 /// Agent authentication configuration retained as an unresolved reference.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AiToolkitAgentAuthConfig {
     /// Secret reference used to derive the agent bearer credential.
     pub shared_secret: String,
+}
+
+/// Redacted `Debug` (WOR-2640). The config-side twin of the toolkit
+/// agent input this change's first half protected. The field doc calls
+/// it a secret reference, and it is one until the resolver pass
+/// substitutes the real value into it; after that this struct holds
+/// the bearer credential the proxy presents to the agent.
+impl std::fmt::Debug for AiToolkitAgentAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AiToolkitAgentAuthConfig")
+            .field("shared_secret", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// One discoverable agent capability and its request/response schemas.
@@ -6023,7 +6036,7 @@ pub struct MessengerSettings {
 // --- Admin Config ---
 
 /// Configuration for the embedded read-only admin/stats API server.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AdminConfig {
     /// Whether the admin server is enabled. Defaults to false.
@@ -6094,6 +6107,36 @@ pub struct AdminConfig {
     /// read-only or admin identity that logs in with its own credentials.
     #[serde(default)]
     pub operators: Vec<AdminOperator>,
+}
+
+/// Redacted `Debug` (WOR-2640). `password` is the HTTP Basic password
+/// for the admin API, in plaintext, and its default is `changeme`,
+/// which is exactly the value most likely to still be in place when
+/// something formats this struct into a config-load diagnostic. The
+/// username stays, along with every listener and policy field: those
+/// are what an operator debugging a refused admin request needs, and
+/// none of them authenticates anything.
+///
+/// Curated rather than exhaustive, ending `finish_non_exhaustive`, so
+/// a credential-shaped field added to this block later is absent from
+/// the output rather than printed.
+impl std::fmt::Debug for AdminConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminConfig")
+            .field("enabled", &self.enabled)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("max_log_entries", &self.max_log_entries)
+            .field("rate_limit_per_minute", &self.rate_limit_per_minute)
+            .field("prompt_persistence_path", &self.prompt_persistence_path)
+            .field("trace_url_template", &self.trace_url_template)
+            .field("bind", &self.bind)
+            .field("allow_ips", &self.allow_ips)
+            .field("cors_origins", &self.cors_origins)
+            .field("operators", &self.operators)
+            .finish_non_exhaustive()
+    }
 }
 
 /// TLS material for the admin server (WOR-1717): filesystem paths to a
@@ -9540,7 +9583,7 @@ fn default_secret_mount() -> String {
 }
 
 /// Authentication for a `hashicorp` secret backend (WOR-1767).
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[serde(deny_unknown_fields)]
 pub enum HashiCorpBackendAuth {
@@ -9570,6 +9613,44 @@ pub enum HashiCorpBackendAuth {
         #[serde(default)]
         mount: Option<String>,
     },
+}
+
+/// Redacted `Debug` (WOR-2640). This is the config-side twin of
+/// `sbproxy_vault::HashiCorpAuth`, which was given a redacting `Debug`
+/// while this one kept the derive, so the same Vault token and AppRole
+/// `secret_id` were protected at runtime and printed at config load.
+/// The load-time diagnostic is the likelier of the two to reach a log.
+///
+/// The role id, the role name, the JWT path and the mount all stay:
+/// they name which auth method was tried and none of them
+/// authenticates anything on its own. An AppRole `role_id` is
+/// deliberately kept for the same reason Vault treats it as the
+/// username half of the pair.
+impl std::fmt::Debug for HashiCorpBackendAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Token { .. } => f
+                .debug_struct("Token")
+                .field("token", &"[REDACTED]")
+                .finish(),
+            Self::Approle { role_id, mount, .. } => f
+                .debug_struct("Approle")
+                .field("role_id", role_id)
+                .field("secret_id", &"[REDACTED]")
+                .field("mount", mount)
+                .finish(),
+            Self::Kubernetes {
+                role,
+                jwt_path,
+                mount,
+            } => f
+                .debug_struct("Kubernetes")
+                .field("role", role)
+                .field("jwt_path", jwt_path)
+                .field("mount", mount)
+                .finish(),
+        }
+    }
 }
 
 /// Authentication for an `aws` secret backend (WOR-1767).
@@ -9630,7 +9711,7 @@ pub enum GcpBackendAuth {
 
 /// Authentication for an `azure` secret backend. Externally tagged to
 /// match the bare-string `managed_identity` default.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[serde(deny_unknown_fields)]
 pub enum AzureBackendAuth {
@@ -9656,6 +9737,37 @@ pub enum AzureBackendAuth {
     },
     /// The logged-in Azure CLI (`az account get-access-token`).
     AzureCli,
+}
+
+/// Redacted `Debug` (WOR-2640). The config-side twin of
+/// `sbproxy_vault::AzureKeyVaultAuth`, protected at runtime and
+/// printed at config load until now. `client_secret` is an app
+/// registration's credential; the tenant id, the client id and the
+/// authority stay, because they are what tells one misconfigured
+/// service principal from another and none is a secret.
+impl std::fmt::Debug for AzureBackendAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ManagedIdentity => f.write_str("ManagedIdentity"),
+            Self::UserAssignedIdentity { client_id } => f
+                .debug_struct("UserAssignedIdentity")
+                .field("client_id", client_id)
+                .finish(),
+            Self::ServicePrincipal {
+                tenant_id,
+                client_id,
+                authority,
+                ..
+            } => f
+                .debug_struct("ServicePrincipal")
+                .field("tenant_id", tenant_id)
+                .field("client_id", client_id)
+                .field("client_secret", &"[REDACTED]")
+                .field("authority", authority)
+                .finish(),
+            Self::AzureCli => f.write_str("AzureCli"),
+        }
+    }
 }
 
 /// Authentication for a `k8s` secret backend (WOR-1767).
@@ -13624,5 +13736,93 @@ mod decision_audit_scope_tests {
         let scopes = DecisionAuditScopes::default();
         assert!(scopes.is_empty());
         assert!(!scopes.publishes("cache.admit", Some("acme"), Some("api.example.test")));
+    }
+
+    /// WOR-2640: the config-side twins.
+    ///
+    /// Three of these carry the same values as runtime types that were
+    /// given a redacting `Debug` in the first half of this ticket, and
+    /// kept the derive: the Vault token and AppRole `secret_id`, the
+    /// Entra client secret, and the toolkit agent's shared secret were
+    /// protected where they are used and printed where they are loaded.
+    /// A config-load diagnostic is the likelier of the two to reach a
+    /// log. `AdminConfig.password` is the fourth, and its default is
+    /// `changeme`, which is what makes it worth naming.
+    #[test]
+    fn debug_never_renders_a_config_side_credential() {
+        const SENTINEL: &str = "SENTINEL-SECRET-9f3a";
+
+        let admin = AdminConfig {
+            enabled: true,
+            port: 9090,
+            username: "operator".to_string(),
+            password: SENTINEL.to_string(),
+            max_log_entries: 1000,
+            rate_limit_per_minute: 240,
+            prompt_persistence_path: None,
+            prompt_persistence_encryption: None,
+            trace_url_template: None,
+            tls: None,
+            bind: None,
+            allow_ips: Vec::new(),
+            cors_origins: Vec::new(),
+            operators: Vec::new(),
+        };
+        let rendered = format!("{admin:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the admin password reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("operator") && rendered.contains("9090"),
+            "the username and port must survive: {rendered}"
+        );
+
+        let token = HashiCorpBackendAuth::Token {
+            token: SENTINEL.to_string(),
+        };
+        assert!(
+            !format!("{token:?}").contains(SENTINEL),
+            "the Vault token reached Debug: {token:?}"
+        );
+
+        let approle = HashiCorpBackendAuth::Approle {
+            role_id: "role-1".to_string(),
+            secret_id: SENTINEL.to_string(),
+            mount: None,
+        };
+        let rendered = format!("{approle:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the AppRole secret id reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("role-1"),
+            "the role id must survive: it is the username half of the pair: {rendered}"
+        );
+
+        let principal = AzureBackendAuth::ServicePrincipal {
+            tenant_id: "tenant-1".to_string(),
+            client_id: "client-1".to_string(),
+            client_secret: SENTINEL.to_string(),
+            authority: None,
+        };
+        let rendered = format!("{principal:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "the Entra client secret reached Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("tenant-1") && rendered.contains("client-1"),
+            "the tenant and client ids must survive: {rendered}"
+        );
+
+        let toolkit = AiToolkitAgentAuthConfig {
+            shared_secret: SENTINEL.to_string(),
+        };
+        assert!(
+            !format!("{toolkit:?}").contains(SENTINEL),
+            "the toolkit shared secret reached Debug: {toolkit:?}"
+        );
     }
 }
