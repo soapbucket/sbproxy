@@ -93,20 +93,28 @@ ulid = { workspace = true }
 tokio-tungstenite = "0.21"
 futures-util = "0.3"
 
-# gRPC end-to-end coverage for action_grpc.rs. Pin to 0.12 / prost 0.13
-# so the e2e crate uses the same major as opentelemetry-otlp's tonic
-# (already in the workspace lock), avoiding a duplicate compile of two
-# tonic majors.
-tonic = "0.12"
-prost = "0.13"
+# gRPC end-to-end coverage for action_grpc.rs, and the transport under
+# the mock OTLP collector below. Pinned to the 0.14 major that
+# `opentelemetry-proto` 0.32 generates against (WOR-2549). The
+# production crates still build on the workspace's tonic 0.12 / prost
+# 0.13, so both majors are in the lock either way; matching the OTLP
+# major here is what retires the whole opentelemetry 0.27 chain.
+# `tonic-prost` carries the codec the generated stubs name, which tonic
+# 0.14 split out of the core crate.
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
 
 # WOR-1233: span-arrival e2e. A mock OTLP gRPC collector (built from the
 # OTLP proto's TraceServiceServer) receives the proxy's AI spans, and the
-# test asserts the gen_ai / OpenInference vocabulary arrives intact. The
-# proto + opentelemetry crates are pinned to the same majors already in the
-# lock via opentelemetry-otlp, so no duplicate compile.
+# test asserts the gen_ai / OpenInference vocabulary arrives intact.
+# WOR-2549: pinned to the 0.32 major `sbproxy-observe` already exports
+# through `opentelemetry-otlp`, so the collector shares one
+# opentelemetry / opentelemetry_sdk / opentelemetry-proto compile with
+# the proxy instead of keeping a second 0.27 chain alive for this one
+# test fixture.
 sbproxy-ai.workspace = true
-opentelemetry-proto = { version = "0.27", features = ["gen-tonic", "trace", "metrics"] }
+opentelemetry-proto = { version = "0.32", features = ["gen-tonic", "trace", "metrics"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 
 # Compression decoders for compression.rs e2e assertions. Pinned to the
@@ -163,6 +171,8 @@ name = "streaming"
 path = "tests/streaming/main.rs"
 
 [build-dependencies]
-# Compiles the in-tree `proto/echo.proto` for the gRPC e2e test. Kept
-# pinned to the same major as `tonic` above.
-tonic-build = "0.12"
+# Compiles the in-tree `proto/echo.proto` for the gRPC e2e test. tonic
+# 0.14 moved prost codegen out of `tonic-build` into `tonic-prost-build`
+# (WOR-2549); the generated stubs name `tonic_prost`, which is a regular
+# dependency above.
+tonic-prost-build = "0.14"
