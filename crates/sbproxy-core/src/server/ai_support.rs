@@ -710,6 +710,145 @@ impl AiTraceStreamContent {
     }
 }
 
+/// How much streamed assistant text is kept verbatim for the tokenizer
+/// fallback. Past this the estimator keeps counting bytes and scales the
+/// sample's token density over the rest, so a multi-megabyte generation
+/// costs one fixed buffer rather than a copy of the whole answer.
+const STREAM_ESTIMATE_SAMPLE_MAX_BYTES: usize = 32 * 1024;
+
+/// WOR-2622: the assistant text a stream actually delivered, kept so the
+/// stream finalizer can price a response whose provider never sent a
+/// `usage` frame, or that ended before one could arrive.
+///
+/// Providers optimize streaming for latency and leave usage out of the
+/// wire format: OpenAI and Azure OpenAI omit it unless the caller asks
+/// for `stream_options.include_usage`, and Anthropic and Gemini report
+/// it only in a terminal frame. The industry answer is to reassemble
+/// what was received and count it with the model's own tokenizer, which
+/// is what LiteLLM does when it records partial spend for an interrupted
+/// stream and what Portkey does when a provider omits usage. This is the
+/// accumulator half of that: [`Self::feed`] takes the same raw upstream
+/// chunks the usage parser sees, and
+/// [`Self::estimate_completion_tokens`] does the counting once, at
+/// stream close.
+///
+/// The estimate is deliberately coarse. It exists so that work a
+/// provider really performed cannot be billed at zero purely because a
+/// usage frame never arrived, not to compete with the provider's own
+/// count; a stream that produced a real usage frame never reaches it.
+pub(super) struct StreamOutputEstimator {
+    /// Bytes of a partially received SSE line, rejoined on the next feed.
+    carry: String,
+    /// The leading `STREAM_ESTIMATE_SAMPLE_MAX_BYTES` of assistant text.
+    sample: String,
+    /// Every byte of assistant text seen, sample and overflow alike.
+    text_bytes: u64,
+}
+
+impl StreamOutputEstimator {
+    /// Start an estimator for one stream.
+    pub(super) fn new() -> Self {
+        Self {
+            carry: String::new(),
+            sample: String::new(),
+            text_bytes: 0,
+        }
+    }
+
+    /// Feed one raw upstream chunk. Chunk boundaries are arbitrary, so
+    /// the estimator rejoins partial lines the same way the usage
+    /// parsers and the trace accumulator do.
+    pub(super) fn feed(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            // A chunk that splits a multi-byte character is skipped
+            // rather than lossily decoded: an estimate is allowed to
+            // undercount a fragment, and a replacement character would
+            // otherwise be counted as delivered output.
+            return;
+        };
+        self.carry.push_str(text);
+        while let Some(pos) = self.carry.find('\n') {
+            let line: String = self.carry.drain(..=pos).collect();
+            self.process_line(line.trim_end_matches(&['\r', '\n'][..]));
+        }
+        if self.carry.len() > AI_TRACE_STREAM_LINE_MAX_BYTES {
+            let line = std::mem::take(&mut self.carry);
+            self.process_line(line.trim_end_matches(&['\r', '\n'][..]));
+        }
+    }
+
+    /// Tokens the received assistant text is worth under `model`.
+    ///
+    /// Flushes whatever line is still in hand, counts the sample with
+    /// [`sbproxy_ai::estimate_tokens`] (the model's BPE when one is
+    /// known, a byte-length heuristic otherwise), and scales that
+    /// density over any text past the sample bound. Returns 0 when the
+    /// stream delivered no assistant text at all, which is the caller's
+    /// signal that there is nothing to estimate from.
+    pub(super) fn estimate_completion_tokens(&mut self, model: &str) -> u64 {
+        if !self.carry.trim().is_empty() {
+            let line = std::mem::take(&mut self.carry);
+            self.process_line(line.trim_end_matches(&['\r', '\n'][..]));
+        }
+        if self.sample.is_empty() || self.text_bytes == 0 {
+            return 0;
+        }
+        let message = sbproxy_ai::Message {
+            role: "assistant".to_string(),
+            content: serde_json::Value::String(self.sample.clone()),
+        };
+        let sampled = sbproxy_ai::estimate_tokens(model, std::slice::from_ref(&message));
+        let sample_bytes = self.sample.len() as u64;
+        if self.text_bytes <= sample_bytes || sample_bytes == 0 {
+            return sampled;
+        }
+        // Scale the sample's tokens-per-byte over the text the bound
+        // dropped. Saturating throughout: an overflow here would be a
+        // free generation, not a rounding error.
+        sampled
+            .saturating_mul(self.text_bytes)
+            .checked_div(sample_bytes)
+            .unwrap_or(sampled)
+    }
+
+    fn process_line(&mut self, line: &str) {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(':') || line.starts_with("event:") {
+            return;
+        }
+        let payload = line
+            .strip_prefix("data:")
+            .map(str::trim_start)
+            .unwrap_or(line);
+        if payload == "[DONE]" {
+            return;
+        }
+        // Only structured frames count. An unparseable line is a
+        // keep-alive, a provider-specific control frame, or a fragment,
+        // and counting its bytes as output would inflate the bill.
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+            return;
+        };
+        let text = extract_stream_delta_text(&value);
+        if text.is_empty() {
+            return;
+        }
+        self.text_bytes = self.text_bytes.saturating_add(text.len() as u64);
+        let remaining = STREAM_ESTIMATE_SAMPLE_MAX_BYTES.saturating_sub(self.sample.len());
+        if remaining == 0 {
+            return;
+        }
+        let mut boundary = remaining.min(text.len());
+        while boundary > 0 && !text.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        self.sample.push_str(&text[..boundary]);
+    }
+}
+
 fn extract_stream_delta_text(value: &serde_json::Value) -> String {
     let mut parts = Vec::new();
 
@@ -5137,6 +5276,93 @@ mod cache_token_attribution_tests {
         assert_eq!(
             attributed_tokens(model, "cache_write") - before_write,
             120.0
+        );
+    }
+}
+
+#[cfg(test)]
+mod stream_output_estimator_tests {
+    use super::StreamOutputEstimator;
+
+    /// The estimator counts assistant text and nothing else.
+    ///
+    /// An SSE stream is mostly not answer: comments, `event:` lines,
+    /// the terminal `[DONE]`, and frames whose only content is a role
+    /// or a finish reason. Counting those would bill a caller for the
+    /// provider's framing, so each shape gets its own assertion here
+    /// rather than one aggregate that a single leak could hide inside.
+    #[test]
+    fn only_assistant_deltas_are_counted() {
+        let mut estimator = StreamOutputEstimator::new();
+        estimator.feed(b": keep-alive comment\n\n");
+        estimator.feed(b"event: message\n\n");
+        estimator.feed(b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n");
+        estimator.feed(b"data: [DONE]\n\n");
+        assert_eq!(
+            estimator.estimate_completion_tokens("gpt-4o-mini"),
+            0,
+            "framing with no answer in it is not billable output"
+        );
+
+        let mut estimator = StreamOutputEstimator::new();
+        estimator.feed(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"the quick brown fox jumps over\"}}]}\n\n",
+        );
+        estimator.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\" the lazy dog\"}}]}\n\n");
+        estimator.feed(b"data: [DONE]\n\n");
+        assert!(
+            estimator.estimate_completion_tokens("gpt-4o-mini") > 0,
+            "delivered assistant text has to price above zero"
+        );
+    }
+
+    /// Chunk boundaries are the provider's business, not the
+    /// estimator's: a frame split across two reads counts the same as
+    /// one that arrived whole.
+    #[test]
+    fn a_frame_split_across_chunks_counts_once_and_whole() {
+        let frame =
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"the quick brown fox jumps over\"}}]}\n\n";
+        let mut whole = StreamOutputEstimator::new();
+        whole.feed(frame);
+        let expected = whole.estimate_completion_tokens("gpt-4o-mini");
+        assert!(expected > 0, "the fixture frame has to carry real text");
+
+        for split in 1..frame.len() {
+            let mut estimator = StreamOutputEstimator::new();
+            estimator.feed(&frame[..split]);
+            estimator.feed(&frame[split..]);
+            assert_eq!(
+                estimator.estimate_completion_tokens("gpt-4o-mini"),
+                expected,
+                "split at byte {split} changed the count"
+            );
+        }
+    }
+
+    /// Past the sample bound the estimator scales rather than
+    /// truncating, so a long generation is not billed as a short one.
+    #[test]
+    fn output_past_the_sample_bound_still_scales() {
+        let long: String = "lorem ipsum dolor sit amet ".repeat(4000);
+        let mut estimator = StreamOutputEstimator::new();
+        estimator.feed(
+            format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{long}\"}}}}]}}\n\n")
+                .as_bytes(),
+        );
+        let scaled = estimator.estimate_completion_tokens("gpt-4o-mini");
+
+        let short: String = "lorem ipsum dolor sit amet ".repeat(40);
+        let mut small = StreamOutputEstimator::new();
+        small.feed(
+            format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{short}\"}}}}]}}\n\n")
+                .as_bytes(),
+        );
+        let unscaled = small.estimate_completion_tokens("gpt-4o-mini");
+
+        assert!(
+            scaled > unscaled * 50,
+            "a generation a hundred times longer cannot price at {scaled} against {unscaled}"
         );
     }
 }

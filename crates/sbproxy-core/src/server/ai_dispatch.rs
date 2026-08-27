@@ -17608,6 +17608,223 @@ mod stream_classifier_holdback_tests {
     }
 }
 
+/// WOR-2622: how a streamed AI response ended.
+///
+/// The relay has three terminal shapes and they are billed differently,
+/// so the finalizer is told which one it was rather than inferring it
+/// from state that several branches write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamTermination {
+    /// The upstream stream ran to its natural end and every byte of it
+    /// reached the client.
+    Delivered,
+    /// The stream stopped early with the caller still on the line: an
+    /// upstream truncation or error, a guardrail or stream-safety cut,
+    /// or any relay failure that was not a downstream write.
+    Partial,
+    /// A write to the client failed, so the client is gone. The upstream
+    /// body is dropped at that point and only what arrived before it is
+    /// billed.
+    ClientDisconnected,
+}
+
+impl StreamTermination {
+    /// Closed-set label for logs and the post-commit failure metric.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::Partial => "partial",
+            Self::ClientDisconnected => "client_disconnected",
+        }
+    }
+
+    /// Whether the client received the whole of what the upstream sent.
+    fn is_complete(self) -> bool {
+        matches!(self, Self::Delivered)
+    }
+}
+
+/// WOR-2622: where a finalized stream's token counts came from.
+///
+/// Recorded beside the counts everywhere they are written, because a
+/// spend report that mixes a provider's own numbers with this gateway's
+/// estimate without saying which is which is worse than one that reports
+/// neither.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamUsageSource {
+    /// A provider `usage` frame arrived and these are its numbers.
+    Measured,
+    /// No usage frame arrived, so the prompt estimate computed on the
+    /// request path and a tokenizer count of the received output stand
+    /// in for it.
+    Estimated,
+    /// Neither: the stream carried no usage frame and delivered no
+    /// assistant text, so there is nothing to bill.
+    Absent,
+}
+
+impl StreamUsageSource {
+    /// Closed-set label for logs.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Measured => "measured",
+            Self::Estimated => "estimated",
+            Self::Absent => "absent",
+        }
+    }
+}
+
+/// WOR-2622: the accounting a streamed response accumulates, held
+/// outside the frame loop so that no exit can lose it.
+///
+/// Before this existed the parser, the flags and the counters were
+/// locals in the relay and every settlement read them after the loop.
+/// Any `?` on a downstream write therefore returned past the settlement
+/// entirely: a stream whose client hung up after the provider's terminal
+/// usage frame had exact numbers in hand and threw them away, refunding
+/// the reservation for work the provider had already done. Splitting the
+/// state out gives [`relay_ai_stream`] a finally shape, where
+/// [`finalize_ai_stream_usage`] runs on every path out of
+/// [`relay_ai_stream_frames`] including the ones that return an error.
+struct StreamAccounting {
+    /// Upstream response status. Only 2xx streams are billable.
+    status: u16,
+    /// Per-provider SSE usage parser, or `None` when the operator set
+    /// `usage_parser: none`.
+    usage_parser: Option<Box<dyn sbproxy_ai::SseUsageParser>>,
+    /// Tokenizer fallback fed the same raw chunks as the parser.
+    output_estimator: Option<StreamOutputEstimator>,
+    /// Set only when the chunk loop reached the upstream's end of stream.
+    upstream_complete: bool,
+    /// Which upstream read failure ended the stream, when one did.
+    upstream_stream_error: Option<&'static str>,
+    /// Anchors the generation window for TTFT and throughput.
+    stream_started: std::time::Instant,
+    /// First chunk carrying any payload.
+    first_token_at: Option<std::time::Instant>,
+    /// The stream-safety classifier refused a chunk (WOR-1144).
+    safety_blocked: bool,
+    /// An output guardrail refused a chunk (WOR-1141).
+    output_guard_blocked: bool,
+}
+
+impl StreamAccounting {
+    /// Build the accounting for one stream.
+    ///
+    /// The parser is built for every stream that has a parser
+    /// configured, not only for origins with a `budget:` block. It used
+    /// to be gated on the budget recorder, which meant an origin with a
+    /// usage sink, a Stripe bridge or nothing but an access log never
+    /// parsed usage at all and reported zero tokens for a stream the
+    /// provider had counted exactly.
+    fn new(status: u16, parser_args: &StreamUsageParserArgs) -> Self {
+        let billable = (200..300).contains(&status);
+        let usage_parser = billable.then(|| {
+            let hints = sbproxy_ai::UsageParserHints {
+                upstream_host: parser_args.upstream_host.as_deref(),
+                content_type: parser_args.content_type.as_deref(),
+                x_provider: parser_args.x_provider.as_deref(),
+            };
+            sbproxy_ai::select_parser(&parser_args.configured, &hints)
+        });
+        Self {
+            status,
+            usage_parser: usage_parser.flatten(),
+            output_estimator: billable.then(StreamOutputEstimator::new),
+            upstream_complete: false,
+            upstream_stream_error: None,
+            stream_started: std::time::Instant::now(),
+            first_token_at: None,
+            safety_blocked: false,
+            output_guard_blocked: false,
+        }
+    }
+}
+
+/// Whether a relay error is the client's connection failing under a
+/// write.
+///
+/// What this can see is exactly one thing: the pingora [`ErrorType`] on
+/// the error the relay returned. Every error the relay produces with one
+/// of these four types came out of a `Session` write, because those are
+/// the only calls in it that can produce them: `write_response_header`
+/// and `write_response_body` on H1 answer `WriteError` or `WriteTimedout`
+/// (`pingora-core`'s `v1/body.rs` maps every socket failure that way) and
+/// on H2 answer `H2Error` or `ConnectionClosed`. The relay's own error
+/// sites use `HTTPStatus` (the stream-safety fail-closed refusal) and
+/// `InternalError` (header construction), and an upstream read failure
+/// leaves the chunk loop through `break`, never through `?`.
+///
+/// What it cannot see: a write that Pingora buffered and never flushed,
+/// which is the ordinary case for the last chunk of a small stream. A
+/// client that vanishes without its FIN reaching a write is billed as
+/// delivered, exactly as it was before, because nothing in this process
+/// ever learns it left.
+fn stream_write_failed_downstream(error: &Error) -> bool {
+    matches!(
+        error.etype(),
+        ErrorType::WriteError
+            | ErrorType::WriteTimedout
+            | ErrorType::ConnectionClosed
+            | ErrorType::H2Error
+    )
+}
+
+/// Attribute a mid-stream downstream write failure to the client
+/// (WOR-2622, closing the WOR-2335 gap on the streaming path).
+///
+/// The error source is the load-bearing part, for the same reason it is
+/// on the non-streaming cancellation path
+/// ([`cancel_upstream_for_client_disconnect`]): `logging()` prices the
+/// receipt by asking [`crate::server::proxy_http::client_disconnected`]
+/// whether the failure came from downstream. Pingora's session writer
+/// reports its socket failures as `WriteError` with no source
+/// (`Error::e_because(WriteError, ...)`), so before this the receipt for
+/// a client that hung up mid-stream read `delivered`, priced as a
+/// completed sale, with the provider's tokens billed to a caller who
+/// received none of them.
+fn cancel_stream_for_client_disconnect(
+    ctx: &mut Option<&mut RequestContext>,
+    span: &tracing::Span,
+    provider: &str,
+    observed: Box<Error>,
+) -> Box<Error> {
+    if let Some(context) = ctx.as_deref_mut() {
+        context.ai_upstream_cancelled_on_client_disconnect = true;
+    }
+    sbproxy_observe::metrics::record_provider_attempt(provider, "client_disconnected");
+    sbproxy_ai::tracing_spans::record_error(
+        span,
+        sbproxy_ai::tracing_spans::error_type::CLIENT_DISCONNECTED,
+        "client disconnected while the response was streaming",
+    );
+    warn!(
+        provider = %provider,
+        downstream = %observed,
+        "AI proxy: the client went away mid-stream; upstream stream dropped"
+    );
+    Error::because(
+        ErrorType::ConnectionClosed,
+        "AI stream abandoned: the client disconnected while the response was streaming",
+        observed,
+    )
+    .into_down()
+}
+
+/// Relay a streamed AI response, then settle it exactly once.
+///
+/// The relay proper is [`relay_ai_stream_frames`]; this is the finally
+/// around it. Splitting them is the whole point: the frame loop is
+/// nearly a thousand lines with fourteen `?` sites on downstream writes,
+/// and every one of them used to return past the settlement that follows
+/// the loop. Here the settlement is a statement after the call, so it
+/// runs whether the frames returned `Ok`, failed a write, or failed
+/// anything else, and a `?` added to the loop tomorrow cannot skip it.
+///
+/// Returning from `relay_ai_stream_frames` also drops the
+/// `reqwest::Response` body it owns, which is what stops a provider
+/// generating tokens for a client that is no longer reading. That drop
+/// happens before the settlement below awaits anything.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn relay_ai_stream(
     session: &mut Session,
@@ -17619,6 +17836,91 @@ pub(super) async fn relay_ai_stream(
     budget_recorder: Option<BudgetRecorderArgs<'_>>,
     router_sink: RouterTokenSink<'_>,
     parser_args: StreamUsageParserArgs,
+    format_args: StreamFormatArgs,
+    ai_span: tracing::Span,
+    trace_content: AiTraceContentArgs<'_>,
+    reversible_pairs: Vec<(String, String, String)>,
+    stream_audit_keys: Option<(String, String, String)>,
+    output_guardrails: Option<std::sync::Arc<sbproxy_ai::guardrails::GuardrailPipeline>>,
+    principal: Option<sbproxy_plugin::Principal>,
+    mut ctx: Option<&mut RequestContext>,
+    ai_extensions: Option<crate::ai_extensions::AiRequestExtensions>,
+) -> Result<()> {
+    let status = resp.status().as_u16();
+    let mut acct = StreamAccounting::new(status, &parser_args);
+    // The model the tokenizer fallback counts against. The budget
+    // recorder carries the resolved upstream model; without one the
+    // requested id is the best name available, and an unknown name
+    // degrades the estimator to its byte heuristic rather than failing.
+    let estimate_model = budget_recorder
+        .as_ref()
+        .map(|args| args.model.to_string())
+        .or_else(|| model_id.clone())
+        .unwrap_or_default();
+    let framed = relay_ai_stream_frames(
+        &mut acct,
+        session,
+        resp,
+        pipeline,
+        hostname,
+        model_id,
+        origin_idx,
+        router_sink.provider_name,
+        format_args,
+        ai_span.clone(),
+        trace_content,
+        reversible_pairs,
+        stream_audit_keys,
+        output_guardrails,
+        principal,
+        &mut ctx,
+        ai_extensions,
+    )
+    .await;
+    let termination = match framed.as_ref() {
+        Ok(()) if acct.upstream_complete && !acct.safety_blocked && !acct.output_guard_blocked => {
+            StreamTermination::Delivered
+        }
+        Ok(()) => StreamTermination::Partial,
+        Err(error) if stream_write_failed_downstream(error) => {
+            StreamTermination::ClientDisconnected
+        }
+        Err(_) => StreamTermination::Partial,
+    };
+    finalize_ai_stream_usage(
+        &mut acct,
+        termination,
+        &mut ctx,
+        budget_recorder.as_ref(),
+        &router_sink,
+        &ai_span,
+        &estimate_model,
+    )
+    .await;
+    match framed {
+        Ok(()) => Ok(()),
+        Err(error) if termination == StreamTermination::ClientDisconnected => {
+            Err(cancel_stream_for_client_disconnect(
+                &mut ctx,
+                &ai_span,
+                router_sink.provider_name,
+                error,
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn relay_ai_stream_frames(
+    acct: &mut StreamAccounting,
+    session: &mut Session,
+    resp: reqwest::Response,
+    pipeline: &CompiledPipeline,
+    hostname: &str,
+    model_id: Option<String>,
+    origin_idx: Option<usize>,
+    provider_name: &str,
     format_args: StreamFormatArgs,
     ai_span: tracing::Span,
     trace_content: AiTraceContentArgs<'_>,
@@ -17648,17 +17950,21 @@ pub(super) async fn relay_ai_stream(
     // WOR-1874: request context, mirrored from the buffered relay, so
     // a streaming guardrail block stamps the guardrail columns the
     // access log and admin request ring read at request end.
-    mut ctx: Option<&mut RequestContext>,
+    ctx: &mut Option<&mut RequestContext>,
     mut ai_extensions: Option<crate::ai_extensions::AiRequestExtensions>,
 ) -> Result<()> {
-    let status = resp.status().as_u16();
-    record_ai_provider_response_failure(
-        &ai_span,
-        router_sink.provider_name,
-        status,
-        None,
-        ctx.as_deref(),
-    );
+    let status = acct.status;
+    let StreamAccounting {
+        usage_parser,
+        output_estimator,
+        upstream_complete,
+        upstream_stream_error,
+        first_token_at,
+        safety_blocked,
+        output_guard_blocked,
+        ..
+    } = acct;
+    record_ai_provider_response_failure(&ai_span, provider_name, status, None, ctx.as_deref());
 
     // WOR-1811: a served (local) engine stamps its internal model id
     // (historically the weights file path or the internal deployment
@@ -17760,42 +18066,16 @@ pub(super) async fn relay_ai_stream(
     // its natural end without an error. It is only set to `true`
     // when the chunk loop exits via the `None` arm (no `break` from
     // an upstream error). The flag classifies the waste marker the
-    // budget branch below records for a truncated stream.
+    // finalizer records for a truncated stream.
     //
-    // `usage_scanner` is materialised only when a budget recorder
-    // is wired so the scan cost stays opt-in. Each chunk is fed to
-    // the scanner in addition to being forwarded to the client; the
-    // scanner buffers at most one line of pending bytes so the full
-    // SSE body never lands in memory.
+    // The usage parser and the tokenizer fallback both live on
+    // `StreamAccounting`, destructured above, so a downstream write
+    // failure that leaves this function on `?` still hands the
+    // finalizer everything the stream managed to parse. Each chunk is
+    // fed to both in addition to being forwarded to the client; each
+    // buffers at most one line of pending bytes so the full SSE body
+    // never lands in memory.
     let mut stream = resp.bytes_stream();
-    let mut upstream_complete = false;
-    // Which upstream read failure ended the stream, when one did. Read
-    // once after the loop to label
-    // `sbproxy_ai_stream_post_commit_failures_total`; a timeout there
-    // means a whole-call budget cut a generation that was still running,
-    // which is a different operator action from a reset.
-    let mut upstream_stream_error: Option<&'static str> = None;
-    // WOR-895: track TTFT + output throughput. `stream_started` anchors
-    // the generation window; `first_token_at` is set on the first chunk
-    // that carries any payload. Both feed `sbproxy_ai_ttft_seconds` +
-    // `sbproxy_ai_output_throughput_tokens_per_second` at stream close.
-    let stream_started = std::time::Instant::now();
-    let mut first_token_at: Option<std::time::Instant> = None;
-    // Build the per-stream usage parser when a budget recorder is
-    // wired. `select_parser` returns `None` only when the operator
-    // sets `usage_parser: none`; every other branch yields a live
-    // parser whose snapshot is read at stream close.
-    let mut usage_parser: Option<Box<dyn sbproxy_ai::SseUsageParser>> = if budget_recorder.is_some()
-    {
-        let hints = sbproxy_ai::UsageParserHints {
-            upstream_host: parser_args.upstream_host.as_deref(),
-            content_type: parser_args.content_type.as_deref(),
-            x_provider: parser_args.x_provider.as_deref(),
-        };
-        sbproxy_ai::select_parser(&parser_args.configured, &hints)
-    } else {
-        None
-    };
 
     // --- WOR-1810: per-stream output-guardrail session ---
     //
@@ -17927,17 +18207,17 @@ pub(super) async fn relay_ai_stream(
     // the console capture gate wants the completion.
     let mut trace_stream_content = (trace_content.enabled() || trace_content.capture_enabled())
         .then(AiTraceStreamContent::default);
-    // WOR-1144: set when the stream-safety classifier rejects a chunk so
-    // the relay stops forwarding (fail closed) instead of delivering
-    // flagged content. Leaves `upstream_complete` false so the stream is
-    // accounted as a partial delivery.
-    let mut safety_blocked = false;
-    // WOR-1141: set when a streaming-safe output guardrail matches an
-    // outbound chunk so the relay stops forwarding (the violating chunk
-    // and everything after it). Headers are already sent, so an
-    // already-written chunk cannot be recalled, but the rest of the
-    // violating output does not reach the client.
-    let mut output_guard_blocked = false;
+    // `safety_blocked` (WOR-1144) is set when the stream-safety
+    // classifier rejects a chunk so the relay stops forwarding (fail
+    // closed) instead of delivering flagged content.
+    // `output_guard_blocked` (WOR-1141) is set when a streaming-safe
+    // output guardrail matches an outbound chunk so the relay stops
+    // forwarding the violating chunk and everything after it. Headers
+    // are already sent in both cases, so an already-written chunk cannot
+    // be recalled, but the rest of the output does not reach the client.
+    // Both leave `upstream_complete` false, so the finalizer accounts
+    // the stream as a partial delivery. Both live on `StreamAccounting`
+    // because the finalizer reads them after this function returns.
     let mut extension_response_sent = false;
     let mut stream_output_guarded = false;
     let mut assembled_output = String::new();
@@ -17949,7 +18229,7 @@ pub(super) async fn relay_ai_stream(
                 let chunk_bytes = Bytes::copy_from_slice(&chunk);
                 // WOR-895: first non-empty chunk marks TTFT.
                 if first_token_at.is_none() && !chunk_bytes.is_empty() {
-                    first_token_at = Some(std::time::Instant::now());
+                    *first_token_at = Some(std::time::Instant::now());
                 }
 
                 // --- Per-chunk safety probe (fail closed) ---
@@ -17991,21 +18271,26 @@ pub(super) async fn relay_ai_stream(
                                         reason,
                                     });
                             }
-                            safety_blocked = true;
+                            *safety_blocked = true;
                             break 'relay;
                         }
                     }
                 }
 
-                // --- Per-chunk usage capture for budget recording ---
+                // --- Per-chunk usage capture for accounting ---
                 //
-                // Feed the parser before writing to the client so the
-                // scan cost is bounded by the chunk we already have in
-                // hand. The parser is only built when a budget
-                // recorder is wired, so the non-budget path stays the
-                // original zero-overhead pass-through.
+                // Feed both usage readers before writing to the client,
+                // so the scan cost is bounded by the chunk already in
+                // hand and so a write that fails on the very next line
+                // still leaves this chunk counted. The estimator is the
+                // fallback for a provider that never emits a usage
+                // frame; it costs one JSON parse per frame on top of the
+                // one the parser already does, and only on 2xx streams.
                 if let Some(parser) = usage_parser.as_mut() {
                     parser.feed(&chunk_bytes);
+                }
+                if let Some(estimator) = output_estimator.as_mut() {
+                    estimator.feed(&chunk_bytes);
                 }
 
                 // --- WOR-1810: decode + guardrail session ---
@@ -18063,7 +18348,7 @@ pub(super) async fn relay_ai_stream(
                         if pending_stream_header.is_some() {
                             pending_builtin_block = Some(block);
                         }
-                        output_guard_blocked = true;
+                        *output_guard_blocked = true;
                         break 'relay;
                     }
                 }
@@ -18113,7 +18398,7 @@ pub(super) async fn relay_ai_stream(
                         if pending_stream_header.is_some() {
                             pending_builtin_block = Some(block);
                         }
-                        output_guard_blocked = true;
+                        *output_guard_blocked = true;
                         break 'relay;
                     }
                 }
@@ -18144,14 +18429,14 @@ pub(super) async fn relay_ai_stream(
                             if send_ai_stream_extension_block(
                                 session,
                                 &mut pending_stream_header,
-                                &mut ctx,
+                                ctx,
                                 &ai_span,
                                 &block,
                             )
                             .await?
                             {
                                 extension_response_sent = true;
-                                output_guard_blocked = true;
+                                *output_guard_blocked = true;
                                 break 'relay;
                             }
                         }
@@ -18273,7 +18558,7 @@ pub(super) async fn relay_ai_stream(
                         if pending_stream_header.is_some() {
                             pending_builtin_block = Some(block);
                         }
-                        output_guard_blocked = true;
+                        *output_guard_blocked = true;
                         break 'relay;
                     }
                 }
@@ -18290,11 +18575,11 @@ pub(super) async fn relay_ai_stream(
                     "AI upstream streaming response failed",
                 );
                 sbproxy_ai::ai_metrics::record_provider_error(
-                    router_sink.provider_name,
+                    provider_name,
                     ai_metric_error_kind_for_span_error_type(kind),
                 );
                 warn!(error = %e, "AI proxy: error reading SSE chunk from upstream");
-                upstream_stream_error = Some(if e.is_timeout() {
+                *upstream_stream_error = Some(if e.is_timeout() {
                     "upstream_timeout"
                 } else {
                     "upstream_error"
@@ -18364,7 +18649,7 @@ pub(super) async fn relay_ai_stream(
                     if pending_stream_header.is_some() {
                         pending_builtin_block = Some(block);
                     }
-                    output_guard_blocked = true;
+                    *output_guard_blocked = true;
                     break;
                 }
                 assemble_hub_assistant_text(&tail_events, &mut assembled_output);
@@ -18374,7 +18659,7 @@ pub(super) async fn relay_ai_stream(
                         &assembled_output,
                         session,
                         &mut pending_stream_header,
-                        &mut ctx,
+                        ctx,
                         &ai_span,
                     )
                     .await?;
@@ -18382,13 +18667,13 @@ pub(super) async fn relay_ai_stream(
                         outcome,
                         session,
                         &mut pending_stream_header,
-                        &mut ctx,
+                        ctx,
                         &ai_span,
                         StreamGuardSink {
                             holdback: &mut response_body_holdback,
                             mutated_stream_body: &mut mutated_stream_body,
                             extension_response_sent: &mut extension_response_sent,
-                            output_guard_blocked: &mut output_guard_blocked,
+                            output_guard_blocked: &mut *output_guard_blocked,
                             stream_output_guarded: &mut stream_output_guarded,
                             inbound_format: format_args.inbound_format.as_deref(),
                         },
@@ -18436,14 +18721,14 @@ pub(super) async fn relay_ai_stream(
                         if send_ai_stream_extension_block(
                             session,
                             &mut pending_stream_header,
-                            &mut ctx,
+                            ctx,
                             &ai_span,
                             &block,
                         )
                         .await?
                         {
                             extension_response_sent = true;
-                            output_guard_blocked = true;
+                            *output_guard_blocked = true;
                             break 'relay;
                         }
                     }
@@ -18512,7 +18797,7 @@ pub(super) async fn relay_ai_stream(
                                     if pending_stream_header.is_some() {
                                         pending_builtin_block = Some(block);
                                     }
-                                    output_guard_blocked = true;
+                                    *output_guard_blocked = true;
                                     break 'relay;
                                 }
                             }
@@ -18558,7 +18843,7 @@ pub(super) async fn relay_ai_stream(
                             if pending_stream_header.is_some() {
                                 pending_builtin_block = Some(block);
                             }
-                            output_guard_blocked = true;
+                            *output_guard_blocked = true;
                             break 'relay;
                         }
                     }
@@ -18583,7 +18868,7 @@ pub(super) async fn relay_ai_stream(
                     if pending_stream_header.is_some() {
                         pending_builtin_block = Some(block);
                     }
-                    output_guard_blocked = true;
+                    *output_guard_blocked = true;
                     break;
                 }
                 if !extension_response_sent {
@@ -18607,37 +18892,25 @@ pub(super) async fn relay_ai_stream(
                         }
                     }
                 }
-                upstream_complete = true;
+                *upstream_complete = true;
                 break;
             }
         }
     }
 
-    // Everything reaching this relay has already been committed to a
-    // provider: the dispatcher only calls it once
-    // `upstream_response_is_successful_stream` accepted the response, and
-    // the attempt loop has closed by then. So a stream that did not run
-    // to its natural end here can never be failed over, and this counter
-    // is where that failure is visible. Counted before the close-out
-    // writes below, because a failed downstream write leaves this
-    // function on `?` and would otherwise swallow an upstream cause the
-    // operator needs.
-    if !upstream_complete {
-        let cause = upstream_stream_error.unwrap_or(if safety_blocked || output_guard_blocked {
-            "guardrail"
-        } else {
-            // Every other way out of the chunk loop leaves through `?`,
-            // so this is a floor rather than a live branch.
-            "upstream_error"
-        });
-        sbproxy_ai::ai_metrics::record_stream_post_commit_failure(router_sink.provider_name, cause);
-    }
+    // The post-commit failure counter used to be recorded here, ahead of
+    // the close-out writes, because a failed downstream write left this
+    // function on `?` and would otherwise have swallowed the upstream
+    // cause. `finalize_ai_stream_usage` records it now: it runs on every
+    // exit including that one, so the counter no longer has to be placed
+    // ahead of the code that could skip it, and the disconnect itself
+    // becomes a cause the operator can select on.
 
     if let Some(block) = pending_builtin_block.take() {
         if send_ai_stream_guardrail_block_before_headers(
             session,
             &mut pending_stream_header,
-            &mut ctx,
+            ctx,
             &ai_span,
             block,
         )
@@ -18654,7 +18927,7 @@ pub(super) async fn relay_ai_stream(
                 &assembled_output,
                 session,
                 &mut pending_stream_header,
-                &mut ctx,
+                ctx,
                 &ai_span,
             )
             .await?;
@@ -18662,13 +18935,13 @@ pub(super) async fn relay_ai_stream(
                 outcome,
                 session,
                 &mut pending_stream_header,
-                &mut ctx,
+                ctx,
                 &ai_span,
                 StreamGuardSink {
                     holdback: &mut response_body_holdback,
                     mutated_stream_body: &mut mutated_stream_body,
                     extension_response_sent: &mut extension_response_sent,
-                    output_guard_blocked: &mut output_guard_blocked,
+                    output_guard_blocked: &mut *output_guard_blocked,
                     stream_output_guarded: &mut stream_output_guarded,
                     inbound_format: format_args.inbound_format.as_deref(),
                 },
@@ -18699,7 +18972,7 @@ pub(super) async fn relay_ai_stream(
             if send_ai_stream_extension_block(
                 session,
                 &mut pending_stream_header,
-                &mut ctx,
+                ctx,
                 &ai_span,
                 &block,
             )
@@ -18707,7 +18980,7 @@ pub(super) async fn relay_ai_stream(
             {
                 extension_response_sent = true;
             }
-            output_guard_blocked = true;
+            *output_guard_blocked = true;
         }
     }
 
@@ -18727,14 +19000,14 @@ pub(super) async fn relay_ai_stream(
         session.write_response_body(None, true).await?;
     }
 
-    if safety_blocked {
+    if *safety_blocked {
         // WOR-1144: the stream was cut short by an output-safety verdict.
-        // `upstream_complete` stayed false. Budget is still recorded
-        // best-effort below for whatever the upstream produced before the
-        // cut.
+        // `upstream_complete` stayed false. The finalizer that runs once
+        // this function returns still records best-effort budget for
+        // whatever the upstream produced before the cut.
         debug!("AI proxy: streaming response terminated early by stream-safety enforcement");
     }
-    if output_guard_blocked {
+    if *output_guard_blocked {
         // WOR-1141: the stream was cut short by an output guardrail.
         // Same partial-recording semantics as the safety-verdict cut.
         debug!("AI proxy: streaming response terminated early by an output guardrail");
@@ -18755,184 +19028,311 @@ pub(super) async fn relay_ai_stream(
         }
     }
 
-    // --- Streaming budget recording ---
-    //
-    // When the parser picked up a usage block (OpenAI's terminal
-    // chunk, Anthropic's `message_delta`, Vertex's `usageMetadata`,
-    // ...) record tokens + cost against every configured scope. A
-    // truncated stream (`upstream_complete == false`) is best-effort:
-    // if the parser saw a usage block before the truncation we still
-    // record so partial billing reflects the work the upstream
-    // actually did.
-    if let (Some(args), Some(parser)) = (budget_recorder.as_ref(), usage_parser.as_ref()) {
-        if (200..300).contains(&status) {
-            if let Some(tokens) = parser.snapshot() {
-                // WOR-2212: same single-writer rule as the relay path.
-                // The local debit is `record_billing_event`, below; the
-                // gauge refresh follows it.
-                //
-                // WOR-1722: mirror into the cluster-shared counters.
-                super::budget_share::record_shared_budget_usage(
-                    args.config,
-                    args.keys,
-                    args.model,
-                    tokens.prompt_tokens as u64,
-                    tokens.completion_tokens as u64,
-                )
-                .await;
-                let prompt = tokens.prompt_tokens as u64;
-                let completion = tokens.completion_tokens as u64;
-                // WOR-798: feed the router's per-provider token
-                // counter so streaming responses contribute to the
-                // `LeastTokenUsage` / `TokenRate` signal the same as
-                // unary responses.
-                router_sink.record(prompt + completion);
-                let usage = if prompt != 0 || completion != 0 {
-                    sbproxy_ai::budget::AiUsage::Tokens {
-                        input: prompt,
-                        output: completion,
-                        // WOR-1708: from the streaming usage parser. These
-                        // are 0 until the per-provider SSE parsers populate
-                        // cache tokens (follow-up); billing then discounts
-                        // them automatically.
-                        cached_input: tokens.cache_read_tokens as u64,
-                        cache_creation: tokens.cache_write_tokens as u64,
-                    }
-                } else {
-                    sbproxy_ai::budget::AiUsage::PerCall
-                };
-                let cost = sbproxy_ai::budget::estimate_cost_for_usage(args.model, &usage);
-                let scope_keys = args.keys.iter().map(|(_, k)| k.clone()).collect::<Vec<_>>();
-                // WOR-1835: bind the billing event's micro-USD return
-                // (previously discarded here) so a streaming response can
-                // settle its governance reservation with the same figure
-                // just recorded to the budget ledger.
-                let cost_micros = emit_ai_billing_event(
-                    &args.origin,
-                    args.surface_label,
-                    args.provider_name,
-                    Some(args.model.to_string()),
-                    usage,
-                    cost,
-                    scope_keys,
-                    &args.attribution_tags,
-                    args.tenant_id.as_str(),
-                    args.api_key_id.as_str(),
-                    &args.rollup_properties,
-                    args.agent_identity(),
-                    &ai_span,
-                    sbproxy_ai::budget::TokenDebit::Measured,
-                );
-                refresh_budget_utilization(args.config, args.keys);
-                // WOR-1835: governed-key settlement. `ai_admission` never
-                // reconciles on the streaming path (its reservation is
-                // simply refunded in full on drop), a pre-existing gap
-                // this settle deliberately does not inherit: streaming
-                // responses settle their governance reservation with
-                // actual usage here. Best-effort on error (the lease's
-                // `Drop` repairs a failed settle).
-                if let Some(c) = ctx.as_mut() {
-                    if let Some(mut lease) = c.governance_lease.take() {
-                        let _ = lease.settle(prompt + completion, cost_micros).await;
-                    }
-                }
-
-                // WOR-1093: a stream that did not run to a clean
-                // upstream completion still consumed the prompt (and
-                // any reasoning) tokens; flag the spend as wasted so
-                // the ledger's waste detectors can see it. The billing
-                // event above still records the real spend; this is an
-                // additional waste marker, not a double count of cost.
-                // A stream cut short by an output guardrail or the
-                // stream-safety classifier is `validation_failed`
-                // (spend that produced a rejected outcome); any other
-                // incomplete close is an `abandoned_stream` (client
-                // cancel or upstream truncation).
-                let stream_waste_kind = if output_guard_blocked || safety_blocked {
-                    Some(sbproxy_ai::ai_metrics::WasteKind::ValidationFailed)
-                } else if !upstream_complete {
-                    Some(sbproxy_ai::ai_metrics::WasteKind::AbandonedStream)
-                } else {
-                    None
-                };
-                if let Some(kind) = stream_waste_kind {
-                    sbproxy_ai::ai_metrics::record_waste(
-                        kind,
-                        args.provider_name,
-                        args.model,
-                        args.surface_label,
-                        &args.attribution_tags,
-                        prompt.saturating_add(completion),
-                        cost,
-                    );
-                }
-
-                // WOR-895: TTFT + output throughput. TTFT only when the
-                // upstream actually sent at least one chunk; throughput
-                // requires both completion tokens and a measurable
-                // generation window (first_token -> now). Both are
-                // recorded against the same provider/model labels the
-                // billing event used.
-                let stream_end = std::time::Instant::now();
-                if let Some(ft) = first_token_at {
-                    let ttft_secs = ft.duration_since(stream_started).as_secs_f64();
-                    sbproxy_ai::ai_metrics::record_ttft(args.provider_name, args.model, ttft_secs);
-                    let gen_secs = stream_end.duration_since(ft).as_secs_f64();
-                    if completion > 0 && gen_secs > 0.0 {
-                        let tps = completion as f64 / gen_secs;
-                        sbproxy_ai::ai_metrics::record_output_throughput(
-                            args.provider_name,
-                            args.model,
-                            tps,
-                        );
-                    }
-                    // WOR-1873: average inter-token latency (TPOT) over
-                    // the same generation window, so TTFT / TPOT /
-                    // throughput describe one consistent stream. Needs
-                    // at least two tokens to define a gap.
-                    if completion > 1 && gen_secs > 0.0 {
-                        let itl = gen_secs / (completion - 1) as f64;
-                        sbproxy_ai::ai_metrics::record_inter_token_latency(
-                            args.provider_name,
-                            args.model,
-                            itl,
-                        );
-                    }
-                }
-            }
-        }
-    } else if let Some(parser) = usage_parser.as_ref() {
-        // WOR-798: no-budget streaming path. Still feed the router's
-        // per-provider token counter so `LeastTokenUsage` /
-        // `TokenRate` see streaming load even when the origin opted
-        // out of budgets. Mirrors the unary no-budget branch in
-        // `relay_ai_response_with_cache`.
-        if (200..300).contains(&status) {
-            if let Some(tokens) = parser.snapshot() {
-                router_sink.record(tokens.prompt_tokens as u64 + tokens.completion_tokens as u64);
-            }
-        }
-    }
-
-    // WOR-2312: charge the streamed response's aggregated token usage
-    // into the agent_budget hourly window. Streaming usage is only
-    // known here, at end of stream, where the budget and router
-    // accounting above read the same parser snapshot; the context
-    // sinks drain on first charge, so the logging-phase seam (which
-    // covers buffered responses) cannot charge this stream twice. A
-    // stream with no parseable usage frame leaves the sinks for the
-    // logging phase, which drains them with zero.
-    if (200..300).contains(&status) {
-        if let Some(tokens) = usage_parser.as_ref().and_then(|parser| parser.snapshot()) {
-            if let Some(c) = ctx.as_mut() {
-                c.charge_agent_budget_tokens(
-                    (tokens.prompt_tokens as u64).saturating_add(tokens.completion_tokens as u64),
-                );
-            }
-        }
-    }
-
     Ok(())
+}
+
+/// Settle a streamed AI response, exactly once, on every way out of the
+/// relay (WOR-2622).
+///
+/// Every terminal path of [`relay_ai_stream_frames`] arrives here: a
+/// clean close, an upstream truncation or error, a guardrail or
+/// stream-safety cut, a downstream write failure, and any other relay
+/// error. This is the one place a stream's usage becomes a number, and
+/// every consumer reads that same number: the cluster-shared counters,
+/// the router's per-provider token signal, the billing event and its
+/// budget debit, the governance lease, the tokens-per-minute
+/// reservation, the agent budget, and the `RequestContext` fields the
+/// access log, the usage sinks and the payment bridge read at request
+/// end.
+///
+/// Three defects this closes, each a version of the same shape:
+///
+/// * A stream whose client hung up left the relay on `?` before the old
+///   settlement, so a provider's terminal usage frame that had already
+///   been parsed was thrown away and the reservation refunded in full.
+/// * A stream whose provider never emitted a usage frame recorded
+///   nothing at all, so repeated `stream: true` calls without
+///   `stream_options.include_usage` ran indefinitely against a token cap
+///   that never moved.
+/// * A clean stream with exact usage never stamped `ai_tokens_in` /
+///   `ai_tokens_out` / `ai_cost_usd_micros`, so the usage sinks and the
+///   payment bridge reported zero for work the provider had counted.
+///
+/// The fallback is what the other gateways do when a provider omits
+/// usage on the wire: prefer the last usage frame received, and
+/// otherwise count the assistant text that did arrive with the model's
+/// own tokenizer. LiteLLM records partial spend for an interrupted
+/// stream on that basis; Portkey counts the reassembled completion the
+/// same way.
+///
+/// Where an estimate and a measurement are deliberately not
+/// interchangeable: the [`sbproxy_ai::budget::AiBillingEvent`] carries
+/// measured usage only, which is its documented invariant, because it is
+/// serialized onto the observability bus and into spend reports. An
+/// estimated stream therefore debits the cap through
+/// [`sbproxy_ai::budget::TokenDebit::Estimated`] and reports its token
+/// counts on the request context, but prices no cost: a cost the
+/// provider never reported is not one this gateway invents.
+/// `sbproxy_ai_usage_parse_miss_total` is the operator's signal that a
+/// stream took that branch.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_ai_stream_usage(
+    acct: &mut StreamAccounting,
+    termination: StreamTermination,
+    ctx: &mut Option<&mut RequestContext>,
+    budget_recorder: Option<&BudgetRecorderArgs<'_>>,
+    router_sink: &RouterTokenSink<'_>,
+    ai_span: &tracing::Span,
+    estimate_model: &str,
+) {
+    let provider = router_sink.provider_name;
+    if !termination.is_complete() {
+        // Everything reaching the relay has already been committed to a
+        // provider, so a stream that did not run to its natural end can
+        // never be failed over and this counter is where that failure is
+        // visible. It used to sit ahead of the relay's close-out writes
+        // precisely because a failed write skipped everything after
+        // them; here it cannot be skipped at all, and the disconnect is
+        // a cause an operator can select on.
+        let cause = acct.upstream_stream_error.unwrap_or(match termination {
+            StreamTermination::ClientDisconnected => "client_disconnected",
+            _ if acct.safety_blocked || acct.output_guard_blocked => "guardrail",
+            _ => "upstream_error",
+        });
+        sbproxy_ai::ai_metrics::record_stream_post_commit_failure(provider, cause);
+    }
+    if !(200..300).contains(&acct.status) {
+        return;
+    }
+
+    // Exact usage first. A snapshot of all zeros is the parser saying it
+    // saw a usage object with nothing in it, which is not a measurement.
+    let measured = acct
+        .usage_parser
+        .as_ref()
+        .and_then(|parser| parser.snapshot())
+        .filter(|tokens| tokens.prompt_tokens > 0 || tokens.completion_tokens > 0);
+    let (tokens, source) = match measured {
+        Some(tokens) => (tokens, StreamUsageSource::Measured),
+        None => {
+            let completion = acct
+                .output_estimator
+                .as_mut()
+                .map(|estimator| estimator.estimate_completion_tokens(estimate_model))
+                .unwrap_or(0);
+            if completion == 0 {
+                // No usage frame and no assistant text: the provider
+                // produced nothing measurable, so there is nothing to
+                // bill and the reservations refund correctly on drop.
+                (
+                    sbproxy_ai::UsageTokens::default(),
+                    StreamUsageSource::Absent,
+                )
+            } else {
+                let prompt = budget_recorder
+                    .and_then(|args| args.estimated_prompt_tokens)
+                    .or_else(|| ctx.as_deref().and_then(|c| c.ai_prompt_tokens_est))
+                    .unwrap_or(0);
+                (
+                    sbproxy_ai::UsageTokens::prompt_completion(
+                        u32::try_from(prompt).unwrap_or(u32::MAX),
+                        u32::try_from(completion).unwrap_or(u32::MAX),
+                    ),
+                    StreamUsageSource::Estimated,
+                )
+            }
+        }
+    };
+    let prompt = u64::from(tokens.prompt_tokens);
+    let completion = u64::from(tokens.completion_tokens);
+    if source == StreamUsageSource::Absent {
+        debug!(
+            provider = %provider,
+            outcome = %termination.as_str(),
+            usage_source = %source.as_str(),
+            "AI proxy: stream finalized with no usage to settle"
+        );
+        return;
+    }
+    if source == StreamUsageSource::Estimated {
+        let surface = budget_recorder
+            .map(|args| args.surface_label)
+            .or_else(|| ctx.as_deref().and_then(|c| c.ai_surface.as_deref()))
+            .unwrap_or("");
+        sbproxy_observe::metrics::record_ai_usage_parse_miss(provider, surface);
+    }
+
+    // Stamp the request context with measured usage. These are the
+    // fields the access log, the usage sinks, the key tokens-per-minute
+    // charge and the payment bridge read at request end, and no streamed
+    // response ever wrote them before this function existed.
+    //
+    // An estimate deliberately does not go here. These fields are the
+    // outward-facing report of what a caller used, the payment bridge
+    // turns them into an invoiced quantity, and they carry no provenance
+    // of their own, so writing this gateway's own count into them would
+    // invoice an estimate as though the provider had reported it. The
+    // buffered relay draws the same line for the same reason
+    // (`relay_ai_response_with_cache`, WOR-1146), and an estimated
+    // stream is visible instead on
+    // `sbproxy_ai_usage_parse_miss_total{provider, surface}`.
+    let measured_usage = source == StreamUsageSource::Measured;
+    if let Some(context) = ctx.as_deref_mut() {
+        if measured_usage {
+            context.ai_tokens_in = Some(prompt);
+            context.ai_tokens_out = Some(completion);
+            context.ai_tokens_cached =
+                (tokens.cache_read_tokens > 0).then_some(u64::from(tokens.cache_read_tokens));
+            context.ai_tokens_cache_write =
+                (tokens.cache_write_tokens > 0).then_some(u64::from(tokens.cache_write_tokens));
+        }
+        // WOR-232: settle the tokens-per-minute reservation against what
+        // the stream used. Streaming never reconciled, so every streamed
+        // reservation was refunded in full on drop and a caller could
+        // stream past a token-rate cap indefinitely. The estimate is
+        // allowed here because a reservation is this gateway's own
+        // enforcement rather than a report to anyone; it was taken from
+        // the same request-path estimate in the first place.
+        if let Some(admission) = context.ai_admission.take() {
+            admission.reconcile(prompt);
+        }
+    }
+    if measured_usage {
+        sbproxy_ai::tracing_spans::record_token_usage(ai_span, prompt, completion);
+    }
+    // WOR-798: the router's per-provider token counter, so streamed
+    // responses feed `LeastTokenUsage` / `TokenRate` like unary ones.
+    router_sink.record(prompt.saturating_add(completion));
+
+    let mut cost_micros = 0_u64;
+    if let Some(args) = budget_recorder {
+        // WOR-1722: mirror into the cluster-shared counters so other
+        // replicas enforce against this spend.
+        super::budget_share::record_shared_budget_usage(
+            args.config,
+            args.keys,
+            args.model,
+            prompt,
+            completion,
+        )
+        .await;
+        let (usage, debit) = match source {
+            StreamUsageSource::Measured => (
+                sbproxy_ai::budget::AiUsage::Tokens {
+                    input: prompt,
+                    output: completion,
+                    cached_input: u64::from(tokens.cache_read_tokens),
+                    cache_creation: u64::from(tokens.cache_write_tokens),
+                },
+                sbproxy_ai::budget::TokenDebit::Measured,
+            ),
+            _ => (
+                sbproxy_ai::budget::AiUsage::PerCall,
+                sbproxy_ai::budget::TokenDebit::Estimated(prompt.saturating_add(completion)),
+            ),
+        };
+        let cost = sbproxy_ai::budget::estimate_cost_for_usage(args.model, &usage);
+        let scope_keys = args.keys.iter().map(|(_, k)| k.clone()).collect::<Vec<_>>();
+        // WOR-2212: the local debit lives inside `record_billing_event`,
+        // reached through this call, so this stays the single writer.
+        cost_micros = emit_ai_billing_event(
+            &args.origin,
+            args.surface_label,
+            args.provider_name,
+            Some(args.model.to_string()),
+            usage,
+            cost,
+            scope_keys,
+            &args.attribution_tags,
+            args.tenant_id.as_str(),
+            args.api_key_id.as_str(),
+            &args.rollup_properties,
+            args.agent_identity(),
+            ai_span,
+            debit,
+        );
+        refresh_budget_utilization(args.config, args.keys);
+        // WOR-1093: a stream that did not close cleanly still consumed
+        // the prompt; flag the spend so the ledger's waste detectors see
+        // it. The billing event above records the real spend, this is an
+        // additional marker rather than a second charge. A guardrail or
+        // safety cut is `validation_failed` (spend that produced a
+        // rejected outcome); every other incomplete close, client
+        // disconnect included, is an `abandoned_stream`.
+        let waste_kind = if acct.output_guard_blocked || acct.safety_blocked {
+            Some(sbproxy_ai::ai_metrics::WasteKind::ValidationFailed)
+        } else if !termination.is_complete() {
+            Some(sbproxy_ai::ai_metrics::WasteKind::AbandonedStream)
+        } else {
+            None
+        };
+        if let Some(kind) = waste_kind {
+            sbproxy_ai::ai_metrics::record_waste(
+                kind,
+                args.provider_name,
+                args.model,
+                args.surface_label,
+                &args.attribution_tags,
+                prompt.saturating_add(completion),
+                cost,
+            );
+        }
+        // WOR-895 / WOR-1873: TTFT, output throughput and average
+        // inter-token latency over the same generation window, against
+        // the labels the billing event used.
+        if let Some(first_token) = acct.first_token_at {
+            let ttft_secs = first_token
+                .duration_since(acct.stream_started)
+                .as_secs_f64();
+            sbproxy_ai::ai_metrics::record_ttft(args.provider_name, args.model, ttft_secs);
+            let gen_secs = std::time::Instant::now()
+                .duration_since(first_token)
+                .as_secs_f64();
+            if completion > 0 && gen_secs > 0.0 {
+                sbproxy_ai::ai_metrics::record_output_throughput(
+                    args.provider_name,
+                    args.model,
+                    completion as f64 / gen_secs,
+                );
+            }
+            if completion > 1 && gen_secs > 0.0 {
+                sbproxy_ai::ai_metrics::record_inter_token_latency(
+                    args.provider_name,
+                    args.model,
+                    gen_secs / (completion - 1) as f64,
+                );
+            }
+        }
+    }
+
+    if let Some(context) = ctx.as_deref_mut() {
+        if cost_micros > 0 {
+            context.ai_cost_usd_micros = Some(cost_micros);
+        }
+        // WOR-1835: settle the governed-key reservation with the same
+        // figures just recorded. Best-effort: the lease's `Drop` repairs
+        // a failed settle.
+        if let Some(mut lease) = context.governance_lease.take() {
+            let _ = lease
+                .settle(prompt.saturating_add(completion), cost_micros)
+                .await;
+        }
+        // WOR-2312: charge the agent_budget hourly window. The context
+        // sinks drain on first charge, so the logging-phase seam that
+        // covers buffered responses cannot charge this stream twice.
+        context.charge_agent_budget_tokens(prompt.saturating_add(completion));
+    }
+
+    debug!(
+        provider = %provider,
+        model = %estimate_model,
+        outcome = %termination.as_str(),
+        usage_source = %source.as_str(),
+        prompt_tokens = %prompt,
+        completion_tokens = %completion,
+        cost_usd_micros = %cost_micros,
+        "AI proxy: streaming usage finalized"
+    );
 }
 
 /// WOR-798: extract a stable prefix key from an AI chat / completion
@@ -20890,6 +21290,591 @@ mod external_guardrail_context_tests {
     // external guardrails and has long since stopped being only about
     // them. The qualifier is what a CI failure line shows, so these read
     // as what they are.
+    /// WOR-2622: what a streamed response is billed, and what its
+    /// receipt says, when the stream does not end the way the happy
+    /// path assumes.
+    ///
+    /// Every test here drives a whole `handle_ai_proxy` dispatch over a
+    /// live loopback socket pair against a provider fixture that speaks
+    /// real SSE, because the thing under test is the seam between the
+    /// relay's exits and the settlement, and an in-process call to the
+    /// relay would not have a downstream write that can fail.
+    mod stream_usage_finalizer_tests {
+        use super::*;
+
+        /// One SSE frame, already wrapped in its `data:` envelope.
+        fn sse(payload: &str) -> String {
+            format!("data: {payload}\n\n")
+        }
+
+        /// A content delta carrying `text`.
+        fn content_frame(text: &str) -> String {
+            sse(&format!(
+                r#"{{"choices":[{{"index":0,"delta":{{"content":"{text}"}}}}]}}"#
+            ))
+        }
+
+        /// The provider's terminal usage frame.
+        fn usage_frame(prompt: u64, completion: u64) -> String {
+            sse(&format!(
+                r#"{{"choices":[],"usage":{{"prompt_tokens":{prompt},"completion_tokens":{completion}}}}}"#
+            ))
+        }
+
+        /// What a streaming provider fixture saw happen to its
+        /// connection.
+        #[derive(Debug, PartialEq, Eq)]
+        enum StreamUpstreamOutcome {
+            /// The gateway stopped reading before the fixture ran out of
+            /// frames, which is the generation not being paid for past
+            /// the point the client left.
+            Abandoned,
+            /// The fixture wrote everything it had and closed.
+            Completed,
+        }
+
+        struct StreamUpstream {
+            /// Fires once the fixture has written `announce_after`
+            /// frames, so a test can act at a known point in the stream.
+            announced: tokio::sync::oneshot::Receiver<()>,
+            outcome: tokio::task::JoinHandle<StreamUpstreamOutcome>,
+        }
+
+        /// A provider that streams `frames` and then, if `filler` is
+        /// non-zero, keeps emitting content frames until one of its
+        /// writes fails.
+        ///
+        /// The filler is what makes a downstream disconnect observable:
+        /// a socket absorbs the first few kilobytes whatever the peer
+        /// does, so a relay only learns the client is gone by trying to
+        /// write after the reset has landed. `Abandoned` therefore means
+        /// the gateway really did stop consuming this generation.
+        async fn streaming_upstream_fixture(
+            frames: Vec<String>,
+            announce_after: usize,
+            filler: usize,
+        ) -> (String, StreamUpstream) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind streaming upstream fixture");
+            let address = listener.local_addr().expect("streaming upstream address");
+            let (announce, announced) = tokio::sync::oneshot::channel();
+            let outcome = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept upstream request");
+                drain_upstream_request(&mut stream).await;
+                let header = "HTTP/1.1 200 Fixture\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n";
+                if stream.write_all(header.as_bytes()).await.is_err() {
+                    return StreamUpstreamOutcome::Abandoned;
+                }
+                let mut announce = Some(announce);
+                for (index, frame) in frames.iter().enumerate() {
+                    if stream.write_all(frame.as_bytes()).await.is_err() {
+                        return StreamUpstreamOutcome::Abandoned;
+                    }
+                    let _ = stream.flush().await;
+                    if index + 1 == announce_after {
+                        if let Some(tx) = announce.take() {
+                            let _ = tx.send(());
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                if let Some(tx) = announce.take() {
+                    let _ = tx.send(());
+                }
+                for _ in 0..filler {
+                    let frame = content_frame("filler");
+                    if stream.write_all(frame.as_bytes()).await.is_err() {
+                        return StreamUpstreamOutcome::Abandoned;
+                    }
+                    if stream.flush().await.is_err() {
+                        return StreamUpstreamOutcome::Abandoned;
+                    }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                let _ = stream.shutdown().await;
+                if filler > 0 {
+                    // The fixture ran its whole filler budget without a
+                    // failed write, so the gateway was still relaying.
+                    StreamUpstreamOutcome::Completed
+                } else {
+                    StreamUpstreamOutcome::Completed
+                }
+            });
+            (
+                format!("http://{address}/v1"),
+                StreamUpstream { announced, outcome },
+            )
+        }
+
+        /// A downstream client that reads the streamed response and
+        /// breaks its connection when the test says so.
+        ///
+        /// `SO_LINGER` at zero turns the close into an RST rather than a
+        /// FIN, which is the shape a relay's next write actually fails
+        /// on. A half-close would leave the gateway writing into a
+        /// socket that is still reading, which is the case WOR-2690
+        /// deliberately does not treat as a departure.
+        async fn streaming_downstream_session(
+            body: serde_json::Value,
+        ) -> (Session, tokio::sync::oneshot::Sender<()>, DownstreamClient) {
+            let body = serde_json::to_vec(&body).expect("request JSON");
+            let mut wire = format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: ai.test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            wire.extend_from_slice(&body);
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind downstream fixture");
+            let address = listener.local_addr().expect("downstream address");
+            let (close, mut closed) = tokio::sync::oneshot::channel::<()>();
+            let mut client = DownstreamClient::new(tokio::spawn(async move {
+                let mut stream = tokio::net::TcpStream::connect(address)
+                    .await
+                    .expect("connect downstream fixture");
+                stream.write_all(&wire).await.expect("write request");
+                let mut response = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut closed => {
+                            #[allow(deprecated)]
+                            let _ = stream.set_linger(Some(Duration::ZERO));
+                            return response;
+                        }
+                        read = stream.read(&mut chunk) => match read {
+                            Ok(0) | Err(_) => return response,
+                            Ok(read) => response.extend_from_slice(&chunk[..read]),
+                        },
+                    }
+                }
+            }));
+            let (stream, _) =
+                match tokio::time::timeout(Duration::from_secs(2), listener.accept()).await {
+                    Ok(Ok(accepted)) => accepted,
+                    Ok(Err(error)) => {
+                        client.abort_and_wait().await;
+                        panic!("accept downstream request: {error}");
+                    }
+                    Err(error) => {
+                        client.abort_and_wait().await;
+                        panic!("accept downstream request timed out: {error:?}");
+                    }
+                };
+            let mut session = Session::new_h1(Box::new(Stream::from(stream)));
+            match tokio::time::timeout(
+                Duration::from_secs(2),
+                session.as_downstream_mut().read_request(),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    client.abort_and_wait().await;
+                    panic!("parse downstream request: {error}");
+                }
+                Err(error) => {
+                    client.abort_and_wait().await;
+                    panic!("parse downstream request timed out: {error:?}");
+                }
+            }
+            (session, close, client)
+        }
+
+        fn stream_probe_config(upstream_url: &str) -> sbproxy_ai::AiHandlerConfig {
+            sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+                "providers": [{
+                    "name": "openai",
+                    "provider_type": "openai",
+                    "base_url": upstream_url,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key"
+                }],
+                // Pinned rather than left on `auto`, which resolves a
+                // loopback host to the generic parser: the test is about
+                // what the finalizer does with a snapshot, not about
+                // which parser produced it.
+                "usage_parser": "openai"
+            }))
+            .expect("single-provider streaming fixture config")
+        }
+
+        /// The same fixture origin with a token cap that blocks.
+        ///
+        /// `origin` scope so the key is this test's hostname and nothing
+        /// else, and `total` so the cap is cumulative rather than
+        /// windowed: the process-wide tracker is shared, and a windowed
+        /// key would make the assertion depend on which second the test
+        /// ran in.
+        fn stream_capped_config(
+            upstream_url: &str,
+            max_tokens: u64,
+        ) -> sbproxy_ai::AiHandlerConfig {
+            sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+                "providers": [{
+                    "name": "openai",
+                    "provider_type": "openai",
+                    "base_url": upstream_url,
+                    "allow_private_base_url": true,
+                    "api_key": "fixture-key"
+                }],
+                "usage_parser": "openai",
+                "budget": {
+                    "limits": [{
+                        "scope": "origin",
+                        "max_tokens": max_tokens,
+                        "period": "total"
+                    }],
+                    "on_exceed": "block"
+                }
+            }))
+            .expect("capped streaming fixture config")
+        }
+
+        fn stream_probe_request() -> serde_json::Value {
+            serde_json::json!({
+                "model": "gpt-4o-mini",
+                "stream": true,
+                "messages": [{"role": "user", "content": "fixture prompt for the stream"}]
+            })
+        }
+
+        /// Seam: the relay's downstream write, and the settlement that
+        /// used to sit behind it.
+        ///
+        /// A client that hangs up mid-stream fails the relay's next
+        /// write. Every one of those writes propagates with `?`, and the
+        /// settlement was after the loop, so the exact usage the
+        /// provider had already sent was parsed and then dropped on the
+        /// floor: no context stamp, no budget debit, a reservation
+        /// refunded in full, and a receipt that priced the call as
+        /// delivered because a pingora write error carries no error
+        /// source.
+        #[tokio::test]
+        async fn a_client_that_hangs_up_mid_stream_still_settles_what_it_received() {
+            let frames = vec![
+                content_frame("hello"),
+                usage_frame(11, 7),
+                content_frame("more"),
+            ];
+            let (upstream_url, upstream) = streaming_upstream_fixture(frames, 2, 3000).await;
+            let config = stream_probe_config(&upstream_url);
+            let pipeline = crate::pipeline::CompiledPipeline::default();
+            let (mut session, close, client) =
+                streaming_downstream_session(stream_probe_request()).await;
+            let mut context = crate::context::RequestContext::new();
+
+            let StreamUpstream { announced, outcome } = upstream;
+            let dispatch = super::super::handle_ai_proxy(
+                &mut session,
+                &config,
+                &pipeline,
+                "ai.test",
+                &mut context,
+                None,
+            );
+            let walk_away = async {
+                let _ = announced.await;
+                // The usage frame is on the wire. Whatever the relay
+                // writes next is written into a broken connection.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let _ = close.send(());
+            };
+            let (result, ()) = tokio::join!(dispatch, walk_away);
+
+            let error = result.expect_err("a stream whose client is gone cannot succeed");
+            assert_eq!(
+                *error.esource(),
+                pingora_error::ErrorSource::Downstream,
+                "a failed relay write is the client's failure, not the provider's: {error}"
+            );
+            assert!(
+                crate::server::proxy_http::client_disconnected(
+                    Some(error.esource().clone()),
+                    crate::server::proxy_http::downstream_half_closed(&session),
+                ),
+                "the abandoned stream must settle as client_disconnected, not as a delivered sale"
+            );
+            assert_eq!(
+                context.ai_tokens_in,
+                Some(11),
+                "the usage frame arrived before the disconnect, so its prompt count must survive"
+            );
+            assert_eq!(
+                context.ai_tokens_out,
+                Some(7),
+                "the usage frame arrived before the disconnect, so its output count must survive"
+            );
+            let observed = tokio::time::timeout(Duration::from_secs(10), outcome)
+                .await
+                .expect("the provider connection settles once the client is gone")
+                .expect("streaming upstream fixture");
+            assert_eq!(
+                observed,
+                StreamUpstreamOutcome::Abandoned,
+                "the upstream body must be dropped, not left draining"
+            );
+            drop(session);
+            drop(client);
+        }
+
+        /// Seam: the context fields every usage consumer reads.
+        ///
+        /// A clean stream with an exact usage frame debited the budget
+        /// and never wrote `ai_tokens_in` / `ai_tokens_out`, so the
+        /// access log, the usage sinks and the payment bridge all
+        /// reported zero tokens for a request the provider had counted
+        /// precisely.
+        #[tokio::test]
+        async fn a_clean_stream_stamps_the_usage_its_consumers_read() {
+            let frames = vec![
+                content_frame("hello"),
+                content_frame(" world"),
+                usage_frame(23, 5),
+                sse("[DONE]"),
+            ];
+            let (upstream_url, upstream) = streaming_upstream_fixture(frames, 4, 0).await;
+            let config = stream_probe_config(&upstream_url);
+            let pipeline = crate::pipeline::CompiledPipeline::default();
+            let (mut session, close, client) =
+                streaming_downstream_session(stream_probe_request()).await;
+            let mut context = crate::context::RequestContext::new();
+
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                super::super::handle_ai_proxy(
+                    &mut session,
+                    &config,
+                    &pipeline,
+                    "ai.test",
+                    &mut context,
+                    None,
+                ),
+            )
+            .await
+            .expect("the stream completes");
+            result.expect("a clean stream is served");
+
+            assert_eq!(
+                context.ai_tokens_in,
+                Some(23),
+                "the provider's prompt count has to reach the request context"
+            );
+            assert_eq!(
+                context.ai_tokens_out,
+                Some(5),
+                "the provider's output count has to reach the request context"
+            );
+            let _ = close.send(());
+            let _ = tokio::time::timeout(Duration::from_secs(5), upstream.outcome).await;
+            drop(session);
+            drop(client);
+        }
+
+        /// Seam: a 2xx stream that carried no usage frame at all.
+        ///
+        /// OpenAI and Azure omit usage from a stream unless the caller
+        /// asks for `stream_options.include_usage`, and this gateway
+        /// does not ask. Without a fallback the parser snapshot is
+        /// `None`, nothing is recorded, and the ticket's headline
+        /// scenario follows: ordinary `stream: true` calls succeed
+        /// forever against a token cap that never moves.
+        ///
+        /// The cap is the assertion because it is the consequence. A
+        /// second identical stream has to be refused, which it can only
+        /// be if the first one debited something.
+        #[tokio::test]
+        async fn repeated_usage_less_streams_still_trip_the_token_cap() {
+            const CAP: u64 = 20;
+            let frames = || {
+                vec![
+                    content_frame("the quick brown fox jumps over the lazy dog"),
+                    content_frame(" and then keeps going for a good while longer"),
+                    sse("[DONE]"),
+                ]
+            };
+            // The origin scope key is this hostname, so the shared
+            // process-wide tracker cannot be moved by another test.
+            let hostname = "usage-less-stream-cap.test";
+            let pipeline = crate::pipeline::CompiledPipeline::default();
+
+            let (first_url, first_upstream) = streaming_upstream_fixture(frames(), 3, 0).await;
+            let config = stream_capped_config(&first_url, CAP);
+            let (mut session, close, client) =
+                streaming_downstream_session(stream_probe_request()).await;
+            let mut context = crate::context::RequestContext::new();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                super::super::handle_ai_proxy(
+                    &mut session,
+                    &config,
+                    &pipeline,
+                    hostname,
+                    &mut context,
+                    None,
+                ),
+            )
+            .await
+            .expect("the first stream completes")
+            .expect("the first stream is served");
+            let _ = close.send(());
+            let _ = tokio::time::timeout(Duration::from_secs(5), first_upstream.outcome).await;
+            drop(session);
+            drop(client);
+
+            let (second_url, second_upstream) = streaming_upstream_fixture(frames(), 3, 0).await;
+            let config = stream_capped_config(&second_url, CAP);
+            let (mut session, close, client) =
+                streaming_downstream_session(stream_probe_request()).await;
+            let mut context = crate::context::RequestContext::new();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                super::super::handle_ai_proxy(
+                    &mut session,
+                    &config,
+                    &pipeline,
+                    hostname,
+                    &mut context,
+                    None,
+                ),
+            )
+            .await
+            .expect("the second request is answered")
+            .expect("a budget refusal is a served response, not a relay error");
+            // Close the gateway side rather than the client side: the
+            // client fixture returns whatever it has buffered the moment
+            // it is told to break the connection, which can be nothing.
+            // Dropping the session ends the client's read with `Ok(0)`
+            // after the refusal has been written.
+            drop(session);
+            let answer = live_downstream_body(client).await;
+            drop(close);
+            let answer = String::from_utf8_lossy(&answer);
+            assert!(
+                answer.starts_with("HTTP/1.1 402"),
+                "the first usage-less stream has to spend the cap, so the second is refused: \
+                 {answer}"
+            );
+            // The refusal happens before dispatch, so the second
+            // fixture is never called.
+            second_upstream.outcome.abort();
+        }
+
+        /// The classifier the disconnect attribution rests on, held to
+        /// account directly.
+        ///
+        /// It reads one thing, the pingora `ErrorType`, so what it can
+        /// and cannot see is worth pinning: the four types a `Session`
+        /// write produces are the client leaving, and the two the relay
+        /// raises itself are not. Invert either half and this fails.
+        #[test]
+        fn only_a_session_write_failure_reads_as_the_client_leaving() {
+            use pingora_error::{Error, ErrorType};
+
+            for etype in [
+                ErrorType::WriteError,
+                ErrorType::WriteTimedout,
+                ErrorType::ConnectionClosed,
+                ErrorType::H2Error,
+            ] {
+                let error = Error::explain(etype.clone(), "fixture");
+                assert!(
+                    super::super::stream_write_failed_downstream(&error),
+                    "{etype:?} comes out of a downstream write and nothing else in this relay"
+                );
+            }
+            for etype in [
+                ErrorType::HTTPStatus(503),
+                ErrorType::InternalError,
+                ErrorType::ReadError,
+                ErrorType::ConnectTimedout,
+            ] {
+                let error = Error::explain(etype.clone(), "fixture");
+                assert!(
+                    !super::super::stream_write_failed_downstream(&error),
+                    "{etype:?} is the relay's own failure or the upstream's, not the client's"
+                );
+            }
+        }
+
+        /// The streaming twin of
+        /// `a_non_streaming_dispatch_fits_a_pingora_worker_stack`.
+        ///
+        /// The relay gained a frame: `relay_ai_stream` now calls
+        /// `relay_ai_stream_frames` and settles after it returns, so the
+        /// chunk loop and everything it awaits sit one call deeper than
+        /// they did. Pingora workers are std threads with the default
+        /// 2 MiB stack and `#[tokio::test]` is not, which is how
+        /// WOR-2165's overflow on the sibling path shipped green. This
+        /// runs a whole streamed dispatch, header write, chunk loop,
+        /// close-out and settlement, on a worker-sized thread.
+        ///
+        /// A stack overflow aborts rather than unwinding, so the failure
+        /// here is the test binary dying with a signal, which is louder
+        /// than an assertion. The dev profile spills more locals than
+        /// release, so a pass is the stricter answer.
+        ///
+        /// What it still cannot see: the fixture provider is local
+        /// plaintext, so no TLS frames sit on this stack, and no
+        /// guardrail, translator or holdback session is wired, each of
+        /// which adds its own locals to the loop.
+        #[test]
+        fn a_streaming_dispatch_fits_a_pingora_worker_stack() {
+            const PINGORA_WORKER_STACK: usize = 2 * 1024 * 1024;
+
+            let worker = std::thread::Builder::new()
+                .stack_size(PINGORA_WORKER_STACK)
+                .spawn(|| {
+                    // `new_current_thread` drives the future on *this*
+                    // thread, so the sized stack is the one the relay is
+                    // polled on.
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("current-thread runtime");
+                    runtime.block_on(async {
+                        let frames =
+                            vec![content_frame("hello"), usage_frame(11, 7), sse("[DONE]")];
+                        let (upstream_url, upstream) =
+                            streaming_upstream_fixture(frames, 3, 0).await;
+                        let config = stream_probe_config(&upstream_url);
+                        let pipeline = crate::pipeline::CompiledPipeline::default();
+                        let (mut session, close, client) =
+                            streaming_downstream_session(stream_probe_request()).await;
+                        let mut context = crate::context::RequestContext::new();
+
+                        super::super::handle_ai_proxy(
+                            &mut session,
+                            &config,
+                            &pipeline,
+                            "ai.test",
+                            &mut context,
+                            None,
+                        )
+                        .await
+                        .expect("the streamed dispatch completes on a worker-sized stack");
+                        assert_eq!(
+                            context.ai_tokens_out,
+                            Some(7),
+                            "the settlement has to run on that stack too, not just the loop"
+                        );
+                        let _ = close.send(());
+                        let _ = upstream.outcome.await;
+                        drop(session);
+                        drop(client);
+                    });
+                })
+                .expect("spawn a worker-sized thread");
+
+            worker
+                .join()
+                .expect("a streamed AI request must fit a 2 MiB Pingora worker stack");
+        }
+    }
     mod client_disconnect_tests {
         use super::*;
 
