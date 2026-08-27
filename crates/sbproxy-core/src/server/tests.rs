@@ -4875,6 +4875,23 @@ fn map_upstream_failure_translates_pingora_etype_to_status_and_token() {
         super::map_upstream_failure(&e),
         (502, Some("http_request_error"))
     );
+    // WOR-2685: an AI cascade the credential's provider policy locked
+    // out carries its own closed token, so a caller can tell "your
+    // credential cannot reach that provider" from "our upstream is
+    // down" without being told which providers the credential does
+    // reach. Any other custom etype stays on the catch-all.
+    let e = Error::new(ErrorType::Custom(
+        super::ai_support::CREDENTIAL_PROVIDER_LOCKED_TOKEN,
+    ));
+    assert_eq!(
+        super::map_upstream_failure(&e),
+        (502, Some("credential_provider_locked"))
+    );
+    let e = Error::new(ErrorType::Custom("some_other_custom_etype"));
+    assert_eq!(
+        super::map_upstream_failure(&e),
+        (502, Some("http_request_error"))
+    );
 }
 
 // --- WOR-229: native bypass body helper ---
@@ -6656,4 +6673,52 @@ async fn ldap_auth_missing_credentials_denies_with_401() {
         "missing credentials must refuse with 401, got {result:?}"
     );
     assert!(principal.is_none());
+}
+
+/// WOR-2687: the header phase must not publish a terminal `allow` for a
+/// policy whose real decision happens in the request-body phase.
+///
+/// `OpenApiValidationEnforcer::enforce` returns `Allow` unconditionally
+/// because all it does at that phase is arm body buffering, so before
+/// this change a request the body phase went on to refuse carried two
+/// contradicting `policy_verdict_event` records keyed identically on
+/// `(request_id, policy_id)`, and the natural SIEM query for "which
+/// requests did `openapi_validation` admit" matched every request it
+/// denied.
+///
+/// The negative halves are the load-bearing halves. Suppressing a
+/// header-phase record that no body phase republishes deletes a
+/// decision instead of de-duplicating one, and that can arrive on
+/// either axis: a sibling built-in that refuses in the body phase
+/// without emitting there, or a plugin bundle that names its hook after
+/// a built-in policy.
+#[test]
+fn wor_2687_only_policies_that_emit_in_the_body_phase_skip_the_header_verdict() {
+    use sbproxy_observe::events::PolicySurface;
+
+    assert!(
+        emits_own_verdict_in_body_phase(PolicySurface::BuiltIn, "openapi_validation"),
+        "the body phase publishes this policy's verdict, so the header phase must not"
+    );
+    for policy_id in [
+        "request_validator",
+        "content_digest",
+        "body_threat_protection",
+        "prompt_injection_v2",
+        "a2a",
+        "rate_limit",
+        "waf",
+    ] {
+        assert!(
+            !emits_own_verdict_in_body_phase(PolicySurface::BuiltIn, policy_id),
+            "{policy_id} publishes no verdict from the body phase; suppressing its \
+             header-phase record would delete the decision, not de-duplicate it"
+        );
+    }
+    assert!(
+        !emits_own_verdict_in_body_phase(PolicySurface::Plugin, "openapi_validation"),
+        "a plugin or bundle hook may call itself anything, including a built-in policy \
+         name; nothing republishes its verdict in the body phase, so it keeps the only \
+         record it has"
+    );
 }

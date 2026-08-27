@@ -1099,6 +1099,17 @@ pub(super) fn ai_outcome_label(
             // ceiling trimmed, and a real exhaustion on a
             // ceiling-enabled origin cannot be told apart from them.
             "price_ceiling_block" => "price_ceiling_block",
+            // WOR-2685: a cascade whose every tier the calling
+            // credential's provider policy excluded returns 502, and
+            // the status arm below reads any 5xx as `upstream_5xx`. No
+            // upstream was contacted: the refusal is the gateway's, on
+            // a condition that will not heal by itself. Without its own
+            // value it lands in `upstream_5xx` beside real provider
+            // outages, so an operator paging on those is woken by a
+            // credential whose provider policy drifted away from its
+            // routing plan, and the alert this PR's own changelog and
+            // troubleshooting entry tell them to write matches nothing.
+            "credential_provider_lock" => "credential_provider_lock",
             "refusal" => "refusal",
             _ => "other",
         };
@@ -1555,6 +1566,36 @@ mod outcome_tests {
         // An unknown override degrades to `other` rather than leaking an
         // unbounded label.
         assert_eq!(ai_outcome_label(200, Some("bogus"), false), "other");
+    }
+
+    /// WOR-2685: the closed label an AI cascade's credential provider
+    /// lock is broken down by, on `sbproxy_ai_requests_attributed_total`,
+    /// on `sbproxy_ai_gateway_decisions_total`'s rejection reason, and
+    /// in the durable usage rollup. Stamping `ctx.ai_outcome` is only
+    /// half the wiring: an override this match does not name falls
+    /// through to `other`, which is where every unclassified outcome
+    /// already is, so the series an operator alerts on would stay empty
+    /// forever while the requests piled up somewhere unreadable.
+    #[test]
+    fn outcome_label_separates_a_credential_provider_lock_from_an_upstream_failure() {
+        assert_eq!(
+            ai_outcome_label(502, None, true),
+            "upstream_5xx",
+            "a 502 with no override is still a plain upstream failure"
+        );
+        assert_eq!(
+            ai_outcome_label(502, Some("credential_provider_lock"), false),
+            "credential_provider_lock",
+            "a refusal the gateway made before contacting any provider must not read as an \
+             upstream outage"
+        );
+        // The second scrapeable surface the same label feeds: the
+        // rejection `reason` on `sbproxy_ai_gateway_decisions_total`.
+        assert_eq!(
+            ai_gateway_decision("credential_provider_lock", 0, true),
+            Some(("rejected", "credential_provider_lock")),
+            "a cascade that never reached a provider is a rejection, named by its own reason"
+        );
     }
 }
 

@@ -3355,6 +3355,222 @@ fn record_posture_refusal(
     );
 }
 
+/// The provider ids a failed cascade dispatch was locked out of by the
+/// calling credential's provider policy, or `None` when the cascade
+/// exhausted for any other reason (WOR-2685).
+///
+/// A named function rather than an inline `downcast_ref` chain so the
+/// disposition can be tested against an error the real cascade
+/// executor built, rather than against a hand-made one that could
+/// disagree with it.
+fn cascade_credential_lock_providers(error: &anyhow::Error) -> Option<String> {
+    error
+        .downcast_ref::<sbproxy_ai::CascadeExhausted>()
+        .filter(|exhausted| exhausted.is_credential_lock())
+        .map(|exhausted| exhausted.locked_providers().join(", "))
+}
+
+/// Stamp every operator-facing surface for a cascade that dispatched
+/// no tier because the credential's provider policy excluded all of
+/// them (WOR-2685).
+///
+/// The `Err` arm this serves used to write nothing to `ctx`, so the
+/// admin console's Routing Decisions row read the same blank it read
+/// before the diagnosis existed and the SIEM feed never learned a
+/// credential policy denied the request. The five surfaces here are
+/// the same ones [`record_posture_refusal`] stamps for the adjacent
+/// refusal class, for the same reason: a refusal that is not recorded
+/// is a refusal an operator cannot alert on.
+///
+/// A free function rather than an inline block because the cascade
+/// arm's frame sits on the Pingora worker's 2 MB stack; its locals
+/// belong in a frame of their own. `locked` is a rendered list of
+/// config-derived provider names, never caller-supplied text.
+fn record_cascade_credential_lock(
+    locked: &str,
+    method: &str,
+    ctx: &mut crate::context::RequestContext,
+) {
+    let detail = format!("credential_provider_lock: {locked}");
+    ctx.ai_outcome = Some("credential_provider_lock".to_string());
+    ctx.record_policy_decision("credential_provider_policy", "deny");
+    ctx.deny_reason = Some(detail.clone());
+    append_ai_route_reason(ctx, detail.clone());
+    sbproxy_observe::SecurityAuditEntry::policy_violation(
+        "credential_provider_policy",
+        detail,
+        502,
+        Some(ctx.hostname.to_string()),
+        ctx.client_ip,
+        Some(ctx.request_id.to_string()),
+        Some(method.to_string()),
+    )
+    .with_tenant_id(ctx.tenant_id.as_str())
+    .with_key_context(
+        ctx.native_key_provider.clone(),
+        ctx.inbound_key_mode.as_str(),
+    )
+    .with_api_key_id(ctx.accountable_key_id())
+    .emit();
+}
+
+#[cfg(test)]
+mod cascade_credential_lock_tests {
+    use super::*;
+
+    fn locked_cascade_config(allowed_to_dispatch: bool) -> sbproxy_ai::AiHandlerConfig {
+        sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "anthropic",
+                "provider_type": "anthropic",
+                "api_key": "test-key",
+                "base_url": "http://127.0.0.1:9",
+                "allow_private_base_url": allowed_to_dispatch
+            }],
+            "routing": {
+                "strategy": "cascade",
+                "tiers": [{
+                    "provider_id": "anthropic",
+                    "model": "claude-3-5-sonnet",
+                    "quality_threshold": 0.5
+                }]
+            }
+        }))
+        .expect("cascade fixture")
+    }
+
+    /// Exhaust a cascade through the entry point the `Err` arm under
+    /// test dispatches on, rather than through a simpler wrapper: the
+    /// classification this asserts on lives in the executor, and a
+    /// test that entered it by another door would not prove the door
+    /// production uses reaches the same place.
+    async fn exhaust_cascade(
+        config: &sbproxy_ai::AiHandlerConfig,
+        allowed_providers: &[String],
+    ) -> anyhow::Error {
+        let cascade = config.router().cascade_config().cloned().expect("cascade");
+        let body = serde_json::json!({
+            "model": "claude-3-5-sonnet",
+            "messages": [{"role": "user", "content": "ping"}]
+        });
+        let admission = sbproxy_ai::quota_pool::QuotaPoolAdmission::new(
+            None,
+            Ok(None),
+            Ok("virtual-key-a".to_string()),
+        );
+        sbproxy_ai::AiClient::new()
+            .forward_cascade_with_policy_and_quota_with_reasoning_eligibility(
+                config,
+                &cascade,
+                allowed_providers,
+                sbproxy_ai::CascadeBlockLists::credential_only(&[]),
+                "/v1/messages",
+                &body,
+                &sbproxy_ai::attribution::AttributionTags::default(),
+                "messages",
+                &admission,
+                "wor-2685:quota-pool:cascade",
+                sbproxy_ai::reasoning_eligibility(&body),
+            )
+            .await
+            .expect_err("this cascade cannot dispatch")
+    }
+
+    /// WOR-2685: the disposition seam. The cascade `Err` arm treats a
+    /// credential provider lock as a policy refusal and every other
+    /// exhaustion as an upstream failure, so this drives the real
+    /// executor across the crate boundary and asks the same question
+    /// the arm asks, rather than asserting against a hand-built error
+    /// that could disagree with what the executor returns.
+    #[tokio::test]
+    async fn a_credential_locked_cascade_is_dispositioned_as_a_refusal() {
+        let config = locked_cascade_config(true);
+
+        let error = exhaust_cascade(&config, &["openai".to_string()]).await;
+
+        assert_eq!(
+            cascade_credential_lock_providers(&error).as_deref(),
+            Some("anthropic"),
+            "the credential's lock is the whole reason nothing dispatched, so the arm has to \
+             see it: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cascade_exhausted_for_another_reason_is_not_a_refusal() {
+        let config = locked_cascade_config(true);
+        // Unhealthy, not locked: the credential allows this provider.
+        config.router().set_provider_health(0, false);
+
+        let error = exhaust_cascade(&config, &[]).await;
+
+        assert_eq!(
+            cascade_credential_lock_providers(&error),
+            None,
+            "an unhealthy provider is an upstream failure; calling it a policy refusal would \
+             stamp a deny reason on a request no policy denied: {error}"
+        );
+    }
+
+    /// WOR-2685: the refusal-surface seam, the same five surfaces
+    /// [`posture_refusal_body`] stamps for the adjacent refusal class.
+    /// The `Err` arm used to write none of them, so the admin console's
+    /// Routing Decisions row stayed blank and the SIEM feed never
+    /// learned a credential policy denied the request.
+    #[test]
+    fn a_credential_lock_stamps_every_refusal_surface() {
+        let mut ctx = crate::context::RequestContext::new();
+        ctx.tenant_id = "cascade-lock-test-tenant".into();
+        ctx.request_id = "cascade-lock-test-rid".into();
+        ctx.ai_route_reason = Some("price_ceiling: 0.02".to_string());
+
+        record_cascade_credential_lock("anthropic", "POST", &mut ctx);
+
+        assert_eq!(
+            ctx.ai_outcome.as_deref(),
+            Some("credential_provider_lock"),
+            "the closed outcome label the access log breaks down by"
+        );
+        assert_eq!(
+            ctx.deny_reason.as_deref(),
+            Some("credential_provider_lock: anthropic"),
+            "metering must classify this as policy_blocked, never origin_5xx"
+        );
+        assert!(
+            ctx.policy_decisions
+                .iter()
+                .any(|decision| decision == "credential_provider_policy:deny"),
+            "the admin ring explainability column carries the deny: {:?}",
+            ctx.policy_decisions
+        );
+        let reason = ctx
+            .ai_route_reason
+            .as_deref()
+            .expect("the admin routing-decisions row reads this column");
+        assert!(
+            reason.contains("credential_provider_lock: anthropic"),
+            "the row has to name the lock, not just that something narrowed: {reason}"
+        );
+        assert!(
+            reason.starts_with("price_ceiling: 0.02"),
+            "an earlier narrowing on the same request is appended to, not overwritten: {reason}"
+        );
+        let audited = sbproxy_observe::audit_ring::recent_audit_events(
+            64,
+            Some("security"),
+            Some("credential_provider_policy"),
+            None,
+        );
+        assert!(
+            audited
+                .iter()
+                .any(|event| event.request_id.as_deref() == Some("cascade-lock-test-rid")),
+            "the refusal must land on the security-audit channel, which is what reaches an \
+             `events:` sink as policy_denied"
+        );
+    }
+}
+
 /// WOR-2557: the typed fail-closed refusal for a candidate set the
 /// data-posture constraint emptied.
 ///
@@ -11424,7 +11640,21 @@ pub(super) async fn handle_ai_proxy(
                     config,
                     cascade_cfg,
                     allowed_providers,
-                    blocked_providers,
+                    // WOR-2685: the executor skips a tier on
+                    // `effective` and diagnoses it on
+                    // `credential_only`, so a tier the data-posture
+                    // constraint excluded is never reported as the
+                    // credential's provider lock. `blocked_providers`
+                    // is the posture-widened binding from the narrowing
+                    // above; `blocked_without_posture` is what it was
+                    // before that. Named fields because the two are
+                    // both `&[String]` and repeating one of them here
+                    // would silently reinstate the misattribution with
+                    // every test still green.
+                    sbproxy_ai::CascadeBlockLists {
+                        effective: blocked_providers,
+                        credential_only: blocked_without_posture,
+                    },
                     &path,
                     &body,
                     &ctx.attribution_tags,
@@ -11647,6 +11877,28 @@ pub(super) async fn handle_ai_proxy(
                             send_error(session, status, message).await?;
                             return Ok(());
                         }
+                    }
+                    // WOR-2685: a cascade that never dispatched because
+                    // the credential's provider policy excluded every
+                    // tier is a policy refusal, not an upstream
+                    // failure, and every surface an operator reads has
+                    // to say so. The detailed message stays here in the
+                    // server log; the caller gets the closed
+                    // `credential_provider_locked` token and nothing
+                    // about the credential's policy contents.
+                    if let Some(locked) = cascade_credential_lock_providers(&e) {
+                        warn!(
+                            event = "ai.cascade.credential_lock",
+                            error = %e,
+                            "AI proxy: cascade refused; the credential's provider policy \
+                             excluded every tier"
+                        );
+                        record_cascade_credential_lock(&locked, &method_str, ctx);
+                        return Err(Error::because(
+                            ErrorType::Custom(CREDENTIAL_PROVIDER_LOCKED_TOKEN),
+                            "AI cascade refused by the credential's provider policy",
+                            e,
+                        ));
                     }
                     warn!(
                         error = %e,
@@ -13529,9 +13781,31 @@ fn record_ai_admission_refusal(ctx: &RequestContext, surface: &str, reason: &'st
 /// never constructs one, so `ai.close` publishes nothing there even
 /// with `decision_audit` enabled. See `DecisionEvent::coverage`'s doc
 /// on the `AiClose` arm and `docs/events.md`.
+///
+/// `refusal_code` is the `ai_close` hook's refusal code when the hook
+/// blocked the close, and `None` for a clean one. It decides the
+/// outcome, the way [`record_guardrail_decision`] takes one: `Deny` for
+/// a refusal, `Allow` otherwise. `DecisionDetails` does not change
+/// shape for it, because `verdict` is contracted as the stream's
+/// terminal `finish_reason` (see `decision_contract`), and putting a
+/// second vocabulary in that field would break every rule selecting on
+/// it.
+///
+/// The code, never the hook's `message`. A code is bounded at decode to
+/// lowercase ASCII, digits, and `_-.` (`valid_event_code`), while the
+/// message is guest-authored prose that can quote the generation the
+/// hook just read; the message reaches the client's refusal body and
+/// nothing else. Same line `record_guardrail_decision` draws when it
+/// names a guardrail and carries positions rather than matched text.
+///
+/// A host-side fault (`ai_extension_failed` from a session that could
+/// not finish) records as a refusal too: the client gets the same
+/// refused close either way, and the code in the reason is what
+/// separates a hook's verdict from the host's own failure.
 fn record_ai_close_decision(
     ctx: Option<&RequestContext>,
     summary: &crate::ai_extensions::AiCloseSummary,
+    refusal_code: Option<&str>,
 ) {
     use sbproxy_observe::decision::{
         DecisionDetails, DecisionEngine, DecisionEvent, DecisionOutcome,
@@ -13539,6 +13813,11 @@ fn record_ai_close_decision(
 
     let Some(ctx) = ctx else {
         return;
+    };
+    let outcome = if refusal_code.is_some() {
+        DecisionOutcome::Deny
+    } else {
+        DecisionOutcome::Allow
     };
     let origin_id = ctx
         .origin_idx
@@ -13548,7 +13827,7 @@ fn record_ai_close_decision(
     sbproxy_observe::decision::record_decision(
         DecisionEvent::AiClose,
         DecisionEngine::BuiltIn,
-        DecisionOutcome::Allow,
+        outcome,
         origin_for_family,
         &ctx.tenant_id,
     );
@@ -13564,20 +13843,64 @@ fn record_ai_close_decision(
     ) {
         return;
     }
-    let reason = match summary.finish_reason.as_deref() {
-        Some(reason) => format!("stream closed (finish_reason={reason})"),
-        None => "stream closed (no finish_reason reported)".to_owned(),
+    let reason = match (refusal_code, summary.finish_reason.as_deref()) {
+        (Some(code), Some(finish)) => {
+            format!("stream close refused by an AI extension: {code} (finish_reason={finish})")
+        }
+        (Some(code), None) => format!("stream close refused by an AI extension: {code}"),
+        (None, Some(finish)) => format!("stream closed (finish_reason={finish})"),
+        (None, None) => "stream closed (no finish_reason reported)".to_owned(),
     };
     crate::policy_bus::emit_decision_audit_detailed(
         DecisionEvent::AiClose,
         DecisionEngine::BuiltIn,
-        DecisionOutcome::Allow,
+        outcome,
         &ctx.request_id,
         &origin_id,
         &origin_id,
         &ctx.tenant_id,
         &reason,
         DecisionDetails::ai_close(summary.finish_reason.as_deref()),
+    );
+}
+
+/// The one place both `relay_ai_stream` exit paths turn a finished
+/// close into its `ai.close` record (WOR-2689).
+///
+/// `close()` is idempotent across those two paths, but the decision
+/// record is not one of the things it idempotently guards, so the
+/// once-per-generation rule lives here rather than being written twice
+/// and drifting on one path. `already_closed` is the caller's read of
+/// [`crate::ai_extensions::AiRequestExtensions::is_closed`] from
+/// *before* it called `close()`, since `close()` flips that flag as its
+/// own first act.
+///
+/// `refusal` is the close's own `Err` and never a block another hook
+/// raised earlier in the same batch: a stream-event hook's refusal is
+/// `ai.stream.event`'s fact, and filing it here would attribute it to
+/// the wrong event. That is also why the tail-events call site keeps one
+/// condition of its own that this function cannot see: when an earlier
+/// hook in the batch blocked and the close itself was clean, it does not
+/// call here at all, because an `allow` record would claim a normal end
+/// the client never got.
+///
+/// Synchronous on purpose, like [`record_ai_close_decision`]. This sits
+/// on the AI request path, which runs at the Pingora worker's 2 MB
+/// stack limit, so it takes no future and adds no frame the compiler
+/// has to hold live across an await.
+fn record_ai_close_outcome(
+    ctx: Option<&RequestContext>,
+    extensions: &crate::ai_extensions::AiRequestExtensions,
+    already_closed: bool,
+    refusal: Option<&crate::ai_extensions::AiExtensionBlock>,
+) {
+    if already_closed {
+        return;
+    }
+    record_ai_close_decision(
+        ctx,
+        &extensions.close_summary(),
+        refusal.map(|block| block.code.as_str()),
     );
 }
 
@@ -17640,21 +17963,32 @@ pub(super) async fn relay_ai_stream(
                 }
                 if let Some(extensions) = ai_extensions.as_mut() {
                     let already_closed = extensions.is_closed();
-                    let decision = dispatch_ai_hub_events(
+                    let tail = dispatch_ai_hub_events(
                         extensions,
                         &tail_events,
                         &completed_tool_calls,
                         &mut close_released,
                     )
-                    .await
-                    .and(extensions.close().await);
-                    // WOR-2486: `close()` is idempotent across the two
-                    // exit paths this function has, but the decision
-                    // record is not one of the things it idempotently
-                    // guards, so this call site owns not double-firing.
-                    if decision.is_ok() && !already_closed {
-                        record_ai_close_decision(ctx.as_deref(), &extensions.close_summary());
+                    .await;
+                    // WOR-2689: awaited on its own line rather than
+                    // folded into the `and` below, so the record follows
+                    // the close's own verdict. A block from the tail
+                    // dispatch is `ai.stream.event`'s fact, so it never
+                    // becomes this record's refusal, and it does not let
+                    // a clean close claim the stream reached a normal
+                    // end either: that combination publishes nothing,
+                    // exactly as it did before. A close that refuses
+                    // still records, whatever the tail did.
+                    let closed = extensions.close().await;
+                    if closed.is_err() || tail.is_ok() {
+                        record_ai_close_outcome(
+                            ctx.as_deref(),
+                            extensions,
+                            already_closed,
+                            closed.as_ref().err(),
+                        );
                     }
+                    let decision = tail.and(closed);
                     if let Err(block) = decision {
                         warn!(
                             extension_code = %block.code,
@@ -17912,9 +18246,12 @@ pub(super) async fn relay_ai_stream(
     if let Some(extensions) = ai_extensions.as_mut() {
         let already_closed = extensions.is_closed();
         let close_result = extensions.close().await;
-        if close_result.is_ok() && !already_closed {
-            record_ai_close_decision(ctx.as_deref(), &extensions.close_summary());
-        }
+        record_ai_close_outcome(
+            ctx.as_deref(),
+            extensions,
+            already_closed,
+            close_result.as_ref().err(),
+        );
         if let Err(block) = close_result {
             warn!(
                 extension_code = %block.code,
@@ -21726,6 +22063,20 @@ origins:
         manifest: &str,
         javascript: &str,
     ) -> (TempDir, crate::pipeline::CompiledPipeline) {
+        let (directory, chain) = ai_chain_fixture(manifest, javascript);
+        let pipeline = crate::pipeline::CompiledPipeline {
+            ai_extension_chain: Arc::new(chain),
+            ..Default::default()
+        };
+        (directory, pipeline)
+    }
+
+    /// The bundle half of [`pipeline_with_ai_javascript`], for a test
+    /// that needs the chain on a pipeline compiled from real config
+    /// (origins, tenants, and `decision_audit` scoping) instead of on
+    /// `Default::default()`, which carries none of them and so publishes
+    /// no audit record at all.
+    fn ai_chain_fixture(manifest: &str, javascript: &str) -> (TempDir, AiExtensionChain) {
         let directory = TempDir::new().expect("extension fixture directory");
         let bundle = directory.path().join("fixture");
         std::fs::create_dir(&bundle).expect("create extension fixture");
@@ -21741,14 +22092,9 @@ origins:
             &BTreeSet::new(),
         )
         .expect("load extension fixture");
-        let pipeline = crate::pipeline::CompiledPipeline {
-            ai_extension_chain: Arc::new(
-                AiExtensionChain::from_registry(registry.as_ref())
-                    .expect("prepare AI extension chain"),
-            ),
-            ..Default::default()
-        };
-        (directory, pipeline)
+        let chain =
+            AiExtensionChain::from_registry(registry.as_ref()).expect("prepare AI extension chain");
+        (directory, chain)
     }
 
     struct DenyingBufferedPolicy;
@@ -26465,6 +26811,205 @@ origins:
         );
     }
 
+    /// The `ai_close` fixture chain, for the two close-verdict tests
+    /// below. One `ai_close` hook and nothing else, so the only hook
+    /// verdict either test can be reading is the close's own.
+    const AI_CLOSE_MANIFEST: &str = "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: close-verdict\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nhooks:\n  - kind: ai_close\n    type: inspect_close\n    export: inspect\n";
+
+    /// A two-chunk SSE completion that ends `stop`, so the close
+    /// summary the record is built from carries a finish reason.
+    fn ai_close_upstream_stream() -> Vec<u8> {
+        concat!(
+            "data: {\"id\":\"chatcmpl-close\",\"object\":\"chat.completion.chunk\",",
+            "\"created\":1,\"model\":\"requested-model\",\"choices\":[{\"index\":0,",
+            "\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-close\",\"object\":\"chat.completion.chunk\",",
+            "\"created\":1,\"model\":\"requested-model\",\"choices\":[{\"index\":0,",
+            "\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .as_bytes()
+        .to_vec()
+    }
+
+    /// Compile the `ai.close` audit fixture and hang an AI extension
+    /// chain built from `javascript` off it.
+    fn ai_close_pipeline(
+        javascript: &str,
+    ) -> (TempDir, std::sync::Arc<crate::pipeline::CompiledPipeline>) {
+        let compiled = sbproxy_config::compile_config(
+            r#"
+proxy:
+  tenants:
+    - id: acme
+  observability:
+    log:
+      decision_audit:
+        enabled: false
+        events:
+          ai.close: true
+origins:
+  "ai.test":
+    tenant_id: acme
+    action:
+      type: static
+      body: ok
+"#,
+        )
+        .expect("ai.close fixture config");
+        let mut pipeline = crate::pipeline::CompiledPipeline::from_config_for_validation(compiled)
+            .expect("ai.close fixture pipeline");
+        let (directory, chain) = ai_chain_fixture(AI_CLOSE_MANIFEST, javascript);
+        pipeline.ai_extension_chain = Arc::new(chain);
+        (directory, std::sync::Arc::new(pipeline))
+    }
+
+    /// Every `ai.close` record this request published.
+    fn ai_close_records(
+        rx: &mut crate::policy_bus::PolicyVerdictReceiver,
+        request_id: &str,
+    ) -> Vec<sbproxy_observe::decision::DecisionAudit> {
+        let mut ours = Vec::new();
+        while let Ok(record) = rx.try_recv() {
+            if let crate::policy_bus::AuditRecord::Decision(audit) = record {
+                if audit.request_id == request_id
+                    && audit.event == sbproxy_observe::decision::DecisionEvent::AiClose
+                {
+                    ours.push(*audit);
+                }
+            }
+        }
+        ours
+    }
+
+    /// WOR-2689: an `ai_close` hook that refuses the close has to reach
+    /// the decision feed.
+    ///
+    /// Red before the fix: both `relay_ai_stream` close sites published
+    /// only when `close()` returned `Ok`, so a refused close cut the
+    /// stream, wrote a warn line, and left the audit feed with nothing
+    /// at all, while `docs/extension-bundles.md` promises a record
+    /// either way. Driven through `handle_ai_proxy` rather than against
+    /// `record_ai_close_decision` directly, because the defect was in
+    /// the call sites' gating, which a direct call cannot see.
+    #[tokio::test]
+    async fn a_refused_stream_close_publishes_a_denied_ai_close_record() {
+        let (upstream_url, _hits) =
+            upstream_bytes_fixture(ai_close_upstream_stream(), "text/event-stream").await;
+        let (_directory, pipeline) = ai_close_pipeline(
+            r#"export function inspect() { return {version:"sbproxy-envelope/v1",decision:"block",status:409,code:"fixture_close_refused",message:"zebramarker close refusal"}; }"#,
+        );
+        let config = openai_proxy_config(&upstream_url);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        context.pipeline = std::sync::Arc::clone(&pipeline);
+        context.origin_idx = Some(0);
+        context.tenant_id = "acme".into();
+        context.request_id = "req-ai-close-block".into();
+
+        let (bus, mut rx) = crate::policy_bus::channel(32);
+        crate::policy_bus::init_global_bus(bus);
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            pipeline.as_ref(),
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("the refused close is handled");
+        drop(session);
+        let _ = live_downstream_body(client).await;
+
+        let ours = ai_close_records(&mut rx, "req-ai-close-block");
+        assert_eq!(
+            ours.len(),
+            1,
+            "a refused close publishes exactly one ai.close record"
+        );
+        let audit = &ours[0];
+        assert_eq!(
+            audit.outcome,
+            sbproxy_observe::decision::DecisionOutcome::Deny
+        );
+        assert_eq!(audit.origin, "ai.test");
+        assert_eq!(audit.tenant, "acme");
+        // The stream's own terminal reason still rides in `verdict`; the
+        // refusal is the record's outcome, not a second vocabulary in
+        // that field.
+        assert_eq!(audit.details.verdict.as_deref(), Some("stop"));
+        assert!(
+            audit.reason.as_str().contains("fixture_close_refused"),
+            "the hook's bounded code is what says which hook refused: {}",
+            audit.reason.as_str()
+        );
+        let rendered = audit.to_ocsf().to_string();
+        assert!(
+            !rendered.contains("zebramarker"),
+            "the hook's message is guest-authored prose that can quote the \
+             generation, so it must not reach the record: {rendered}"
+        );
+    }
+
+    /// The other half of the same promise: a clean close still records
+    /// `allow`, and still records exactly once.
+    #[tokio::test]
+    async fn a_clean_stream_close_publishes_an_allowed_ai_close_record() {
+        let (upstream_url, _hits) =
+            upstream_bytes_fixture(ai_close_upstream_stream(), "text/event-stream").await;
+        let (_directory, pipeline) = ai_close_pipeline(
+            r#"export function inspect() { return {version:"sbproxy-envelope/v1",decision:"release"}; }"#,
+        );
+        let config = openai_proxy_config(&upstream_url);
+        let (mut session, client) = downstream_session(serde_json::json!({
+            "model": "requested-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        }))
+        .await;
+        let mut context = crate::context::RequestContext::new();
+        context.pipeline = std::sync::Arc::clone(&pipeline);
+        context.origin_idx = Some(0);
+        context.tenant_id = "acme".into();
+        context.request_id = "req-ai-close-allow".into();
+
+        let (bus, mut rx) = crate::policy_bus::channel(32);
+        crate::policy_bus::init_global_bus(bus);
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            pipeline.as_ref(),
+            "ai.test",
+            &mut context,
+            Some(0),
+        )
+        .await
+        .expect("the clean close is handled");
+        drop(session);
+        let _ = live_downstream_body(client).await;
+
+        let ours = ai_close_records(&mut rx, "req-ai-close-allow");
+        assert_eq!(
+            ours.len(),
+            1,
+            "close() is idempotent across the relay's two exit paths, so one \
+             generation publishes one record"
+        );
+        assert_eq!(
+            ours[0].outcome,
+            sbproxy_observe::decision::DecisionOutcome::Allow
+        );
+        assert_eq!(ours[0].details.verdict.as_deref(), Some("stop"));
+    }
+
     /// The negative case: a request the shim admits with a lossiness
     /// note must publish no `ai.admission` record at all.
     ///
@@ -29393,6 +29938,7 @@ origins:
             &crate::ai_extensions::AiCloseSummary {
                 finish_reason: Some("tool_calls".to_string()),
             },
+            None,
         );
 
         let mut ours = None;
@@ -29451,6 +29997,7 @@ origins:
             &crate::ai_extensions::AiCloseSummary {
                 finish_reason: Some("stop".to_string()),
             },
+            None,
         );
 
         while let Ok(record) = rx.try_recv() {
