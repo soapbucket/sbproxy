@@ -310,7 +310,7 @@ See [guardrails.md](guardrails.md) and [prompt-injection-v2.md](prompt-injection
 | Per-token streaming safety, session-aware | gRPC `ClassifierService.StreamSafety` (bidi) | Checks accumulated streamed tokens against a rule set as they arrive, so a caller can cut a response short instead of waiting for the full body. The stream retains a tail across messages, so a rule spanning two tokens still matches. After the first match, `safe` remains false and carries the matching reason; `blocked` is true only on the message that first caused that transition. |
 | Per-token streaming safety, stateless | TCP `streaming_safety` | Scores one frame's `streaming_tokens` against that frame's `safety_rules` and nothing else. There is no retained tail, so a rule spanning two frames never matches, and there is no sticky state: `blocked` is always `!safe`, and `safe` returns to true on the next frame. A caller that wants the session semantics above accumulates the tokens itself, or uses the gRPC stream. |
 
-`Compress` (token-classification pruning) is not ported and returns `UNIMPLEMENTED` on this binary; run the minimal sidecar for that RPC. See the crate's module docs (`crates/sbproxy-classifier/src/*.rs`) for the full scope note, including what was deliberately not ported from the enterprise source (LLM-judge backends, license-leak detection, the Wave 5 agent-classifier ML path, Ed25519 model-signing, OpenTelemetry).
+`Compress` (token-classification pruning) is not ported and returns `UNIMPLEMENTED` on this binary; run the minimal sidecar for that RPC. See the crate's module docs (`crates/sbproxy-classifier/src/*.rs`) for the full scope note, including what this port deliberately leaves out (LLM-judge backends, license-leak detection, the Wave 5 agent-classifier ML path, Ed25519 model-signing, OpenTelemetry).
 
 ### Running it
 
@@ -378,11 +378,21 @@ share available to it is disconnected.
 
 The three deadlines nest, and they nest for a reason. `--tcp-io-timeout-ms`
 bounds one `read()`, `--tcp-frame-timeout-ms` bounds the length prefix plus
-the declared body, and `--tcp-connection-timeout-ms` bounds the socket from
-accept to close. Without the middle one a client that sends a byte just
-inside every per-read window holds its share of the shared frame budget for
-as long as it likes, and a handful of such sockets lock every other
-connection, the admin listener included, out of that budget.
+the declared body, and `--tcp-connection-timeout-ms` bounds the span from
+accept, or from the last answered frame, to close. Without the middle one a
+client that sends a byte just inside every per-read window holds its share of
+the shared frame budget for as long as it likes, and a handful of such sockets
+lock every other connection, the admin listener included, out of that budget.
+
+The connection deadline is refreshed by progress: every answered frame moves
+it one full `--tcp-connection-timeout-ms` further out, so a client that pools
+a connection and keeps it busy is never cut mid-exchange, while a socket that
+stops answering is closed on schedule and gives up its connection slot. It
+covers the whole exchange, not just the reading, so it is also the bound on a
+command that never comes back from the inference executor. Both listeners are
+covered, the loopback admin one included: a stalled admin socket holds a slot
+and draws on the same frame budget a public one does, and an admin client that
+is working refreshes the deadline like any other.
 
 The public TCP listener authenticates nothing, encrypts nothing, and takes
 the `tenant` field verbatim from each frame. It therefore binds to loopback
@@ -427,6 +437,14 @@ Other rich-sidecar refusal limits are fixed:
 | Inference token file | 256 KiB and 1024 bearer tokens |
 | Inference bearer token | 256 bytes |
 | Listener TLS certificate, key, and client-CA files | 256 KiB each |
+
+The compiled-program ceilings are what a pattern costs after compilation, not
+how long it is, and a pattern well inside the 4096-byte source limit can
+exceed one. The usual cause is a Unicode-aware shorthand inside a bounded
+repeat: `\b(?:\d[ -]?){13,16}\b` compiles past 64 KiB, where the same rule
+written `\b(?:[0-9][ -]?){13,16}\b` compiles in a fraction of it. A pattern
+past its budget is refused at registration with a message naming the budget
+and the number of bytes, so it is diagnosable without guessing at syntax.
 
 An admin token path must open as a regular file. On Unix the sidecar opens it
 nonblocking and with no-follow enabled, then checks file type, group/other

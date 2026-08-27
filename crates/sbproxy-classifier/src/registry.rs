@@ -68,11 +68,11 @@ const DEFAULT_ENABLED_NORMALIZATION_RULE_BYTES: usize = 64 * 1024;
 /// `DEFAULT_MAX_COMPILED_PROGRAM_BYTES` a name rather than a bound. A 10 MiB
 /// builder limit against a 48 KiB charge let one admitted pattern hold 213
 /// times what the budget thought it had reserved.
-const CLASSIFIER_PATTERN_SIZE_LIMIT: usize = DEFAULT_CLASSIFIER_PROGRAM_BYTES;
+pub(crate) const CLASSIFIER_PATTERN_SIZE_LIMIT: usize = DEFAULT_CLASSIFIER_PROGRAM_BYTES;
 
 /// Per-rule compiled-program ceiling handed to the regex builder, matching
 /// the weight charged per enabled normalization rule for the same reason.
-const NORMALIZATION_RULE_SIZE_LIMIT: usize = DEFAULT_ENABLED_NORMALIZATION_RULE_BYTES;
+pub(crate) const NORMALIZATION_RULE_SIZE_LIMIT: usize = DEFAULT_ENABLED_NORMALIZATION_RULE_BYTES;
 
 /// Internal config used to build a [`Tenant`] from the wire-protocol
 /// [`TenantConfig`].
@@ -1834,7 +1834,12 @@ fn compile_enabled_regexes(
                     .size_limit(CLASSIFIER_PATTERN_SIZE_LIMIT)
                     .build()
                     .map_err(|error| {
-                        format!("label '{}' has invalid regex: {error}", label.name)
+                        compile_refusal(
+                            &format!("label '{}'", label.name),
+                            "pattern",
+                            CLASSIFIER_PATTERN_SIZE_LIMIT,
+                            &error,
+                        )
                     })?,
             );
         }
@@ -1860,15 +1865,35 @@ fn compile_enabled_regexes(
             .size_limit(NORMALIZATION_RULE_SIZE_LIMIT)
             .build()
             .map_err(|error| {
-                format!(
-                    "normalization rule '{}' has invalid regex: {error}",
-                    rule.name
+                compile_refusal(
+                    &format!("normalization rule '{}'", rule.name),
+                    "rule",
+                    NORMALIZATION_RULE_SIZE_LIMIT,
+                    &error,
                 )
             })?;
         rules.push(CompiledRule::new(regex, rule.replace.clone()));
     }
 
     Ok((labels, rules))
+}
+
+/// Wording for a pattern the compiler refused, keeping a budget refusal
+/// legible as one.
+///
+/// The per-pattern ceiling is the weight the compiled-program budget
+/// charges, which is 213 times smaller than the builder default this crate
+/// used to pass. A pattern well inside `MAX_PATTERN_LENGTH` can compile past
+/// it, and calling that "invalid regex" sends the operator looking for a
+/// syntax mistake that is not there. A size refusal therefore names the
+/// budget and the number; everything else keeps the syntax wording.
+fn compile_refusal(subject: &str, charged_per: &str, limit: usize, error: &regex::Error) -> String {
+    match error {
+        regex::Error::CompiledTooBig(_) => format!(
+            "{subject} exceeds the {limit}-byte compiled-program budget charged per {charged_per}"
+        ),
+        _ => format!("{subject} has invalid regex: {error}"),
+    }
 }
 
 /// Bound and character-check a caller-supplied tenant id at registration.
@@ -2267,7 +2292,10 @@ mod tests {
                 },
             )
             .expect_err("a pattern past its charged weight must be refused");
-        assert!(error.contains("invalid regex"), "unexpected: {error}");
+        assert!(
+            error.contains("exceeds the 49152-byte compiled-program budget charged per pattern"),
+            "a budget refusal must read as one, not as a syntax error: {error}"
+        );
     }
 
     /// Both tenant-id log sinks run the caller-supplied id through the
