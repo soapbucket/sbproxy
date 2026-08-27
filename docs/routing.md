@@ -1,6 +1,6 @@
 # Routing and traffic management
 *Last modified: 2026-08-21*
-
+*Last modified: 2026-08-27*
 How SBproxy decides which upstream serves a request: hostname matching, forward rules, load balancing, protocol-specific actions, failover, and the extension point for custom selection logic. This page is the hub; [configuration.md](configuration.md) is the field-by-field source of truth for every block below.
 
 ![The same hostname routed to different backends by request body content](assets/body-routing.gif)
@@ -184,6 +184,8 @@ complete working config.
 ## Failing over: fallback origin
 
 `fallback_origin` swaps in a backup action (static, redirect, mock, proxy, anything) when the primary errors (`on_error: true`) or returns a listed status (`on_status: [502, 503, 504]`). It runs only the fallback action, not the origin's own auth/policies/transforms; point it at another `proxy` origin if you need the full chain. See [Fallback origin](configuration.md#fallback-origin); runnable at [`examples/fallback-origin/`](../examples/fallback-origin/).
+
+`on_error` has exactly one exception, and it is narrow: an AI request the gateway cancelled itself because the caller's connection broke mid-generation does not run the fallback. The fallback exists to give a waiting caller something rather than a 502, and that request has no waiting caller; on an `ai_proxy` fallback it would also dispatch a second paid provider call for someone who is already gone. Every other failure serves the fallback as it always did, including failures the proxy attributes to the client, such as a request whose `Connection` header nominates a protected field. See [ai-gateway.md](ai-gateway.md#when-a-broken-connection-stops-the-meter).
 
 ## Where an SRE lead goes next
 

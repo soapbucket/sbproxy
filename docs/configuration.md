@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-25*
+*Last modified: 2026-08-27*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -5051,7 +5051,7 @@ origins:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `on_error` | bool | false | Trigger the fallback on transport-level upstream failures (DNS, connect, TLS, timeout). |
+| `on_error` | bool | false | Trigger the fallback on transport-level upstream failures (DNS, connect, TLS, timeout). Not triggered for an AI request the gateway cancelled because the caller's connection broke: there is no caller left to serve, and on an `ai_proxy` fallback the substitute action would be a second paid provider call. See [ai-gateway.md](ai-gateway.md#when-a-broken-connection-stops-the-meter). |
 | `on_status` | list[int] | `[]` | Trigger the fallback when the upstream responds with one of these status codes. Pair with `on_error` for full coverage. |
 | `add_debug_header` | bool | false | When true, the proxy sets `X-Fallback-Trigger` on the response so callers can tell the fallback path served the request. |
 | `origin` | object | required | Inline origin spec used to serve the request when a trigger fires. Must contain an `action` block. `id` is optional and is used to name the rule in emitted OpenAPI operation ids. `hostname`, `workspace_id`, and `version` are refused at config compile: nothing read them. |

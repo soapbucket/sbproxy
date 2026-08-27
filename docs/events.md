@@ -1,6 +1,6 @@
 # SBproxy events
 
-*Last modified: 2026-08-25*
+*Last modified: 2026-08-27*
 
 SBproxy hands a SIEM three different things, and this page is the map of how they fit together: typed proxy events (the `events:` block, a closed set of twenty-two), decision-audit records (`observability.log.decision_audit`, nineteen pipeline decisions normalized to OCSF), and four audit channels that write to their own tracing targets (`security_audit`, `config_audit`, `key_audit`, and the admin action ring). Two of those four, `security_audit` and `config_audit`, can additionally be hash-chained and Ed25519-signed for tamper evidence.
 
@@ -301,7 +301,7 @@ There is no single schema file to point at; the convention is consistent rather 
 Two vocabularies get reused deliberately rather than invented per feature:
 
 - **The OCSF envelope**, for decision-audit. Every record is API Activity (6003) with the Security Control profile: `class_uid`, `metadata.correlation_uid` (the request id), `cloud.org.name` (tenant), `api.service.name` (the origin id, never the request `Host`), `disposition_id` / `is_alert`, and per-event structured detail under `unmapped`, OCSF's sanctioned home for attributes the class does not define. [observability.md](observability.md) and [decision-records.md](decision-records.md) have the full field-by-field reference.
-- **The OTel GenAI and error vocabulary**, for the AI request/response spans this page's events correlate with. `gen_ai.*` attributes follow the OTel GenAI semantic conventions, and a failed span sets `otel.status_code = ERROR` with `error.type` drawn from a closed set: `guardrail_blocked`, `rate_limited`, `content_filter`, `budget_exceeded`, `invalid_request`, `upstream_5xx`, `timeout`, `provider_error`. `ai.failure`'s decision-audit `verdict` field (`rate_limited`, `content_filter`, `upstream_5xx`, `provider_error`) is drawn from the same closed vocabulary on purpose, so a rule written against the span's `error.type` and a rule written against the decision-audit record agree about what a failure was.
+- **The OTel GenAI and error vocabulary**, for the AI request/response spans this page's events correlate with. `gen_ai.*` attributes follow the OTel GenAI semantic conventions, and a failed span sets `otel.status_code = ERROR` with `error.type` drawn from a closed set: `guardrail_blocked`, `rate_limited`, `content_filter`, `budget_exceeded`, `invalid_request`, `upstream_5xx`, `timeout`, `client_disconnected`, `provider_error`. `client_disconnected` is the one member that is nobody's failure: the caller's connection broke and the gateway abandoned the provider call rather than pay for an answer nobody would read, and it is kept out of `provider_error` so a provider's reliability numbers are not charged for callers who left. `ai.failure`'s decision-audit `verdict` field (`rate_limited`, `content_filter`, `upstream_5xx`, `provider_error`) is drawn from the same closed vocabulary on purpose, so a rule written against the span's `error.type` and a rule written against the decision-audit record agree about what a failure was.
 
 Standard resource attributes (`service.name`, `service.version`, `host.name`, `k8s.pod.name`, and the rest) and the `sbproxy.*` namespace (`sbproxy.request_id`, `sbproxy.tenant_id`, `sbproxy.route`) are documented in full in [observability.md](observability.md#traces).
 
