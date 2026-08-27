@@ -1,6 +1,6 @@
 # Secret Backends
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-27*
 
 SBproxy resolves every secret-bearing config value through one reference grammar, checked by one function. A provider credential under `credentials:`, a `source:` block's `credential` field, the `pepper` and `master_key` under `key_management.crypto`, and the value each provider URI on this page resolves to are all meant to go through that same grammar, in the same order, with the same failure behavior. There is nothing field-specific to learn: a form that works in one secret-bearing field works in all of them.
 
@@ -443,6 +443,30 @@ Two of the three have a better alternative than hand-generation:
 
 * **Virtual keys:** the dynamic key-management admin API mints keys server-side (`POST /admin/keys`) with the right shape and entropy, and returns the plaintext token exactly once. Prefer minting over inventing a static key; see [key-management.md](key-management.md). A hand-generated static key is fine for local walkthroughs, but replace placeholder values like `sk-your-virtual-key` before anything reachable beyond localhost.
 * **`pepper` and `master_key`:** if you leave them unset, sbproxy generates an ephemeral value at boot and warns. That is a fallback so a first run works, not a recommendation. Stored key hashes and encrypted credentials do not survive a restart without stable values, so set both before minting any key you intend to keep.
+
+## What a diagnostic can print
+
+A backend's auth block holds a working credential: an AWS secret access
+key, an Entra client secret, an inline GCP service-account key, a Vault
+client token or AppRole `secret_id`. Those fields are never printed.
+Formatting the config for a startup error, an `anyhow` chain, or a
+support bundle renders them as `[REDACTED]`, and so does formatting any
+struct that contains one.
+
+What still prints is everything that identifies which backend is
+misconfigured without authenticating to it: the region, the vault URL,
+the AWS access key id, the Entra tenant and client ids, the Vault role
+id, the mount prefix, and the path to a key file. An error that names
+none of those is not worth reading, so the line is drawn at reusability
+rather than at sensitivity.
+
+The same rule covers the credentials the proxy issues rather than
+consumes. A minted virtual key's plaintext token is returned by the
+admin API once and never rendered again, and a plaintext credential
+posted to `POST /admin/credentials` does not appear in the admin log if
+the request is rejected. Peppered hashes still print: they are what
+correlates a mint with the record it produced, and they are not
+credentials.
 
 ## Related Reading
 
