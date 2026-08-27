@@ -1672,14 +1672,15 @@ fn load_with_depth(
             // gets the same boundary a config-authority bundle gets
             // (WOR-2433).
             //
-            // Opt-in rather than on by default, because in the ordinary
-            // GitOps shape the repository is the operator's own config
-            // store: the local file is a pointer, so the refusal's
-            // remedy - declare the value in the config the operator
-            // owns - has nowhere to go, and `env:` / `file:` are the
-            // documented (and for the cluster shared key the only)
-            // spellings for a secret there. See `ConfigSource::Git`'s
-            // `confine` field for the full reasoning.
+            // Opt-in rather than on by default, because flipping it on
+            // is a fail-closed upgrade on a running fleet: every GitOps
+            // deployment whose repository names a host path would refuse
+            // its own config on the release that changed the default,
+            // and a node that boots into a refusal serves nothing. The
+            // unconfined path is not silent, though - a document that
+            // reaches for this host logs one warning per finding, so an
+            // operator on the default learns the setting exists. See
+            // `ConfigSource::Git`'s `confine` field for the rest.
             //
             // `remote_document()` keeps `${VAR}`, which is the
             // documented and only supported way to run one shared
@@ -1688,6 +1689,8 @@ fn load_with_depth(
             // straight off this host, and a host path the proxy opens.
             if *confine {
                 confine_fetched_document(&spec, &text)?;
+            } else {
+                warn_unconfined_host_reference(&spec, &text);
             }
             revisions.push(resolved);
             Ok(text)
@@ -1725,12 +1728,99 @@ fn confine_fetched_document(spec: &GitSpec<'_>, text: &str) -> Result<(), Config
         &crate::confined_template::ConfinementPolicy::remote_document(),
     )
     .map_err(|error| match error {
-        crate::confined_template::ConfinedTemplateError::Parse { .. } => {
-            ConfigSourceError::Invalid(error.to_string())
+        // "config fragment does not parse as YAML" is the wrong noun for
+        // a whole document an operator hands the proxy, and this check is
+        // the first thing that parses it, so the message is rebuilt here
+        // rather than borrowed (WOR-2433 re-review).
+        crate::confined_template::ConfinedTemplateError::Parse { source, .. } => {
+            ConfigSourceError::Invalid(format!(
+                "config document `{label}` does not parse as YAML: {source}"
+            ))
         }
         other => ConfigSourceError::Confinement(other.to_string()),
     })
 }
+
+/// Warn once when an **unconfined** git source serves a document that
+/// reaches for this host.
+///
+/// `source.confine` defaults to off, which keeps every GitOps fleet
+/// working across the upgrade, and leaves the operator with no signal
+/// that the setting exists or that their repository is reaching for the
+/// node. This is that signal: the same checker the opt-in runs, with the
+/// refusal turned into one warning naming the source and the key. The
+/// value is never rendered - the checker's own refusals carry a field
+/// path and a static form and never a value, which is what makes this
+/// safe to log.
+///
+/// Deduplicated per source and finding, because the refresh poller
+/// resolves the document on every cycle and an operator does not need
+/// the same line every sixty seconds. A document that changes to reach
+/// for something else warns again, which is the behavior that matters.
+///
+/// Returns the redacted source label and the summary it logged, for the
+/// test that pins this, and `None` when the document reaches for nothing
+/// (or when this exact finding has already been reported).
+fn warn_unconfined_host_reference(spec: &GitSpec<'_>, text: &str) -> Option<(String, String)> {
+    let label = format!("{}:{}", redact_repo(spec.repo), spec.path);
+    let refusal = crate::confined_template::check_confined_document(
+        &label,
+        text,
+        &crate::confined_template::ConfinementPolicy::remote_document(),
+    )
+    .err()?;
+    // Only the two host-reaching refusals are worth a warning here. A
+    // YAML tag or a parse failure is the compiler's business and is
+    // reported by the compile that follows, and no other variant can
+    // occur under `remote_document`.
+    let summary = match &refusal {
+        crate::confined_template::ConfinedTemplateError::HostSecretReference {
+            path, form, ..
+        } => format!("`{path}` is a `{form}` secret reference read off this host"),
+        crate::confined_template::ConfinedTemplateError::HostFileInlining { path, .. } => {
+            format!("`{path}` names a path the proxy opens on this host")
+        }
+        _ => return None,
+    };
+    if !first_report_of(&label, &summary) {
+        return None;
+    }
+    tracing::warn!(
+        source = %label,
+        finding = %summary,
+        "config source is not confined and its document reaches for this host; the \
+         repository can read this node's environment, secrets and filesystem. Set \
+         `source.confine: true` to refuse that, after moving the named key into the \
+         layer this node owns"
+    );
+    Some((label, summary))
+}
+
+/// Whether this is the first time `summary` has been reported for
+/// `label` in this process.
+///
+/// Bounded: the set stops growing at
+/// [`MAX_REMEMBERED_UNCONFINED_FINDINGS`], after which every finding is
+/// treated as new. A process with that many distinct findings has a
+/// louder problem than a repeated log line.
+fn first_report_of(label: &str, summary: &str) -> bool {
+    static REPORTED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let reported = REPORTED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let Ok(mut seen) = reported.lock() else {
+        // A poisoned lock means another thread panicked while holding
+        // it. Warning twice is better than not warning.
+        return true;
+    };
+    if seen.len() >= MAX_REMEMBERED_UNCONFINED_FINDINGS {
+        return true;
+    }
+    seen.insert(format!("{label} :: {summary}"))
+}
+
+/// How many distinct unconfined-source findings this process remembers
+/// for deduplication.
+const MAX_REMEMBERED_UNCONFINED_FINDINGS: usize = 256;
 
 /// One `Git` source, flattened so the loader is not passing seven
 /// arguments around.
@@ -1974,6 +2064,129 @@ mod tests {
                 "the refusal must still say which document it refused: {rendered}"
             );
         }
+    }
+
+    /// WOR-2433 re-review, the ruling on the default. `source.confine`
+    /// stays off, so the unconfined path has to say something: an
+    /// operator who never heard of the setting otherwise gets no signal
+    /// that their repository can read this node's environment.
+    #[test]
+    fn an_unconfined_source_reaching_for_this_host_warns_once_per_finding() {
+        let spec = GitSpec {
+            repo: "https://ghp_examplesecrettoken@github.com/acme/warn-once.git",
+            revision: None,
+            path: "sb.yml",
+            credential: None,
+            verify_signature: false,
+            timeout: Duration::from_secs(60),
+        };
+        let document =
+            "origins:\n  api:\n    authentication:\n      api_key: \"env:AWS_SECRET_ACCESS_KEY\"\n";
+
+        let (label, summary) = warn_unconfined_host_reference(&spec, document)
+            .expect("an unconfined source reaching for this host must be reported");
+
+        assert!(
+            !label.contains("ghp_examplesecrettoken"),
+            "the warning carried the repository credential: {label}"
+        );
+        assert!(
+            label.contains("github.com/acme/warn-once.git:sb.yml"),
+            "{label}"
+        );
+        assert!(
+            summary.contains("origins.api.authentication.api_key"),
+            "the warning must name the key: {summary}"
+        );
+        assert!(
+            !summary.contains("AWS_SECRET_ACCESS_KEY"),
+            "the warning named the variable rather than the form: {summary}"
+        );
+        assert!(
+            warn_unconfined_host_reference(&spec, document).is_none(),
+            "the same finding must not be reported on every refresh cycle"
+        );
+    }
+
+    #[test]
+    fn an_unconfined_source_naming_a_host_path_warns_about_the_key() {
+        let spec = GitSpec {
+            repo: "https://github.com/acme/warn-path.git",
+            revision: None,
+            path: "sb.yml",
+            credential: None,
+            verify_signature: false,
+            timeout: Duration::from_secs(60),
+        };
+        let document =
+            "origins:\n  api:\n    request_modifiers:\n      - rego_module_path: /etc/sbproxy/x.rego\n";
+
+        let (_, summary) = warn_unconfined_host_reference(&spec, document)
+            .expect("a host path in an unconfined document must be reported");
+
+        assert!(summary.contains("rego_module_path"), "{summary}");
+        assert!(
+            !summary.contains("/etc/sbproxy/x.rego"),
+            "the warning echoed the path: {summary}"
+        );
+    }
+
+    #[test]
+    fn the_loader_reports_an_unconfined_source_that_reaches_for_this_host() {
+        // A covered function is not a wired one. The dedup set is the
+        // observable: if `load` reported this finding, a direct call
+        // with the same source and document returns `None` because it
+        // has already been said.
+        const DOCUMENT: &str =
+            "origins:\n  api:\n    authentication:\n      api_key: \"env:AWS_SECRET_ACCESS_KEY\"\n";
+        let mut repos: HashMapOfRepos = std::collections::HashMap::new();
+        repos.insert(
+            "https://example.test/warn-wired.git".into(),
+            vec![("sb.yml", DOCUMENT)],
+        );
+        let (ctx, _cloner) = ctx_with(FixtureCloner::new(repos));
+        let source = git_source(
+            "https://example.test/warn-wired.git",
+            Some("main"),
+            "sb.yml",
+        );
+
+        let loaded = load(&source, "", &ctx).expect("an unconfined source still loads");
+        assert_eq!(loaded.text, DOCUMENT, "and is served unchanged");
+
+        let spec = GitSpec {
+            repo: "https://example.test/warn-wired.git",
+            revision: None,
+            path: "sb.yml",
+            credential: None,
+            verify_signature: false,
+            timeout: Duration::from_secs(60),
+        };
+        assert!(
+            warn_unconfined_host_reference(&spec, DOCUMENT).is_none(),
+            "the loader did not report the finding, so nothing warned the operator"
+        );
+    }
+
+    #[test]
+    fn an_unconfined_source_with_a_clean_document_says_nothing() {
+        // `${VAR}` is the documented way one shared document names
+        // per-node values, so it is not a finding and must not train
+        // operators to ignore this warning.
+        let spec = GitSpec {
+            repo: "https://github.com/acme/warn-clean.git",
+            revision: None,
+            path: "sb.yml",
+            credential: None,
+            verify_signature: false,
+            timeout: Duration::from_secs(60),
+        };
+
+        assert!(warn_unconfined_host_reference(
+            &spec,
+            "proxy:\n  cluster:\n    node_id: \"${SB_NODE_ID}\"\n"
+        )
+        .is_none());
     }
 
     /// The other half of the same site: a document that does not parse is

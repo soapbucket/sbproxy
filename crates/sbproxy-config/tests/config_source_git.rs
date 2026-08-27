@@ -367,14 +367,15 @@ fn a_git_document_may_still_name_per_node_variables() {
 
 #[test]
 fn an_unconfined_git_document_keeps_the_documented_secret_spellings() {
-    // The default, and the reason it is the default. On a git-sourced
-    // node the local file is a pointer, so "declare the value in the
-    // config the operator owns" has nowhere to go, and `env:NAME` is the
-    // only spelling `proxy.cluster.security.shared_key` accepts
-    // (docs/secrets.md) as well as the one the Kubernetes operator
-    // generates. Sealing this by default would take a clustered GitOps
-    // node down on upgrade with no legal spelling left, which is what
-    // the first cut of this change did (WOR-2433 re-review).
+    // The default, and the reason it is the default: flipping it on for
+    // everybody is a fail-closed upgrade. Every one of the three forms
+    // below is documented (docs/secrets.md) and shipped in the examples,
+    // and `env:` is what the Kubernetes operator generates, so a release
+    // that sealed them would refuse running fleets' own configs at boot.
+    // The reason is not that there would be no legal spelling left:
+    // `${VAR}` survives confinement and works for the cluster shared
+    // key, which `a_confined_document_may_name_its_shared_key_as_a_variable`
+    // pins (WOR-2433 re-review).
     if !require_git("an_unconfined_git_document_keeps_the_documented_secret_spellings") {
         return;
     }
@@ -402,6 +403,44 @@ origins:
     assert_eq!(
         resolved.text, document,
         "the loader must return the document byte for byte",
+    );
+}
+
+#[test]
+fn a_git_overlay_over_a_local_base_keeps_the_pointer_files_own_content() {
+    // The remedy every host-file refusal now names, and the one the
+    // docs used to get wrong by telling operators to "keep the value in
+    // the pointer file": for `kind: git` the pointer file's content is
+    // discarded outright, and `kind: git_overlay` with a `kind: local`
+    // base is the one arm that merges it (WOR-2433 re-review).
+    if !require_git("a_git_overlay_over_a_local_base_keeps_the_pointer_files_own_content") {
+        return;
+    }
+    let pointer = r#"proxy:
+  tls_cert_file: /etc/sbproxy/node.pem
+source:
+  kind: git_overlay
+"#;
+    let fixture = Fixture::new(REPO_CONFIG);
+    let source = ConfigSource::GitOverlay {
+        base: Box::new(ConfigSource::Local),
+        overlays: vec![confined_git_source(&fixture.url(), Some("main"))],
+    };
+
+    let resolved = load_source_blocking(&source, pointer, &FetchContext::with_git_binary())
+        .expect("a confined overlay over the operator's own file resolves");
+
+    assert!(
+        resolved
+            .text
+            .contains("tls_cert_file: /etc/sbproxy/node.pem"),
+        "the node-owned key from the pointer file must survive the merge: {}",
+        resolved.text
+    );
+    assert!(
+        resolved.text.contains("edge.example.com"),
+        "the repository's document must be merged over it: {}",
+        resolved.text
     );
 }
 
